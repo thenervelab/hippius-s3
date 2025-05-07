@@ -43,8 +43,6 @@ Hippius-S3 is an S3-compatible API gateway that allows storing data in IPFS (Int
 - [ ] **Event Notifications**: Triggers for object operations
 - [ ] **Testing**: Comprehensive test suite
 - [ ] **Documentation**: OpenAPI/Swagger integration
-- [ ] **Health Checks**: Proper implementation of health check endpoints
-- [ ] **API Routing**: Include all routes in the main application
 
 ## Setup
 
@@ -126,8 +124,6 @@ mypy hippius_s3 tests
 ```
 hippius_s3/
 ├── api/                # API endpoints organized by domain
-│   ├── health/         # Health check endpoints
-│   ├── root/           # Root endpoint
 │   └── s3/             # S3 gateway endpoints
 │       ├── endpoints.py # Basic S3 operations
 │       ├── multipart.py # Multipart upload support
@@ -176,11 +172,6 @@ hippius_s3/
 
 - [ ] `POST /s3/presigned/url` - Generate a pre-signed URL for temporary access
 - [ ] `GET /s3/presigned/validate` - Validate a pre-signed URL signature (internal only)
-
-### System Endpoints
-
-- `GET /` - Root endpoint
-- `GET /health` - Health check endpoint
 
 ## Usage Examples
 
@@ -275,9 +266,8 @@ The following features are planned for future development:
 6. Integrate OpenAPI/Swagger documentation
 7. Add object versioning support
 8. Implement CORS configuration for buckets
-9. Add health check endpoints and proper API routing
-10. Add event notifications for object operations
-11. Implement static website hosting capabilities
+9. Add event notifications for object operations
+10. Implement static website hosting capabilities
 
 ## Compatibility with S3 Clients
 
