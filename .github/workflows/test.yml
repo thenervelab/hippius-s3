@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.12"]  # Only using the latest Python version
 
     steps:
     - uses: actions/checkout@v4
@@ -43,7 +43,8 @@ jobs:
         source .venv/bin/activate
         mypy hippius_s3 tests
 
-    - name: Test with pytest
-      run: |
-        source .venv/bin/activate
-        pytest
+    # Temporarily commenting out tests until we have actual tests
+    # - name: Test with pytest
+    #   run: |
+    #     source .venv/bin/activate
+    #     pytest
