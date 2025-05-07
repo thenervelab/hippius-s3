@@ -28,17 +28,22 @@ jobs:
 
     - name: Install dependencies
       run: |
+        uv venv
+        source .venv/bin/activate
         uv pip install -e ".[dev]"
 
     - name: Lint with ruff
       run: |
+        source .venv/bin/activate
         ruff check .
         ruff format --check .
 
     - name: Type check with mypy
       run: |
+        source .venv/bin/activate
         mypy hippius_s3 tests
 
     - name: Test with pytest
       run: |
+        source .venv/bin/activate
         pytest

@@ -153,7 +153,6 @@ hippius_s3/
 - `POST /s3/buckets` - Create a new bucket
 - `GET /s3/buckets` - List all buckets
 - `DELETE /s3/buckets/{bucket_name}` - Delete a bucket
-
 - `POST /s3/objects` - Upload an object to a bucket
 - `GET /s3/objects/{bucket_name}` - List objects in a bucket
 - `GET /s3/objects/{bucket_name}/{object_key}` - Get object metadata
