@@ -6,3 +6,4 @@ SELECT o.object_id, o.bucket_id, o.object_key, o.ipfs_cid,
 FROM objects o
 JOIN buckets b ON o.bucket_id = b.bucket_id
 WHERE o.bucket_id = $1 AND o.object_key = $2
+ORDER BY o.created_at DESC LIMIT 1

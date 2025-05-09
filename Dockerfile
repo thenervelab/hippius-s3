@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir -e .
 ENV PYTHONUNBUFFERED=1
 
 # Create a startup script that runs dbmate and then uvicorn
-RUN echo '#!/bin/bash\nset -e\n\n# Apply database migrations\necho "Applying database migrations..."\ndbmate wait\ndbmate up\n\n# Run the application\nexec uvicorn hippius_s3.main:app --host 0.0.0.0 --port 8000 --reload' > /start.sh && \
+RUN echo '#!/bin/bash\nset -e\n\n# Apply database migrations\necho "Applying database migrations..."\ndbmate wait\ndbmate up\n\n# Run the application\nexec uvicorn hippius_s3.main:app --host 0.0.0.0 --port 8000 --reload --log-level debug --access-log' > /start.sh && \
     chmod +x /start.sh
 
 # Run the startup script

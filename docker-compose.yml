@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   api:
     build: .
@@ -12,6 +10,10 @@ services:
     volumes:
       - .:/app
     restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - UVICORN_LOG_LEVEL=debug
+      - DEBUG=true
 
   db:
     image: postgres:15
@@ -30,18 +32,6 @@ services:
       timeout: 5s
       retries: 5
 
-  ipfs:  # for local debug and testing
-    image: ipfs/kubo:latest
-    ports:
-      - "4001:4001"
-      - "5001:5001"
-      - "8080:8080"
-    volumes:
-      - ipfs_data:/data/ipfs
-    restart: unless-stopped
-
-
 volumes:
   postgres_data:
-  ipfs_data:
   minio_data:

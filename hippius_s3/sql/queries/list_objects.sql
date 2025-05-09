@@ -6,5 +6,5 @@ SELECT o.object_id, o.bucket_id, o.object_key, o.ipfs_cid,
 FROM objects o
 JOIN buckets b ON o.bucket_id = b.bucket_id
 WHERE o.bucket_id = $1
-  AND ($2 IS NULL OR o.object_key LIKE $2 || '%')
+  AND ($2::text IS NULL OR o.object_key LIKE $2::text || '%')
 ORDER BY o.object_key

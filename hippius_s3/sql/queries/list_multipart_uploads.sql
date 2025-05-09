@@ -3,6 +3,6 @@
 SELECT *
 FROM multipart_uploads
 WHERE bucket_id = $1
-  AND ($2 IS NULL OR object_key LIKE $2 || '%')
+  AND ($2::text IS NULL OR object_key LIKE $2::text || '%')
   AND is_completed = FALSE
 ORDER BY initiated_at DESC
