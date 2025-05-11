@@ -42,6 +42,7 @@ jobs:
         # Check if this is a git repository
         if [ ! -d ".git" ]; then
           echo "No git repository found. Initializing..."
+          echo "DEBUG: Attempting to clone from: $REPO_URL"
           # Clone the repository if it's not already there
           git clone -b production $REPO_URL .
         else
