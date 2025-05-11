@@ -1,0 +1,112 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches: [ production ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up SSH
+      uses: webfactory/ssh-agent@v0.8.0
+      with:
+        ssh-private-key: ${{ secrets.DEPLOYMENT_SSH_KEY }}
+
+    - name: Setup known hosts
+      run: |
+        mkdir -p ~/.ssh
+        ssh-keyscan -H ${{ secrets.DEPLOYMENT_IP }} >> ~/.ssh/known_hosts
+
+    - name: Deploy to production
+      env:
+        DEPLOYMENT_IP: ${{ secrets.DEPLOYMENT_IP }}
+        DEPLOYMENT_USER: ${{ secrets.DEPLOYMENT_USER }}
+        DEPLOYMENT_PATH: ${{ secrets.DEPLOYMENT_PATH }}
+        DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      run: |
+        # Create deployment script
+        cat > deploy.sh << 'EOF'
+        #!/bin/bash
+        set -e
+
+        echo "Deploying Hippius-S3 to production server..."
+
+        # Install Docker if not already installed
+        if ! command -v docker &> /dev/null; then
+            echo "Installing Docker..."
+            sudo apt update
+            sudo apt install -y apt-transport-https ca-certificates curl software-properties-common
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+            sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+            sudo apt update
+            sudo apt install -y docker-ce docker-ce-cli containerd.io
+            sudo usermod -aG docker $USER
+            echo "Docker installed successfully. You may need to log out and back in for group changes to take effect."
+        else
+            echo "Docker is already installed."
+        fi
+
+        # Install Docker Compose if not already installed
+        if ! command -v docker compose &> /dev/null; then
+            echo "Installing Docker Compose..."
+            sudo apt update
+            sudo apt install -y docker-compose-plugin
+
+            # Verify installation
+            docker compose version
+            echo "Docker Compose installed successfully."
+        else
+            echo "Docker Compose is already installed."
+        fi
+
+        # Navigate to the deployment directory
+        cd $DEPLOYMENT_PATH
+
+        # Pull the latest changes from the production branch
+        git fetch origin production
+        git reset --hard origin/production
+
+        # Create .env file with secrets
+        cat > .env << ENVEOF
+        DATABASE_URL=${DATABASE_URL}
+        DEBUG=false
+        ENVEOF
+
+        # Build and start the Docker containers
+        docker compose down
+        docker compose build --no-cache
+        docker compose up -d
+
+        # Wait for the database to be ready
+        echo "Waiting for database to be ready..."
+        sleep 10
+
+        # Run database migrations
+        docker compose exec -T api dbmate up
+
+        echo "Deployment completed successfully!"
+        EOF
+
+        # Make the script executable
+        chmod +x deploy.sh
+
+        # Copy the script to the server and execute it
+        scp deploy.sh ${DEPLOYMENT_USER}@${DEPLOYMENT_IP}:/tmp/deploy.sh
+        ssh ${DEPLOYMENT_USER}@${DEPLOYMENT_IP} "bash /tmp/deploy.sh"
+
+        # Clean up
+        ssh ${DEPLOYMENT_USER}@${DEPLOYMENT_IP} "rm /tmp/deploy.sh"
+
+    - name: Verify deployment
+      env:
+        DEPLOYMENT_IP: ${{ secrets.DEPLOYMENT_IP }}
+        DEPLOYMENT_USER: ${{ secrets.DEPLOYMENT_USER }}
+        DEPLOYMENT_PATH: ${{ secrets.DEPLOYMENT_PATH }}
+      run: |
+        # Check if the containers are running
+        ssh ${DEPLOYMENT_USER}@${DEPLOYMENT_IP} "cd ${DEPLOYMENT_PATH} && docker compose ps | grep -q 'running' && echo 'Containers are running successfully' || echo 'Warning: Some containers may not be running'"

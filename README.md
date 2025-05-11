@@ -56,6 +56,56 @@ This project uses modern Python tooling:
 
 ### Installation
 
+#### Production Deployment with Cloudflare Tunnel
+
+The easiest way to deploy Hippius S3 in production is using the included installation script, which is designed to work with Cloudflare Tunnel for secure access:
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/your-username/hippius-s3.git
+cd hippius-s3
+
+# 2. Verify configuration in the script
+# The script is already configured with:
+#   - DOMAIN: s3.hippius.com (to be managed by Cloudflare)
+#   - TUNNEL_PORT: 8000 (port for Cloudflare Tunnel)
+# You can customize other settings if needed:
+nano install_script.sh
+
+# 3. Run the installation script
+chmod +x install_script.sh
+./install_script.sh
+
+# 4. Check service status
+sudo systemctl status hippius-s3
+
+# 5. Set up Cloudflare Tunnel
+# In your Cloudflare dashboard:
+# - Go to Access > Tunnels
+# - Create a new tunnel or use an existing one
+# - Add public hostname: s3.hippius.com
+# - Set service to: http://localhost:8000
+# - Save configuration
+
+# 6. View logs (if needed)
+sudo journalctl -u hippius-s3 -f
+```
+
+The installation script performs a complete setup:
+- Sets up PostgreSQL database
+- Creates a systemd service for reliable operation
+- Configures minimal firewall rules (only SSH and app port)
+- Configures environment variables
+- Prepares the service for Cloudflare Tunnel access
+
+Using Cloudflare Tunnel provides:
+- Automatic SSL/TLS encryption
+- DDoS protection
+- No need to expose ports to the internet
+- Access control capabilities through Cloudflare Access (optional)
+
+For customized deployments, you can modify the script or follow the manual steps in the script.
+
 #### Local Development
 
 ```bash
