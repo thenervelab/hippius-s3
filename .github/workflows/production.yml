@@ -21,6 +21,12 @@ jobs:
       run: |
         mkdir -p ~/.ssh
         ssh-keyscan -H ${{ secrets.DEPLOYMENT_IP }} >> ~/.ssh/known_hosts
+        ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+
+    - name: Debug Repository URL
+      run: |
+        echo "Repository URL: ${{ github.server_url }}/${{ github.repository }}.git"
+        echo "SSH URL: git@github.com:${{ github.repository }}.git"
 
     - name: Deploy to production
       env:
@@ -28,54 +34,51 @@ jobs:
         DEPLOYMENT_USER: ${{ secrets.DEPLOYMENT_USER }}
         DEPLOYMENT_PATH: ${{ secrets.DEPLOYMENT_PATH }}
         DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        REPO_URL: "git@github.com:${{ github.repository }}.git"
       run: |
-        cat > deploy.sh << 'EOF'
-        #!/bin/bash
-        set -e
-        echo "Deploying Hippius-S3 to production server..."
+        # Deploy directly via SSH commands
+        ssh ${DEPLOYMENT_USER}@${DEPLOYMENT_IP} << EOF
+          set -e
+          echo "Deploying Hippius-S3 to production server..."
 
-        # Make sure the deployment path exists
-        mkdir -p $DEPLOYMENT_PATH
-        cd $DEPLOYMENT_PATH || { echo "Failed to change to deployment path"; exit 1; }
+          # Debug info
+          echo "Using repo URL: ${REPO_URL}"
 
-        # Check if this is a git repository
-        if [ ! -d ".git" ]; then
-          echo "No git repository found. Initializing..."
-          echo "DEBUG: Attempting to clone from: $REPO_URL"
-          # Clone the repository if it's not already there
-          git clone -b production $REPO_URL .
-        else
-          echo "Updating git repository..."
-          # Try to pull latest changes
-          git fetch origin production
-          git checkout production || git checkout -b production origin/production
-          git pull origin production
-        fi
+          # Make sure the deployment path exists
+          mkdir -p ${DEPLOYMENT_PATH}
+          cd ${DEPLOYMENT_PATH} || { echo "Failed to change to deployment path"; exit 1; }
 
-        echo "Creating .env file..."
-        cat > .env << ENVEOF
-        DATABASE_URL=${DATABASE_URL}
-        DEBUG=false
-        ENVEOF
+          # Check if this is a git repository
+          if [ ! -d ".git" ]; then
+            echo "No git repository found. Initializing..."
+            # Clone the repository if it's not already there
+            git clone -b production ${REPO_URL} .
+          else
+            echo "Updating git repository..."
+            # Try to pull latest changes
+            git fetch origin production
+            git checkout production || git checkout -b production origin/production
+            git pull origin production
+          fi
 
-        echo "Building and starting Docker containers..."
-        docker compose down || true
-        docker compose build --no-cache
-        docker compose up -d
+          echo "Creating .env file..."
+          cat > .env << ENVEOF
+          DATABASE_URL=${DATABASE_URL}
+          DEBUG=false
+          ENVEOF
 
-        echo "Waiting for database to be ready..."
-        sleep 10
+          echo "Building and starting Docker containers..."
+          docker compose down || true
+          docker compose build --no-cache
+          docker compose up -d
 
-        echo "Running database migrations..."
-        docker compose exec -T api dbmate up
+          echo "Waiting for database to be ready..."
+          sleep 10
 
-        echo "Deployment completed successfully!"
-        EOF
-        chmod +x deploy.sh
-        scp deploy.sh ${DEPLOYMENT_USER}@${DEPLOYMENT_IP}:/tmp/deploy.sh
-        ssh ${DEPLOYMENT_USER}@${DEPLOYMENT_IP} "DEPLOYMENT_PATH=${DEPLOYMENT_PATH} DATABASE_URL=${DATABASE_URL} REPO_URL=${REPO_URL} bash /tmp/deploy.sh"
-        ssh ${DEPLOYMENT_USER}@${DEPLOYMENT_IP} "rm /tmp/deploy.sh"
+          echo "Running database migrations..."
+          docker compose exec -T api dbmate up
+
+          echo "Deployment completed successfully!"
 
     - name: Verify deployment
       env:
