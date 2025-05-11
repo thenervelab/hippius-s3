@@ -61,12 +61,6 @@ jobs:
             git pull origin production
           fi
 
-          echo "Creating .env file..."
-          cat > .env << ENVEOF
-          DATABASE_URL=${DATABASE_URL}
-          DEBUG=false
-          ENVEOF
-
           echo "Building and starting Docker containers..."
           docker compose down || true
           docker compose build --no-cache
