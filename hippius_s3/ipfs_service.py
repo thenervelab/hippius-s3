@@ -1,5 +1,7 @@
+import asyncio
 import hashlib
 import logging
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Dict
@@ -81,53 +83,45 @@ class IPFSService:
         Returns:
             Binary file data
         """
-        # Create a temporary file path for the download
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            temp_path = temp_file.name
+        last_exception = None
 
-        try:
-            # Implement retry logic for IPFS downloads
-            attempt = 0
-            last_exception = None
+        for attempt in range(1, max_retries + 1):
+            # Create a new temp directory for each attempt
+            temp_dir = tempfile.mkdtemp()
+            temp_path = Path(temp_dir) / "downloaded_file"
 
-            while attempt < max_retries:
-                attempt += 1
+            try:
+                await self.client.download_file(
+                    cid,
+                    str(temp_path),
+                    decrypt=decrypt,
+                )
+
+                # Read the file data
+                # todo: what if it's a really big file? we might wanna stream
+                async with aiofiles.open(temp_path, "rb") as f:
+                    content = await f.read()
+                    return cast(bytes, content)
+
+            except Exception as e:
+                last_exception = e
+                logger.warning(f"Download attempt {attempt} failed: {e}")
+
+                if attempt < max_retries:
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+
+            finally:
                 try:
-                    # Download the file from IPFS
-                    await self.client.download_file(
-                        cid,
-                        temp_path,
-                        decrypt=decrypt,
-                    )
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to clean up temporary directory: {cleanup_error}")
 
-                    # Read the file data
-                    async with aiofiles.open(temp_path, "rb") as f:
-                        content = await f.read()
-                        logger.info(f"Successfully downloaded file with CID {cid} (attempt {attempt})")
-                        return cast(bytes, content)
-
-                except Exception as e:
-                    last_exception = e
-                    logger.warning(f"Download attempt {attempt} failed: {e}")
-
-                    if attempt < max_retries:
-                        logger.info(f"Retrying in {retry_delay} seconds...")
-                        import asyncio
-
-                        await asyncio.sleep(retry_delay)
-                        # Double the delay for exponential backoff
-                        retry_delay *= 2
-
-            # If we get here, all retries have failed
-            logger.error(
-                f"Failed to download file with CID {cid} after {max_retries} attempts. Last error: {last_exception}"
-            )
-            raise last_exception or RuntimeError(f"Failed to download file with CID {cid} after {max_retries} attempts")
-
-        finally:
-            # Clean up the temporary file
-            if Path(temp_path).exists():
-                Path(temp_path).unlink()
+        logger.error(
+            f"Failed to download file with CID {cid} after {max_retries} attempts. Last error: {last_exception}"
+        )
+        raise last_exception or RuntimeError(f"Failed to download file with CID {cid} after {max_retries} attempts")
 
     async def delete_file(self, cid: str) -> Dict[str, Union[bool, str]]:
         """
