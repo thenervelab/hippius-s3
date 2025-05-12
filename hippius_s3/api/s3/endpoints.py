@@ -1319,13 +1319,35 @@ async def _get_object(
 async def head_object(
     bucket_name: str,
     object_key: str,
+    request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    ipfs_service=Depends(dependencies.get_ipfs_service),
 ) -> Response:
     """
     Get object metadata using S3 protocol (HEAD /{bucket_name}/{object_key}).
+    Also handles getting object tags (HEAD /{bucket_name}/{object_key}?tagging).
 
     This endpoint is compatible with the S3 protocol used by MinIO and other S3 clients.
+    This endpoint only checks if the object exists in the database and IPFS without
+    downloading the entire object content.
     """
+    # If tagging is in query params, handle object tags request (HEAD equivalent)
+    if "tagging" in request.query_params:
+        try:
+            # Just check if the object exists, don't return the tags content for HEAD
+            await _get_object(bucket_name, object_key, db)
+            return Response(status_code=200)
+        except errors.S3Error as e:
+            logger.info(f"S3 error in HEAD tagging request: {e.code} - {e.message}")
+            return Response(status_code=e.status_code)
+        except Exception as e:
+            logger.exception(f"Error in HEAD tagging request: {e}")
+            return Response(status_code=500)
+
+    # Handle other query parameters similarly to GET
+    # Add other query param handlers as needed, matching the GET handler's structure
+
+    # Default HEAD behavior for regular object metadata
     try:
         result = await _get_object(
             bucket_name,
@@ -1334,11 +1356,20 @@ async def head_object(
         )
 
         metadata = json.loads(result["metadata"])
+        ipfs_cid = result["ipfs_cid"]
+
+        # Efficiently check if the file exists in IPFS without downloading it
+        # This avoids the expensive download operation that occurs with GET requests
+        exists_in_ipfs = await ipfs_service.check_file_exists(ipfs_cid)
+
+        if not exists_in_ipfs:
+            logger.warning(f"Object {bucket_name}/{object_key} exists in database but not in IPFS (CID: {ipfs_cid})")
+            # Still return 200 for compatibility, but log the inconsistency
 
         headers = {
             "Content-Type": result["content_type"],
             "Content-Length": str(result["size_bytes"]),
-            "ETag": f'"{result["ipfs_cid"]}"',
+            "ETag": f'"{ipfs_cid}"',
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
         }
 
