@@ -46,33 +46,25 @@ logging.getLogger("hippius_s3").setLevel(logging.DEBUG)
 logging.getLogger("hippius_s3.api.s3.multipart").setLevel(logging.DEBUG)
 logging.getLogger("hippius_s3.api.s3.endpoints").setLevel(logging.DEBUG)
 
-# Set HTTP client log levels based on global level
-if is_debug:
-    # In debug mode, show all HTTP client logs
-    logging.getLogger("httpcore").setLevel(logging.DEBUG)
-    logging.getLogger("httpcore.http11").setLevel(logging.DEBUG)
-    logging.getLogger("urllib3").setLevel(logging.DEBUG)
-    logging.getLogger("httpx").setLevel(logging.DEBUG)
-else:
-    # In non-debug mode, reduce HTTP client log noise
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("httpcore.http11").setLevel(logging.WARNING)
-    logging.getLogger("urllib3").setLevel(logging.INFO)
-    logging.getLogger("httpx").setLevel(logging.INFO)
+
+# Reduce HTTP client log noise
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpcore.http11").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Set up this module's logger
 logger = logging.getLogger(__name__)
-logger.info(f"Logging configured at level: {logging.getLevelName(log_level)}")
 
 
 async def postgres_create_pool(database_url: str) -> asyncpg.Pool:
-    """Create and return a PostgreSQL connection pool.
+    """Create and return a Postgres connection pool.
 
     Args:
-        database_url: PostgreSQL connection URL
+        database_url: Postgres connection URL
 
     Returns:
-        Connection pool for PostgreSQL
+        Connection pool for Postgres
     """
     return await asyncpg.create_pool(database_url)
 
@@ -85,7 +77,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         config = app.state.config
 
         app.state.postgres_pool = await postgres_create_pool(config.database_url)
-        logger.info("PostgreSQL connection pool created")
+        logger.info("Postgres connection pool created")
 
         app.state.ipfs_service = IPFSService(config)
         logger.info("IPFS service initialized")
@@ -95,7 +87,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     finally:
         try:
             await app.state.postgres_pool.close()
-            logger.info("PostgreSQL connection pool closed")
+            logger.info("Postgres connection pool closed")
         except Exception:
             logger.exception("Error shutting down postgres pool")
 
@@ -105,7 +97,7 @@ app = FastAPI(
     description="S3 Gateway for Hippius' IPFS storage",
     lifespan=lifespan,
     debug=os.getenv("DEBUG", "false").lower() == "true",
-    default_response_class=Response,  # Use plain Response as default to allow XML responses
+    default_response_class=Response,
 )
 
 # noinspection PyTypeChecker
@@ -118,10 +110,6 @@ app.add_middleware(
 )
 
 
-# Include routers in the correct order
-# We previously had multipart_router first, but that causes standard object operations to fail
-# because the multipart router was intercepting non-multipart requests
-# Regular S3 router should be first, since the multipart router is designed to return None
-# for non-multipart requests, allowing them to fall through to the main S3 router
+# Include routers in the correct order! Do not change this por favor.
 app.include_router(s3_router, prefix="")
 app.include_router(multipart_router, prefix="")

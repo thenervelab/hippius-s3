@@ -8,7 +8,6 @@ from typing import Dict
 from typing import List
 from typing import Tuple
 from typing import Union
-from typing import cast
 
 import aiofiles
 from hippius_sdk.client import HippiusClient
@@ -83,45 +82,71 @@ class IPFSService:
         Returns:
             Binary file data
         """
+        # Regular file download with retry logic - we'll handle directories inside the try/except
         last_exception = None
-
         for attempt in range(1, max_retries + 1):
-            # Create a new temp directory for each attempt
             temp_dir = tempfile.mkdtemp()
             temp_path = Path(temp_dir) / "downloaded_file"
 
             try:
-                await self.client.download_file(
-                    cid,
-                    str(temp_path),
-                    decrypt=decrypt,
-                )
-
-                # Read the file data
-                # todo: what if it's a really big file? we might wanna stream
+                await self.client.download_file(cid, str(temp_path), decrypt=decrypt)
                 async with aiofiles.open(temp_path, "rb") as f:
-                    content = await f.read()
-                    return cast(bytes, content)
+                    data = await f.read()
+                    return bytes(data)
 
             except Exception as e:
                 last_exception = e
                 logger.warning(f"Download attempt {attempt} failed: {e}")
-
                 if attempt < max_retries:
                     logger.info(f"Retrying in {retry_delay} seconds...")
                     await asyncio.sleep(retry_delay)
                     retry_delay *= 2
-
             finally:
-                try:
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-                except Exception as cleanup_error:
-                    logger.warning(f"Failed to clean up temporary directory: {cleanup_error}")
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
         logger.error(
             f"Failed to download file with CID {cid} after {max_retries} attempts. Last error: {last_exception}"
         )
-        raise last_exception or RuntimeError(f"Failed to download file with CID {cid} after {max_retries} attempts")
+        if last_exception:
+            raise RuntimeError(f"Failed to download file with CID {cid}") from last_exception
+        raise RuntimeError(f"Failed to download file with CID {cid} after {max_retries} attempts")
+
+    async def _download_directory(self, cid: str, decrypt: bool = False) -> bytes:
+        """
+        Handle downloading content from an IPFS directory CID.
+
+        Args:
+            cid: IPFS content identifier for a directory
+            decrypt: Whether to decrypt the files (if they were encrypted)
+
+        Returns:
+            Binary data from the first file in the directory
+        """
+        logger.info(f"Handling directory CID: {cid}")
+
+        # Get the directory listing to find files
+        ls_result = await self.client.ipfs_client.ls(cid)
+        objects = ls_result.get("Objects", [])
+
+        if not objects or not objects[0].get("Links"):
+            raise ValueError(f"No valid content found in directory CID: {cid}")
+
+        # Get links from the first object
+        links = objects[0].get("Links", [])
+
+        if not links:
+            raise ValueError(f"No links found in directory CID: {cid}")
+
+        # Get the first file in the directory
+        first_link = links[0]
+        file_cid = first_link.get("Hash")
+
+        if not file_cid:
+            raise ValueError("No file CID found in directory listing")
+
+        logger.info(f"Using first file from directory: {first_link.get('Name', 'unnamed')} (CID: {file_cid})")
+
+        return await self.download_file(file_cid, decrypt)
 
     async def delete_file(self, cid: str) -> Dict[str, Union[bool, str]]:
         """
@@ -163,6 +188,40 @@ class IPFSService:
         except Exception as e:
             logger.error(f"Error checking if file exists in IPFS: {e}")
             return False
+
+    async def check_cid_type(self, cid: str) -> str:
+        """
+        Check if a CID refers to a file or a directory in IPFS.
+
+        Args:
+            cid: IPFS content identifier
+
+        Returns:
+            'file' if the CID is a file, 'directory' if it's a directory,
+            or 'unknown' if the check failed
+        """
+        # Get the detailed result from ls to check if it's a directory
+        ls_result = await self.client.ipfs_client.ls(cid)
+
+        # Analyze the response to determine if it's a file or directory
+        # The 'Objects' list will contain entries with 'Links'
+        # If it's a directory, there will be Links with their own Hashes
+        objects = ls_result.get("Objects", [])
+
+        if not objects:
+            raise ValueError(f"Objects field empty when ls-ing cid={cid}")
+
+        # Get the first (and usually only) object
+        first_object = objects[0]
+        links = first_object.get("Links", [])
+
+        # If there are links, it's a directory
+        if links:
+            logger.info(f"CID {cid} is a directory with {len(links)} items")
+            return "directory"
+
+        logger.info(f"CID {cid} is a file")
+        return "file"
 
     async def upload_part(self, file_data: bytes, part_number: int) -> Dict[str, Union[str, int]]:
         """

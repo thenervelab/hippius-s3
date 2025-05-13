@@ -194,7 +194,9 @@ async def get_bucket(
         except Exception as e:
             logger.exception(f"Error getting bucket tags: {e}")
             return errors.s3_error_response(
-                code="InternalError", message="We encountered an internal error. Please try again.", status_code=500
+                code="InternalError",
+                message="We encountered an internal error. Please try again.",
+                status_code=500,
             )
 
     # If the lifecycle query parameter is present, this is a bucket lifecycle request
@@ -762,7 +764,9 @@ async def get_bucket_location(
         logger.info(f"get_bucket_location response for {bucket_name}: {xml}")
 
         return Response(
-            content=xml.encode("utf-8"), media_type="application/xml", headers={"Content-Type": "application/xml"}
+            content=xml.encode("utf-8"),
+            media_type="application/xml",
+            headers={"Content-Type": "application/xml"},
         )
     except Exception as e:
         logger.exception(f"Error getting bucket location: {e}")
@@ -771,7 +775,9 @@ async def get_bucket_location(
         xml += '<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">us-east-1</LocationConstraint>'
 
         return Response(
-            content=xml.encode("utf-8"), media_type="application/xml", headers={"Content-Type": "application/xml"}
+            content=xml.encode("utf-8"),
+            media_type="application/xml",
+            headers={"Content-Type": "application/xml"},
         )
 
 
@@ -1292,7 +1298,9 @@ async def _get_object(
     if not bucket:
         logger.info(f"Bucket not found: {bucket_name}")
         raise errors.S3Error(
-            code="NoSuchBucket", status_code=404, message=f"The specified bucket {bucket_name} does not exist"
+            code="NoSuchBucket",
+            status_code=404,
+            message=f"The specified bucket {bucket_name} does not exist",
         )
 
     # Get object by path
@@ -1305,7 +1313,9 @@ async def _get_object(
     if not object:
         logger.info(f"Object not found: {bucket_name}/{object_key}")
         raise errors.S3Error(
-            code="NoSuchKey", status_code=404, message=f"The specified key {object_key} does not exist"
+            code="NoSuchKey",
+            status_code=404,
+            message=f"The specified key {object_key} does not exist",
         )
 
     logger.debug(f"Found object: {bucket_name}/{object_key}")
@@ -1363,8 +1373,9 @@ async def head_object(
         exists_in_ipfs = await ipfs_service.check_file_exists(ipfs_cid)
 
         if not exists_in_ipfs:
-            logger.warning(f"Object {bucket_name}/{object_key} exists in database but not in IPFS (CID: {ipfs_cid})")
-            # Still return 200 for compatibility, but log the inconsistency
+            logger.warning(
+                f"Object {bucket_name}/{object_key} exists in database but not in IPFS (CID: {ipfs_cid})"
+            )  # Still return 200 for compatibility, but log the inconsistency
 
         headers = {
             "Content-Type": result["content_type"],
@@ -1440,64 +1451,13 @@ async def get_object(
         # Fetch the ipfs_cid from the result and use it to download the file
         ipfs_cid = result["ipfs_cid"]
 
-        # When doing a GET for an object with a filename ending in .bin, .zip, etc, check if the object might be a multipart object
-        obj_is_file = object_key.endswith(
-            (".bin", ".zip", ".rar", ".tgz", ".tar.gz", ".exe", ".iso", ".dmg", ".mp4", ".mp3", ".pdf")
-        )
-
         # Detect multipart upload by checking metadata
         part_cids = ipfs_metadata.get("part_cids") or metadata.get("part_cids")
 
-        # Special handling for binary files that might be from multipart uploads
-        if object_key.endswith(".bin"):
-            try:
-                # Get bucket_id from the current result object
-                bucket_id = result["bucket_id"]
+        # Determine if this is a multipart upload based on metadata flags
+        found_multipart = is_multipart or is_root_multipart or part_cids
 
-                # Verify parts table exists
-                check_table_query = """
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables
-                        WHERE table_schema = 'public'
-                        AND table_name = 'parts'
-                    )
-                """
-                table_exists = await db.fetchrow(check_table_query)
-
-                if not table_exists or not table_exists[0]:
-                    logger.error("Parts table does not exist in database")
-                    raise RuntimeError("Database schema not properly initialized - parts table missing")
-
-                # Fetch all parts from the database for this object
-                recent_parts_query = """
-                    SELECT p.* FROM parts p
-                    JOIN multipart_uploads m ON p.upload_id = m.upload_id
-                    WHERE m.object_key = $1 AND m.bucket_id = $2
-                    AND m.is_completed = true
-                    ORDER BY p.uploaded_at DESC
-                    LIMIT 10
-                """
-                parts = await db.fetch(recent_parts_query, object_key, bucket_id)
-
-                if len(parts) > 1:
-                    logger.info(f"Found {len(parts)} parts for {object_key}")
-                    part_cids = [p["ipfs_cid"] for p in parts]
-
-                    # Check if the current ipfs_cid is one of the parts
-                    if ipfs_cid in part_cids:
-                        logger.warning(f"CID {ipfs_cid} appears to be a part, not concatenated result")
-
-                        # Force multipart handling and activate emergency concatenation
-                        found_multipart = True
-                        metadata["part_cids"] = part_cids
-                        metadata["force_emergency_concatenation"] = True
-
-            except Exception as e:
-                logger.warning(f"Failed to check multipart status: {e}")
-
-        found_multipart = is_multipart or is_root_multipart or (obj_is_file and part_cids)
-
-        if found_multipart or (obj_is_file and ipfs_cid in str(part_cids)):
+        if found_multipart or (part_cids is not None and ipfs_cid in part_cids):
             # First, try to get the CID from metadata
             metadata_cid = ipfs_metadata.get("cid") or metadata.get("final_cid") or metadata.get("concatenated_cid")
             if metadata_cid and metadata_cid != ipfs_cid:
@@ -1506,16 +1466,16 @@ async def get_object(
 
             # When parts are available but concatenated CID is missing, concatenate them
             part_cids = ipfs_metadata.get("part_cids") or metadata.get("part_cids")
-            if part_cids and len(part_cids) > 0 and obj_is_file:
+            if part_cids:
                 try:
-                    # Create a map of our part files to concatenate
                     part_info = []
                     for i, cid in enumerate(part_cids, 1):
                         part_info.append(
                             {
                                 "ipfs_cid": cid,
                                 "part_number": i,
-                                "size_bytes": 0,  # Will be filled during download
+                                "size_bytes": 0,
+                                # Will be filled during download
                             }
                         )
 
@@ -1527,25 +1487,16 @@ async def get_object(
                 except Exception as e:
                     logger.error(f"Concatenation failed: {e}, using original CID")
 
-        try:
-            file_data = await ipfs_service.download_file(
-                cid=ipfs_cid,
-                decrypt=is_encrypted,
-            )
-
-            logger.debug(f"Downloaded {len(file_data)} bytes from IPFS CID: {ipfs_cid}")
-
-        except Exception as e:
-            logger.error(f"Error downloading file: {e}")
-            raise
-
-        # Ensure we use the correct CID for the ETag header
-        etag_cid = ipfs_cid
+        file_data = await ipfs_service.download_file(
+            cid=ipfs_cid,
+            decrypt=is_encrypted,
+        )
+        logger.debug(f"Downloaded {len(file_data)} bytes from IPFS CID: {ipfs_cid}")
 
         headers = {
             "Content-Type": result["content_type"],
             "Content-Length": str(len(file_data)),
-            "ETag": f'"{etag_cid}"',
+            "ETag": f'"{ipfs_cid}"',
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
         }
@@ -1556,7 +1507,10 @@ async def get_object(
             if key != "ipfs" and not isinstance(value, dict):
                 headers[f"x-amz-meta-{key}"] = str(value)
 
-        return Response(content=file_data, headers=headers)
+        return Response(
+            content=file_data,
+            headers=headers,
+        )
 
     except errors.S3Error as e:
         logger.exception(f"S3 Error getting object {bucket_name}/{object_key}: {e.message}")
