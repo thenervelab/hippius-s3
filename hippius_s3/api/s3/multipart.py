@@ -6,6 +6,7 @@ import re
 import uuid
 from datetime import UTC
 from datetime import datetime
+from typing import Optional
 
 from fastapi import APIRouter
 from fastapi import Depends
@@ -15,6 +16,7 @@ from lxml import etree as ET
 
 from hippius_s3 import dependencies
 from hippius_s3.api.s3.errors import s3_error_response
+from hippius_s3.dependencies import extract_seed_phrase
 from hippius_s3.utils import get_query
 
 
@@ -36,6 +38,7 @@ async def handle_post_object(
     object_key: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     Handle POST requests for objects:
@@ -52,7 +55,7 @@ async def handle_post_object(
     if "uploadId" in request.query_params:
         upload_id = request.query_params.get("uploadId")
         if upload_id is not None:
-            return await complete_multipart_upload_handler(bucket_name, object_key, upload_id, request, db)
+            return await complete_multipart_upload_handler(bucket_name, object_key, upload_id, request, db, seed_phrase)
 
     # Not a multipart operation we handle
     return None
@@ -125,12 +128,16 @@ async def complete_multipart_upload_handler(
     upload_id: str,
     request: Request,
     db: dependencies.DBConnection,
+    seed_phrase: Optional[str] = None,
 ) -> Response:
     """Complete a multipart upload (POST /{bucket_name}/{object_key}?uploadId=xyz)."""
     try:
         # Use the existing internal implementation
+        # Get IPFS service from app state
+        ipfs_service = request.app.state.ipfs_service
+
         return await complete_multipart_upload_internal(
-            bucket_name, object_key, upload_id, request, db, request.app.state.ipfs_service
+            bucket_name, object_key, upload_id, request, db, ipfs_service, seed_phrase=seed_phrase
         )
     except Exception as e:
         logger.exception(f"Error completing multipart: {e}")
@@ -144,6 +151,7 @@ async def upload_part(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
+    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """Upload a part for a multipart upload (PUT with partNumber & uploadId)."""
     # These two parameters are required for multipart upload parts
@@ -179,7 +187,7 @@ async def upload_part(
             return s3_error_response("InvalidArgument", "Zero-length part not allowed", status_code=400)
 
         # Upload to IPFS and get part information
-        part_result = await ipfs_service.upload_part(file_data, part_number)
+        part_result = await ipfs_service.upload_part(file_data, part_number, seed_phrase=seed_phrase)
 
         # Save the part information in the database
         part_id = str(uuid.uuid4())
@@ -202,7 +210,7 @@ async def upload_part(
             "InvalidArgument", "Part number must be an integer between 1 and 10000", status_code=400
         )
     except Exception as e:
-        logger.error(f"Error uploading part: {e}")
+        logger.exception(f"Error uploading part: {e}")
         return s3_error_response("InternalError", f"Error uploading part: {str(e)}", status_code=500)
 
 
@@ -213,6 +221,7 @@ async def abort_multipart_upload(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
+    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """Abort a multipart upload (DELETE with uploadId)."""
     upload_id = request.query_params.get("uploadId")
@@ -228,7 +237,7 @@ async def abort_multipart_upload(
         # Get and delete parts from IPFS
         parts = await db.fetch(get_query("list_parts"), upload_id)
         for part in parts:
-            await ipfs_service.delete_file(part["ipfs_cid"])
+            await ipfs_service.delete_file(part["ipfs_cid"], seed_phrase=seed_phrase)
 
         # Delete the multipart upload from the database
         await db.fetchrow(get_query("abort_multipart_upload"), upload_id)
@@ -301,6 +310,7 @@ async def complete_multipart_upload_internal(
     request: Request,
     db: dependencies.DBConnection,
     ipfs_service,
+    seed_phrase: Optional[str] = None,
 ) -> Response:
     """Internal implementation of multipart upload completion logic."""
     try:
@@ -372,7 +382,9 @@ async def complete_multipart_upload_internal(
         content_type = multipart_upload["content_type"] or "application/octet-stream"
 
         # Concatenate the parts
-        concat_result = await ipfs_service.concatenate_parts(parts_for_concat, content_type, object_key)
+        concat_result = await ipfs_service.concatenate_parts(
+            parts_for_concat, content_type, object_key, seed_phrase=seed_phrase
+        )
 
         # Prepare metadata
         object_id = str(uuid.uuid4())

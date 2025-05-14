@@ -36,12 +36,11 @@ def calculate_md5(file_path):
 def main():
     # Create MinIO client pointing to our S3-compatible API
     minio_client = Minio(
-        "localhost:8000",  # These credentials aren't actually checked by our API
-        # but are required by the MinIO client
-        access_key="123",
-        secret_key="456",
+        "s3.hippius.com",
+        access_key="diet buyer illness prison drama moment license input job ball tornado solar",
+        secret_key="hippius",
         secure=False,
-        region="us-east-1", # Set default region to avoid location lookup
+        region="us-east-1",  # Set default region to avoid location lookup
     )
 
     # Test bucket names and object keys

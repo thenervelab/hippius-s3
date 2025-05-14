@@ -1,8 +1,11 @@
 import asyncio
+import re
 from typing import Any
 from typing import AsyncGenerator
 
+from fastapi import HTTPException
 from fastapi import Request
+from starlette import status
 
 from hippius_s3.config import Config
 from hippius_s3.ipfs_service import IPFSService
@@ -54,3 +57,27 @@ def get_ipfs_service(request: Request) -> IPFSService:
     """Extract the IPFS service from the request."""
     service: IPFSService = request.app.state.ipfs_service
     return service
+
+
+async def extract_seed_phrase(request: Request) -> str:
+    """
+    Extract seed phrase from S3 authorization header.
+
+    The seed phrase is expected to be the account name in the AWS4 authorization header.
+    Format: Authorization: AWS4-HMAC-SHA256 Credential=ACCOUNT_NAME/DATE/REGION/...
+
+    Returns:
+        str: The extracted seed phrase or None if not found
+    """
+    # Get authorization header
+    auth_header = request.headers.get("authorization")
+    if not auth_header:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing authorization header")
+
+    # Extract account name (which contains seed phrase)
+    # Format: AWS4-HMAC-SHA256 Credential=ACCOUNT_NAME/DATE/REGION/...
+    credential_match = re.search(r"Credential=([^/]+)/", auth_header)
+    if not credential_match:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authorization header format")
+
+    return credential_match.group(1)

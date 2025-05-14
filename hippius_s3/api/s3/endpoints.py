@@ -15,6 +15,7 @@ from lxml import etree as ET
 
 from hippius_s3 import dependencies
 from hippius_s3.api.s3 import errors
+from hippius_s3.dependencies import extract_seed_phrase
 from hippius_s3.utils import get_query
 
 
@@ -67,6 +68,7 @@ def create_xml_error_response(
 @router.get("/", status_code=200)
 async def list_buckets(
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     List all buckets using S3 protocol (GET /).
@@ -124,6 +126,7 @@ async def get_bucket(
     bucket_name: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     List objects in a bucket using S3 protocol (GET /{bucket_name}).
@@ -136,7 +139,7 @@ async def get_bucket(
     # If the location query parameter is present, this is a bucket location request
     if "location" in request.query_params:
         logger.info(f"Handling location request for bucket {bucket_name}")
-        return await get_bucket_location(bucket_name, db)
+        return await get_bucket_location(bucket_name, db, seed_phrase)
 
     # If the tagging query parameter is present, this is a bucket tags request
     if "tagging" in request.query_params:
@@ -201,7 +204,7 @@ async def get_bucket(
 
     # If the lifecycle query parameter is present, this is a bucket lifecycle request
     if "lifecycle" in request.query_params:
-        return await get_bucket_lifecycle(bucket_name, db)
+        return await get_bucket_lifecycle(bucket_name, db, seed_phrase)
 
     # If the uploads parameter is present, this is a multipart uploads listing request
     if "uploads" in request.query_params:
@@ -303,6 +306,7 @@ async def get_bucket(
 async def delete_bucket_tags(
     bucket_name: str,
     db: dependencies.DBConnection,
+    seed_phrase: str,
 ) -> Response:
     """
     Delete all tags from a bucket (DELETE /{bucket_name}?tagging).
@@ -348,6 +352,7 @@ async def get_object_tags(
     bucket_name: str,
     object_key: str,
     db: dependencies.DBConnection,
+    seed_phrase: str,
 ) -> Response:
     """
     Get the tags of an object (GET /{bucket_name}/{object_key}?tagging).
@@ -434,6 +439,7 @@ async def set_object_tags(
     object_key: str,
     request: Request,
     db: dependencies.DBConnection,
+    seed_phrase: str,
 ) -> Response:
     """
     Set tags for an object (PUT /{bucket_name}/{object_key}?tagging).
@@ -533,6 +539,7 @@ async def delete_object_tags(
     bucket_name: str,
     object_key: str,
     db: dependencies.DBConnection,
+    seed_phrase: str,
 ) -> Response:
     """
     Delete all tags from an object (DELETE /{bucket_name}/{object_key}?tagging).
@@ -599,6 +606,7 @@ async def delete_object_tags(
 async def get_bucket_tags(
     bucket_name: str,
     db: dependencies.DBConnection,
+    seed_phrase: str,
 ) -> Response:
     """
     Get the tags of a bucket (GET /{bucket_name}?tagging).
@@ -680,6 +688,7 @@ async def get_bucket_tags(
 async def get_bucket_lifecycle(
     bucket_name: str,
     db: dependencies.DBConnection,
+    seed_phrase: str,
 ) -> Response:
     """
     Get the lifecycle configuration of a bucket (GET /{bucket_name}?lifecycle).
@@ -746,6 +755,7 @@ async def get_bucket_lifecycle(
 async def get_bucket_location(
     bucket_name: str,
     db: dependencies.DBConnection,
+    seed_phrase: str,
 ) -> Response:
     """
     Get the region/location of a bucket (GET /{bucket_name}?location).
@@ -785,6 +795,7 @@ async def get_bucket_location(
 async def head_bucket(
     bucket_name: str,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     Check if a bucket exists using S3 protocol (HEAD /{bucket_name}).
@@ -815,6 +826,7 @@ async def create_bucket(
     bucket_name: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     Create a new bucket using S3 protocol (PUT /{bucket_name}).
@@ -982,6 +994,7 @@ async def delete_bucket(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
+    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     Delete a bucket using S3 protocol (DELETE /{bucket_name}).
@@ -991,7 +1004,7 @@ async def delete_bucket(
     """
     # If tagging is in query params, we're just deleting tags
     if "tagging" in request.query_params:
-        return await delete_bucket_tags(bucket_name, db)
+        return await delete_bucket_tags(bucket_name, db, seed_phrase)
 
     try:
         bucket = await db.fetchrow(
@@ -1015,7 +1028,7 @@ async def delete_bucket(
         )
 
         for obj in objects:
-            await ipfs_service.delete_file(obj["ipfs_cid"])
+            await ipfs_service.delete_file(obj["ipfs_cid"], seed_phrase=seed_phrase)
 
         await db.fetchrow(
             get_query("delete_bucket"),
@@ -1040,6 +1053,7 @@ async def put_object(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
+    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     Upload an object to a bucket using S3 protocol (PUT /{bucket_name}/{object_key}).
@@ -1069,6 +1083,7 @@ async def put_object(
             object_key,
             request,
             db,
+            seed_phrase,
         )
 
     # Check if this is a copy operation
@@ -1215,6 +1230,7 @@ async def put_object(
             file_data=file_data,
             file_name=object_key,
             content_type=content_type,
+            seed_phrase=seed_phrase,
         )
 
         ipfs_cid = ipfs_result["cid"]
@@ -1264,7 +1280,7 @@ async def put_object(
         # Clean up old IPFS content if needed
         if existing_object and existing_object["ipfs_cid"] != ipfs_cid:
             try:
-                await ipfs_service.delete_file(existing_object["ipfs_cid"])
+                await ipfs_service.delete_file(existing_object["ipfs_cid"], seed_phrase=seed_phrase)
                 logger.info(f"Cleaned up previous IPFS content for {bucket_name}/{object_key}")
             except Exception as e:
                 logger.warning(f"Failed to clean up previous IPFS content: {e}")
@@ -1287,6 +1303,7 @@ async def _get_object(
     bucket_name: str,
     object_key: str,
     db: dependencies.DBConnection,
+    seed_phrase: str,
 ) -> asyncpg.Record:
     logger.debug(f"Getting object {bucket_name}/{object_key}")
 
@@ -1331,6 +1348,7 @@ async def head_object(
     object_key: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     Get object metadata using S3 protocol (HEAD /{bucket_name}/{object_key}).
@@ -1345,7 +1363,7 @@ async def head_object(
     if "tagging" in request.query_params:
         try:
             # Just check if the object exists, don't return the tags content for HEAD
-            await _get_object(bucket_name, object_key, db)
+            await _get_object(bucket_name, object_key, db, seed_phrase)
             return Response(status_code=200)
         except errors.S3Error as e:
             logger.info(f"S3 error in HEAD tagging request: {e.code} - {e.message}")
@@ -1363,6 +1381,7 @@ async def head_object(
             bucket_name,
             object_key,
             db,
+            seed_phrase,
         )
 
         metadata = json.loads(result["metadata"])
@@ -1400,6 +1419,7 @@ async def get_object(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
+    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     Get an object using S3 protocol (GET /{bucket_name}/{object_key}).
@@ -1413,6 +1433,7 @@ async def get_object(
             bucket_name,
             object_key,
             db,
+            seed_phrase,
         )
 
     try:
@@ -1420,6 +1441,7 @@ async def get_object(
             bucket_name,
             object_key,
             db,
+            seed_phrase,
         )
 
         metadata = json.loads(result["metadata"])
@@ -1471,7 +1493,9 @@ async def get_object(
                         )
 
                     # Use the concatenate_parts method to rebuild the file
-                    concat_result = await ipfs_service.concatenate_parts(part_info, result["content_type"], object_key)
+                    concat_result = await ipfs_service.concatenate_parts(
+                        part_info, result["content_type"], object_key, seed_phrase=seed_phrase
+                    )
 
                     logger.info(f"Successfully concatenated {len(part_cids)} parts for {bucket_name}/{object_key}")
                     ipfs_cid = concat_result["cid"]
@@ -1481,6 +1505,7 @@ async def get_object(
         file_data = await ipfs_service.download_file(
             cid=ipfs_cid,
             decrypt=is_encrypted,
+            seed_phrase=seed_phrase,
         )
         logger.debug(f"Downloaded {len(file_data)} bytes from IPFS CID: {ipfs_cid}")
 
@@ -1514,7 +1539,6 @@ async def get_object(
     except RuntimeError as e:
         # Handle specific RuntimeError from IPFS service
         if "Failed to download file with CID" in str(e):
-            logger.exception(f"IPFS download error for {bucket_name}/{object_key}: {e}")
             return create_xml_error_response(
                 "ServiceUnavailable",
                 f"The IPFS network is currently experiencing issues. Please try again later. ({str(e)})",
@@ -1543,6 +1567,7 @@ async def delete_object(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
+    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     Delete an object using S3 protocol (DELETE /{bucket_name}/{object_key}).
@@ -1556,6 +1581,7 @@ async def delete_object(
             bucket_name,
             object_key,
             db,
+            seed_phrase,
         )
 
     try:
@@ -1585,7 +1611,7 @@ async def delete_object(
             return Response(status_code=204)
 
         ipfs_cid = object_info["ipfs_cid"]
-        await ipfs_service.delete_file(ipfs_cid)
+        await ipfs_service.delete_file(ipfs_cid, seed_phrase=seed_phrase)
         await db.fetchrow(
             get_query("delete_object"),
             bucket_id,
