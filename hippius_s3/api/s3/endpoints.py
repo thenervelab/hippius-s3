@@ -1342,6 +1342,7 @@ async def head_object(
     downloading the entire object content.
     """
     # If tagging is in query params, handle object tags request (HEAD equivalent)
+    logger.debug(f"Request query params {request.query_params}")
     if "tagging" in request.query_params:
         try:
             # Just check if the object exists, don't return the tags content for HEAD
