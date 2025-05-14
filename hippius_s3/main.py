@@ -5,10 +5,12 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
+from typing import Callable
 
 import asyncpg
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi import Request
 from fastapi import Response
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -108,6 +110,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# DEBUG: Add middleware to log all incoming requests
+@app.middleware("http")
+async def log_requests(request: Request, call_next: Callable) -> Response:
+    logger.info(f"Request received: {request.method} {request.url}")
+    logger.info(f"Request headers: {request.headers}")
+    response = await call_next(request)
+    logger.info(f"Response status: {response.status_code}")
+    return response
 
 
 # Include routers in the correct order! Do not change this por favor.
