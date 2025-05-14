@@ -1331,7 +1331,6 @@ async def head_object(
     object_key: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    ipfs_service=Depends(dependencies.get_ipfs_service),
 ) -> Response:
     """
     Get object metadata using S3 protocol (HEAD /{bucket_name}/{object_key}).
@@ -1368,15 +1367,6 @@ async def head_object(
 
         metadata = json.loads(result["metadata"])
         ipfs_cid = result["ipfs_cid"]
-
-        # Efficiently check if the file exists in IPFS without downloading it
-        # This avoids the expensive download operation that occurs with GET requests
-        exists_in_ipfs = await ipfs_service.check_file_exists(ipfs_cid)
-
-        if not exists_in_ipfs:
-            logger.warning(
-                f"Object {bucket_name}/{object_key} exists in database but not in IPFS (CID: {ipfs_cid})"
-            )  # Still return 200 for compatibility, but log the inconsistency
 
         headers = {
             "Content-Type": result["content_type"],
