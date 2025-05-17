@@ -5,15 +5,15 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
-from typing import Callable
 
 import asyncpg
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from fastapi import Request
 from fastapi import Response
 from fastapi.middleware.cors import CORSMiddleware
 
+from hippius_s3.api.middlewares import check_credit_for_bucket_creation
+from hippius_s3.api.middlewares import extract_seed_phrase_middleware
 from hippius_s3.api.s3.endpoints import router as s3_router
 from hippius_s3.api.s3.multipart import router as multipart_router
 from hippius_s3.config import get_config
@@ -47,7 +47,6 @@ uvicorn_access_logger.setLevel(log_level)
 logging.getLogger("hippius_s3").setLevel(logging.DEBUG)
 logging.getLogger("hippius_s3.api.s3.multipart").setLevel(logging.DEBUG)
 logging.getLogger("hippius_s3.api.s3.endpoints").setLevel(logging.DEBUG)
-
 
 # Reduce HTTP client log noise
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -111,16 +110,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# DEBUG: Add middleware to log all incoming requests
-@app.middleware("http")
-async def log_requests(request: Request, call_next: Callable) -> Response:
-    logger.info(f"Request received: {request.method} {request.url}")
-    logger.info(f"Request headers: {request.headers}")
-    response = await call_next(request)
-    logger.info(f"Response status: {response.status_code}")
-    return response
-
+# Register middlewares (order matters)
+# 1. First extract seed phrase from authorization header
+app.middleware("http")(extract_seed_phrase_middleware)
+# 3. Check credit for bucket creation
+app.middleware("http")(check_credit_for_bucket_creation)
 
 # Include routers in the correct order! Do not change this por favor.
 app.include_router(s3_router, prefix="")
