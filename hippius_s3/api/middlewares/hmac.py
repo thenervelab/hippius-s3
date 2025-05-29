@@ -1,10 +1,11 @@
 import base64
-import hashlib
-import hmac
 import logging
 import re
 from typing import Callable
 
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
+from botocore.credentials import Credentials as BotocoreCredentials
 from fastapi import Request
 from fastapi import Response
 from starlette import status
@@ -107,115 +108,68 @@ class SigV4Verifier:
 
         return provided_signature
 
-    async def create_canonical_request(self, headers) -> str:
-        logger.debug("Creating canonical request")
-        canonical_headers = ""
-        # Ensure headers are processed in sorted order (AWS SigV4 requirement)
-        sorted_headers = sorted(headers, key=str.lower)
-        for header in sorted_headers:
-            if header.lower() == "host":
-                # For Cloudflare Tunnel: use original host if available
-                value = (
-                    self.request.headers.get("x-forwarded-host")
-                    or self.request.headers.get("x-original-host")
-                    or self.request.headers.get("host", "")
-                )
-
-                logger.debug(f"Using host header as received: '{value}'")
-            else:
-                value = self.request.headers.get(header, "")
-
-            # AWS SigV4 requires trimming whitespace and collapsing multiple spaces
-            value = " ".join(value.strip().split())
-            canonical_headers += f"{header.lower()}:{value}\n"
-            logger.debug(f"Header {header}: present={bool(value)}, value='{value}'")
-
-        # Remove the pesky trailing newline from canonical_headers
-        canonical_headers = canonical_headers.rstrip("\n")
-        signed_headers_str = ";".join(sorted_headers)
-
-        # Use client-provided payload hash (AWS SigV4 standard)
-        # This is cryptographically verified by the signature itself
-        payload_hash = self.request.headers.get("x-amz-content-sha256", "")
-
-        if not payload_hash:
-            logger.debug("Missing x-amz-content-sha256 header - rejecting request")
-            raise AuthParsingError("Missing payload hash header")
-        if payload_hash == "UNSIGNED-PAYLOAD":
-            logger.debug("Unsigned payload - keeping UNSIGNED-PAYLOAD")
-            # For UNSIGNED-PAYLOAD, we keep the literal string, not empty hash
-        elif payload_hash == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD":
-            logger.debug("Streaming payload - using empty hash")
-            payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"  # SHA256 of empty string
-        else:
-            logger.debug(f"Using client-provided payload hash: {payload_hash}")
-
-        logger.debug(f"Payload hash: {payload_hash}")
-        logger.debug(f"Signed headers string: {signed_headers_str}")
-
-        canonical_request = f"{self.method}\n{self.path}\n{self.query_string}\n{canonical_headers}\n\n{signed_headers_str}\n{payload_hash}"
-        logger.debug(f"Canonical request created (length: {len(canonical_request)})")
-        logger.debug("=== CANONICAL REQUEST ===")
-        for i, line in enumerate(canonical_request.split("\n")):
-            logger.debug(f"Line {i}: '{line}'")
-        logger.debug("=== END CANONICAL REQUEST ===")
-        return canonical_request
-
-    def create_string_to_sign(self, canonical_request: str) -> str:
-        logger.debug("Creating string to sign")
-        credential_scope = f"{self.amz_date[:8]}/{self.region}/{self.service}/aws4_request"
-        hashed_canonical_request = hashlib.sha256(canonical_request.encode()).hexdigest()
-        string_to_sign = f"AWS4-HMAC-SHA256\n{self.amz_date}\n{credential_scope}\n{hashed_canonical_request}"
-
-        logger.debug(f"Credential scope: {credential_scope}")
-        logger.debug(f"Hashed canonical request: {hashed_canonical_request}")
-        logger.debug(f"String to sign created (length: {len(string_to_sign)})")
-        logger.debug("=== STRING TO SIGN ===")
-        for i, line in enumerate(string_to_sign.split("\n")):
-            logger.debug(f"Line {i}: '{line}'")
-        logger.debug("=== END STRING TO SIGN ===")
-
-        return string_to_sign
-
-    def calculate_signature(self, string_to_sign: str) -> str:
-        logger.debug("Calculating signature")
-
-        def sign(key: bytes, msg: str) -> bytes:
-            return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
-
-        date_stamp = self.amz_date[:8]
-        k_secret = ("AWS4" + self.seed_phrase).encode("utf-8")
-        k_date = sign(k_secret, date_stamp)
-        k_region = sign(k_date, self.region)
-        k_service = sign(k_region, self.service)
-        k_signing = sign(k_service, "aws4_request")
-
-        calculated_signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
-
-        logger.debug(f"Date stamp: {date_stamp}")
-        logger.debug(f"Calculated signature: {calculated_signature}")
-
-        return calculated_signature
-
     async def verify_signature(self) -> bool:
-        logger.debug("Starting signature verification")
+        logger.debug("Starting signature verification using botocore")
         try:
             self.extract_auth_parts()
             logger.debug("Auth parts extraction successful")
         except AuthParsingError as e:
             logger.debug(f"Auth parsing failed: {e}")
             return False
-        else:
-            canonical_request = await self.create_canonical_request(self.signed_headers)
-            string_to_sign = self.create_string_to_sign(canonical_request)
-            calculated_signature = self.calculate_signature(string_to_sign)
 
-            signature_match = calculated_signature == self.provided_signature
-            logger.debug(f"Signature verification result: {signature_match}")
-            logger.debug(f"Provided signature:  {self.provided_signature}")
-            logger.debug(f"Calculated signature: {calculated_signature}")
+        # Create botocore credentials using the seed phrase as secret key
+        credentials = BotocoreCredentials(
+            access_key="dummy",  # Access key not used in our case
+            secret_key=self.seed_phrase,
+        )
 
-            return signature_match
+        # Create an AWS request object from the FastAPI request
+        url = f"https://{self.request.headers.get('host', 'localhost')}{self.path}"
+        if self.query_string:
+            url += f"?{self.query_string}"
+
+        # Prepare headers for botocore - only include the exact headers that MinIO signed
+        headers_for_signing = {}
+        for header_name in self.signed_headers:
+            if header_name.lower() in self.request.headers:
+                headers_for_signing[header_name] = self.request.headers[header_name.lower()]
+
+        # Handle request body for signature calculation
+        # If client provided content hash, we need to set body to None to trust the header
+        content_sha256 = self.request.headers.get("x-amz-content-sha256", "")
+        body = None
+        if content_sha256 == "UNSIGNED-PAYLOAD":
+            body = b""  # Empty body for unsigned payload
+        # For other cases, set body to None so botocore uses the x-amz-content-sha256 header
+
+        aws_request = AWSRequest(
+            method=self.method,
+            url=url,
+            headers=headers_for_signing,
+            data=body,
+        )
+
+        # Create SigV4Auth instance and calculate signature
+        signer = SigV4Auth(credentials, self.service, self.region)
+        signer.add_auth(aws_request)
+
+        # Extract the calculated signature from the authorization header
+        calculated_auth = aws_request.headers.get("Authorization", "")
+        calculated_signature_match = re.search(r"Signature=([a-f0-9]+)", calculated_auth)
+
+        if not calculated_signature_match:
+            logger.debug("Failed to extract calculated signature from botocore")
+            return False
+
+        calculated_signature = calculated_signature_match.group(1)
+
+        signature_match = calculated_signature == self.provided_signature
+        logger.debug(f"Signature verification result: {signature_match}")
+        logger.debug(f"Provided signature:  {self.provided_signature}")
+        logger.debug(f"Calculated signature: {calculated_signature}")
+        logger.debug(f"Calculated auth header: {calculated_auth}")
+
+        return signature_match
 
 
 async def verify_hmac_middleware(
