@@ -126,6 +126,8 @@ class SigV4Verifier:
             canonical_headers += f"{header.lower()}:{value}\n"
             logger.debug(f"Header {header}: present={bool(value)}, value='{value}'")
 
+        # Remove the pesky trailing newline from canonical_headers
+        canonical_headers = canonical_headers.rstrip("\n")
         signed_headers_str = ";".join(headers)
 
         # Use client-provided payload hash (AWS SigV4 standard)
