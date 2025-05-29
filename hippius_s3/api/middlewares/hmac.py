@@ -152,17 +152,26 @@ class SigV4Verifier:
         # Create SigV4Auth instance and calculate signature
         signer = SigV4Auth(credentials, self.service, self.region)
 
-        # Preserve the original timestamp - botocore will try to override x-amz-date
-        original_amz_date = aws_request.headers.get("x-amz-date")
+        # Store the original timestamp to ensure we use exactly what MinIO signed with
+        original_amz_date = headers_for_signing.get("x-amz-date")
+        logger.debug(f"Original timestamp from request: {original_amz_date}")
 
+        # First signature calculation (botocore may override the timestamp)
         signer.add_auth(aws_request)
 
-        # Restore the original timestamp if it was changed
-        if original_amz_date and aws_request.headers.get("x-amz-date") != original_amz_date:
-            logger.debug(f"Restoring original timestamp: {original_amz_date}")
+        # Check if botocore changed the timestamp and fix it if needed
+        current_amz_date = aws_request.headers.get("x-amz-date")
+        logger.debug(f"Timestamp after botocore signing: {current_amz_date}")
+
+        if original_amz_date and current_amz_date != original_amz_date:
+            logger.debug(f"Timestamp mismatch! Restoring original: {original_amz_date}")
+            # Restore the original timestamp and recalculate
             aws_request.headers["x-amz-date"] = original_amz_date
-            # Need to recalculate with the correct timestamp
+            # Clear the authorization header so botocore recalculates it
+            if "Authorization" in aws_request.headers:
+                del aws_request.headers["Authorization"]
             signer.add_auth(aws_request)
+            logger.debug(f"Recalculated with correct timestamp: {original_amz_date}")
 
         # Extract the calculated signature from the authorization header
         calculated_auth = aws_request.headers.get("Authorization", "")
