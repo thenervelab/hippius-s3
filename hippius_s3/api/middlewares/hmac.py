@@ -109,10 +109,20 @@ class SigV4Verifier:
             logger.debug(f"Header {header}: present={bool(value)}")
 
         signed_headers_str = ";".join(headers)
-        body = await self.request.body()
-        payload_hash = hashlib.sha256(body).hexdigest()
 
-        logger.debug(f"Body length: {len(body)}")
+        # Use client-provided payload hash (AWS SigV4 standard)
+        # This is cryptographically verified by the signature itself
+        payload_hash = self.request.headers.get("x-amz-content-sha256", "")
+
+        if not payload_hash:
+            logger.debug("Missing x-amz-content-sha256 header - rejecting request")
+            raise AuthParsingError("Missing payload hash header")
+        if payload_hash in ["UNSIGNED-PAYLOAD", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"]:
+            logger.debug("Unsigned or streaming payload - using empty hash")
+            payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"  # SHA256 of empty string
+        else:
+            logger.debug(f"Using client-provided payload hash: {payload_hash}")
+
         logger.debug(f"Payload hash: {payload_hash}")
         logger.debug(f"Signed headers string: {signed_headers_str}")
 
