@@ -153,7 +153,7 @@ class SigV4Verifier:
         logger.debug(f"Payload hash: {payload_hash}")
         logger.debug(f"Signed headers string: {signed_headers_str}")
 
-        canonical_request = f"{self.method}\n{self.path}\n{self.query_string}\n{canonical_headers}\n{signed_headers_str}\n{payload_hash}"
+        canonical_request = f"{self.method}\n{self.path}\n{self.query_string}\n{canonical_headers}\n\n{signed_headers_str}\n{payload_hash}"
         logger.debug(f"Canonical request created (length: {len(canonical_request)})")
         logger.debug("=== CANONICAL REQUEST ===")
         for i, line in enumerate(canonical_request.split("\n")):
