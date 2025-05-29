@@ -151,7 +151,18 @@ class SigV4Verifier:
 
         # Create SigV4Auth instance and calculate signature
         signer = SigV4Auth(credentials, self.service, self.region)
+
+        # Preserve the original timestamp - botocore will try to override x-amz-date
+        original_amz_date = aws_request.headers.get("x-amz-date")
+
         signer.add_auth(aws_request)
+
+        # Restore the original timestamp if it was changed
+        if original_amz_date and aws_request.headers.get("x-amz-date") != original_amz_date:
+            logger.debug(f"Restoring original timestamp: {original_amz_date}")
+            aws_request.headers["x-amz-date"] = original_amz_date
+            # Need to recalculate with the correct timestamp
+            signer.add_auth(aws_request)
 
         # Extract the calculated signature from the authorization header
         calculated_auth = aws_request.headers.get("Authorization", "")
