@@ -46,6 +46,8 @@ class SigV4Verifier:
         logger.debug(f"X-Forwarded-Host: {self.request.headers.get('x-forwarded-host')}")
         logger.debug(f"X-Original-Host: {self.request.headers.get('x-original-host')}")
         logger.debug(f"CF-Connecting-IP: {self.request.headers.get('cf-connecting-ip')}")
+        logger.debug(f"X-Forwarded-Proto: {self.request.headers.get('x-forwarded-proto')}")
+        logger.debug(f"X-Forwarded-Port: {self.request.headers.get('x-forwarded-port')}")
 
         if self.auth_header:
             logger.debug(f"Auth header starts with AWS4-HMAC-SHA256: {self.auth_header.startswith('AWS4-HMAC-SHA256')}")
