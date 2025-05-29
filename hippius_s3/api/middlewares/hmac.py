@@ -40,6 +40,13 @@ class SigV4Verifier:
         logger.debug(f"Has auth header: {bool(self.auth_header)}")
         logger.debug(f"Has amz-date: {bool(self.amz_date)}")
         logger.debug(f"Query string: {self.query_string}")
+
+        # Debug Cloudflare Tunnel headers
+        logger.debug(f"Host header: {self.request.headers.get('host')}")
+        logger.debug(f"X-Forwarded-Host: {self.request.headers.get('x-forwarded-host')}")
+        logger.debug(f"X-Original-Host: {self.request.headers.get('x-original-host')}")
+        logger.debug(f"CF-Connecting-IP: {self.request.headers.get('cf-connecting-ip')}")
+
         if self.auth_header:
             logger.debug(f"Auth header starts with AWS4-HMAC-SHA256: {self.auth_header.startswith('AWS4-HMAC-SHA256')}")
 
@@ -104,9 +111,17 @@ class SigV4Verifier:
         logger.debug("Creating canonical request")
         canonical_headers = ""
         for header in headers:
-            value = self.request.headers.get(header, "")
+            if header.lower() == "host":
+                # For Cloudflare Tunnel: use original host if available
+                value = (
+                    self.request.headers.get("x-forwarded-host")
+                    or self.request.headers.get("x-original-host")
+                    or self.request.headers.get("host", "")
+                )
+            else:
+                value = self.request.headers.get(header, "")
             canonical_headers += f"{header.lower()}:{value}\n"
-            logger.debug(f"Header {header}: present={bool(value)}")
+            logger.debug(f"Header {header}: present={bool(value)}, value='{value}'")
 
         signed_headers_str = ";".join(headers)
 
