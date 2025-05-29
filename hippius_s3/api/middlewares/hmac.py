@@ -120,6 +120,9 @@ class SigV4Verifier:
                 )
             else:
                 value = self.request.headers.get(header, "")
+
+            # AWS SigV4 requires trimming whitespace and collapsing multiple spaces
+            value = " ".join(value.strip().split())
             canonical_headers += f"{header.lower()}:{value}\n"
             logger.debug(f"Header {header}: present={bool(value)}, value='{value}'")
 
@@ -132,8 +135,11 @@ class SigV4Verifier:
         if not payload_hash:
             logger.debug("Missing x-amz-content-sha256 header - rejecting request")
             raise AuthParsingError("Missing payload hash header")
-        if payload_hash in ["UNSIGNED-PAYLOAD", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"]:
-            logger.debug("Unsigned or streaming payload - using empty hash")
+        if payload_hash == "UNSIGNED-PAYLOAD":
+            logger.debug("Unsigned payload - keeping UNSIGNED-PAYLOAD")
+            # For UNSIGNED-PAYLOAD, we keep the literal string, not empty hash
+        elif payload_hash == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD":
+            logger.debug("Streaming payload - using empty hash")
             payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"  # SHA256 of empty string
         else:
             logger.debug(f"Using client-provided payload hash: {payload_hash}")
@@ -143,6 +149,10 @@ class SigV4Verifier:
 
         canonical_request = f"{self.method}\n{self.path}\n{self.query_string}\n{canonical_headers}\n{signed_headers_str}\n{payload_hash}"
         logger.debug(f"Canonical request created (length: {len(canonical_request)})")
+        logger.debug("=== CANONICAL REQUEST ===")
+        for i, line in enumerate(canonical_request.split("\n")):
+            logger.debug(f"Line {i}: '{line}'")
+        logger.debug("=== END CANONICAL REQUEST ===")
         return canonical_request
 
     def create_string_to_sign(self, canonical_request: str) -> str:
