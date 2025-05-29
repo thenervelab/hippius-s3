@@ -110,7 +110,9 @@ class SigV4Verifier:
     async def create_canonical_request(self, headers) -> str:
         logger.debug("Creating canonical request")
         canonical_headers = ""
-        for header in headers:
+        # Ensure headers are processed in sorted order (AWS SigV4 requirement)
+        sorted_headers = sorted(headers, key=str.lower)
+        for header in sorted_headers:
             if header.lower() == "host":
                 # For Cloudflare Tunnel: use original host if available
                 value = (
@@ -168,6 +170,10 @@ class SigV4Verifier:
         logger.debug(f"Credential scope: {credential_scope}")
         logger.debug(f"Hashed canonical request: {hashed_canonical_request}")
         logger.debug(f"String to sign created (length: {len(string_to_sign)})")
+        logger.debug("=== STRING TO SIGN ===")
+        for i, line in enumerate(string_to_sign.split("\n")):
+            logger.debug(f"Line {i}: '{line}'")
+        logger.debug("=== END STRING TO SIGN ===")
 
         return string_to_sign
 
