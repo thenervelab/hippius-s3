@@ -23,10 +23,7 @@ from hippius_s3.ipfs_service import IPFSService
 
 load_dotenv()
 
-# Configure logging
-is_debug = os.getenv("DEBUG", "false").lower() == "true"
-log_level = logging.DEBUG if is_debug else logging.INFO
-
+log_level = os.getenv("LOG_LEVEL", "INFO")
 # Configure the root logger
 logging.basicConfig(
     level=log_level,

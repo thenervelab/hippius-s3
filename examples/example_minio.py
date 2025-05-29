@@ -16,6 +16,10 @@ from minio.lifecycleconfig import LifecycleConfig
 from minio.lifecycleconfig import Rule
 
 
+# S3_URL = "localhost:8000"
+S3_URL = "s3.hippius.com"
+
+
 def create_test_file(file_size_mb=1, pattern=None):
     """
     Create a test file with specified size and pattern.
@@ -141,7 +145,7 @@ def main():
     # The seed phrase is used as the access_key, and the corresponding HMAC secret key
     # Both work together to create the SigV4 signature
     minio_client = Minio(
-        "localhost:8000",
+        S3_URL,
         access_key=encoded_primary,  # Base64 encoded seed phrase
         secret_key=primary_seed_phrase,  # The seed phrase is also used as the HMAC secret
         secure=False,
@@ -150,7 +154,7 @@ def main():
     # Create a second client with different seed phrase (different user)
     # This will be used to test ACL permissions
     minio_client_secondary = Minio(
-        "localhost:8000",
+        S3_URL,
         access_key=encoded_secondary,
         secret_key=secondary_seed_phrase,  # The seed phrase is also used as the HMAC secret
         secure=False,
