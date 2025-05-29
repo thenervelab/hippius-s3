@@ -11,16 +11,17 @@ from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import Request
 from fastapi import Response
+from fastapi.security import HTTPBearer
 from lxml import etree as ET
 
 from hippius_s3 import dependencies
 from hippius_s3.api.s3 import errors
-from hippius_s3.dependencies import extract_seed_phrase
 from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
 
+security = HTTPBearer()
 router = APIRouter(tags=["s3"])
 
 
@@ -67,8 +68,8 @@ def create_xml_error_response(
 
 @router.get("/", status_code=200)
 async def list_buckets(
+    request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     List all buckets using S3 protocol (GET /).
@@ -126,7 +127,6 @@ async def get_bucket(
     bucket_name: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     List objects in a bucket using S3 protocol (GET /{bucket_name}).
@@ -139,7 +139,11 @@ async def get_bucket(
     # If the location query parameter is present, this is a bucket location request
     if "location" in request.query_params:
         logger.info(f"Handling location request for bucket {bucket_name}")
-        return await get_bucket_location(bucket_name, db, seed_phrase)
+        return await get_bucket_location(
+            bucket_name,
+            db,
+            request.state.seed_phrase,
+        )
 
     # If the tagging query parameter is present, this is a bucket tags request
     if "tagging" in request.query_params:
@@ -175,7 +179,12 @@ async def get_bucket(
                 value_elem.text = str(value)
 
             # Generate XML with proper declaration
-            xml_content = ET.tostring(root, encoding="UTF-8", xml_declaration=True, pretty_print=True)
+            xml_content = ET.tostring(
+                root,
+                encoding="UTF-8",
+                xml_declaration=True,
+                pretty_print=True,
+            )
 
             # Generate request ID for tracing
             request_id = str(uuid.uuid4())
@@ -204,7 +213,11 @@ async def get_bucket(
 
     # If the lifecycle query parameter is present, this is a bucket lifecycle request
     if "lifecycle" in request.query_params:
-        return await get_bucket_lifecycle(bucket_name, db, seed_phrase)
+        return await get_bucket_lifecycle(
+            bucket_name,
+            db,
+            request.state.seed_phrase,
+        )
 
     # If the uploads parameter is present, this is a multipart uploads listing request
     if "uploads" in request.query_params:
@@ -794,8 +807,8 @@ async def get_bucket_location(
 @router.head("/{bucket_name}", status_code=200)
 async def head_bucket(
     bucket_name: str,
+    request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     Check if a bucket exists using S3 protocol (HEAD /{bucket_name}).
@@ -826,7 +839,6 @@ async def create_bucket(
     bucket_name: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     Create a new bucket using S3 protocol (PUT /{bucket_name}).
@@ -959,7 +971,16 @@ async def create_bucket(
             created_at = datetime.now(UTC)
             is_public = True
 
-            logger.info(f"Creating bucket '{bucket_name}' via S3 protocol")
+            # Get or create user record for the seed phrase
+            user_id = str(uuid.uuid4())
+            user = await db.fetchrow(
+                get_query("get_or_create_user"),
+                user_id,
+                request.state.seed_phrase,
+                created_at,
+            )
+
+            logger.info(f"Creating bucket '{bucket_name}' via S3 protocol for user {user['user_id']}")
 
             query = get_query("create_bucket")
             await db.fetchrow(
@@ -968,6 +989,7 @@ async def create_bucket(
                 bucket_name,
                 created_at,
                 is_public,
+                user["user_id"],
             )
 
             return Response(status_code=200)
@@ -994,7 +1016,6 @@ async def delete_bucket(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
-    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     Delete a bucket using S3 protocol (DELETE /{bucket_name}).
@@ -1004,7 +1025,11 @@ async def delete_bucket(
     """
     # If tagging is in query params, we're just deleting tags
     if "tagging" in request.query_params:
-        return await delete_bucket_tags(bucket_name, db, seed_phrase)
+        return await delete_bucket_tags(
+            bucket_name,
+            db,
+            request.state.seed_phrase,
+        )
 
     try:
         bucket = await db.fetchrow(
@@ -1027,13 +1052,43 @@ async def delete_bucket(
             None,
         )
 
-        for obj in objects:
-            await ipfs_service.delete_file(obj["ipfs_cid"], seed_phrase=seed_phrase)
+        # Get the user_id for the current seed phrase
+        user = await db.fetchrow(
+            get_query("get_user_by_seed_phrase"),
+            request.state.seed_phrase,
+        )
 
-        await db.fetchrow(
+        if not user:
+            logger.warning(f"User with seed phrase not found when trying to delete bucket {bucket_name}")
+            return create_xml_error_response(
+                "AccessDenied",
+                f"You do not have permission to delete bucket {bucket_name}",
+                status_code=403,
+                BucketName=bucket_name,
+            )
+
+        # Delete bucket and check if user has permission
+        deleted_bucket = await db.fetchrow(
             get_query("delete_bucket"),
             bucket["bucket_id"],
+            user["user_id"],
         )
+
+        if not deleted_bucket:
+            logger.warning(f"User {user['user_id']} tried to delete bucket {bucket_name} without permission")
+            return create_xml_error_response(
+                "AccessDenied",
+                f"You do not have permission to delete bucket {bucket_name}",
+                status_code=403,
+                BucketName=bucket_name,
+            )
+
+        # If we got here, the bucket was successfully deleted, so now delete the associated objects from IPFS
+        for obj in objects:
+            await ipfs_service.delete_file(
+                obj["ipfs_cid"],
+                seed_phrase=request.state.seed_phrase,
+            )
 
         return Response(status_code=204)
 
@@ -1053,7 +1108,6 @@ async def put_object(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
-    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     Upload an object to a bucket using S3 protocol (PUT /{bucket_name}/{object_key}).
@@ -1083,7 +1137,7 @@ async def put_object(
             object_key,
             request,
             db,
-            seed_phrase,
+            request.state.seed_phrase,
         )
 
     # Check if this is a copy operation
@@ -1230,7 +1284,7 @@ async def put_object(
             file_data=file_data,
             file_name=object_key,
             content_type=content_type,
-            seed_phrase=seed_phrase,
+            seed_phrase=request.state.seed_phrase,
         )
 
         ipfs_cid = ipfs_result["cid"]
@@ -1280,7 +1334,10 @@ async def put_object(
         # Clean up old IPFS content if needed
         if existing_object and existing_object["ipfs_cid"] != ipfs_cid:
             try:
-                await ipfs_service.delete_file(existing_object["ipfs_cid"], seed_phrase=seed_phrase)
+                await ipfs_service.delete_file(
+                    existing_object["ipfs_cid"],
+                    seed_phrase=request.state.seed_phrase,
+                )
                 logger.info(f"Cleaned up previous IPFS content for {bucket_name}/{object_key}")
             except Exception as e:
                 logger.warning(f"Failed to clean up previous IPFS content: {e}")
@@ -1348,7 +1405,6 @@ async def head_object(
     object_key: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     Get object metadata using S3 protocol (HEAD /{bucket_name}/{object_key}).
@@ -1363,7 +1419,12 @@ async def head_object(
     if "tagging" in request.query_params:
         try:
             # Just check if the object exists, don't return the tags content for HEAD
-            await _get_object(bucket_name, object_key, db, seed_phrase)
+            await _get_object(
+                bucket_name,
+                object_key,
+                db,
+                request.state.seed_phrase,
+            )
             return Response(status_code=200)
         except errors.S3Error as e:
             logger.info(f"S3 error in HEAD tagging request: {e.code} - {e.message}")
@@ -1381,7 +1442,7 @@ async def head_object(
             bucket_name,
             object_key,
             db,
-            seed_phrase,
+            request.state.seed_phrase,
         )
 
         metadata = json.loads(result["metadata"])
@@ -1419,7 +1480,6 @@ async def get_object(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
-    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     Get an object using S3 protocol (GET /{bucket_name}/{object_key}).
@@ -1433,7 +1493,7 @@ async def get_object(
             bucket_name,
             object_key,
             db,
-            seed_phrase,
+            request.state.seed_phrase,
         )
 
     try:
@@ -1441,7 +1501,7 @@ async def get_object(
             bucket_name,
             object_key,
             db,
-            seed_phrase,
+            request.state.seed_phrase,
         )
 
         metadata = json.loads(result["metadata"])
@@ -1494,7 +1554,10 @@ async def get_object(
 
                     # Use the concatenate_parts method to rebuild the file
                     concat_result = await ipfs_service.concatenate_parts(
-                        part_info, result["content_type"], object_key, seed_phrase=seed_phrase
+                        part_info,
+                        result["content_type"],
+                        object_key,
+                        seed_phrase=request.state.seed_phrase,
                     )
 
                     logger.info(f"Successfully concatenated {len(part_cids)} parts for {bucket_name}/{object_key}")
@@ -1505,7 +1568,7 @@ async def get_object(
         file_data = await ipfs_service.download_file(
             cid=ipfs_cid,
             decrypt=is_encrypted,
-            seed_phrase=seed_phrase,
+            seed_phrase=request.state.seed_phrase,
         )
         logger.debug(f"Downloaded {len(file_data)} bytes from IPFS CID: {ipfs_cid}")
 
@@ -1567,7 +1630,6 @@ async def delete_object(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
-    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     Delete an object using S3 protocol (DELETE /{bucket_name}/{object_key}).
@@ -1581,7 +1643,7 @@ async def delete_object(
             bucket_name,
             object_key,
             db,
-            seed_phrase,
+            request.state.seed_phrase,
         )
 
     try:
@@ -1610,12 +1672,43 @@ async def delete_object(
             # S3 returns 204 even if the object doesn't exist, so no error here
             return Response(status_code=204)
 
-        ipfs_cid = object_info["ipfs_cid"]
-        await ipfs_service.delete_file(ipfs_cid, seed_phrase=seed_phrase)
-        await db.fetchrow(
+        # Get the user_id for the current seed phrase
+        user = await db.fetchrow(
+            get_query("get_user_by_seed_phrase"),
+            request.state.seed_phrase,
+        )
+
+        if not user:
+            logger.warning(f"User with seed phrase not found when trying to delete object {object_key}")
+            return create_xml_error_response(
+                "AccessDenied",
+                f"You do not have permission to delete object {object_key}",
+                status_code=403,
+                Key=object_key,
+            )
+
+        # Delete the object and check if user has permission
+        deleted_object = await db.fetchrow(
             get_query("delete_object"),
             bucket_id,
             object_key,
+            user["user_id"],  # Add user_id parameter for permission check
+        )
+
+        if not deleted_object:
+            logger.warning(f"User {user['user_id']} tried to delete object {object_key} without permission")
+            return create_xml_error_response(
+                "AccessDenied",
+                f"You do not have permission to delete object {object_key}",
+                status_code=403,
+                Key=object_key,
+            )
+
+        # If we got here, the object was successfully deleted, so we can delete it from IPFS as well
+        ipfs_cid = object_info["ipfs_cid"]
+        await ipfs_service.delete_file(
+            ipfs_cid,
+            seed_phrase=request.state.seed_phrase,
         )
 
         return Response(status_code=204)

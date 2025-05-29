@@ -11,9 +11,10 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi import Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 
 from hippius_s3.api.middlewares import check_credit_for_bucket_creation
-from hippius_s3.api.middlewares import extract_seed_phrase_middleware
+from hippius_s3.api.middlewares.hmac import verify_hmac_middleware
 from hippius_s3.api.s3.endpoints import router as s3_router
 from hippius_s3.api.s3.multipart import router as multipart_router
 from hippius_s3.config import get_config
@@ -101,6 +102,31 @@ app = FastAPI(
     default_response_class=Response,
 )
 
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_openapi(
+        title=app.title,
+        version="1.0.0",
+        description=app.description,
+        routes=app.routes,
+    )
+    openapi_schema["components"]["securitySchemes"] = {
+        "Base64 encoded seed phrase": {
+            "type": "http",
+            "scheme": "bearer",
+            "description": "Enter your base64-encoded seed phrase",
+        }
+    }
+    # Add global security requirement
+    openapi_schema["security"] = [{"Base64 encoded seed phrase": []}]
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
+
 # noinspection PyTypeChecker
 app.add_middleware(
     CORSMiddleware,
@@ -111,8 +137,8 @@ app.add_middleware(
 )
 
 # Register middlewares (order matters)
-# 1. First extract seed phrase from authorization header
-app.middleware("http")(extract_seed_phrase_middleware)
+# 1. First verify HMAC signature and extract seed phrase
+app.middleware("http")(verify_hmac_middleware)
 # 3. Check credit for bucket creation
 app.middleware("http")(check_credit_for_bucket_creation)
 

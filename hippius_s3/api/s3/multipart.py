@@ -16,14 +16,10 @@ from lxml import etree as ET
 
 from hippius_s3 import dependencies
 from hippius_s3.api.s3.errors import s3_error_response
-from hippius_s3.dependencies import extract_seed_phrase
 from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
-
-# Create a router with a unique prefix that won't conflict with the main S3 router
-# This ensures our handlers aren't skipped due to overlapping routes
 router = APIRouter(tags=["s3-multipart"])
 
 
@@ -38,7 +34,6 @@ async def handle_post_object(
     object_key: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """
     Handle POST requests for objects:
@@ -46,16 +41,29 @@ async def handle_post_object(
     2. CompleteMultipartUpload (if ?uploadId=X is in query params)
     """
     logger.info(f"[POST] {bucket_name}/{object_key} - {dict(request.query_params)}")
+    seed_phrase = request.state.seed_phrase
 
     # Check for uploads parameter (Initiate Multipart Upload)
     if "uploads" in request.query_params:
-        return await initiate_multipart_upload(bucket_name, object_key, request, db)
+        return await initiate_multipart_upload(
+            bucket_name,
+            object_key,
+            request,
+            db,
+        )
 
     # Check for uploadId parameter (Complete Multipart Upload)
     if "uploadId" in request.query_params:
         upload_id = request.query_params.get("uploadId")
         if upload_id is not None:
-            return await complete_multipart_upload_handler(bucket_name, object_key, upload_id, request, db, seed_phrase)
+            return await complete_multipart_upload_handler(
+                bucket_name,
+                object_key,
+                upload_id,
+                request,
+                db,
+                seed_phrase,
+            )
 
     # Not a multipart operation we handle
     return None
@@ -72,7 +80,11 @@ async def initiate_multipart_upload(
         # Check if bucket exists
         bucket = await db.fetchrow(get_query("get_bucket_by_name"), bucket_name)
         if not bucket:
-            return s3_error_response("NoSuchBucket", f"Bucket {bucket_name} does not exist", status_code=404)
+            return s3_error_response(
+                "NoSuchBucket",
+                f"Bucket {bucket_name} does not exist",
+                status_code=404,
+            )
 
         # Create a new multipart upload
         upload_id = str(uuid.uuid4())
@@ -119,7 +131,11 @@ async def initiate_multipart_upload(
         )
     except Exception as e:
         logger.exception(f"Error initiating multipart upload: {e}")
-        return s3_error_response("InternalError", f"Error initiating multipart upload: {str(e)}", status_code=500)
+        return s3_error_response(
+            "InternalError",
+            f"Error initiating multipart upload: {str(e)}",
+            status_code=500,
+        )
 
 
 async def complete_multipart_upload_handler(
@@ -137,21 +153,34 @@ async def complete_multipart_upload_handler(
         ipfs_service = request.app.state.ipfs_service
 
         return await complete_multipart_upload_internal(
-            bucket_name, object_key, upload_id, request, db, ipfs_service, seed_phrase=seed_phrase
+            bucket_name,
+            object_key,
+            upload_id,
+            request,
+            db,
+            ipfs_service,
+            seed_phrase=seed_phrase,
         )
     except Exception as e:
         logger.exception(f"Error completing multipart: {e}")
-        return s3_error_response("InternalError", f"Error completing multipart upload: {str(e)}", status_code=500)
+        return s3_error_response(
+            "InternalError",
+            f"Error completing multipart upload: {str(e)}",
+            status_code=500,
+        )
 
 
-@router.put("/{bucket_name}/{object_key:path}", status_code=200, include_in_schema=True)
+@router.put(
+    "/{bucket_name}/{object_key:path}",
+    status_code=200,
+    include_in_schema=True,
+)
 async def upload_part(
     bucket_name: str,
     object_key: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
-    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """Upload a part for a multipart upload (PUT with partNumber & uploadId)."""
     # These two parameters are required for multipart upload parts
@@ -167,27 +196,46 @@ async def upload_part(
         part_number = int(part_number_str)
         if part_number < 1 or part_number > 10000:
             return s3_error_response(
-                "InvalidArgument", "Part number must be an integer between 1 and 10000", status_code=400
+                "InvalidArgument",
+                "Part number must be an integer between 1 and 10000",
+                status_code=400,
             )
 
         # Check if the multipart upload exists
-        multipart_upload = await db.fetchrow(get_query("get_multipart_upload"), upload_id)
+        multipart_upload = await db.fetchrow(
+            get_query("get_multipart_upload"),
+            upload_id,
+        )
         if not multipart_upload:
-            return s3_error_response("NoSuchUpload", "The specified upload does not exist", status_code=404)
+            return s3_error_response(
+                "NoSuchUpload",
+                "The specified upload does not exist",
+                status_code=404,
+            )
 
         if multipart_upload["is_completed"]:
             return s3_error_response(
-                "InvalidRequest", "The specified multipart upload has already been completed", status_code=400
+                "InvalidRequest",
+                "The specified multipart upload has already been completed",
+                status_code=400,
             )
 
         # Upload the part data to IPFS
         file_data = await request.body()
         file_size = len(file_data)
         if file_size == 0:
-            return s3_error_response("InvalidArgument", "Zero-length part not allowed", status_code=400)
+            return s3_error_response(
+                "InvalidArgument",
+                "Zero-length part not allowed",
+                status_code=400,
+            )
 
         # Upload to IPFS and get part information
-        part_result = await ipfs_service.upload_part(file_data, part_number, seed_phrase=seed_phrase)
+        part_result = await ipfs_service.upload_part(
+            file_data,
+            part_number,
+            seed_phrase=request.state.seed_phrase,
+        )
 
         # Save the part information in the database
         part_id = str(uuid.uuid4())
@@ -207,11 +255,17 @@ async def upload_part(
 
     except ValueError:
         return s3_error_response(
-            "InvalidArgument", "Part number must be an integer between 1 and 10000", status_code=400
+            "InvalidArgument",
+            "Part number must be an integer between 1 and 10000",
+            status_code=400,
         )
     except Exception as e:
         logger.exception(f"Error uploading part: {e}")
-        return s3_error_response("InternalError", f"Error uploading part: {str(e)}", status_code=500)
+        return s3_error_response(
+            "InternalError",
+            f"Error uploading part: {str(e)}",
+            status_code=500,
+        )
 
 
 @router.delete("/{bucket_name}/{object_key:path}", status_code=204)
@@ -221,7 +275,6 @@ async def abort_multipart_upload(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
-    seed_phrase: str = Depends(extract_seed_phrase),
 ) -> Response:
     """Abort a multipart upload (DELETE with uploadId)."""
     upload_id = request.query_params.get("uploadId")
@@ -230,21 +283,35 @@ async def abort_multipart_upload(
 
     try:
         # Get the multipart upload information
-        multipart_upload = await db.fetchrow(get_query("get_multipart_upload"), upload_id)
+        multipart_upload = await db.fetchrow(
+            get_query("get_multipart_upload"),
+            upload_id,
+        )
         if not multipart_upload:
-            return s3_error_response("NoSuchUpload", "The specified upload does not exist", status_code=404)
+            return s3_error_response(
+                "NoSuchUpload",
+                "The specified upload does not exist",
+                status_code=404,
+            )
 
         # Get and delete parts from IPFS
         parts = await db.fetch(get_query("list_parts"), upload_id)
         for part in parts:
-            await ipfs_service.delete_file(part["ipfs_cid"], seed_phrase=seed_phrase)
+            await ipfs_service.delete_file(
+                part["ipfs_cid"],
+                seed_phrase=request.state.seed_phrase,
+            )
 
         # Delete the multipart upload from the database
         await db.fetchrow(get_query("abort_multipart_upload"), upload_id)
         return Response(status_code=204)
     except Exception as e:
         logger.error(f"Error aborting multipart upload: {e}")
-        return s3_error_response("InternalError", "We encountered an internal error", status_code=500)
+        return s3_error_response(
+            "InternalError",
+            "We encountered an internal error",
+            status_code=500,
+        )
 
 
 # Moving multipart uploads function to main endpoints.py for better routing
@@ -261,7 +328,11 @@ async def list_multipart_uploads(
     try:
         bucket = await db.fetchrow(get_query("get_bucket_by_name"), bucket_name)
         if not bucket:
-            return s3_error_response("NoSuchBucket", f"Bucket {bucket_name} does not exist", status_code=404)
+            return s3_error_response(
+                "NoSuchBucket",
+                f"Bucket {bucket_name} does not exist",
+                status_code=404,
+            )
 
         # List multipart uploads
         uploads = await db.fetch(
@@ -300,7 +371,11 @@ async def list_multipart_uploads(
         )
     except Exception as e:
         logger.error(f"Error listing multipart uploads: {e}")
-        return s3_error_response("InternalError", "Error listing multipart uploads", status_code=500)
+        return s3_error_response(
+            "InternalError",
+            "Error listing multipart uploads",
+            status_code=500,
+        )
 
 
 async def complete_multipart_upload_internal(
@@ -317,11 +392,17 @@ async def complete_multipart_upload_internal(
         # Validate the multipart upload exists
         multipart_upload = await db.fetchrow(get_query("get_multipart_upload"), upload_id)
         if not multipart_upload:
-            return s3_error_response("NoSuchUpload", "The specified upload does not exist", status_code=404)
+            return s3_error_response(
+                "NoSuchUpload",
+                "The specified upload does not exist",
+                status_code=404,
+            )
 
         if multipart_upload["is_completed"]:
             return s3_error_response(
-                "InvalidRequest", "The specified multipart upload has already been completed", status_code=400
+                "InvalidRequest",
+                "The specified multipart upload has already been completed",
+                status_code=400,
             )
 
         # Parse the XML request body to get parts list
@@ -336,7 +417,11 @@ async def complete_multipart_upload_internal(
         etags = re.findall(r"<ETag>([^<]+)</ETag>", body_text)
 
         if not part_numbers or not etags or len(part_numbers) != len(etags):
-            return s3_error_response("InvalidRequest", "The XML provided was not well-formed", status_code=400)
+            return s3_error_response(
+                "InvalidRequest",
+                "The XML provided was not well-formed",
+                status_code=400,
+            )
 
         # Create part info list
         part_info = []
@@ -354,7 +439,11 @@ async def complete_multipart_upload_internal(
 
         if not db_parts_dict:
             logger.error(f"No parts found for multipart upload {upload_id}")
-            return s3_error_response("InvalidRequest", "No parts found for this multipart upload", status_code=400)
+            return s3_error_response(
+                "InvalidRequest",
+                "No parts found for this multipart upload",
+                status_code=400,
+            )
 
         # Check that all parts exist
         missing_parts = [pn for pn, _ in part_info if pn not in db_parts_dict]
@@ -417,7 +506,11 @@ async def complete_multipart_upload_internal(
         await db.fetchrow(get_query("complete_multipart_upload"), upload_id)
 
         # Delete any existing object with same key
-        await db.execute("DELETE FROM objects WHERE bucket_id = $1 AND object_key = $2", bucket_id, object_key)
+        await db.execute(
+            "DELETE FROM objects WHERE bucket_id = $1 AND object_key = $2",
+            bucket_id,
+            object_key,
+        )
 
         # Create the object in database
         await db.fetchrow(
@@ -465,4 +558,8 @@ async def complete_multipart_upload_internal(
         )
     except Exception as e:
         logger.exception(f"Error completing multipart upload: {e}")
-        return s3_error_response("InternalError", f"Error completing multipart upload: {str(e)}", status_code=500)
+        return s3_error_response(
+            "InternalError",
+            f"Error completing multipart upload: {str(e)}",
+            status_code=500,
+        )

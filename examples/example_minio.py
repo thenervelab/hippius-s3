@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
+import base64
 import hashlib
 import os
 import tempfile
 import time
 from datetime import timedelta
 from pathlib import Path
-import requests
-import xml.etree.ElementTree as ET
-import re
 
 from minio import Minio
 from minio.commonconfig import ENABLED, CopySource
@@ -18,29 +16,145 @@ from minio.lifecycleconfig import LifecycleConfig
 from minio.lifecycleconfig import Rule
 
 
-def create_test_file(file_size_mb=1):
+def create_test_file(file_size_mb=1, pattern=None):
+    """
+    Create a test file with specified size and pattern.
+
+    Args:
+        file_size_mb: Size of the file in MB
+        pattern: Optional pattern type - if None, use random data;
+                'sequential' creates a file with sequential bytes that's easier to verify part boundaries
+                'alternating' creates a file with alternating patterns for each MB to identify part mixing issues
+
+    Returns:
+        Path to the created file
+    """
     with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-        temp_file.write(os.urandom(file_size_mb * 1024 * 1024))
+        if pattern is None:
+            # Random data (most realistic test)
+            temp_file.write(os.urandom(file_size_mb * 1024 * 1024))
+        elif pattern == "sequential":
+            # Sequential bytes - good for identifying part boundary issues
+            for i in range(file_size_mb):
+                chunk = bytearray(range(256)) * (1024 * 4)  # 1MB of sequential bytes
+                temp_file.write(chunk)
+        elif pattern == "alternating":
+            # Alternating patterns for each MB - good for identifying mixed parts
+            for i in range(file_size_mb):
+                # Create a unique pattern for each MB to identify part mixing
+                pattern_byte = (i % 256).to_bytes(1, byteorder="big")
+                chunk = pattern_byte * (1024 * 1024)  # 1MB of the same byte
+                temp_file.write(chunk)
         return temp_file.name
 
 
-def calculate_md5(file_path):
+def calculate_md5(file_path, start=None, end=None):
+    """
+    Calculate MD5 hash of a file or a portion of a file.
+
+    Args:
+        file_path: Path to the file
+        start: Optional start byte position (for range hashing)
+        end: Optional end byte position (for range hashing)
+
+    Returns:
+        MD5 hash as a hexadecimal string
+    """
     md5_hash = hashlib.md5()
     with Path.open(file_path, "rb") as f:
-        # Read file in chunks to handle large files efficiently
-        for chunk in iter(lambda: f.read(4096), b""):
-            md5_hash.update(chunk)
+        if start is not None:
+            f.seek(start)
+
+        # If range is specified, read only that range
+        if start is not None and end is not None:
+            bytes_to_read = end - start
+            data = f.read(bytes_to_read)
+            md5_hash.update(data)
+        else:
+            # Read file in chunks to handle large files efficiently
+            for chunk in iter(lambda: f.read(4096), b""):
+                md5_hash.update(chunk)
+
     return md5_hash.hexdigest()
 
 
+def verify_multipart_integrity(original_file, downloaded_file, part_size_bytes):
+    """
+    Verify the integrity of a multipart upload by checking individual parts.
+
+    Args:
+        original_file: Path to the original file
+        downloaded_file: Path to the downloaded file
+        part_size_bytes: Size of each part in bytes
+
+    Returns:
+        Tuple of (overall_match, list of part matches)
+    """
+    original_size = os.path.getsize(original_file)
+    downloaded_size = os.path.getsize(downloaded_file)
+
+    # First check if sizes match
+    if original_size != downloaded_size:
+        print(f"Size mismatch: Original={original_size}, Downloaded={downloaded_size}")
+        return False, []
+
+    # Calculate overall hashes
+    original_hash = calculate_md5(original_file)
+    downloaded_hash = calculate_md5(downloaded_file)
+    overall_match = original_hash == downloaded_hash
+
+    # Check individual parts
+    part_matches = []
+    num_parts = (original_size + part_size_bytes - 1) // part_size_bytes
+
+    for i in range(num_parts):
+        start = i * part_size_bytes
+        end = min(start + part_size_bytes, original_size)
+
+        original_part_hash = calculate_md5(original_file, start, end)
+        downloaded_part_hash = calculate_md5(downloaded_file, start, end)
+
+        part_match = original_part_hash == downloaded_part_hash
+        part_matches.append(part_match)
+
+        if not part_match:
+            print(f"Part {i + 1}/{num_parts} hash mismatch!")
+            print(f"  Original part hash: {original_part_hash}")
+            print(f"  Downloaded part hash: {downloaded_part_hash}")
+
+    return overall_match, part_matches
+
+
 def main():
-    # Create MinIO client pointing to our S3-compatible API
+    # Encode seed phrases in base64
+    primary_seed_phrase = "hello buyer illness prison drama car license input job ball tornado solar"
+    secondary_seed_phrase = "another fake seed phrase for testing acl permissions"
+
+    # Base64 encode the seed phrases
+    encoded_primary = base64.b64encode(primary_seed_phrase.encode("utf-8")).decode("utf-8")
+    encoded_secondary = base64.b64encode(secondary_seed_phrase.encode("utf-8")).decode("utf-8")
+
+    print(f"Base64 encoded primary seed phrase: {encoded_primary}")
+    print(f"Base64 encoded secondary seed phrase: {encoded_secondary}")
+
+    # Create MinIO client pointing to our S3-compatible API with base64 encoded seed phrase
+    # The seed phrase is used as the access_key, and the corresponding HMAC secret key
+    # Both work together to create the SigV4 signature
     minio_client = Minio(
-        "s3.hippius.com",
-        access_key="diet buyer illness prison drama moment license input job ball tornado solar",
-        secret_key="hippius",
+        "localhost:8000",
+        access_key=encoded_primary,  # Base64 encoded seed phrase
+        secret_key=primary_seed_phrase,  # The seed phrase is also used as the HMAC secret
         secure=False,
-        region="us-east-1",  # Set default region to avoid location lookup
+        region="decentralized",  # Match the region used in our SigV4 implementation
+    )
+    # Create a second client with different seed phrase (different user)
+    # This will be used to test ACL permissions
+    minio_client_secondary = Minio(
+        "localhost:8000",
+        access_key=encoded_secondary,
+        secret_key=secondary_seed_phrase,  # The seed phrase is also used as the HMAC secret
+        secure=False,
+        region="decentralized",
     )
 
     # Test bucket names and object keys
@@ -101,27 +215,7 @@ def main():
     tags["Environment"] = "Development"
     print(f"Setting tags on bucket {main_bucket}")
     minio_client.set_bucket_tags(main_bucket, tags)
-
-    # Get bucket tags
-    print(f"Getting tags for bucket {main_bucket}")
-    try:
-        # Debug the raw request
-        url = f"http://localhost:8000/{main_bucket}?tagging"
-        print(f"DEBUG: Making direct request to {url}")
-        response = requests.get(url)
-        print(f"DEBUG: Raw response status: {response.status_code}")
-        print(f"DEBUG: Raw response headers: {response.headers}")
-        print(f"DEBUG: Raw response content: {response.content}")
-
-        # Now try the minio client
-        retrieved_tags = minio_client.get_bucket_tags(main_bucket)
-        print(f"Retrieved tags: {retrieved_tags}")
-    except Exception as e:
-        print(f"DEBUG: Exception caught: {e}")
-        print(f"DEBUG: Exception type: {type(e)}")
-        if hasattr(e, '__context__') and e.__context__:
-            print(f"DEBUG: Context: {e.__context__}")
-        raise
+    minio_client.get_bucket_tags(main_bucket)
 
     # Set lifecycle configuration
     config = LifecycleConfig(
@@ -201,8 +295,9 @@ def main():
             file_data,
             large_size,
             content_type="application/octet-stream",
-            part_size=5*1024*1024,  # 5MB part size (minimum allowed)
-            num_parallel_uploads=3  # Use 3 parallel uploads
+            part_size=5 * 1024 * 1024,
+            # 5MB part size (minimum allowed)
+            num_parallel_uploads=3,  # Use 3 parallel uploads
         )
     print(f"Large object uploaded successfully: etag={large_result.etag}")
 
@@ -352,59 +447,143 @@ def main():
 
     print("\n=== MULTIPART OPERATIONS ===")
 
-    # Create multiple test files for multipart upload testing
-    print("Creating multipart test files...")
-    multipart_file = create_test_file(10)  # 10MB file (should be split into 2 parts with 5MB part size)
-    multipart_object = "multipart-object.bin"
+    # Define part size
+    part_size_bytes = 5 * 1024 * 1024  # 5MB part size (minimum allowed)
 
-    # Calculate hash before upload
-    multipart_hash = calculate_md5(multipart_file)
-    print(f"Multipart file created at: {multipart_file}, hash: {multipart_hash}")
+    print("Creating multipart test files with different patterns...")
 
-    # ------- Test 1: Standard multipart upload with verification -------
-    print(f"\n--- Test 1: Standard multipart upload ---")
-    print(f"Uploading multipart object to {main_bucket}/{multipart_object}")
-    with open(multipart_file, "rb") as file_data:
-        file_size = os.path.getsize(multipart_file)
-        result = minio_client.put_object(
+    # ------- Test 1: Multipart upload with random data (most realistic) -------
+    print(f"\n--- Test 1: Standard multipart upload with random data ---")
+    multipart_file_random = create_test_file(15)  # 15MB file (should be split into 3 parts with 5MB part size)
+    multipart_object_random = "multipart-random.bin"
+    multipart_hash_random = calculate_md5(multipart_file_random)
+    print(f"Random data file created at: {multipart_file_random}, hash: {multipart_hash_random}")
+
+    print(f"Uploading random data multipart object to {main_bucket}/{multipart_object_random}")
+    with open(multipart_file_random, "rb") as file_data:
+        file_size = os.path.getsize(multipart_file_random)
+        result_random = minio_client.put_object(
             main_bucket,
-            multipart_object,
+            multipart_object_random,
             file_data,
             file_size,
             content_type="application/octet-stream",
-            part_size=5*1024*1024,  # 5MB part size (minimum allowed)
-            num_parallel_uploads=3  # Use 3 parallel uploads
+            part_size=part_size_bytes,
+            num_parallel_uploads=3,  # Use 3 parallel uploads
         )
-    print(f"Multipart object uploaded successfully: etag={result.etag}")
+    print(f"Random data multipart object uploaded successfully: etag={result_random.etag}")
 
-    # Download the multipart object
-    multipart_download = f"{multipart_file}.downloaded"
-    print(f"Downloading multipart object to {multipart_download}")
-    multipart_response = minio_client.get_object(main_bucket, multipart_object)
-    with open(multipart_download, "wb") as file:
-        for data in multipart_response.stream(4096):
+    # Download and verify
+    multipart_download_random = f"{multipart_file_random}.downloaded"
+    print(f"Downloading random data multipart object to {multipart_download_random}")
+    multipart_response_random = minio_client.get_object(main_bucket, multipart_object_random)
+    with open(multipart_download_random, "wb") as file:
+        for data in multipart_response_random.stream(4096):
             file.write(data)
-    multipart_response.close()
-    multipart_response.release_conn()
+    multipart_response_random.close()
+    multipart_response_random.release_conn()
 
-    # Verify the multipart download
-    multipart_downloaded_hash = calculate_md5(multipart_download)
-    print(f"Original multipart file hash: {multipart_hash}")
-    print(f"Downloaded multipart file hash: {multipart_downloaded_hash}")
-    print(f"Multipart verification: {multipart_hash == multipart_downloaded_hash}")
-    assert multipart_hash == multipart_downloaded_hash, "INTEGRITY ERROR: Multipart object hash mismatch!"
+    # Thorough verification including part-by-part checks
+    overall_match, part_matches_random = verify_multipart_integrity(
+        multipart_file_random, multipart_download_random, part_size_bytes
+    )
 
-    # Check file size too
-    original_size = os.path.getsize(multipart_file)
-    downloaded_size = os.path.getsize(multipart_download)
-    print(f"Original file size: {original_size} bytes")
-    print(f"Downloaded file size: {downloaded_size} bytes")
-    print(f"Size verification: {original_size == downloaded_size}")
-    assert original_size == downloaded_size, "INTEGRITY ERROR: Multipart object size mismatch!"
+    print(f"Random data multipart verification: {overall_match}")
+    print(f"Part-by-part verification summary: {all(part_matches_random)}")
+    print(f"Parts verified: {len(part_matches_random)} (All match: {all(part_matches_random)})")
 
-    # ------- Test 2: Get multipart object metadata -------
-    print(f"\n--- Test 2: Get multipart object metadata ---")
-    metadata_stat = minio_client.stat_object(main_bucket, multipart_object)
+    assert overall_match, "INTEGRITY ERROR: Multipart object hash mismatch!"
+    assert all(part_matches_random), "INTEGRITY ERROR: One or more parts do not match!"
+
+    # ------- Test 2: Multipart upload with sequential pattern (good for boundary checking) -------
+    print(f"\n--- Test 2: Multipart upload with sequential pattern ---")
+    multipart_file_seq = create_test_file(15, pattern="sequential")  # 15MB with sequential pattern
+    multipart_object_seq = "multipart-sequential.bin"
+    multipart_hash_seq = calculate_md5(multipart_file_seq)
+    print(f"Sequential pattern file created at: {multipart_file_seq}, hash: {multipart_hash_seq}")
+
+    print(f"Uploading sequential data multipart object to {main_bucket}/{multipart_object_seq}")
+    with open(multipart_file_seq, "rb") as file_data:
+        file_size = os.path.getsize(multipart_file_seq)
+        result_seq = minio_client.put_object(
+            main_bucket,
+            multipart_object_seq,
+            file_data,
+            file_size,
+            content_type="application/octet-stream",
+            part_size=part_size_bytes,
+            num_parallel_uploads=3,
+        )
+    print(f"Sequential data multipart object uploaded successfully: etag={result_seq.etag}")
+
+    # Download and verify
+    multipart_download_seq = f"{multipart_file_seq}.downloaded"
+    print(f"Downloading sequential data multipart object to {multipart_download_seq}")
+    multipart_response_seq = minio_client.get_object(main_bucket, multipart_object_seq)
+    with open(multipart_download_seq, "wb") as file:
+        for data in multipart_response_seq.stream(4096):
+            file.write(data)
+    multipart_response_seq.close()
+    multipart_response_seq.release_conn()
+
+    # Thorough verification including part-by-part checks
+    overall_match_seq, part_matches_seq = verify_multipart_integrity(
+        multipart_file_seq, multipart_download_seq, part_size_bytes
+    )
+
+    print(f"Sequential data multipart verification: {overall_match_seq}")
+    print(f"Part-by-part verification summary: {all(part_matches_seq)}")
+    print(f"Parts verified: {len(part_matches_seq)} (All match: {all(part_matches_seq)})")
+
+    assert overall_match_seq, "INTEGRITY ERROR: Sequential multipart object hash mismatch!"
+    assert all(part_matches_seq), "INTEGRITY ERROR: One or more sequential parts do not match!"
+
+    # ------- Test 3: Multipart upload with alternating pattern (best for part mixing detection) -------
+    print(f"\n--- Test 3: Multipart upload with alternating pattern ---")
+    multipart_file_alt = create_test_file(15, pattern="alternating")  # 15MB with alternating pattern
+    multipart_object_alt = "multipart-alternating.bin"
+    multipart_hash_alt = calculate_md5(multipart_file_alt)
+    print(f"Alternating pattern file created at: {multipart_file_alt}, hash: {multipart_hash_alt}")
+
+    print(f"Uploading alternating data multipart object to {main_bucket}/{multipart_object_alt}")
+    with open(multipart_file_alt, "rb") as file_data:
+        file_size = os.path.getsize(multipart_file_alt)
+        result_alt = minio_client.put_object(
+            main_bucket,
+            multipart_object_alt,
+            file_data,
+            file_size,
+            content_type="application/octet-stream",
+            part_size=part_size_bytes,
+            num_parallel_uploads=3,
+        )
+    print(f"Alternating data multipart object uploaded successfully: etag={result_alt.etag}")
+
+    # Download and verify
+    multipart_download_alt = f"{multipart_file_alt}.downloaded"
+    print(f"Downloading alternating data multipart object to {multipart_download_alt}")
+    multipart_response_alt = minio_client.get_object(main_bucket, multipart_object_alt)
+    with open(multipart_download_alt, "wb") as file:
+        for data in multipart_response_alt.stream(4096):
+            file.write(data)
+    multipart_response_alt.close()
+    multipart_response_alt.release_conn()
+
+    # Thorough verification including part-by-part checks
+    overall_match_alt, part_matches_alt = verify_multipart_integrity(
+        multipart_file_alt, multipart_download_alt, part_size_bytes
+    )
+
+    print(f"Alternating data multipart verification: {overall_match_alt}")
+    print(f"Part-by-part verification summary: {all(part_matches_alt)}")
+    print(f"Parts verified: {len(part_matches_alt)} (All match: {all(part_matches_alt)})")
+
+    assert overall_match_alt, "INTEGRITY ERROR: Alternating multipart object hash mismatch!"
+    assert all(part_matches_alt), "INTEGRITY ERROR: One or more alternating parts do not match!"
+
+    # ------- Test 4: Get multipart object metadata -------
+    print(f"\n--- Test 4: Get multipart object metadata ---")
+    metadata_stat = minio_client.stat_object(main_bucket, multipart_object_random)
     print(f"  ETag: {metadata_stat.etag}")
     print(f"  Size: {metadata_stat.size}")
     print(f"  Last Modified: {metadata_stat.last_modified}")
@@ -415,35 +594,97 @@ def main():
     # Check if the ETag is present (note: in S3, ETags for multipart uploads differ between the upload response and HEAD request)
     # The ETag from upload is typically the MD5 hash of concatenated part hashes followed by -<number of parts>
     # The ETag from HEAD is typically the IPFS CID in our implementation
-    print(f"  ETag from upload: {result.etag}")
+    print(f"  ETag from upload: {result_random.etag}")
     print(f"  ETag from stat: {metadata_stat.etag}")
     print(f"  NOTE: ETags for multipart uploads may differ between upload response and metadata stat")
 
     # Check if the size matches
+    original_size = os.path.getsize(multipart_file_random)
     print(f"  Size verification: {metadata_stat.size == original_size}")
     assert metadata_stat.size == original_size, "INTEGRITY ERROR: Multipart object size mismatch in metadata!"
 
-    # ------- Test 3: Range request on multipart object -------
-    print(f"\n--- Test 3: Range request on multipart object ---")
+    # ------- Test 5: Range request on multipart object -------
+    print(f"\n--- Test 5: Range request on multipart object ---")
     print(f"NOTE: Range requests are not yet fully supported by the server")
     print(f"Skipping range request test...")
 
     # Create a placeholder file for cleanup
-    range_download = f"{multipart_file}.range_downloaded"
+    range_download = f"{multipart_file_random}.range_downloaded"
     with open(range_download, "wb") as f:
         f.write(b"placeholder")
 
     # ------- Clean up -------
-    # Delete the multipart object from the bucket
+    # Delete the multipart objects from the bucket
     print(f"\n--- Cleaning up ---")
-    print(f"Deleting multipart object {main_bucket}/{multipart_object}")
-    minio_client.remove_object(main_bucket, multipart_object)
+    print(f"Deleting multipart objects")
+    minio_client.remove_object(main_bucket, multipart_object_random)
+    minio_client.remove_object(main_bucket, multipart_object_seq)
+    minio_client.remove_object(main_bucket, multipart_object_alt)
 
     # Clean up all the local files
-    os.unlink(multipart_file)
-    os.unlink(multipart_download)
-    os.unlink(range_download)
+    cleanup_files = [
+        multipart_file_random,
+        multipart_download_random,
+        multipart_file_seq,
+        multipart_download_seq,
+        multipart_file_alt,
+        multipart_download_alt,
+        range_download,
+    ]
+
+    for file_path in cleanup_files:
+        if os.path.exists(file_path):
+            os.unlink(file_path)
+
     print(f"Cleaned up all local multipart test files")
+
+    print("\n=== ACL TESTING OPERATIONS ===")
+
+    # Create a bucket using the primary client (user)
+    acl_bucket = f"acl-test-bucket-{int(time.time())}"
+    acl_object = "acl-test-object.bin"
+
+    print(f"Creating ACL test bucket: {acl_bucket}")
+    minio_client.make_bucket(acl_bucket)
+
+    # Upload a test object to the bucket
+    print(f"Uploading ACL test object: {acl_object}")
+    acl_test_file = create_test_file(1)  # 1MB
+    with open(acl_test_file, "rb") as file_data:
+        acl_size = os.path.getsize(acl_test_file)
+        minio_client.put_object(
+            acl_bucket,
+            acl_object,
+            file_data,
+            acl_size,
+            content_type="application/octet-stream",
+        )
+
+    print("\n--- Testing ACL enforcement for bucket deletion ---")
+    print(f"Attempting to delete bucket {acl_bucket} with secondary client (different user)")
+    try:
+        minio_client_secondary.remove_bucket(acl_bucket)
+        print("SECURITY FAILURE: Secondary user was able to delete primary user's bucket!")
+        assert False, "ACL enforcement failed for bucket deletion"
+    except Exception as e:
+        print(f"Expected error: {e}")
+        print("SUCCESS: Secondary user was not able to delete primary user's bucket (ACL protected)")
+
+    print("\n--- Testing ACL enforcement for object deletion ---")
+    print(f"Attempting to delete object {acl_object} with secondary client (different user)")
+    try:
+        minio_client_secondary.remove_object(acl_bucket, acl_object)
+        print("SECURITY FAILURE: Secondary user was able to delete primary user's object!")
+        assert False, "ACL enforcement failed for object deletion"
+    except Exception as e:
+        print(f"Expected error: {e}")
+        print("SUCCESS: Secondary user was not able to delete primary user's object (ACL protected)")
+
+    # Clean up the ACL test resources using the primary client
+    print("\nCleaning up ACL test resources with primary client")
+    minio_client.remove_object(acl_bucket, acl_object)
+    minio_client.remove_bucket(acl_bucket)
+    os.unlink(acl_test_file)
 
     print("\n=== CLEANUP OPERATIONS ===")
 
@@ -453,9 +694,11 @@ def main():
     minio_client.remove_object(main_bucket, nested_object)
     minio_client.remove_object(main_bucket, metadata_object)
     minio_client.remove_object(main_bucket, large_object)
-    # Multipart object is already deleted above, but add a safeguard just in case
+    # Multipart objects are already deleted above, but add safeguards just in case
     try:
-        minio_client.remove_object(main_bucket, multipart_object)
+        minio_client.remove_object(main_bucket, multipart_object_random)
+        minio_client.remove_object(main_bucket, multipart_object_seq)
+        minio_client.remove_object(main_bucket, multipart_object_alt)
     except:
         pass
 

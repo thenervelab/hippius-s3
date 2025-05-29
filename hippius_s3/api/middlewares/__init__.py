@@ -1,8 +1,8 @@
-from hippius_s3.api.middlewares.auth import extract_seed_phrase_middleware
 from hippius_s3.api.middlewares.credit import check_credit_for_bucket_creation
+from hippius_s3.api.middlewares.hmac import verify_hmac_middleware
 
 
 __all__ = [
-    "extract_seed_phrase_middleware",
+    "verify_hmac_middleware",
     "check_credit_for_bucket_creation",
 ]

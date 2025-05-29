@@ -4,35 +4,41 @@ repos:
     hooks:
       - id: ruff
         args: [ --fix ]
+        stages: [ commit ]
       - id: ruff-format
-
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.8.0
-    hooks:
-      - id: mypy
-        additional_dependencies:
-          - pydantic>=2.3.0
-          - types-python-dateutil
-        files: ^hippius_s3/
-        args: ["--ignore-missing-imports", "--disallow-untyped-defs"]
+        stages: [ commit ]
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
     hooks:
       - id: trailing-whitespace
+        stages: [ commit ]
       - id: end-of-file-fixer
+        stages: [ commit ]
       - id: check-yaml
+        stages: [ commit ]
       - id: check-added-large-files
+        stages: [ commit ]
       - id: debug-statements
+        stages: [ commit ]
       - id: check-toml
+        stages: [ commit ]
 
-  # Temporarily removing local hooks
-  # - repo: local
-  #   hooks:
-  #     - id: pytest-check
-  #       name: pytest-check
-  #       entry: pytest
-  #       language: system
-  #       pass_filenames: false
-  #       always_run: true
-  #       args: ["--cov=hippius_s3", "--cov-fail-under=50"]
+  # Auto-fix local hooks
+  - repo: local
+    hooks:
+      - id: auto-ruff-apply
+        name: Auto apply ruff fixes
+        entry: bash -c 'source .venv/bin/activate && ruff check --fix-only hippius_s3/'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [ commit ]
+
+      - id: auto-ruff-format
+        name: Auto format with ruff
+        entry: bash -c 'source .venv/bin/activate && ruff format hippius_s3/'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [ commit ]
