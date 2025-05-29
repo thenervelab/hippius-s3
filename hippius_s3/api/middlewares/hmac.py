@@ -41,13 +41,11 @@ class SigV4Verifier:
         logger.debug(f"Has amz-date: {bool(self.amz_date)}")
         logger.debug(f"Query string: {self.query_string}")
 
-        # Debug Cloudflare Tunnel headers
-        logger.debug(f"Host header: {self.request.headers.get('host')}")
-        logger.debug(f"X-Forwarded-Host: {self.request.headers.get('x-forwarded-host')}")
-        logger.debug(f"X-Original-Host: {self.request.headers.get('x-original-host')}")
-        logger.debug(f"CF-Connecting-IP: {self.request.headers.get('cf-connecting-ip')}")
-        logger.debug(f"X-Forwarded-Proto: {self.request.headers.get('x-forwarded-proto')}")
-        logger.debug(f"X-Forwarded-Port: {self.request.headers.get('x-forwarded-port')}")
+        # Debug ALL headers to see what MinIO is actually sending
+        logger.debug("=== ALL REQUEST HEADERS ===")
+        for name, value in self.request.headers.items():
+            logger.debug(f"  {name}: {value}")
+        logger.debug("=== END HEADERS ===")
 
         if self.auth_header:
             logger.debug(f"Auth header starts with AWS4-HMAC-SHA256: {self.auth_header.startswith('AWS4-HMAC-SHA256')}")
@@ -120,6 +118,20 @@ class SigV4Verifier:
                     or self.request.headers.get("x-original-host")
                     or self.request.headers.get("host", "")
                 )
+
+                # Handle port restoration from proxy headers
+                forwarded_port = self.request.headers.get("x-forwarded-port")
+                forwarded_proto = self.request.headers.get("x-forwarded-proto")
+
+                if value and ":" not in value and forwarded_port:
+                    # Use explicit port from proxy header
+                    value = f"{value}:{forwarded_port}"
+                    logger.debug(f"Restored port from header: '{value}'")
+                elif value and ":" not in value and forwarded_proto:
+                    # Fallback: use standard ports for protocol
+                    default_port = "443" if forwarded_proto == "https" else "80"
+                    value = f"{value}:{default_port}"
+                    logger.debug(f"Using default port for {forwarded_proto}: '{value}'")
             else:
                 value = self.request.headers.get(header, "")
 
