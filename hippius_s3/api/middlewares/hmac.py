@@ -36,7 +36,7 @@ class SigV4Verifier:
 
     def extract_auth_parts(self) -> bool:
         if not self.auth_header or not self.auth_header.startswith("AWS4-HMAC-SHA256"):
-            return False
+            raise AuthParsingError("Credentials not found")
 
         credential_match = re.search(
             r"Credential=([^/]+)/([^/]+)/([^/]+)/([^/]+)/([^,]+)",
