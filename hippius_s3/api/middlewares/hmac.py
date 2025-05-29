@@ -119,19 +119,7 @@ class SigV4Verifier:
                     or self.request.headers.get("host", "")
                 )
 
-                # Handle port restoration from proxy headers
-                forwarded_port = self.request.headers.get("x-forwarded-port")
-                forwarded_proto = self.request.headers.get("x-forwarded-proto")
-
-                if value and ":" not in value and forwarded_port:
-                    # Use explicit port from proxy header
-                    value = f"{value}:{forwarded_port}"
-                    logger.debug(f"Restored port from header: '{value}'")
-                elif value and ":" not in value and forwarded_proto:
-                    # Fallback: use standard ports for protocol
-                    default_port = "443" if forwarded_proto == "https" else "80"
-                    value = f"{value}:{default_port}"
-                    logger.debug(f"Using default port for {forwarded_proto}: '{value}'")
+                logger.debug(f"Using host header as received: '{value}'")
             else:
                 value = self.request.headers.get(header, "")
 
