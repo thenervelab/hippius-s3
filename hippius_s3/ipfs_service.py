@@ -268,14 +268,21 @@ class IPFSService:
 
         try:
             # Upload the part to IPFS
-            result = await self.client.upload_file(temp_path, encrypt=False, seed_phrase=seed_phrase)
+            result = await self.client.upload_file(
+                temp_path,
+                encrypt=False,
+                seed_phrase=seed_phrase,
+            )
 
             # Calculate ETag (MD5 hash) for the part, similar to S3
             md5_hash = hashlib.md5(file_data).hexdigest()
             etag = f"{md5_hash}-{part_number}"
 
             # Pin the CID to ensure it stays available
-            await self.client.pin(result["cid"], seed_phrase=seed_phrase)
+            await self.client.pin(
+                result["cid"],
+                seed_phrase=seed_phrase,
+            )
 
             return {
                 "cid": result["cid"],
