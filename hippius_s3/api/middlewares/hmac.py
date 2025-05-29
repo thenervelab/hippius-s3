@@ -132,7 +132,7 @@ class SigV4Verifier:
 
         # Remove the pesky trailing newline from canonical_headers
         canonical_headers = canonical_headers.rstrip("\n")
-        signed_headers_str = ";".join(headers)
+        signed_headers_str = ";".join(sorted_headers)
 
         # Use client-provided payload hash (AWS SigV4 standard)
         # This is cryptographically verified by the signature itself
