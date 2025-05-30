@@ -41,7 +41,13 @@ class IPFSService:
         seed_phrase: Optional[str] = None,
     ) -> Dict[str, Union[str, int]]:
         """
-        Upload file data to IPFS.
+        Upload file data to IPFS (legacy method).
+
+        NOTE: This method is deprecated for regular uploads. Use client.s3_publish() instead
+        for full IPFS upload + pinning + blockchain publishing.
+
+        This method is still used for multipart upload parts, which only need IPFS upload
+        without blockchain publishing (the final concatenated file gets published).
 
         Args:
             file_data: Binary file data
@@ -58,8 +64,15 @@ class IPFSService:
             temp_file.write(file_data)
 
         try:
-            result = await self.client.upload_file(temp_path, encrypt=encrypt, seed_phrase=seed_phrase)
-            pinning_status = await self.client.pin(result["cid"], seed_phrase=seed_phrase)
+            result = await self.client.upload_file(
+                temp_path,
+                encrypt=encrypt,
+                seed_phrase=seed_phrase,
+            )
+            pinning_status = await self.client.pin(
+                result["cid"],
+                seed_phrase=seed_phrase,
+            )
 
             return {
                 "cid": result["cid"],
@@ -392,24 +405,35 @@ class IPFSService:
             logger.info(f"Concatenated file MD5 hash: {concatenated_md5}")
             logger.info(f"Concatenated file size: {concatenated_size} bytes")
 
-            # Upload the complete file to IPFS
+            # Upload the complete file to IPFS and publish to blockchain using s3_publish
             try:
-                result = await self.client.upload_file(output_path, encrypt=False, seed_phrase=seed_phrase)
                 logger.info(
-                    f"Uploaded concatenated file to IPFS: CID={result['cid']}, Size={result['size_bytes']} bytes"
+                    f"Using seed phrase for multipart s3_publish: '{seed_phrase}' (length: {len(seed_phrase.split()) if seed_phrase else 0} words)"
+                )
+
+                s3_result = await self.client.s3_publish(
+                    file_path=str(output_path),
+                    encrypt=False,
+                    seed_phrase=seed_phrase,
+                )
+                logger.info(
+                    f"Published concatenated file: CID={s3_result.cid}, Size={s3_result.size_bytes} bytes, TX={s3_result.tx_hash}"
                 )
 
                 # Verify that the uploaded size matches our calculated size
-                if result["size_bytes"] != concatenated_size:
+                if s3_result.size_bytes != concatenated_size:
                     logger.warning(
-                        f"Size mismatch in uploaded file: Expected={concatenated_size}, Actual={result['size_bytes']}"
+                        f"Size mismatch in uploaded file: Expected={concatenated_size}, Actual={s3_result.size_bytes}"
                     )
 
-                # Pin the CID to ensure it stays available
-                await self.client.pin(result["cid"], seed_phrase=seed_phrase)
-                logger.info(f"Pinned CID: {result['cid']}")
+                # Store the result for later use
+                result = {
+                    "cid": s3_result.cid,
+                    "size_bytes": s3_result.size_bytes,
+                    "tx_hash": s3_result.tx_hash,
+                }
             except Exception as e:
-                logger.error(f"Failed to upload concatenated file: {e}")
+                logger.error(f"Failed to publish concatenated file: {e}")
                 raise
 
             # Calculate the combined ETag (required for S3 compatibility)
@@ -419,7 +443,7 @@ class IPFSService:
             verification_path = Path(temp_dir) / "verification_download"
             await self.client.download_file(
                 result["cid"],
-                verification_path,
+                str(verification_path),
                 decrypt=False,
                 seed_phrase=seed_phrase,
                 skip_directory_check=True,
@@ -458,6 +482,7 @@ class IPFSService:
                 "size_bytes": total_size,
                 "etag": final_etag,
                 "encrypted": False,
+                "tx_hash": result["tx_hash"],
             }
         finally:
             # Clean up temporary files

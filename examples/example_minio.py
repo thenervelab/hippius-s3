@@ -16,8 +16,8 @@ from minio.lifecycleconfig import LifecycleConfig
 from minio.lifecycleconfig import Rule
 
 
-# S3_URL = "localhost:8000"
-S3_URL = "s3.hippius.com"
+S3_URL = "localhost:8000"
+# S3_URL = "s3.hippius.com"
 
 
 def create_test_file(file_size_mb=1, pattern=None):
@@ -131,7 +131,7 @@ def verify_multipart_integrity(original_file, downloaded_file, part_size_bytes):
 
 def main():
     # Encode seed phrases in base64
-    primary_seed_phrase = "hello buyer illness prison drama car license input job ball tornado solar"
+    primary_seed_phrase = os.environ["HIPPIUS_SEED_PHRASE"]  # valid seed phrase required
     secondary_seed_phrase = "another fake seed phrase for testing acl permissions"
 
     # Base64 encode the seed phrases

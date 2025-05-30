@@ -2,9 +2,11 @@
 
 import json
 import logging
+import tempfile
 import uuid
 from datetime import UTC
 from datetime import datetime
+from pathlib import Path
 
 import asyncpg
 from fastapi import APIRouter
@@ -12,6 +14,8 @@ from fastapi import Depends
 from fastapi import Request
 from fastapi import Response
 from fastapi.security import HTTPBearer
+from hippius_sdk.errors import HippiusIPFSError
+from hippius_sdk.errors import HippiusSubstrateError
 from lxml import etree as ET
 
 from hippius_s3 import dependencies
@@ -1211,9 +1215,17 @@ async def put_object(
             file_size = source_object["size_bytes"]
             content_type = source_object["content_type"]
 
-            # Copy any metadata
+            # Copy all metadata including encryption and tx_hash
             source_metadata = json.loads(source_object["metadata"])
-            metadata = {"ipfs": source_metadata.get("ipfs", {})}
+            metadata = {
+                "ipfs": source_metadata.get("ipfs", {}),
+                "hippius": source_metadata.get("hippius", {}),
+            }
+
+            # Copy any user metadata (x-amz-meta-*)
+            for key, value in source_metadata.items():
+                if key not in ["ipfs", "hippius"]:
+                    metadata[key] = value
 
             # Create or update the object using upsert
             await db.fetchrow(
@@ -1279,28 +1291,48 @@ async def put_object(
             object_key,
         )
 
-        # Upload the file to IPFS
-        ipfs_result = await ipfs_service.upload_file(
-            file_data=file_data,
-            file_name=object_key,
-            content_type=content_type,
-            seed_phrase=request.state.seed_phrase,
-        )
+        # Detect encryption request from S3 headers
+        encrypt = request.headers.get("x-amz-server-side-encryption") == "AES256"
 
-        ipfs_cid = ipfs_result["cid"]
-        object_id = str(uuid.uuid4())
-        created_at = datetime.now(UTC)
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_path = temp_file.name
+            temp_file.write(file_data)
 
-        metadata = {}
-        for key, value in request.headers.items():
-            if key.lower().startswith("x-amz-meta-"):
-                meta_key = key[11:]
-                metadata[meta_key] = value
+        try:
+            # Use s3_publish for IPFS upload + pinning + blockchain publishing
+            seed_phrase = request.state.seed_phrase
+            logger.info(
+                f"Using seed phrase for s3_publish: '{seed_phrase}' (length: {len(seed_phrase.split()) if seed_phrase else 0} words)"
+            )
 
-        metadata["ipfs"] = {
-            "cid": ipfs_cid,
-            "encrypted": ipfs_result.get("encrypted", False),
-        }
+            s3_result = await ipfs_service.client.s3_publish(
+                file_path=temp_path,
+                encrypt=encrypt,
+                seed_phrase=seed_phrase,
+            )
+
+            ipfs_cid = s3_result.cid
+            tx_hash = s3_result.tx_hash
+            object_id = str(uuid.uuid4())
+            created_at = datetime.now(UTC)
+
+            metadata = {}
+            for key, value in request.headers.items():
+                if key.lower().startswith("x-amz-meta-"):
+                    meta_key = key[11:]
+                    metadata[meta_key] = value
+
+            metadata["ipfs"] = {
+                "cid": ipfs_cid,
+                "encrypted": encrypt,
+            }
+            metadata["hippius"] = {
+                "tx_hash": tx_hash,
+            }
+        finally:
+            # Clean up temporary file
+            if Path(temp_path).exists():
+                Path(temp_path).unlink()
 
         # Begin a transaction to ensure atomic operation
         try:
@@ -1347,8 +1379,21 @@ async def put_object(
             headers={"ETag": f'"{ipfs_cid}"'},
         )
 
-    except Exception:
+    except Exception as e:
         logger.exception("Error uploading object")
+        if isinstance(e, HippiusIPFSError):
+            return create_xml_error_response(
+                "InternalError",
+                f"IPFS upload failed: {str(e)}",
+                status_code=500,
+            )
+        if isinstance(e, HippiusSubstrateError):
+            return create_xml_error_response(
+                "InternalError",
+                f"Blockchain publishing failed: {str(e)}",
+                status_code=500,
+            )
+
         return create_xml_error_response(
             "InternalError",
             "We encountered an internal error. Please try again.",

@@ -499,6 +499,9 @@ async def complete_multipart_upload_internal(
                     "part_cids": [part["ipfs_cid"] for part in parts_for_concat],
                     "total_size": concat_result["size_bytes"],
                 },
+                "hippius": {
+                    "tx_hash": concat_result.get("tx_hash"),
+                },
             }
         )
 
