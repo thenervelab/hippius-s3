@@ -7,6 +7,7 @@ services:
       - .env
     depends_on:
       - db
+      - ipfs
     volumes:
       - .:/app
     restart: unless-stopped
@@ -14,6 +15,8 @@ services:
       - PYTHONUNBUFFERED=1
       - UVICORN_LOG_LEVEL=debug
       - DEBUG=true
+      - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
+      - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
 
   db:
     image: postgres:15
@@ -32,6 +35,23 @@ services:
       timeout: 5s
       retries: 5
 
+  ipfs:
+    image: ipfs/kubo:latest
+    ports:
+      - "4001:4001"      # IPFS swarm port
+      - "5001:5001"      # IPFS API port
+      - "8080:8080"      # IPFS gateway port
+    volumes:
+      - ipfs_data:/data/ipfs
+    restart: unless-stopped
+    environment:
+      - IPFS_PROFILE=server
+    healthcheck:
+      test: ["CMD-SHELL", "ipfs id"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
 volumes:
   postgres_data:
-  minio_data:
+  ipfs_data:

@@ -1,7 +1,5 @@
-import asyncio
 import hashlib
 import logging
-import shutil
 import tempfile
 from pathlib import Path
 from typing import Dict
@@ -89,61 +87,52 @@ class IPFSService:
     async def download_file(
         self,
         cid: str,
-        decrypt: bool = False,
+        decrypt: bool = True,
         max_retries: int = 1,
         retry_delay: int = 2,
         seed_phrase: Optional[str] = None,
     ) -> bytes:
         """
-        Download file data from IPFS with retry logic.
+        Download file data from IPFS with automatic decryption using s3_download.
+
+        This method now uses s3_download internally for better key management and
+        automatic decryption while maintaining backward compatibility.
 
         Args:
             cid: IPFS content identifier
-            decrypt: Whether to decrypt the file (if it was encrypted)
-            max_retries: Maximum number of download retry attempts
-            retry_delay: Delay in seconds between retry attempts
-            seed_phrase: Seed phrase to use for blockchain operations
+            decrypt: Whether to attempt automatic decryption (default: True since all files are encrypted)
+            max_retries: Maximum number of download retry attempts (currently not used by s3_download)
+            retry_delay: Delay in seconds between retry attempts (currently not used by s3_download)
+            seed_phrase: Seed phrase to use for decryption key retrieval
 
         Returns:
-            Binary file data
+            Binary file data (decrypted if decrypt=True and file was encrypted)
         """
-        last_exception = None
-        for attempt in range(1, max_retries + 1):
-            temp_dir = tempfile.mkdtemp()
-            temp_path = Path(temp_dir) / "downloaded_file"
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_path = temp_file.name
 
-            try:
-                await self.client.download_file(
-                    cid,
-                    str(temp_path),
-                    decrypt=decrypt,
-                    seed_phrase=seed_phrase,
-                    skip_directory_check=True,
-                )
+        try:
+            await self.client.s3_download(
+                cid=cid,
+                output_path=temp_path,
+                seed_phrase=seed_phrase,
+                auto_decrypt=decrypt,
+                download_node=self.config.ipfs_store_url,
+            )
 
-                if temp_path.is_dir():
-                    logger.debug(f"Directory detected at {temp_path}")
-                    for file in temp_path.iterdir():
-                        logger.debug(f"Directory contains file: {file}")
+            # Read file and return bytes (maintains existing interface)
+            async with aiofiles.open(temp_path, "rb") as f:
+                data = await f.read()
+                return bytes(data)
 
-                async with aiofiles.open(temp_path, "rb") as f:
-                    data = await f.read()
-                    return bytes(data)
-
-            except Exception as e:
-                last_exception = e
-                logger.exception(f"Download attempt {attempt} failed: {e}")
-                if attempt < max_retries:
-                    logger.info(f"Retrying in {retry_delay} seconds...")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2
-            finally:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-
-        if last_exception:
-            raise RuntimeError(f"Failed to download file with CID {cid}") from last_exception
-
-        raise RuntimeError(f"Failed to download file with CID {cid} after {max_retries} attempts")
+        except Exception as e:
+            # Maintain compatibility with existing error handling
+            logger.exception(f"Failed to download file with CID {cid}: {e}")
+            raise RuntimeError(f"Failed to download file with CID {cid}") from e
+        finally:
+            # Clean up temporary file
+            if Path(temp_path).exists():
+                Path(temp_path).unlink()
 
     async def _download_directory(self, cid: str, decrypt: bool = False, seed_phrase: Optional[str] = None) -> bytes:
         """
@@ -347,26 +336,27 @@ class IPFSService:
 
                 logger.info(f"Processing part {part_number}: CID={cid}, Expected size={part_size} bytes")
 
-                # Download the part from IPFS
+                # Download the part from IPFS (parts are unencrypted)
                 try:
-                    await self.client.download_file(
-                        cid,
-                        part_path,
+                    part_data = await self.download_file(
+                        cid=cid,
                         decrypt=False,
                         seed_phrase=seed_phrase,
-                        skip_directory_check=True,
                     )
-                    actual_size = part_path.stat().st_size
-                    logger.info(f"Downloaded part {part_number}: CID={cid}, Actual size={actual_size} bytes")
 
-                    # Verify size matches expected
-                    if actual_size != part_size:
-                        logger.warning(
-                            f"Size mismatch for part {part_number}: Expected={part_size}, Actual={actual_size}"
-                        )
+                    # Write part data to file
+                    async with aiofiles.open(part_path, "wb") as f:
+                        await f.write(part_data)
+
+                    actual_size = len(part_data)
+                    logger.info(f"Downloaded part {part_number}: CID={cid}, Size={actual_size} bytes")
+
+                    # Verify size matches expected if provided
+                    if 0 < part_size != actual_size:
+                        logger.warning(f"Part {part_number} size mismatch: Expected={part_size}, Actual={actual_size}")
 
                     part_files.append((int(part_number), part_path))
-                    total_size += part_size
+                    total_size += actual_size
                 except Exception as e:
                     logger.error(f"Failed to download part {part_number}: {e}")
                     raise
@@ -413,8 +403,10 @@ class IPFSService:
 
                 s3_result = await self.client.s3_publish(
                     file_path=str(output_path),
-                    encrypt=False,
+                    encrypt=True,
                     seed_phrase=seed_phrase,
+                    store_node=self.config.ipfs_store_url,
+                    pin_node=self.config.ipfs_store_url,
                 )
                 logger.info(
                     f"Published concatenated file: CID={s3_result.cid}, Size={s3_result.size_bytes} bytes, TX={s3_result.tx_hash}"
@@ -439,21 +431,16 @@ class IPFSService:
             # Calculate the combined ETag (required for S3 compatibility)
             # For multipart uploads, S3 uses a special ETag format
 
-            # First, download the concatenated file we just uploaded to verify integrity
-            verification_path = Path(temp_dir) / "verification_download"
-            await self.client.download_file(
-                result["cid"],
-                str(verification_path),
+            # Verify integrity by downloading the final concatenated file
+            verification_data = await self.download_file(
+                cid=result["cid"],
                 decrypt=False,
+                # Download encrypted version for verification
                 seed_phrase=seed_phrase,
-                skip_directory_check=True,
             )
 
-            # Calculate MD5 of the downloaded concatenated file
-            async with aiofiles.open(verification_path, "rb") as f:
-                verification_data = await f.read()
-                verification_md5 = hashlib.md5(verification_data).hexdigest()
-            logger.info(f"Downloaded concatenated file md5: {verification_md5}")
+            verification_md5 = hashlib.md5(verification_data).hexdigest()
+            logger.info(f"Verification: downloaded file MD5={verification_md5}, size={len(verification_data)} bytes")
 
             # Calculate individual MD5s for each part
             part_md5s = []

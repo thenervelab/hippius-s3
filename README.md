@@ -1,333 +1,205 @@
-# hippius-s3
+# Hippius S3
 
-S3 Gateway for Hippius' IPFS storage
+S3-compatible API gateway with IPFS storage and blockchain publishing
 
-Hippius-S3 is an S3-compatible API gateway that allows storing data in IPFS (InterPlanetary File System) while presenting a standard S3 interface to clients. This allows applications that work with Amazon S3 to seamlessly store their data on IPFS instead.
+## Overview
 
-## Current Status
+Hippius S3 is a production-ready S3-compatible API that stores data on IPFS while automatically publishing to the Hippius blockchain marketplace. It provides standard S3 operations with AWS SigV4 authentication, server-side encryption, and seamless integration with existing S3 clients.
 
-### Implemented Features
-- **Bucket Operations**:
-  - Create, list, and delete buckets
-  - Bucket tags support
-  - Bucket location queries
+## Features
 
-- **Object Operations**:
-  - Upload and download objects
-  - Object metadata handling
-  - List objects in buckets with prefix filtering
-  - Delete objects
+### ✅ Core S3 Operations
+- **Bucket Management**: Create, list, delete, and check bucket existence
+- **Object Operations**: Upload, download, list, delete, and copy objects
+- **Multipart Uploads**: Complete support for large file uploads with part assembly
+- **Metadata**: Custom metadata support with x-amz-meta-* headers
+- **Tagging**: Bucket and object tagging with full CRUD operations
 
-- **Multipart Uploads**:
-  - Initiate multipart uploads
-  - Upload parts with proper ETag generation
-  - Complete multipart uploads with part assembly
-  - Abort uploads with proper cleanup
-  - List ongoing multipart uploads
+### ✅ Security & Authentication
+- **AWS SigV4 HMAC**: Full AWS Signature Version 4 authentication
+- **Seed Phrase Authentication**: Base64-encoded seed phrase credentials
+- **Server-Side Encryption**: AES256 encryption via x-amz-server-side-encryption header
+- **Account Credits**: Automatic credit verification for bucket creation
 
-- **Core Components**:
-  - FastAPI application with middleware and database connection pooling
-  - PostgreSQL database integration with SQL queries and migrations
-  - IPFS integration via Hippius SDK
-  - S3-compatible XML response formatting
-  - Configuration management with environment variables
+### ✅ Blockchain Integration
+- **IPFS Storage**: Automatic file storage and pinning via Hippius SDK
+- **Blockchain Publishing**: Files automatically published to Hippius marketplace
+- **Transaction Tracking**: Blockchain transaction hashes stored in metadata
+- **Decentralized Access**: Files remain accessible via IPFS network
 
-### TODO: Missing Features
-- [ ] **Pre-signed URLs**: Implementation of pre-signed URL generation and validation
-- [ ] **Access Control Lists (ACLs)**: Fine-grained permission control for buckets and objects
-- [ ] **Server-Side Encryption**: Support for encryption headers and parameters
-- [ ] **Bucket Lifecycle Management**: Implementation of object expiration and transitions
-- [ ] **Object Versioning**: Support for multiple versions of objects
-- [ ] **Website Hosting**: Static website hosting capabilities
-- [ ] **Cross-Origin Resource Sharing (CORS)**: Bucket-specific CORS configuration
-- [ ] **Event Notifications**: Triggers for object operations
-- [ ] **Testing**: Comprehensive test suite
-- [ ] **Documentation**: OpenAPI/Swagger integration
+### ✅ S3 Client Compatibility
+Works with standard S3 clients including:
+- AWS CLI
+- MinIO Client (minio-py)
+- boto3
+- s3cmd
 
-## Setup
+## Installation
 
-This project uses modern Python tooling:
-
-- [uv](https://github.com/astral-sh/uv) for fast dependency management
-- [ruff](https://github.com/astral-sh/ruff) for linting and formatting
-- [mypy](https://github.com/python/mypy) for static type checking
-- [pytest](https://github.com/pytest-dev/pytest) for testing
-- [dbmate](https://github.com/amacneil/dbmate) for database migrations
-
-### Installation
-
-#### Production Deployment with Cloudflare Tunnel
-
-The easiest way to deploy Hippius S3 in production is using the included installation script, which is designed to work with Cloudflare Tunnel for secure access:
+### Quick Start with Docker
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/your-username/hippius-s3.git
+git clone https://github.com/thenervelab/hippius-s3.git
 cd hippius-s3
-
-# 2. Verify configuration in the script
-# The script is already configured with:
-#   - DOMAIN: s3.hippius.com (to be managed by Cloudflare)
-#   - TUNNEL_PORT: 8000 (port for Cloudflare Tunnel)
-# You can customize other settings if needed:
-nano install_script.sh
-
-# 3. Run the installation script
-chmod +x install_script.sh
-./install_script.sh
-
-# 4. Check service status
-sudo systemctl status hippius-s3
-
-# 5. Set up Cloudflare Tunnel
-# In your Cloudflare dashboard:
-# - Go to Access > Tunnels
-# - Create a new tunnel or use an existing one
-# - Add public hostname: s3.hippius.com
-# - Set service to: http://localhost:8000
-# - Save configuration
-
-# 6. View logs (if needed)
-sudo journalctl -u hippius-s3 -f
+docker compose up -d
 ```
 
-The installation script performs a complete setup:
-- Sets up PostgreSQL database
-- Creates a systemd service for reliable operation
-- Configures minimal firewall rules (only SSH and app port)
-- Configures environment variables
-- Prepares the service for Cloudflare Tunnel access
-
-Using Cloudflare Tunnel provides:
-- Automatic SSL/TLS encryption
-- DDoS protection
-- No need to expose ports to the internet
-- Access control capabilities through Cloudflare Access (optional)
-
-For customized deployments, you can modify the script or follow the manual steps in the script.
-
-#### Local Development
+### Production Deployment
 
 ```bash
-# Install with development dependencies
-uv pip install -e ".[dev]"
+# 1. Install dependencies
+pip install -r requirements.txt
 
-# Install dbmate (macOS)
-brew install dbmate
-
-# Or install dbmate (Linux)
-curl -fsSL -o ~/bin/dbmate https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-amd64
-chmod +x ~/bin/dbmate
-
-# Initialize the database (requires PostgreSQL running)
+# 2. Set up database
+createdb hippius_s3
 dbmate up
+
+# 3. Configure environment
+cp .env.example .env
+# Edit .env with your settings
+
+# 4. Run the service
+uvicorn hippius_s3.main:app --host 0.0.0.0 --port 8000
 ```
 
-#### Docker
+## Configuration
 
-The project includes a Docker setup with PostgreSQL, IPFS node, and the FastAPI application:
+### Environment Variables
 
 ```bash
-# Start all services
-docker-compose up
+# Database
+DB_HOST=localhost
+DB_PORT=5432
+DB_USER=postgres
+DB_PASSWORD=your_password
+DB_NAME=hippius_s3
 
-# Start in background
-docker-compose up -d
+# IPFS
+IPFS_STORE_URL=https://store.hippius.network
+IPFS_GET_URL=https://get.hippius.network
 
-# View logs
-docker-compose logs -f
-
-# Stop services
-docker-compose down
+# Blockchain
+VALIDATOR_REGION=decentralized
 ```
 
-The Docker setup automatically:
-- Installs dbmate in the API container
-- Applies database migrations on startup
-- Connects to PostgreSQL and IPFS services
+### Encryption Key Storage
 
-### Development
+For automatic encryption key management per user, install the Hippius SDK with key storage support:
 
 ```bash
-# Run the FastAPI application
-uvicorn hippius_s3.main:app --reload
+pip install hippius_sdk[keystore]
+```
 
-# Database operations
-dbmate up     # Apply all pending migrations
-dbmate new migration_name  # Create a new migration file
+This enables PostgreSQL-backed encryption key storage and management. See the [Hippius SDK documentation](https://github.com/thenervelab/hippius-sdk/tree/main/hippius_sdk/db) for setup details.
+
+## Usage Examples
+
+### Using MinIO Client
+
+```python
+from minio import Minio
+import base64
+
+# Encode your seed phrase
+seed_phrase = "your twelve word seed phrase here"
+encoded_key = base64.b64encode(seed_phrase.encode('utf-8')).decode('utf-8')
+
+# Create client
+client = Minio(
+    "s3.hippius.com",  # or localhost:8000
+    access_key=encoded_key,
+    secret_key=seed_phrase,
+    secure=True,
+    region="decentralized"
+)
+
+# Upload with encryption
+client.put_object(
+    "my-bucket",
+    "encrypted-file.txt",
+    data,
+    length,
+    metadata={"encrypted": "true"}
+)
+```
+
+### Using AWS CLI
+
+```bash
+# Configure AWS CLI
+aws configure set aws_access_key_id "base64-encoded-seed-phrase"
+aws configure set aws_secret_access_key "your-seed-phrase"
+aws configure set default.region "decentralized"
+aws configure set default.s3.signature_version "s3v4"
+
+# Upload file with encryption
+aws s3 cp file.txt s3://my-bucket/ \
+  --endpoint-url https://s3.hippius.com \
+  --server-side-encryption AES256
+```
+
+## API Reference
+
+The service implements S3-compatible endpoints:
+
+- `GET /` - List buckets
+- `PUT /{bucket}` - Create bucket
+- `DELETE /{bucket}` - Delete bucket
+- `PUT /{bucket}/{key}` - Upload object
+- `GET /{bucket}/{key}` - Download object
+- `DELETE /{bucket}/{key}` - Delete object
+- `POST /{bucket}/{key}?uploads` - Initiate multipart upload
+- `PUT /{bucket}/{key}?uploadId=X&partNumber=Y` - Upload part
+- `POST /{bucket}/{key}?uploadId=X` - Complete multipart upload
+
+All endpoints support standard S3 headers and return S3-compatible XML responses.
+
+## Architecture
+
+```
+Client (MinIO/AWS CLI)
+    ↓ [HTTPS + AWS SigV4]
+HAProxy/Nginx
+    ↓ [HTTP]
+Hippius S3 API
+    ↓ [s3_publish()]
+Hippius SDK
+    ↓
+IPFS Network + Blockchain
+```
+
+### Components
+
+- **FastAPI Application**: Modern async Python API framework
+- **PostgreSQL**: Metadata storage with full schema migrations
+- **Hippius SDK**: IPFS and blockchain integration
+- **HMAC Middleware**: AWS SigV4 signature verification
+- **Credit Middleware**: Account verification for operations
+
+## Development
+
+```bash
+# Install development dependencies
+pip install -e ".[dev]"
 
 # Run tests
 pytest
 
-# Run linter
-ruff check .
-
 # Format code
 ruff format .
 
-# Type check
-mypy hippius_s3 tests
+# Type checking
+mypy hippius_s3
 ```
 
-## Project Structure
+## TODO Features
 
-```
-hippius_s3/
-├── api/                # API endpoints organized by domain
-│   └── s3/             # S3 gateway endpoints
-│       ├── endpoints.py # Basic S3 operations
-│       ├── multipart.py # Multipart upload support
-│       └── schemas.py   # API schemas
-├── sql/
-│   ├── migrations/     # Database migrations (managed by dbmate)
-│   └── queries/        # SQL query files
-├── config.py           # Application configuration
-├── dependencies.py     # FastAPI dependency injection
-├── ipfs_service.py     # IPFS integration service
-├── main.py             # Application entry point
-└── utils.py            # Utility functions
-```
-
-### Implementation Details
-
-- **Database Schema**: PostgreSQL database with tables for buckets, objects, multipart uploads, and parts
-- **IPFS Integration**: Uses the Hippius SDK to interact with IPFS for storing and retrieving data
-- **S3 Compatibility**: Implements XML response formatting for S3 clients with proper error codes
-- **API Structure**: FastAPI-based endpoints with proper response models and validation
-- **Configuration**: Environment variable-based configuration with sane defaults
-
-## API Endpoints
-
-### S3 Core Operations
-
-- `POST /s3/buckets` - Create a new bucket
-- `GET /s3/buckets` - List all buckets
-- `DELETE /s3/buckets/{bucket_name}` - Delete a bucket
-- `POST /s3/objects` - Upload an object to a bucket
-- `GET /s3/objects/{bucket_name}` - List objects in a bucket
-- `GET /s3/objects/{bucket_name}/{object_key}` - Get object metadata
-- `GET /s3/download/{bucket_name}/{object_key}` - Download an object
-- `DELETE /s3/objects/{bucket_name}/{object_key}` - Delete an object
-
-### Multipart Uploads
-
-- `POST /s3/multipart/uploads` - Create a new multipart upload
-- `POST /s3/multipart/uploads/{upload_id}/parts/{part_number}` - Upload a part
-- `GET /s3/multipart/uploads/{upload_id}/parts` - List parts for a multipart upload
-- `POST /s3/multipart/uploads/{upload_id}/complete` - Complete a multipart upload
-- `DELETE /s3/multipart/uploads/{upload_id}` - Abort a multipart upload
-
-### Pre-signed URLs (Not Yet Implemented)
-
-- [ ] `POST /s3/presigned/url` - Generate a pre-signed URL for temporary access
-- [ ] `GET /s3/presigned/validate` - Validate a pre-signed URL signature (internal only)
-
-## Usage Examples
-
-### Creating a bucket
-
-```bash
-curl -X POST "http://localhost:8000/s3/buckets" \
-  -H "Content-Type: application/json" \
-  -d '{"bucket_name": "my-bucket", "is_public": false}'
-```
-
-### Uploading an object
-
-```bash
-curl -X POST "http://localhost:8000/s3/objects" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "bucket_name": "my-bucket",
-    "object_key": "hello.txt",
-    "content_type": "text/plain",
-    "file_size": 14,
-    "file_data": "SGVsbG8sIHdvcmxkIQo=",
-    "metadata": {"author": "John Doe"}
-  }'
-```
-
-### Downloading an object
-
-```bash
-curl -X GET "http://localhost:8000/s3/download/my-bucket/hello.txt" -o downloaded_file.txt
-```
-
-### Using multipart uploads for large files
-
-1. Create a multipart upload:
-```bash
-curl -X POST "http://localhost:8000/s3/multipart/uploads" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "bucket_name": "my-bucket",
-    "object_key": "large-file.zip",
-    "content_type": "application/zip"
-  }'
-```
-
-2. Upload parts (repeat for each part):
-```bash
-curl -X POST "http://localhost:8000/s3/multipart/uploads/{upload_id}/parts/1" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "part_number": 1,
-    "file_size": 1024000,
-    "file_data": "base64-encoded-part-data"
-  }'
-```
-
-3. Complete the multipart upload:
-```bash
-curl -X POST "http://localhost:8000/s3/multipart/uploads/{upload_id}/complete" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "parts": [
-      {"PartNumber": 1, "ETag": "etag1"},
-      {"PartNumber": 2, "ETag": "etag2"}
-    ]
-  }'
-```
-
-### Generating a pre-signed URL (Not Yet Implemented)
-
-```bash
-# This functionality is not yet implemented
-curl -X POST "http://localhost:8000/s3/presigned/url" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "bucket_name": "my-bucket",
-    "object_key": "hello.txt",
-    "expiration": 3600,
-    "http_method": "GET"
-  }'
-```
-
-## Roadmap
-
-The following features are planned for future development:
-
-1. Implement pre-signed URLs functionality for secure temporary access to objects
-2. Add Access Control Lists (ACLs) for fine-grained permission control
-3. Implement server-side encryption options
-4. Add support for bucket lifecycle management
-5. Develop a comprehensive test suite with high coverage
-6. Integrate OpenAPI/Swagger documentation
-7. Add object versioning support
-8. Implement CORS configuration for buckets
-9. Add event notifications for object operations
-10. Implement static website hosting capabilities
-
-## Compatibility with S3 Clients
-
-This project aims to be compatible with common S3 clients like:
-
-- [AWS CLI](https://aws.amazon.com/cli/)
-- [MinIO Client](https://docs.min.io/docs/minio-client-complete-guide.html)
-- [s3cmd](https://s3tools.org/s3cmd)
-- [boto3](https://boto3.amazonaws.com/v1/documentation/api/latest/index.html) (Python AWS SDK)
-
-The `/examples` directory contains sample code for interacting with the S3 API using these clients.
+- [ ] **Access Control Lists (ACLs)** - Fine-grained permissions
+- [ ] **Pre-signed URLs** - Temporary access without credentials
+- [ ] **Object Versioning** - Multiple versions of objects
+- [ ] **Lifecycle Management** - Automated object expiration
+- [ ] **CORS Configuration** - Cross-origin request handling
+- [ ] **Event Notifications** - Webhooks for object operations
 
 ## License
 

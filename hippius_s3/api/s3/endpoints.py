@@ -20,11 +20,12 @@ from lxml import etree as ET
 
 from hippius_s3 import dependencies
 from hippius_s3.api.s3 import errors
+from hippius_s3.config import get_config
 from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
-
+config = get_config()
 security = HTTPBearer()
 router = APIRouter(tags=["s3"])
 
@@ -1291,9 +1292,7 @@ async def put_object(
             object_key,
         )
 
-        # Detect encryption request from S3 headers
-        encrypt = request.headers.get("x-amz-server-side-encryption") == "AES256"
-
+        # Create temporary file for s3_publish
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
             temp_path = temp_file.name
             temp_file.write(file_data)
@@ -1301,14 +1300,13 @@ async def put_object(
         try:
             # Use s3_publish for IPFS upload + pinning + blockchain publishing
             seed_phrase = request.state.seed_phrase
-            logger.info(
-                f"Using seed phrase for s3_publish: '{seed_phrase}' (length: {len(seed_phrase.split()) if seed_phrase else 0} words)"
-            )
 
             s3_result = await ipfs_service.client.s3_publish(
                 file_path=temp_path,
-                encrypt=encrypt,
+                encrypt=True,
                 seed_phrase=seed_phrase,
+                store_node=config.ipfs_store_url,
+                pin_node=config.ipfs_store_url,
             )
 
             ipfs_cid = s3_result.cid
@@ -1316,19 +1314,16 @@ async def put_object(
             object_id = str(uuid.uuid4())
             created_at = datetime.now(UTC)
 
+            # Extract user metadata from headers
             metadata = {}
             for key, value in request.headers.items():
                 if key.lower().startswith("x-amz-meta-"):
                     meta_key = key[11:]
                     metadata[meta_key] = value
 
-            metadata["ipfs"] = {
-                "cid": ipfs_cid,
-                "encrypted": encrypt,
-            }
-            metadata["hippius"] = {
-                "tx_hash": tx_hash,
-            }
+            # Add system metadata
+            metadata["ipfs"] = {"cid": ipfs_cid, "encrypted": True}
+            metadata["hippius"] = {"tx_hash": tx_hash}
         finally:
             # Clean up temporary file
             if Path(temp_path).exists():
@@ -1552,67 +1547,42 @@ async def get_object(
         metadata = json.loads(result["metadata"])
 
         ipfs_metadata = metadata.get("ipfs", {})
-        is_encrypted = ipfs_metadata.get("encrypted", False)
-        is_multipart = ipfs_metadata.get("multipart", False)
-
-        logger.debug(f"Getting object {bucket_name}/{object_key} with CID: {result['ipfs_cid']}")
-
-        # Check for multipart flag in either root level or ipfs metadata object
-        is_root_multipart = metadata.get("multipart", False)
-        if is_multipart or is_root_multipart:
-            logger.debug(f"Detected multipart object: {bucket_name}/{object_key}")
-
-            # Double-check metadata CID matches DB CID
-            if ipfs_metadata.get("cid") and ipfs_metadata["cid"] != result["ipfs_cid"]:
-                logger.error(f"Metadata CID mismatch: {ipfs_metadata['cid']} != {result['ipfs_cid']}")
-
-        # Fetch the ipfs_cid from the result and use it to download the file
         ipfs_cid = result["ipfs_cid"]
 
-        # Detect multipart upload by checking metadata
+        logger.debug(f"Getting object {bucket_name}/{object_key} with CID: {ipfs_cid}")
+
+        # Handle multipart objects - check for part CIDs that need concatenation
         part_cids = ipfs_metadata.get("part_cids") or metadata.get("part_cids")
+        is_multipart = ipfs_metadata.get("multipart", False) or metadata.get("multipart", False) or bool(part_cids)
 
-        # Determine if this is a multipart upload based on metadata flags
-        found_multipart = is_multipart or is_root_multipart or part_cids
+        if is_multipart and part_cids:
+            # Reconstruct file from parts if needed
+            try:
+                part_info = [
+                    {
+                        "ipfs_cid": cid,
+                        "part_number": i,
+                        "size_bytes": 0,  # Will be determined during download
+                    }
+                    for i, cid in enumerate(part_cids, 1)
+                ]
 
-        if found_multipart or (part_cids is not None and ipfs_cid in part_cids):
-            # First, try to get the CID from metadata
-            metadata_cid = ipfs_metadata.get("cid") or metadata.get("final_cid") or metadata.get("concatenated_cid")
-            if metadata_cid and metadata_cid != ipfs_cid:
-                logger.warning(f"CID mismatch: DB has {ipfs_cid}, metadata has {metadata_cid}")
-                ipfs_cid = metadata_cid
+                concat_result = await ipfs_service.concatenate_parts(
+                    part_info,
+                    result["content_type"],
+                    object_key,
+                    seed_phrase=request.state.seed_phrase,
+                )
 
-            # When parts are available but concatenated CID is missing, concatenate them
-            part_cids = ipfs_metadata.get("part_cids") or metadata.get("part_cids")
-            if part_cids:
-                try:
-                    part_info = []
-                    for i, cid in enumerate(part_cids, 1):
-                        part_info.append(
-                            {
-                                "ipfs_cid": cid,
-                                "part_number": i,
-                                "size_bytes": 0,
-                                # Will be filled during download
-                            }
-                        )
+                logger.info(f"Reconstructed multipart file with {len(part_cids)} parts")
+                ipfs_cid = concat_result["cid"]
+            except Exception as e:
+                logger.error(f"Failed to reconstruct multipart file: {e}, using stored CID")
 
-                    # Use the concatenate_parts method to rebuild the file
-                    concat_result = await ipfs_service.concatenate_parts(
-                        part_info,
-                        result["content_type"],
-                        object_key,
-                        seed_phrase=request.state.seed_phrase,
-                    )
-
-                    logger.info(f"Successfully concatenated {len(part_cids)} parts for {bucket_name}/{object_key}")
-                    ipfs_cid = concat_result["cid"]
-                except Exception as e:
-                    logger.error(f"Concatenation failed: {e}, using original CID")
-
+        # Download file with automatic decryption (all files are encrypted now)
         file_data = await ipfs_service.download_file(
             cid=ipfs_cid,
-            decrypt=is_encrypted,
+            decrypt=True,
             seed_phrase=request.state.seed_phrase,
         )
         logger.debug(f"Downloaded {len(file_data)} bytes from IPFS CID: {ipfs_cid}")

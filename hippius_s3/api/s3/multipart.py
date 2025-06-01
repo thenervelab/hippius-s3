@@ -485,19 +485,17 @@ async def complete_multipart_upload_internal(
         if isinstance(metadata, str):
             metadata = json.loads(metadata)
 
-        # Add metadata
+        # Add metadata for multipart upload
+        parts_count = len(parts_for_concat)
         metadata.update(
             {
                 "multipart": True,
-                "parts_count": len(parts_for_concat),
-                "final_cid": final_cid,
+                "parts_count": parts_count,
                 "ipfs": {
                     "cid": final_cid,
-                    "encrypted": False,
+                    "encrypted": True,
                     "multipart": True,
-                    "parts_count": len(parts_for_concat),
                     "part_cids": [part["ipfs_cid"] for part in parts_for_concat],
-                    "total_size": concat_result["size_bytes"],
                 },
                 "hippius": {
                     "tx_hash": concat_result.get("tx_hash"),
