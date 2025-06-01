@@ -1562,7 +1562,8 @@ async def get_object(
                     {
                         "ipfs_cid": cid,
                         "part_number": i,
-                        "size_bytes": 0,  # Will be determined during download
+                        "size_bytes": 0,
+                        # Will be determined during download
                     }
                     for i, cid in enumerate(part_cids, 1)
                 ]
@@ -1721,12 +1722,18 @@ async def delete_object(
 
         # If we got here, the object was successfully deleted, so we can delete it from IPFS as well
         ipfs_cid = object_info["ipfs_cid"]
-        await ipfs_service.delete_file(
+        deletion_result = await ipfs_service.delete_file(
             ipfs_cid,
             seed_phrase=request.state.seed_phrase,
         )
+        logger.info(f"{deletion_result=}")
 
-        return Response(status_code=204)
+        return Response(
+            status_code=204,
+            headers={
+                "x-amz-request-id": ipfs_cid,
+            },
+        )
 
     except Exception:
         logger.exception("Error deleting object")
