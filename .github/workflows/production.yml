@@ -61,16 +61,16 @@ jobs:
             git pull origin production
           fi
 
-          echo "Building and starting Docker containers..."
-          docker compose down || true
-          docker compose build --no-cache
-          docker compose up -d
+          echo "Building and starting Docker containers with production config..."
+          docker compose -f docker-compose.yml -f docker-compose.prod.yml down || true
+          docker compose -f docker-compose.yml -f docker-compose.prod.yml build --no-cache
+          docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 
           echo "Waiting for database to be ready..."
           sleep 10
 
           echo "Running database migrations..."
-          docker compose exec -T api dbmate up
+          docker compose -f docker-compose.yml -f docker-compose.prod.yml exec -T api dbmate up
 
           echo "Deployment completed successfully!"
 
@@ -80,4 +80,4 @@ jobs:
         DEPLOYMENT_USER: ${{ secrets.DEPLOYMENT_USER }}
         DEPLOYMENT_PATH: ${{ secrets.DEPLOYMENT_PATH }}
       run: |
-        ssh ${DEPLOYMENT_USER}@${DEPLOYMENT_IP} "cd ${DEPLOYMENT_PATH} && docker compose ps"
+        ssh ${DEPLOYMENT_USER}@${DEPLOYMENT_IP} "cd ${DEPLOYMENT_PATH} && docker compose -f docker-compose.yml -f docker-compose.prod.yml ps"
