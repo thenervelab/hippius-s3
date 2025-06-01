@@ -1,0 +1,17 @@
+services:
+  api:
+    environment:
+      - UVICORN_LOG_LEVEL=info
+      - DEBUG=false
+
+  ipfs:
+    volumes:
+      - /ipfs:/data/ipfs
+    environment:
+      - IPFS_PROFILE=server
+      - IPFS_FD_MAX=8192
+    user: "1000:1000"
+
+# Remove the ipfs_data volume since we're using host mount
+volumes:
+  postgres_data:
