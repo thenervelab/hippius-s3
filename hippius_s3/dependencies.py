@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # TTL cache for credit checks - cache results for 60 seconds
 # maxsize=1000 allows caching up to 1000 different seed phrases
-credit_cache = TTLCache(maxsize=1000, ttl=60)
+credit_cache: TTLCache[str, bool] = TTLCache(maxsize=1000, ttl=60)
 
 
 class DBConnection:
@@ -112,7 +112,7 @@ async def check_account_has_credit(seed_phrase: str) -> bool:
     # Check cache first
     if seed_phrase in credit_cache:
         logger.debug(f"Credit check cache HIT for seed phrase: {seed_phrase[:20]}...")
-        return credit_cache[seed_phrase]
+        return bool(credit_cache[seed_phrase])
 
     logger.debug(f"Credit check cache MISS for seed phrase: {seed_phrase[:20]}...")
 

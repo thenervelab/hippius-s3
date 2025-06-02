@@ -5,11 +5,13 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
+from typing import Callable
 
 import asyncpg
 import redis.asyncio as async_redis
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi import Request
 from fastapi import Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
@@ -83,16 +85,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.postgres_pool = await postgres_create_pool(config.database_url)
         logger.info("Postgres connection pool created")
 
-        # Initialize Redis connection
-        redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
-        app.state.redis_client = async_redis.from_url(redis_url)
+        app.state.redis_client = async_redis.from_url(config.redis_url)
         logger.info("Redis client initialized")
 
-        # Initialize rate limiting service
         app.state.rate_limit_service = RateLimitService(app.state.redis_client)
         logger.info("Rate limiting service initialized")
 
-        # Initialize banhammer service
         app.state.banhammer_service = BanHammerService(app.state.redis_client)
         logger.info("Banhammer service initialized")
 
@@ -124,7 +122,7 @@ app = FastAPI(
 )
 
 
-def custom_openapi():
+def custom_openapi() -> dict:
     if app.openapi_schema:
         return app.openapi_schema
     openapi_schema = get_openapi(
@@ -146,24 +144,26 @@ def custom_openapi():
     return app.openapi_schema
 
 
-app.openapi = custom_openapi
+# Override the openapi schema generation
+app.openapi = custom_openapi  # type: ignore[method-assign]
+
+# Register middlewares (order matters!)
+# CORS middleware - add_middleware() executes in NORMAL order, so add this FIRST
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Custom middlewares - middleware("http") executes in REVERSE order
+# 1. Credit verification (executes LAST, needs seed phrase)
+app.middleware("http")(check_credit_for_all_operations)
 
 
-# Register middlewares (order matters - executed in reverse order of registration)
-# 4. Banhammer (IP-based protection - executes FIRST)
-async def banhammer_wrapper(request, call_next):
-    return await banhammer_middleware(
-        request,
-        call_next,
-        request.app.state.banhammer_service,
-    )
-
-
-app.middleware("http")(banhammer_wrapper)
-
-
-# 3. Rate limiting (per seed phrase - executes SECOND)
-async def rate_limit_wrapper(request, call_next):
+# 2. Rate limiting (per seed phrase - executes FOURTH, needs seed phrase)
+async def rate_limit_wrapper(request: Request, call_next: Callable) -> Response:
     return await rate_limit_middleware(
         request,
         call_next,
@@ -175,21 +175,20 @@ async def rate_limit_wrapper(request, call_next):
 
 app.middleware("http")(rate_limit_wrapper)
 
-# 2. Credit verification (executes THIRD)
-app.middleware("http")(check_credit_for_all_operations)
-
-# 1. HMAC authentication (extract seed phrase - executes FOURTH)
+# 3. HMAC authentication (extract seed phrase - executes THIRD)
 app.middleware("http")(verify_hmac_middleware)
 
-# 5. CORS middleware must be added LAST so it executes FIRST
-# noinspection PyTypeChecker
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+# 4. Banhammer (IP-based protection - executes SECOND, after CORS)
+async def banhammer_wrapper(request: Request, call_next: Callable) -> Response:
+    return await banhammer_middleware(
+        request,
+        call_next,
+        request.app.state.banhammer_service,
+    )
+
+
+app.middleware("http")(banhammer_wrapper)
 
 # Include routers in the correct order! Do not change this por favor.
 app.include_router(s3_router, prefix="")

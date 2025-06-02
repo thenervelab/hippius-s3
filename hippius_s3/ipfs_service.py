@@ -329,7 +329,7 @@ class IPFSService:
             total_size = 0
 
             for part_info in parts:
-                cid = part_info["ipfs_cid"]
+                cid = str(part_info["ipfs_cid"])
                 part_number = part_info["part_number"]
                 part_path = Path(temp_dir) / f"part_{part_number}"
                 part_size = int(part_info["size_bytes"])

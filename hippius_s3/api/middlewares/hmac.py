@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import logging
 import re
+from typing import Awaitable
 from typing import Callable
 from urllib.parse import quote
 
@@ -108,9 +109,9 @@ class SigV4Verifier:
         self.provided_signature = provided_signature
         logger.debug(f"SUCCESS: Extracted signed headers: {self.signed_headers}")
 
-        return provided_signature
+        return True
 
-    async def create_canonical_request(self, headers) -> str:
+    async def create_canonical_request(self, headers: list[str]) -> str:
         logger.debug(f"Creating canonical request with signed headers: {headers}")
         canonical_headers = ""
         sorted_headers = sorted(headers, key=str.lower)
@@ -128,7 +129,7 @@ class SigV4Verifier:
             else:
                 value = self.request.headers.get(header, "")
 
-            value = " ".join(value.strip().split())
+            value = " ".join((value or "").strip().split())
             canonical_headers += f"{header.lower()}:{value}\n"
             logger.debug(f"Canonical header: {header.lower()}:{value}")
 
@@ -198,7 +199,7 @@ class SigV4Verifier:
 
 async def verify_hmac_middleware(
     request: Request,
-    call_next: Callable,
+    call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
     exempt_paths = ["/docs", "/openapi.json"]
 

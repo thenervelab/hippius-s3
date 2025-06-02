@@ -1,5 +1,6 @@
 import logging
 import secrets
+from typing import Awaitable
 from typing import Callable
 
 import redis.asyncio as async_redis
@@ -52,7 +53,7 @@ class BanHammerService:
     async def is_blocked(self, ip: str) -> int | None:
         """Check if an IP is currently banned. Returns seconds until unban, or None if not banned."""
         key = f"hippius_banhammer:block:{ip}"
-        ttl = await self.redis.ttl(key)
+        ttl = int(await self.redis.ttl(key))
 
         # ttl == -2: key doesn't exist (not banned)
         # ttl == -1: key exists but no TTL (shouldn't happen)
@@ -61,7 +62,7 @@ class BanHammerService:
             return ttl
         return None
 
-    async def add_infringement(self, ip: str, reason: str = ""):
+    async def add_infringement(self, ip: str, reason: str = "") -> None:
         """Add an infringement for an IP and check if it should be banned."""
         # Add an infringement with unique key
         infringement_key = f"hippius_banhammer:infringement:{ip}:{secrets.token_hex(8)}"
@@ -103,7 +104,7 @@ class BanHammerService:
 
 async def banhammer_middleware(
     request: Request,
-    call_next: Callable,
+    call_next: Callable[[Request], Awaitable[Response]],
     banhammer_service: BanHammerService,
 ) -> Response:
     """
@@ -157,7 +158,7 @@ async def _post_request_checks(
     response: Response,
     client_ip: str,
     banhammer_service: BanHammerService,
-):
+) -> None:
     """Run post-request checks to detect suspicious behavior."""
 
     # Check 1: Too many 4xx errors (client errors)

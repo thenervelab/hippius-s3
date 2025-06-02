@@ -1,6 +1,7 @@
 import base64
 import logging
 import secrets
+from typing import Awaitable
 from typing import Callable
 
 import redis.asyncio as async_redis
@@ -23,7 +24,7 @@ class RateLimitService:
         self,
         seed_phrase: str,
         ttl_seconds: int,
-    ):
+    ) -> None:
         """Logs a request for a given seed phrase.
 
         Args:
@@ -65,7 +66,7 @@ class RateLimitService:
 
 async def rate_limit_middleware(
     request: Request,
-    call_next: Callable,
+    call_next: Callable[[Request], Awaitable[Response]],
     rate_limit_service: RateLimitService,
     max_requests: int = 100,
     window_seconds: int = 60,
