@@ -124,6 +124,13 @@ def custom_openapi():
 
 app.openapi = custom_openapi
 
+# Register middlewares (order matters - executed in reverse order of registration)
+# 1. First verify HMAC signature and extract seed phrase
+app.middleware("http")(verify_hmac_middleware)
+# 2. Check credit for bucket creation
+app.middleware("http")(check_credit_for_bucket_creation)
+
+# 3. CORS middleware must be added LAST so it executes FIRST
 # noinspection PyTypeChecker
 app.add_middleware(
     CORSMiddleware,
@@ -132,12 +139,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Register middlewares (order matters)
-# 1. First verify HMAC signature and extract seed phrase
-app.middleware("http")(verify_hmac_middleware)
-# 3. Check credit for bucket creation
-app.middleware("http")(check_credit_for_bucket_creation)
 
 # Include routers in the correct order! Do not change this por favor.
 app.include_router(s3_router, prefix="")
