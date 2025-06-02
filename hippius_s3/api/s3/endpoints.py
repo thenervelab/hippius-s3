@@ -127,6 +127,7 @@ async def list_buckets(
         )
 
 
+@router.get("/{bucket_name}/", status_code=200, include_in_schema=True)
 @router.get("/{bucket_name}", status_code=200, include_in_schema=True)
 async def get_bucket(
     bucket_name: str,
@@ -809,6 +810,7 @@ async def get_bucket_location(
         )
 
 
+@router.head("/{bucket_name}/", status_code=200)
 @router.head("/{bucket_name}", status_code=200)
 async def head_bucket(
     bucket_name: str,
@@ -839,6 +841,7 @@ async def head_bucket(
         return Response(status_code=500)  # Simple 500 response for HEAD requests
 
 
+@router.put("/{bucket_name}/", status_code=200)
 @router.put("/{bucket_name}", status_code=200)
 async def create_bucket(
     bucket_name: str,
@@ -1015,6 +1018,7 @@ async def create_bucket(
             )
 
 
+@router.delete("/{bucket_name}/", status_code=204)
 @router.delete("/{bucket_name}", status_code=204)
 async def delete_bucket(
     bucket_name: str,
@@ -1106,6 +1110,7 @@ async def delete_bucket(
         )
 
 
+@router.put("/{bucket_name}/{object_key:path}/", status_code=200)
 @router.put("/{bucket_name}/{object_key:path}", status_code=200)
 async def put_object(
     bucket_name: str,
@@ -1437,6 +1442,10 @@ async def _get_object(
 
 
 @router.head(
+    "/{bucket_name}/{object_key:path}/",
+    status_code=200,
+)
+@router.head(
     "/{bucket_name}/{object_key:path}",
     status_code=200,
 )
@@ -1513,6 +1522,7 @@ async def head_object(
         return Response(status_code=500)
 
 
+@router.get("/{bucket_name}/{object_key:path}/", status_code=200)
 @router.get("/{bucket_name}/{object_key:path}", status_code=200)
 async def get_object(
     bucket_name: str,
@@ -1639,6 +1649,7 @@ async def get_object(
         )
 
 
+@router.delete("/{bucket_name}/{object_key:path}/", status_code=204)
 @router.delete("/{bucket_name}/{object_key:path}", status_code=204)
 async def delete_object(
     bucket_name: str,

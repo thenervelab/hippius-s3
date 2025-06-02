@@ -24,6 +24,12 @@ router = APIRouter(tags=["s3-multipart"])
 
 
 @router.api_route(
+    "/{bucket_name}/{object_key:path}/",
+    methods=["POST"],
+    status_code=200,
+    include_in_schema=True,
+)
+@router.api_route(
     "/{bucket_name}/{object_key:path}",
     methods=["POST"],
     status_code=200,
@@ -171,6 +177,11 @@ async def complete_multipart_upload_handler(
 
 
 @router.put(
+    "/{bucket_name}/{object_key:path}/",
+    status_code=200,
+    include_in_schema=True,
+)
+@router.put(
     "/{bucket_name}/{object_key:path}",
     status_code=200,
     include_in_schema=True,
@@ -268,6 +279,7 @@ async def upload_part(
         )
 
 
+@router.delete("/{bucket_name}/{object_key:path}/", status_code=204)
 @router.delete("/{bucket_name}/{object_key:path}", status_code=204)
 async def abort_multipart_upload(
     bucket_name: str,
