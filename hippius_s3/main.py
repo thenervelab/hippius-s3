@@ -7,14 +7,19 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 import asyncpg
+import redis.asyncio as async_redis
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi import Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 
+from hippius_s3.api.middlewares.banhammer import BanHammerService
+from hippius_s3.api.middlewares.banhammer import banhammer_middleware
 from hippius_s3.api.middlewares.credit_check import check_credit_for_all_operations
 from hippius_s3.api.middlewares.hmac import verify_hmac_middleware
+from hippius_s3.api.middlewares.rate_limit import RateLimitService
+from hippius_s3.api.middlewares.rate_limit import rate_limit_middleware
 from hippius_s3.api.s3.endpoints import router as s3_router
 from hippius_s3.api.s3.multipart import router as multipart_router
 from hippius_s3.config import get_config
@@ -78,12 +83,31 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.postgres_pool = await postgres_create_pool(config.database_url)
         logger.info("Postgres connection pool created")
 
+        # Initialize Redis connection
+        redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+        app.state.redis_client = async_redis.from_url(redis_url)
+        logger.info("Redis client initialized")
+
+        # Initialize rate limiting service
+        app.state.rate_limit_service = RateLimitService(app.state.redis_client)
+        logger.info("Rate limiting service initialized")
+
+        # Initialize banhammer service
+        app.state.banhammer_service = BanHammerService(app.state.redis_client)
+        logger.info("Banhammer service initialized")
+
         app.state.ipfs_service = IPFSService(config)
         logger.info("IPFS service initialized")
 
         yield
 
     finally:
+        try:
+            await app.state.redis_client.close()
+            logger.info("Redis client closed")
+        except Exception:
+            logger.exception("Error shutting down Redis client")
+
         try:
             await app.state.postgres_pool.close()
             logger.info("Postgres connection pool closed")
@@ -124,13 +148,40 @@ def custom_openapi():
 
 app.openapi = custom_openapi
 
+
 # Register middlewares (order matters - executed in reverse order of registration)
-# 1. First verify HMAC signature and extract seed phrase
-app.middleware("http")(verify_hmac_middleware)
-# 2. Check credit for all operations
+# 4. Banhammer (IP-based protection - executes FIRST)
+async def banhammer_wrapper(request, call_next):
+    return await banhammer_middleware(
+        request,
+        call_next,
+        request.app.state.banhammer_service,
+    )
+
+
+app.middleware("http")(banhammer_wrapper)
+
+
+# 3. Rate limiting (per seed phrase - executes SECOND)
+async def rate_limit_wrapper(request, call_next):
+    return await rate_limit_middleware(
+        request,
+        call_next,
+        request.app.state.rate_limit_service,
+        max_requests=100,
+        window_seconds=60,
+    )
+
+
+app.middleware("http")(rate_limit_wrapper)
+
+# 2. Credit verification (executes THIRD)
 app.middleware("http")(check_credit_for_all_operations)
 
-# 3. CORS middleware must be added LAST so it executes FIRST
+# 1. HMAC authentication (extract seed phrase - executes FOURTH)
+app.middleware("http")(verify_hmac_middleware)
+
+# 5. CORS middleware must be added LAST so it executes FIRST
 # noinspection PyTypeChecker
 app.add_middleware(
     CORSMiddleware,

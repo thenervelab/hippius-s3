@@ -3,6 +3,7 @@ import logging
 from typing import Any
 from typing import AsyncGenerator
 
+import redis.asyncio as async_redis
 from cachetools import TTLCache
 from fastapi import HTTPException
 from fastapi import Request
@@ -66,6 +67,12 @@ def get_ipfs_service(request: Request) -> IPFSService:
     """Extract the IPFS service from the request."""
     service: IPFSService = request.app.state.ipfs_service
     return service
+
+
+def get_redis(request: Request) -> async_redis.Redis:
+    """Extract the Redis client from the request."""
+    redis_client: async_redis.Redis = request.app.state.redis_client
+    return redis_client
 
 
 async def extract_seed_phrase(request: Request) -> str:
