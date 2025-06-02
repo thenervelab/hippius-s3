@@ -1245,7 +1245,7 @@ async def put_object(
             # Copy any user metadata (x-amz-meta-*)
             for key, value in source_metadata.items():
                 if key not in ["ipfs", "hippius"]:
-                    metadata[key] = value
+                    metadata[key] = value  # noqa: PERF403
 
             # Create or update the object using upsert
             await db.fetchrow(
