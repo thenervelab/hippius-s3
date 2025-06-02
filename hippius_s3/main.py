@@ -13,7 +13,7 @@ from fastapi import Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 
-from hippius_s3.api.middlewares import check_credit_for_bucket_creation
+from hippius_s3.api.middlewares.credit_check import check_credit_for_all_operations
 from hippius_s3.api.middlewares.hmac import verify_hmac_middleware
 from hippius_s3.api.s3.endpoints import router as s3_router
 from hippius_s3.api.s3.multipart import router as multipart_router
@@ -127,8 +127,8 @@ app.openapi = custom_openapi
 # Register middlewares (order matters - executed in reverse order of registration)
 # 1. First verify HMAC signature and extract seed phrase
 app.middleware("http")(verify_hmac_middleware)
-# 2. Check credit for bucket creation
-app.middleware("http")(check_credit_for_bucket_creation)
+# 2. Check credit for all operations
+app.middleware("http")(check_credit_for_all_operations)
 
 # 3. CORS middleware must be added LAST so it executes FIRST
 # noinspection PyTypeChecker

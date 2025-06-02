@@ -77,12 +77,23 @@ async def list_buckets(
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
 ) -> Response:
     """
-    List all buckets using S3 protocol (GET /).
+    List user's buckets using S3 protocol (GET /).
 
     This endpoint is compatible with the S3 protocol used by MinIO and other S3 clients.
+    Returns only buckets owned by the authenticated user.
     """
     try:
-        results = await db.fetch(get_query("list_buckets"))
+        # Get or create the user_id for the current seed phrase
+        user_id = str(uuid.uuid4())
+        user = await db.fetchrow(
+            get_query("get_or_create_user"),
+            user_id,
+            request.state.seed_phrase,
+            datetime.now(UTC),
+        )
+
+        # List only buckets owned by this user
+        results = await db.fetch(get_query("list_user_buckets"), user["user_id"])
 
         root = ET.Element(
             "ListAllMyBucketsResult",
@@ -1061,10 +1072,13 @@ async def delete_bucket(
             None,
         )
 
-        # Get the user_id for the current seed phrase
+        # Get or create the user_id for the current seed phrase
+        user_id = str(uuid.uuid4())
         user = await db.fetchrow(
-            get_query("get_user_by_seed_phrase"),
+            get_query("get_or_create_user"),
+            user_id,
             request.state.seed_phrase,
+            datetime.now(UTC),
         )
 
         if not user:
@@ -1699,10 +1713,13 @@ async def delete_object(
             # S3 returns 204 even if the object doesn't exist, so no error here
             return Response(status_code=204)
 
-        # Get the user_id for the current seed phrase
+        # Get or create the user_id for the current seed phrase
+        user_id = str(uuid.uuid4())
         user = await db.fetchrow(
-            get_query("get_user_by_seed_phrase"),
+            get_query("get_or_create_user"),
+            user_id,
             request.state.seed_phrase,
+            datetime.now(UTC),
         )
 
         if not user:

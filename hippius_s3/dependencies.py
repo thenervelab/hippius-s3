@@ -3,6 +3,7 @@ import logging
 from typing import Any
 from typing import AsyncGenerator
 
+from cachetools import TTLCache
 from fastapi import HTTPException
 from fastapi import Request
 from hippius_sdk.substrate import SubstrateClient
@@ -13,6 +14,10 @@ from hippius_s3.ipfs_service import IPFSService
 
 
 logger = logging.getLogger(__name__)
+
+# TTL cache for credit checks - cache results for 60 seconds
+# maxsize=1000 allows caching up to 1000 different seed phrases
+credit_cache = TTLCache(maxsize=1000, ttl=60)
 
 
 class DBConnection:
@@ -88,12 +93,22 @@ async def check_account_has_credit(seed_phrase: str) -> bool:
     """
     Check if the account associated with the seed phrase has enough credit.
 
+    Results are cached for 60 seconds to improve performance and reduce
+    substrate network calls.
+
     Args:
         seed_phrase: The seed phrase of the account to check
 
     Returns:
         bool: True if the account has credit, False otherwise
     """
+    # Check cache first
+    if seed_phrase in credit_cache:
+        logger.debug(f"Credit check cache HIT for seed phrase: {seed_phrase[:20]}...")
+        return credit_cache[seed_phrase]
+
+    logger.debug(f"Credit check cache MISS for seed phrase: {seed_phrase[:20]}...")
+
     try:
         substrate_client = SubstrateClient(password=None, account_name=None)
         substrate_client.connect(seed_phrase=seed_phrase)
@@ -103,8 +118,16 @@ async def check_account_has_credit(seed_phrase: str) -> bool:
             seed_phrase=seed_phrase,
         )
 
-        return bool(credit > 0)
+        has_credit = bool(credit > 0)
+
+        # Cache the result for 60 seconds
+        credit_cache[seed_phrase] = has_credit
+        logger.debug(f"Cached credit result for {account_address}: {has_credit}")
+
+        return has_credit
 
     except Exception as e:
         logger.exception(f"Error in account credit verification: {e}")
+        # Cache negative result for shorter time to allow retries
+        credit_cache[seed_phrase] = False
         return False

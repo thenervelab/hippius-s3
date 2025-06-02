@@ -4,6 +4,7 @@ import hmac
 import logging
 import re
 from typing import Callable
+from urllib.parse import quote
 
 from fastapi import Request
 from fastapi import Response
@@ -30,7 +31,9 @@ class SigV4Verifier:
         self.auth_header = request.headers.get("authorization", "")
         self.amz_date = request.headers.get("x-amz-date", "")
         self.method = request.method
-        self.path = request.url.path
+        # URI encode the path according to AWS Signature V4 specs
+        # Use quote with safe='/' to encode spaces as %20 but keep slashes
+        self.path = quote(request.url.path, safe="/")
         self.query_string = request.url.query
         self.seed_phrase = ""
         self.region = config.validator_region

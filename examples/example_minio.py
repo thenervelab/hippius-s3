@@ -128,6 +128,9 @@ def verify_multipart_integrity(original_file, downloaded_file, part_size_bytes):
 
 
 def main():
+    print("=== TESTING DELETE FUNCTIONALITY AND USER ISOLATION ===")
+    print("Testing delete operations and user-scoped bucket listing...\n")
+
     # Encode seed phrases in base64
     primary_seed_phrase = os.environ["HIPPIUS_SEED_PHRASE"]  # valid seed phrase required
     secondary_seed_phrase = "another fake seed phrase for testing acl permissions"
@@ -158,6 +161,107 @@ def main():
         secure=MINIO_SECURE,
         region=MINIO_REGION,
     )
+
+    # Test 1: Delete functionality
+    print("=== TEST 1: DELETE FUNCTIONALITY ===")
+    delete_test_bucket = f"delete-test-bucket-{int(time.time())}"
+    print(f"Creating bucket for delete testing: '{delete_test_bucket}'")
+    try:
+        minio_client.make_bucket(delete_test_bucket)
+        print("✅ SUCCESS: Created bucket for delete testing")
+
+        # Upload a test object
+        test_object = "delete-test-object.txt"
+        test_content = b"This content will be deleted"
+        from io import BytesIO
+        minio_client.put_object(
+            delete_test_bucket,
+            test_object,
+            BytesIO(test_content),
+            len(test_content),
+            content_type="text/plain"
+        )
+        print(f"✅ SUCCESS: Uploaded test object '{test_object}'")
+
+        # Verify object exists
+        objects = list(minio_client.list_objects(delete_test_bucket))
+        if any(obj.object_name == test_object for obj in objects):
+            print("✅ SUCCESS: Object exists in bucket")
+        else:
+            print("❌ FAIL: Object not found in bucket")
+
+        # Delete the object
+        print(f"Deleting object '{test_object}'...")
+        minio_client.remove_object(delete_test_bucket, test_object)
+        print("✅ SUCCESS: Object deleted successfully")
+
+        # Verify object is gone
+        objects_after = list(minio_client.list_objects(delete_test_bucket))
+        if not any(obj.object_name == test_object for obj in objects_after):
+            print("✅ SUCCESS: Object no longer exists after deletion")
+        else:
+            print("❌ FAIL: Object still exists after deletion")
+
+        # Delete the bucket
+        print(f"Deleting bucket '{delete_test_bucket}'...")
+        minio_client.remove_bucket(delete_test_bucket)
+        print("✅ SUCCESS: Bucket deleted successfully")
+
+        # Verify bucket is gone
+        remaining_buckets = [bucket.name for bucket in minio_client.list_buckets()]
+        if delete_test_bucket not in remaining_buckets:
+            print("✅ SUCCESS: Bucket no longer exists after deletion")
+        else:
+            print("❌ FAIL: Bucket still exists after deletion")
+
+    except Exception as e:
+        print(f"❌ FAIL: Error with delete functionality: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # Test 2: User-scoped bucket listing
+    print("\n=== TEST 2: USER-SCOPED BUCKET LISTING ===")
+
+    # Create buckets with both users
+    user1_bucket = f"user1-bucket-{int(time.time())}"
+    user2_bucket = f"user2-bucket-{int(time.time())}"
+
+    print(f"User 1 creating bucket: {user1_bucket}")
+    minio_client.make_bucket(user1_bucket)
+
+    print(f"User 2 creating bucket: {user2_bucket}")
+    minio_client_secondary.make_bucket(user2_bucket)
+
+    # List buckets from user 1's perspective
+    print("Listing buckets from User 1's perspective:")
+    user1_buckets = minio_client.list_buckets()
+    user1_bucket_names = [bucket.name for bucket in user1_buckets]
+    print(f"User 1 sees buckets: {user1_bucket_names}")
+
+    # List buckets from user 2's perspective
+    print("Listing buckets from User 2's perspective:")
+    user2_buckets = minio_client_secondary.list_buckets()
+    user2_bucket_names = [bucket.name for bucket in user2_buckets]
+    print(f"User 2 sees buckets: {user2_bucket_names}")
+
+    # Verify isolation
+    if user1_bucket in user1_bucket_names and user1_bucket not in user2_bucket_names:
+        print("✅ SUCCESS: User 1's bucket is visible to User 1 but not User 2")
+    else:
+        print("❌ FAIL: User bucket isolation not working correctly")
+
+    if user2_bucket in user2_bucket_names and user2_bucket not in user1_bucket_names:
+        print("✅ SUCCESS: User 2's bucket is visible to User 2 but not User 1")
+    else:
+        print("❌ FAIL: User bucket isolation not working correctly")
+
+    # Clean up user test buckets
+    print("Cleaning up user test buckets...")
+    minio_client.remove_bucket(user1_bucket)
+    minio_client_secondary.remove_bucket(user2_bucket)
+    print("✅ SUCCESS: User-scoped bucket listing test completed")
+
+    print("\n=== CONTINUING WITH MAIN TESTS ===\n")
 
     # Test bucket names and object keys
     main_bucket = f"test-bucket-{int(time.time())}"
