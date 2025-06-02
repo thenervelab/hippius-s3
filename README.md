@@ -20,6 +20,7 @@ Hippius S3 is a production-ready S3-compatible API that stores data on IPFS whil
 - **Seed Phrase Authentication**: Base64-encoded seed phrase credentials
 - **Server-Side Encryption**: AES256 encryption via x-amz-server-side-encryption header
 - **Account Credits**: Automatic credit verification for bucket creation
+- **Rate Limiting**: 100 requests per minute per seed phrase to prevent abuse
 
 ### ✅ Blockchain Integration
 - **IPFS Storage**: Automatic file storage and pinning via Hippius SDK
@@ -43,6 +44,8 @@ git clone https://github.com/thenervelab/hippius-s3.git
 cd hippius-s3
 docker compose up -d
 ```
+
+The service will be available at `http://localhost:8000` with PostgreSQL, Redis, and IPFS running in containers.
 
 ### Production Deployment
 
@@ -73,6 +76,9 @@ DB_PORT=5432
 DB_USER=postgres
 DB_PASSWORD=your_password
 DB_NAME=hippius_s3
+
+# Redis (for rate limiting and caching)
+REDIS_URL=redis://localhost:6379/0
 
 # IPFS
 IPFS_STORE_URL=https://store.hippius.network
@@ -172,9 +178,11 @@ IPFS Network + Blockchain
 
 - **FastAPI Application**: Modern async Python API framework
 - **PostgreSQL**: Metadata storage with full schema migrations
+- **Redis**: Rate limiting and caching layer
 - **Hippius SDK**: IPFS and blockchain integration
 - **HMAC Middleware**: AWS SigV4 signature verification
 - **Credit Middleware**: Account verification for operations
+- **Rate Limit Middleware**: Request throttling per seed phrase
 
 ## Development
 

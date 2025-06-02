@@ -133,7 +133,8 @@ def main():
 
     # Encode seed phrases in base64
     primary_seed_phrase = os.environ["HIPPIUS_SEED_PHRASE"]  # valid seed phrase required
-    secondary_seed_phrase = "another fake seed phrase for testing acl permissions"
+    # For testing ACL/isolation, use a second valid seed phrase if provided, otherwise use the same user
+    secondary_seed_phrase = os.environ.get("HIPPIUS_SEED_PHRASE_2", primary_seed_phrase)
 
     # Base64 encode the seed phrases
     encoded_primary = base64.b64encode(primary_seed_phrase.encode("utf-8")).decode("utf-8")
@@ -141,6 +142,10 @@ def main():
 
     print(f"Base64 encoded primary seed phrase: {encoded_primary}")
     print(f"Base64 encoded secondary seed phrase: {encoded_secondary}")
+
+    if secondary_seed_phrase == primary_seed_phrase:
+        print("⚠️  NOTE: Using same user for both clients (no HIPPIUS_SEED_PHRASE_2 provided)")
+        print("   ACL tests will show same-user behavior, not true isolation")
 
     # Create MinIO client pointing to our S3-compatible API with base64 encoded seed phrase
     # The seed phrase is used as the access_key, and the corresponding HMAC secret key
@@ -230,35 +235,63 @@ def main():
     minio_client.make_bucket(user1_bucket)
 
     print(f"User 2 creating bucket: {user2_bucket}")
-    minio_client_secondary.make_bucket(user2_bucket)
+    user2_has_credits = True
+    try:
+        minio_client_secondary.make_bucket(user2_bucket)
+    except Exception as e:
+        if "InsufficientAccountCredit" in str(e):
+            print(f"⚠️  User 2 has insufficient credits - skipping user isolation tests")
+            print(f"   To test user isolation, ensure HIPPIUS_SEED_PHRASE_2 has credits")
+            user2_has_credits = False
+        else:
+            raise e
 
-    # List buckets from user 1's perspective
-    print("Listing buckets from User 1's perspective:")
-    user1_buckets = minio_client.list_buckets()
-    user1_bucket_names = [bucket.name for bucket in user1_buckets]
-    print(f"User 1 sees buckets: {user1_bucket_names}")
+    if user2_has_credits:
+        # List buckets from user 1's perspective
+        print("Listing buckets from User 1's perspective:")
+        user1_buckets = minio_client.list_buckets()
+        user1_bucket_names = [bucket.name for bucket in user1_buckets]
+        print(f"User 1 sees buckets: {user1_bucket_names}")
 
-    # List buckets from user 2's perspective
-    print("Listing buckets from User 2's perspective:")
-    user2_buckets = minio_client_secondary.list_buckets()
-    user2_bucket_names = [bucket.name for bucket in user2_buckets]
-    print(f"User 2 sees buckets: {user2_bucket_names}")
+        # List buckets from user 2's perspective
+        print("Listing buckets from User 2's perspective:")
+        user2_buckets = minio_client_secondary.list_buckets()
+        user2_bucket_names = [bucket.name for bucket in user2_buckets]
+        print(f"User 2 sees buckets: {user2_bucket_names}")
 
-    # Verify isolation
-    if user1_bucket in user1_bucket_names and user1_bucket not in user2_bucket_names:
-        print("✅ SUCCESS: User 1's bucket is visible to User 1 but not User 2")
+        # Verify isolation (adjust expectations if using same user)
+        if secondary_seed_phrase == primary_seed_phrase:
+            # Same user - both buckets should be visible to both clients
+            if user1_bucket in user1_bucket_names and user1_bucket in user2_bucket_names:
+                print("✅ SUCCESS: User 1's bucket visible to both clients (same user)")
+            else:
+                print("❌ FAIL: User 1's bucket should be visible to both clients (same user)")
+
+            if user2_bucket in user2_bucket_names and user2_bucket in user1_bucket_names:
+                print("✅ SUCCESS: User 2's bucket visible to both clients (same user)")
+            else:
+                print("❌ FAIL: User 2's bucket should be visible to both clients (same user)")
+        else:
+            # Different users - buckets should be isolated
+            if user1_bucket in user1_bucket_names and user1_bucket not in user2_bucket_names:
+                print("✅ SUCCESS: User 1's bucket is visible to User 1 but not User 2")
+            else:
+                print("❌ FAIL: User bucket isolation not working correctly")
+
+            if user2_bucket in user2_bucket_names and user2_bucket not in user1_bucket_names:
+                print("✅ SUCCESS: User 2's bucket is visible to User 2 but not User 1")
+            else:
+                print("❌ FAIL: User bucket isolation not working correctly")
+
+        # Clean up user test buckets
+        print("Cleaning up user test buckets...")
+        minio_client.remove_bucket(user1_bucket)
+        minio_client_secondary.remove_bucket(user2_bucket)
     else:
-        print("❌ FAIL: User bucket isolation not working correctly")
+        # Clean up just user 1's bucket since user 2 couldn't create one
+        print("Cleaning up user 1's bucket...")
+        minio_client.remove_bucket(user1_bucket)
 
-    if user2_bucket in user2_bucket_names and user2_bucket not in user1_bucket_names:
-        print("✅ SUCCESS: User 2's bucket is visible to User 2 but not User 1")
-    else:
-        print("❌ FAIL: User bucket isolation not working correctly")
-
-    # Clean up user test buckets
-    print("Cleaning up user test buckets...")
-    minio_client.remove_bucket(user1_bucket)
-    minio_client_secondary.remove_bucket(user2_bucket)
     print("✅ SUCCESS: User-scoped bucket listing test completed")
 
     print("\n=== CONTINUING WITH MAIN TESTS ===\n")
@@ -766,25 +799,29 @@ def main():
             content_type="application/octet-stream",
         )
 
-    print("\n--- Testing ACL enforcement for bucket deletion ---")
-    print(f"Attempting to delete bucket {acl_bucket} with secondary client (different user)")
-    try:
-        minio_client_secondary.remove_bucket(acl_bucket)
-        print("SECURITY FAILURE: Secondary user was able to delete primary user's bucket!")
-        assert False, "ACL enforcement failed for bucket deletion"
-    except Exception as e:
-        print(f"Expected error: {e}")
-        print("SUCCESS: Secondary user was not able to delete primary user's bucket (ACL protected)")
+    if secondary_seed_phrase != primary_seed_phrase:
+        print("\n--- Testing ACL enforcement for bucket deletion ---")
+        print(f"Attempting to delete bucket {acl_bucket} with secondary client (different user)")
+        try:
+            minio_client_secondary.remove_bucket(acl_bucket)
+            print("SECURITY FAILURE: Secondary user was able to delete primary user's bucket!")
+            assert False, "ACL enforcement failed for bucket deletion"
+        except Exception as e:
+            print(f"Expected error: {e}")
+            print("SUCCESS: Secondary user was not able to delete primary user's bucket (ACL protected)")
 
-    print("\n--- Testing ACL enforcement for object deletion ---")
-    print(f"Attempting to delete object {acl_object} with secondary client (different user)")
-    try:
-        minio_client_secondary.remove_object(acl_bucket, acl_object)
-        print("SECURITY FAILURE: Secondary user was able to delete primary user's object!")
-        assert False, "ACL enforcement failed for object deletion"
-    except Exception as e:
-        print(f"Expected error: {e}")
-        print("SUCCESS: Secondary user was not able to delete primary user's object (ACL protected)")
+        print("\n--- Testing ACL enforcement for object deletion ---")
+        print(f"Attempting to delete object {acl_object} with secondary client (different user)")
+        try:
+            minio_client_secondary.remove_object(acl_bucket, acl_object)
+            print("SECURITY FAILURE: Secondary user was able to delete primary user's object!")
+            assert False, "ACL enforcement failed for object deletion"
+        except Exception as e:
+            print(f"Expected error: {e}")
+            print("SUCCESS: Secondary user was not able to delete primary user's object (ACL protected)")
+    else:
+        print("\n--- Skipping ACL enforcement tests (same user for both clients) ---")
+        print("To test ACL enforcement, set HIPPIUS_SEED_PHRASE_2 environment variable")
 
     # Clean up the ACL test resources using the primary client
     print("\nCleaning up ACL test resources with primary client")

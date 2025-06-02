@@ -25,6 +25,7 @@ dependencies = [
     "botocore>=1.38.25",
     "hippius[key_storage]>=0.2.22",
     "cachetools",
+    "redis",
 ]
 
 [project.optional-dependencies]

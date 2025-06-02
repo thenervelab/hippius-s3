@@ -12,6 +12,7 @@ class Config:
     ipfs_get_url: str = env("HIPPIUS_IPFS_GET_URL")
     ipfs_store_url: str = env("HIPPIUS_IPFS_STORE_URL")
     validator_region: str = env("HIPPIUS_VALIDATOR_REGION")
+    redis_url: str = env("REDIS_URL")
 
     debug: bool = env("DEBUG:false", convert=lambda x: x.lower() == "true")
 
