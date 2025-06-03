@@ -429,15 +429,17 @@ class IPFSService:
                     "tx_hash": s3_result.tx_hash,
                 }
 
-                # Unpin the individual part CIDs since they're no longer needed
+                # Delete the individual part CIDs since they're no longer needed
                 # The final concatenated file is now pinned instead
                 for part_info in parts:
                     try:
-                        await self.client.ipfs_client.unpin(part_info["ipfs_cid"])
-                        logger.debug(f"Unpinned part CID: {part_info['ipfs_cid']}")
+                        await self.client.delete_file(
+                            part_info["ipfs_cid"], cancel_from_blockchain=False, seed_phrase=seed_phrase
+                        )
+                        logger.debug(f"Deleted part CID: {part_info['ipfs_cid']}")
                     except Exception as e:  # noqa: PERF203
-                        logger.error(f"Failed to unpin part {part_info['ipfs_cid']}: {e}")
-                        # Don't fail the whole operation if unpinning fails
+                        logger.error(f"Failed to delete part {part_info['ipfs_cid']}: {e}")
+                        # Don't fail the whole operation if deletion fails
 
             except Exception as e:
                 logger.error(f"Failed to publish concatenated file: {e}")

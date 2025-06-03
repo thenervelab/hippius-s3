@@ -16,7 +16,7 @@ from hippius_s3.ipfs_service import IPFSService
 
 logger = logging.getLogger(__name__)
 
-# maxsize=1000 allows caching up to 1000 different seed phrases
+# maxsize=1000 allows caching up to 1000 different main accounts
 credit_cache: TTLCache[str, bool] = TTLCache(maxsize=1000, ttl=60)
 
 

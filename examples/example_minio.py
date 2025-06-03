@@ -128,44 +128,155 @@ def verify_multipart_integrity(original_file, downloaded_file, part_size_bytes):
 
 
 def main():
-    print("=== TESTING DELETE FUNCTIONALITY AND USER ISOLATION ===")
-    print("Testing delete operations and user-scoped bucket listing...\n")
+    print("=== TESTING SUB-ACCOUNT PERMISSIONS AND USER ISOLATION ===")
+    print("Testing upload/delete permissions with sub-accounts and user isolation...\n")
 
-    # Encode seed phrases in base64
-    primary_seed_phrase = os.environ["HIPPIUS_SEED_PHRASE"]  # valid seed phrase required
-    # For testing ACL/isolation, use a second valid seed phrase if provided, otherwise use the same user
-    secondary_seed_phrase = os.environ.get("HIPPIUS_SEED_PHRASE_2", primary_seed_phrase)
+    # Get sub-account seed phrases from environment
+    acc1_upload = os.environ["HIPPIUS_ACC_1_SUBACCOUNT_UPLOAD"]  # Upload-only for account 1
+    acc1_uploaddelete = os.environ["HIPPIUS_ACC_1_SUBACCOUNT_UPLOADDELETE"]  # Upload+delete for account 1
+    acc2_upload = os.environ["HIPPIUS_ACC_2_SUBACCOUNT_UPLOAD"]  # Upload-only for account 2
+    acc2_uploaddelete = os.environ["HIPPIUS_ACC_2_SUBACCOUNT_UPLOADDELETE"]  # Upload+delete for account 2
 
-    # Base64 encode the seed phrases
-    encoded_primary = base64.b64encode(primary_seed_phrase.encode("utf-8")).decode("utf-8")
-    encoded_secondary = base64.b64encode(secondary_seed_phrase.encode("utf-8")).decode("utf-8")
+    # Base64 encode the seed phrases for access keys
+    encoded_acc1_upload = base64.b64encode(acc1_upload.encode("utf-8")).decode("utf-8")
+    encoded_acc1_uploaddelete = base64.b64encode(acc1_uploaddelete.encode("utf-8")).decode("utf-8")
+    encoded_acc2_upload = base64.b64encode(acc2_upload.encode("utf-8")).decode("utf-8")
+    encoded_acc2_uploaddelete = base64.b64encode(acc2_uploaddelete.encode("utf-8")).decode("utf-8")
 
-    print(f"Base64 encoded primary seed phrase: {encoded_primary}")
-    print(f"Base64 encoded secondary seed phrase: {encoded_secondary}")
+    print(f"Account 1 Upload-only client: {encoded_acc1_upload[:20]}...")
+    print(f"Account 1 Upload+Delete client: {encoded_acc1_uploaddelete[:20]}...")
+    print(f"Account 2 Upload-only client: {encoded_acc2_upload[:20]}...")
+    print(f"Account 2 Upload+Delete client: {encoded_acc2_uploaddelete[:20]}...")
 
-    if secondary_seed_phrase == primary_seed_phrase:
-        print("⚠️  NOTE: Using same user for both clients (no HIPPIUS_SEED_PHRASE_2 provided)")
-        print("   ACL tests will show same-user behavior, not true isolation")
-
-    # Create MinIO client pointing to our S3-compatible API with base64 encoded seed phrase
-    # The seed phrase is used as the access_key, and the corresponding HMAC secret key
-    # Both work together to create the SigV4 signature
-    minio_client = Minio(
+    # Create 4 different MinIO clients with different permission levels
+    # Account 1 - Upload only
+    acc1_upload_client = Minio(
         MINIO_URL,
-        access_key=encoded_primary,  # Base64 encoded seed phrase
-        secret_key=primary_seed_phrase,  # The seed phrase is also used as the HMAC secret
-        secure=MINIO_SECURE,
-        region=MINIO_REGION,  # Match the region used in our SigV4 implementation
-    )
-    # Create a second client with different seed phrase (different user)
-    # This will be used to test ACL permissions
-    minio_client_secondary = Minio(
-        MINIO_URL,
-        access_key=encoded_secondary,
-        secret_key=secondary_seed_phrase,  # The seed phrase is also used as the HMAC secret
+        access_key=encoded_acc1_upload,
+        secret_key=acc1_upload,
         secure=MINIO_SECURE,
         region=MINIO_REGION,
     )
+
+    # Account 1 - Upload + Delete
+    acc1_uploaddelete_client = Minio(
+        MINIO_URL,
+        access_key=encoded_acc1_uploaddelete,
+        secret_key=acc1_uploaddelete,
+        secure=MINIO_SECURE,
+        region=MINIO_REGION,
+    )
+
+    # Account 2 - Upload only
+    acc2_upload_client = Minio(
+        MINIO_URL,
+        access_key=encoded_acc2_upload,
+        secret_key=acc2_upload,
+        secure=MINIO_SECURE,
+        region=MINIO_REGION,
+    )
+
+    # Account 2 - Upload + Delete
+    acc2_uploaddelete_client = Minio(
+        MINIO_URL,
+        access_key=encoded_acc2_uploaddelete,
+        secret_key=acc2_uploaddelete,
+        secure=MINIO_SECURE,
+        region=MINIO_REGION,
+    )
+
+    # For backwards compatibility, use the upload+delete client as the primary client
+    minio_client = acc1_uploaddelete_client
+    minio_client_secondary = acc2_uploaddelete_client
+
+    # NEW: Test sub-account permissions
+    print("\n=== SUB-ACCOUNT PERMISSION TESTS ===")
+
+    # Create a test bucket and object with account 1's upload+delete client
+    permission_test_bucket = f"permission-test-{int(time.time())}"
+    permission_test_object = "permission-test.txt"
+    test_content = b"Test content for permission testing"
+
+    print(f"Creating test bucket '{permission_test_bucket}' with Account 1 upload+delete client...")
+    acc1_uploaddelete_client.make_bucket(permission_test_bucket)
+
+    print(f"Uploading test object with Account 1 upload+delete client...")
+    from io import BytesIO
+    acc1_uploaddelete_client.put_object(
+        permission_test_bucket,
+        permission_test_object,
+        BytesIO(test_content),
+        len(test_content),
+        content_type="text/plain"
+    )
+
+    # Test 1: Account 1 upload-only client tries to upload (should succeed)
+    print("\n--- Test: Account 1 upload-only client uploading ---")
+    try:
+        upload_only_object = "upload-only-test.txt"
+        acc1_upload_client.put_object(
+            permission_test_bucket,
+            upload_only_object,
+            BytesIO(b"Upload only test"),
+            len(b"Upload only test"),
+            content_type="text/plain"
+        )
+        print("✅ SUCCESS: Account 1 upload-only client can upload objects")
+    except Exception as e:
+        print(f"❌ UNEXPECTED FAILURE: Account 1 upload-only client failed to upload: {e}")
+
+    # Test 2: Account 1 upload-only client tries to delete (should fail)
+    print("\n--- Test: Account 1 upload-only client trying to delete ---")
+    try:
+        acc1_upload_client.remove_object(permission_test_bucket, permission_test_object)
+        print("❌ SECURITY FAILURE: Account 1 upload-only client was able to delete!")
+        assert False, "Upload-only client should not be able to delete"
+    except Exception as e:
+        print(f"✅ SUCCESS: Account 1 upload-only client blocked from deleting: {e}")
+
+    # Test 3: Account 2 upload-only client tries to access Account 1's bucket (should fail)
+    print("\n--- Test: Account 2 upload-only client accessing Account 1's bucket ---")
+    try:
+        acc2_upload_client.put_object(
+            permission_test_bucket,
+            "cross-account-test.txt",
+            BytesIO(b"Cross account test"),
+            len(b"Cross account test"),
+            content_type="text/plain"
+        )
+        print("❌ SECURITY FAILURE: Account 2 client accessed Account 1's bucket!")
+        assert False, "Cross-account access should be denied"
+    except Exception as e:
+        print(f"✅ SUCCESS: Account 2 client blocked from Account 1's bucket: {e}")
+
+    # Test 4: Account 2 upload+delete client tries to delete from Account 1's bucket (should fail)
+    print("\n--- Test: Account 2 upload+delete client trying to delete from Account 1's bucket ---")
+    try:
+        acc2_uploaddelete_client.remove_object(permission_test_bucket, permission_test_object)
+        print("❌ SECURITY FAILURE: Account 2 upload+delete client deleted from Account 1's bucket!")
+        assert False, "Cross-account deletion should be denied"
+    except Exception as e:
+        print(f"✅ SUCCESS: Account 2 upload+delete client blocked from Account 1's bucket: {e}")
+
+    # Test 5: Account 1 upload+delete client can delete (should succeed)
+    print("\n--- Test: Account 1 upload+delete client deleting ---")
+    try:
+        acc1_uploaddelete_client.remove_object(permission_test_bucket, permission_test_object)
+        print("✅ SUCCESS: Account 1 upload+delete client can delete objects")
+    except Exception as e:
+        print(f"❌ UNEXPECTED FAILURE: Account 1 upload+delete client failed to delete: {e}")
+
+    # Clean up permission test resources
+    print("\n--- Cleaning up permission test resources ---")
+    try:
+        # Clean up any remaining objects
+        objects = list(acc1_uploaddelete_client.list_objects(permission_test_bucket))
+        for obj in objects:
+            acc1_uploaddelete_client.remove_object(permission_test_bucket, obj.object_name)
+        acc1_uploaddelete_client.remove_bucket(permission_test_bucket)
+        print("✅ Permission test cleanup completed")
+    except Exception as e:
+        print(f"⚠️  Warning during permission test cleanup: {e}")
 
     # Test 1: Delete functionality
     print("=== TEST 1: DELETE FUNCTIONALITY ===")
@@ -224,75 +335,62 @@ def main():
         import traceback
         traceback.print_exc()
 
-    # Test 2: User-scoped bucket listing
-    print("\n=== TEST 2: USER-SCOPED BUCKET LISTING ===")
+    # Test 2: Main account isolation (different main accounts)
+    print("\n=== TEST 2: MAIN ACCOUNT ISOLATION ===")
 
-    # Create buckets with both users
-    user1_bucket = f"user1-bucket-{int(time.time())}"
-    user2_bucket = f"user2-bucket-{int(time.time())}"
+    # Create buckets with both main accounts (using their upload+delete sub-accounts)
+    account1_bucket = f"account1-bucket-{int(time.time())}"
+    account2_bucket = f"account2-bucket-{int(time.time())}"
 
-    print(f"User 1 creating bucket: {user1_bucket}")
-    minio_client.make_bucket(user1_bucket)
+    print(f"Account 1 creating bucket: {account1_bucket}")
+    acc1_uploaddelete_client.make_bucket(account1_bucket)
 
-    print(f"User 2 creating bucket: {user2_bucket}")
-    user2_has_credits = True
+    print(f"Account 2 creating bucket: {account2_bucket}")
+    account2_has_credits = True
     try:
-        minio_client_secondary.make_bucket(user2_bucket)
+        acc2_uploaddelete_client.make_bucket(account2_bucket)
     except Exception as e:
-        if "InsufficientAccountCredit" in str(e):
-            print(f"⚠️  User 2 has insufficient credits - skipping user isolation tests")
-            print(f"   To test user isolation, ensure HIPPIUS_SEED_PHRASE_2 has credits")
-            user2_has_credits = False
+        if "InsufficientAccountCredit" in str(e) or "AccountVerificationError" in str(e):
+            print(f"⚠️  Account 2 has insufficient credits or verification error - skipping isolation tests")
+            print(f"   To test isolation, ensure Account 2's sub-accounts have credits")
+            account2_has_credits = False
         else:
             raise e
 
-    if user2_has_credits:
-        # List buckets from user 1's perspective
-        print("Listing buckets from User 1's perspective:")
-        user1_buckets = minio_client.list_buckets()
-        user1_bucket_names = [bucket.name for bucket in user1_buckets]
-        print(f"User 1 sees buckets: {user1_bucket_names}")
+    if account2_has_credits:
+        # List buckets from account 1's perspective
+        print("Listing buckets from Account 1's perspective:")
+        account1_buckets = acc1_uploaddelete_client.list_buckets()
+        account1_bucket_names = [bucket.name for bucket in account1_buckets]
+        print(f"Account 1 sees buckets: {account1_bucket_names}")
 
-        # List buckets from user 2's perspective
-        print("Listing buckets from User 2's perspective:")
-        user2_buckets = minio_client_secondary.list_buckets()
-        user2_bucket_names = [bucket.name for bucket in user2_buckets]
-        print(f"User 2 sees buckets: {user2_bucket_names}")
+        # List buckets from account 2's perspective
+        print("Listing buckets from Account 2's perspective:")
+        account2_buckets = acc2_uploaddelete_client.list_buckets()
+        account2_bucket_names = [bucket.name for bucket in account2_buckets]
+        print(f"Account 2 sees buckets: {account2_bucket_names}")
 
-        # Verify isolation (adjust expectations if using same user)
-        if secondary_seed_phrase == primary_seed_phrase:
-            # Same user - both buckets should be visible to both clients
-            if user1_bucket in user1_bucket_names and user1_bucket in user2_bucket_names:
-                print("✅ SUCCESS: User 1's bucket visible to both clients (same user)")
-            else:
-                print("❌ FAIL: User 1's bucket should be visible to both clients (same user)")
-
-            if user2_bucket in user2_bucket_names and user2_bucket in user1_bucket_names:
-                print("✅ SUCCESS: User 2's bucket visible to both clients (same user)")
-            else:
-                print("❌ FAIL: User 2's bucket should be visible to both clients (same user)")
+        # Verify isolation (should always be isolated since different main accounts)
+        if account1_bucket in account1_bucket_names and account1_bucket not in account2_bucket_names:
+            print("✅ SUCCESS: Account 1's bucket is visible to Account 1 but not Account 2")
         else:
-            # Different users - buckets should be isolated
-            if user1_bucket in user1_bucket_names and user1_bucket not in user2_bucket_names:
-                print("✅ SUCCESS: User 1's bucket is visible to User 1 but not User 2")
-            else:
-                print("❌ FAIL: User bucket isolation not working correctly")
+            print("❌ FAIL: Main account isolation not working correctly")
 
-            if user2_bucket in user2_bucket_names and user2_bucket not in user1_bucket_names:
-                print("✅ SUCCESS: User 2's bucket is visible to User 2 but not User 1")
-            else:
-                print("❌ FAIL: User bucket isolation not working correctly")
+        if account2_bucket in account2_bucket_names and account2_bucket not in account1_bucket_names:
+            print("✅ SUCCESS: Account 2's bucket is visible to Account 2 but not Account 1")
+        else:
+            print("❌ FAIL: Main account isolation not working correctly")
 
-        # Clean up user test buckets
-        print("Cleaning up user test buckets...")
-        minio_client.remove_bucket(user1_bucket)
-        minio_client_secondary.remove_bucket(user2_bucket)
+        # Clean up account test buckets
+        print("Cleaning up account test buckets...")
+        acc1_uploaddelete_client.remove_bucket(account1_bucket)
+        acc2_uploaddelete_client.remove_bucket(account2_bucket)
     else:
-        # Clean up just user 1's bucket since user 2 couldn't create one
-        print("Cleaning up user 1's bucket...")
-        minio_client.remove_bucket(user1_bucket)
+        # Clean up just account 1's bucket since account 2 couldn't create one
+        print("Cleaning up account 1's bucket...")
+        acc1_uploaddelete_client.remove_bucket(account1_bucket)
 
-    print("✅ SUCCESS: User-scoped bucket listing test completed")
+    print("✅ SUCCESS: Main account isolation test completed")
 
     print("\n=== CONTINUING WITH MAIN TESTS ===\n")
 
@@ -776,58 +874,6 @@ def main():
             os.unlink(file_path)
 
     print(f"Cleaned up all local multipart test files")
-
-    print("\n=== ACL TESTING OPERATIONS ===")
-
-    # Create a bucket using the primary client (user)
-    acl_bucket = f"acl-test-bucket-{int(time.time())}"
-    acl_object = "acl-test-object.bin"
-
-    print(f"Creating ACL test bucket: {acl_bucket}")
-    minio_client.make_bucket(acl_bucket)
-
-    # Upload a test object to the bucket
-    print(f"Uploading ACL test object: {acl_object}")
-    acl_test_file = create_test_file(1)  # 1MB
-    with open(acl_test_file, "rb") as file_data:
-        acl_size = os.path.getsize(acl_test_file)
-        minio_client.put_object(
-            acl_bucket,
-            acl_object,
-            file_data,
-            acl_size,
-            content_type="application/octet-stream",
-        )
-
-    if secondary_seed_phrase != primary_seed_phrase:
-        print("\n--- Testing ACL enforcement for bucket deletion ---")
-        print(f"Attempting to delete bucket {acl_bucket} with secondary client (different user)")
-        try:
-            minio_client_secondary.remove_bucket(acl_bucket)
-            print("SECURITY FAILURE: Secondary user was able to delete primary user's bucket!")
-            assert False, "ACL enforcement failed for bucket deletion"
-        except Exception as e:
-            print(f"Expected error: {e}")
-            print("SUCCESS: Secondary user was not able to delete primary user's bucket (ACL protected)")
-
-        print("\n--- Testing ACL enforcement for object deletion ---")
-        print(f"Attempting to delete object {acl_object} with secondary client (different user)")
-        try:
-            minio_client_secondary.remove_object(acl_bucket, acl_object)
-            print("SECURITY FAILURE: Secondary user was able to delete primary user's object!")
-            assert False, "ACL enforcement failed for object deletion"
-        except Exception as e:
-            print(f"Expected error: {e}")
-            print("SUCCESS: Secondary user was not able to delete primary user's object (ACL protected)")
-    else:
-        print("\n--- Skipping ACL enforcement tests (same user for both clients) ---")
-        print("To test ACL enforcement, set HIPPIUS_SEED_PHRASE_2 environment variable")
-
-    # Clean up the ACL test resources using the primary client
-    print("\nCleaning up ACL test resources with primary client")
-    minio_client.remove_object(acl_bucket, acl_object)
-    minio_client.remove_bucket(acl_bucket)
-    os.unlink(acl_test_file)
 
     print("\n=== CLEANUP OPERATIONS ===")
 

@@ -83,17 +83,8 @@ async def list_buckets(
     Returns only buckets owned by the authenticated user.
     """
     try:
-        # Get or create the user_id for the current seed phrase
-        user_id = str(uuid.uuid4())
-        user = await db.fetchrow(
-            get_query("get_or_create_user"),
-            user_id,
-            request.state.seed_phrase,
-            datetime.now(UTC),
-        )
-
-        # List only buckets owned by this user
-        results = await db.fetch(get_query("list_user_buckets"), user["user_id"])
+        # List only buckets owned by this main account
+        results = await db.fetch(get_query("list_user_buckets"), request.state.account.main_account)
 
         root = ET.Element(
             "ListAllMyBucketsResult",
@@ -159,7 +150,7 @@ async def get_bucket(
         return await get_bucket_location(
             bucket_name,
             db,
-            request.state.seed_phrase,
+            request.state.account.main_account,
         )
 
     # If the tagging query parameter is present, this is a bucket tags request
@@ -167,21 +158,10 @@ async def get_bucket(
         logger.info(f"Handling tagging request for bucket {bucket_name}")
 
         try:
-            # Get user for user-scoped bucket lookup
-            user = await db.fetchrow(
-                get_query("get_user_by_seed_phrase"),
-                request.state.seed_phrase,
+            # Get bucket for this main account
+            bucket = await db.fetchrow(
+                get_query("get_bucket_by_name_and_owner"), bucket_name, request.state.account.main_account
             )
-            if not user:
-                user_id = str(uuid.uuid4())
-                user = await db.fetchrow(
-                    get_query("get_or_create_user"),
-                    user_id,
-                    request.state.seed_phrase,
-                    datetime.now(UTC),
-                )
-
-            bucket = await db.fetchrow(get_query("get_bucket_by_name_and_owner"), bucket_name, user["user_id"])
 
             if not bucket:
                 # For S3 compatibility, return XML error for non-existent buckets
@@ -248,6 +228,7 @@ async def get_bucket(
             bucket_name,
             db,
             request.state.seed_phrase,
+            request.state.account.main_account,
         )
 
     # If the uploads parameter is present, this is a multipart uploads listing request
@@ -259,24 +240,11 @@ async def get_bucket(
         return await list_multipart_uploads(bucket_name, request, db)
 
     try:
-        # Get user for user-scoped bucket lookup
-        user = await db.fetchrow(
-            get_query("get_user_by_seed_phrase"),
-            request.state.seed_phrase,
-        )
-        if not user:
-            user_id = str(uuid.uuid4())
-            user = await db.fetchrow(
-                get_query("get_or_create_user"),
-                user_id,
-                request.state.seed_phrase,
-                datetime.now(UTC),
-            )
-
+        # Get bucket for this main account
         bucket = await db.fetchrow(
             get_query("get_bucket_by_name_and_owner"),
             bucket_name,
-            user["user_id"],
+            request.state.account.main_account,
         )
 
         if not bucket:
@@ -365,7 +333,7 @@ async def get_bucket(
 async def delete_bucket_tags(
     bucket_name: str,
     db: dependencies.DBConnection,
-    seed_phrase: str,
+    main_account_id: str,
 ) -> Response:
     """
     Delete all tags from a bucket (DELETE /{bucket_name}?tagging).
@@ -373,19 +341,11 @@ async def delete_bucket_tags(
     This is used by the MinIO client to remove all bucket tags.
     """
     try:
-        # Get user for user-scoped bucket lookup
-        user_id = str(uuid.uuid4())
-        user = await db.fetchrow(
-            get_query("get_or_create_user"),
-            user_id,
-            seed_phrase,
-            datetime.now(UTC),
-        )
-
+        # Get bucket for this main account
         bucket = await db.fetchrow(
             get_query("get_bucket_by_name_and_owner"),
             bucket_name,
-            user["user_id"],
+            main_account_id,
         )
 
         if not bucket:
@@ -422,6 +382,7 @@ async def get_object_tags(
     object_key: str,
     db: dependencies.DBConnection,
     seed_phrase: str,
+    main_account_id: str,
 ) -> Response:
     """
     Get the tags of an object (GET /{bucket_name}/{object_key}?tagging).
@@ -430,18 +391,16 @@ async def get_object_tags(
     """
     try:
         # Get user for user-scoped bucket lookup
-        user_id = str(uuid.uuid4())
-        user = await db.fetchrow(
-            get_query("get_or_create_user"),
-            user_id,
-            seed_phrase,
+        await db.fetchrow(
+            get_query("get_or_create_user_by_main_account"),
+            main_account_id,
             datetime.now(UTC),
         )
 
         bucket = await db.fetchrow(
             get_query("get_bucket_by_name_and_owner"),
             bucket_name,
-            user["user_id"],
+            main_account_id,
         )
 
         if not bucket:
@@ -519,6 +478,7 @@ async def set_object_tags(
     request: Request,
     db: dependencies.DBConnection,
     seed_phrase: str,
+    main_account_id: str,
 ) -> Response:
     """
     Set tags for an object (PUT /{bucket_name}/{object_key}?tagging).
@@ -526,19 +486,16 @@ async def set_object_tags(
     This is used by the MinIO client to set object tags.
     """
     try:
-        # Get user for user-scoped bucket lookup
-        user_id = str(uuid.uuid4())
-        user = await db.fetchrow(
-            get_query("get_or_create_user"),
-            user_id,
-            seed_phrase,
+        await db.fetchrow(
+            get_query("get_or_create_user_by_main_account"),
+            main_account_id,
             datetime.now(UTC),
         )
 
         bucket = await db.fetchrow(
             get_query("get_bucket_by_name_and_owner"),
             bucket_name,
-            user["user_id"],
+            main_account_id,
         )
 
         if not bucket:
@@ -629,6 +586,7 @@ async def delete_object_tags(
     object_key: str,
     db: dependencies.DBConnection,
     seed_phrase: str,
+    main_account_id: str,
 ) -> Response:
     """
     Delete all tags from an object (DELETE /{bucket_name}/{object_key}?tagging).
@@ -637,18 +595,16 @@ async def delete_object_tags(
     """
     try:
         # Get user for user-scoped bucket lookup
-        user_id = str(uuid.uuid4())
         user = await db.fetchrow(
-            get_query("get_or_create_user"),
-            user_id,
-            seed_phrase,
+            get_query("get_or_create_user_by_main_account"),
+            main_account_id,
             datetime.now(UTC),
         )
 
         bucket = await db.fetchrow(
             get_query("get_bucket_by_name_and_owner"),
             bucket_name,
-            user["user_id"],
+            user["main_account_id"],
         )
 
         if not bucket:
@@ -706,6 +662,7 @@ async def get_bucket_tags(
     bucket_name: str,
     db: dependencies.DBConnection,
     seed_phrase: str,
+    main_account_id: str,
 ) -> Response:
     """
     Get the tags of a bucket (GET /{bucket_name}?tagging).
@@ -715,18 +672,16 @@ async def get_bucket_tags(
     logger.info(f"Getting tags for bucket {bucket_name}")
     try:
         # Get user for user-scoped bucket lookup
-        user_id = str(uuid.uuid4())
         user = await db.fetchrow(
-            get_query("get_or_create_user"),
-            user_id,
-            seed_phrase,
+            get_query("get_or_create_user_by_main_account"),
+            main_account_id,
             datetime.now(UTC),
         )
 
         bucket = await db.fetchrow(
             get_query("get_bucket_by_name_and_owner"),
             bucket_name,
-            user["user_id"],
+            user["main_account_id"],
         )
 
         if not bucket:
@@ -798,6 +753,7 @@ async def get_bucket_lifecycle(
     bucket_name: str,
     db: dependencies.DBConnection,
     seed_phrase: str,
+    main_account_id: str,
 ) -> Response:
     """
     Get the lifecycle configuration of a bucket (GET /{bucket_name}?lifecycle).
@@ -806,18 +762,16 @@ async def get_bucket_lifecycle(
     """
     try:
         # Get user for user-scoped bucket lookup
-        user_id = str(uuid.uuid4())
         user = await db.fetchrow(
-            get_query("get_or_create_user"),
-            user_id,
-            seed_phrase,
+            get_query("get_or_create_user_by_main_account"),
+            main_account_id,
             datetime.now(UTC),
         )
 
         bucket = await db.fetchrow(
             get_query("get_bucket_by_name_and_owner"),
             bucket_name,
-            user["user_id"],
+            user["main_account_id"],
         )
 
         if not bucket:
@@ -874,7 +828,7 @@ async def get_bucket_lifecycle(
 async def get_bucket_location(
     bucket_name: str,
     db: dependencies.DBConnection,
-    seed_phrase: str,
+    main_account_id: str,
 ) -> Response:
     """
     Get the region/location of a bucket (GET /{bucket_name}?location).
@@ -924,18 +878,17 @@ async def head_bucket(
     """
     try:
         # Get user for user-scoped bucket lookup
-        user_id = str(uuid.uuid4())
-        user = await db.fetchrow(
-            get_query("get_or_create_user"),
-            user_id,
-            request.state.seed_phrase,
+        main_account_id = request.state.account.main_account
+        await db.fetchrow(
+            get_query("get_or_create_user_by_main_account"),
+            main_account_id,
             datetime.now(UTC),
         )
 
         bucket = await db.fetchrow(
             get_query("get_bucket_by_name_and_owner"),
             bucket_name,
-            user["user_id"],
+            main_account_id,
         )
 
         if not bucket:
@@ -969,18 +922,16 @@ async def create_bucket(
     if "lifecycle" in request.query_params:
         try:
             # Get user for user-scoped bucket lookup
-            user_id = str(uuid.uuid4())
             user = await db.fetchrow(
-                get_query("get_or_create_user"),
-                user_id,
-                request.state.seed_phrase,
+                get_query("get_or_create_user_by_main_account"),
+                request.state.account.main_account,
                 datetime.now(UTC),
             )
 
             bucket = await db.fetchrow(
                 get_query("get_bucket_by_name_and_owner"),
                 bucket_name,
-                user["user_id"],
+                user["main_account_id"],
             )
 
             if not bucket:
@@ -1033,11 +984,9 @@ async def create_bucket(
     elif "tagging" in request.query_params:
         try:
             # Get user for user-scoped bucket lookup
-            user_id = str(uuid.uuid4())
             user = await db.fetchrow(
-                get_query("get_or_create_user"),
-                user_id,
-                request.state.seed_phrase,
+                get_query("get_or_create_user_by_main_account"),
+                request.state.account.main_account,
                 datetime.now(UTC),
             )
 
@@ -1045,7 +994,7 @@ async def create_bucket(
             bucket = await db.fetchrow(
                 get_query("get_bucket_by_name_and_owner"),
                 bucket_name,
-                user["user_id"],
+                user["main_account_id"],
             )
 
             if not bucket:
@@ -1109,16 +1058,15 @@ async def create_bucket(
             created_at = datetime.now(UTC)
             is_public = True
 
-            # Get or create user record for the seed phrase
-            user_id = str(uuid.uuid4())
-            user = await db.fetchrow(
-                get_query("get_or_create_user"),
-                user_id,
-                request.state.seed_phrase,
+            # Get or create user record for the main account
+            main_account_id = request.state.account.main_account
+            await db.fetchrow(
+                get_query("get_or_create_user_by_main_account"),
+                main_account_id,
                 created_at,
             )
 
-            logger.info(f"Creating bucket '{bucket_name}' via S3 protocol for user {user['user_id']}")
+            logger.info(f"Creating bucket '{bucket_name}' via S3 protocol for account {main_account_id}")
 
             query = get_query("create_bucket")
             await db.fetchrow(
@@ -1127,7 +1075,7 @@ async def create_bucket(
                 bucket_name,
                 created_at,
                 is_public,
-                user["user_id"],
+                main_account_id,
             )
 
             return Response(status_code=200)
@@ -1167,23 +1115,16 @@ async def delete_bucket(
         return await delete_bucket_tags(
             bucket_name,
             db,
-            request.state.seed_phrase,
+            request.state.account.main_account,
         )
 
     try:
-        # Get user for user-scoped bucket lookup
-        user_id = str(uuid.uuid4())
-        user = await db.fetchrow(
-            get_query("get_or_create_user"),
-            user_id,
-            request.state.seed_phrase,
-            datetime.now(UTC),
-        )
-
+        # Get bucket for this main account
+        main_account_id = request.state.account.main_account
         bucket = await db.fetchrow(
             get_query("get_bucket_by_name_and_owner"),
             bucket_name,
-            user["user_id"],
+            main_account_id,
         )
 
         if not bucket:
@@ -1201,26 +1142,15 @@ async def delete_bucket(
             None,
         )
 
-        # Use the user already retrieved above
-
-        if not user:
-            logger.warning(f"User with seed phrase not found when trying to delete bucket {bucket_name}")
-            return create_xml_error_response(
-                "AccessDenied",
-                f"You do not have permission to delete bucket {bucket_name}",
-                status_code=403,
-                BucketName=bucket_name,
-            )
-
-        # Delete bucket and check if user has permission
+        # Delete bucket (permission is checked via main_account_id ownership)
         deleted_bucket = await db.fetchrow(
             get_query("delete_bucket"),
             bucket["bucket_id"],
-            user["user_id"],
+            main_account_id,
         )
 
         if not deleted_bucket:
-            logger.warning(f"User {user['user_id']} tried to delete bucket {bucket_name} without permission")
+            logger.warning(f"Account {main_account_id} tried to delete bucket {bucket_name} without permission")
             return create_xml_error_response(
                 "AccessDenied",
                 f"You do not have permission to delete bucket {bucket_name}",
@@ -1284,6 +1214,7 @@ async def put_object(
             request,
             db,
             request.state.seed_phrase,
+            request.state.account.main_account,
         )
 
     # Check if this is a copy operation
@@ -1309,11 +1240,9 @@ async def put_object(
             source_bucket_name, source_object_key = source_parts
 
             # Get user for user-scoped bucket lookup
-            user_id = str(uuid.uuid4())
             user = await db.fetchrow(
-                get_query("get_or_create_user"),
-                user_id,
-                request.state.seed_phrase,
+                get_query("get_or_create_user_by_main_account"),
+                request.state.account.main_account,
                 datetime.now(UTC),
             )
 
@@ -1321,7 +1250,7 @@ async def put_object(
             source_bucket = await db.fetchrow(
                 get_query("get_bucket_by_name_and_owner"),
                 source_bucket_name,
-                user["user_id"],
+                user["main_account_id"],
             )
 
             if not source_bucket:
@@ -1336,7 +1265,7 @@ async def put_object(
             dest_bucket = await db.fetchrow(
                 get_query("get_bucket_by_name_and_owner"),
                 bucket_name,
-                user["user_id"],
+                user["main_account_id"],
             )
 
             if not dest_bucket:
@@ -1419,19 +1348,18 @@ async def put_object(
             )
 
     try:
-        # Get user for user-scoped bucket lookup
-        user_id = str(uuid.uuid4())
-        user = await db.fetchrow(
-            get_query("get_or_create_user"),
-            user_id,
-            request.state.seed_phrase,
+        # Get or create user and bucket for this main account
+        main_account_id = request.state.account.main_account
+        await db.fetchrow(
+            get_query("get_or_create_user_by_main_account"),
+            main_account_id,
             datetime.now(UTC),
         )
 
         bucket = await db.fetchrow(
             get_query("get_bucket_by_name_and_owner"),
             bucket_name,
-            user["user_id"],
+            main_account_id,
         )
 
         if not bucket:
@@ -1461,7 +1389,7 @@ async def put_object(
 
         try:
             # Use s3_publish for IPFS upload + pinning + blockchain publishing
-            seed_phrase = request.state.seed_phrase
+            seed_phrase = request.state.account.seed
 
             s3_result = await ipfs_service.client.s3_publish(
                 file_path=temp_path,
@@ -1564,22 +1492,21 @@ async def _get_object(
     object_key: str,
     db: dependencies.DBConnection,
     seed_phrase: str,
+    main_account_id: str,
 ) -> asyncpg.Record:
     logger.debug(f"Getting object {bucket_name}/{object_key}")
 
     # Get user for user-scoped bucket lookup
-    user_id = str(uuid.uuid4())
     user = await db.fetchrow(
-        get_query("get_or_create_user"),
-        user_id,
-        seed_phrase,
+        get_query("get_or_create_user_by_main_account"),
+        main_account_id,
         datetime.now(UTC),
     )
 
     bucket = await db.fetchrow(
         get_query("get_bucket_by_name_and_owner"),
         bucket_name,
-        user["user_id"],
+        user["main_account_id"],
     )
 
     if not bucket:
@@ -1641,6 +1568,7 @@ async def head_object(
                 object_key,
                 db,
                 request.state.seed_phrase,
+                request.state.account.main_account,
             )
             return Response(status_code=200)
         except errors.S3Error as e:
@@ -1659,7 +1587,8 @@ async def head_object(
             bucket_name,
             object_key,
             db,
-            request.state.seed_phrase,
+            main_account_id=request.state.account.main_account,
+            seed_phrase=request.state.seed_phrase,
         )
 
         metadata = json.loads(result["metadata"])
@@ -1712,6 +1641,7 @@ async def get_object(
             object_key,
             db,
             request.state.seed_phrase,
+            request.state.account.main_account,
         )
 
     try:
@@ -1720,6 +1650,7 @@ async def get_object(
             object_key,
             db,
             request.state.seed_phrase,
+            request.state.account.main_account,
         )
 
         metadata = json.loads(result["metadata"])
@@ -1839,22 +1770,21 @@ async def delete_object(
             object_key,
             db,
             request.state.seed_phrase,
+            request.state.account.main_account,
         )
 
     try:
         # Get user for user-scoped bucket lookup
-        user_id = str(uuid.uuid4())
         user = await db.fetchrow(
-            get_query("get_or_create_user"),
-            user_id,
-            request.state.seed_phrase,
+            get_query("get_or_create_user_by_main_account"),
+            request.state.account.main_account,
             datetime.now(UTC),
         )
 
         bucket = await db.fetchrow(
             get_query("get_bucket_by_name_and_owner"),
             bucket_name,
-            user["user_id"],
+            user["main_account_id"],
         )
 
         if not bucket:
@@ -1893,7 +1823,7 @@ async def delete_object(
             get_query("delete_object"),
             bucket_id,
             object_key,
-            user["user_id"],  # Add user_id parameter for permission check
+            user["main_account_id"],  # Add user_id parameter for permission check
         )
 
         if not deleted_object:
