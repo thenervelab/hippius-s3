@@ -9,8 +9,11 @@ from fastapi import Response
 from starlette import status
 
 from hippius_s3.api.s3.errors import s3_error_response
+from hippius_s3.config import get_config
 from hippius_s3.dependencies import check_account_has_credit
 
+
+config = get_config()
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +38,10 @@ async def check_credit_for_all_operations(request: Request, call_next: Callable)
             seed_phrase = request.state.seed_phrase
 
             try:
-                has_credit = await check_account_has_credit(seed_phrase)
+                has_credit = await check_account_has_credit(
+                    seed_phrase,
+                    substrate_url=config.substrate_url,
+                )
 
                 if not has_credit:
                     logger.warning(f"Account does not have credit for {request.method} operation: {path}")

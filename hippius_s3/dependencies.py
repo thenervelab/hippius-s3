@@ -16,7 +16,6 @@ from hippius_s3.ipfs_service import IPFSService
 
 logger = logging.getLogger(__name__)
 
-# TTL cache for credit checks - cache results for 60 seconds
 # maxsize=1000 allows caching up to 1000 different seed phrases
 credit_cache: TTLCache[str, bool] = TTLCache(maxsize=1000, ttl=60)
 
@@ -96,7 +95,7 @@ async def extract_seed_phrase(request: Request) -> str:
     )
 
 
-async def check_account_has_credit(seed_phrase: str) -> bool:
+async def check_account_has_credit(seed_phrase: str, substrate_url: str) -> bool:
     """
     Check if the account associated with the seed phrase has enough credit.
 
@@ -105,6 +104,7 @@ async def check_account_has_credit(seed_phrase: str) -> bool:
 
     Args:
         seed_phrase: The seed phrase of the account to check
+        substrate_url: the substrate url to use for the credit check.
 
     Returns:
         bool: True if the account has credit, False otherwise
@@ -117,7 +117,11 @@ async def check_account_has_credit(seed_phrase: str) -> bool:
     logger.debug(f"Credit check cache MISS for seed phrase: {seed_phrase[:20]}...")
 
     try:
-        substrate_client = SubstrateClient(password=None, account_name=None)
+        substrate_client = SubstrateClient(
+            url=substrate_url,
+            password=None,
+            account_name=None,
+        )
         substrate_client.connect(seed_phrase=seed_phrase)
         account_address = substrate_client._account_address
         credit = await substrate_client.get_free_credits(
@@ -129,7 +133,7 @@ async def check_account_has_credit(seed_phrase: str) -> bool:
 
         # Cache the result for 60 seconds
         credit_cache[seed_phrase] = has_credit
-        logger.debug(f"Cached credit result for {account_address}: {has_credit}")
+        logger.debug(f"Cached credit result for {seed_phrase=} {account_address=} {has_credit} {int(credit)=}")
 
         return has_credit
 

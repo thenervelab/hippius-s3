@@ -83,8 +83,21 @@ async def initiate_multipart_upload(
 ) -> Response:
     """Initiate a multipart upload (POST /{bucket_name}/{object_key}?uploads)."""
     try:
+        # Get user for user-scoped bucket lookup
+        user_id = str(uuid.uuid4())
+        user = await db.fetchrow(
+            get_query("get_or_create_user"),
+            user_id,
+            request.state.seed_phrase,
+            datetime.now(UTC),
+        )
+
         # Check if bucket exists
-        bucket = await db.fetchrow(get_query("get_bucket_by_name"), bucket_name)
+        bucket = await db.fetchrow(
+            get_query("get_bucket_by_name_and_owner"),
+            bucket_name,
+            user["user_id"],
+        )
         if not bucket:
             return s3_error_response(
                 "NoSuchBucket",
@@ -338,7 +351,20 @@ async def list_multipart_uploads(
     """List multipart uploads in a bucket (GET with ?uploads)."""
 
     try:
-        bucket = await db.fetchrow(get_query("get_bucket_by_name"), bucket_name)
+        # Get user for user-scoped bucket lookup
+        user_id = str(uuid.uuid4())
+        user = await db.fetchrow(
+            get_query("get_or_create_user"),
+            user_id,
+            request.state.seed_phrase,
+            datetime.now(UTC),
+        )
+
+        bucket = await db.fetchrow(
+            get_query("get_bucket_by_name_and_owner"),
+            bucket_name,
+            user["user_id"],
+        )
         if not bucket:
             return s3_error_response(
                 "NoSuchBucket",

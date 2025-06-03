@@ -22,6 +22,7 @@ class Config:
     # API signing key for pre-signed URLs
     # Generated on first run if not provided
     api_signing_key: str = env("API_SIGNING_KEY:" + str(uuid.uuid4()))
+    substrate_url: str = env("HIPPIUS_SUBSTRATE_URL")
 
 
 def get_config() -> Config:

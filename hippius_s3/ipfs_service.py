@@ -26,9 +26,12 @@ class IPFSService:
         self.client = HippiusClient(
             ipfs_gateway=config.ipfs_get_url,
             ipfs_api_url=config.ipfs_store_url,
+            substrate_url=config.substrate_url,
             encrypt_by_default=False,
         )
-        logger.info(f"IPFS service initialized: {config.ipfs_get_url} {config.ipfs_store_url}")
+        logger.info(
+            f"IPFS service initialized: IPFS={config.ipfs_get_url} {config.ipfs_store_url}, Substrate={config.substrate_url}"
+        )
 
     async def upload_file(
         self,
@@ -407,6 +410,7 @@ class IPFSService:
                     seed_phrase=seed_phrase,
                     store_node=self.config.ipfs_store_url,
                     pin_node=self.config.ipfs_store_url,
+                    substrate_url=self.config.substrate_url,
                 )
                 logger.info(
                     f"Published concatenated file: CID={s3_result.cid}, Size={s3_result.size_bytes} bytes, TX={s3_result.tx_hash}"

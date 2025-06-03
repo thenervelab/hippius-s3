@@ -167,7 +167,21 @@ async def get_bucket(
         logger.info(f"Handling tagging request for bucket {bucket_name}")
 
         try:
-            bucket = await db.fetchrow(get_query("get_bucket_by_name"), bucket_name)
+            # Get user for user-scoped bucket lookup
+            user = await db.fetchrow(
+                get_query("get_user_by_seed_phrase"),
+                request.state.seed_phrase,
+            )
+            if not user:
+                user_id = str(uuid.uuid4())
+                user = await db.fetchrow(
+                    get_query("get_or_create_user"),
+                    user_id,
+                    request.state.seed_phrase,
+                    datetime.now(UTC),
+                )
+
+            bucket = await db.fetchrow(get_query("get_bucket_by_name_and_owner"), bucket_name, user["user_id"])
 
             if not bucket:
                 # For S3 compatibility, return XML error for non-existent buckets
@@ -245,9 +259,24 @@ async def get_bucket(
         return await list_multipart_uploads(bucket_name, request, db)
 
     try:
+        # Get user for user-scoped bucket lookup
+        user = await db.fetchrow(
+            get_query("get_user_by_seed_phrase"),
+            request.state.seed_phrase,
+        )
+        if not user:
+            user_id = str(uuid.uuid4())
+            user = await db.fetchrow(
+                get_query("get_or_create_user"),
+                user_id,
+                request.state.seed_phrase,
+                datetime.now(UTC),
+            )
+
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name"),
+            get_query("get_bucket_by_name_and_owner"),
             bucket_name,
+            user["user_id"],
         )
 
         if not bucket:
@@ -344,9 +373,19 @@ async def delete_bucket_tags(
     This is used by the MinIO client to remove all bucket tags.
     """
     try:
+        # Get user for user-scoped bucket lookup
+        user_id = str(uuid.uuid4())
+        user = await db.fetchrow(
+            get_query("get_or_create_user"),
+            user_id,
+            seed_phrase,
+            datetime.now(UTC),
+        )
+
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name"),
+            get_query("get_bucket_by_name_and_owner"),
             bucket_name,
+            user["user_id"],
         )
 
         if not bucket:
@@ -390,9 +429,19 @@ async def get_object_tags(
     This is used by the MinIO client to retrieve object tags.
     """
     try:
+        # Get user for user-scoped bucket lookup
+        user_id = str(uuid.uuid4())
+        user = await db.fetchrow(
+            get_query("get_or_create_user"),
+            user_id,
+            seed_phrase,
+            datetime.now(UTC),
+        )
+
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name"),
+            get_query("get_bucket_by_name_and_owner"),
             bucket_name,
+            user["user_id"],
         )
 
         if not bucket:
@@ -477,9 +526,19 @@ async def set_object_tags(
     This is used by the MinIO client to set object tags.
     """
     try:
+        # Get user for user-scoped bucket lookup
+        user_id = str(uuid.uuid4())
+        user = await db.fetchrow(
+            get_query("get_or_create_user"),
+            user_id,
+            seed_phrase,
+            datetime.now(UTC),
+        )
+
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name"),
+            get_query("get_bucket_by_name_and_owner"),
             bucket_name,
+            user["user_id"],
         )
 
         if not bucket:
@@ -577,9 +636,19 @@ async def delete_object_tags(
     This is used by the MinIO client to remove all object tags.
     """
     try:
+        # Get user for user-scoped bucket lookup
+        user_id = str(uuid.uuid4())
+        user = await db.fetchrow(
+            get_query("get_or_create_user"),
+            user_id,
+            seed_phrase,
+            datetime.now(UTC),
+        )
+
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name"),
+            get_query("get_bucket_by_name_and_owner"),
             bucket_name,
+            user["user_id"],
         )
 
         if not bucket:
@@ -645,9 +714,19 @@ async def get_bucket_tags(
     """
     logger.info(f"Getting tags for bucket {bucket_name}")
     try:
+        # Get user for user-scoped bucket lookup
+        user_id = str(uuid.uuid4())
+        user = await db.fetchrow(
+            get_query("get_or_create_user"),
+            user_id,
+            seed_phrase,
+            datetime.now(UTC),
+        )
+
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name"),
+            get_query("get_bucket_by_name_and_owner"),
             bucket_name,
+            user["user_id"],
         )
 
         if not bucket:
@@ -726,9 +805,19 @@ async def get_bucket_lifecycle(
     This is used by the MinIO client to retrieve bucket lifecycle configuration.
     """
     try:
+        # Get user for user-scoped bucket lookup
+        user_id = str(uuid.uuid4())
+        user = await db.fetchrow(
+            get_query("get_or_create_user"),
+            user_id,
+            seed_phrase,
+            datetime.now(UTC),
+        )
+
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name"),
+            get_query("get_bucket_by_name_and_owner"),
             bucket_name,
+            user["user_id"],
         )
 
         if not bucket:
@@ -834,9 +923,19 @@ async def head_bucket(
     This endpoint is compatible with the S3 protocol used by MinIO and other S3 clients.
     """
     try:
+        # Get user for user-scoped bucket lookup
+        user_id = str(uuid.uuid4())
+        user = await db.fetchrow(
+            get_query("get_or_create_user"),
+            user_id,
+            request.state.seed_phrase,
+            datetime.now(UTC),
+        )
+
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name"),
+            get_query("get_bucket_by_name_and_owner"),
             bucket_name,
+            user["user_id"],
         )
 
         if not bucket:
@@ -869,9 +968,19 @@ async def create_bucket(
     # Check if this is a request to set bucket lifecycle
     if "lifecycle" in request.query_params:
         try:
+            # Get user for user-scoped bucket lookup
+            user_id = str(uuid.uuid4())
+            user = await db.fetchrow(
+                get_query("get_or_create_user"),
+                user_id,
+                request.state.seed_phrase,
+                datetime.now(UTC),
+            )
+
             bucket = await db.fetchrow(
-                get_query("get_bucket_by_name"),
+                get_query("get_bucket_by_name_and_owner"),
                 bucket_name,
+                user["user_id"],
             )
 
             if not bucket:
@@ -923,10 +1032,20 @@ async def create_bucket(
     # Check if this is a request to set bucket tags
     elif "tagging" in request.query_params:
         try:
+            # Get user for user-scoped bucket lookup
+            user_id = str(uuid.uuid4())
+            user = await db.fetchrow(
+                get_query("get_or_create_user"),
+                user_id,
+                request.state.seed_phrase,
+                datetime.now(UTC),
+            )
+
             # First check if the bucket exists
             bucket = await db.fetchrow(
-                get_query("get_bucket_by_name"),
+                get_query("get_bucket_by_name_and_owner"),
                 bucket_name,
+                user["user_id"],
             )
 
             if not bucket:
@@ -1052,9 +1171,19 @@ async def delete_bucket(
         )
 
     try:
+        # Get user for user-scoped bucket lookup
+        user_id = str(uuid.uuid4())
+        user = await db.fetchrow(
+            get_query("get_or_create_user"),
+            user_id,
+            request.state.seed_phrase,
+            datetime.now(UTC),
+        )
+
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name"),
+            get_query("get_bucket_by_name_and_owner"),
             bucket_name,
+            user["user_id"],
         )
 
         if not bucket:
@@ -1072,14 +1201,7 @@ async def delete_bucket(
             None,
         )
 
-        # Get or create the user_id for the current seed phrase
-        user_id = str(uuid.uuid4())
-        user = await db.fetchrow(
-            get_query("get_or_create_user"),
-            user_id,
-            request.state.seed_phrase,
-            datetime.now(UTC),
-        )
+        # Use the user already retrieved above
 
         if not user:
             logger.warning(f"User with seed phrase not found when trying to delete bucket {bucket_name}")
@@ -1186,10 +1308,20 @@ async def put_object(
 
             source_bucket_name, source_object_key = source_parts
 
+            # Get user for user-scoped bucket lookup
+            user_id = str(uuid.uuid4())
+            user = await db.fetchrow(
+                get_query("get_or_create_user"),
+                user_id,
+                request.state.seed_phrase,
+                datetime.now(UTC),
+            )
+
             # Get the source bucket
             source_bucket = await db.fetchrow(
-                get_query("get_bucket_by_name"),
+                get_query("get_bucket_by_name_and_owner"),
                 source_bucket_name,
+                user["user_id"],
             )
 
             if not source_bucket:
@@ -1200,10 +1332,11 @@ async def put_object(
                     BucketName=source_bucket_name,
                 )
 
-            # Get the destination bucket
+            # Get the destination bucket (using same user as source)
             dest_bucket = await db.fetchrow(
-                get_query("get_bucket_by_name"),
+                get_query("get_bucket_by_name_and_owner"),
                 bucket_name,
+                user["user_id"],
             )
 
             if not dest_bucket:
@@ -1286,9 +1419,19 @@ async def put_object(
             )
 
     try:
+        # Get user for user-scoped bucket lookup
+        user_id = str(uuid.uuid4())
+        user = await db.fetchrow(
+            get_query("get_or_create_user"),
+            user_id,
+            request.state.seed_phrase,
+            datetime.now(UTC),
+        )
+
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name"),
+            get_query("get_bucket_by_name_and_owner"),
             bucket_name,
+            user["user_id"],
         )
 
         if not bucket:
@@ -1326,6 +1469,7 @@ async def put_object(
                 seed_phrase=seed_phrase,
                 store_node=config.ipfs_store_url,
                 pin_node=config.ipfs_store_url,
+                substrate_url=config.substrate_url,
             )
 
             ipfs_cid = s3_result.cid
@@ -1423,9 +1567,19 @@ async def _get_object(
 ) -> asyncpg.Record:
     logger.debug(f"Getting object {bucket_name}/{object_key}")
 
+    # Get user for user-scoped bucket lookup
+    user_id = str(uuid.uuid4())
+    user = await db.fetchrow(
+        get_query("get_or_create_user"),
+        user_id,
+        seed_phrase,
+        datetime.now(UTC),
+    )
+
     bucket = await db.fetchrow(
-        get_query("get_bucket_by_name"),
+        get_query("get_bucket_by_name_and_owner"),
         bucket_name,
+        user["user_id"],
     )
 
     if not bucket:
@@ -1688,9 +1842,19 @@ async def delete_object(
         )
 
     try:
+        # Get user for user-scoped bucket lookup
+        user_id = str(uuid.uuid4())
+        user = await db.fetchrow(
+            get_query("get_or_create_user"),
+            user_id,
+            request.state.seed_phrase,
+            datetime.now(UTC),
+        )
+
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name"),
+            get_query("get_bucket_by_name_and_owner"),
             bucket_name,
+            user["user_id"],
         )
 
         if not bucket:
@@ -1713,14 +1877,7 @@ async def delete_object(
             # S3 returns 204 even if the object doesn't exist, so no error here
             return Response(status_code=204)
 
-        # Get or create the user_id for the current seed phrase
-        user_id = str(uuid.uuid4())
-        user = await db.fetchrow(
-            get_query("get_or_create_user"),
-            user_id,
-            request.state.seed_phrase,
-            datetime.now(UTC),
-        )
+        # Use the user already retrieved above
 
         if not user:
             logger.warning(f"User with seed phrase not found when trying to delete object {object_key}")
