@@ -5,9 +5,9 @@ from typing import Awaitable
 from typing import Callable
 
 import redis.asyncio as async_redis
-from fastapi import Request
-from fastapi import Response
 from starlette import status
+from starlette.requests import Request
+from starlette.responses import Response
 
 from hippius_s3.api.s3.errors import s3_error_response
 
@@ -126,3 +126,13 @@ async def rate_limit_middleware(
         logger.error(f"Rate limiting error: {e}")
         # allow the request to proceed rather than blocking all traffic
         return await call_next(request)
+
+
+async def rate_limit_wrapper(request: Request, call_next: Callable) -> Response:
+    return await rate_limit_middleware(
+        request,
+        call_next,
+        request.app.state.rate_limit_service,
+        max_requests=100,
+        window_seconds=60,
+    )

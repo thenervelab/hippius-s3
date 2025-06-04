@@ -5,24 +5,22 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
-from typing import Callable
 
 import asyncpg
 import redis.asyncio as async_redis
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from fastapi import Request
 from fastapi import Response
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 
 from hippius_s3.api.middlewares.banhammer import BanHammerService
-from hippius_s3.api.middlewares.banhammer import banhammer_middleware
+from hippius_s3.api.middlewares.banhammer import banhammer_wrapper
+from hippius_s3.api.middlewares.cors import cors_middleware
 from hippius_s3.api.middlewares.credit_check import check_credit_for_all_operations
 from hippius_s3.api.middlewares.frontend_hmac import verify_frontend_hmac_middleware
 from hippius_s3.api.middlewares.hmac import verify_hmac_middleware
 from hippius_s3.api.middlewares.rate_limit import RateLimitService
-from hippius_s3.api.middlewares.rate_limit import rate_limit_middleware
+from hippius_s3.api.middlewares.rate_limit import rate_limit_wrapper
 from hippius_s3.api.s3.endpoints import router as s3_router
 from hippius_s3.api.s3.multipart import router as multipart_router
 from hippius_s3.api.user import router as user_router
@@ -149,53 +147,19 @@ def custom_openapi() -> dict:
 # Override the openapi schema generation
 app.openapi = custom_openapi  # type: ignore[method-assign]
 
-# Register middlewares (order matters!)
-# CORS middleware - add_middleware() executes in NORMAL order, so add this FIRST
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # Custom middlewares - middleware("http") executes in REVERSE order
 # 1. Credit verification (executes LAST, needs seed phrase)
 app.middleware("http")(check_credit_for_all_operations)
-
 # Frontend HMAC verification for /user/ endpoints (executes after credit check)
 app.middleware("http")(verify_frontend_hmac_middleware)
-
-
 # 2. Rate limiting (per seed phrase - executes FOURTH, needs seed phrase)
-async def rate_limit_wrapper(request: Request, call_next: Callable) -> Response:
-    return await rate_limit_middleware(
-        request,
-        call_next,
-        request.app.state.rate_limit_service,
-        max_requests=100,
-        window_seconds=60,
-    )
-
-
 app.middleware("http")(rate_limit_wrapper)
-
 # 3. HMAC authentication (extract seed phrase - executes THIRD)
 app.middleware("http")(verify_hmac_middleware)
-
-
-# 4. Banhammer (IP-based protection - executes SECOND, after CORS)
-async def banhammer_wrapper(request: Request, call_next: Callable) -> Response:
-    return await banhammer_middleware(
-        request,
-        call_next,
-        request.app.state.banhammer_service,
-    )
-
-
+# 4. Banhammer (IP-based protection - executes SECOND)
 app.middleware("http")(banhammer_wrapper)
-
-# Include routers in the correct order! Do not change this por favor.
+# 5. CORS (executes FIRST - outermost layer)
+app.middleware("http")(cors_middleware)
 app.include_router(user_router, prefix="/user")
 app.include_router(s3_router, prefix="")
 app.include_router(multipart_router, prefix="")

@@ -102,7 +102,6 @@ async def check_credit_for_all_operations(request: Request, call_next: Callable)
                 seed_phrase,
                 substrate_url=config.substrate_url,
             )
-            logger.info(f"{request.state.account=}")
 
             # Only check permissions and credits for operations that modify state
             if request.method in ["PUT", "POST", "DELETE"]:

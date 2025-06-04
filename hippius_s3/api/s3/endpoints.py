@@ -1163,6 +1163,7 @@ async def delete_bucket(
             await ipfs_service.delete_file(
                 obj["ipfs_cid"],
                 seed_phrase=request.state.seed_phrase,
+                unpin=False,
             )
 
         return Response(status_code=204)
@@ -1389,12 +1390,13 @@ async def put_object(
 
         try:
             # Use s3_publish for IPFS upload + pinning + blockchain publishing
-            seed_phrase = request.state.account.seed
+            seed_phrase = request.state.seed_phrase
 
             s3_result = await ipfs_service.client.s3_publish(
                 file_path=temp_path,
                 encrypt=True,
                 seed_phrase=seed_phrase,
+                subaccount_id=request.state.account.id,
                 store_node=config.ipfs_store_url,
                 pin_node=config.ipfs_store_url,
                 substrate_url=config.substrate_url,
@@ -1455,6 +1457,7 @@ async def put_object(
                 await ipfs_service.delete_file(
                     existing_object["ipfs_cid"],
                     seed_phrase=request.state.seed_phrase,
+                    unpin=False,
                 )
                 logger.info(f"Cleaned up previous IPFS content for {bucket_name}/{object_key}")
             except Exception as e:
@@ -1693,7 +1696,7 @@ async def get_object(
         file_data = await ipfs_service.download_file(
             cid=ipfs_cid,
             decrypt=True,
-            seed_phrase=request.state.seed_phrase,
+            subaccount_id=request.state.seed_phrase,
         )
         logger.debug(f"Downloaded {len(file_data)} bytes from IPFS CID: {ipfs_cid}")
 
@@ -1840,6 +1843,7 @@ async def delete_object(
         deletion_result = await ipfs_service.delete_file(
             ipfs_cid,
             seed_phrase=request.state.seed_phrase,
+            unpin=False,
         )
         logger.info(f"{deletion_result=}")
 

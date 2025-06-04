@@ -90,6 +90,7 @@ class IPFSService:
     async def download_file(
         self,
         cid: str,
+        subaccount_id: str,
         decrypt: bool = True,
         max_retries: int = 1,
         retry_delay: int = 2,
@@ -118,7 +119,7 @@ class IPFSService:
             await self.client.s3_download(
                 cid=cid,
                 output_path=temp_path,
-                seed_phrase=seed_phrase,
+                subaccount_id=subaccount_id,
                 auto_decrypt=decrypt,
                 download_node=self.config.ipfs_store_url,
             )
@@ -137,45 +138,11 @@ class IPFSService:
             if Path(temp_path).exists():
                 Path(temp_path).unlink()
 
-    async def _download_directory(self, cid: str, decrypt: bool = False, seed_phrase: Optional[str] = None) -> bytes:
-        """
-        Handle downloading content from an IPFS directory CID.
-
-        Args:
-            cid: IPFS content identifier for a directory
-            decrypt: Whether to decrypt the files (if they were encrypted)
-            seed_phrase: Seed phrase to use for blockchain operations
-
-        Returns:
-            Binary data from the first file in the directory
-        """
-        logger.info(f"Handling directory CID: {cid}")
-
-        # Get the directory listing to find files
-        ls_result = await self.client.ipfs_client.ls(cid, seed_phrase=seed_phrase)
-        objects = ls_result.get("Objects", [])
-
-        if not objects or not objects[0].get("Links"):
-            raise ValueError(f"No valid content found in directory CID: {cid}")
-
-        # Get links from the first object
-        links = objects[0].get("Links", [])
-
-        if not links:
-            raise ValueError(f"No links found in directory CID: {cid}")
-
-        # Get the first file in the directory
-        first_link = links[0]
-        file_cid = first_link.get("Hash")
-
-        if not file_cid:
-            raise ValueError("No file CID found in directory listing")
-
-        logger.info(f"Using first file from directory: {first_link.get('Name', 'unnamed')} (CID: {file_cid})")
-
-        return await self.download_file(file_cid, decrypt, seed_phrase=seed_phrase)
-
-    async def delete_file(self, cid: str, seed_phrase: Optional[str] = None) -> Dict[str, Union[bool, str]]:
+    async def delete_file(
+        self,
+        cid: str,
+        seed_phrase: Optional[str] = None,
+    ) -> Dict[str, Union[bool, str]]:
         """
         Delete file from IPFS.
 
@@ -188,7 +155,9 @@ class IPFSService:
         """
         try:
             return {
-                "deleted": await self.client.delete_file(cid, cancel_from_blockchain=True, seed_phrase=seed_phrase),
+                "deleted": await self.client.delete_file(
+                    cid, cancel_from_blockchain=True, seed_phrase=seed_phrase, unpin=False
+                ),
                 "cid": cid,
                 "message": "File successfully deleted from IPFS",
             }
@@ -305,6 +274,7 @@ class IPFSService:
         parts: List[Dict[str, Union[str, int]]],
         content_type: str,
         file_name: str,
+        subaccount_id: str,
         seed_phrase: Optional[str] = None,
     ) -> Dict[str, Union[str, int]]:
         """
@@ -316,6 +286,7 @@ class IPFSService:
             parts: List of part information including CIDs
             content_type: MIME type of the final file
             file_name: Name of the final file
+            subaccount_id: the api key
             seed_phrase: Seed phrase to use for blockchain operations
 
         Returns:
@@ -344,7 +315,7 @@ class IPFSService:
                     part_data = await self.download_file(
                         cid=cid,
                         decrypt=False,
-                        seed_phrase=seed_phrase,
+                        subaccount_id=subaccount_id,
                     )
 
                     # Write part data to file
@@ -408,6 +379,7 @@ class IPFSService:
                     file_path=str(output_path),
                     encrypt=True,
                     seed_phrase=seed_phrase,
+                    subaccount_id=subaccount_id,
                     store_node=self.config.ipfs_store_url,
                     pin_node=self.config.ipfs_store_url,
                     substrate_url=self.config.substrate_url,
@@ -452,8 +424,7 @@ class IPFSService:
             verification_data = await self.download_file(
                 cid=result["cid"],
                 decrypt=False,
-                # Download encrypted version for verification
-                seed_phrase=seed_phrase,
+                subaccount_id=subaccount_id,
             )
 
             verification_md5 = hashlib.md5(verification_data).hexdigest()

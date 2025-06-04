@@ -323,6 +323,7 @@ async def abort_multipart_upload(
             await ipfs_service.delete_file(
                 part["ipfs_cid"],
                 seed_phrase=request.state.seed_phrase,
+                unpin=False,
             )
 
         # Delete the multipart upload from the database

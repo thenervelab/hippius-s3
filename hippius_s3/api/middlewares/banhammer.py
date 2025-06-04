@@ -4,9 +4,9 @@ from typing import Awaitable
 from typing import Callable
 
 import redis.asyncio as async_redis
-from fastapi import Request
-from fastapi import Response
 from starlette import status
+from starlette.requests import Request
+from starlette.responses import Response
 
 from hippius_s3.api.s3.errors import s3_error_response
 
@@ -181,3 +181,11 @@ async def _post_request_checks(
             client_ip,
             f"auth_failure_{request.method}_{request.url.path}",
         )
+
+
+async def banhammer_wrapper(request: Request, call_next: Callable) -> Response:
+    return await banhammer_middleware(
+        request,
+        call_next,
+        request.app.state.banhammer_service,
+    )
