@@ -155,8 +155,11 @@ class IPFSService:
         """
         try:
             return {
-                "deleted": await self.client.delete_file(
-                    cid, cancel_from_blockchain=True, seed_phrase=seed_phrase, unpin=False
+                "deleted": await self.client.ipfs_client.delete_file(
+                    cid,
+                    cancel_from_blockchain=True,
+                    seed_phrase=seed_phrase,
+                    unpin=False,
                 ),
                 "cid": cid,
                 "message": "File successfully deleted from IPFS",
@@ -405,13 +408,17 @@ class IPFSService:
                 # The final concatenated file is now pinned instead
                 for part_info in parts:
                     try:
-                        await self.client.delete_file(
-                            part_info["ipfs_cid"], cancel_from_blockchain=False, seed_phrase=seed_phrase
+                        await self.client.ipfs_client.delete_file(
+                            part_info["ipfs_cid"],
+                            cancel_from_blockchain=False,
+                            seed_phrase=seed_phrase,
+                            unpin=False,
                         )
                         logger.debug(f"Deleted part CID: {part_info['ipfs_cid']}")
                     except Exception as e:  # noqa: PERF203
-                        logger.error(f"Failed to delete part {part_info['ipfs_cid']}: {e}")
-                        # Don't fail the whole operation if deletion fails
+                        logger.error(
+                            f"Failed to delete part {part_info['ipfs_cid']}: {e}"
+                        )  # Don't fail the whole operation if deletion fails
 
             except Exception as e:
                 logger.error(f"Failed to publish concatenated file: {e}")

@@ -116,7 +116,7 @@ async def list_objects(
     prefix: Optional[str] = Query(None, description="Object key prefix filter"),
     max_keys: int = Query(1000, description="Maximum number of objects to return"),
     db=Depends(get_postgres),
-) -> Dict[str, Any]:
+) -> JSONResponse:
     """
     List objects in a bucket owned by a specific main account.
 

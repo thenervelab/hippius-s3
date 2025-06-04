@@ -507,7 +507,11 @@ async def complete_multipart_upload_internal(
 
         # Concatenate the parts
         concat_result = await ipfs_service.concatenate_parts(
-            parts_for_concat, content_type, object_key, seed_phrase=seed_phrase
+            parts_for_concat,
+            content_type,
+            object_key,
+            seed_phrase=seed_phrase,
+            subaccount_id=request.state.account.main_account,
         )
 
         # Prepare metadata

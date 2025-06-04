@@ -1396,7 +1396,7 @@ async def put_object(
                 file_path=temp_path,
                 encrypt=True,
                 seed_phrase=seed_phrase,
-                subaccount_id=request.state.account.id,
+                subaccount_id=request.state.account.main_account,
                 store_node=config.ipfs_store_url,
                 pin_node=config.ipfs_store_url,
                 substrate_url=config.substrate_url,
@@ -1684,6 +1684,7 @@ async def get_object(
                     part_info,
                     result["content_type"],
                     object_key,
+                    subaccount_id=request.state.account.main_account,
                     seed_phrase=request.state.seed_phrase,
                 )
 
@@ -1696,7 +1697,7 @@ async def get_object(
         file_data = await ipfs_service.download_file(
             cid=ipfs_cid,
             decrypt=True,
-            subaccount_id=request.state.seed_phrase,
+            subaccount_id=request.state.account.main_account,
         )
         logger.debug(f"Downloaded {len(file_data)} bytes from IPFS CID: {ipfs_cid}")
 
