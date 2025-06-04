@@ -59,11 +59,13 @@ async def fetch_account(
         client._account_address,
         seed_phrase=seed_phrase,
     )
-
     has_credits = await check_account_has_credit(
-        seed_phrase,
+        subaccount=client._account_address,
+        main_account=main_account,
+        seed_phrase=seed_phrase,
         substrate_url=config.substrate_url,
     )
+    logger.info(f"checking account credits for subaccount={client._account_address} {main_account=} {has_credits=}")
 
     return HippiusAccount(
         seed=seed_phrase,
