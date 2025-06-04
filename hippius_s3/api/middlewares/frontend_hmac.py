@@ -29,6 +29,10 @@ async def verify_frontend_hmac_middleware(
     if not request.url.path.startswith("/user/"):
         return await call_next(request)
 
+    # Skip HMAC verification for OPTIONS requests (CORS preflight)
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
     hmac_signature = request.headers.get("x-hmac-signature")
     if not hmac_signature:
         logger.warning(f"Missing X-HMAC-Signature header for {request.method} {request.url.path}")
@@ -41,7 +45,9 @@ async def verify_frontend_hmac_middleware(
 
     # Calculate the expected signature
     expected_signature = hmac.new(
-        config.frontend_hmac_secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256
+        config.frontend_hmac_secret.encode("utf-8"),
+        message.encode("utf-8"),
+        hashlib.sha256,
     ).hexdigest()
 
     # Compare signatures
