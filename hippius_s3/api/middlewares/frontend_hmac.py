@@ -52,8 +52,12 @@ async def verify_frontend_hmac_middleware(
 
     # Compare signatures
     if not hmac.compare_digest(expected_signature, hmac_signature):
-        logger.warning(f"Frontend HMAC verification failed for {request.method} {request.url.path}")
+        logger.warning(
+            f"Frontend HMAC verification failed for {request.method} {request.url.path}, raw message={message}"
+        )
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid HMAC signature")
 
-    logger.debug(f"Frontend HMAC verification successful for {request.method} {request.url.path}")
+    logger.debug(
+        f"Frontend HMAC verification successful for {request.method} {request.url.path} {message=} {expected_signature=}"
+    )
     return await call_next(request)
