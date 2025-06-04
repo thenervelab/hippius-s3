@@ -89,6 +89,10 @@ async def rate_limit_middleware(
     if request.url.path in skip_paths:
         return await call_next(request)
 
+    # dont rate limit the front end
+    if request.url.path.startswith("/user/"):
+        return await call_next(request)
+
     # Ensure seed phrase is available from authentication
     if not hasattr(request.state, "seed_phrase"):
         logger.error(f"Rate limiting failed: no seed_phrase found for {request.url.path}")

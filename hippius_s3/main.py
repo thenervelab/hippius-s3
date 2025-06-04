@@ -19,11 +19,13 @@ from fastapi.openapi.utils import get_openapi
 from hippius_s3.api.middlewares.banhammer import BanHammerService
 from hippius_s3.api.middlewares.banhammer import banhammer_middleware
 from hippius_s3.api.middlewares.credit_check import check_credit_for_all_operations
+from hippius_s3.api.middlewares.frontend_hmac import verify_frontend_hmac_middleware
 from hippius_s3.api.middlewares.hmac import verify_hmac_middleware
 from hippius_s3.api.middlewares.rate_limit import RateLimitService
 from hippius_s3.api.middlewares.rate_limit import rate_limit_middleware
 from hippius_s3.api.s3.endpoints import router as s3_router
 from hippius_s3.api.s3.multipart import router as multipart_router
+from hippius_s3.api.user import router as user_router
 from hippius_s3.config import get_config
 from hippius_s3.ipfs_service import IPFSService
 
@@ -161,6 +163,9 @@ app.add_middleware(
 # 1. Credit verification (executes LAST, needs seed phrase)
 app.middleware("http")(check_credit_for_all_operations)
 
+# Frontend HMAC verification for /user/ endpoints (executes after credit check)
+app.middleware("http")(verify_frontend_hmac_middleware)
+
 
 # 2. Rate limiting (per seed phrase - executes FOURTH, needs seed phrase)
 async def rate_limit_wrapper(request: Request, call_next: Callable) -> Response:
@@ -191,5 +196,6 @@ async def banhammer_wrapper(request: Request, call_next: Callable) -> Response:
 app.middleware("http")(banhammer_wrapper)
 
 # Include routers in the correct order! Do not change this por favor.
+app.include_router(user_router, prefix="/user")
 app.include_router(s3_router, prefix="")
 app.include_router(multipart_router, prefix="")

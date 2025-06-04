@@ -24,6 +24,9 @@ class Config:
     api_signing_key: str = env("API_SIGNING_KEY:" + str(uuid.uuid4()))
     substrate_url: str = env("HIPPIUS_SUBSTRATE_URL")
 
+    # Frontend HMAC secret for user endpoints authentication
+    frontend_hmac_secret: str = env("FRONTEND_HMAC_SECRET")
+
 
 def get_config() -> Config:
     """Get application configuration."""
