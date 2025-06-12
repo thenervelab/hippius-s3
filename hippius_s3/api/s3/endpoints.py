@@ -1056,7 +1056,10 @@ async def create_bucket(
         try:
             bucket_id = str(uuid.uuid4())
             created_at = datetime.now(UTC)
-            is_public = True
+
+            # Check if bucket should be public based on ACL header
+            acl_header = request.headers.get("x-amz-acl", "private")
+            is_public = acl_header in ["public-read", "public-read-write"]
 
             # Get or create user record for the main account
             main_account_id = request.state.account.main_account
@@ -1276,6 +1279,7 @@ async def put_object(
                     status_code=404,
                     BucketName=bucket_name,
                 )
+            logger.info(f"Copying {source_bucket_name}/{source_object_key} to {dest_bucket}")
 
             # Get the source object
             source_object = await db.fetchrow(
@@ -1392,11 +1396,15 @@ async def put_object(
             # Use s3_publish for IPFS upload + pinning + blockchain publishing
             seed_phrase = request.state.seed_phrase
 
+            # Only encrypt if bucket is private
+            should_encrypt = not bucket["is_public"]
+
             s3_result = await ipfs_service.client.s3_publish(
                 file_path=temp_path,
-                encrypt=True,
+                encrypt=should_encrypt,
                 seed_phrase=seed_phrase,
                 subaccount_id=request.state.account.main_account,
+                bucket_name=bucket_name,
                 store_node=config.ipfs_store_url,
                 pin_node=config.ipfs_store_url,
                 substrate_url=config.substrate_url,
@@ -1415,7 +1423,7 @@ async def put_object(
                     metadata[meta_key] = value
 
             # Add system metadata
-            metadata["ipfs"] = {"cid": ipfs_cid, "encrypted": True}
+            metadata["ipfs"] = {"cid": ipfs_cid, "encrypted": should_encrypt}
             metadata["hippius"] = {"tx_hash": tx_hash}
         finally:
             # Clean up temporary file
@@ -1656,6 +1664,13 @@ async def get_object(
             request.state.account.main_account,
         )
 
+        # Get bucket info to check if it's public
+        bucket = await db.fetchrow(
+            get_query("get_bucket_by_name_and_owner"),
+            bucket_name,
+            request.state.account.main_account,
+        )
+
         metadata = json.loads(result["metadata"])
 
         ipfs_metadata = metadata.get("ipfs", {})
@@ -1685,6 +1700,8 @@ async def get_object(
                     result["content_type"],
                     object_key,
                     subaccount_id=request.state.account.main_account,
+                    bucket_name=bucket_name,
+                    is_public_bucket=bucket["is_public"],
                     seed_phrase=request.state.seed_phrase,
                 )
 
@@ -1693,11 +1710,15 @@ async def get_object(
             except Exception as e:
                 logger.error(f"Failed to reconstruct multipart file: {e}, using stored CID")
 
-        # Download file with automatic decryption (all files are encrypted now)
+        # Check if file was encrypted based on metadata
+        is_encrypted = ipfs_metadata.get("encrypted", True)  # Default to encrypted for backward compatibility
+
+        # Download file with conditional decryption
         file_data = await ipfs_service.download_file(
             cid=ipfs_cid,
-            decrypt=True,
             subaccount_id=request.state.account.main_account,
+            bucket_name=bucket_name,
+            decrypt=is_encrypted,
         )
         logger.debug(f"Downloaded {len(file_data)} bytes from IPFS CID: {ipfs_cid}")
 
@@ -1814,7 +1835,7 @@ async def delete_object(
         # Use the user already retrieved above
 
         if not user:
-            logger.warning(f"User with seed phrase not found when trying to delete object {object_key}")
+            logger.warning(f"User not found when trying to delete object {object_key}")
             return create_xml_error_response(
                 "AccessDenied",
                 f"You do not have permission to delete object {object_key}",

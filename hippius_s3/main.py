@@ -1,7 +1,6 @@
 """Main application module for Hippius S3 service."""
 
 import logging
-import os
 import sys
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
@@ -30,23 +29,25 @@ from hippius_s3.ipfs_service import IPFSService
 
 load_dotenv()
 
-log_level = os.getenv("LOG_LEVEL", "INFO")
+# Get config early for logging setup
+config = get_config()
+
 # Configure the root logger
 logging.basicConfig(
-    level=log_level,
+    level=config.log_level,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 
 # Set logging level for all loggers
 for name in logging.root.manager.loggerDict:
-    logging.getLogger(name).setLevel(log_level)
+    logging.getLogger(name).setLevel(config.log_level)
 
 # Configure specific loggers
 uvicorn_logger = logging.getLogger("uvicorn")
-uvicorn_logger.setLevel(log_level)
+uvicorn_logger.setLevel(config.log_level)
 uvicorn_access_logger = logging.getLogger("uvicorn.access")
-uvicorn_access_logger.setLevel(log_level)
+uvicorn_access_logger.setLevel(config.log_level)
 
 # Set highest logging level for our application code
 logging.getLogger("hippius_s3").setLevel(logging.DEBUG)
@@ -116,8 +117,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(
     title="Hippius S3",
     description="S3 Gateway for Hippius' IPFS storage",
+    docs_url="/docs" if config.enable_api_docs else None,
+    redoc_url="/redoc" if config.enable_api_docs else None,
     lifespan=lifespan,
-    debug=os.getenv("DEBUG", "false").lower() == "true",
+    debug=config.debug,
     default_response_class=Response,
 )
 
@@ -148,18 +151,55 @@ def custom_openapi() -> dict:
 app.openapi = custom_openapi  # type: ignore[method-assign]
 
 # Custom middlewares - middleware("http") executes in REVERSE order
-# 1. Credit verification (executes LAST, needs seed phrase)
+# 1. Rate limiting (executes LAST, needs account from credit check)
+app.middleware("http")(rate_limit_wrapper)
+# 2. Credit verification (executes SIXTH, sets account info, needs seed phrase)
 app.middleware("http")(check_credit_for_all_operations)
 # Frontend HMAC verification for /user/ endpoints (executes after credit check)
 app.middleware("http")(verify_frontend_hmac_middleware)
-# 2. Rate limiting (per seed phrase - executes FOURTH, needs seed phrase)
-app.middleware("http")(rate_limit_wrapper)
-# 3. HMAC authentication (extract seed phrase - executes THIRD)
+# 3. HMAC authentication (extract seed phrase - executes FOURTH)
 app.middleware("http")(verify_hmac_middleware)
-# 4. Banhammer (IP-based protection - executes SECOND)
+# 4. Input validation (AWS S3 compliance - executes THIRD)
+# app.middleware("http")(input_validation_middleware)
+# 5. Banhammer (IP-based protection - executes SECOND)
 app.middleware("http")(banhammer_wrapper)
-# 5. CORS (executes FIRST - outermost layer)
+# 6. CORS (executes FIRST - outermost layer)
 app.middleware("http")(cors_middleware)
+
+
+@app.get("/robots.txt", include_in_schema=False)
+async def robots_txt():
+    """Serve robots.txt to prevent crawler indexing."""
+    content = """User-agent: *
+Disallow: /
+
+# Explicitly disallow common crawlers
+User-agent: Googlebot
+Disallow: /
+
+User-agent: Bingbot
+Disallow: /
+
+User-agent: Slurp
+Disallow: /
+
+User-agent: DuckDuckBot
+Disallow: /
+
+User-agent: Baiduspider
+Disallow: /
+
+User-agent: YandexBot
+Disallow: /
+
+User-agent: facebookexternalhit
+Disallow: /
+
+User-agent: Twitterbot
+Disallow: /"""
+    return Response(content=content, media_type="text/plain")
+
+
 app.include_router(user_router, prefix="/user")
 app.include_router(s3_router, prefix="")
 app.include_router(multipart_router, prefix="")

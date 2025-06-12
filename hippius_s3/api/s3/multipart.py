@@ -505,13 +505,22 @@ async def complete_multipart_upload_internal(
         # Get content type
         content_type = multipart_upload["content_type"] or "application/octet-stream"
 
+        # Get bucket info to check if it's public
+        bucket = await db.fetchrow(
+            get_query("get_bucket_by_name_and_owner"),
+            bucket_name,
+            request.state.account.main_account,
+        )
+
         # Concatenate the parts
         concat_result = await ipfs_service.concatenate_parts(
             parts_for_concat,
             content_type,
             object_key,
-            seed_phrase=seed_phrase,
             subaccount_id=request.state.account.main_account,
+            bucket_name=bucket_name,
+            is_public_bucket=bucket["is_public"] if bucket else False,
+            seed_phrase=seed_phrase,
         )
 
         # Prepare metadata

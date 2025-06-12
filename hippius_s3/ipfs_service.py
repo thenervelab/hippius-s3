@@ -91,6 +91,7 @@ class IPFSService:
         self,
         cid: str,
         subaccount_id: str,
+        bucket_name: str,
         decrypt: bool = True,
         max_retries: int = 1,
         retry_delay: int = 2,
@@ -120,6 +121,7 @@ class IPFSService:
                 cid=cid,
                 output_path=temp_path,
                 subaccount_id=subaccount_id,
+                bucket_name=bucket_name,
                 auto_decrypt=decrypt,
                 download_node=self.config.ipfs_store_url,
             )
@@ -278,6 +280,8 @@ class IPFSService:
         content_type: str,
         file_name: str,
         subaccount_id: str,
+        bucket_name: str,
+        is_public_bucket: bool = False,
         seed_phrase: Optional[str] = None,
     ) -> Dict[str, Union[str, int]]:
         """
@@ -317,8 +321,9 @@ class IPFSService:
                 try:
                     part_data = await self.download_file(
                         cid=cid,
-                        decrypt=False,
                         subaccount_id=subaccount_id,
+                        bucket_name=bucket_name,
+                        decrypt=False,
                     )
 
                     # Write part data to file
@@ -375,14 +380,18 @@ class IPFSService:
             # Upload the complete file to IPFS and publish to blockchain using s3_publish
             try:
                 logger.info(
-                    f"Using seed phrase for multipart s3_publish: '{seed_phrase}' (length: {len(seed_phrase.split()) if seed_phrase else 0} words)"
+                    f"Using seed phrase for multipart s3_publish (length: {len(seed_phrase.split()) if seed_phrase else 0} words)"
                 )
+
+                # Only encrypt if bucket is private
+                should_encrypt = not is_public_bucket
 
                 s3_result = await self.client.s3_publish(
                     file_path=str(output_path),
-                    encrypt=True,
+                    encrypt=should_encrypt,
                     seed_phrase=seed_phrase,
                     subaccount_id=subaccount_id,
+                    bucket_name=bucket_name,
                     store_node=self.config.ipfs_store_url,
                     pin_node=self.config.ipfs_store_url,
                     substrate_url=self.config.substrate_url,
@@ -430,8 +439,9 @@ class IPFSService:
             # Verify integrity by downloading the final concatenated file
             verification_data = await self.download_file(
                 cid=result["cid"],
-                decrypt=False,
                 subaccount_id=subaccount_id,
+                bucket_name=bucket_name,
+                decrypt=False,
             )
 
             verification_md5 = hashlib.md5(verification_data).hexdigest()
@@ -463,7 +473,7 @@ class IPFSService:
                 "content_type": content_type,
                 "size_bytes": total_size,
                 "etag": final_etag,
-                "encrypted": False,
+                "encrypted": should_encrypt,
                 "tx_hash": result["tx_hash"],
             }
         finally:
