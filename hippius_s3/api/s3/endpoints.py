@@ -1295,24 +1295,103 @@ async def put_object(
                     status_code=404,
                 )
 
-            # Create the object in the destination bucket (reusing the IPFS CID)
+            # Check if we can do a fast copy (same encryption context) or need decrypt/re-encrypt
+            source_is_public = source_bucket["is_public"]
+            dest_is_public = dest_bucket["is_public"]
+            same_bucket = source_bucket["bucket_id"] == dest_bucket["bucket_id"]
+            same_encryption_context = source_is_public == dest_is_public and same_bucket
+
+            source_metadata = json.loads(source_object["metadata"])
+
+            # Check for multipart objects - skip copying them for now
+            is_multipart = (
+                source_metadata.get("multipart", False)
+                or source_metadata.get("ipfs", {}).get("multipart", False)
+                or bool(source_metadata.get("ipfs", {}).get("part_cids"))
+            )
+
+            if is_multipart:
+                return create_xml_error_response(
+                    "NotImplemented",
+                    "Copying multipart objects is not currently supported",
+                    status_code=501,
+                )
+
             object_id = str(uuid.uuid4())
             created_at = datetime.now(UTC)
-            ipfs_cid = source_object["ipfs_cid"]
-            file_size = source_object["size_bytes"]
-            content_type = source_object["content_type"]
 
-            # Copy all metadata including encryption and tx_hash
-            source_metadata = json.loads(source_object["metadata"])
-            metadata = {
-                "ipfs": source_metadata.get("ipfs", {}),
-                "hippius": source_metadata.get("hippius", {}),
-            }
+            if same_encryption_context:
+                # Fast path: same encryption context, reuse CID
+                logger.info(
+                    f"Fast copy: same encryption context (same_bucket={same_bucket}, both_public={source_is_public})"
+                )
+                ipfs_cid = source_object["ipfs_cid"]
+                file_size = source_object["size_bytes"]
+                content_type = source_object["content_type"]
 
-            # Copy any user metadata (x-amz-meta-*)
-            for key, value in source_metadata.items():
-                if key not in ["ipfs", "hippius"]:
-                    metadata[key] = value  # noqa: PERF403
+                # Copy all metadata as-is
+                metadata = {
+                    "ipfs": source_metadata.get("ipfs", {}),
+                    "hippius": source_metadata.get("hippius", {}),
+                }
+
+                # Copy any user metadata (x-amz-meta-*)
+                for key, value in source_metadata.items():
+                    if key not in ["ipfs", "hippius"]:
+                        metadata[key] = value  # noqa: PERF403
+            else:
+                # Slow path: different encryption context, decrypt and re-encrypt
+                logger.info(
+                    f"Slow copy: different encryption (source public={source_is_public}, dest public={dest_is_public})"
+                )
+
+                # Download file from source bucket with source encryption
+                file_data = await ipfs_service.download_file(
+                    cid=source_object["ipfs_cid"],
+                    subaccount_id=request.state.account.main_account,
+                    bucket_name=source_bucket_name,
+                    decrypt=not source_is_public,
+                    # Decrypt if source was encrypted
+                )
+
+                # Create temporary file for re-upload
+                with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                    temp_path = temp_file.name
+                    temp_file.write(file_data)
+
+                try:
+                    # Re-encrypt for destination bucket
+                    should_encrypt = not dest_is_public
+                    s3_result = await ipfs_service.client.s3_publish(
+                        file_path=temp_path,
+                        encrypt=should_encrypt,
+                        seed_phrase=request.state.seed_phrase,
+                        subaccount_id=request.state.account.main_account,
+                        bucket_name=bucket_name,
+                        store_node=config.ipfs_store_url,
+                        pin_node=config.ipfs_store_url,
+                        substrate_url=config.substrate_url,
+                    )
+
+                    ipfs_cid = s3_result.cid
+                    file_size = len(file_data)
+                    content_type = source_object["content_type"]
+
+                    # Create new metadata for destination
+                    metadata = {
+                        "ipfs": {"cid": ipfs_cid, "encrypted": should_encrypt},
+                        "hippius": {"tx_hash": s3_result.tx_hash},
+                    }
+
+                    # Copy any user metadata (x-amz-meta-*)
+                    for key, value in source_metadata.items():
+                        if key not in ["ipfs", "hippius", "multipart"]:
+                            metadata[key] = value  # noqa: PERF403
+
+                finally:
+                    # Clean up temporary file
+                    if Path(temp_path).exists():
+                        Path(temp_path).unlink()
 
             # Create or update the object using upsert
             await db.fetchrow(
