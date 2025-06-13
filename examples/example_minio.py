@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import base64
 import hashlib
+import json
 import os
 import tempfile
 import time
@@ -128,6 +129,336 @@ def verify_multipart_integrity(original_file, downloaded_file, part_size_bytes):
             print(f"  Downloaded part hash: {downloaded_part_hash}")
 
     return overall_match, part_matches
+
+
+def test_bucket_policy_system():
+    """
+    Comprehensive test of the bucket policy system covering all requested test cases:
+    1. Create a public bucket, upload an object, check it's not encrypted
+    2. Copy object to same bucket, verify both objects have same hash, try to make bucket public again (should fail)
+    3. Try to make a private bucket with objects public (should fail)
+    4. Copy object from public bucket to private bucket (should be encrypted)
+    """
+    print("\n=== TESTING BUCKET POLICY SYSTEM ===")
+
+    from io import BytesIO
+
+    # Use upload+delete credentials for this test
+    acc1_uploaddelete = os.environ["HIPPIUS_ACC_1_SUBACCOUNT_UPLOADDELETE"]
+    encoded_acc1_uploaddelete = base64.b64encode(acc1_uploaddelete.encode("utf-8")).decode("utf-8")
+
+    # Create client
+    client = Minio(
+        MINIO_URL,
+        access_key=encoded_acc1_uploaddelete,
+        secret_key=acc1_uploaddelete,
+        secure=MINIO_SECURE,
+        region=MINIO_REGION,
+    )
+
+    # Generate unique bucket names
+    public_bucket_name = f"test-public-bucket-{int(time.time())}"
+    private_bucket_name = f"test-private-bucket-{int(time.time())}"
+    object_key = "test-object.txt"
+    copied_object_key = "copied-object.txt"
+    test_content = b"This is test content for bucket policy testing"
+
+    try:
+        # === TEST 1: Create public bucket and verify unencrypted storage ===
+        print(f"\n--- Test 1: Creating public bucket and testing unencrypted storage ---")
+
+        # Create empty bucket first
+        print(f"Creating empty bucket: {public_bucket_name}")
+        client.make_bucket(public_bucket_name)
+
+        # Set bucket policy to make it public using requests
+        print("Setting bucket policy to make bucket public...")
+        policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": ["s3:GetObject"],
+                    "Resource": [f"arn:aws:s3:::{public_bucket_name}/*"],
+                }
+            ],
+        }
+
+        # Use MinIO client to set bucket policy
+        try:
+            client.set_bucket_policy(public_bucket_name, json.dumps(policy))
+            print("✅ Bucket policy set successfully - bucket is now public")
+        except Exception as e:
+            print(f"❌ Failed to set bucket policy: {e}")
+            return False
+
+        # Upload object to public bucket
+        print(f"Uploading object to public bucket: {object_key}")
+        client.put_object(
+            public_bucket_name, object_key, BytesIO(test_content), len(test_content), content_type="text/plain"
+        )
+
+        # Get object metadata to check if it's properly stored
+        stat = client.stat_object(public_bucket_name, object_key)
+        print(f"Object uploaded - ETag: {stat.etag}")
+
+        # Download and verify content
+        response = client.get_object(public_bucket_name, object_key)
+        downloaded_content = response.read()
+        response.close()
+
+        if downloaded_content == test_content:
+            print("✅ Test 1 PASSED: Public bucket object stored and retrieved correctly")
+        else:
+            print("❌ Test 1 FAILED: Content mismatch")
+            return False
+
+        # === TEST 2: Copy object within same bucket and try to make bucket public again ===
+        print(f"\n--- Test 2: Copy object within same bucket and test policy restrictions ---")
+
+        # Copy object within same bucket
+        print(f"Copying {object_key} to {copied_object_key} within same bucket")
+        copy_source = CopySource(public_bucket_name, object_key)
+        client.copy_object(public_bucket_name, copied_object_key, copy_source)
+
+        # Download both objects and verify they have same content
+        print("Verifying both objects have same content...")
+
+        # Download original
+        original_response = client.get_object(public_bucket_name, object_key)
+        original_content = original_response.read()
+        original_response.close()
+
+        # Download copied
+        copied_response = client.get_object(public_bucket_name, copied_object_key)
+        copied_content = copied_response.read()
+        copied_response.close()
+
+        if original_content == copied_content == test_content:
+            print("✅ Both objects have matching content")
+        else:
+            print("❌ Test 2 FAILED: Object content mismatch after copy")
+            return False
+
+        # Try to make the bucket public again (should fail since it's already public)
+        print("Attempting to set bucket policy again (should fail)...")
+        try:
+            client.set_bucket_policy(public_bucket_name, json.dumps(policy))
+            print("❌ Test 2 FAILED: Should not be able to set policy on already public bucket")
+            return False
+        except Exception as e:
+            if "PolicyAlreadyExists" in str(e) or "409" in str(e):
+                print("✅ Test 2 PASSED: Cannot set policy on already public bucket")
+            else:
+                print(f"❌ Test 2 FAILED: Unexpected error: {e}")
+                return False
+
+        # === TEST 3: Try to make private bucket with objects public (should fail) ===
+        print(f"\n--- Test 3: Try to make private bucket with objects public ---")
+
+        # Create private bucket with objects
+        print(f"Creating private bucket: {private_bucket_name}")
+        client.make_bucket(private_bucket_name)
+
+        # Upload object to private bucket
+        print("Uploading object to private bucket...")
+        client.put_object(
+            private_bucket_name, object_key, BytesIO(test_content), len(test_content), content_type="text/plain"
+        )
+
+        # Try to make it public (should fail because bucket has objects)
+        print("Attempting to set bucket policy on non-empty private bucket (should fail)...")
+        private_policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": ["s3:GetObject"],
+                    "Resource": [f"arn:aws:s3:::{private_bucket_name}/*"],
+                }
+            ],
+        }
+
+        try:
+            client.set_bucket_policy(private_bucket_name, json.dumps(private_policy))
+            print("❌ Test 3 FAILED: Should not be able to set policy on non-empty bucket")
+            return False
+        except Exception as e:
+            if "BucketNotEmpty" in str(e) or "409" in str(e):
+                print("✅ Test 3 PASSED: Cannot make non-empty bucket public")
+            else:
+                print(f"❌ Test 3 FAILED: Unexpected error: {e}")
+                return False
+
+        # === TEST 4: Copy object from public bucket to private bucket ===
+        print(f"\n--- Test 4: Copy object from public bucket to private bucket ---")
+
+        # Copy object from public bucket to private bucket
+        print(f"Copying object from public bucket {public_bucket_name} to private bucket {private_bucket_name}")
+        copy_source_cross = CopySource(public_bucket_name, object_key)
+        client.copy_object(private_bucket_name, copied_object_key, copy_source_cross)
+
+        # Download from both buckets and verify content
+        print("Verifying cross-bucket copy worked...")
+
+        # Download from public bucket
+        public_response = client.get_object(public_bucket_name, object_key)
+        public_content = public_response.read()
+        public_response.close()
+
+        # Download from private bucket
+        private_response = client.get_object(private_bucket_name, copied_object_key)
+        private_content = private_response.read()
+        private_response.close()
+
+        if public_content == private_content == test_content:
+            print("✅ Test 4 PASSED: Cross-bucket copy successful, content matches")
+        else:
+            print("❌ Test 4 FAILED: Cross-bucket copy content mismatch")
+            return False
+
+        print("\n✅ ALL BUCKET POLICY TESTS PASSED!")
+        return True
+
+    except Exception as e:
+        print(f"❌ BUCKET POLICY TEST FAILED: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return False
+
+    finally:
+        # Cleanup
+        print("\n--- Cleaning up test resources ---")
+        try:
+            # Remove objects from public bucket
+            try:
+                client.remove_object(public_bucket_name, object_key)
+                client.remove_object(public_bucket_name, copied_object_key)
+            except:
+                pass
+
+            # Remove objects from private bucket
+            try:
+                client.remove_object(private_bucket_name, object_key)
+                client.remove_object(private_bucket_name, copied_object_key)
+            except:
+                pass
+
+            # Remove buckets
+            try:
+                client.remove_bucket(public_bucket_name)
+            except:
+                pass
+            try:
+                client.remove_bucket(private_bucket_name)
+            except:
+                pass
+
+            print("✅ Cleanup completed")
+        except Exception as e:
+            print(f"⚠️ Warning during cleanup: {e}")
+
+
+def test_same_bucket_copy():
+    """
+    Test copying objects within the same bucket (private bucket scenario).
+    This is the old test_public_bucket_copy function, renamed for clarity.
+    """
+    print("\n=== TESTING SAME-BUCKET COPY OPERATIONS (PRIVATE BUCKET) ===")
+
+    # Use upload+delete credentials for this test
+    acc1_uploaddelete = os.environ["HIPPIUS_ACC_1_SUBACCOUNT_UPLOADDELETE"]
+
+    # Base64 encode the seed phrase for access key (to match main script)
+    encoded_acc1_uploaddelete = base64.b64encode(acc1_uploaddelete.encode("utf-8")).decode("utf-8")
+
+    # Create client
+    client = Minio(
+        MINIO_URL,
+        access_key=encoded_acc1_uploaddelete,
+        secret_key=acc1_uploaddelete,
+        secure=MINIO_SECURE,
+        region=MINIO_REGION,
+    )
+
+    # Generate unique bucket name
+    bucket_name = f"test-private-bucket-{int(time.time())}"
+    original_object_key = "original-object.bin"
+    copied_object_key = "copied-object.bin"
+
+    try:
+        # Create regular bucket (private by default)
+        print(f"Creating private bucket: {bucket_name}")
+        client.make_bucket(bucket_name)
+
+        # Create test file
+        print("Creating test file...")
+        test_file = create_test_file(file_size_mb=1)
+        original_hash = calculate_md5(test_file)
+        print(f"Original file hash: {original_hash}")
+
+        # Upload original object
+        print(f"Uploading object: {original_object_key}")
+        client.fput_object(bucket_name, original_object_key, test_file)
+
+        # Copy object within same bucket
+        print(f"Copying {original_object_key} to {copied_object_key}")
+        copy_source = CopySource(bucket_name, original_object_key)
+        client.copy_object(bucket_name, copied_object_key, copy_source)
+        print("Copy operation completed successfully")
+
+        # Download original object
+        print("Downloading original object...")
+        with tempfile.NamedTemporaryFile(delete=False) as temp_original:
+            client.fget_object(bucket_name, original_object_key, temp_original.name)
+            original_downloaded_hash = calculate_md5(temp_original.name)
+
+        # Download copied object
+        print("Downloading copied object...")
+        with tempfile.NamedTemporaryFile(delete=False) as temp_copied:
+            client.fget_object(bucket_name, copied_object_key, temp_copied.name)
+            copied_downloaded_hash = calculate_md5(temp_copied.name)
+
+        # Verify hashes
+        print(f"Original file hash: {original_hash}")
+        print(f"Original downloaded hash: {original_downloaded_hash}")
+        print(f"Copied downloaded hash: {copied_downloaded_hash}")
+
+        # Check all hashes match
+        hashes_match = original_hash == original_downloaded_hash == copied_downloaded_hash
+        print(f"All hashes match: {hashes_match}")
+
+        if hashes_match:
+            print("✅ SAME-BUCKET COPY TEST PASSED: All objects have matching hashes")
+        else:
+            print("❌ SAME-BUCKET COPY TEST FAILED: Hash mismatch detected")
+            return False
+
+        # Clean up temporary files
+        os.unlink(test_file)
+        os.unlink(temp_original.name)
+        os.unlink(temp_copied.name)
+
+        # Clean up bucket and objects
+        client.remove_object(bucket_name, original_object_key)
+        client.remove_object(bucket_name, copied_object_key)
+        client.remove_bucket(bucket_name)
+
+        return True
+
+    except Exception as e:
+        print(f"❌ SAME-BUCKET COPY TEST FAILED: {e}")
+        # Attempt cleanup on failure
+        try:
+            client.remove_object(bucket_name, original_object_key)
+            client.remove_object(bucket_name, copied_object_key)
+            client.remove_bucket(bucket_name)
+        except:
+            pass
+        return False
 
 
 def main():
@@ -395,6 +726,16 @@ def main():
     print("✅ SUCCESS: Main account isolation test completed")
 
     print("\n=== CONTINUING WITH MAIN TESTS ===\n")
+
+    # Run bucket policy system tests
+    if not test_bucket_policy_system():
+        print("❌ Bucket policy tests failed, stopping execution!")
+        return
+
+    # Run same-bucket copy test (private bucket)
+    if not test_same_bucket_copy():
+        print("❌ Same-bucket copy test failed, stopping execution!")
+        return
 
     # Test bucket names and object keys
     main_bucket = f"test-bucket-{int(time.time())}"

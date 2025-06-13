@@ -239,6 +239,10 @@ async def get_bucket(
 
         return await list_multipart_uploads(bucket_name, request, db)
 
+    # If the policy query parameter is present, this is a bucket policy request
+    if "policy" in request.query_params:
+        return await get_bucket_policy(bucket_name, db, request.state.account.main_account)
+
     try:
         # Get bucket for this main account
         bucket = await db.fetchrow(
@@ -1051,7 +1055,11 @@ async def create_bucket(
                 status_code=500,
             )
 
-    # Handle standard bucket creation if not a tagging or lifecycle request
+    # Check if this is a request to set bucket policy
+    elif "policy" in request.query_params:
+        return await set_bucket_policy(bucket_name, request, db)
+
+    # Handle standard bucket creation if not a tagging, lifecycle, or policy request
     else:
         try:
             bucket_id = str(uuid.uuid4())
@@ -1962,3 +1970,208 @@ async def delete_object(
             "We encountered an internal error. Please try again.",
             status_code=500,
         )
+
+
+async def set_bucket_policy(
+    bucket_name: str,
+    request: Request,
+    db: dependencies.DBConnection,
+) -> Response:
+    """
+    Set bucket policy to make bucket public (PUT /{bucket_name}?policy).
+
+    This allows transitioning a private bucket to public (one-way only).
+    Validates that bucket is empty and not already public.
+    """
+    try:
+        main_account_id = request.state.account.main_account
+
+        # Get bucket for this main account
+        bucket = await db.fetchrow(
+            get_query("get_bucket_by_name_and_owner"),
+            bucket_name,
+            main_account_id,
+        )
+
+        if not bucket:
+            return create_xml_error_response(
+                "NoSuchBucket",
+                f"The specified bucket {bucket_name} does not exist",
+                status_code=404,
+                BucketName=bucket_name,
+            )
+
+        # Check if bucket is already public
+        if bucket["is_public"]:
+            return create_xml_error_response(
+                "PolicyAlreadyExists",
+                "The bucket policy already exists and bucket is public",
+                status_code=409,
+                BucketName=bucket_name,
+            )
+
+        # Check if bucket has objects
+        if not await bucket_is_empty(bucket["bucket_id"], db):
+            return create_xml_error_response(
+                "BucketNotEmpty",
+                "Cannot make bucket public: bucket contains objects",
+                status_code=409,
+                BucketName=bucket_name,
+            )
+
+        # Parse and validate policy
+        policy_data = await request.body()
+        if not policy_data:
+            return create_xml_error_response(
+                "MalformedPolicy",
+                "Policy document is empty",
+                status_code=400,
+            )
+
+        try:
+            policy_json = json.loads(policy_data.decode("utf-8"))
+        except json.JSONDecodeError:
+            return create_xml_error_response(
+                "MalformedPolicy",
+                "Policy document is not valid JSON",
+                status_code=400,
+            )
+
+        # Validate it's a public read policy
+        if not validate_public_policy(policy_json, bucket_name):
+            return create_xml_error_response(
+                "InvalidPolicyDocument",
+                "Policy document is invalid or not a public read policy",
+                status_code=400,
+            )
+
+        # Update bucket to public
+        await db.fetchrow(
+            "UPDATE buckets SET is_public = TRUE WHERE bucket_id = $1",
+            bucket["bucket_id"],
+        )
+
+        logger.info(f"Bucket '{bucket_name}' set to public via policy")
+        return Response(status_code=204)
+
+    except Exception as e:
+        logger.exception(f"Error setting bucket policy: {e}")
+        return create_xml_error_response(
+            "InternalError",
+            "We encountered an internal error. Please try again.",
+            status_code=500,
+        )
+
+
+async def get_bucket_policy(
+    bucket_name: str,
+    db: dependencies.DBConnection,
+    main_account_id: str,
+) -> Response:
+    """
+    Get bucket policy (GET /{bucket_name}?policy).
+
+    Returns the policy for public buckets, or error for private buckets.
+    """
+    try:
+        # Get bucket for this main account
+        bucket = await db.fetchrow(
+            get_query("get_bucket_by_name_and_owner"),
+            bucket_name,
+            main_account_id,
+        )
+
+        if not bucket:
+            return create_xml_error_response(
+                "NoSuchBucket",
+                f"The specified bucket {bucket_name} does not exist",
+                status_code=404,
+                BucketName=bucket_name,
+            )
+
+        # If bucket is not public, no policy exists
+        if not bucket["is_public"]:
+            return create_xml_error_response(
+                "NoSuchBucketPolicy",
+                "The bucket policy does not exist",
+                status_code=404,
+                BucketName=bucket_name,
+            )
+
+        # Return standard public read policy
+        policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": ["s3:GetObject"],
+                    "Resource": [f"arn:aws:s3:::{bucket_name}/*"],
+                }
+            ],
+        }
+
+        return Response(
+            content=json.dumps(policy, indent=2),
+            media_type="application/json",
+            status_code=200,
+        )
+
+    except Exception as e:
+        logger.exception(f"Error getting bucket policy: {e}")
+        return create_xml_error_response(
+            "InternalError",
+            "We encountered an internal error. Please try again.",
+            status_code=500,
+        )
+
+
+async def validate_public_policy(policy: dict, bucket_name: str) -> bool:
+    """
+    Validate that the policy is a valid public read policy.
+
+    Checks for standard S3 public read policy structure.
+    """
+    try:
+        # Check required fields
+        if policy.get("Version") != "2012-10-17":
+            return False
+
+        statements = policy.get("Statement", [])
+        if not statements or not isinstance(statements, list):
+            return False
+
+        # Check for at least one public read statement
+        for statement in statements:
+            if (
+                statement.get("Effect") == "Allow"
+                and statement.get("Principal") == "*"
+                and "s3:GetObject" in statement.get("Action", [])
+            ):
+                resources = statement.get("Resource", [])
+                expected_resource = f"arn:aws:s3:::{bucket_name}/*"
+
+                if expected_resource in resources:
+                    return True
+
+        return False
+
+    except Exception:
+        logger.exception("Error validating policy")
+        return False
+
+
+async def bucket_is_empty(bucket_id: str, db: dependencies.DBConnection) -> bool:
+    """
+    Check if bucket contains any objects.
+    """
+    try:
+        result = await db.fetchval(
+            "SELECT COUNT(*) FROM objects WHERE bucket_id = $1",
+            bucket_id,
+        )
+        return result == 0
+
+    except Exception:
+        logger.exception("Error checking if bucket is empty")
+        return False
