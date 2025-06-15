@@ -89,8 +89,8 @@ async def check_credit_for_all_operations(request: Request, call_next: Callable)
     """
     path = request.url.path
 
-    # Skip credit checks for frontend user endpoints
-    if path.startswith("/user/"):
+    # Skip credit checks for frontend user endpoints and docs
+    if path.startswith("/user/") or path in ["/docs", "/openapi.json", "/redoc"] or path.startswith("/docs/"):
         return await call_next(request)
 
     # Check if we have a seed phrase in request.state (set by HMAC middleware)

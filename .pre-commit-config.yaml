@@ -5,8 +5,10 @@ repos:
       - id: ruff
         args: [ --fix ]
         stages: [ commit ]
+        files: ^hippius_s3/
       - id: ruff-format
         stages: [ commit ]
+        files: ^hippius_s3/
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
@@ -22,23 +24,4 @@ repos:
       - id: debug-statements
         stages: [ commit ]
       - id: check-toml
-        stages: [ commit ]
-
-  # Auto-fix local hooks
-  - repo: local
-    hooks:
-      - id: auto-ruff-apply
-        name: Auto apply ruff fixes
-        entry: bash -c 'source .venv/bin/activate && ruff check --fix-only hippius_s3/'
-        language: system
-        pass_filenames: false
-        always_run: true
-        stages: [ commit ]
-
-      - id: auto-ruff-format
-        name: Auto format with ruff
-        entry: bash -c 'source .venv/bin/activate && ruff format hippius_s3/'
-        language: system
-        pass_filenames: false
-        always_run: true
         stages: [ commit ]

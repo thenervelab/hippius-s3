@@ -42,7 +42,16 @@ async def cors_middleware(
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none';"
+
+    # Relaxed CSP for documentation endpoints, strict for everything else
+    path = request.url.path
+    if path in ["/docs", "/redoc"] or path.startswith("/docs/"):
+        response.headers[
+            "Content-Security-Policy"
+        ] = "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: https:; frame-ancestors 'none';"
+    else:
+        response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none';"
+
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
 
