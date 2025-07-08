@@ -1,8 +1,6 @@
 """User API endpoints for frontend JSON responses."""
 
 import logging
-from typing import Any
-from typing import Dict
 from typing import Optional
 
 from fastapi import APIRouter
@@ -10,21 +8,24 @@ from fastapi import Depends
 from fastapi import HTTPException
 from fastapi import Query
 from fastapi.responses import JSONResponse
+from hippius_sdk.substrate import SubstrateClient
 from starlette import status
 
+from hippius_s3.config import get_config
 from hippius_s3.dependencies import get_postgres
 from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["user"])
+config = get_config()
 
 
 @router.get("/list_buckets")
 async def list_buckets(
     main_account_id: str = Query(..., description="Main account ID to list buckets for"),
     db=Depends(get_postgres),
-) -> Dict[str, Any]:
+) -> JSONResponse:
     """
     List all buckets owned by a specific main account.
 
@@ -68,7 +69,7 @@ async def get_bucket_location(
     bucket_name: str = Query(..., description="Bucket name to get location for"),
     main_account_id: str = Query(..., description="Main account ID that owns the bucket"),
     db=Depends(get_postgres),
-) -> Dict[str, Any]:
+) -> JSONResponse:
     """
     Get bucket location information for a specific bucket.
 
@@ -107,6 +108,27 @@ async def get_bucket_location(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get bucket location",
         ) from e
+
+
+@router.get("/credits")
+async def credits(
+    main_account_id: str = Query(..., description="Main account ID"),
+) -> JSONResponse:
+    try:
+        substrate_client = SubstrateClient(
+            url=config.substrate_url,
+        )
+        return JSONResponse(
+            {
+                "account_id": main_account_id,
+                "credits": await substrate_client.get_free_credits(main_account_id),
+            }
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{main_account_id} is not a valid account ID",
+        ) from None
 
 
 @router.get("/list_objects")
