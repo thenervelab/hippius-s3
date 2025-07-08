@@ -1,5 +1,6 @@
 """User API endpoints for frontend JSON responses."""
 
+import base64
 import logging
 from typing import Optional
 
@@ -112,22 +113,25 @@ async def get_bucket_location(
 
 @router.get("/credits")
 async def credits(
-    main_account_id: str = Query(..., description="Main account ID"),
+    b64_seed_phrase: str = Query(..., description="Main account seed phrase in base64"),
 ) -> JSONResponse:
     try:
+        main_account_seed_phrase = base64.b64decode(b64_seed_phrase).decode()
         substrate_client = SubstrateClient(
             url=config.substrate_url,
         )
+        remaining_credits = await substrate_client.get_free_credits(
+            seed_phrase=main_account_seed_phrase,
+        )
         return JSONResponse(
             {
-                "account_id": main_account_id,
-                "credits": await substrate_client.get_free_credits(main_account_id),
+                "credits": remaining_credits,
             }
         )
     except ValueError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"{main_account_id} is not a valid account ID",
+            detail="Provided value is not a valid seed phrase",
         ) from None
 
 
