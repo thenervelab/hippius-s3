@@ -113,16 +113,31 @@ async def get_bucket_location(
 
 @router.get("/credits")
 async def credits(
-    b64_seed_phrase: str = Query(..., description="Main account seed phrase in base64"),
+    b64_subaccount_seed_phrase: str = Query(..., description="Subaccount seed phrase in base64"),
 ) -> JSONResponse:
     try:
-        main_account_seed_phrase = base64.b64decode(b64_seed_phrase).decode()
+        subaccount_seed = base64.b64decode(b64_subaccount_seed_phrase).decode()
+
         substrate_client = SubstrateClient(
             url=config.substrate_url,
         )
-        remaining_credits = await substrate_client.get_free_credits(
-            seed_phrase=main_account_seed_phrase,
+        substrate_client.connect(seed_phrase=subaccount_seed)
+
+        main_account = substrate_client.query_sub_account(
+            substrate_client._account_address,
+            seed_phrase=subaccount_seed,
         )
+
+        if not main_account:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The seed phrase you passed in belongs to a main account, please pass in a subaccount seed phrase instead",
+            )
+
+        remaining_credits = await substrate_client.get_free_credits(
+            account_address=main_account,
+        )
+
         return JSONResponse(
             {
                 "credits": remaining_credits,
