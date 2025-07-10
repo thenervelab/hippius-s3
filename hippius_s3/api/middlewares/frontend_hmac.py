@@ -50,6 +50,8 @@ async def verify_frontend_hmac_middleware(
         hashlib.sha256,
     ).hexdigest()
 
+    logger.info(f"{message=} {expected_signature=} {hmac_signature=}")
+
     # Compare signatures
     if not hmac.compare_digest(expected_signature, hmac_signature):
         logger.warning(
