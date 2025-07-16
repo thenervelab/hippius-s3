@@ -20,33 +20,25 @@ async def cors_middleware(
     """
     # Handle preflight OPTIONS requests
     if request.method == "OPTIONS":
-        response = Response(status_code=204)  # Changed from 200 to 204
+        response = Response(status_code=204)
+    else:
+        response = await call_next(request)
 
-        # Add CORS headers to preflight response
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, HEAD, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "*"
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Max-Age"] = "86400"
-
-        # Echo back any requested headers
-        if "Access-Control-Request-Headers" in request.headers:
-            response.headers["Access-Control-Allow-Headers"] = request.headers["Access-Control-Request-Headers"]
-
-        # Echo back any requested methods
-        if "Access-Control-Request-Method" in request.headers:
-            response.headers["Access-Control-Allow-Methods"] = request.headers["Access-Control-Request-Method"]
-
-        return response
-
-    response = await call_next(request)
-
-    # Add CORS headers to actual responses
+    # Add CORS headers to ALL responses (including OPTIONS)
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, HEAD, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "*"
     response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["Access-Control-Expose-Headers"] = "*"
+    response.headers["Access-Control-Max-Age"] = "86400"
+
+    # Echo back any requested headers for OPTIONS requests
+    if request.method == "OPTIONS":
+        if "Access-Control-Request-Headers" in request.headers:
+            response.headers["Access-Control-Allow-Headers"] = request.headers["Access-Control-Request-Headers"]
+
+        if "Access-Control-Request-Method" in request.headers:
+            response.headers["Access-Control-Allow-Methods"] = request.headers["Access-Control-Request-Method"]
 
     # other security headers...
     response.headers["X-Robots-Tag"] = "noindex, nofollow, nosnippet, noarchive"
