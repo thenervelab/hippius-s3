@@ -18,13 +18,17 @@ async def cors_middleware(
     """
     Custom CORS middleware that adds CORS headers without intercepting exceptions.
     """
+    logger.info(f"CORS middleware: {request.method} {request.url.path}")
+
     # Handle preflight OPTIONS requests
     if request.method == "OPTIONS":
+        logger.info("Handling OPTIONS request")
         response = Response(status_code=204)
     else:
         response = await call_next(request)
 
     # Add CORS headers to ALL responses (including OPTIONS)
+    logger.info("Adding CORS headers...")
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, HEAD, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "*"
@@ -40,7 +44,7 @@ async def cors_middleware(
         if "Access-Control-Request-Method" in request.headers:
             response.headers["Access-Control-Allow-Methods"] = request.headers["Access-Control-Request-Method"]
 
-    # other security headers...
+    # Add your other security headers...
     response.headers["X-Robots-Tag"] = "noindex, nofollow, nosnippet, noarchive"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -59,4 +63,5 @@ async def cors_middleware(
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
 
+    logger.info(f"CORS response headers {dict(response.headers)}")
     return response
