@@ -12,12 +12,14 @@ from fastapi import FastAPI
 from fastapi import Response
 from fastapi.openapi.utils import get_openapi
 
+from hippius_s3.api.middlewares.audit_log import audit_log_middleware
+from hippius_s3.api.middlewares.backend_hmac import verify_hmac_middleware
 from hippius_s3.api.middlewares.banhammer import BanHammerService
 from hippius_s3.api.middlewares.banhammer import banhammer_wrapper
 from hippius_s3.api.middlewares.cors import cors_middleware
 from hippius_s3.api.middlewares.credit_check import check_credit_for_all_operations
 from hippius_s3.api.middlewares.frontend_hmac import verify_frontend_hmac_middleware
-from hippius_s3.api.middlewares.hmac import verify_hmac_middleware
+from hippius_s3.api.middlewares.profiler import SpeedscopeProfilerMiddleware
 from hippius_s3.api.middlewares.rate_limit import RateLimitService
 from hippius_s3.api.middlewares.rate_limit import rate_limit_wrapper
 from hippius_s3.api.s3.endpoints import router as s3_router
@@ -53,6 +55,9 @@ uvicorn_access_logger.setLevel(config.log_level)
 logging.getLogger("hippius_s3").setLevel(logging.DEBUG)
 logging.getLogger("hippius_s3.api.s3.multipart").setLevel(logging.DEBUG)
 logging.getLogger("hippius_s3.api.s3.endpoints").setLevel(logging.DEBUG)
+
+# Configure audit logger
+logging.getLogger("audit").setLevel(logging.INFO)
 
 # Reduce HTTP client log noise
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -153,18 +158,22 @@ app.openapi = custom_openapi  # type: ignore[method-assign]
 # Custom middlewares - middleware("http") executes in REVERSE order
 # 1. Rate limiting (executes LAST, needs account from credit check)
 app.middleware("http")(rate_limit_wrapper)
-# 2. Credit verification (executes SIXTH, sets account info, needs seed phrase)
+# 2. Audit logging (executes EIGHTH, logs all operations after auth)
+app.middleware("http")(audit_log_middleware)
+# 3. Credit verification (executes SEVENTH, sets account info, needs seed phrase)
 app.middleware("http")(check_credit_for_all_operations)
-# Frontend HMAC verification for /user/ endpoints (executes after credit check)
+# 4. Frontend HMAC verification for /user/ endpoints (executes SIXTH)
 app.middleware("http")(verify_frontend_hmac_middleware)
-# 3. HMAC authentication (extract seed phrase - executes FOURTH)
+# 5. HMAC authentication (extract seed phrase - executes FIFTH)
 app.middleware("http")(verify_hmac_middleware)
-# 4. Input validation (AWS S3 compliance - executes THIRD)
-# app.middleware("http")(input_validation_middleware)
-# 5. Banhammer (IP-based protection - executes SECOND)
+# 6. Input validation (AWS S3 compliance - executes FOURTH)
+# app.middleware("http")(input_validation_middleware)  # noqa: ERA001
+# 7. Banhammer (IP-based protection - executes THIRD)
 app.middleware("http")(banhammer_wrapper)
-# 6. CORS (executes FIRST - outermost layer)
+# 8. CORS (executes SECOND)
 app.middleware("http")(cors_middleware)
+# 9. Profiler (executes FIRST - outermost layer, profiles entire request including auth)
+app.add_middleware(SpeedscopeProfilerMiddleware)
 
 
 @app.get("/robots.txt", include_in_schema=False)

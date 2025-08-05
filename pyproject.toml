@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
 authors = [
-    {name = "eatmyveggies", email = "radu@corcel.io"},
+    {name = "eatmyveggies", email = "veggies@hippius.com"},
 ]
 dependencies = [
     "fastapi>=0.115.12",
@@ -26,6 +26,7 @@ dependencies = [
     "hippius[key_storage]>=0.2.37",
     "cachetools",
     "redis",
+    "pyinstrument>=4.0.0",
 ]
 
 [project.optional-dependencies]
@@ -43,20 +44,14 @@ dev = [
 packages = ["hippius_s3"]
 
 [tool.ruff]
-exclude        = ["tests", ".git", "__pycache__", ".mypy_cache", ".pytest_cache", "tasks.py", "examples"]
-line-length    = 120
-src            = ["hippius_s3", "tests"]
-target-version = "py310"
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.format]
+quote-style = "double"
+skip-magic-trailing-comma = false
 
 [tool.ruff.lint]
-ignore = [
-    "B008",   # do not perform function calls in argument defaults (pydantic.Field(...))
-    "ERA001", # code commented out
-    "G004",   # logging statement uses f-string
-    "TRY400", # use logging.exception instead of logging.error
-    "C901",   # function too complex
-    "E501",   # line too long
-]
 select = [
     "F",        # pyflakes
     "E",        # pycodestyle errors
@@ -77,6 +72,11 @@ select = [
     "RET",
     "PERF",     # perflint
     "TID",      # flake8-tidy-imports
+]
+ignore = [
+    "C901", # Too complex functions
+    "E722", # Bare except clauses
+    "E501", # Line too long (let formatter handle this)
 ]
 
 [tool.ruff.lint.isort]

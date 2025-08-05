@@ -1,10 +1,10 @@
 # Hippius S3
 
-S3-compatible API gateway with IPFS storage and blockchain publishing
+A high-performance S3-compatible gateway for Hippius' decentralized IPFS storage network. This service provides AWS S3 API compatibility while storing data on IPFS with built-in authentication, rate limiting, and audit logging.
 
 ## Overview
 
-Hippius S3 is a production-ready S3-compatible API that stores data on IPFS while automatically publishing to the Hippius blockchain marketplace. It provides standard S3 operations with AWS SigV4 authentication, server-side encryption, and seamless integration with existing S3 clients.
+Hippius S3 is a production-ready S3-compatible API that stores data on IPFS while automatically publishing to the Hippius blockchain marketplace. It provides standard S3 operations with HMAC-based authentication, comprehensive middleware stack, and seamless integration with existing S3 clients.
 
 ## Features
 
@@ -16,17 +16,25 @@ Hippius S3 is a production-ready S3-compatible API that stores data on IPFS whil
 - **Tagging**: Bucket and object tagging with full CRUD operations
 
 ### ✅ Security & Authentication
-- **AWS SigV4 HMAC**: Full AWS Signature Version 4 authentication
-- **Seed Phrase Authentication**: Base64-encoded seed phrase credentials
-- **Server-Side Encryption**: AES256 encryption via x-amz-server-side-encryption header
-- **Account Credits**: Automatic credit verification for bucket creation
-- **Rate Limiting**: 100 requests per minute per seed phrase to prevent abuse
+- **HMAC Authentication**: Full HMAC signature verification with seed phrase credentials
+- **Frontend/Backend HMAC**: Separate HMAC verification for different endpoints
+- **Account Credits**: Automatic credit verification for all operations
+- **Rate Limiting**: Configurable per-user rate limiting with Redis backend
+- **IP-based Banning**: BanHammer service for IP-based protection
+- **Input Validation**: AWS S3 compliance validation middleware
 
 ### ✅ Blockchain Integration
 - **IPFS Storage**: Automatic file storage and pinning via Hippius SDK
 - **Blockchain Publishing**: Files automatically published to Hippius marketplace
 - **Transaction Tracking**: Blockchain transaction hashes stored in metadata
 - **Decentralized Access**: Files remain accessible via IPFS network
+
+### ✅ Production Features
+- **Audit Logging**: Comprehensive audit trails for all operations
+- **Performance Profiling**: Optional request profiling with Speedscope integration
+- **Multi-tenant**: User-scoped buckets with isolated storage
+- **Health Checks**: Built-in health checking for all dependencies
+- **CORS Support**: Configurable cross-origin request handling
 
 ### ✅ S3 Client Compatibility
 Works with standard S3 clients including:
@@ -35,68 +43,84 @@ Works with standard S3 clients including:
 - boto3
 - s3cmd
 
-## Installation
+## Getting Started
+
+### Prerequisites
+
+- Docker and Docker Compose
+- Python 3.10+ (for local development)
 
 ### Quick Start with Docker
 
+1. **Clone the repository**:
+   ```bash
+   git clone <repository-url>
+   cd hippius-s3
+   ```
+
+2. **Create environment configuration**:
+   ```bash
+   # Create .env file with required variables (see Configuration section)
+   ```
+
+3. **Start all services**:
+   ```bash
+   docker compose up -d
+   ```
+
+4. **Verify the setup**:
+   ```bash
+   curl http://localhost:8000/docs
+   ```
+
 ```bash
-git clone https://github.com/thenervelab/hippius-s3.git
-cd hippius-s3
-docker compose up -d
-```
-
-The service will be available at `http://localhost:8000` with PostgreSQL, Redis, and IPFS running in containers.
-
-### Production Deployment
-
-```bash
-# 1. Install dependencies
-pip install -r requirements.txt
-
-# 2. Set up database
-createdb hippius_s3
-dbmate up
-
-# 3. Configure environment
-cp .env.example .env
-# Edit .env with your settings
-
-# 4. Run the service
-uvicorn hippius_s3.main:app --host 0.0.0.0 --port 8000
+docker compose -f docker-compose.prod.yml up -d
 ```
 
 ## Configuration
 
-### Environment Variables
+### Required Environment Variables
+Create a `.env` file with the following required variables:
 
 ```bash
 # Database
-DB_HOST=localhost
-DB_PORT=5432
-DB_USER=postgres
-DB_PASSWORD=your_password
-DB_NAME=hippius_s3
+DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius
 
-# Redis (for rate limiting and caching)
-REDIS_URL=redis://localhost:6379/0
+# IPFS Configuration
+HIPPIUS_IPFS_GET_URL=http://ipfs:8080
+HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
 
-# IPFS
-IPFS_STORE_URL=https://store.hippius.network
-IPFS_GET_URL=https://get.hippius.network
+# Security
+FRONTEND_HMAC_SECRET=your-secret-key-here
+RATE_LIMIT_PER_MINUTE=100
+MAX_REQUEST_SIZE_MB=100
+
+# Server
+HOST=0.0.0.0
+PORT=8000
+ENVIRONMENT=development
+DEBUG=true
+LOG_LEVEL=DEBUG
+
+# Features
+ENABLE_AUDIT_LOGGING=true
+ENABLE_STRICT_VALIDATION=true
+ENABLE_API_DOCS=true
+ENABLE_REQUEST_PROFILING=false
+
+# S3 Limits
+MIN_BUCKET_NAME_LENGTH=3
+MAX_BUCKET_NAME_LENGTH=63
+MAX_OBJECT_KEY_LENGTH=1024
+MAX_METADATA_SIZE=2048
 
 # Blockchain
-VALIDATOR_REGION=decentralized
+HIPPIUS_SUBSTRATE_URL=your-substrate-endpoint
+HIPPIUS_VALIDATOR_REGION=your-region
+
+# Redis
+REDIS_URL=redis://redis:6379/0
 ```
-
-### Encryption Key Storage
-
-For automatic encryption key management per user, install the Hippius SDK with key storage support:
-
-```bash
-pip install hippius_sdk[keystore]
-```
-
-This enables PostgreSQL-backed encryption key storage and management. See the [Hippius SDK documentation](https://github.com/thenervelab/hippius-sdk/tree/main/hippius_sdk/db) for setup details.
 
 ## Usage Examples
 
@@ -112,7 +136,7 @@ encoded_key = base64.b64encode(seed_phrase.encode('utf-8')).decode('utf-8')
 
 # Create client
 client = Minio(
-    "s3.hippius.com",  # or localhost:8000
+    "http://localhost:8000",
     access_key=encoded_key,
     secret_key=seed_phrase,
     secure=True,
@@ -174,16 +198,6 @@ Hippius SDK
 IPFS Network + Blockchain
 ```
 
-### Components
-
-- **FastAPI Application**: Modern async Python API framework
-- **PostgreSQL**: Metadata storage with full schema migrations
-- **Redis**: Rate limiting and caching layer
-- **Hippius SDK**: IPFS and blockchain integration
-- **HMAC Middleware**: AWS SigV4 signature verification
-- **Credit Middleware**: Account verification for operations
-- **Rate Limit Middleware**: Request throttling per seed phrase
-
 ## Development
 
 ```bash
@@ -204,10 +218,7 @@ mypy hippius_s3
 
 - [ ] **Access Control Lists (ACLs)** - Fine-grained permissions
 - [ ] **Pre-signed URLs** - Temporary access without credentials
-- [ ] **Object Versioning** - Multiple versions of objects
 - [ ] **Lifecycle Management** - Automated object expiration
-- [ ] **CORS Configuration** - Cross-origin request handling
-- [ ] **Event Notifications** - Webhooks for object operations
 
 ## License
 
