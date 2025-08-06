@@ -271,7 +271,7 @@ async def main():
     try:
         # Load environment variables directly
         substrate_url = os.getenv("HIPPIUS_SUBSTRATE_URL")
-        redis_url = os.getenv("REDIS_URL")
+        redis_url = "redis://127.0.0.1:6379/0"
 
         if not substrate_url:
             raise ValueError("HIPPIUS_SUBSTRATE_URL environment variable is required")
