@@ -59,9 +59,13 @@ class SubstrateCacher:
         """Fetch all free credits from substrate storage."""
         logger.debug("Fetching all free credits")
 
-        # Debug: try to find the correct pallet name by testing common variations
-        pallet_names = ["credits", "Credits", "CREDITS", "credit", "Credit", "CREDIT"]
-        storage_names = ["freeCredits", "FreeCredits", "free_credits", "FREE_CREDITS"]
+        # Use the correct pallet and storage names we found earlier
+        pallet_names = [
+            "Credits",
+        ]
+        storage_names = [
+            "FreeCredits",
+        ]
 
         storage_map = None
 
@@ -103,13 +107,18 @@ class SubstrateCacher:
 
         # Try to find the correct pallet name for subaccount roles
         pallet_names = ["SubAccount"]
-        storage_names = ["SubaccountRole", "subaccountRole", "SubAccountRole", "Role", "role"]
+        storage_names = [
+            "SubAccountRole",
+        ]
 
         storage_map = None
         for pallet in pallet_names:
             for storage in storage_names:
                 try:
-                    storage_map = self.substrate_client._substrate.query_map(module=pallet, storage_function=storage)
+                    storage_map = self.substrate_client._substrate.query_map(
+                        module=pallet,
+                        storage_function=storage,
+                    )
                     logger.info(f"Found subaccount roles at {pallet}.{storage}")
                     break
                 except Exception as e:
@@ -147,7 +156,10 @@ class SubstrateCacher:
         for pallet in pallet_names:
             for storage in storage_names:
                 try:
-                    storage_map = self.substrate_client._substrate.query_map(module=pallet, storage_function=storage)
+                    storage_map = self.substrate_client._substrate.query_map(
+                        module=pallet,
+                        storage_function=storage,
+                    )
                     logger.info(f"Found subaccount mappings at {pallet}.{storage}")
                     break
                 except Exception as e:
