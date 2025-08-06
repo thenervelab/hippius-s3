@@ -1,9 +1,11 @@
 """Credit checking middleware for all S3 operations."""
 
 import base64
+import json
 import logging
 import re
 from typing import Callable
+from typing import Optional
 
 from fastapi import Request
 from fastapi import Response
@@ -14,6 +16,7 @@ from starlette import status
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import check_account_has_credit
+from hippius_s3.dependencies import get_redis
 
 
 config = get_config()
@@ -38,10 +41,68 @@ class BadAccount(Exception):
     pass
 
 
+async def fetch_account_from_cache(
+    seed_phrase: str,
+    request: Request,
+) -> Optional[HippiusAccount]:
+    """
+    Try to fetch account data from Redis cache first.
+
+    Returns:
+        HippiusAccount if found in cache, None if not found or cache miss
+    """
+    redis_client = get_redis(request)
+
+    # First get the account address from the seed phrase (we need substrate client for this)
+    client = SubstrateClient(
+        seed_phrase=seed_phrase,
+        url=config.substrate_url,
+    )
+    client.connect(seed_phrase=seed_phrase)
+    subaccount_id = client._account_address
+
+    # Try to get cached subaccount data
+    cache_key = f"hippius_subaccount_cache:{subaccount_id}"
+    cached_data = await redis_client.get(cache_key)
+
+    if cached_data:
+        data = json.loads(cached_data)
+        logger.debug(f"Cache hit for subaccount {subaccount_id}")
+
+        # Extract role information
+        role = data.get("role", "Unknown")
+        upload = role in ["Upload", "UploadDelete"]
+        delete = role == "UploadDelete"
+        has_credits = data.get("has_credits", False)
+        main_account_id = data.get("main_account_id")
+
+        return HippiusAccount(
+            seed=seed_phrase,
+            id=subaccount_id,
+            main_account=main_account_id,
+            has_credits=has_credits,
+            upload=upload,
+            delete=delete,
+        )
+
+    logger.debug(f"Cache miss for subaccount {subaccount_id}")
+    return None
+
+
 async def fetch_account(
     seed_phrase: str,
     substrate_url: str,
+    request: Request,
 ) -> HippiusAccount:
+    # First try to get from cache
+    cached_account = await fetch_account_from_cache(seed_phrase, request)
+    if cached_account:
+        logger.debug(f"Using cached data for account {cached_account.id}")
+        return cached_account
+
+    # Cache miss - fall back to substrate queries
+    logger.debug("Cache miss - fetching from substrate")
+
     client = SubstrateClient(
         seed_phrase=seed_phrase,
         url=substrate_url,
@@ -101,6 +162,7 @@ async def check_credit_for_all_operations(request: Request, call_next: Callable)
             request.state.account = await fetch_account(
                 seed_phrase,
                 substrate_url=config.substrate_url,
+                request=request,
             )
 
             # Only check permissions and credits for operations that modify state

@@ -95,7 +95,12 @@ async def extract_seed_phrase(request: Request) -> str:
     )
 
 
-async def check_account_has_credit(subaccount: str, main_account, seed_phrase: str, substrate_url: str) -> bool:
+async def check_account_has_credit(
+    subaccount: str,
+    main_account,
+    seed_phrase: str,
+    substrate_url: str,
+) -> bool:
     """
     Check if the account associated with the seed phrase has enough credit.
 
