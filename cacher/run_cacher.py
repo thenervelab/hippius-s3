@@ -2,19 +2,14 @@
 import asyncio
 import json
 import logging
+import os
 import sys
-from pathlib import Path
 from typing import Dict
 from typing import Optional
 
 import redis.asyncio as async_redis
 from dotenv import load_dotenv
 from hippius_sdk.substrate import SubstrateClient
-
-
-sys.path.append(str(Path(__file__).parent.parent))
-
-from hippius_s3.config import get_config
 
 
 logging.basicConfig(level=logging.INFO)
@@ -274,9 +269,19 @@ class SubstrateCacher:
 async def main():
     """Entry point for the cacher script."""
     try:
-        config = get_config()
+        # Load environment variables directly
+        substrate_url = os.getenv("HIPPIUS_SUBSTRATE_URL")
+        redis_url = os.getenv("REDIS_URL")
 
-        cacher = SubstrateCacher(substrate_url=config.substrate_url, redis_url=config.redis_url)
+        if not substrate_url:
+            raise ValueError("HIPPIUS_SUBSTRATE_URL environment variable is required")
+        if not redis_url:
+            raise ValueError("REDIS_URL environment variable is required")
+
+        cacher = SubstrateCacher(
+            substrate_url=substrate_url,
+            redis_url=redis_url,
+        )
 
         await cacher.run_cache_update()
         logger.info("Cache update completed successfully")
