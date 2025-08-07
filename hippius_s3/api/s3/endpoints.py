@@ -21,6 +21,7 @@ from lxml import etree as ET
 from hippius_s3 import dependencies
 from hippius_s3.api.s3 import errors
 from hippius_s3.config import get_config
+from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.utils import get_query
 
 
@@ -1196,6 +1197,7 @@ async def put_object(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
+    redis_client=Depends(dependencies.get_redis),
 ) -> Response:
     """
     Upload an object to a bucket using S3 protocol (PUT /{bucket_name}/{object_key}).
@@ -1379,7 +1381,11 @@ async def put_object(
                         store_node=config.ipfs_store_url,
                         pin_node=config.ipfs_store_url,
                         substrate_url=config.substrate_url,
+                        publish=False,
                     )
+
+                    # Queue the upload request for pinning
+                    await enqueue_upload_request(redis_client, s3_result, request.state.seed_phrase)
 
                     ipfs_cid = s3_result.cid
                     file_size = len(file_data)
@@ -1388,7 +1394,7 @@ async def put_object(
                     # Create new metadata for destination
                     metadata = {
                         "ipfs": {"cid": ipfs_cid, "encrypted": should_encrypt},
-                        "hippius": {"tx_hash": s3_result.tx_hash},
+                        "hippius": {},
                     }
 
                     # Copy any user metadata (x-amz-meta-*)
@@ -1495,10 +1501,13 @@ async def put_object(
                 store_node=config.ipfs_store_url,
                 pin_node=config.ipfs_store_url,
                 substrate_url=config.substrate_url,
+                publish=False,
             )
 
+            # Queue the upload request for pinning
+            await enqueue_upload_request(redis_client, s3_result, seed_phrase)
+
             ipfs_cid = s3_result.cid
-            tx_hash = s3_result.tx_hash
             object_id = str(uuid.uuid4())
             created_at = datetime.now(UTC)
 
@@ -1511,7 +1520,7 @@ async def put_object(
 
             # Add system metadata
             metadata["ipfs"] = {"cid": ipfs_cid, "encrypted": should_encrypt}
-            metadata["hippius"] = {"tx_hash": tx_hash}
+            metadata["hippius"] = {}
         finally:
             # Clean up temporary file
             if Path(temp_path).exists():
@@ -2038,7 +2047,7 @@ async def set_bucket_policy(
             )
 
         # Validate it's a public read policy
-        if not validate_public_policy(policy_json, bucket_name):
+        if not await validate_public_policy(policy_json, bucket_name):
             return create_xml_error_response(
                 "InvalidPolicyDocument",
                 "Policy document is invalid or not a public read policy",

@@ -9,9 +9,11 @@ from typing import Tuple
 from typing import Union
 
 import aiofiles
+import redis.asyncio as async_redis
 from hippius_sdk.client import HippiusClient
 
 from hippius_s3.config import Config
+from hippius_s3.queue import enqueue_upload_request
 
 
 logger = logging.getLogger(__name__)
@@ -20,7 +22,7 @@ logger = logging.getLogger(__name__)
 class IPFSService:
     """Service for interacting with IPFS through Hippius SDK."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, redis_client: Optional[async_redis.Redis] = None):
         """Initialize the IPFS service."""
         self.config = config
         self.client = HippiusClient(
@@ -29,6 +31,7 @@ class IPFSService:
             substrate_url=config.substrate_url,
             encrypt_by_default=False,
         )
+        self.redis_client = redis_client
         logger.info(
             f"IPFS service initialized: IPFS={config.ipfs_get_url} {config.ipfs_store_url}, Substrate={config.substrate_url}"
         )
@@ -395,10 +398,12 @@ class IPFSService:
                     store_node=self.config.ipfs_store_url,
                     pin_node=self.config.ipfs_store_url,
                     substrate_url=self.config.substrate_url,
+                    publish=False,
                 )
-                logger.info(
-                    f"Published concatenated file: CID={s3_result.cid}, Size={s3_result.size_bytes} bytes, TX={s3_result.tx_hash}"
-                )
+                logger.info(f"Published concatenated file: CID={s3_result.cid}, Size={s3_result.size_bytes} bytes")
+
+                # Queue the upload request for pinning
+                await enqueue_upload_request(self.redis_client, s3_result, seed_phrase)
 
                 # Verify that the uploaded size matches our calculated size
                 if s3_result.size_bytes != concatenated_size:
@@ -410,7 +415,6 @@ class IPFSService:
                 result = {
                     "cid": s3_result.cid,
                     "size_bytes": s3_result.size_bytes,
-                    "tx_hash": s3_result.tx_hash,
                 }
 
                 # Delete the individual part CIDs since they're no longer needed
@@ -474,7 +478,6 @@ class IPFSService:
                 "size_bytes": total_size,
                 "etag": final_etag,
                 "encrypted": should_encrypt,
-                "tx_hash": result["tx_hash"],
             }
         finally:
             # Clean up temporary files

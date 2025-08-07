@@ -100,8 +100,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.banhammer_service = BanHammerService(app.state.redis_client)
         logger.info("Banhammer service initialized")
 
-        app.state.ipfs_service = IPFSService(config)
-        logger.info("IPFS service initialized")
+        app.state.ipfs_service = IPFSService(config, app.state.redis_client)
+        logger.info("IPFS service initialized with Redis client")
 
         yield
 

@@ -53,13 +53,25 @@ async def fetch_account_from_cache(
     """
     redis_client = get_redis(request)
 
-    # First get the account address from the seed phrase (we need substrate client for this)
-    client = SubstrateClient(
-        seed_phrase=seed_phrase,
-        url=config.substrate_url,
-    )
-    client.connect(seed_phrase=seed_phrase)
-    subaccount_id = client._account_address
+    # Cache seed phrase to subaccount_id mapping to avoid substrate connection
+    seed_cache_key = f"hippius_seed_to_subaccount:{hash(seed_phrase)}"
+    cached_subaccount_id = await redis_client.get(seed_cache_key)
+
+    if cached_subaccount_id:
+        subaccount_id = cached_subaccount_id.decode()
+        logger.debug(f"Cache hit for seed phrase hash -> {subaccount_id}")
+    else:
+        # Only connect to substrate if we don't have the subaccount_id cached
+        client = SubstrateClient(
+            seed_phrase=seed_phrase,
+            url=config.substrate_url,
+        )
+        client.connect(seed_phrase=seed_phrase)
+        subaccount_id = client._account_address
+
+        # Cache the seed phrase to subaccount_id mapping for 2 hour
+        await redis_client.setex(seed_cache_key, 7200, subaccount_id)
+        logger.debug(f"Cached seed phrase hash -> {subaccount_id}")
 
     # Try to get cached subaccount data
     cache_key = f"hippius_subaccount_cache:{subaccount_id}"
@@ -103,34 +115,74 @@ async def fetch_account(
     # Cache miss - fall back to substrate queries
     logger.debug("Cache miss - fetching from substrate")
 
-    client = SubstrateClient(
-        seed_phrase=seed_phrase,
-        url=substrate_url,
-    )
-    client.connect(seed_phrase=seed_phrase)
+    # Get or cache the subaccount_id from seed phrase
+    redis_client = get_redis(request)
+    seed_cache_key = f"hippius_seed_to_subaccount:{hash(seed_phrase)}"
+    cached_subaccount_id = await redis_client.get(seed_cache_key)
+
+    if cached_subaccount_id:
+        subaccount_id = cached_subaccount_id.decode()
+        logger.debug(f"Using cached subaccount_id: {subaccount_id}")
+
+        # Create client for substrate queries but we already know the address
+        client = SubstrateClient(
+            seed_phrase=seed_phrase,
+            url=substrate_url,
+        )
+        client.connect(seed_phrase=seed_phrase)
+        # Override the address to use our cached one
+        client._account_address = subaccount_id
+    else:
+        client = SubstrateClient(
+            seed_phrase=seed_phrase,
+            url=substrate_url,
+        )
+        client.connect(seed_phrase=seed_phrase)
+        subaccount_id = client._account_address
+
+        # Cache for future use
+        await redis_client.setex(seed_cache_key, 3600, subaccount_id)
+        logger.debug(f"Cached new subaccount_id: {subaccount_id}")
+
+    # If we reach here, it means we have a cache miss for the full subaccount data
+    # This should be rare since the cacher runs every 5 minutes
+    # As a fallback, we need to query substrate for the missing data
 
     main_account = client.query_sub_account(
-        client._account_address,
+        subaccount_id,
         seed_phrase=seed_phrase,
     )
     if not main_account:
-        raise BadAccount(f"{client._account_address} is a main account, please use subaccounts for s3 interactions")
+        raise BadAccount(f"{subaccount_id} is a main account, please use subaccounts for s3 interactions")
 
     roles = client.get_account_roles(
-        client._account_address,
+        subaccount_id,
         seed_phrase=seed_phrase,
     )
-    has_credits = await check_account_has_credit(
-        subaccount=client._account_address,
-        main_account=main_account,
-        seed_phrase=seed_phrase,
-        substrate_url=config.substrate_url,
-    )
-    logger.info(f"checking account credits for subaccount={client._account_address} {main_account=} {has_credits=}")
+
+    # Check if we have main account credits cached
+    main_cache_key = f"hippius_main_account_credits:{main_account}"
+    cached_credits = await redis_client.get(main_cache_key)
+
+    if cached_credits:
+        credits_data = json.loads(cached_credits)
+        has_credits = credits_data.get("has_credits", False)
+        logger.debug(f"Using cached credits for main account {main_account}: {has_credits}")
+    else:
+        # Fall back to substrate query for credits
+        has_credits = await check_account_has_credit(
+            subaccount=subaccount_id,
+            main_account=main_account,
+            seed_phrase=seed_phrase,
+            substrate_url=config.substrate_url,
+        )
+        logger.debug(f"Fetched credits from substrate for {main_account}: {has_credits}")
+
+    logger.warning(f"Cache miss fallback used for subaccount={subaccount_id} {main_account=} {has_credits=}")
 
     return HippiusAccount(
         seed=seed_phrase,
-        id=client._account_address,
+        id=subaccount_id,
         main_account=main_account,
         has_credits=has_credits,
         upload="Upload" in roles,
