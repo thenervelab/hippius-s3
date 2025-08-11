@@ -74,7 +74,7 @@ services:
     depends_on:
       - redis
     deploy:
-      replicas: 3
+      replicas: 1  # can't scale up otherwise we get transaction conflicts for the same user
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1

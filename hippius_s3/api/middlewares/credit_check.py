@@ -109,11 +109,7 @@ async def fetch_account(
     # First try to get from cache
     cached_account = await fetch_account_from_cache(seed_phrase, request)
     if cached_account:
-        logger.debug(f"Using cached data for account {cached_account.id}")
         return cached_account
-
-    # Cache miss - fall back to substrate queries
-    logger.debug("Cache miss - fetching from substrate")
 
     # Get or cache the subaccount_id from seed phrase
     redis_client = get_redis(request)
