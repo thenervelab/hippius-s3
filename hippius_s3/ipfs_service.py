@@ -147,6 +147,7 @@ class IPFSService:
         self,
         cid: str,
         seed_phrase: Optional[str] = None,
+        unpin=False,
     ) -> Dict[str, Union[bool, str]]:
         """
         Delete file from IPFS.
@@ -154,6 +155,7 @@ class IPFSService:
         Args:
             cid: IPFS content identifier
             seed_phrase: Seed phrase to use for blockchain operations
+            unpin: whether to unpin the file as well.
 
         Returns:
             Dict containing deletion status
@@ -164,7 +166,7 @@ class IPFSService:
                     cid,
                     cancel_from_blockchain=True,
                     seed_phrase=seed_phrase,
-                    unpin=False,
+                    unpin=unpin,
                 ),
                 "cid": cid,
                 "message": "File successfully deleted from IPFS",
