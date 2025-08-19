@@ -5,7 +5,9 @@ import logging
 import re
 from typing import Awaitable
 from typing import Callable
+from urllib.parse import parse_qsl
 from urllib.parse import quote
+from urllib.parse import urlencode
 
 from fastapi import Request
 from fastapi import Response
@@ -136,6 +138,8 @@ class SigV4Verifier:
         canonical_headers = canonical_headers.rstrip("\n")
         signed_headers_str = ";".join(sorted_headers)
 
+        canonical_query_string = canonicalize_query_string(self.query_string)
+
         payload_hash = self.request.headers.get("x-amz-content-sha256", "")
         logger.debug(f"Payload hash from header: '{payload_hash}'")
 
@@ -149,11 +153,11 @@ class SigV4Verifier:
         logger.debug("Final canonical request components:")
         logger.debug(f"  Method: {self.method}")
         logger.debug(f"  Path: {self.path}")
-        logger.debug(f"  Query: {self.query_string}")
+        logger.debug(f"  Query: {canonical_query_string}")
         logger.debug(f"  Signed headers: {signed_headers_str}")
         logger.debug(f"  Payload hash: {payload_hash}")
 
-        return f"{self.method}\n{self.path}\n{self.query_string}\n{canonical_headers}\n\n{signed_headers_str}\n{payload_hash}"
+        return f"{self.method}\n{self.path}\n{canonical_query_string}\n{canonical_headers}\n\n{signed_headers_str}\n{payload_hash}"
 
     def create_string_to_sign(self, canonical_request: str) -> str:
         credential_scope = f"{self.amz_date[:8]}/{self.region}/{self.service}/aws4_request"
@@ -222,3 +226,17 @@ async def verify_hmac_middleware(
 
     request.state.seed_phrase = verifier.seed_phrase
     return await call_next(request)
+
+
+def canonicalize_query_string(query_string: str) -> str:
+    if not query_string:
+        return ""
+
+    # Parse into list of (key, value) tuples
+    params = parse_qsl(query_string, keep_blank_values=True)
+
+    # Sort by key name
+    params.sort(key=lambda x: x[0])
+
+    # Re-encode with proper AWS formatting
+    return urlencode(params, quote_via=quote, safe="")
