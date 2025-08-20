@@ -1385,7 +1385,11 @@ async def put_object(
                     )
 
                     # Queue the upload request for pinning
-                    await enqueue_upload_request(redis_client, s3_result, request.state.seed_phrase)
+                    await enqueue_upload_request(
+                        redis_client,
+                        s3_result,
+                        request.state.seed_phrase,
+                    )
 
                     ipfs_cid = s3_result.cid
                     file_size = len(file_data)

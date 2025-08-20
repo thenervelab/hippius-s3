@@ -402,21 +402,15 @@ class IPFSService:
                     substrate_url=self.config.substrate_url,
                     publish=False,
                 )
-                logger.info(f"Published concatenated file: CID={s3_result.cid}, Size={s3_result.size_bytes} bytes")
+                logger.info(f"Published concatenated file: CID={s3_result.cid}, Size={concatenated_size} bytes")
 
                 # Queue the upload request for pinning
                 await enqueue_upload_request(self.redis_client, s3_result, seed_phrase)
 
-                # Verify that the uploaded size matches our calculated size
-                if s3_result.size_bytes != concatenated_size:
-                    logger.warning(
-                        f"Size mismatch in uploaded file: Expected={concatenated_size}, Actual={s3_result.size_bytes}"
-                    )
-
-                # Store the result for later use
+                # Store the result for later use - use our calculated size since s3_result doesn't have size_bytes
                 result = {
                     "cid": s3_result.cid,
-                    "size_bytes": s3_result.size_bytes,
+                    "size_bytes": concatenated_size,
                 }
 
                 # Delete the individual part CIDs since they're no longer needed

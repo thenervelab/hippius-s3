@@ -30,8 +30,6 @@ from hippius_s3.ipfs_service import IPFSService
 
 
 load_dotenv()
-
-# Get config early for logging setup
 config = get_config()
 
 # Configure the root logger
@@ -52,12 +50,12 @@ uvicorn_access_logger = logging.getLogger("uvicorn.access")
 uvicorn_access_logger.setLevel(config.log_level)
 
 # Set highest logging level for our application code
-logging.getLogger("hippius_s3").setLevel(logging.DEBUG)
-logging.getLogger("hippius_s3.api.s3.multipart").setLevel(logging.DEBUG)
-logging.getLogger("hippius_s3.api.s3.endpoints").setLevel(logging.DEBUG)
+logging.getLogger("hippius_s3").setLevel(config.log_level)
+logging.getLogger("hippius_s3.api.s3.multipart").setLevel(config.log_level)
+logging.getLogger("hippius_s3.api.s3.endpoints").setLevel(config.log_level)
 
 # Configure audit logger
-logging.getLogger("audit").setLevel(logging.INFO)
+logging.getLogger("audit").setLevel(config.log_level)
 
 # Reduce HTTP client log noise
 logging.getLogger("httpcore").setLevel(logging.WARNING)
