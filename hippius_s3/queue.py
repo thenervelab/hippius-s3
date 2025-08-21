@@ -35,3 +35,33 @@ async def dequeue_upload_request(redis_client: async_redis.Redis) -> Dict[str, A
         _, queue_data = result
         return json.loads(queue_data)
     return None
+
+
+async def enqueue_unpin_request(
+    redis_client: async_redis.Redis,
+    cid: str,
+    subaccount: str,
+    seed_phrase: str,
+    file_name: str,
+    owner: str,
+) -> None:
+    """Add an unpin request to the Redis queue for processing by unpinner."""
+    queue_item = {
+        "cid": cid,
+        "subaccount": subaccount,
+        "seed_phrase": seed_phrase,
+        "file_name": file_name,
+        "owner": owner,
+    }
+
+    await redis_client.lpush("unpin_requests", json.dumps(queue_item))
+    logger.info(f"Enqueued unpin request for CID={cid}")
+
+
+async def dequeue_unpin_request(redis_client: async_redis.Redis) -> Dict[str, Any] | None:
+    """Get the next unpin request from the Redis queue."""
+    result = await redis_client.brpop("unpin_requests", timeout=1)
+    if result:
+        _, queue_data = result
+        return json.loads(queue_data)
+    return None

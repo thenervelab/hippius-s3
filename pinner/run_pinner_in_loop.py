@@ -105,7 +105,7 @@ async def run_pinner_loop():
         logger.error(f"Error in pinner loop: {e}")
         raise
     finally:
-        await redis_client.close()
+        await redis_client.aclose()
 
 
 if __name__ == "__main__":

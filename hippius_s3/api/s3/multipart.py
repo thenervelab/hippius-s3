@@ -572,7 +572,7 @@ async def complete_multipart_upload_internal(
             content_type,
             created_at,
             json.dumps(metadata),
-            concat_result["etag"],
+            concat_result["md5_hash"],
         )
 
         # Verify that the object was actually inserted

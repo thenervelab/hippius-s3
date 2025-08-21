@@ -473,6 +473,7 @@ class IPFSService:
                 "content_type": content_type,
                 "size_bytes": total_size,
                 "etag": final_etag,
+                "md5_hash": concatenated_md5,
                 "encrypted": should_encrypt,
             }
         finally:
