@@ -1,7 +1,12 @@
 import dataclasses
 import uuid
 
+import dotenv
+
 from hippius_s3.utils import env
+
+
+dotenv.load_dotenv()
 
 
 @dataclasses.dataclass

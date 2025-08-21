@@ -1,5 +1,6 @@
 """S3-compatible API endpoints implementation for bucket and object operations."""
 
+import hashlib
 import json
 import logging
 import tempfile
@@ -306,7 +307,8 @@ async def get_bucket(
             last_modified.text = obj["created_at"].strftime("%Y-%m-%dT%H:%M:%SZ")
 
             etag = ET.SubElement(content, "ETag")
-            etag.text = f'"{obj["ipfs_cid"]}"'
+            # Use MD5 hash as ETag for AWS CLI compatibility, fallback to CID if not available
+            etag.text = f'"{obj.get("md5_hash", obj["ipfs_cid"])}"'
 
             size = ET.SubElement(content, "Size")
             size.text = str(obj["size_bytes"])
@@ -1338,6 +1340,7 @@ async def put_object(
                 ipfs_cid = source_object["ipfs_cid"]
                 file_size = source_object["size_bytes"]
                 content_type = source_object["content_type"]
+                md5_hash = source_object.get("md5_hash", ipfs_cid)  # Fallback to CID if no MD5
 
                 # Copy all metadata as-is
                 metadata = {
@@ -1363,6 +1366,9 @@ async def put_object(
                     decrypt=not source_is_public,
                     # Decrypt if source was encrypted
                 )
+
+                # Calculate MD5 hash for ETag compatibility
+                md5_hash = hashlib.md5(file_data).hexdigest()
 
                 # Create temporary file for re-upload
                 with tempfile.NamedTemporaryFile(delete=False) as temp_file:
@@ -1422,12 +1428,13 @@ async def put_object(
                 content_type,
                 created_at,
                 json.dumps(metadata),
+                md5_hash,
             )
 
             # Prepare the XML response
             root = ET.Element("CopyObjectResult")
             etag = ET.SubElement(root, "ETag")
-            etag.text = f'"{ipfs_cid}"'
+            etag.text = f'"{md5_hash}"'
             last_modified = ET.SubElement(root, "LastModified")
             # Format in S3-compatible format: YYYY-MM-DDThh:mm:ssZ
             last_modified.text = created_at.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1438,7 +1445,10 @@ async def put_object(
                 content=xml_response,
                 media_type="application/xml",
                 status_code=200,
-                headers={"ETag": f'"{ipfs_cid}"'},
+                headers={
+                    "ETag": f'"{md5_hash}"',
+                    "x-amz-ipfs-cid": ipfs_cid,
+                },
             )
 
         except Exception as e:
@@ -1483,6 +1493,9 @@ async def put_object(
             bucket_id,
             object_key,
         )
+
+        # Calculate MD5 hash for ETag compatibility
+        md5_hash = hashlib.md5(file_data).hexdigest()
 
         # Create temporary file for s3_publish
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
@@ -1545,6 +1558,7 @@ async def put_object(
                     content_type,
                     created_at,
                     json.dumps(metadata),
+                    md5_hash,
                 )
 
                 # Execute an immediate verification query within the same transaction
@@ -1573,7 +1587,10 @@ async def put_object(
 
         return Response(
             status_code=200,
-            headers={"ETag": f'"{ipfs_cid}"'},
+            headers={
+                "ETag": f'"{md5_hash}"',
+                "x-amz-ipfs-cid": ipfs_cid,
+            },
         )
 
     except Exception as e:
@@ -1708,8 +1725,9 @@ async def head_object(
         headers = {
             "Content-Type": result["content_type"],
             "Content-Length": str(result["size_bytes"]),
-            "ETag": f'"{ipfs_cid}"',
+            "ETag": f'"{result.get("md5_hash", ipfs_cid)}"',
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
+            "x-amz-ipfs-cid": ipfs_cid,
         }
 
         for key, value in metadata.items():
@@ -1825,9 +1843,10 @@ async def get_object(
         headers = {
             "Content-Type": result["content_type"],
             "Content-Length": str(len(file_data)),
-            "ETag": f'"{ipfs_cid}"',
+            "ETag": f'"{result.get("md5_hash", ipfs_cid)}"',
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
+            "x-amz-ipfs-cid": ipfs_cid,
         }
 
         logger.debug(f"Response headers set for {bucket_name}/{object_key}")
