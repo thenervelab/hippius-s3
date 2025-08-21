@@ -36,10 +36,8 @@ router = APIRouter(tags=["s3"])
 
 async def get_request_body(request: Request) -> bytes:
     """Get request body properly handling chunked encoding from HAProxy."""
-    body_bytes = b""
-    async for chunk in request.stream():
-        body_bytes += chunk
-    return body_bytes
+    # Use FastAPI's built-in body() method which properly handles chunked encoding
+    return await request.body()
 
 
 def create_xml_error_response(
