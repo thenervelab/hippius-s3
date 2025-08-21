@@ -1498,6 +1498,17 @@ async def put_object(
         md5_hash = hashlib.md5(file_data).hexdigest()
         logger.info(f"PUT {bucket_name}/{object_key}: size={len(file_data)}, md5={md5_hash}")
 
+        # Log full request body for debugging HAProxy issue
+        logger.info(f"PUT {bucket_name}/{object_key}: full_body={file_data!r}")
+
+        # Check if body appears to be duplicated
+        if len(file_data) >= 2:
+            mid_point = len(file_data) // 2
+            first_half = file_data[:mid_point]
+            second_half = file_data[mid_point:]
+            if first_half == second_half:
+                logger.error(f"PUT {bucket_name}/{object_key}: DUPLICATED BODY DETECTED!")
+
         # Create temporary file for s3_publish
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
             temp_path = temp_file.name
