@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 import redis.asyncio as async_redis
-from hippius_sdk.errors import HippiusSubstrateError
+
 from hippius_sdk.substrate import SubstrateClient
 
 
@@ -23,63 +23,75 @@ logger = logging.getLogger(__name__)
 
 
 async def process_unpin_request(unpin_requests: list[dict]) -> bool:
-    """Process unpin requests by canceling storage requests using the Hippius SDK."""
+    """Process unpin requests by creating a manifest and canceling storage request using the Hippius SDK."""
+    import json
+    import tempfile
+
+    from hippius_sdk import HippiusIPFSClient
+
     seed_phrase = None
-    cids = []
+    manifest_objects = []
 
     for req in unpin_requests:
         cid = req["cid"]
         subaccount = req["subaccount"]
         seed_phrase = req["seed_phrase"]
-        file_name = req["file_name"]
+        file_path = req["file_path"]
 
         logger.info(f"Processing unpin request for CID={cid}, subaccount={subaccount}")
-        cids.append(cid)
-        logger.info(f"Submitting storage cancellation to substrate for file: {file_name}, CID: {cid}")
 
-    substrate_client = SubstrateClient(
-        seed_phrase=seed_phrase,
-        url=config.substrate_url,
+        manifest_objects.append({"cid": cid, "filename": file_path})
+        logger.info(f"Added to unpin manifest: {file_path}, CID: {cid}")
+
+    # Create manifest JSON file
+    manifest_data = json.dumps(manifest_objects, indent=2)
+
+    # Upload manifest to IPFS
+    ipfs_client = HippiusIPFSClient(
+        get_node=config.ipfs_store_url,
+        store_node=config.ipfs_store_url,
     )
 
-    # Process each CID individually since cancel_storage_request takes one CID at a time
-    successful_unpins = []
-    failed_unpins = []
+    try:
+        # Create temporary file with manifest
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as temp_file:
+            temp_file.write(manifest_data)
+            temp_path = temp_file.name
 
-    for i, cid in enumerate(cids):
-        try:
-            tx_hash = await substrate_client.cancel_storage_request(
-                cid=cid,
-                seed_phrase=seed_phrase,
-            )
+        # Upload manifest to IPFS using regular file add
+        manifest_result = await ipfs_client.add_file(temp_path)
 
-            logger.debug(f"Substrate call result for CID {cid}: {tx_hash}")
+        manifest_cid = manifest_result.cid
+        logger.info(f"Created unpin manifest with CID: {manifest_cid}")
 
-            # Check if we got a valid transaction hash
-            if not tx_hash or tx_hash == "0x" or len(tx_hash) < 10:
-                logger.error(f"Invalid transaction hash received for CID {cid}: {tx_hash}")
-                failed_unpins.append(cid)
-                continue
+        # Clean up temp file
+        Path(temp_path).unlink(missing_ok=True)
 
-            logger.info(f"Successfully unpinned CID {cid} with transaction: {tx_hash}")
-            successful_unpins.append(cid)
+        # Submit manifest CID to substrate for cancellation
+        substrate_client = SubstrateClient(
+            seed_phrase=seed_phrase,
+            url=config.substrate_url,
+        )
 
-        except HippiusSubstrateError as e:
-            logger.error(f"Failed to unpin CID {cid}: {e}")
-            failed_unpins.append(cid)
-        except Exception as e:
-            logger.error(f"Unexpected error unpinning CID {cid}: {e}")
-            failed_unpins.append(cid)
+        tx_hash = await substrate_client.cancel_storage_request(
+            cid=manifest_cid,
+            seed_phrase=seed_phrase,
+        )
 
-    if successful_unpins:
-        logger.info(f"Successfully unpinned {len(successful_unpins)} files: {successful_unpins}")
+        logger.debug(f"Substrate call result for manifest {manifest_cid}: {tx_hash}")
 
-    if failed_unpins:
-        logger.warning(f"Failed to unpin {len(failed_unpins)} files: {failed_unpins}")
-        # Return False if any unpins failed to retry later
+        # Check if we got a valid transaction hash
+        if not tx_hash or tx_hash == "0x" or len(tx_hash) < 10:
+            logger.error(f"Invalid transaction hash received for manifest {manifest_cid}: {tx_hash}")
+            return False
+
+        logger.info(f"Successfully submitted unpin manifest {manifest_cid} with transaction: {tx_hash}")
+        logger.info(f"Unpinned {len(manifest_objects)} files in batch")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to process unpin manifest: {e}")
         return False
-
-    return True
 
 
 async def run_unpinner_loop():
@@ -105,14 +117,13 @@ async def run_unpinner_loop():
                 for user in list(user_unpin_requests.keys()):
                     success = await process_unpin_request(user_unpin_requests[user])
                     if success:
-                        logger.info(
-                            f"SUCCESSFULLY processed user's {user} with {len(user_unpin_requests[user])} files"
-                        )
+                        logger.info(f"SUCCESSFULLY processed user's {user} with {len(user_unpin_requests[user])} files")
                         # Remove that user
                         user_unpin_requests.pop(user)
                     else:
-                        logger.warning(f"Some unpins failed for user {user}, will retry later")
-                        # Keep the user in the dict to retry later
+                        logger.warning(
+                            f"Some unpins failed for user {user}, will retry later"
+                        )  # Keep the user in the dict to retry later
 
                 await asyncio.sleep(10)
 

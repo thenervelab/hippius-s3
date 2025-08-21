@@ -170,8 +170,9 @@ app.middleware("http")(verify_hmac_middleware)
 app.middleware("http")(banhammer_wrapper)
 # 8. CORS (executes SECOND)
 app.middleware("http")(cors_middleware)
-# 9. Profiler (executes FIRST - outermost layer, profiles entire request including auth)
-app.add_middleware(SpeedscopeProfilerMiddleware)
+if config.enable_request_profiling:
+    # 9. Profiler (executes FIRST - outermost layer, profiles entire request including auth)
+    app.add_middleware(SpeedscopeProfilerMiddleware)
 
 
 @app.get("/robots.txt", include_in_schema=False)

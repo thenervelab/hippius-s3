@@ -10,6 +10,7 @@ from typing import Union
 
 import aiofiles
 import redis.asyncio as async_redis
+
 from hippius_sdk.client import HippiusClient
 
 from hippius_s3.config import Config
@@ -405,7 +406,12 @@ class IPFSService:
                 logger.info(f"Published concatenated file: CID={s3_result.cid}, Size={concatenated_size} bytes")
 
                 # Queue the upload request for pinning
-                await enqueue_upload_request(self.redis_client, s3_result, seed_phrase)
+                await enqueue_upload_request(
+                    self.redis_client,
+                    s3_result,
+                    seed_phrase,
+                    owner=subaccount_id,
+                )
 
                 # Store the result for later use - use our calculated size since s3_result doesn't have size_bytes
                 result = {

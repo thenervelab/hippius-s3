@@ -13,6 +13,7 @@ async def enqueue_upload_request(
     redis_client: async_redis.Redis,
     s3_result: Any,
     seed_phrase: str,
+    owner: str,
 ) -> None:
     """Add an upload request to the Redis queue for processing by pinner."""
     queue_item = {
@@ -22,6 +23,7 @@ async def enqueue_upload_request(
         "pin_node": s3_result.pin_node,
         "substrate_url": s3_result.substrate_url,
         "seed_phrase": seed_phrase,
+        "owner": owner,
     }
 
     await redis_client.lpush("upload_requests", json.dumps(queue_item))

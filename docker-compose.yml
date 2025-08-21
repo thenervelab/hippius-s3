@@ -16,8 +16,8 @@ services:
       - PYTHONUNBUFFERED=1
       - UVICORN_LOG_LEVEL=debug
       - DEBUG=true
-      - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
-      - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
+      - HIPPIUS_IPFS_GET_URL=https://get.hippius.network
+      - HIPPIUS_IPFS_STORE_URL=https://store.hippius.network
 
   db:
     image: postgres:15
@@ -75,6 +75,20 @@ services:
       - redis
     deploy:
       replicas: 1  # can't scale up otherwise we get transaction conflicts for the same user
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_URL=redis://redis:6379/0
+
+  unpinner:
+    build: .
+    command: ["python", "pinner/run_unpinner_in_loop.py"]
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    deploy:
+      replicas: 1
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1

@@ -38,9 +38,9 @@ class BanHammerService:
     def __init__(
         self,
         redis: async_redis.Redis,
-        infringement_window_seconds: int = 300,
-        infringement_cooldown_seconds: int = 3600,  # 1 hour
-        infringement_max: int = 50,
+        infringement_window_seconds: int = 60,
+        infringement_cooldown_seconds: int = 3600,  # 1h
+        infringement_max: int = 60,
     ):
         self.redis = redis
         self.infringement_window_seconds = infringement_window_seconds

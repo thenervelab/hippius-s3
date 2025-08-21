@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import asyncio
 import logging
+import pathlib
 import sys
 from pathlib import Path
 
 import redis.asyncio as async_redis
+
 from hippius_sdk.errors import HippiusSubstrateError
 from hippius_sdk.substrate import FileInput
 from hippius_sdk.substrate import SubstrateClient
@@ -31,7 +33,7 @@ async def process_upload_request(upload_requests: list[dict]) -> bool:
         cid = req["cid"]
         subaccount = req["subaccount"]
         seed_phrase = req["seed_phrase"]
-        file_name = req["file_name"]
+        file_name = pathlib.Path(req["file_path"]).name
 
         logger.info(f"Processing upload request for CID={cid}, subaccount={subaccount}")
 
@@ -93,10 +95,12 @@ async def run_pinner_loop():
                         logger.info(
                             f"SUCCESSFULLY processed user's {user} with {len(user_upload_requests[user])} files"
                         )
+                    else:
+                        logger.info(
+                            f"Failed to batch and serve {len(user_upload_requests[user])} pin requests for user {user}"
+                        )
 
-                    # Remove that user
-                    user_upload_requests.pop(user)
-
+                user_upload_requests = {}
                 await asyncio.sleep(10)
 
     except KeyboardInterrupt:

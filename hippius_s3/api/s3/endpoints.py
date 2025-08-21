@@ -15,13 +15,15 @@ from fastapi import Depends
 from fastapi import Request
 from fastapi import Response
 from fastapi.security import HTTPBearer
+from lxml import etree as ET
+
 from hippius_sdk.errors import HippiusIPFSError
 from hippius_sdk.errors import HippiusSubstrateError
-from lxml import etree as ET
 
 from hippius_s3 import dependencies
 from hippius_s3.api.s3 import errors
 from hippius_s3.config import get_config
+from hippius_s3.queue import enqueue_unpin_request
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.utils import get_query
 
@@ -1125,6 +1127,7 @@ async def delete_bucket(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
+    redis_client=Depends(dependencies.get_redis),
 ) -> Response:
     """
     Delete a bucket using S3 protocol (DELETE /{bucket_name}).
@@ -1180,12 +1183,14 @@ async def delete_bucket(
                 BucketName=bucket_name,
             )
 
-        # If we got here, the bucket was successfully deleted, so now delete the associated objects from IPFS
+        # If we got here, the bucket was successfully deleted, so now enqueue objects for unpinning
         for obj in objects:
-            await ipfs_service.delete_file(
-                obj["ipfs_cid"],
+            await enqueue_unpin_request(
+                redis_client,
+                cid=obj["ipfs_cid"],
+                file_path=f"{bucket_name}/{obj.get('object_key', 'unknown')}",
+                subaccount=request.state.account.main_account,
                 seed_phrase=request.state.seed_phrase,
-                unpin=False,
             )
 
         return Response(status_code=204)
@@ -1403,6 +1408,7 @@ async def put_object(
                         redis_client,
                         s3_result,
                         request.state.seed_phrase,
+                        request.state.account.main_account,
                     )
 
                     ipfs_cid = s3_result.cid
@@ -1532,7 +1538,12 @@ async def put_object(
             )
 
             # Queue the upload request for pinning
-            await enqueue_upload_request(redis_client, s3_result, seed_phrase)
+            await enqueue_upload_request(
+                redis_client,
+                s3_result,
+                seed_phrase,
+                request.state.account.main_account,
+            )
 
             ipfs_cid = s3_result.cid
             object_id = str(uuid.uuid4())
@@ -1586,14 +1597,16 @@ async def put_object(
         # Clean up old IPFS content if needed
         if existing_object and existing_object["ipfs_cid"] != ipfs_cid:
             try:
-                await ipfs_service.delete_file(
-                    existing_object["ipfs_cid"],
+                await enqueue_unpin_request(
+                    redis_client,
+                    cid=existing_object["ipfs_cid"],
+                    file_path=f"{bucket_name}/{object_key}",
+                    subaccount=request.state.account.main_account,
                     seed_phrase=request.state.seed_phrase,
-                    unpin=False,
                 )
-                logger.info(f"Cleaned up previous IPFS content for {bucket_name}/{object_key}")
+                logger.info(f"Enqueued cleanup of previous IPFS content for {bucket_name}/{object_key}")
             except Exception as e:
-                logger.warning(f"Failed to clean up previous IPFS content: {e}")
+                logger.warning(f"Failed to enqueue cleanup of previous IPFS content: {e}")
 
         return Response(
             status_code=200,
@@ -1827,6 +1840,7 @@ async def get_object(
                     part_info,
                     result["content_type"],
                     object_key,
+                    main_account=request.state.account.main_account,
                     subaccount_id=request.state.account.main_account,
                     bucket_name=bucket_name,
                     is_public_bucket=bucket["is_public"],
@@ -1910,6 +1924,7 @@ async def delete_object(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
+    redis_client=Depends(dependencies.get_redis),
 ) -> Response:
     """
     Delete an object using S3 protocol (DELETE /{bucket_name}/{object_key}).
@@ -1989,14 +2004,16 @@ async def delete_object(
                 Key=object_key,
             )
 
-        # If we got here, the object was successfully deleted, so we can delete it from IPFS as well
+        # If we got here, the object was successfully deleted, so enqueue it for unpinning
         ipfs_cid = object_info["ipfs_cid"]
-        deletion_result = await ipfs_service.delete_file(
-            ipfs_cid,
+        await enqueue_unpin_request(
+            redis_client,
+            cid=ipfs_cid,
+            file_path=f"{bucket_name}/{object_key}",
+            subaccount=request.state.account.main_account,
             seed_phrase=request.state.seed_phrase,
-            unpin=False,
         )
-        logger.info(f"{deletion_result=}")
+        logger.info(f"Enqueued unpin request for deleted object {object_key}")
 
         return Response(
             status_code=204,
