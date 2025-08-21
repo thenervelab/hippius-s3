@@ -32,6 +32,14 @@ security = HTTPBearer()
 router = APIRouter(tags=["s3"])
 
 
+async def get_request_body(request: Request) -> bytes:
+    """Get request body properly handling chunked encoding from HAProxy."""
+    body_bytes = b""
+    async for chunk in request.stream():
+        body_bytes += chunk
+    return body_bytes
+
+
 def create_xml_error_response(
     code: str,
     message: str,
@@ -529,7 +537,7 @@ async def set_object_tags(
             )
 
         # Parse the XML tag data from the request
-        xml_data = await request.body()
+        xml_data = await get_request_body(request)
         if not xml_data:
             # Empty tags is valid (clears tags)
             tag_dict = {}
@@ -950,7 +958,7 @@ async def create_bucket(
                 )
 
             # Parse the XML lifecycle configuration
-            xml_data = await request.body()
+            xml_data = await get_request_body(request)
 
             # If no XML data provided, return a MalformedXML error
             if not xml_data:
@@ -1013,7 +1021,7 @@ async def create_bucket(
                 )
 
             # Parse the XML tag data from the request
-            xml_data = await request.body()
+            xml_data = await get_request_body(request)
             if not xml_data:
                 # Empty tags is valid (clears tags)
                 tag_dict = {}
@@ -1483,7 +1491,9 @@ async def put_object(
             )
 
         bucket_id = bucket["bucket_id"]
-        file_data = await request.body()
+
+        # Read request body properly handling chunked encoding
+        file_data = await get_request_body(request)
         file_size = len(file_data)
         content_type = request.headers.get("Content-Type", "application/octet-stream")
 
@@ -1496,18 +1506,6 @@ async def put_object(
 
         # Calculate MD5 hash for ETag compatibility
         md5_hash = hashlib.md5(file_data).hexdigest()
-        logger.info(f"PUT {bucket_name}/{object_key}: size={len(file_data)}, md5={md5_hash}")
-
-        # Log full request body for debugging HAProxy issue
-        logger.info(f"PUT {bucket_name}/{object_key}: full_body={file_data!r}")
-
-        # Check if body appears to be duplicated
-        if len(file_data) >= 2:
-            mid_point = len(file_data) // 2
-            first_half = file_data[:mid_point]
-            second_half = file_data[mid_point:]
-            if first_half == second_half:
-                logger.error(f"PUT {bucket_name}/{object_key}: DUPLICATED BODY DETECTED!")
 
         # Create temporary file for s3_publish
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
@@ -2064,7 +2062,7 @@ async def set_bucket_policy(
             )
 
         # Parse and validate policy
-        policy_data = await request.body()
+        policy_data = await get_request_body(request)
         if not policy_data:
             return create_xml_error_response(
                 "MalformedPolicy",

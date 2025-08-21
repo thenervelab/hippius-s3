@@ -23,6 +23,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["s3-multipart"])
 
 
+async def get_request_body(request: Request) -> bytes:
+    """Get request body properly handling chunked encoding from HAProxy."""
+    body_bytes = b""
+    async for chunk in request.stream():
+        body_bytes += chunk
+    return body_bytes
+
+
 @router.api_route(
     "/{bucket_name}/{object_key:path}/",
     methods=["POST"],
@@ -243,7 +251,7 @@ async def upload_part(
             )
 
         # Upload the part data to IPFS
-        file_data = await request.body()
+        file_data = await get_request_body(request)
         file_size = len(file_data)
         if file_size == 0:
             return s3_error_response(
@@ -443,7 +451,7 @@ async def complete_multipart_upload_internal(
         # Parse the XML request body to get parts list
         body_text = ""
         try:
-            body_text = (await request.body()).decode("utf-8")
+            body_text = (await get_request_body(request)).decode("utf-8")
         except Exception:
             body_text = "<CompleteMultipartUpload></CompleteMultipartUpload>"
 
