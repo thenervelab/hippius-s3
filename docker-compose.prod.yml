@@ -3,6 +3,8 @@ services:
     environment:
       - UVICORN_LOG_LEVEL=info
       - DEBUG=false
+      - HIPPIUS_IPFS_GET_URL=https://get.hippius.network
+      - HIPPIUS_IPFS_STORE_URL=https://store.hippius.network
 
   ipfs:
     volumes:
