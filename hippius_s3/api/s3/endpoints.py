@@ -1496,6 +1496,7 @@ async def put_object(
 
         # Calculate MD5 hash for ETag compatibility
         md5_hash = hashlib.md5(file_data).hexdigest()
+        logger.info(f"PUT {bucket_name}/{object_key}: size={len(file_data)}, md5={md5_hash}")
 
         # Create temporary file for s3_publish
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
