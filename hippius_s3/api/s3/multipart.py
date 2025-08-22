@@ -15,6 +15,7 @@ from fastapi import Response
 from lxml import etree as ET
 
 from hippius_s3 import dependencies
+from hippius_s3 import utils
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.utils import get_query
 
@@ -25,8 +26,7 @@ router = APIRouter(tags=["s3-multipart"])
 
 async def get_request_body(request: Request) -> bytes:
     """Get request body properly handling chunked encoding from HAProxy."""
-    # Use FastAPI's built-in body() method which properly handles chunked encoding
-    return await request.body()
+    return await utils.get_request_body()
 
 
 @router.api_route(

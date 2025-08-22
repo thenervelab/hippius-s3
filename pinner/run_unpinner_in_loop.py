@@ -27,7 +27,7 @@ async def process_unpin_request(unpin_requests: list[dict]) -> bool:
     import json
     import tempfile
 
-    from hippius_sdk import HippiusIPFSClient
+    from hippius_sdk import HippiusClient
 
     seed_phrase = None
     manifest_objects = []
@@ -36,18 +36,18 @@ async def process_unpin_request(unpin_requests: list[dict]) -> bool:
         cid = req["cid"]
         subaccount = req["subaccount"]
         seed_phrase = req["seed_phrase"]
-        file_path = req["file_path"]
+        file_name = req["file_name"]
 
         logger.info(f"Processing unpin request for CID={cid}, subaccount={subaccount}")
 
-        manifest_objects.append({"cid": cid, "filename": file_path})
-        logger.info(f"Added to unpin manifest: {file_path}, CID: {cid}")
+        manifest_objects.append({"cid": cid, "filename": file_name})
+        logger.info(f"Added to unpin manifest: {file_name}, CID: {cid}")
 
     # Create manifest JSON file
     manifest_data = json.dumps(manifest_objects, indent=2)
 
     # Upload manifest to IPFS
-    ipfs_client = HippiusIPFSClient(
+    ipfs_client = HippiusClient(
         get_node=config.ipfs_store_url,
         store_node=config.ipfs_store_url,
     )

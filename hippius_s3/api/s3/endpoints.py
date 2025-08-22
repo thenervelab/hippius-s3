@@ -21,6 +21,7 @@ from hippius_sdk.errors import HippiusIPFSError
 from hippius_sdk.errors import HippiusSubstrateError
 
 from hippius_s3 import dependencies
+from hippius_s3 import utils
 from hippius_s3.api.s3 import errors
 from hippius_s3.config import get_config
 from hippius_s3.queue import enqueue_unpin_request
@@ -36,8 +37,7 @@ router = APIRouter(tags=["s3"])
 
 async def get_request_body(request: Request) -> bytes:
     """Get request body properly handling chunked encoding from HAProxy."""
-    # Use FastAPI's built-in body() method which properly handles chunked encoding
-    return await request.body()
+    return await utils.get_request_body(request)
 
 
 def create_xml_error_response(
@@ -1186,8 +1186,9 @@ async def delete_bucket(
             await enqueue_unpin_request(
                 redis_client,
                 cid=obj["ipfs_cid"],
-                file_path=f"{bucket_name}/{obj.get('object_key', 'unknown')}",
+                file_name=f"{bucket_name}/{obj.get('object_key', 'unknown')}",
                 subaccount=request.state.account.main_account,
+                owner=request.state.account.main_account,
                 seed_phrase=request.state.seed_phrase,
             )
 
@@ -1606,8 +1607,9 @@ async def put_object(
                 await enqueue_unpin_request(
                     redis_client,
                     cid=existing_object["ipfs_cid"],
-                    file_path=f"{bucket_name}/{object_key}",
+                    file_name=f"{bucket_name}/{object_key}",
                     subaccount=request.state.account.main_account,
+                    owner=request.state.account.main_account,
                     seed_phrase=request.state.seed_phrase,
                 )
                 logger.info(f"Enqueued cleanup of previous IPFS content for {bucket_name}/{object_key}")
@@ -2015,8 +2017,9 @@ async def delete_object(
         await enqueue_unpin_request(
             redis_client,
             cid=ipfs_cid,
-            file_path=f"{bucket_name}/{object_key}",
+            file_name=f"{bucket_name}/{object_key}",
             subaccount=request.state.account.main_account,
+            owner=request.state.account.main_account,
             seed_phrase=request.state.seed_phrase,
         )
         logger.info(f"Enqueued unpin request for deleted object {object_key}")
