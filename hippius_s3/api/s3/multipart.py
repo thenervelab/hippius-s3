@@ -26,7 +26,7 @@ router = APIRouter(tags=["s3-multipart"])
 
 async def get_request_body(request: Request) -> bytes:
     """Get request body properly handling chunked encoding from HAProxy."""
-    return await utils.get_request_body()
+    return await utils.get_request_body(request)
 
 
 @router.api_route(
