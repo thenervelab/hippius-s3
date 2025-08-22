@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 import asyncio
+import json
 import logging
 import sys
+import tempfile
 from pathlib import Path
 
 import redis.asyncio as async_redis
 
+from hippius_sdk import HippiusClient
 from hippius_sdk.substrate import SubstrateClient
 
 
@@ -18,16 +21,15 @@ from hippius_s3.queue import dequeue_unpin_request
 
 config = get_config()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 
 async def process_unpin_request(unpin_requests: list[dict]) -> bool:
     """Process unpin requests by creating a manifest and canceling storage request using the Hippius SDK."""
-    import json
-    import tempfile
-
-    from hippius_sdk import HippiusClient
 
     seed_phrase = None
     manifest_objects = []
@@ -37,32 +39,44 @@ async def process_unpin_request(unpin_requests: list[dict]) -> bool:
         subaccount = req["subaccount"]
         seed_phrase = req["seed_phrase"]
         file_name = req["file_name"]
-
         logger.info(f"Processing unpin request for CID={cid}, subaccount={subaccount}")
 
         manifest_objects.append({"cid": cid, "filename": file_name})
-        logger.info(f"Added to unpin manifest: {file_name}, CID: {cid}")
+        logger.info(f"Added to unpin manifest: {subaccount=} {file_name=} {cid=}")
 
     # Create manifest JSON file
-    manifest_data = json.dumps(manifest_objects, indent=2)
+    manifest_data = json.dumps(
+        manifest_objects,
+        indent=2,
+    )
 
     # Upload manifest to IPFS
     ipfs_client = HippiusClient(
-        get_node=config.ipfs_store_url,
-        store_node=config.ipfs_store_url,
+        ipfs_gateway=config.ipfs_store_url,
+        ipfs_api_url=config.ipfs_store_url,
+        substrate_url=config.substrate_url,
     )
 
     try:
         # Create temporary file with manifest
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as temp_file:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".json",
+            delete=False,
+        ) as temp_file:
             temp_file.write(manifest_data)
             temp_path = temp_file.name
 
         # Upload manifest to IPFS using regular file add
-        manifest_result = await ipfs_client.add_file(temp_path)
+        manifest = await ipfs_client.upload_file(temp_path)
+        pinning_result = await ipfs_client.pin(
+            manifest["cid"],
+            seed_phrase,
+        )
+        if not pinning_result["success"]:
+            raise Exception(pinning_result["message"])
 
-        manifest_cid = manifest_result.cid
-        logger.info(f"Created unpin manifest with CID: {manifest_cid}")
+        logger.info(f"Created unpin manifest with CID: {manifest['cid']}")
 
         # Clean up temp file
         Path(temp_path).unlink(missing_ok=True)
@@ -74,18 +88,18 @@ async def process_unpin_request(unpin_requests: list[dict]) -> bool:
         )
 
         tx_hash = await substrate_client.cancel_storage_request(
-            cid=manifest_cid,
+            cid=manifest["cid"],
             seed_phrase=seed_phrase,
         )
 
-        logger.debug(f"Substrate call result for manifest {manifest_cid}: {tx_hash}")
+        logger.debug(f"Substrate call result for manifest {manifest['cid']}: {tx_hash}")
 
         # Check if we got a valid transaction hash
         if not tx_hash or tx_hash == "0x" or len(tx_hash) < 10:
-            logger.error(f"Invalid transaction hash received for manifest {manifest_cid}: {tx_hash}")
+            logger.error(f"Invalid transaction hash received for manifest {manifest['cid']}: {tx_hash}")
             return False
 
-        logger.info(f"Successfully submitted unpin manifest {manifest_cid} with transaction: {tx_hash}")
+        logger.info(f"Successfully submitted unpin manifest {manifest['cid']} with transaction: {tx_hash}")
         logger.info(f"Unpinned {len(manifest_objects)} files in batch")
         return True
 
