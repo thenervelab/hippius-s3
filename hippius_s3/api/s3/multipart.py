@@ -1,6 +1,7 @@
 """S3-compatible multipart upload implementation for handling large file uploads."""
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -118,12 +119,26 @@ async def initiate_multipart_upload(
         initiated_at = datetime.now(UTC)
         content_type = request.headers.get("Content-Type", "application/octet-stream")
 
-        # Extract metadata from headers
+        # Extract metadata from headers and check for file size
         metadata = {}
+        file_size = None
+
         for key, value in request.headers.items():
             if key.lower().startswith("x-amz-meta-"):
                 meta_key = key[11:]
                 metadata[meta_key] = value
+            elif key.lower() in ["content-length", "x-amz-content-length", "x-amz-decoded-content-length"]:
+                with contextlib.suppress(ValueError):
+                    file_size = int(value)
+
+        # Check 15GB file size limit if size is provided
+        MAX_FILE_SIZE = 15 * 1024 * 1024 * 1024  # 15GB
+        if file_size and file_size > MAX_FILE_SIZE:
+            return s3_error_response(
+                "EntityTooLarge",
+                f"Your proposed upload size {file_size} bytes exceeds the maximum allowed object size of {MAX_FILE_SIZE} bytes",
+                status_code=400,
+            )
 
         # Create the multipart upload in the database
         await db.fetchrow(
@@ -292,13 +307,26 @@ async def upload_part(
 
     # For new uploads (part 1), check if we have enough space for the entire estimated upload
     if part_number == 1:
+        # Check 15GB file size limit early using estimation
+        MAX_FILE_SIZE = 15 * 1024 * 1024 * 1024  # 15GB
+
         # Get total file size from Content-Length or estimate from first part
         estimated_total_size = request.headers.get("content-length")
         if estimated_total_size:  # noqa: SIM108
             estimated_total_size = int(estimated_total_size) * 2500  # Rough estimate: each part ~8MB, total parts
         else:
-            # Fallback: estimate based on typical large upload (assume 20GB max)
-            estimated_total_size = 20 * 1024 * 1024 * 1024  # 20GB
+            # Conservative estimate: if first part is close to max part size, assume large file
+            if file_size >= 20 * 1024 * 1024:  # If part is >= 20MB, estimate large file  # noqa: SIM108
+                estimated_total_size = file_size * 1000  # Conservative high estimate
+            else:
+                estimated_total_size = file_size * 100  # Smaller file estimate
+
+        if estimated_total_size > MAX_FILE_SIZE:
+            return s3_error_response(
+                "EntityTooLarge",
+                f"Estimated upload size {estimated_total_size} bytes would exceed the maximum allowed object size of {MAX_FILE_SIZE} bytes",
+                status_code=400,
+            )
 
         # Wait for memory availability with 10% buffer
         memory_needed = int(estimated_total_size * 1.1)  # Add 10% buffer
@@ -376,8 +404,7 @@ async def upload_part(
                     status_code=503,
                 )
     except Exception as e:
-        logger.error(f"Failed to check Redis memory for part: {e}")
-        # Continue with upload if memory check fails
+        logger.error(f"Failed to check Redis memory for part: {e}")  # Continue with upload if memory check fails
 
     # Check part size limits
     MAX_PART_SIZE = 32 * 1024 * 1024  # 32 MB
