@@ -30,6 +30,99 @@ from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
+
+
+def _handle_range_request(
+    file_data: bytes, range_header: str, result: dict, metadata: dict, object_key: str, ipfs_cid: str
+) -> Response:
+    """
+    Handle HTTP Range requests for partial content downloads.
+
+    Parses Range header and returns appropriate 206 Partial Content response
+    or 416 Range Not Satisfiable if invalid range.
+    """
+    import re
+
+    file_size = len(file_data)
+
+    # Parse range header - format: "bytes=start-end" or "bytes=start-" or "bytes=-suffix"
+    range_match = re.match(r"bytes=(\d*)-(\d*)", range_header.lower())
+    if not range_match:
+        # Invalid range format
+        return Response(
+            status_code=416,
+            content=f"Invalid range format: {range_header}",
+            headers={"Content-Range": f"bytes */{file_size}"},
+        )
+
+    start_str, end_str = range_match.groups()
+
+    try:
+        # Handle different range formats
+        if start_str and end_str:
+            start = int(start_str)
+            end = int(end_str)
+        elif start_str and not end_str:
+            # Format: bytes=start- (from start to end of file)
+            start = int(start_str)
+            end = file_size - 1
+        elif not start_str and end_str:
+            # Format: bytes=-suffix (last N bytes)
+            suffix = int(end_str)
+            start = max(0, file_size - suffix)
+            end = file_size - 1
+        else:
+            # Invalid: bytes=-
+            raise ValueError("Invalid range")
+
+        # Validate range
+        if start < 0 or end < 0 or start > end or start >= file_size:
+            return Response(
+                status_code=416,
+                content=f"Range not satisfiable: {range_header}",
+                headers={"Content-Range": f"bytes */{file_size}"},
+            )
+
+        # Clamp end to file size
+        end = min(end, file_size - 1)
+        content_length = end - start + 1
+
+        # Extract the requested byte range
+        range_data = file_data[start : end + 1]
+
+        logger.info(f"Range request for {object_key}: bytes {start}-{end}/{file_size} ({content_length} bytes)")
+
+        headers = {
+            "Content-Type": result["content_type"],
+            "Content-Length": str(content_length),
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "ETag": f'"{result.get("md5_hash", ipfs_cid)}"',
+            "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
+            "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
+            "x-amz-ipfs-cid": ipfs_cid,
+            "Accept-Ranges": "bytes",
+        }
+
+        # Add custom metadata headers
+        for key, value in metadata.items():
+            if key != "ipfs" and not isinstance(value, dict):
+                headers[f"x-amz-meta-{key}"] = str(value)
+
+        return Response(
+            content=range_data,
+            status_code=206,  # Partial Content
+            headers=headers,
+        )
+
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Invalid range request '{range_header}': {e}")
+        return Response(
+            status_code=416,
+            content=f"Range not satisfiable: {range_header}",
+            headers={"Content-Range": f"bytes */{file_size}"},
+        )
+
+
 config = get_config()
 security = HTTPBearer()
 router = APIRouter(tags=["s3"])
@@ -1391,7 +1484,7 @@ async def put_object(
                     # Re-encrypt for destination bucket
                     should_encrypt = not dest_is_public
                     s3_result = await ipfs_service.client.s3_publish(
-                        file_path=temp_path,
+                        content=temp_path,
                         encrypt=should_encrypt,
                         seed_phrase=request.state.seed_phrase,
                         subaccount_id=request.state.account.main_account,
@@ -1512,13 +1605,6 @@ async def put_object(
         # Calculate MD5 hash for ETag compatibility
         md5_hash = hashlib.md5(file_data).hexdigest()
         logger.info(f"PUT {bucket_name}/{object_key}: size={len(file_data)}, md5={md5_hash}")
-        logger.info(f"PUT {bucket_name}/{object_key}: body={file_data!r}")
-        if len(file_data) >= 2:
-            mid_point = len(file_data) // 2
-            first_half = file_data[:mid_point]
-            second_half = file_data[mid_point:]
-            if first_half == second_half:
-                logger.error(f"PUT {bucket_name}/{object_key}: DUPLICATED BODY DETECTED!")
 
         # Create temporary file for s3_publish
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
@@ -1533,7 +1619,7 @@ async def put_object(
             should_encrypt = not bucket["is_public"]
 
             s3_result = await ipfs_service.client.s3_publish(
-                file_path=temp_path,
+                content=temp_path,
                 encrypt=should_encrypt,
                 seed_phrase=seed_phrase,
                 subaccount_id=request.state.account.main_account,
@@ -1813,7 +1899,7 @@ async def get_object(
             request.state.account.main_account,
         )
 
-        # Get bucket info to check if it's public
+        # Get bucket info to check if it's public (determines encryption)
         bucket = await db.fetchrow(
             get_query("get_bucket_by_name_and_owner"),
             bucket_name,
@@ -1822,48 +1908,57 @@ async def get_object(
 
         metadata = json.loads(result["metadata"])
 
-        ipfs_metadata = metadata.get("ipfs", {})
         ipfs_cid = result["ipfs_cid"]
 
         logger.debug(f"Getting object {bucket_name}/{object_key} with CID: {ipfs_cid}")
 
-        # Handle multipart objects - check for part CIDs that need concatenation
-        part_cids = ipfs_metadata.get("part_cids") or metadata.get("part_cids")
-        is_multipart = ipfs_metadata.get("multipart", False) or metadata.get("multipart", False) or bool(part_cids)
+        # Multipart objects are now stored as single concatenated files in IPFS
+        # No special handling needed - just download the final CID
 
-        if is_multipart and part_cids:
-            # Reconstruct file from parts if needed
-            try:
-                part_info = [
-                    {
-                        "ipfs_cid": cid,
-                        "part_number": i,
-                        "size_bytes": 0,
-                        # Will be determined during download
-                    }
-                    for i, cid in enumerate(part_cids, 1)
-                ]
+        # Check if file was encrypted based on bucket public status
+        # Public buckets = no encryption, private buckets = encryption
+        is_encrypted = not bucket["is_public"]
 
-                concat_result = await ipfs_service.concatenate_parts(
-                    part_info,
-                    result["content_type"],
-                    object_key,
-                    main_account=request.state.account.main_account,
-                    subaccount_id=request.state.account.main_account,
-                    bucket_name=bucket_name,
-                    is_public_bucket=bucket["is_public"],
-                    seed_phrase=request.state.seed_phrase,
-                )
+        # Check if this was originally a multipart upload
+        is_multipart = metadata.get("multipart", False)
 
-                logger.info(f"Reconstructed multipart file with {len(part_cids)} parts")
-                ipfs_cid = concat_result["cid"]
-            except Exception as e:
-                logger.error(f"Failed to reconstruct multipart file: {e}, using stored CID")
+        if is_multipart:
+            # Download full bytes for multipart objects instead of streaming
+            logger.debug(f"Downloading multipart object {bucket_name}/{object_key} from CID: {ipfs_cid}")
 
-        # Check if file was encrypted based on metadata
-        is_encrypted = ipfs_metadata.get("encrypted", True)  # Default to encrypted for backward compatibility
+            # Get full decrypted bytes for multipart objects
+            file_data = await ipfs_service.download_file(
+                cid=ipfs_cid,
+                subaccount_id=request.state.account.main_account,
+                bucket_name=bucket_name,
+                decrypt=is_encrypted,
+                streaming=False,
+            )
 
-        # Download file with conditional decryption
+            logger.debug(f"Downloaded {len(file_data)} bytes from IPFS CID: {ipfs_cid}")
+
+            # Handle HTTP Range requests for partial content
+            range_header = request.headers.get("range")
+            if range_header:
+                return _handle_range_request(file_data, range_header, result, metadata, object_key, ipfs_cid)
+
+            headers = {
+                "Content-Type": result["content_type"],
+                "Content-Length": str(len(file_data)),
+                "ETag": f'"{result.get("md5_hash", ipfs_cid)}"',
+                "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
+                "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
+                "x-amz-ipfs-cid": ipfs_cid,
+                "Accept-Ranges": "bytes",  # Indicate we support range requests
+            }
+
+            # Add custom metadata headers
+            for key, value in metadata.items():
+                if key != "ipfs" and not isinstance(value, dict):
+                    headers[f"x-amz-meta-{key}"] = str(value)
+
+            return Response(content=file_data, headers=headers)
+        # Legacy behavior for regular (non-multipart) objects
         file_data = await ipfs_service.download_file(
             cid=ipfs_cid,
             subaccount_id=request.state.account.main_account,
@@ -1872,6 +1967,11 @@ async def get_object(
         )
         logger.debug(f"Downloaded {len(file_data)} bytes from IPFS CID: {ipfs_cid}")
 
+        # Handle HTTP Range requests for partial content
+        range_header = request.headers.get("range")
+        if range_header:
+            return _handle_range_request(file_data, range_header, result, metadata, object_key, ipfs_cid)
+
         headers = {
             "Content-Type": result["content_type"],
             "Content-Length": str(len(file_data)),
@@ -1879,9 +1979,8 @@ async def get_object(
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
             "x-amz-ipfs-cid": ipfs_cid,
+            "Accept-Ranges": "bytes",  # Indicate we support range requests
         }
-
-        logger.debug(f"Response headers set for {bucket_name}/{object_key}")
 
         for key, value in metadata.items():
             if key != "ipfs" and not isinstance(value, dict):

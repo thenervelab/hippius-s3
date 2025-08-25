@@ -101,7 +101,7 @@ async def run_pinner_loop():
                         )
 
                 user_upload_requests = {}
-                await asyncio.sleep(10)
+                await asyncio.sleep(60)
 
     except KeyboardInterrupt:
         logger.info("Pinner service stopping...")

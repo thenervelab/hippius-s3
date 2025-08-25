@@ -6,6 +6,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import aiofiles
+import httpx
 import redis.asyncio as async_redis
 
 from hippius_sdk import HippiusClient
@@ -51,10 +53,16 @@ async def process_unpin_request(unpin_requests: list[dict]) -> bool:
     )
 
     # Upload manifest to IPFS
+    # Ensure we use HTTPS for API URL to avoid redirect issues
+    api_url = config.ipfs_store_url
+    if api_url.startswith('http://'):
+        api_url = api_url.replace('http://', 'https://')
+
     ipfs_client = HippiusClient(
         ipfs_gateway=config.ipfs_store_url,
-        ipfs_api_url=config.ipfs_store_url,
+        ipfs_api_url=api_url,
         substrate_url=config.substrate_url,
+        encrypt_by_default=False,  # Manifest doesn't need encryption
     )
 
     try:
@@ -67,14 +75,54 @@ async def process_unpin_request(unpin_requests: list[dict]) -> bool:
             temp_file.write(manifest_data)
             temp_path = temp_file.name
 
-        # Upload manifest to IPFS using regular file add
-        manifest = await ipfs_client.upload_file(temp_path)
-        pinning_result = await ipfs_client.pin(
-            manifest["cid"],
-            seed_phrase,
-        )
+        # Upload manifest to IPFS using httpx with proper redirect handling
+        async with httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True
+        ) as client:
+            # Read manifest data
+            async with aiofiles.open(temp_path, 'rb') as f:
+                file_data = await f.read()
+
+            # Ensure we're using HTTPS and the correct endpoint
+            base_url = config.ipfs_store_url.rstrip('/')
+            if not base_url.startswith('https://'):
+                base_url = base_url.replace('http://', 'https://')
+
+            upload_url = f"{base_url}/api/v0/add?wrap-with-directory=false&cid-version=1"
+            logger.info(f"Uploading manifest to: {upload_url}")
+
+            # Prepare multipart form data
+            files = {"file": ("manifest.json", file_data, "application/json")}
+
+            # Use POST with proper redirect handling that maintains method
+            response = await client.post(upload_url, files=files)
+
+            logger.info(f"Upload response: {response.status_code} from {response.url}")
+            response.raise_for_status()
+
+            # Parse IPFS response (newline-delimited JSON)
+            response_text = response.text
+            logger.debug(f"IPFS response: {response_text}")
+
+            # Handle newline-delimited JSON response from IPFS
+            for line in response_text.strip().split('\n'):
+                if line.strip():
+                    result = json.loads(line)
+                    if 'Hash' in result:
+                        manifest_cid = result["Hash"]
+                        break
+            else:
+                raise Exception(f"No valid CID found in IPFS response: {response_text}")
+
+        logger.info(f"Uploaded manifest directly to IPFS with CID: {manifest_cid}")
+
+        # Pin the manifest
+        pinning_result = await ipfs_client.pin(manifest_cid, seed_phrase)
         if not pinning_result["success"]:
             raise Exception(pinning_result["message"])
+
+        manifest = {"cid": manifest_cid}
 
         logger.info(f"Created unpin manifest with CID: {manifest['cid']}")
 
@@ -139,7 +187,7 @@ async def run_unpinner_loop():
                             f"Some unpins failed for user {user}, will retry later"
                         )  # Keep the user in the dict to retry later
 
-                await asyncio.sleep(10)
+                await asyncio.sleep(60)
 
     except KeyboardInterrupt:
         logger.info("Unpinner service stopping...")
