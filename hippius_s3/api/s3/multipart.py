@@ -319,12 +319,7 @@ async def upload_part(
         "part_number": part_number,
     }
 
-    # Update total size only (MD5 will be computed during completion)
-    await db.execute(
-        "UPDATE multipart_uploads SET total_size = COALESCE(total_size, 0) + $2 WHERE upload_id = $1",
-        upload_id,
-        file_size,
-    )
+    # Part uploaded successfully (final size computed during completion)
 
     # Save the part information in the database
     part_id = str(uuid.uuid4())
