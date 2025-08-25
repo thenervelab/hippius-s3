@@ -267,6 +267,18 @@ async def upload_part(
         file_data = await get_request_body(request)
     except ClientDisconnect:
         logger.warning(f"Client disconnected during part {part_number} upload for upload {upload_id}")
+
+        # Clean up any cached parts for this upload when client disconnects
+        redis_client = request.app.state.redis_client
+        try:
+            keys_pattern = f"multipart:{upload_id}:part:*"
+            keys = await redis_client.keys(keys_pattern)
+            if keys:
+                await redis_client.delete(*keys)
+                logger.info(f"Cleaned up {len(keys)} cached parts for disconnected upload {upload_id}")
+        except Exception as e:
+            logger.error(f"Failed to cleanup parts after disconnect: {e}")
+
         return s3_error_response(
             "RequestTimeout",
             "Client disconnected during upload",
@@ -399,36 +411,90 @@ async def upload_part(
     # Cache raw part data for concatenation at completion (no IPFS upload for parts)
     redis_client = request.app.state.redis_client
     part_key = f"multipart:{upload_id}:part:{part_number}"
-    await redis_client.setex(part_key, 86400, file_data)  # 24 hour TTL
 
-    # Create mock part result (no IPFS upload needed for individual parts)
-    md5_hash = hashlib.md5(file_data).hexdigest()
-    etag = f"{md5_hash}-{part_number}"
+    try:
+        # Check if client is still connected before proceeding
+        if await request.is_disconnected():
+            logger.warning(f"Client disconnected before caching part {part_number} for upload {upload_id}")
+            return s3_error_response(
+                "RequestTimeout",
+                "Client disconnected during upload",
+                status_code=408,
+            )
 
-    part_result = {
-        "cid": f"temp-part-{part_number}",  # Temporary placeholder
-        "size_bytes": file_size,
-        "etag": etag,
-        "part_number": part_number,
-    }
+        await redis_client.setex(part_key, 1800, file_data)  # 30 minute TTL
 
-    # Part uploaded successfully (final size computed during completion)
+        # Create mock part result (no IPFS upload needed for individual parts)
+        md5_hash = hashlib.md5(file_data).hexdigest()
+        etag = f"{md5_hash}-{part_number}"
 
-    # Save the part information in the database
-    part_id = str(uuid.uuid4())
-    await db.fetchrow(
-        get_query("upload_part"),
-        part_id,
-        upload_id,
-        part_number,
-        part_result["cid"],
-        part_result["size_bytes"],
-        part_result["etag"],
-        datetime.now(UTC),
-    )
+        part_result = {
+            "cid": f"temp-part-{part_number}",  # Temporary placeholder
+            "size_bytes": file_size,
+            "etag": etag,
+            "part_number": part_number,
+        }
 
-    # Return the part's ETag in the response header
-    return Response(status_code=200, headers={"ETag": f'"{part_result["etag"]}"'})
+        # Check if client is still connected before database operation
+        if await request.is_disconnected():
+            logger.warning(f"Client disconnected during part {part_number} processing for upload {upload_id}")
+            # Clean up the Redis key we just created
+            await redis_client.delete(part_key)
+            return s3_error_response(
+                "RequestTimeout",
+                "Client disconnected during upload",
+                status_code=408,
+            )
+
+        # Save the part information in the database
+        part_id = str(uuid.uuid4())
+        await db.fetchrow(
+            get_query("upload_part"),
+            part_id,
+            upload_id,
+            part_number,
+            part_result["cid"],
+            part_result["size_bytes"],
+            part_result["etag"],
+            datetime.now(UTC),
+        )
+
+        # Final check before returning response
+        if await request.is_disconnected():
+            logger.warning(f"Client disconnected after part {part_number} saved for upload {upload_id}")
+            # Clean up both Redis and database
+            await redis_client.delete(part_key)
+            # Note: We don't remove from database as it's already committed
+            return s3_error_response(
+                "RequestTimeout",
+                "Client disconnected during upload",
+                status_code=408,
+            )
+
+        # Return the part's ETag in the response header
+        return Response(status_code=200, headers={"ETag": f'"{part_result["etag"]}"'})
+
+    except Exception as e:
+        # If any error occurs, clean up the Redis key
+        logger.error(f"Error during part {part_number} upload: {e}")
+        try:
+            await redis_client.delete(part_key)
+        except Exception as cleanup_error:
+            logger.error(f"Failed to cleanup Redis key after error: {cleanup_error}")
+
+        # Check if it's a disconnect-related error
+        if "disconnect" in str(e).lower() or "connection" in str(e).lower():
+            # Clean up all parts for this upload on connection errors
+            try:
+                keys_pattern = f"multipart:{upload_id}:part:*"
+                keys = await redis_client.keys(keys_pattern)
+                if keys:
+                    await redis_client.delete(*keys)
+                    logger.info(f"Cleaned up {len(keys)} cached parts for failed upload {upload_id}")
+            except Exception as batch_cleanup_error:
+                logger.error(f"Failed to cleanup all parts after connection error: {batch_cleanup_error}")
+
+        raise
 
 
 @router.delete("/{bucket_name}/{object_key:path}/", status_code=204)
