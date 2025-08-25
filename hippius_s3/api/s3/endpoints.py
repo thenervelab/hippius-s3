@@ -96,7 +96,7 @@ def _handle_range_request(
             "Content-Type": result["content_type"],
             "Content-Length": str(content_length),
             "Content-Range": f"bytes {start}-{end}/{file_size}",
-            "ETag": f'"{result.get("md5_hash", ipfs_cid)}"',
+            "ETag": f'"{ipfs_cid}"',
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
             "x-amz-ipfs-cid": ipfs_cid,
@@ -409,7 +409,7 @@ async def get_bucket(
 
             etag = ET.SubElement(content, "ETag")
             # Use MD5 hash as ETag for AWS CLI compatibility, fallback to CID if not available
-            etag.text = f'"{obj.get("md5_hash", obj["ipfs_cid"])}"'
+            etag.text = f'"{obj["ipfs_cid"]}"'
 
             size = ET.SubElement(content, "Size")
             size.text = str(obj["size_bytes"])
@@ -1540,7 +1540,7 @@ async def put_object(
             # Prepare the XML response
             root = ET.Element("CopyObjectResult")
             etag = ET.SubElement(root, "ETag")
-            etag.text = f'"{md5_hash}"'
+            etag.text = f'"{ipfs_cid}"'
             last_modified = ET.SubElement(root, "LastModified")
             # Format in S3-compatible format: YYYY-MM-DDThh:mm:ssZ
             last_modified.text = created_at.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1552,7 +1552,7 @@ async def put_object(
                 media_type="application/xml",
                 status_code=200,
                 headers={
-                    "ETag": f'"{md5_hash}"',
+                    "ETag": f'"{ipfs_cid}"',
                     "x-amz-ipfs-cid": ipfs_cid,
                 },
             )
@@ -1705,7 +1705,7 @@ async def put_object(
         return Response(
             status_code=200,
             headers={
-                "ETag": f'"{md5_hash}"',
+                "ETag": f'"{ipfs_cid}"',
                 "x-amz-ipfs-cid": ipfs_cid,
             },
         )
@@ -1842,7 +1842,7 @@ async def head_object(
         headers = {
             "Content-Type": result["content_type"],
             "Content-Length": str(result["size_bytes"]),
-            "ETag": f'"{result.get("md5_hash", ipfs_cid)}"',
+            "ETag": f'"{ipfs_cid}"',
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "x-amz-ipfs-cid": ipfs_cid,
         }
@@ -1945,7 +1945,7 @@ async def get_object(
             headers = {
                 "Content-Type": result["content_type"],
                 "Content-Length": str(len(file_data)),
-                "ETag": f'"{result.get("md5_hash", ipfs_cid)}"',
+                "ETag": f'"{ipfs_cid}"',
                 "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
                 "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
                 "x-amz-ipfs-cid": ipfs_cid,
@@ -1975,7 +1975,7 @@ async def get_object(
         headers = {
             "Content-Type": result["content_type"],
             "Content-Length": str(len(file_data)),
-            "ETag": f'"{result.get("md5_hash", ipfs_cid)}"',
+            "ETag": f'"{ipfs_cid}"',
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
             "x-amz-ipfs-cid": ipfs_cid,
