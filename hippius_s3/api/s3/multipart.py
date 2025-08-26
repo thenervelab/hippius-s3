@@ -1,6 +1,5 @@
 """S3-compatible multipart upload implementation for handling large file uploads."""
 
-import asyncio
 import contextlib
 import hashlib
 import json
@@ -301,110 +300,6 @@ async def upload_part(
         )
 
     file_size = len(file_data)
-
-    # Check Redis memory and wait if insufficient space
-    redis_client = request.app.state.redis_client
-
-    # For new uploads (part 1), check if we have enough space for the entire estimated upload
-    if part_number == 1:
-        # Check 15GB file size limit early using estimation
-        MAX_FILE_SIZE = 15 * 1024 * 1024 * 1024  # 15GB
-
-        # Get total file size from Content-Length or estimate from first part
-        estimated_total_size = request.headers.get("content-length")
-        if estimated_total_size:  # noqa: SIM108
-            estimated_total_size = int(estimated_total_size) * 2500  # Rough estimate: each part ~8MB, total parts
-        else:
-            # Conservative estimate: if first part is close to max part size, assume large file
-            if file_size >= 20 * 1024 * 1024:  # If part is >= 20MB, estimate large file  # noqa: SIM108
-                estimated_total_size = file_size * 1000  # Conservative high estimate
-            else:
-                estimated_total_size = file_size * 100  # Smaller file estimate
-
-        if estimated_total_size > MAX_FILE_SIZE:
-            return s3_error_response(
-                "EntityTooLarge",
-                f"Estimated upload size {estimated_total_size} bytes would exceed the maximum allowed object size of {MAX_FILE_SIZE} bytes",
-                status_code=400,
-            )
-
-        # Wait for memory availability with 10% buffer
-        memory_needed = int(estimated_total_size * 1.1)  # Add 10% buffer
-        max_wait_time = 300  # 5 minutes max wait
-        wait_interval = 5  # Check every 5 seconds
-        total_waited = 0
-
-        logger.info(
-            f"New upload {upload_id}: estimated size {estimated_total_size} bytes, need {memory_needed} bytes with buffer"
-        )
-
-        while total_waited < max_wait_time:
-            try:
-                memory_info = await redis_client.info("memory")
-                used_memory = int(memory_info["used_memory"])
-                max_memory = int(memory_info.get("maxmemory", 0))
-
-                if max_memory > 0:
-                    available_memory = max_memory - used_memory
-
-                    if available_memory >= memory_needed:
-                        logger.info(
-                            f"Memory available for upload {upload_id}: {available_memory} bytes >= {memory_needed} bytes needed"
-                        )
-                        break
-                    logger.info(
-                        f"Waiting for memory: need {memory_needed} bytes, available {available_memory} bytes. Waited {total_waited}s/{max_wait_time}s"
-                    )
-                    await asyncio.sleep(wait_interval)
-                    total_waited += wait_interval
-                else:
-                    # No memory limit set, proceed
-                    break
-
-            except Exception as e:
-                logger.error(f"Failed to check Redis memory: {e}")
-                break  # Continue with upload if memory check fails
-
-        # If we waited the max time and still don't have space, reject
-        if total_waited >= max_wait_time:
-            try:
-                memory_info = await redis_client.info("memory")
-                used_memory = int(memory_info["used_memory"])
-                max_memory = int(memory_info.get("maxmemory", 0))
-                available_memory = max_memory - used_memory if max_memory > 0 else 0
-
-                logger.error(
-                    f"Upload {upload_id} rejected after {max_wait_time}s wait: need {memory_needed} bytes, have {available_memory} bytes"
-                )
-                return s3_error_response(
-                    "ServiceUnavailable",
-                    f"Insufficient cache memory for upload after waiting {max_wait_time} seconds. Please try again later.",
-                    status_code=503,
-                )
-            except Exception as e:
-                logger.error(f"Failed final memory check: {e}")
-
-    # For all parts, do a quick check for immediate part storage
-    try:
-        memory_info = await redis_client.info("memory")
-        used_memory = int(memory_info["used_memory"])
-        max_memory = int(memory_info.get("maxmemory", 0))
-
-        if max_memory > 0:
-            available_memory = max_memory - used_memory
-            part_buffer = int(file_size * 0.1)  # 10% buffer for this part
-
-            if available_memory < (file_size + part_buffer):
-                logger.warning(
-                    f"Redis memory insufficient for part {part_number}: need {file_size + part_buffer} bytes, have {available_memory} bytes"
-                )
-                return s3_error_response(
-                    "ServiceUnavailable",
-                    "Insufficient cache memory for this part. Please try again later.",
-                    status_code=503,
-                )
-    except Exception as e:
-        logger.error(f"Failed to check Redis memory for part: {e}")  # Continue with upload if memory check fails
 
     # Check part size limits
     MAX_PART_SIZE = 32 * 1024 * 1024  # 32 MB
