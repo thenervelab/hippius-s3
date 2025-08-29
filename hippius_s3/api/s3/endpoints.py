@@ -409,7 +409,7 @@ async def get_bucket(
 
             etag = ET.SubElement(content, "ETag")
             # Use MD5 hash as ETag for AWS CLI compatibility, fallback to CID if not available
-            etag.text = f'"{obj["md5_hash"]}"'
+            etag.text = obj["md5_hash"]
 
             size = ET.SubElement(content, "Size")
             size.text = str(obj["size_bytes"])
@@ -1445,7 +1445,7 @@ async def put_object(
                 ipfs_cid = source_object["ipfs_cid"]
                 file_size = source_object["size_bytes"]
                 content_type = source_object["content_type"]
-                md5_hash = source_object.get("md5_hash", ipfs_cid)  # Fallback to CID if no MD5
+                md5_hash = source_object["md5_hash"]  # Fallback to CID if no MD5
 
                 # Copy all metadata as-is
                 metadata = {
