@@ -3,11 +3,9 @@
 import hashlib
 import json
 import logging
-import tempfile
 import uuid
 from datetime import UTC
 from datetime import datetime
-from pathlib import Path
 
 import asyncpg
 from fastapi import APIRouter
@@ -24,8 +22,8 @@ from hippius_s3 import dependencies
 from hippius_s3 import utils
 from hippius_s3.api.s3 import errors
 from hippius_s3.config import get_config
+from hippius_s3.queue import enqueue_s3_publish_request
 from hippius_s3.queue import enqueue_unpin_request
-from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.utils import get_query
 
 
@@ -363,17 +361,25 @@ async def get_bucket(
             )
 
         bucket_id = bucket["bucket_id"]
-        prefix = request.query_params.get(
-            "prefix",
-            None,
-        )
+        prefix = request.query_params.get("prefix", None)
+
+        # Add pagination parameters with AWS S3 compatible defaults
+        max_keys = min(int(request.query_params.get("max-keys", "1000")), 1000)
+        marker = request.query_params.get("marker", "")
+
+        # Calculate offset based on marker (simplified - could be optimized with key-based pagination)
+        offset = 0
+        if marker:
+            # For now, use simple offset calculation - could be optimized later
+            marker_result = await db.fetchrow(
+                "SELECT COUNT(*) as offset_count FROM objects WHERE bucket_id = $1 AND object_key <= $2",
+                bucket_id,
+                marker,
+            )
+            offset = marker_result["offset_count"] if marker_result else 0
 
         query = get_query("list_objects")
-        results = await db.fetch(
-            query,
-            bucket_id,
-            prefix,
-        )
+        results = await db.fetch(query, bucket_id, prefix, max_keys, offset)
 
         # Create XML using lxml for better compatibility with MinIO client
         root = ET.Element(
@@ -390,11 +396,18 @@ async def get_bucket(
         marker = ET.SubElement(root, "Marker")
         marker.text = ""
 
-        max_keys = ET.SubElement(root, "MaxKeys")
-        max_keys.text = "1000"
+        max_keys_elem = ET.SubElement(root, "MaxKeys")
+        max_keys_elem.text = str(max_keys)
 
+        # Check if there are more objects (for pagination)
+        is_truncated_val = len(results) == max_keys
         is_truncated = ET.SubElement(root, "IsTruncated")
-        is_truncated.text = "false"
+        is_truncated.text = "true" if is_truncated_val else "false"
+
+        # Add NextMarker if truncated
+        if is_truncated_val and results:
+            next_marker = ET.SubElement(root, "NextMarker")
+            next_marker.text = results[-1]["object_key"]
 
         # Add content objects
         for obj in results:
@@ -1475,54 +1488,30 @@ async def put_object(
                 # Calculate MD5 hash for ETag compatibility
                 md5_hash = hashlib.md5(file_data).hexdigest()
 
-                # Create temporary file for re-upload
-                with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-                    temp_path = temp_file.name
-                    temp_file.write(file_data)
+                # Setup for async copy operation
+                should_encrypt = not dest_is_public
+                object_id = str(uuid.uuid4())
+                created_at = datetime.now(UTC)
 
-                try:
-                    # Re-encrypt for destination bucket
-                    should_encrypt = not dest_is_public
-                    s3_result = await ipfs_service.client.s3_publish(
-                        content=temp_path,
-                        encrypt=should_encrypt,
-                        seed_phrase=request.state.seed_phrase,
-                        subaccount_id=request.state.account.main_account,
-                        bucket_name=bucket_name,
-                        file_name=object_key,
-                        store_node=config.ipfs_store_url,
-                        pin_node=config.ipfs_store_url,
-                        substrate_url=config.substrate_url,
-                        publish=False,
-                    )
+                # Store file data in Redis for background processing
+                copy_chunk_key = f"copy:{object_id}:part:0"
+                await redis_client.set(copy_chunk_key, file_data, ex=3600)
 
-                    # Queue the upload request for pinning
-                    await enqueue_upload_request(
-                        redis_client,
-                        s3_result,
-                        request.state.seed_phrase,
-                        request.state.account.main_account,
-                    )
+                # Prepare metadata for copy operation
+                ipfs_cid = ""  # Will be set after s3_publish
+                file_size = len(file_data)
+                content_type = source_object["content_type"]
 
-                    ipfs_cid = s3_result.cid
-                    file_size = len(file_data)
-                    content_type = source_object["content_type"]
+                # Create new metadata for destination
+                metadata = {
+                    "ipfs": {"cid": "", "encrypted": should_encrypt},
+                    "hippius": {},
+                }
 
-                    # Create new metadata for destination
-                    metadata = {
-                        "ipfs": {"cid": ipfs_cid, "encrypted": should_encrypt},
-                        "hippius": {},
-                    }
-
-                    # Copy any user metadata (x-amz-meta-*)
-                    for key, value in source_metadata.items():
-                        if key not in ["ipfs", "hippius", "multipart"]:
-                            metadata[key] = value  # noqa: PERF403
-
-                finally:
-                    # Clean up temporary file
-                    if Path(temp_path).exists():
-                        Path(temp_path).unlink()
+                # Copy any user metadata (x-amz-meta-*)
+                for key, value in source_metadata.items():
+                    if key not in ["ipfs", "hippius", "multipart"]:
+                        metadata[key] = value  # noqa: PERF403
 
             # Create or update the object using upsert
             await db.fetchrow(
@@ -1538,10 +1527,32 @@ async def put_object(
                 md5_hash,
             )
 
+            # Queue s3_publish request for background processing
+            await enqueue_s3_publish_request(
+                redis_client,
+                object_id=object_id,
+                file_name=object_key,
+                owner=request.state.account.main_account,
+                chunks=[{"chunk_key": copy_chunk_key, "chunk_index": 0}],
+                seed_phrase=request.state.seed_phrase,
+                bucket_name=bucket_name,
+                subaccount_id=request.state.account.main_account,
+                should_encrypt=should_encrypt,
+                store_node=config.ipfs_store_url,
+                pin_node=config.ipfs_store_url,
+                substrate_url=config.substrate_url,
+            )
+
+            # Mark object as 'pinning' after queueing
+            await db.execute(
+                "UPDATE objects SET status = 'pinning' WHERE object_id = $1",
+                object_id,
+            )
+
             # Prepare the XML response
             root = ET.Element("CopyObjectResult")
             etag = ET.SubElement(root, "ETag")
-            etag.text = f'"{ipfs_cid}"'
+            etag.text = f'"{md5_hash}"'
             last_modified = ET.SubElement(root, "LastModified")
             # Format in S3-compatible format: YYYY-MM-DDThh:mm:ssZ
             last_modified.text = created_at.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1553,8 +1564,8 @@ async def put_object(
                 media_type="application/xml",
                 status_code=200,
                 headers={
-                    "ETag": f'"{ipfs_cid}"',
-                    "x-amz-ipfs-cid": ipfs_cid,
+                    "ETag": f'"{md5_hash}"',
+                    "x-amz-request-id": object_id,
                 },
             )
 
@@ -1607,57 +1618,29 @@ async def put_object(
         md5_hash = hashlib.md5(file_data).hexdigest()
         logger.info(f"PUT {bucket_name}/{object_key}: size={len(file_data)}, md5={md5_hash}")
 
-        # Create temporary file for s3_publish
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            temp_path = temp_file.name
-            temp_file.write(file_data)
+        # Setup for async s3_publish processing
+        seed_phrase = request.state.seed_phrase
+        should_encrypt = not bucket["is_public"]
+        object_id = str(uuid.uuid4())
+        created_at = datetime.now(UTC)
 
-        try:
-            # Use s3_publish for IPFS upload + pinning + blockchain publishing
-            seed_phrase = request.state.seed_phrase
+        # Store file data in Redis for background processing (using multipart-style naming)
+        chunk_key = f"upload:{object_id}:part:0"
+        await redis_client.set(chunk_key, file_data, ex=3600)
 
-            # Only encrypt if bucket is private
-            should_encrypt = not bucket["is_public"]
+        # Extract user metadata from headers
+        metadata = {}
+        for key, value in request.headers.items():
+            if key.lower().startswith("x-amz-meta-"):
+                meta_key = key[11:]
+                metadata[meta_key] = value
 
-            s3_result = await ipfs_service.client.s3_publish(
-                content=temp_path,
-                encrypt=should_encrypt,
-                seed_phrase=seed_phrase,
-                subaccount_id=request.state.account.main_account,
-                bucket_name=bucket_name,
-                file_name=object_key,
-                store_node=config.ipfs_store_url,
-                pin_node=config.ipfs_store_url,
-                substrate_url=config.substrate_url,
-                publish=False,
-            )
+        # Add placeholder metadata (will be updated after s3_publish)
+        metadata["ipfs"] = {"cid": "", "encrypted": should_encrypt}
+        metadata["hippius"] = {}
 
-            # Queue the upload request for pinning
-            await enqueue_upload_request(
-                redis_client,
-                s3_result,
-                seed_phrase,
-                request.state.account.main_account,
-            )
-
-            ipfs_cid = s3_result.cid
-            object_id = str(uuid.uuid4())
-            created_at = datetime.now(UTC)
-
-            # Extract user metadata from headers
-            metadata = {}
-            for key, value in request.headers.items():
-                if key.lower().startswith("x-amz-meta-"):
-                    meta_key = key[11:]
-                    metadata[meta_key] = value
-
-            # Add system metadata
-            metadata["ipfs"] = {"cid": ipfs_cid, "encrypted": should_encrypt}
-            metadata["hippius"] = {}
-        finally:
-            # Clean up temporary file
-            if Path(temp_path).exists():
-                Path(temp_path).unlink()
+        # Placeholder CID until s3_publish completes
+        ipfs_cid = ""
 
         # Begin a transaction to ensure atomic operation
         try:
@@ -1685,12 +1668,34 @@ async def put_object(
                 )
                 if not verify_result:
                     raise RuntimeError(f"Failed to insert object: {bucket_name}/{object_key}")
+
+                # Queue s3_publish request for background processing
+                await enqueue_s3_publish_request(
+                    redis_client,
+                    object_id=object_id,
+                    file_name=object_key,
+                    owner=request.state.account.main_account,
+                    chunks=[{"chunk_key": chunk_key, "chunk_index": 0}],
+                    seed_phrase=seed_phrase,
+                    bucket_name=bucket_name,
+                    subaccount_id=request.state.account.main_account,
+                    should_encrypt=should_encrypt,
+                    store_node=config.ipfs_store_url,
+                    pin_node=config.ipfs_store_url,
+                    substrate_url=config.substrate_url,
+                )
+
+                # Mark object as 'pinning' after queueing
+                await db.execute(
+                    "UPDATE objects SET status = 'pinning' WHERE object_id = $1",
+                    object_id,
+                )
         except Exception as e:
             logger.error(f"Transaction failed for PUT {bucket_name}/{object_key}: {str(e)}")
             raise
 
         # Clean up old IPFS content if needed
-        if existing_object and existing_object["ipfs_cid"] != ipfs_cid:
+        if existing_object and existing_object["ipfs_cid"]:
             try:
                 await enqueue_unpin_request(
                     redis_client,
@@ -1707,8 +1712,8 @@ async def put_object(
         return Response(
             status_code=200,
             headers={
-                "ETag": f'"{ipfs_cid}"',
-                "x-amz-ipfs-cid": ipfs_cid,
+                "ETag": f'"{md5_hash}"',
+                "x-amz-request-id": object_id,
             },
         )
 
@@ -1951,7 +1956,8 @@ async def get_object(
                 "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
                 "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
                 "x-amz-ipfs-cid": ipfs_cid,
-                "Accept-Ranges": "bytes",  # Indicate we support range requests
+                "Accept-Ranges": "bytes",
+                # Indicate we support range requests
             }
 
             # Add custom metadata headers
@@ -1981,7 +1987,8 @@ async def get_object(
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
             "x-amz-ipfs-cid": ipfs_cid,
-            "Accept-Ranges": "bytes",  # Indicate we support range requests
+            "Accept-Ranges": "bytes",
+            # Indicate we support range requests
         }
 
         for key, value in metadata.items():

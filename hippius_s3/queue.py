@@ -67,3 +67,45 @@ async def dequeue_unpin_request(redis_client: async_redis.Redis) -> Dict[str, An
         _, queue_data = result
         return json.loads(queue_data)
     return None
+
+
+async def enqueue_s3_publish_request(
+    redis_client: async_redis.Redis,
+    object_id: str,
+    file_name: str,
+    owner: str,
+    chunks: list[dict],
+    seed_phrase: str,
+    bucket_name: str,
+    subaccount_id: str,
+    should_encrypt: bool,
+    store_node: str,
+    pin_node: str,
+    substrate_url: str,
+) -> None:
+    """Add an s3_publish request to the Redis queue for background processing."""
+    queue_item = {
+        "object_id": object_id,
+        "file_name": file_name,
+        "owner": owner,
+        "chunks": chunks,
+        "seed_phrase": seed_phrase,
+        "bucket_name": bucket_name,
+        "subaccount_id": subaccount_id,
+        "should_encrypt": should_encrypt,
+        "store_node": store_node,
+        "pin_node": pin_node,
+        "substrate_url": substrate_url,
+    }
+
+    await redis_client.lpush("s3_publish_requests", json.dumps(queue_item))
+    logger.info(f"Enqueued s3_publish request for object_id={object_id}, file={file_name}")
+
+
+async def dequeue_s3_publish_request(redis_client: async_redis.Redis) -> Dict[str, Any] | None:
+    """Get the next s3_publish request from the Redis queue."""
+    result = await redis_client.brpop("s3_publish_requests", timeout=1)
+    if result:
+        _, queue_data = result
+        return json.loads(queue_data)
+    return None

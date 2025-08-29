@@ -20,7 +20,7 @@ from starlette.requests import ClientDisconnect
 from hippius_s3 import dependencies
 from hippius_s3 import utils
 from hippius_s3.api.s3.errors import s3_error_response
-from hippius_s3.queue import enqueue_upload_request
+from hippius_s3.queue import enqueue_s3_publish_request
 from hippius_s3.utils import get_query
 
 
@@ -627,10 +627,10 @@ async def complete_multipart_upload_internal(
             )
 
         # Prepare parts for concatenation in correct order
-        parts_for_concat = []
+        chunks = []
         for part_number, _ in part_info:  # part_info is already sorted by part number
             part_data = db_parts_dict[part_number]
-            parts_for_concat.append(
+            chunks.append(
                 {
                     "ipfs_cid": part_data["ipfs_cid"],
                     "part_number": part_data["part_number"],
@@ -650,116 +650,27 @@ async def complete_multipart_upload_internal(
         )
 
         # Ensure parts are in correct order before concatenation
-        parts_for_concat.sort(key=lambda x: x["part_number"])
-        logger.info(
-            f"Processing {len(parts_for_concat)} parts in order: {[p['part_number'] for p in parts_for_concat]}"
-        )
-
-        # Compute MD5 hash from concatenated parts data and cleanup Redis in one pass
-        redis_client = request.app.state.redis_client
-        all_data = b""
-        redis_keys_to_delete = []
-        processed_parts = set()  # Track processed parts to avoid duplicates
-
-        for part_dict in parts_for_concat:  # Renamed variable for clarity
-            part_number = part_dict["part_number"]
-
-            # Check for duplicate part numbers to prevent double processing
-            if part_number in processed_parts:
-                logger.error(f"Duplicate part number {part_number} detected - skipping")
-                continue
-            processed_parts.add(part_number)
-
-            part_key = f"multipart:{upload_id}:part:{part_number}"
-            part_data = await redis_client.get(part_key)
-
-            if part_data is None:
-                return s3_error_response(
-                    "InvalidRequest",
-                    f"Part {part_number} data not found in cache",
-                    status_code=400,
-                )
-
-            part_size = len(part_data)
-            logger.info(f"Processing part {part_number}: {part_size} bytes")
-            all_data += part_data
-            redis_keys_to_delete.append(part_key)
-
-        final_md5_hash = hashlib.md5(all_data).hexdigest()
-        total_size = len(all_data)  # Use actual computed size instead of DB value
-        logger.info(
-            f"Multipart concatenation complete: {len(processed_parts)} parts, {total_size} bytes total, MD5: {final_md5_hash}"
-        )
-
-        # Batch delete Redis keys
-        if redis_keys_to_delete:
-            await redis_client.delete(*redis_keys_to_delete)
+        chunks.sort(key=lambda x: x["part_number"])
+        logger.debug(f"Processing {len(chunks)} parts in order: {[p['part_number'] for p in chunks]}")
 
         # Calculate combined ETag (required for S3 compatibility)
-        etags = [str(part_dict["etag"]).split("-")[0] for part_dict in parts_for_concat]
+        etags = [str(part_dict["etag"]).split("-")[0] for part_dict in chunks]
         combined_etag = hashlib.md5(("".join(etags)).encode()).hexdigest()
-        final_etag = f"{combined_etag}-{len(parts_for_concat)}"
+        final_etag = f"{combined_etag}-{len(chunks)}"
 
-        # Upload concatenated file to IPFS
+        # Setup for async s3_publish processing
         should_encrypt = not bucket["is_public"]
-
-        s3_result = await ipfs_service.client.s3_publish(
-            content=all_data,
-            encrypt=should_encrypt,
-            seed_phrase=request.state.seed_phrase,
-            subaccount_id=request.state.account.main_account,
-            bucket_name=bucket_name,
-            store_node=ipfs_service.config.ipfs_store_url,
-            pin_node=ipfs_service.config.ipfs_store_url,
-            substrate_url=ipfs_service.config.substrate_url,
-            publish=False,
-            file_name=object_key,
-        )
-
-        # Queue for pinning
-        redis_client = request.app.state.redis_client
-        await enqueue_upload_request(
-            redis_client,
-            s3_result,
-            request.state.seed_phrase,
-            owner=request.state.account.main_account,
-        )
-
-        final_cid = s3_result.cid
-
-        # Verification: Check that the file is properly encrypted on IPFS
-        logger.info(f"Multipart upload completed. CID: {final_cid}")
-        logger.info(f"Verification: File should be encrypted at https://get.hippius.network/ipfs/{final_cid}")
-        logger.info(f"Expected size: {total_size} bytes, Should encrypt: {should_encrypt}")
-
-        # No need to delete individual parts from IPFS since they were never uploaded there
 
         # Prepare metadata
         object_id = str(uuid.uuid4())
         bucket_id = multipart_upload["bucket_id"]
         created_at = datetime.now(UTC)
 
-        metadata = multipart_upload["metadata"] if multipart_upload["metadata"] else {}
-        if isinstance(metadata, str):
-            metadata = json.loads(metadata)
-
-        # Add metadata for final concatenated file
-        metadata.update(
-            {
-                "multipart": True,
-                "parts_count": len(parts_for_concat),
-                "original_parts": len(parts_for_concat),  # Track original part count
-                "ipfs": {
-                    "cid": final_cid,
-                    "encrypted": should_encrypt,
-                    "multipart": False,
-                    # Final file is single IPFS object
-                },
-            }
-        )
-
         # Mark the upload as completed
-        await db.fetchrow(get_query("complete_multipart_upload"), upload_id)
+        await db.fetchrow(
+            get_query("complete_multipart_upload"),
+            upload_id,
+        )
 
         # Delete any existing object with same key
         await db.execute(
@@ -771,26 +682,44 @@ async def complete_multipart_upload_internal(
         # Create the object in database
         await db.fetchrow(
             get_query("upsert_object"),
-            object_id,
+            upload_id,
             bucket_id,
             object_key,
-            final_cid,
-            total_size,
+            "",
+            0,
             content_type,
             created_at,
-            json.dumps(metadata),
-            final_md5_hash,
+            "{}",
+            final_etag,
         )
 
-        # Verify that the object was actually inserted
-        verify_result = await db.fetchrow(
-            get_query("get_object_by_path"),
-            bucket_id,
-            object_key,
+        # Queue s3_publish request for background processing
+        await enqueue_s3_publish_request(
+            request.app.state.redis_client,
+            object_id=object_id,
+            file_name=object_key,
+            owner=request.state.account.main_account,
+            chunks=[
+                {
+                    "chunk_index": c["part_number"],
+                    "chunk_key": f"multipart:{upload_id}:part:{c['part_number']}",
+                }
+                for c in chunks
+            ],
+            seed_phrase=request.state.seed_phrase,
+            bucket_name=bucket_name,
+            subaccount_id=request.state.account.main_account,
+            should_encrypt=should_encrypt,
+            store_node=ipfs_service.config.ipfs_store_url,
+            pin_node=ipfs_service.config.ipfs_store_url,
+            substrate_url=ipfs_service.config.substrate_url,
         )
-        if not verify_result:
-            logger.error(f"Failed to find object after multipart completion: {bucket_name}/{object_key}")
-            raise RuntimeError(f"Failed to insert multipart object: {bucket_name}/{object_key}")
+
+        # Mark object as 'pinning' after queueing
+        await db.execute(
+            "UPDATE objects SET status = 'pinning' WHERE object_id = $1",
+            object_id,
+        )
 
         # Create XML response
         xml_string = f"""<?xml version="1.0" encoding="UTF-8"?>

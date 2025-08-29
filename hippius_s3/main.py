@@ -11,6 +11,11 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi import Response
 from fastapi.openapi.utils import get_openapi
+from redis.asyncio.retry import Retry
+from redis.backoff import ExponentialBackoff
+from redis.exceptions import BusyLoadingError
+from redis.exceptions import ConnectionError
+from redis.exceptions import TimeoutError
 
 from hippius_s3.api.middlewares.audit_log import audit_log_middleware
 from hippius_s3.api.middlewares.backend_hmac import verify_hmac_middleware
@@ -89,8 +94,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.postgres_pool = await postgres_create_pool(config.database_url)
         logger.info("Postgres connection pool created")
 
-        app.state.redis_client = async_redis.from_url(config.redis_url)
-        logger.info("Redis client initialized")
+        # Configure Redis client with retry logic for BusyLoadingError
+        retry_policy = Retry(
+            ExponentialBackoff(base=0.1, cap=1.0),
+            # Start at 100ms, max 1s between retries
+            retries=15,  # Up to 15 retries (roughly 5+ seconds total)
+        )
+        app.state.redis_client = async_redis.from_url(
+            config.redis_url,
+            retry=retry_policy,
+            retry_on_error=[BusyLoadingError, ConnectionError, TimeoutError],
+            socket_timeout=10.0,
+            # 10 second socket timeout
+            socket_connect_timeout=5.0,  # 5 second connection timeout
+        )
+        logger.info("Redis client initialized with retry policy for BusyLoadingError")
 
         app.state.rate_limit_service = RateLimitService(app.state.redis_client)
         logger.info("Rate limiting service initialized")
@@ -171,6 +189,7 @@ app.middleware("http")(banhammer_wrapper)
 # 8. CORS (executes SECOND)
 app.middleware("http")(cors_middleware)
 if config.enable_request_profiling:
+    logger.warning("Enabled request profiling, this will slow down the server...")
     # 9. Profiler (executes FIRST - outermost layer, profiles entire request including auth)
     app.add_middleware(SpeedscopeProfilerMiddleware)
 
