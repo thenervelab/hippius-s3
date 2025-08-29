@@ -409,7 +409,7 @@ async def get_bucket(
 
             etag = ET.SubElement(content, "ETag")
             # Use MD5 hash as ETag for AWS CLI compatibility, fallback to CID if not available
-            etag.text = f'"{obj["ipfs_cid"]}"'
+            etag.text = f'"{obj["md5_hash"]}"'
 
             size = ET.SubElement(content, "Size")
             size.text = str(obj["size_bytes"])
