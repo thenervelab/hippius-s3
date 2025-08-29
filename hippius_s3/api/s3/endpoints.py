@@ -96,7 +96,7 @@ def _handle_range_request(
             "Content-Type": result["content_type"],
             "Content-Length": str(content_length),
             "Content-Range": f"bytes {start}-{end}/{file_size}",
-            "ETag": f'"{ipfs_cid}"',
+            "ETag": f'"{result["md5_hash"]}"',
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
             "x-amz-ipfs-cid": ipfs_cid,
@@ -1553,7 +1553,7 @@ async def put_object(
                 media_type="application/xml",
                 status_code=200,
                 headers={
-                    "ETag": f'"{ipfs_cid}"',
+                    "ETag": f'"{md5_hash}"',
                     "x-amz-ipfs-cid": ipfs_cid,
                 },
             )
@@ -1707,7 +1707,7 @@ async def put_object(
         return Response(
             status_code=200,
             headers={
-                "ETag": f'"{ipfs_cid}"',
+                "ETag": f'"{md5_hash}"',
                 "x-amz-ipfs-cid": ipfs_cid,
             },
         )
@@ -1844,7 +1844,7 @@ async def head_object(
         headers = {
             "Content-Type": result["content_type"],
             "Content-Length": str(result["size_bytes"]),
-            "ETag": f'"{ipfs_cid}"',
+            "ETag": f'"{result["md5_hash"]}"',
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "x-amz-ipfs-cid": ipfs_cid,
         }
@@ -1947,7 +1947,7 @@ async def get_object(
             headers = {
                 "Content-Type": result["content_type"],
                 "Content-Length": str(len(file_data)),
-                "ETag": f'"{ipfs_cid}"',
+                "ETag": f'"{result["md5_hash"]}"',
                 "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
                 "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
                 "x-amz-ipfs-cid": ipfs_cid,
@@ -1977,7 +1977,7 @@ async def get_object(
         headers = {
             "Content-Type": result["content_type"],
             "Content-Length": str(len(file_data)),
-            "ETag": f'"{ipfs_cid}"',
+            "ETag": f'"{result["md5_hash"]}"',
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
             "x-amz-ipfs-cid": ipfs_cid,
