@@ -61,6 +61,11 @@ class Config:
     max_multipart_file_size = 15 * 1024 * 1024 * 1024  # 15GB
     max_multipart_chunk_size = 128 * 1024 * 1024  # 128 MB
 
+    # worker specific settings
+    pinner_sleep_loop = 10
+    unpinner_sleep_loop = 10
+    downloader_sleep_loop = 10
+
 
 def get_config() -> Config:
     """Get application configuration."""

@@ -1409,18 +1409,10 @@ async def _copy_object(
             content_type = source_object["content_type"]
 
             # Create new metadata for destination
-            metadata = {
-                "ipfs": {
-                    "cid": ipfs_cid,
-                    "encrypted": should_encrypt,
-                },
-                "hippius": {},
-            }
-
+            metadata = {}
             # Copy any user metadata (x-amz-meta-*)
             for key, value in source_metadata.items():
-                if key not in ["ipfs", "hippius", "multipart"]:
-                    metadata[key] = value  # noqa: PERF403
+                metadata[key] = value  # noqa: PERF403
 
         # Create or update the object using upsert with CID table
         cid_id = await utils.upsert_cid_and_get_id(db, ipfs_cid)
@@ -1440,7 +1432,7 @@ async def _copy_object(
         # Prepare the XML response
         root = ET.Element("CopyObjectResult")
         etag = ET.SubElement(root, "ETag")
-        etag.text = f'"{ipfs_cid}"'
+        etag.text = md5_hash
         last_modified = ET.SubElement(root, "LastModified")
         last_modified.text = format_s3_timestamp(created_at)
 
@@ -1856,23 +1848,54 @@ async def get_object(
 
         metadata = json.loads(result["metadata"])
         ipfs_cid = result["ipfs_cid"]
+        object_id = result["id"]
+        is_multipart = result.get("multipart", False)
 
-        logger.debug(f"Getting object {bucket_name}/{object_key} with CID: {ipfs_cid}")
-
-        # Multipart objects are now stored as single concatenated files in IPFS
-        # No special handling needed - just download the final CID
+        logger.debug(f"Getting object {bucket_name}/{object_key} with CID: {ipfs_cid}, multipart: {is_multipart}")
 
         # Check if file was encrypted based on bucket public status
         # Public buckets = no encryption, private buckets = encryption
         is_encrypted = not bucket["is_public"]
 
-        file_data = await ipfs_service.download_file(
-            cid=ipfs_cid,
-            subaccount_id=request.state.account.main_account,
-            bucket_name=bucket_name,
-            decrypt=is_encrypted,
-        )
-        logger.debug(f"Downloaded {len(file_data)} bytes from IPFS CID: {ipfs_cid}")
+        if is_multipart:
+            # For multipart objects, reconstruct from individual chunks
+            logger.info(f"Reconstructing multipart object {object_key} from chunks")
+
+            # Get all chunks in correct order
+            chunks = await db.fetch(get_query("get_multipart_chunks"), object_id)
+
+            if not chunks:
+                logger.error(f"No chunks found for multipart object {object_id}")
+                raise errors.S3Error(
+                    code="NoSuchKey",
+                    status_code=404,
+                    message="Multipart object chunks not found",
+                )
+
+            # Download and concatenate all chunks
+            file_data = b""
+            for chunk in chunks:
+                chunk_cid = chunk["cid"]
+                logger.debug(f"Downloading chunk {chunk['part_number']} with CID: {chunk_cid}")
+
+                chunk_data = await ipfs_service.download_file(
+                    cid=chunk_cid,
+                    subaccount_id=request.state.account.main_account,
+                    bucket_name=bucket_name,
+                    decrypt=is_encrypted,
+                )
+                file_data += chunk_data
+
+            logger.debug(f"Reconstructed multipart file: {len(file_data)} bytes from {len(chunks)} chunks")
+        else:
+            # Simple object - direct download
+            file_data = await ipfs_service.download_file(
+                cid=ipfs_cid,
+                subaccount_id=request.state.account.main_account,
+                bucket_name=bucket_name,
+                decrypt=is_encrypted,
+            )
+            logger.debug(f"Downloaded {len(file_data)} bytes from IPFS CID: {ipfs_cid}")
 
         # Handle HTTP Range requests for partial content
         range_header = request.headers.get("range")
@@ -2036,8 +2059,9 @@ async def delete_object(
                 subaccount_seed_phrase=request.state.seed_phrase,
                 bucket_name=bucket_name,
                 object_key=object_key,
-                cid=ipfs_cid,
-                object_id=deleted_object["id"],
+                should_encrypt=not bucket["is_public"],
+                cid=ipfs_cid or "",
+                object_id=str(deleted_object["object_id"]),
             ),
             redis_client=redis_client,
         )
@@ -2046,7 +2070,7 @@ async def delete_object(
         return Response(
             status_code=204,
             headers={
-                "x-amz-request-id": ipfs_cid,
+                "x-amz-request-id": ipfs_cid or "deleted",
             },
         )
 

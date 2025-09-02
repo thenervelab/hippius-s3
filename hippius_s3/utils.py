@@ -176,3 +176,18 @@ async def upsert_cid_and_get_id(db, cid: str) -> str:
     """Insert or get existing CID and return the cid_id (UUID)."""
     result = await db.fetchrow(get_query("upsert_cid"), cid)
     return result["id"]
+
+
+async def get_object_download_info(db, object_id: str) -> dict:
+    """Get complete download information for an object (simple or multipart)."""
+    result = await db.fetchrow(get_query("get_object_download_info_by_id"), object_id)
+
+    if not result:
+        raise ValueError(f"Object not found: {object_id}")
+
+    return {
+        "object_id": result["object_id"],
+        "multipart": result["multipart"],
+        "needs_decryption": result["needs_decryption"],
+        "download_chunks": result["download_chunks"],
+    }

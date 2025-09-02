@@ -734,17 +734,17 @@ async def complete_multipart_upload(
             MultipartUploadChainRequest(
                 object_key=object_key,
                 bucket_name=bucket_name,
-                upload_id=upload_id,
+                multipart_upload_id=upload_id,
                 chunks=[
-                    {
-                        "chunk_key": f"multipart:{upload_id}:part:{part['part_number']}",
-                        "chunk_index": part["part_number"],
-                    }
+                    Chunk(
+                        id=part["part_number"],
+                        redis_key=f"multipart:{upload_id}:part:{part['part_number']}",
+                    )
                     for part in parts
                 ],
                 substrate_url=config.substrate_url,
                 ipfs_node=config.ipfs_store_url,
-                address=request.state.main_account,
+                address=request.state.account.main_account,
                 subaccount=request.state.account.id,
                 subaccount_seed_phrase=request.state.seed_phrase,
                 should_encrypt=should_encrypt,
