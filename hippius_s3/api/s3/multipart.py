@@ -1,31 +1,59 @@
 """S3-compatible multipart upload implementation for handling large file uploads."""
 
+import asyncio
 import contextlib
 import hashlib
 import json
 import logging
 import re
+import time
 import uuid
 from datetime import UTC
 from datetime import datetime
-from typing import Optional
 
 from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import Request
 from fastapi import Response
 from lxml import etree as ET
+from redis.asyncio import Redis
 from starlette.requests import ClientDisconnect
 
 from hippius_s3 import dependencies
 from hippius_s3 import utils
 from hippius_s3.api.s3.errors import s3_error_response
+from hippius_s3.config import get_config
+from hippius_s3.queue import Chunk
+from hippius_s3.queue import MultipartUploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["s3-multipart"])
+
+config = get_config()
+
+
+async def get_all_chunk_ids(
+    upload_id: str,
+    db: dependencies.DBConnection,
+) -> list[Chunk]:
+    """Get all chunk IDs and Redis keys for a multipart upload."""
+    parts = await db.fetch(
+        get_query("list_parts"),
+        upload_id,
+    )
+
+    chunks = []
+    for part in parts:
+        chunk = Chunk(
+            id=part["part_id"],
+            redis_key=f"multipart:{upload_id}:part:{part['part_number']}",
+        )
+        chunks.append(chunk)
+
+    return chunks
 
 
 async def get_request_body(request: Request) -> bytes:
@@ -57,7 +85,6 @@ async def handle_post_object(
     2. CompleteMultipartUpload (if ?uploadId=X is in query params)
     """
     logger.info(f"[POST] {bucket_name}/{object_key} - {dict(request.query_params)}")
-    seed_phrase = request.state.seed_phrase
 
     # Check for uploads parameter (Initiate Multipart Upload)
     if "uploads" in request.query_params:
@@ -72,13 +99,12 @@ async def handle_post_object(
     if "uploadId" in request.query_params:
         upload_id = request.query_params.get("uploadId")
         if upload_id is not None:
-            return await complete_multipart_upload_handler(
+            return await complete_multipart_upload(
                 bucket_name,
                 object_key,
                 upload_id,
                 request,
                 db,
-                seed_phrase,
             )
 
     # Not a multipart operation we handle
@@ -116,26 +142,37 @@ async def initiate_multipart_upload(
         # Create a new multipart upload
         upload_id = str(uuid.uuid4())
         initiated_at = datetime.now(UTC)
-        content_type = request.headers.get("Content-Type", "application/octet-stream")
+        content_type = request.headers.get(
+            "Content-Type",
+            "application/octet-stream",
+        )
 
         # Extract metadata from headers and check for file size
         metadata = {}
         file_size = None
+        file_mtime = None
 
         for key, value in request.headers.items():
             if key.lower().startswith("x-amz-meta-"):
                 meta_key = key[11:]
                 metadata[meta_key] = value
-            elif key.lower() in ["content-length", "x-amz-content-length", "x-amz-decoded-content-length"]:
+                # Extract mtime for file timestamp preservation
+                if meta_key.lower() == "mtime":
+                    with contextlib.suppress(ValueError):
+                        file_mtime = float(value)
+            elif key.lower() in [
+                "content-length",
+                "x-amz-content-length",
+                "x-amz-decoded-content-length",
+            ]:
                 with contextlib.suppress(ValueError):
                     file_size = int(value)
 
-        # Check 15GB file size limit if size is provided
-        MAX_FILE_SIZE = 15 * 1024 * 1024 * 1024  # 15GB
-        if file_size and file_size > MAX_FILE_SIZE:
+        if file_size and file_size > config.max_multipart_file_size:
             return s3_error_response(
                 "EntityTooLarge",
-                f"Your proposed upload size {file_size} bytes exceeds the maximum allowed object size of {MAX_FILE_SIZE} bytes",
+                f"Your proposed upload size {file_size} bytes exceeds the maximum "
+                f"allowed object size of {config.max_multipart_file_size} bytes",
                 status_code=400,
             )
 
@@ -148,6 +185,7 @@ async def initiate_multipart_upload(
             initiated_at,
             content_type,
             json.dumps(metadata),
+            datetime.fromtimestamp(file_mtime, UTC) if file_mtime is not None else None,
         )
 
         # Create XML response using a hardcoded template
@@ -179,36 +217,15 @@ async def initiate_multipart_upload(
         )
 
 
-async def complete_multipart_upload_handler(
-    bucket_name: str,
-    object_key: str,
+async def get_all_cached_chunks(
     upload_id: str,
-    request: Request,
-    db: dependencies.DBConnection,
-    seed_phrase: Optional[str] = None,
-) -> Response:
-    """Complete a multipart upload (POST /{bucket_name}/{object_key}?uploadId=xyz)."""
+    redis_client: Redis,
+):
     try:
-        # Use the existing internal implementation
-        # Get IPFS service from app state
-        ipfs_service = request.app.state.ipfs_service
-
-        return await complete_multipart_upload_internal(
-            bucket_name,
-            object_key,
-            upload_id,
-            request,
-            db,
-            ipfs_service,
-            seed_phrase=seed_phrase,
-        )
+        keys_pattern = f"multipart:{upload_id}:part:*"
+        return await redis_client.keys(keys_pattern)
     except Exception as e:
-        logger.exception(f"Error completing multipart: {e}")
-        return s3_error_response(
-            "InternalError",
-            f"Error completing multipart upload: {str(e)}",
-            status_code=500,
-        )
+        logger.error(f"Failed to find any cached parts for {upload_id=}: {e}")
 
 
 @router.put(
@@ -222,19 +239,16 @@ async def complete_multipart_upload_handler(
     include_in_schema=True,
 )
 async def upload_part(
-    bucket_name: str,
-    object_key: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    ipfs_service=Depends(dependencies.get_ipfs_service),
 ) -> Response:
     """Upload a part for a multipart upload (PUT with partNumber & uploadId)."""
     # These two parameters are required for multipart upload parts
     upload_id = request.query_params.get("uploadId")
     part_number_str = request.query_params.get("partNumber")
 
-    # If this doesn't have both uploadId and partNumber, it's not a multipart upload part
-    # so we should return None to allow the main S3 router to handle it
+    # If this doesn't have both uploadId and partNumber, it's not a multipart upload part.
+    # We should return None to allow the main S3 router to handle it
     if not upload_id or not part_number_str:
         return None  # Allow the request to fall through to the main S3 router
 
@@ -258,18 +272,18 @@ async def upload_part(
         )
 
     # Check if the multipart upload exists
-    multipart_upload = await db.fetchrow(
+    ongoing_multipart_upload = await db.fetchrow(
         get_query("get_multipart_upload"),
         upload_id,
     )
-    if not multipart_upload:
+    if not ongoing_multipart_upload:
         return s3_error_response(
             "NoSuchUpload",
             "The specified upload does not exist",
             status_code=404,
         )
 
-    if multipart_upload["is_completed"]:
+    if ongoing_multipart_upload["is_completed"]:
         return s3_error_response(
             "InvalidRequest",
             "The specified multipart upload has already been completed",
@@ -277,21 +291,25 @@ async def upload_part(
         )
 
     # Upload the part data to IPFS
+    start_time = time.time()
+    logger.info(f"Starting part {part_number} upload for upload {upload_id}")
+
     try:
+        body_start = time.time()
         file_data = await get_request_body(request)
+        body_time = time.time() - body_start
+        logger.info(f"Part {part_number}: Got request body in {body_time:.3f}s, size: {len(file_data)} bytes")
     except ClientDisconnect:
         logger.warning(f"Client disconnected during part {part_number} upload for upload {upload_id}")
 
         # Clean up any cached parts for this upload when client disconnects
-        redis_client = request.app.state.redis_client
-        try:
-            keys_pattern = f"multipart:{upload_id}:part:*"
-            keys = await redis_client.keys(keys_pattern)
-            if keys:
-                await redis_client.delete(*keys)
-                logger.info(f"Cleaned up {len(keys)} cached parts for disconnected upload {upload_id}")
-        except Exception as e:
-            logger.error(f"Failed to cleanup parts after disconnect: {e}")
+        keys = await get_all_cached_chunks(
+            upload_id,
+            request.app.state.redis_client,
+        )
+        if keys:
+            await request.state.redis_client.delete(*keys)
+            logger.info(f"Cleaned up {len(keys)} cached parts for disconnected upload {upload_id}")
 
         return s3_error_response(
             "RequestTimeout",
@@ -299,11 +317,11 @@ async def upload_part(
             status_code=408,
         )
 
+    # Enforce AWS S3 minimum part size (except for final part)
+    # Allow parts smaller than 5MB - AWS S3 allows this for the final part
+    # We don't have a way to know if this is the final part until completion,
+    # so we'll be permissive here and let completion validation handle it
     file_size = len(file_data)
-
-    # Check part size limits
-    MAX_PART_SIZE = 32 * 1024 * 1024  # 32 MB
-    MIN_PART_SIZE = 5 * 1024 * 1024  # 5 MB (AWS S3 minimum)
 
     if file_size == 0:
         return s3_error_response(
@@ -312,21 +330,10 @@ async def upload_part(
             status_code=400,
         )
 
-    if file_size > MAX_PART_SIZE:
+    if file_size > config.max_multipart_chunk_size:
         return s3_error_response(
             "EntityTooLarge",
-            f"Part size {file_size} bytes exceeds maximum {MAX_PART_SIZE} bytes",
-            status_code=400,
-        )
-
-    # Enforce AWS S3 minimum part size (except for final part)
-    # Allow parts smaller than 5MB - AWS S3 allows this for the final part
-    # We don't have a way to know if this is the final part until completion,
-    # so we'll be permissive here and let completion validation handle it
-    if file_size < MIN_PART_SIZE and file_size < 1024:  # Only reject truly tiny parts (< 1KB)
-        return s3_error_response(
-            "EntityTooSmall",
-            f"Part size {file_size} bytes is too small",
+            f"Part size {file_size} bytes exceeds maximum {config.max_multipart_chunk_size} bytes",
             status_code=400,
         )
 
@@ -336,6 +343,7 @@ async def upload_part(
 
     try:
         # Check if client is still connected before proceeding
+        disconnect_start = time.time()
         if await request.is_disconnected():
             logger.warning(f"Client disconnected before caching part {part_number} for upload {upload_id}")
             return s3_error_response(
@@ -343,78 +351,66 @@ async def upload_part(
                 "Client disconnected during upload",
                 status_code=408,
             )
+        disconnect_time = time.time() - disconnect_start
+        logger.info(f"Part {part_number}: Disconnect check took {disconnect_time:.3f}s")
 
-        await redis_client.setex(part_key, 1800, file_data)  # 30 minute TTL
+        # Store in Redis
+        redis_start = time.time()
+        await redis_client.setex(
+            part_key,
+            1800,
+            file_data,
+        )  # 30 minute TTL
+        redis_time = time.time() - redis_start
+        logger.info(f"Part {part_number}: Redis setex took {redis_time:.3f}s")
 
         # Create mock part result (no IPFS upload needed for individual parts)
-        md5_hash = hashlib.md5(file_data).hexdigest()
+        md5_start = time.time()
+        # Move MD5 calculation to thread pool to avoid blocking event loop
+        loop = asyncio.get_event_loop()
+        md5_hash = await loop.run_in_executor(None, lambda: hashlib.md5(file_data).hexdigest())
+        md5_time = time.time() - md5_start
+        logger.info(f"Part {part_number}: MD5 calculation took {md5_time:.3f}s (threaded)")
+
         etag = f"{md5_hash}-{part_number}"
 
         part_result = {
-            "cid": f"temp-part-{part_number}",  # Temporary placeholder
             "size_bytes": file_size,
             "etag": etag,
             "part_number": part_number,
         }
 
-        # Check if client is still connected before database operation
-        if await request.is_disconnected():
-            logger.warning(f"Client disconnected during part {part_number} processing for upload {upload_id}")
-            # Clean up the Redis key we just created
-            await redis_client.delete(part_key)
-            return s3_error_response(
-                "RequestTimeout",
-                "Client disconnected during upload",
-                status_code=408,
-            )
-
         # Save the part information in the database
-        part_id = str(uuid.uuid4())
+        db_start = time.time()
         await db.fetchrow(
             get_query("upload_part"),
-            part_id,
+            str(uuid.uuid4()),
             upload_id,
             part_number,
-            part_result["cid"],
+            "",
+            # cid not yet available
             part_result["size_bytes"],
             part_result["etag"],
             datetime.now(UTC),
         )
+        db_time = time.time() - db_start
+        logger.info(f"Part {part_number}: Database insert took {db_time:.3f}s")
 
-        # Final check before returning response
-        if await request.is_disconnected():
-            logger.warning(f"Client disconnected after part {part_number} saved for upload {upload_id}")
-            # Clean up both Redis and database
-            await redis_client.delete(part_key)
-            # Note: We don't remove from database as it's already committed
-            return s3_error_response(
-                "RequestTimeout",
-                "Client disconnected during upload",
-                status_code=408,
-            )
+        total_time = time.time() - start_time
+        logger.info(f"Part {part_number}: TOTAL processing time: {total_time:.3f}s")
 
         # Return the part's ETag in the response header
-        return Response(status_code=200, headers={"ETag": f'"{part_result["etag"]}"'})
+        return Response(
+            status_code=200,  # etag needs to be double-quoted?
+            headers={"ETag": f'"{part_result["etag"]}"'},
+        )
 
-    except Exception as e:
+    except Exception:
         # If any error occurs, clean up the Redis key
-        logger.error(f"Error during part {part_number} upload: {e}")
         try:
             await redis_client.delete(part_key)
         except Exception as cleanup_error:
             logger.error(f"Failed to cleanup Redis key after error: {cleanup_error}")
-
-        # Check if it's a disconnect-related error
-        if "disconnect" in str(e).lower() or "connection" in str(e).lower():
-            # Clean up all parts for this upload on connection errors
-            try:
-                keys_pattern = f"multipart:{upload_id}:part:*"
-                keys = await redis_client.keys(keys_pattern)
-                if keys:
-                    await redis_client.delete(*keys)
-                    logger.info(f"Cleaned up {len(keys)} cached parts for failed upload {upload_id}")
-            except Exception as batch_cleanup_error:
-                logger.error(f"Failed to cleanup all parts after connection error: {batch_cleanup_error}")
 
         raise
 
@@ -422,17 +418,20 @@ async def upload_part(
 @router.delete("/{bucket_name}/{object_key:path}/", status_code=204)
 @router.delete("/{bucket_name}/{object_key:path}", status_code=204)
 async def abort_multipart_upload(
-    bucket_name: str,
-    object_key: str,
+    _: str,
+    __: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    ipfs_service=Depends(dependencies.get_ipfs_service),
+    ___=Depends(dependencies.get_ipfs_service),
 ) -> Response:
     """Abort a multipart upload (DELETE with uploadId)."""
     upload_id = request.query_params.get("uploadId")
     if not upload_id:
-        return None
-
+        return s3_error_response(
+            "NoSuchUpload",
+            "The specified upload does not exist",
+            status_code=404,
+        )
     try:
         # Get the multipart upload information
         multipart_upload = await db.fetchrow(
@@ -447,16 +446,25 @@ async def abort_multipart_upload(
             )
 
         # Clean up Redis keys for cached parts
-        parts = await db.fetch(get_query("list_parts"), upload_id)
+        parts = await db.fetch(
+            get_query("list_parts"),
+            upload_id,
+        )
         if parts:
             redis_client = request.app.state.redis_client
             redis_keys_to_delete = [f"multipart:{upload_id}:part:{part['part_number']}" for part in parts]
             if redis_keys_to_delete:
-                await redis_client.delete(*redis_keys_to_delete)
+                await redis_client.delete(
+                    *redis_keys_to_delete,
+                )
 
         # Delete the multipart upload from the database
-        await db.fetchrow(get_query("abort_multipart_upload"), upload_id)
+        await db.fetchrow(
+            get_query("abort_multipart_upload"),
+            upload_id,
+        )
         return Response(status_code=204)
+
     except Exception as e:
         logger.error(f"Error aborting multipart upload: {e}")
         return s3_error_response(
@@ -520,7 +528,12 @@ async def list_multipart_uploads(
             ET.SubElement(upload_elem, "Initiated").text = upload["initiated_at"].isoformat()
 
         # Generate XML with proper declaration
-        xml_content = ET.tostring(root, encoding="UTF-8", xml_declaration=True, pretty_print=True)
+        xml_content = ET.tostring(
+            root,
+            encoding="UTF-8",
+            xml_declaration=True,
+            pretty_print=True,
+        )
 
         # Return with proper headers
         return Response(
@@ -541,14 +554,27 @@ async def list_multipart_uploads(
         )
 
 
-async def complete_multipart_upload_internal(
+async def hash_all_etags(
+    upload_id: str,
+    db: dependencies.DBConnection,
+) -> str:
+    parts = await db.fetch(
+        get_query("get_parts_etags"),
+        upload_id,
+    )
+
+    etags = [part["etag"].split("-")[0] for part in parts]
+    combined_etag = hashlib.md5(("".join(etags)).encode()).hexdigest()
+
+    return f"{combined_etag}-{len(parts)}"
+
+
+async def complete_multipart_upload(
     bucket_name: str,
     object_key: str,
     upload_id: str,
     request: Request,
     db: dependencies.DBConnection,
-    ipfs_service,
-    seed_phrase: Optional[str] = None,
 ) -> Response:
     """Internal implementation of multipart upload completion logic."""
     try:
@@ -597,16 +623,25 @@ async def complete_multipart_upload_internal(
 
         # Create part info list
         part_info = []
-        for num, tag in zip(part_numbers, etags, strict=True):
-            part_info.append((int(num), tag.replace('"', "").strip()))
-
-        # Sort parts by part number
+        for num, tag in zip(
+            part_numbers,
+            etags,
+            strict=True,
+        ):
+            part_info.append(
+                (
+                    int(num),
+                    tag.replace('"', "").strip(),
+                ),
+            )
         part_info.sort(key=lambda x: x[0])
 
         # Get the parts from the database
-        db_parts = await db.fetch(get_query("list_parts"), upload_id)
-        logger.info(f"Found {len(db_parts) if db_parts else 0} parts for upload {upload_id}")
-
+        db_parts = await db.fetch(
+            get_query("list_parts"),
+            upload_id,
+        )
+        logger.info(f"Found {len(db_parts)} parts for upload {upload_id}")
         db_parts_dict = {p["part_number"]: p for p in db_parts}
 
         if not db_parts_dict:
@@ -626,19 +661,6 @@ async def complete_multipart_upload_internal(
                 status_code=400,
             )
 
-        # Prepare parts for concatenation in correct order
-        parts_for_concat = []
-        for part_number, _ in part_info:  # part_info is already sorted by part number
-            part_data = db_parts_dict[part_number]
-            parts_for_concat.append(
-                {
-                    "ipfs_cid": part_data["ipfs_cid"],
-                    "part_number": part_data["part_number"],
-                    "size_bytes": part_data["size_bytes"],
-                    "etag": part_data["etag"],
-                }
-            )
-
         # Get content type
         content_type = multipart_upload["content_type"] or "application/octet-stream"
 
@@ -649,95 +671,16 @@ async def complete_multipart_upload_internal(
             request.state.account.main_account,
         )
 
-        # Ensure parts are in correct order before concatenation
-        parts_for_concat.sort(key=lambda x: x["part_number"])
-        logger.info(
-            f"Processing {len(parts_for_concat)} parts in order: {[p['part_number'] for p in parts_for_concat]}"
+        final_md5_hash = await hash_all_etags(
+            upload_id,
+            db,
         )
-
-        # Compute MD5 hash from concatenated parts data and cleanup Redis in one pass
-        redis_client = request.app.state.redis_client
-        all_data = b""
-        redis_keys_to_delete = []
-        processed_parts = set()  # Track processed parts to avoid duplicates
-
-        for part_dict in parts_for_concat:  # Renamed variable for clarity
-            part_number = part_dict["part_number"]
-
-            # Check for duplicate part numbers to prevent double processing
-            if part_number in processed_parts:
-                logger.error(f"Duplicate part number {part_number} detected - skipping")
-                continue
-            processed_parts.add(part_number)
-
-            part_key = f"multipart:{upload_id}:part:{part_number}"
-            part_data = await redis_client.get(part_key)
-
-            if part_data is None:
-                return s3_error_response(
-                    "InvalidRequest",
-                    f"Part {part_number} data not found in cache",
-                    status_code=400,
-                )
-
-            part_size = len(part_data)
-            logger.info(f"Processing part {part_number}: {part_size} bytes")
-            all_data += part_data
-            redis_keys_to_delete.append(part_key)
-
-        final_md5_hash = hashlib.md5(all_data).hexdigest()
-        total_size = len(all_data)  # Use actual computed size instead of DB value
-        logger.info(
-            f"Multipart concatenation complete: {len(processed_parts)} parts, {total_size} bytes total, MD5: {final_md5_hash}"
-        )
-
-        # Batch delete Redis keys
-        if redis_keys_to_delete:
-            await redis_client.delete(*redis_keys_to_delete)
-
-        # Calculate combined ETag (required for S3 compatibility)
-        etags = [str(part_dict["etag"]).split("-")[0] for part_dict in parts_for_concat]
-        combined_etag = hashlib.md5(("".join(etags)).encode()).hexdigest()
-        final_etag = f"{combined_etag}-{len(parts_for_concat)}"
 
         # Upload concatenated file to IPFS
         should_encrypt = not bucket["is_public"]
 
-        s3_result = await ipfs_service.client.s3_publish(
-            content=all_data,
-            encrypt=should_encrypt,
-            seed_phrase=request.state.seed_phrase,
-            subaccount_id=request.state.account.main_account,
-            bucket_name=bucket_name,
-            store_node=ipfs_service.config.ipfs_store_url,
-            pin_node=ipfs_service.config.ipfs_store_url,
-            substrate_url=ipfs_service.config.substrate_url,
-            publish=False,
-            file_name=object_key,
-        )
-
-        # Queue for pinning
-        redis_client = request.app.state.redis_client
-        await enqueue_upload_request(
-            redis_client,
-            s3_result,
-            request.state.seed_phrase,
-            owner=request.state.account.main_account,
-        )
-
-        final_cid = s3_result.cid
-
-        # Verification: Check that the file is properly encrypted on IPFS
-        logger.info(f"Multipart upload completed. CID: {final_cid}")
-        logger.info(f"Verification: File should be encrypted at https://get.hippius.network/ipfs/{final_cid}")
-        logger.info(f"Expected size: {total_size} bytes, Should encrypt: {should_encrypt}")
-
-        # No need to delete individual parts from IPFS since they were never uploaded there
-
         # Prepare metadata
-        object_id = str(uuid.uuid4())
         bucket_id = multipart_upload["bucket_id"]
-        created_at = datetime.now(UTC)
 
         metadata = multipart_upload["metadata"] if multipart_upload["metadata"] else {}
         if isinstance(metadata, str):
@@ -747,19 +690,18 @@ async def complete_multipart_upload_internal(
         metadata.update(
             {
                 "multipart": True,
-                "parts_count": len(parts_for_concat),
-                "original_parts": len(parts_for_concat),  # Track original part count
-                "ipfs": {
-                    "cid": final_cid,
-                    "encrypted": should_encrypt,
-                    "multipart": False,
-                    # Final file is single IPFS object
-                },
+                "encrypted": should_encrypt,
             }
         )
 
+        # Set file creation time to current timestamp
+        file_created_at = datetime.now(UTC)
+
         # Mark the upload as completed
-        await db.fetchrow(get_query("complete_multipart_upload"), upload_id)
+        await db.fetchrow(
+            get_query("complete_multipart_upload"),
+            upload_id,
+        )
 
         # Delete any existing object with same key
         await db.execute(
@@ -768,40 +710,58 @@ async def complete_multipart_upload_internal(
             object_key,
         )
 
-        # Create the object in database
+        # Calculate total size from all parts
+        parts = await db.fetch(
+            get_query("list_parts"),
+            upload_id,
+        )
+        total_size = sum(part["size_bytes"] for part in parts)
+
+        # Create the object in database (without CID initially for multipart uploads)
         await db.fetchrow(
-            get_query("upsert_object"),
-            object_id,
+            get_query("upsert_object_basic"),
+            upload_id,
             bucket_id,
             object_key,
-            final_cid,
-            total_size,
             content_type,
-            created_at,
             json.dumps(metadata),
             final_md5_hash,
+            total_size,
+            file_created_at,
         )
 
-        # Verify that the object was actually inserted
-        verify_result = await db.fetchrow(
-            get_query("get_object_by_path"),
-            bucket_id,
-            object_key,
+        await enqueue_upload_request(
+            MultipartUploadChainRequest(
+                object_key=object_key,
+                bucket_name=bucket_name,
+                upload_id=upload_id,
+                chunks=[
+                    {
+                        "chunk_key": f"multipart:{upload_id}:part:{part['part_number']}",
+                        "chunk_index": part["part_number"],
+                    }
+                    for part in parts
+                ],
+                substrate_url=config.substrate_url,
+                ipfs_node=config.ipfs_store_url,
+                address=request.state.main_account,
+                subaccount=request.state.account.id,
+                subaccount_seed_phrase=request.state.seed_phrase,
+                should_encrypt=should_encrypt,
+                object_id=upload_id,
+            ),
+            request.app.state.redis_client,
         )
-        if not verify_result:
-            logger.error(f"Failed to find object after multipart completion: {bucket_name}/{object_key}")
-            raise RuntimeError(f"Failed to insert multipart object: {bucket_name}/{object_key}")
 
         # Create XML response
-        xml_string = f"""<?xml version="1.0" encoding="UTF-8"?>
+        xml_bytes = f"""<?xml version="1.0" encoding="UTF-8"?>
 <CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Location>http://{request.headers.get("Host", "")}/{bucket_name}/{object_key}</Location>
   <Bucket>{bucket_name}</Bucket>
   <Key>{object_key}</Key>
-  <ETag>"{final_etag}"</ETag>
+  <ETag>"{final_md5_hash}"</ETag>
 </CompleteMultipartUploadResult>
-"""
-        xml_bytes = xml_string.encode("utf-8")
+""".encode("utf-8")
 
         # Return with proper headers
         return Response(
@@ -809,7 +769,6 @@ async def complete_multipart_upload_internal(
             media_type="application/xml",
             headers={
                 "Content-Type": "application/xml; charset=utf-8",
-                "x-amz-request-id": str(uuid.uuid4()),
                 "Content-Length": str(len(xml_bytes)),
             },
         )

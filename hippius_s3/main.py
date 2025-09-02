@@ -39,30 +39,6 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 
-# Set logging level for all loggers
-for name in logging.root.manager.loggerDict:
-    logging.getLogger(name).setLevel(config.log_level)
-
-# Configure specific loggers
-uvicorn_logger = logging.getLogger("uvicorn")
-uvicorn_logger.setLevel(config.log_level)
-uvicorn_access_logger = logging.getLogger("uvicorn.access")
-uvicorn_access_logger.setLevel(config.log_level)
-
-# Set highest logging level for our application code
-logging.getLogger("hippius_s3").setLevel(config.log_level)
-logging.getLogger("hippius_s3.api.s3.multipart").setLevel(config.log_level)
-logging.getLogger("hippius_s3.api.s3.endpoints").setLevel(config.log_level)
-
-# Configure audit logger
-logging.getLogger("audit").setLevel(config.log_level)
-
-# Reduce HTTP client log noise
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("httpcore.http11").setLevel(logging.WARNING)
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
 # Set up this module's logger
 logger = logging.getLogger(__name__)
 
@@ -205,7 +181,10 @@ Disallow: /
 
 User-agent: Twitterbot
 Disallow: /"""
-    return Response(content=content, media_type="text/plain")
+    return Response(
+        content=content,
+        media_type="text/plain",
+    )
 
 
 app.include_router(user_router, prefix="/user")

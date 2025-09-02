@@ -3,13 +3,12 @@
 import hashlib
 import json
 import logging
-import tempfile
 import uuid
 from datetime import UTC
 from datetime import datetime
-from pathlib import Path
 
 import asyncpg
+import fastapi
 from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import Request
@@ -23,10 +22,21 @@ from hippius_sdk.errors import HippiusSubstrateError
 from hippius_s3 import dependencies
 from hippius_s3 import utils
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.multipart import upload_part
 from hippius_s3.config import get_config
+from hippius_s3.dependencies import DBConnection
+from hippius_s3.ipfs_service import IPFSService
+from hippius_s3.queue import Chunk
+from hippius_s3.queue import SimpleUploadChainRequest
+from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import enqueue_unpin_request
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.utils import get_query
+
+
+def format_s3_timestamp(dt):
+    """Format datetime to AWS S3 compatible timestamp: YYYY-MM-DDThh:mm:ss.sssZ"""
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 logger = logging.getLogger(__name__)
@@ -208,8 +218,7 @@ async def list_buckets(
             name.text = row["bucket_name"]
 
             creation_date = ET.SubElement(bucket, "CreationDate")
-            timestamp = row["created_at"].strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-            creation_date.text = timestamp
+            creation_date.text = format_s3_timestamp(row["created_at"])
 
         xml_content = ET.tostring(
             root,
@@ -404,8 +413,7 @@ async def get_bucket(
             key.text = obj["object_key"]
 
             last_modified = ET.SubElement(content, "LastModified")
-            # Format timestamp in the exact format MinIO expects: YYYY-MM-DDThh:mm:ssZ
-            last_modified.text = obj["created_at"].strftime("%Y-%m-%dT%H:%M:%SZ")
+            last_modified.text = format_s3_timestamp(obj["created_at"])
 
             etag = ET.SubElement(content, "ETag")
             # Use MD5 hash as ETag for AWS CLI compatibility, fallback to CID if not available
@@ -489,7 +497,7 @@ async def get_object_tags(
     bucket_name: str,
     object_key: str,
     db: dependencies.DBConnection,
-    seed_phrase: str,
+    _: str,
     main_account_id: str,
 ) -> Response:
     """
@@ -585,7 +593,7 @@ async def set_object_tags(
     object_key: str,
     request: Request,
     db: dependencies.DBConnection,
-    seed_phrase: str,
+    _: str,
     main_account_id: str,
 ) -> Response:
     """
@@ -693,7 +701,7 @@ async def delete_object_tags(
     bucket_name: str,
     object_key: str,
     db: dependencies.DBConnection,
-    seed_phrase: str,
+    _: str,
     main_account_id: str,
 ) -> Response:
     """
@@ -769,7 +777,7 @@ async def delete_object_tags(
 async def get_bucket_tags(
     bucket_name: str,
     db: dependencies.DBConnection,
-    seed_phrase: str,
+    _: str,
     main_account_id: str,
 ) -> Response:
     """
@@ -860,7 +868,7 @@ async def get_bucket_tags(
 async def get_bucket_lifecycle(
     bucket_name: str,
     db: dependencies.DBConnection,
-    seed_phrase: str,
+    _: str,
     main_account_id: str,
 ) -> Response:
     """
@@ -935,8 +943,8 @@ async def get_bucket_lifecycle(
 
 async def get_bucket_location(
     bucket_name: str,
-    db: dependencies.DBConnection,
-    main_account_id: str,
+    _: dependencies.DBConnection,
+    __: str,
 ) -> Response:
     """
     Get the region/location of a bucket (GET /{bucket_name}?location).
@@ -1217,7 +1225,6 @@ async def delete_bucket(
     bucket_name: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    ipfs_service=Depends(dependencies.get_ipfs_service),
     redis_client=Depends(dependencies.get_redis),
 ) -> Response:
     """
@@ -1277,12 +1284,17 @@ async def delete_bucket(
         # If we got here, the bucket was successfully deleted, so now enqueue objects for unpinning
         for obj in objects:
             await enqueue_unpin_request(
-                redis_client,
-                cid=obj["ipfs_cid"],
-                file_name=f"{bucket_name}/{obj.get('object_key', 'unknown')}",
-                subaccount=request.state.account.main_account,
-                owner=request.state.account.main_account,
-                seed_phrase=request.state.seed_phrase,
+                payload=UnpinChainRequest(
+                    substrate_url=config.substrate_url,
+                    ipfs_node=config.ipfs_store_url,
+                    address=request.state.account_main_account,
+                    subaccount=request.state.account.id,
+                    subaccount_seed_phrase=request.state.seed_phrase,
+                    bucket_name=bucket_name,
+                    object_key=obj["key"],
+                    cid=obj["ipfs_cid"],
+                ),
+                redis_client=redis_client,
             )
 
         return Response(status_code=204)
@@ -1292,6 +1304,167 @@ async def delete_bucket(
         return create_xml_error_response(
             "InternalError",
             "We encountered an internal error. Please try again.",
+            status_code=500,
+        )
+
+
+async def _copy_object(
+    source_bucket: dict,
+    destination_bucket: dict,
+    source_object_key: str,
+    request: fastapi.Request,
+    db: DBConnection,
+    ipfs_service: IPFSService,
+):
+    source_bucket_name = source_bucket["bucket_id"]
+    try:
+        logger.info(f"Copying {source_bucket}/{source_object_key} to {destination_bucket}")
+
+        # Get the source object
+        source_object = await db.fetchrow(
+            get_query("get_object_by_path"),
+            source_bucket["bucket_id"],
+            source_object_key,
+        )
+
+        if not source_object:
+            return create_xml_error_response(
+                "NoSuchKey",
+                f"The specified key {source_object_key} does not exist",
+                status_code=404,
+            )
+
+        # Check if we can do a fast copy (same encryption context) or need decrypt/re-encrypt
+        source_is_public = source_bucket["is_public"]
+        dest_is_public = destination_bucket["is_public"]
+        same_bucket = source_bucket["bucket_id"] == destination_bucket["bucket_id"]
+        same_encryption_context = source_is_public == dest_is_public and same_bucket
+        source_metadata = json.loads(source_object["metadata"])
+
+        # Check for multipart objects - skip copying them for now
+        if source_metadata.get("multipart"):
+            return create_xml_error_response(
+                "NotImplemented",
+                "Copying multipart objects is not currently supported",
+                status_code=501,
+            )
+
+        object_id = str(uuid.uuid4())
+        created_at = datetime.now(UTC)
+
+        if same_encryption_context:
+            # Fast path: same encryption context, reuse CID
+            logger.info(
+                f"Fast copy: same encryption context (same_bucket={same_bucket}, both_public={source_is_public})"
+            )
+            ipfs_cid = source_object["ipfs_cid"]
+            file_size = source_object["size_bytes"]
+            content_type = source_object["content_type"]
+            md5_hash = source_object["md5_hash"]  # Fallback to CID if no MD5
+
+            # Copy all metadata as-is
+            metadata = {
+                "ipfs": source_metadata.get("ipfs", {}),
+                "hippius": source_metadata.get("hippius", {}),
+            }
+
+            # Copy any user metadata (x-amz-meta-*)
+            for key, value in source_metadata.items():
+                if key not in ["ipfs", "hippius"]:
+                    metadata[key] = value  # noqa: PERF403
+        else:
+            # Slow path: different encryption context, decrypt and re-encrypt
+            logger.info(
+                f"Slow copy: different encryption (source public={source_is_public}, dest public={dest_is_public})"
+            )
+
+            # Download file from source bucket with source encryption
+            file_data = await ipfs_service.download_file(
+                cid=source_object["ipfs_cid"],
+                subaccount_id=request.state.account.main_account,
+                bucket_name=source_bucket_name,
+                decrypt=not source_is_public,  # Decrypt if source was encrypted
+            )
+
+            # Calculate MD5 hash for ETag compatibility
+            md5_hash = hashlib.md5(file_data).hexdigest()
+
+            # Re-encrypt for destination bucket
+            should_encrypt = not dest_is_public
+            s3_result = await ipfs_service.client.s3_publish(
+                content=file_data,
+                encrypt=should_encrypt,
+                seed_phrase=request.state.seed_phrase,
+                subaccount_id=request.state.account.main_account,
+                bucket_name=source_bucket_name,
+                file_name=source_object_key,
+                store_node=config.ipfs_store_url,
+                pin_node=config.ipfs_store_url,
+                substrate_url=config.substrate_url,
+                publish=True,
+            )
+
+            ipfs_cid = s3_result.cid
+            file_size = len(file_data)
+            content_type = source_object["content_type"]
+
+            # Create new metadata for destination
+            metadata = {
+                "ipfs": {
+                    "cid": ipfs_cid,
+                    "encrypted": should_encrypt,
+                },
+                "hippius": {},
+            }
+
+            # Copy any user metadata (x-amz-meta-*)
+            for key, value in source_metadata.items():
+                if key not in ["ipfs", "hippius", "multipart"]:
+                    metadata[key] = value  # noqa: PERF403
+
+        # Create or update the object using upsert with CID table
+        cid_id = await utils.upsert_cid_and_get_id(db, ipfs_cid)
+        await db.fetchrow(
+            get_query("upsert_object_with_cid"),
+            object_id,
+            destination_bucket["bucket_id"],
+            source_object_key,
+            cid_id,
+            file_size,
+            content_type,
+            created_at,
+            json.dumps(metadata),
+            md5_hash,
+        )
+
+        # Prepare the XML response
+        root = ET.Element("CopyObjectResult")
+        etag = ET.SubElement(root, "ETag")
+        etag.text = f'"{ipfs_cid}"'
+        last_modified = ET.SubElement(root, "LastModified")
+        last_modified.text = format_s3_timestamp(created_at)
+
+        xml_response = ET.tostring(
+            root,
+            encoding="utf-8",
+            xml_declaration=True,
+        )
+
+        return Response(
+            content=xml_response,
+            media_type="application/xml",
+            status_code=200,
+            headers={
+                "ETag": f'"{md5_hash}"',
+                "x-amz-ipfs-cid": ipfs_cid,
+            },
+        )
+
+    except Exception as e:
+        logger.exception("Error copying object")
+        return create_xml_error_response(
+            "InternalError",
+            f"We encountered an internal error while copying the object: {str(e)}",
             status_code=500,
         )
 
@@ -1308,6 +1481,8 @@ async def put_object(
 ) -> Response:
     """
     Upload an object to a bucket using S3 protocol (PUT /{bucket_name}/{object_key}).
+    Also handles setting object tags (PUT /{bucket_name}/{object_key}?tagging).
+    Also handles copying objects when x-amz-copy-source header is present.
 
     Important: For multipart upload parts, this function defers to the multipart.upload_part handler.
     """
@@ -1317,18 +1492,13 @@ async def put_object(
 
     if upload_id and part_number:
         # Forward multipart upload requests to the specialized handler
-        from hippius_s3.api.s3.multipart import upload_part
+        return await upload_part(
+            request,
+            db,
+        )
 
-        return await upload_part(bucket_name, object_key, request, db, ipfs_service)
-    """
-    Upload an object to a bucket using S3 protocol (PUT /{bucket_name}/{object_key}).
-    Also handles setting object tags (PUT /{bucket_name}/{object_key}?tagging).
-    Also handles copying objects when x-amz-copy-source header is present.
-
-    This endpoint is compatible with the S3 protocol used by MinIO and other S3 clients.
-    """
-    # If tagging is in query params, handle object tagging
     if "tagging" in request.query_params:
+        # If tagging is in query params, handle object tagging
         return await set_object_tags(
             bucket_name,
             object_key,
@@ -1339,232 +1509,69 @@ async def put_object(
         )
 
     # Check if this is a copy operation
-    copy_source = request.headers.get("x-amz-copy-source")
-    if copy_source:
-        try:
-            # Parse the copy source in format /source-bucket/source-key
-            if not copy_source.startswith("/"):
-                return create_xml_error_response(
-                    "InvalidArgument",
-                    "x-amz-copy-source must start with /",
-                    status_code=400,
-                )
-
-            source_parts = copy_source[1:].split("/", 1)
-            if len(source_parts) != 2:
-                return create_xml_error_response(
-                    "InvalidArgument",
-                    "x-amz-copy-source must be in format /source-bucket/source-key",
-                    status_code=400,
-                )
-
-            source_bucket_name, source_object_key = source_parts
-
-            # Get user for user-scoped bucket lookup
-            user = await db.fetchrow(
-                get_query("get_or_create_user_by_main_account"),
-                request.state.account.main_account,
-                datetime.now(UTC),
-            )
-
-            # Get the source bucket
-            source_bucket = await db.fetchrow(
-                get_query("get_bucket_by_name_and_owner"),
-                source_bucket_name,
-                user["main_account_id"],
-            )
-
-            if not source_bucket:
-                return create_xml_error_response(
-                    "NoSuchBucket",
-                    f"The specified source bucket {source_bucket_name} does not exist",
-                    status_code=404,
-                    BucketName=source_bucket_name,
-                )
-
-            # Get the destination bucket (using same user as source)
-            dest_bucket = await db.fetchrow(
-                get_query("get_bucket_by_name_and_owner"),
-                bucket_name,
-                user["main_account_id"],
-            )
-
-            if not dest_bucket:
-                return create_xml_error_response(
-                    "NoSuchBucket",
-                    f"The specified destination bucket {bucket_name} does not exist",
-                    status_code=404,
-                    BucketName=bucket_name,
-                )
-            logger.info(f"Copying {source_bucket_name}/{source_object_key} to {dest_bucket}")
-
-            # Get the source object
-            source_object = await db.fetchrow(
-                get_query("get_object_by_path"),
-                source_bucket["bucket_id"],
-                source_object_key,
-            )
-
-            if not source_object:
-                return create_xml_error_response(
-                    "NoSuchKey",
-                    f"The specified key {source_object_key} does not exist",
-                    status_code=404,
-                )
-
-            # Check if we can do a fast copy (same encryption context) or need decrypt/re-encrypt
-            source_is_public = source_bucket["is_public"]
-            dest_is_public = dest_bucket["is_public"]
-            same_bucket = source_bucket["bucket_id"] == dest_bucket["bucket_id"]
-            same_encryption_context = source_is_public == dest_is_public and same_bucket
-
-            source_metadata = json.loads(source_object["metadata"])
-
-            # Check for multipart objects - skip copying them for now
-            is_multipart = (
-                source_metadata.get("multipart", False)
-                or source_metadata.get("ipfs", {}).get("multipart", False)
-                or bool(source_metadata.get("ipfs", {}).get("part_cids"))
-            )
-
-            if is_multipart:
-                return create_xml_error_response(
-                    "NotImplemented",
-                    "Copying multipart objects is not currently supported",
-                    status_code=501,
-                )
-
-            object_id = str(uuid.uuid4())
-            created_at = datetime.now(UTC)
-
-            if same_encryption_context:
-                # Fast path: same encryption context, reuse CID
-                logger.info(
-                    f"Fast copy: same encryption context (same_bucket={same_bucket}, both_public={source_is_public})"
-                )
-                ipfs_cid = source_object["ipfs_cid"]
-                file_size = source_object["size_bytes"]
-                content_type = source_object["content_type"]
-                md5_hash = source_object["md5_hash"]  # Fallback to CID if no MD5
-
-                # Copy all metadata as-is
-                metadata = {
-                    "ipfs": source_metadata.get("ipfs", {}),
-                    "hippius": source_metadata.get("hippius", {}),
-                }
-
-                # Copy any user metadata (x-amz-meta-*)
-                for key, value in source_metadata.items():
-                    if key not in ["ipfs", "hippius"]:
-                        metadata[key] = value  # noqa: PERF403
-            else:
-                # Slow path: different encryption context, decrypt and re-encrypt
-                logger.info(
-                    f"Slow copy: different encryption (source public={source_is_public}, dest public={dest_is_public})"
-                )
-
-                # Download file from source bucket with source encryption
-                file_data = await ipfs_service.download_file(
-                    cid=source_object["ipfs_cid"],
-                    subaccount_id=request.state.account.main_account,
-                    bucket_name=source_bucket_name,
-                    decrypt=not source_is_public,
-                    # Decrypt if source was encrypted
-                )
-
-                # Calculate MD5 hash for ETag compatibility
-                md5_hash = hashlib.md5(file_data).hexdigest()
-
-                # Create temporary file for re-upload
-                with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-                    temp_path = temp_file.name
-                    temp_file.write(file_data)
-
-                try:
-                    # Re-encrypt for destination bucket
-                    should_encrypt = not dest_is_public
-                    s3_result = await ipfs_service.client.s3_publish(
-                        content=temp_path,
-                        encrypt=should_encrypt,
-                        seed_phrase=request.state.seed_phrase,
-                        subaccount_id=request.state.account.main_account,
-                        bucket_name=bucket_name,
-                        file_name=object_key,
-                        store_node=config.ipfs_store_url,
-                        pin_node=config.ipfs_store_url,
-                        substrate_url=config.substrate_url,
-                        publish=False,
-                    )
-
-                    # Queue the upload request for pinning
-                    await enqueue_upload_request(
-                        redis_client,
-                        s3_result,
-                        request.state.seed_phrase,
-                        request.state.account.main_account,
-                    )
-
-                    ipfs_cid = s3_result.cid
-                    file_size = len(file_data)
-                    content_type = source_object["content_type"]
-
-                    # Create new metadata for destination
-                    metadata = {
-                        "ipfs": {"cid": ipfs_cid, "encrypted": should_encrypt},
-                        "hippius": {},
-                    }
-
-                    # Copy any user metadata (x-amz-meta-*)
-                    for key, value in source_metadata.items():
-                        if key not in ["ipfs", "hippius", "multipart"]:
-                            metadata[key] = value  # noqa: PERF403
-
-                finally:
-                    # Clean up temporary file
-                    if Path(temp_path).exists():
-                        Path(temp_path).unlink()
-
-            # Create or update the object using upsert
-            await db.fetchrow(
-                get_query("upsert_object"),
-                object_id,
-                dest_bucket["bucket_id"],
-                object_key,
-                ipfs_cid,
-                file_size,
-                content_type,
-                created_at,
-                json.dumps(metadata),
-                md5_hash,
-            )
-
-            # Prepare the XML response
-            root = ET.Element("CopyObjectResult")
-            etag = ET.SubElement(root, "ETag")
-            etag.text = f'"{ipfs_cid}"'
-            last_modified = ET.SubElement(root, "LastModified")
-            # Format in S3-compatible format: YYYY-MM-DDThh:mm:ssZ
-            last_modified.text = created_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-            xml_response = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-
-            return Response(
-                content=xml_response,
-                media_type="application/xml",
-                status_code=200,
-                headers={
-                    "ETag": f'"{md5_hash}"',
-                    "x-amz-ipfs-cid": ipfs_cid,
-                },
-            )
-
-        except Exception as e:
-            logger.exception("Error copying object")
+    if request.headers.get("x-amz-copy-source"):
+        # Parse the copy source in format /source-bucket/source-key
+        copy_source = request.headers.get("x-amz-copy-source")
+        if not copy_source.startswith("/"):
             return create_xml_error_response(
-                "InternalError",
-                f"We encountered an internal error while copying the object: {str(e)}",
-                status_code=500,
+                "InvalidArgument",
+                "x-amz-copy-source must start with /",
+                status_code=400,
             )
+
+        source_parts = copy_source[1:].split("/", 1)
+        if len(source_parts) != 2:
+            return create_xml_error_response(
+                "InvalidArgument",
+                "x-amz-copy-source must be in format /source-bucket/source-key",
+                status_code=400,
+            )
+        source_bucket_name, source_object_key = source_parts
+
+        # Get user for user-scoped bucket lookup
+        user = await db.fetchrow(
+            get_query("get_or_create_user_by_main_account"),
+            request.state.account.main_account,
+            datetime.now(UTC),
+        )
+
+        # Get the source bucket
+        source_bucket = await db.fetchrow(
+            get_query("get_bucket_by_name_and_owner"),
+            source_bucket_name,
+            user["main_account_id"],
+        )
+
+        if not source_bucket:
+            return create_xml_error_response(
+                "NoSuchBucket",
+                f"The specified source bucket {source_bucket_name} does not exist",
+                status_code=404,
+                BucketName=source_bucket_name,
+            )
+
+        # Get the destination bucket (using same user as source)
+        dest_bucket = await db.fetchrow(
+            get_query("get_bucket_by_name_and_owner"),
+            bucket_name,
+            user["main_account_id"],
+        )
+
+        if not dest_bucket:
+            return create_xml_error_response(
+                "NoSuchBucket",
+                f"The specified destination bucket {bucket_name} does not exist",
+                status_code=404,
+                BucketName=bucket_name,
+            )
+        return await _copy_object(
+            source_bucket=source_bucket,
+            destination_bucket=dest_bucket,
+            source_object_key=source_object_key,
+            request=request,
+            db=db,
+            ipfs_service=ipfs_service,
+        )
 
     try:
         # Get or create user and bucket for this main account
@@ -1596,119 +1603,61 @@ async def put_object(
         file_size = len(file_data)
         content_type = request.headers.get("Content-Type", "application/octet-stream")
 
-        # Check if object already exists to clean up IPFS
-        existing_object = await db.fetchrow(
-            get_query("get_object_by_path"),
-            bucket_id,
-            object_key,
-        )
-
         # Calculate MD5 hash for ETag compatibility
         md5_hash = hashlib.md5(file_data).hexdigest()
         logger.info(f"PUT {bucket_name}/{object_key}: size={len(file_data)}, md5={md5_hash}")
+        object_id = str(uuid.uuid4())
 
-        # Create temporary file for s3_publish
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            temp_path = temp_file.name
-            temp_file.write(file_data)
+        # Only encrypt if bucket is private
+        should_encrypt = not bucket["is_public"]
 
-        try:
-            # Use s3_publish for IPFS upload + pinning + blockchain publishing
-            seed_phrase = request.state.seed_phrase
-
-            # Only encrypt if bucket is private
-            should_encrypt = not bucket["is_public"]
-
-            s3_result = await ipfs_service.client.s3_publish(
-                content=temp_path,
-                encrypt=should_encrypt,
-                seed_phrase=seed_phrase,
-                subaccount_id=request.state.account.main_account,
-                bucket_name=bucket_name,
-                file_name=object_key,
-                store_node=config.ipfs_store_url,
-                pin_node=config.ipfs_store_url,
+        part_index = 0
+        await enqueue_upload_request(
+            payload=SimpleUploadChainRequest(
                 substrate_url=config.substrate_url,
-                publish=False,
-            )
+                ipfs_node=config.ipfs_store_url,
+                address=request.state.account.main_account,
+                subaccount=request.state.account.id,
+                subaccount_seed_phrase=request.state.seed_phrase,
+                bucket_name=bucket_name,
+                object_key=object_key,
+                should_encrypt=should_encrypt,
+                object_id=object_id,
+                chunk=Chunk(
+                    id=part_index,
+                    redis_key=f"simple:{object_id}:part:{part_index}",
+                ),
+            ),
+            redis_client=redis_client,
+        )
 
-            # Queue the upload request for pinning
-            await enqueue_upload_request(
-                redis_client,
-                s3_result,
-                seed_phrase,
-                request.state.account.main_account,
-            )
+        created_at = datetime.now(UTC)
 
-            ipfs_cid = s3_result.cid
-            object_id = str(uuid.uuid4())
-            created_at = datetime.now(UTC)
-
-            # Extract user metadata from headers
-            metadata = {}
-            for key, value in request.headers.items():
-                if key.lower().startswith("x-amz-meta-"):
-                    meta_key = key[11:]
-                    metadata[meta_key] = value
-
-            # Add system metadata
-            metadata["ipfs"] = {"cid": ipfs_cid, "encrypted": should_encrypt}
-            metadata["hippius"] = {}
-        finally:
-            # Clean up temporary file
-            if Path(temp_path).exists():
-                Path(temp_path).unlink()
+        # Extract user metadata from headers
+        metadata = {}
+        for key, value in request.headers.items():
+            if key.lower().startswith("x-amz-meta-"):
+                meta_key = key[11:]
+                metadata[meta_key] = value
 
         # Begin a transaction to ensure atomic operation
-        try:
-            async with db.transaction():
-                # Use upsert to create or update the object
-                query = get_query("upsert_object")
-                await db.fetchrow(
-                    query,
-                    object_id,
-                    bucket_id,
-                    object_key,
-                    ipfs_cid,
-                    file_size,
-                    content_type,
-                    created_at,
-                    json.dumps(metadata),
-                    md5_hash,
-                )
-
-                # Execute an immediate verification query within the same transaction
-                verify_result = await db.fetchrow(
-                    get_query("get_object_by_path"),
-                    bucket_id,
-                    object_key,
-                )
-                if not verify_result:
-                    raise RuntimeError(f"Failed to insert object: {bucket_name}/{object_key}")
-        except Exception as e:
-            logger.error(f"Transaction failed for PUT {bucket_name}/{object_key}: {str(e)}")
-            raise
-
-        # Clean up old IPFS content if needed
-        if existing_object and existing_object["ipfs_cid"] != ipfs_cid:
-            try:
-                await enqueue_unpin_request(
-                    redis_client,
-                    cid=existing_object["ipfs_cid"],
-                    file_name=f"{bucket_name}/{object_key}",
-                    subaccount=request.state.account.main_account,
-                    owner=request.state.account.main_account,
-                    seed_phrase=request.state.seed_phrase,
-                )
-                logger.info(f"Enqueued cleanup of previous IPFS content for {bucket_name}/{object_key}")
-            except Exception as e:
-                logger.warning(f"Failed to enqueue cleanup of previous IPFS content: {e}")
+        async with db.transaction():
+            await db.fetchrow(
+                get_query("upsert_object_basic"),
+                object_id,
+                bucket_id,
+                object_key,
+                content_type,
+                json.dumps(metadata),
+                md5_hash,
+                file_size,
+                created_at,
+            )
 
         return Response(
             status_code=200,
             headers={
                 "ETag": f'"{md5_hash}"',
-                "x-amz-ipfs-cid": ipfs_cid,
             },
         )
 
@@ -1738,7 +1687,6 @@ async def _get_object(
     bucket_name: str,
     object_key: str,
     db: dependencies.DBConnection,
-    seed_phrase: str,
     main_account_id: str,
 ) -> asyncpg.Record:
     logger.debug(f"Getting object {bucket_name}/{object_key}")
@@ -1835,7 +1783,6 @@ async def head_object(
             object_key,
             db,
             main_account_id=request.state.account.main_account,
-            seed_phrase=request.state.seed_phrase,
         )
 
         metadata = json.loads(result["metadata"])
@@ -1897,7 +1844,6 @@ async def get_object(
             bucket_name,
             object_key,
             db,
-            request.state.seed_phrase,
             request.state.account.main_account,
         )
 
@@ -1909,7 +1855,6 @@ async def get_object(
         )
 
         metadata = json.loads(result["metadata"])
-
         ipfs_cid = result["ipfs_cid"]
 
         logger.debug(f"Getting object {bucket_name}/{object_key} with CID: {ipfs_cid}")
@@ -1921,46 +1866,6 @@ async def get_object(
         # Public buckets = no encryption, private buckets = encryption
         is_encrypted = not bucket["is_public"]
 
-        # Check if this was originally a multipart upload
-        is_multipart = metadata.get("multipart", False)
-
-        if is_multipart:
-            # Download full bytes for multipart objects instead of streaming
-            logger.debug(f"Downloading multipart object {bucket_name}/{object_key} from CID: {ipfs_cid}")
-
-            # Get full decrypted bytes for multipart objects
-            file_data = await ipfs_service.download_file(
-                cid=ipfs_cid,
-                subaccount_id=request.state.account.main_account,
-                bucket_name=bucket_name,
-                decrypt=is_encrypted,
-                streaming=False,
-            )
-
-            logger.debug(f"Downloaded {len(file_data)} bytes from IPFS CID: {ipfs_cid}")
-
-            # Handle HTTP Range requests for partial content
-            range_header = request.headers.get("range")
-            if range_header:
-                return _handle_range_request(file_data, range_header, result, metadata, object_key, ipfs_cid)
-
-            headers = {
-                "Content-Type": result["content_type"],
-                "Content-Length": str(len(file_data)),
-                "ETag": f'"{result["md5_hash"]}"',
-                "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
-                "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
-                "x-amz-ipfs-cid": ipfs_cid,
-                "Accept-Ranges": "bytes",  # Indicate we support range requests
-            }
-
-            # Add custom metadata headers
-            for key, value in metadata.items():
-                if key != "ipfs" and not isinstance(value, dict):
-                    headers[f"x-amz-meta-{key}"] = str(value)
-
-            return Response(content=file_data, headers=headers)
-        # Legacy behavior for regular (non-multipart) objects
         file_data = await ipfs_service.download_file(
             cid=ipfs_cid,
             subaccount_id=request.state.account.main_account,
@@ -1972,7 +1877,14 @@ async def get_object(
         # Handle HTTP Range requests for partial content
         range_header = request.headers.get("range")
         if range_header:
-            return _handle_range_request(file_data, range_header, result, metadata, object_key, ipfs_cid)
+            return _handle_range_request(
+                file_data,
+                range_header,
+                dict(result),
+                metadata,
+                object_key,
+                ipfs_cid,
+            )
 
         headers = {
             "Content-Type": result["content_type"],
@@ -1981,7 +1893,7 @@ async def get_object(
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
             "x-amz-ipfs-cid": ipfs_cid,
-            "Accept-Ranges": "bytes",  # Indicate we support range requests
+            "Accept-Ranges": "bytes",
         }
 
         for key, value in metadata.items():
@@ -2032,7 +1944,6 @@ async def delete_object(
     object_key: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    ipfs_service=Depends(dependencies.get_ipfs_service),
     redis_client=Depends(dependencies.get_redis),
 ) -> Response:
     """
@@ -2075,13 +1986,13 @@ async def delete_object(
             )
 
         bucket_id = bucket["bucket_id"]
-        object_info = await db.fetchrow(
+        result = await db.fetchrow(
             get_query("get_object_by_path"),
             bucket_id,
             object_key,
         )
 
-        if not object_info:
+        if not result:
             # S3 returns 204 even if the object doesn't exist, so no error here
             return Response(status_code=204)
 
@@ -2114,14 +2025,21 @@ async def delete_object(
             )
 
         # If we got here, the object was successfully deleted, so enqueue it for unpinning
-        ipfs_cid = object_info["ipfs_cid"]
+        ipfs_cid = result["ipfs_cid"]
+
         await enqueue_unpin_request(
-            redis_client,
-            cid=ipfs_cid,
-            file_name=f"{bucket_name}/{object_key}",
-            subaccount=request.state.account.main_account,
-            owner=request.state.account.main_account,
-            seed_phrase=request.state.seed_phrase,
+            payload=UnpinChainRequest(
+                substrate_url=config.substrate_url,
+                ipfs_node=config.ipfs_store_url,
+                address=request.state.account.main_account,
+                subaccount=request.state.account.id,
+                subaccount_seed_phrase=request.state.seed_phrase,
+                bucket_name=bucket_name,
+                object_key=object_key,
+                cid=ipfs_cid,
+                object_id=deleted_object["id"],
+            ),
+            redis_client=redis_client,
         )
         logger.info(f"Enqueued unpin request for deleted object {object_key}")
 

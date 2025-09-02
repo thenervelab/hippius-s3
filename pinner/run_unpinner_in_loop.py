@@ -12,13 +12,13 @@ import redis.asyncio as async_redis
 
 from hippius_sdk import HippiusClient
 from hippius_sdk.substrate import SubstrateClient
+from hippius_s3.queue import UnpinChainRequest, dequeue_unpin_request
 
 
 # Add parent directory to path to import hippius_s3 modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hippius_s3.config import get_config
-from hippius_s3.queue import dequeue_unpin_request
 
 
 config = get_config()
@@ -30,17 +30,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def process_unpin_request(unpin_requests: list[dict]) -> bool:
+async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool:
     """Process unpin requests by creating a manifest and canceling storage request using the Hippius SDK."""
 
     seed_phrase = None
     manifest_objects = []
 
     for req in unpin_requests:
-        cid = req["cid"]
-        subaccount = req["subaccount"]
-        seed_phrase = req["seed_phrase"]
-        file_name = req["file_name"]
+        cid = req.cid
+        subaccount = req.subaccount
+        seed_phrase = req.subaccount_seed_phrase
+        file_name = f"{req.bucket_name}/{req.object_key}"
         logger.info(f"Processing unpin request for CID={cid}, subaccount={subaccount}")
 
         manifest_objects.append({"cid": cid, "filename": file_name})
@@ -170,9 +170,9 @@ async def run_unpinner_loop():
 
             if unpin_request:
                 try:
-                    user_unpin_requests[unpin_request["owner"]].append(unpin_request)
+                    user_unpin_requests[unpin_request.address].append(unpin_request)
                 except KeyError:
-                    user_unpin_requests[unpin_request["owner"]] = [unpin_request]
+                    user_unpin_requests[unpin_request.address] = [unpin_request]
 
             else:
                 # No items in queue, wait a bit before checking again

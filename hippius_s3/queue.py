@@ -1,69 +1,114 @@
 import json
 import logging
-from typing import Any
-from typing import Dict
+from typing import Union
 
 import redis.asyncio as async_redis
+from pydantic import BaseModel
 
 
 logger = logging.getLogger(__name__)
 
 
+class Chunk(BaseModel):
+    id: int
+    redis_key: str
+
+
+class ChainRequest(BaseModel):
+    substrate_url: str
+    ipfs_node: str
+    address: str
+    subaccount: str
+    subaccount_seed_phrase: str
+    bucket_name: str
+    object_key: str
+    should_encrypt: bool
+    object_id: str
+
+    @property
+    def name(self):
+        if hasattr(self, "upload_id"):
+            return f"multipart::{self.object_id}::{self.multipart_upload_id}::{self.address}"
+
+        return f"simple::{self.object_id}::{self.address}"
+
+
+class MultipartUploadChainRequest(ChainRequest):
+    multipart_upload_id: str
+    chunks: list[Chunk]
+
+
+class SimpleUploadChainRequest(ChainRequest):
+    chunk: Chunk
+
+
+class UnpinChainRequest(ChainRequest):
+    cid: str
+
+
 async def enqueue_upload_request(
+    payload: Union[
+        MultipartUploadChainRequest,
+        SimpleUploadChainRequest,
+    ],
     redis_client: async_redis.Redis,
-    s3_result: Any,
-    seed_phrase: str,
-    owner: str,
 ) -> None:
     """Add an upload request to the Redis queue for processing by pinner."""
-    queue_item = {
-        "cid": s3_result.cid,
-        "subaccount": s3_result.subaccount,
-        "file_path": s3_result.file_path,
-        "pin_node": s3_result.pin_node,
-        "substrate_url": s3_result.substrate_url,
-        "seed_phrase": seed_phrase,
-        "owner": owner,
-    }
-
-    await redis_client.lpush("upload_requests", json.dumps(queue_item))
-    logger.info(f"Enqueued upload request for CID={s3_result.cid}")
+    await redis_client.lpush(
+        "upload_requests",
+        payload.model_dump_json(),
+    )
+    logger.info(f"Enqueued upload request {payload.name=}")
 
 
-async def dequeue_upload_request(redis_client: async_redis.Redis) -> Dict[str, Any] | None:
+async def dequeue_upload_request(
+    redis_client: async_redis.Redis,
+) -> Union[MultipartUploadChainRequest, SimpleUploadChainRequest, None]:
     """Get the next upload request from the Redis queue."""
-    result = await redis_client.brpop("upload_requests", timeout=1)
+    queue_name = "upload_requests"
+    result = await redis_client.brpop(
+        queue_name,
+        timeout=3,
+    )
     if result:
         _, queue_data = result
-        return json.loads(queue_data)
+        queue_data = json.loads(queue_data)
+
+        if "chunk" in queue_data:
+            return SimpleUploadChainRequest.model_validate(queue_data)
+
+        return MultipartUploadChainRequest.model_validate(queue_data)
+
     return None
 
 
 async def enqueue_unpin_request(
+    payload: UnpinChainRequest,
     redis_client: async_redis.Redis,
-    cid: str,
-    subaccount: str,
-    seed_phrase: str,
-    file_name: str,
-    owner: str,
 ) -> None:
     """Add an unpin request to the Redis queue for processing by unpinner."""
-    queue_item = {
-        "cid": cid,
-        "subaccount": subaccount,
-        "seed_phrase": seed_phrase,
-        "file_name": file_name,
-        "owner": owner,
-    }
 
-    await redis_client.lpush("unpin_requests", json.dumps(queue_item))
-    logger.info(f"Enqueued unpin request for CID={cid}")
+    await redis_client.lpush(
+        "unpin_requests",
+        payload.model_dump_json(),
+    )
+    logger.info(f"Enqueued unpin request for {payload.name=}")
 
 
-async def dequeue_unpin_request(redis_client: async_redis.Redis) -> Dict[str, Any] | None:
+async def dequeue_unpin_request(
+    redis_client: async_redis.Redis,
+) -> Union[
+    UnpinChainRequest,
+    None,
+]:
     """Get the next unpin request from the Redis queue."""
-    result = await redis_client.brpop("unpin_requests", timeout=1)
+    queue_name = "unpin_requests"
+    result = await redis_client.brpop(
+        queue_name,
+        timeout=3,
+    )
     if result:
         _, queue_data = result
-        return json.loads(queue_data)
+        return UnpinChainRequest.model_validate_json(queue_data)
+
     return None

@@ -30,42 +30,46 @@ async def process_upload_request(upload_requests: list[dict]) -> bool:
     seed_phrase = None
     files = []
     for req in upload_requests:
-        cid = req["cid"]
-        subaccount = req["subaccount"]
-        seed_phrase = req["seed_phrase"]
-        file_name = pathlib.Path(req["file_path"]).name
+        # Note: SimpleUploadChainRequest doesn't have cid field, it gets generated later
+        subaccount = req.subaccount
+        seed_phrase = req.subaccount_seed_phrase
+        file_name = req.object_key.split('/')[-1]  # Extract filename from object_key
 
-        logger.info(f"Processing upload request for CID={cid}, subaccount={subaccount}")
+        logger.info(f"Processing upload request for object_key={req.object_key}, subaccount={subaccount}")
 
-        files.append(
-            FileInput(
-                file_hash=cid,
-                file_name=file_name,
-            )
-        )
-        logger.info(f"Submitting storage request to substrate for file: {file_name}, CID: {cid}")
+        # TODO: CID needs to be retrieved after upload processing is complete
+        # files.append(
+        #     FileInput(
+        #         file_hash=cid,
+        #         file_name=file_name,
+        #     )
+        # )
+        logger.info(f"Skipping storage request for now - CID not available in upload request: {file_name}")
 
-    substrate_client = SubstrateClient(
-        seed_phrase=seed_phrase,
-        url=config.substrate_url,
-    )
+    # TODO: Substrate client call disabled until CID retrieval is implemented
+    # substrate_client = SubstrateClient(
+    #     seed_phrase=seed_phrase,
+    #     url=config.substrate_url,
+    # )
 
-    tx_hash = await substrate_client.storage_request(
-        files=files,
-        miner_ids=[],
-        seed_phrase=seed_phrase,
-    )
+    # tx_hash = await substrate_client.storage_request(
+    #     files=files,
+    #     miner_ids=[],
+    #     seed_phrase=seed_phrase,
+    # )
 
-    logger.debug(f"Substrate call result: {tx_hash}")
+    logger.info(f"Processed {len(upload_requests)} upload requests (substrate call disabled)")
 
-    # Check if we got a valid transaction hash
-    if not tx_hash or tx_hash == "0x" or len(tx_hash) < 10:
-        logger.error(f"Invalid transaction hash received: {tx_hash}")
-        raise HippiusSubstrateError(
-            f"Invalid transaction hash received: {tx_hash}. This might indicate insufficient credits or transaction failure."
-        )
+    # logger.debug(f"Substrate call result: {tx_hash}")
 
-    logger.info(f"Successfully published to substrate with transaction: {tx_hash}")
+    # TODO: Enable transaction hash validation when substrate calls are re-enabled
+    # if not tx_hash or tx_hash == "0x" or len(tx_hash) < 10:
+    #     logger.error(f"Invalid transaction hash received: {tx_hash}")
+    #     raise HippiusSubstrateError(
+    #         f"Invalid transaction hash received: {tx_hash}. This might indicate insufficient credits or transaction failure."
+    #     )
+
+    # logger.info(f"Successfully published to substrate with transaction: {tx_hash}")
     return True
 
 
@@ -83,9 +87,9 @@ async def run_pinner_loop():
 
             if upload_request:
                 try:
-                    user_upload_requests[upload_request["owner"]].append(upload_request)
+                    user_upload_requests[upload_request.address].append(upload_request)
                 except KeyError:
-                    user_upload_requests[upload_request["owner"]] = [upload_request]
+                    user_upload_requests[upload_request.address] = [upload_request]
 
             else:
                 # No items in queue, wait a bit before checking again

@@ -57,6 +57,10 @@ class Config:
     # Generated on first run if not provided
     api_signing_key: str = env("API_SIGNING_KEY:" + str(uuid.uuid4()))
 
+    # s3 specific settings
+    max_multipart_file_size = 15 * 1024 * 1024 * 1024  # 15GB
+    max_multipart_chunk_size = 128 * 1024 * 1024  # 128 MB
+
 
 def get_config() -> Config:
     """Get application configuration."""
