@@ -1,11 +1,17 @@
 import json
 import logging
+from typing import Union
 
 import redis.asyncio as async_redis
 from pydantic import BaseModel
 
 
 logger = logging.getLogger(__name__)
+
+
+class Chunk(BaseModel):
+    id: int
+    redis_key: str
 
 
 class ChainRequest(BaseModel):
@@ -16,47 +22,62 @@ class ChainRequest(BaseModel):
     subaccount_seed_phrase: str
     bucket_name: str
     object_key: str
+    should_encrypt: bool
+    object_id: str
+
+    @property
+    def name(self):
+        if hasattr(self, "upload_id"):
+            return f"multipart::{self.object_id}::{self.multipart_upload_id}::{self.address}"
+
+        return f"simple::{self.object_id}::{self.address}"
+
+
+class MultipartUploadChainRequest(ChainRequest):
+    multipart_upload_id: str
+    chunks: list[Chunk]
+
+
+class SimpleUploadChainRequest(ChainRequest):
+    chunk: Chunk
 
 
 class UnpinChainRequest(ChainRequest):
     cid: str
 
 
-class Chunk(BaseModel):
-    id: str
-    redis_key: str
-
-
-class MultipartUploadRequest(ChainRequest):
-    upload_id: str
-    chunks: list[Chunk]
-
-
 async def enqueue_upload_request(
-    payload: MultipartUploadRequest,
+    payload: Union[
+        MultipartUploadChainRequest,
+        SimpleUploadChainRequest,
+    ],
     redis_client: async_redis.Redis,
 ) -> None:
     """Add an upload request to the Redis queue for processing by pinner."""
     await redis_client.lpush(
         "upload_requests",
-        json.dumps(
-            payload.model_dump(),
-        ),
+        payload.model_dump_json(),
     )
-    logger.info(f"Enqueued upload request {payload.upload_id=}")
+    logger.info(f"Enqueued upload request {payload.name=}")
 
 
 async def dequeue_upload_request(
     redis_client: async_redis.Redis,
-) -> MultipartUploadRequest | None:
+) -> Union[MultipartUploadChainRequest, SimpleUploadChainRequest, None]:
     """Get the next upload request from the Redis queue."""
+    queue_name = "upload_requests"
     result = await redis_client.brpop(
-        "upload_requests",
+        queue_name,
         timeout=3,
     )
     if result:
         _, queue_data = result
-        return MultipartUploadRequest.model_validate_json(queue_data)
+        queue_data = json.loads(queue_data)
+
+        if "chunk" in queue_data:
+            return SimpleUploadChainRequest.model_validate(queue_data)
+
+        return MultipartUploadChainRequest.model_validate(queue_data)
 
     return None
 
@@ -67,16 +88,27 @@ async def enqueue_unpin_request(
 ) -> None:
     """Add an unpin request to the Redis queue for processing by unpinner."""
 
-    await redis_client.lpush("unpin_requests", json.dumps(payload.model_dump()))
-    logger.info(f"Enqueued unpin request for CID={payload.cid}")
+    await redis_client.lpush(
+        "unpin_requests",
+        payload.model_dump_json(),
+    )
+    logger.info(f"Enqueued unpin request for {payload.name=}")
 
 
 async def dequeue_unpin_request(
     redis_client: async_redis.Redis,
-) -> UnpinChainRequest | None:
+) -> Union[
+    UnpinChainRequest,
+    None,
+]:
     """Get the next unpin request from the Redis queue."""
-    result = await redis_client.brpop("unpin_requests", timeout=1)
+    queue_name = "unpin_requests"
+    result = await redis_client.brpop(
+        queue_name,
+        timeout=3,
+    )
     if result:
         _, queue_data = result
         return UnpinChainRequest.model_validate_json(queue_data)
+
     return None

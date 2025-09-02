@@ -1,6 +1,5 @@
 """S3-compatible API endpoints implementation for bucket and object operations."""
 
-import contextlib
 import hashlib
 import json
 import logging
@@ -27,9 +26,17 @@ from hippius_s3.api.s3.multipart import upload_part
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import DBConnection
 from hippius_s3.ipfs_service import IPFSService
+from hippius_s3.queue import Chunk
+from hippius_s3.queue import SimpleUploadChainRequest
 from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import enqueue_unpin_request
+from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.utils import get_query
+
+
+def format_s3_timestamp(dt):
+    """Format datetime to AWS S3 compatible timestamp: YYYY-MM-DDThh:mm:ss.sssZ"""
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 logger = logging.getLogger(__name__)
@@ -211,8 +218,7 @@ async def list_buckets(
             name.text = row["bucket_name"]
 
             creation_date = ET.SubElement(bucket, "CreationDate")
-            timestamp = row["created_at"].strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-            creation_date.text = timestamp
+            creation_date.text = format_s3_timestamp(row["created_at"])
 
         xml_content = ET.tostring(
             root,
@@ -407,8 +413,7 @@ async def get_bucket(
             key.text = obj["object_key"]
 
             last_modified = ET.SubElement(content, "LastModified")
-            # Format timestamp in the exact format MinIO expects: YYYY-MM-DDThh:mm:ssZ
-            last_modified.text = obj["created_at"].strftime("%Y-%m-%dT%H:%M:%SZ")
+            last_modified.text = format_s3_timestamp(obj["created_at"])
 
             etag = ET.SubElement(content, "ETag")
             # Use MD5 hash as ETag for AWS CLI compatibility, fallback to CID if not available
@@ -1220,7 +1225,6 @@ async def delete_bucket(
     bucket_name: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    ipfs_service=Depends(dependencies.get_ipfs_service),
     redis_client=Depends(dependencies.get_redis),
 ) -> Response:
     """
@@ -1290,7 +1294,7 @@ async def delete_bucket(
                     object_key=obj["key"],
                     cid=obj["ipfs_cid"],
                 ),
-                redis_client=request.state.redis_client,
+                redis_client=redis_client,
             )
 
         return Response(status_code=204)
@@ -1438,8 +1442,7 @@ async def _copy_object(
         etag = ET.SubElement(root, "ETag")
         etag.text = f'"{ipfs_cid}"'
         last_modified = ET.SubElement(root, "LastModified")
-        # Format in S3-compatible format: YYYY-MM-DDThh:mm:ssZ
-        last_modified.text = created_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        last_modified.text = format_s3_timestamp(created_at)
 
         xml_response = ET.tostring(
             root,
@@ -1600,38 +1603,34 @@ async def put_object(
         file_size = len(file_data)
         content_type = request.headers.get("Content-Type", "application/octet-stream")
 
-        # Check if object already exists to clean up IPFS
-        existing_object = await db.fetchrow(
-            get_query("get_object_by_path"),
-            bucket_id,
-            object_key,
-        )
-
         # Calculate MD5 hash for ETag compatibility
         md5_hash = hashlib.md5(file_data).hexdigest()
         logger.info(f"PUT {bucket_name}/{object_key}: size={len(file_data)}, md5={md5_hash}")
-
-        # Use s3_publish for IPFS upload + pinning + blockchain publishing
-        seed_phrase = request.state.seed_phrase
+        object_id = str(uuid.uuid4())
 
         # Only encrypt if bucket is private
         should_encrypt = not bucket["is_public"]
 
-        s3_result = await ipfs_service.client.s3_publish(
-            content=file_data,
-            encrypt=should_encrypt,
-            seed_phrase=seed_phrase,
-            subaccount_id=request.state.account.main_account,
-            bucket_name=bucket_name,
-            file_name=object_key,
-            store_node=config.ipfs_store_url,
-            pin_node=config.ipfs_store_url,
-            substrate_url=config.substrate_url,
-            publish=True,
+        part_index = 0
+        await enqueue_upload_request(
+            payload=SimpleUploadChainRequest(
+                substrate_url=config.substrate_url,
+                ipfs_node=config.ipfs_store_url,
+                address=request.state.account.main_account,
+                subaccount=request.state.account.id,
+                subaccount_seed_phrase=request.state.seed_phrase,
+                bucket_name=bucket_name,
+                object_key=object_key,
+                should_encrypt=should_encrypt,
+                object_id=object_id,
+                chunk=Chunk(
+                    id=part_index,
+                    redis_key=f"simple:{object_id}:part:{part_index}",
+                ),
+            ),
+            redis_client=redis_client,
         )
 
-        ipfs_cid = s3_result.cid
-        object_id = str(uuid.uuid4())
         created_at = datetime.now(UTC)
 
         # Extract user metadata from headers
@@ -1640,67 +1639,25 @@ async def put_object(
             if key.lower().startswith("x-amz-meta-"):
                 meta_key = key[11:]
                 metadata[meta_key] = value
-                # Extract mtime for file timestamp preservation
-                if meta_key.lower() == "mtime":
-                    with contextlib.suppress(ValueError):
-                        mtime_timestamp = float(value)
-                        created_at = datetime.fromtimestamp(mtime_timestamp, UTC)
-
-        # Add system metadata
-        metadata["ipfs"] = {"cid": ipfs_cid, "encrypted": should_encrypt}
-        metadata["hippius"] = {}
 
         # Begin a transaction to ensure atomic operation
         async with db.transaction():
-            # Insert CID and get cid_id
-            cid_id = await utils.upsert_cid_and_get_id(db, ipfs_cid)
-
-            # Use upsert to create or update the object with cid_id
-            query = get_query("upsert_object_with_cid")
             await db.fetchrow(
-                query,
+                get_query("upsert_object_basic"),
                 object_id,
                 bucket_id,
                 object_key,
-                cid_id,
-                file_size,
                 content_type,
-                created_at,
                 json.dumps(metadata),
                 md5_hash,
+                file_size,
+                created_at,
             )
-
-            # Execute an immediate verification query within the same transaction
-            verify_result = await db.fetchrow(
-                get_query("get_object_by_path"),
-                bucket_id,
-                object_key,
-            )
-            if not verify_result:
-                raise RuntimeError(f"Failed to insert object: {bucket_name}/{object_key}")
-
-        # Clean up old IPFS content if needed
-        if existing_object and existing_object["ipfs_cid"] != ipfs_cid:
-            await enqueue_unpin_request(
-                payload=UnpinChainRequest(
-                    substrate_url=config.substrate_url,
-                    ipfs_node=config.ipfs_store_url,
-                    address=request.state.account.main_account,
-                    subaccount=request.state.account.id,
-                    subaccount_seed_phrase=request.state.seed_phrase,
-                    bucket_name=bucket_name,
-                    object_key=object_key,
-                    cid=ipfs_cid,
-                ),
-                redis_client=redis_client,
-            )
-            logger.info(f"Enqueued cleanup of previous version {bucket_name}/{object_key}")
 
         return Response(
             status_code=200,
             headers={
                 "ETag": f'"{md5_hash}"',
-                "x-amz-ipfs-cid": ipfs_cid,
             },
         )
 
@@ -1987,7 +1944,6 @@ async def delete_object(
     object_key: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    _=Depends(dependencies.get_ipfs_service),
     redis_client=Depends(dependencies.get_redis),
 ) -> Response:
     """
@@ -2075,14 +2031,15 @@ async def delete_object(
             payload=UnpinChainRequest(
                 substrate_url=config.substrate_url,
                 ipfs_node=config.ipfs_store_url,
-                address=request.state.account_main_account,
-                subaccount=request.state.account.subaccount,
+                address=request.state.account.main_account,
+                subaccount=request.state.account.id,
                 subaccount_seed_phrase=request.state.seed_phrase,
                 bucket_name=bucket_name,
                 object_key=object_key,
                 cid=ipfs_cid,
+                object_id=deleted_object["id"],
             ),
-            redis_client=request.state.redis_client,
+            redis_client=redis_client,
         )
         logger.info(f"Enqueued unpin request for deleted object {object_key}")
 

@@ -24,7 +24,7 @@ from hippius_s3 import utils
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.config import get_config
 from hippius_s3.queue import Chunk
-from hippius_s3.queue import MultipartUploadRequest
+from hippius_s3.queue import MultipartUploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.utils import get_query
 
@@ -694,12 +694,8 @@ async def complete_multipart_upload(
             }
         )
 
-        # Extract file modification time from metadata if available
+        # Set file creation time to current timestamp
         file_created_at = datetime.now(UTC)
-        if "mtime" in metadata:
-            with contextlib.suppress(ValueError):
-                mtime_timestamp = float(metadata["mtime"])
-                file_created_at = datetime.fromtimestamp(mtime_timestamp, UTC)
 
         # Mark the upload as completed
         await db.fetchrow(
@@ -735,16 +731,24 @@ async def complete_multipart_upload(
         )
 
         await enqueue_upload_request(
-            MultipartUploadRequest(
+            MultipartUploadChainRequest(
                 object_key=object_key,
                 bucket_name=bucket_name,
                 upload_id=upload_id,
-                chunks=[],
+                chunks=[
+                    {
+                        "chunk_key": f"multipart:{upload_id}:part:{part['part_number']}",
+                        "chunk_index": part["part_number"],
+                    }
+                    for part in parts
+                ],
                 substrate_url=config.substrate_url,
                 ipfs_node=config.ipfs_store_url,
                 address=request.state.main_account,
                 subaccount=request.state.account.id,
                 subaccount_seed_phrase=request.state.seed_phrase,
+                should_encrypt=should_encrypt,
+                object_id=upload_id,
             ),
             request.app.state.redis_client,
         )
