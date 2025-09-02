@@ -9,9 +9,10 @@ from typing import Optional
 
 from fastapi import Request
 from fastapi import Response
-from hippius_sdk.substrate import SubstrateClient
 from pydantic import BaseModel
 from starlette import status
+
+from hippius_sdk.substrate import SubstrateClient
 
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.config import get_config
@@ -215,7 +216,7 @@ async def check_credit_for_all_operations(request: Request, call_next: Callable)
 
             # Only check permissions and credits for operations that modify state
             if request.method in ["PUT", "POST", "DELETE"]:
-                logger.info(f"Checking credit for {request.method} operation: {path}")
+                logger.debug(f"Checking credit for {request.method} operation: {path}")
 
                 if not request.state.account.delete and request.method == "DELETE":
                     raise BadAccount("This account does not have DELETE permissions")

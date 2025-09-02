@@ -6,6 +6,7 @@ import logging
 import os
 import pathlib
 import re
+import time
 import typing
 from typing import Any
 from typing import Callable
@@ -28,12 +29,26 @@ async def get_request_body(request: Request) -> bytes:
     AWS CLI sends data in aws-chunked format even through proxies:
     Format: [chunk-size-hex]\r\n[chunk-data]\r\n...[0]\r\n[optional-trailers]\r\n\r\n
     """
-    raw_body = await request.body()
+    start_time = time.time()
+
+    # Use streaming instead of request.body() to avoid blocking
+    chunks = []
+    chunk_count = 0
+
+    async for chunk in request.stream():
+        chunks.append(chunk)
+        chunk_count += 1
+
+    raw_body = b"".join(chunks)
+    body_time = time.time() - start_time
+    logger.info(f"Streaming read took {body_time:.3f}s, {chunk_count} chunks, size: {len(raw_body)} bytes")
 
     # Check if body needs de-chunking
     if _is_aws_chunked_body(raw_body, request):
+        decode_start = time.time()
         decoded_body, trailers = _decode_aws_chunked_body(raw_body)
-        logger.debug(f"Decoded AWS chunked body: {len(raw_body)} bytes -> {len(decoded_body)} bytes")
+        decode_time = time.time() - decode_start
+        logger.info(f"AWS chunked decode took {decode_time:.3f}s: {len(raw_body)} -> {len(decoded_body)} bytes")
         if trailers:
             logger.debug(f"Found trailers: {trailers}")
         return decoded_body
@@ -155,3 +170,9 @@ def get_query(name: str) -> str:
     logger.info(f"Loading/caching query: {file_name}")
     with path.open("r") as fp:
         return fp.read().strip()
+
+
+async def upsert_cid_and_get_id(db, cid: str) -> str:
+    """Insert or get existing CID and return the cid_id (UUID)."""
+    result = await db.fetchrow(get_query("upsert_cid"), cid)
+    return result["id"]
