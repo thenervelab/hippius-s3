@@ -6,6 +6,9 @@ services:
       - HIPPIUS_IPFS_GET_URL=https://get.hippius.network
       - HIPPIUS_IPFS_STORE_URL=https://store.hippius.network
 
+  redis:
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--maxmemory", "200gb"]
+
   ipfs:
     volumes:
       - /ipfs:/data/ipfs
