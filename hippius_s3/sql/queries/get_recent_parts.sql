@@ -1,6 +1,6 @@
 SELECT p.* FROM parts p
-JOIN multipart_uploads m ON p.upload_id = m.upload_id
-WHERE m.object_key = $1 AND m.bucket_id = $2
-AND m.is_completed = true
+JOIN objects o ON p.object_id = o.object_id
+WHERE o.object_key = $1 AND o.bucket_id = $2
+AND o.multipart = true
 ORDER BY p.uploaded_at DESC
 LIMIT 10

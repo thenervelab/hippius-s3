@@ -22,11 +22,9 @@ multipart_chunks AS (
         p.size_bytes,
         oi.object_id
     FROM object_info oi
-    JOIN multipart_uploads mu ON mu.object_id = oi.object_id
-    JOIN parts p ON p.upload_id = mu.upload_id
+    JOIN parts p ON p.object_id = oi.object_id
     JOIN cids c ON p.cid_id = c.id
     WHERE oi.multipart = TRUE
-      AND mu.is_completed = TRUE
     ORDER BY p.part_number ASC
 )
 SELECT

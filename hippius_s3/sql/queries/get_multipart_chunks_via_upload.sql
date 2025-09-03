@@ -1,9 +1,7 @@
--- Get multipart object chunks with CIDs via multipart_uploads relationship
+-- Get multipart object chunks with CIDs via direct object_id reference
 -- Parameters: $1: object_id
 SELECT p.part_number, c.cid, p.size_bytes
-FROM multipart_uploads mu
-JOIN parts p ON p.upload_id = mu.upload_id
+FROM parts p
 JOIN cids c ON p.cid_id = c.id
-WHERE mu.object_id = $1
-  AND mu.is_completed = TRUE
+WHERE p.object_id = $1
 ORDER BY p.part_number ASC

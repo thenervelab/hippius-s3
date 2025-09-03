@@ -421,8 +421,21 @@ async def get_bucket(
             size = ET.SubElement(content, "Size")
             size.text = str(obj["size_bytes"])
 
+            # Use StorageClass (always STANDARD for AWS CLI compatibility)
             storage_class = ET.SubElement(content, "StorageClass")
             storage_class.text = "STANDARD"
+
+            # Use Owner for IPFS CID and account ID
+            owner = ET.SubElement(content, "Owner")
+            owner_id = ET.SubElement(owner, "ID")
+            owner_display_name = ET.SubElement(owner, "DisplayName")
+
+            ipfs_cid = obj.get("ipfs_cid")
+            if ipfs_cid and ipfs_cid.strip():
+                owner_id.text = ipfs_cid
+            else:
+                owner_id.text = "pending"
+            owner_display_name.text = request.state.account.main_account  # Account ID of bucket owner
 
         xml_content = ET.tostring(
             root,
@@ -431,9 +444,25 @@ async def get_bucket(
             pretty_print=True,
         )
 
+        # Add custom headers with IPFS CID count and status summary
+        total_objects = len(results)
+        objects_with_cid = sum(1 for obj in results if obj.get("ipfs_cid"))
+        status_counts = {}
+        for obj in results:
+            status = obj.get("status", "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+
         return Response(
             content=xml_content,
             media_type="application/xml",
+            headers={
+                "x-amz-bucket-objects-total": str(total_objects),
+                "x-amz-bucket-objects-with-cid": str(objects_with_cid),
+                "x-amz-bucket-objects-pending": str(total_objects - objects_with_cid),
+                "x-amz-bucket-status-publishing": str(status_counts.get("publishing", 0)),
+                "x-amz-bucket-status-pinning": str(status_counts.get("pinning", 0)),
+                "x-amz-bucket-status-uploaded": str(status_counts.get("uploaded", 0)),
+            },
         )
 
     except Exception:
@@ -1603,6 +1632,11 @@ async def put_object(
         should_encrypt = not bucket["is_public"]
 
         part_index = 0
+        redis_key = f"simple:{object_id}:part:{part_index}"
+
+        # Store file data in Redis for the pinner to process
+        await redis_client.set(redis_key, file_data)
+
         await enqueue_upload_request(
             payload=SimpleUploadChainRequest(
                 substrate_url=config.substrate_url,
@@ -1616,7 +1650,7 @@ async def put_object(
                 object_id=object_id,
                 chunk=Chunk(
                     id=part_index,
-                    redis_key=f"simple:{object_id}:part:{part_index}",
+                    redis_key=redis_key,
                 ),
             ),
             redis_client=redis_client,
@@ -1784,7 +1818,8 @@ async def head_object(
             "Content-Length": str(result["size_bytes"]),
             "ETag": f'"{result["md5_hash"]}"',
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
-            "x-amz-ipfs-cid": ipfs_cid,
+            "x-amz-ipfs-cid": ipfs_cid or "pending",
+            "x-amz-object-status": result.get("status", "unknown"),
         }
 
         for key, value in metadata.items():
@@ -1914,7 +1949,8 @@ async def get_object(
             "ETag": f'"{result["md5_hash"]}"',
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
-            "x-amz-ipfs-cid": ipfs_cid,
+            "x-amz-ipfs-cid": ipfs_cid or "pending",
+            "x-amz-object-status": result.get("status", "unknown"),
             "Accept-Ranges": "bytes",
         }
 
@@ -2056,7 +2092,7 @@ async def delete_object(
                 bucket_name=bucket_name,
                 object_key=object_key,
                 should_encrypt=not bucket["is_public"],
-                cid=result.get("ipfs_cid", ""),
+                cid=result.get("ipfs_cid") or "",
                 object_id=str(deleted_object["object_id"]),
             ),
             redis_client=redis_client,

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import asyncio  # noqa: I001
+import hashlib
+import json
 import logging
 import sys
 from pathlib import Path
@@ -40,6 +42,12 @@ async def _process_simple_upload(
     if not chunk_data:
         raise ValueError(f"Simple upload chunk not found for key: {payload.chunk.redis_key}")
 
+    # Mangle filename if encrypting
+    file_name = payload.object_key
+    if payload.should_encrypt:
+        filename_hash = hashlib.md5(f"{payload.object_key}_md5".encode()).hexdigest()
+        file_name = f"{filename_hash}.chunk"
+
     # Encrypt chunk using s3_publish
     s3_result = await ipfs_service.client.s3_publish(
         content=chunk_data,
@@ -47,21 +55,21 @@ async def _process_simple_upload(
         seed_phrase=payload.subaccount_seed_phrase,
         subaccount_id=payload.subaccount,
         bucket_name=payload.bucket_name,
-        file_name=payload.object_key,
+        file_name=file_name,
         store_node=payload.ipfs_node,
         pin_node=payload.ipfs_node,
         substrate_url=payload.substrate_url,
         publish=False,
     )
 
-    logger.info(f"Encrypted simple upload -> CID: {s3_result['cid']}")
+    logger.info(f"Encrypted simple upload -> CID: {s3_result.cid}")
 
     # Update objects table with CID
     await db.execute(
-        "UPDATE objects SET cid_id = $1, multipart = FALSE WHERE id = $2",
+        "UPDATE objects SET cid_id = $1, multipart = FALSE WHERE object_id = $2",
         await upsert_cid_and_get_id(
             db,
-            s3_result["cid"],
+            s3_result.cid,
         ),
         payload.object_id,
     )
@@ -83,6 +91,12 @@ async def _process_multipart_chunk(
     if not chunk_data:
         raise ValueError(f"Multipart chunk not found for key: {chunk.redis_key}")
 
+    # Mangle filename if encrypting
+    file_name = payload.object_key
+    if payload.should_encrypt:
+        filename_hash = hashlib.md5(f"{payload.object_key}_{chunk.id}".encode()).hexdigest()
+        file_name = f"{filename_hash}.chunk"
+
     # Encrypt chunk using s3_publish
     s3_result = await ipfs_service.client.s3_publish(
         content=chunk_data,
@@ -90,14 +104,14 @@ async def _process_multipart_chunk(
         seed_phrase=payload.subaccount_seed_phrase,
         subaccount_id=payload.subaccount,
         bucket_name=payload.bucket_name,
-        file_name=payload.object_key,
+        file_name=file_name,
         store_node=payload.ipfs_node,
         pin_node=payload.ipfs_node,
         substrate_url=payload.substrate_url,
         publish=False,
     )
 
-    logger.info(f"Encrypted multipart chunk {chunk.id} -> CID: {s3_result['cid']}")
+    logger.info(f"Encrypted multipart chunk {chunk.id} -> CID: {s3_result.cid}")
 
     # Clean up Redis chunk data
     await redis_client.delete(chunk.redis_key)
@@ -128,7 +142,7 @@ async def _process_multipart_upload(
 
     # Update parts table with CIDs for all chunks
     for s3_result, chunk in chunk_results:
-        cid_id = await upsert_cid_and_get_id(db, s3_result["cid"])
+        cid_id = await upsert_cid_and_get_id(db, s3_result.cid)
         await db.execute(
             "UPDATE parts SET cid_id = $1 WHERE object_id = $2 AND part_number = $3",
             cid_id,
@@ -136,13 +150,45 @@ async def _process_multipart_upload(
             chunk.id,
         )
 
-    # Update objects table to mark as multipart
+    # Create manifest with chunk indices and CIDs
+    manifest = []
+    for s3_result, chunk in chunk_results:
+        manifest.append([chunk.id, s3_result.cid])
+
+    # Sort manifest by chunk index to ensure proper order
+    manifest.sort(key=lambda x: x[0])
+
+    # Create filename_manifest.json and publish it
+    manifest_filename = f"{payload.object_key}_manifest.json"
+    manifest_data = json.dumps(manifest).encode()
+
+    # Publish the manifest to IPFS
+    manifest_result = await ipfs_service.client.s3_publish(
+        content=manifest_data,
+        encrypt=False,
+        seed_phrase=payload.subaccount_seed_phrase,
+        subaccount_id=payload.subaccount,
+        bucket_name=payload.bucket_name,
+        file_name=manifest_filename,
+        store_node=payload.ipfs_node,
+        pin_node=payload.ipfs_node,
+        substrate_url=payload.substrate_url,
+        publish=False,
+    )
+
+    logger.info(f"Created manifest for multipart upload -> Main CID: {manifest_result.cid}")
+
+    # Save the main object CID
+    main_cid_id = await upsert_cid_and_get_id(db, manifest_result.cid)
+
+    # Update objects table with main CID and mark as multipart
     await db.execute(
-        "UPDATE objects SET multipart = TRUE WHERE id = $1",
+        "UPDATE objects SET cid_id = $1, multipart = TRUE WHERE object_id = $2",
+        main_cid_id,
         payload.object_id,
     )
 
-    return [result[0] for result in chunk_results]
+    return [result[0] for result in chunk_results], manifest_result
 
 
 async def process_upload_request(
@@ -157,28 +203,45 @@ async def process_upload_request(
 ) -> bool:
     """Process upload requests by processing chunks, encrypting, and updating database."""
     ipfs_service = IPFSService(config, redis_client)
-    seed_phrase = None
+    seed_phrase = upload_requests[0].subaccount_seed_phrase  # All requests for same user have same seed phrase
     files = []
+
+    # Update all objects status to 'pinning' when processing starts
+    for payload in upload_requests:
+        await db.execute(
+            "UPDATE objects SET status = 'pinning' WHERE object_id = $1",
+            payload.object_id,
+        )
+        logger.info(f"Updated object {payload.object_id} status to 'pinning'")
 
     for payload in upload_requests:
         logger.info(f"Processing upload request for object_key={payload.object_key}, object_id={payload.object_id}")
 
         if hasattr(payload, "chunks"):  # Multipart upload
-            results = await _process_multipart_upload(
+            chunk_results, manifest_result = await _process_multipart_upload(
                 payload=payload,
                 db=db,
                 ipfs_service=ipfs_service,
                 redis_client=redis_client,
             )
 
+            # Add individual chunk CIDs
             files.extend(
                 [
                     FileInput(
                         file_hash=result.cid,
                         file_name=result.file_name,
                     )
-                    for result in results
+                    for result in chunk_results
                 ]
+            )
+
+            # Add manifest CID
+            files.append(
+                FileInput(
+                    file_hash=manifest_result.cid,
+                    file_name=manifest_result.file_name,
+                )
             )
         else:  # Simple upload
             result = await _process_simple_upload(
@@ -216,6 +279,15 @@ async def process_upload_request(
         )
 
     logger.info(f"Successfully published to substrate with transaction: {tx_hash}")
+
+    # Update all processed objects status to 'uploaded'
+    for payload in upload_requests:
+        await db.execute(
+            "UPDATE objects SET status = 'uploaded' WHERE object_id = $1",
+            payload.object_id,
+        )
+        logger.info(f"Updated object {payload.object_id} status to 'uploaded'")
+
     return True
 
 

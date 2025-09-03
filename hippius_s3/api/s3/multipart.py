@@ -564,7 +564,9 @@ async def hash_all_etags(
     )
 
     etags = [part["etag"].split("-")[0] for part in parts]
-    combined_etag = hashlib.md5(("".join(etags)).encode()).hexdigest()
+    # Convert hex ETags to binary and concatenate them (S3 multipart algorithm)
+    binary_etags = b"".join(bytes.fromhex(etag) for etag in etags)
+    combined_etag = hashlib.md5(binary_etags).hexdigest()
 
     return f"{combined_etag}-{len(parts)}"
 
@@ -718,7 +720,7 @@ async def complete_multipart_upload(
         total_size = sum(part["size_bytes"] for part in parts)
 
         # Create the object in database (without CID initially for multipart uploads)
-        await db.fetchrow(
+        object_result = await db.fetchrow(
             get_query("upsert_object_basic"),
             upload_id,
             bucket_id,
@@ -728,6 +730,20 @@ async def complete_multipart_upload(
             final_md5_hash,
             total_size,
             file_created_at,
+        )
+
+        # Update multipart_uploads table with the object_id
+        await db.execute(
+            "UPDATE multipart_uploads SET object_id = $1 WHERE upload_id = $2",
+            object_result["object_id"],
+            upload_id,
+        )
+
+        # Update all parts for this upload to have the correct object_id
+        await db.execute(
+            "UPDATE parts SET object_id = $1 WHERE upload_id = $2",
+            object_result["object_id"],
+            upload_id,
         )
 
         await enqueue_upload_request(
@@ -748,7 +764,7 @@ async def complete_multipart_upload(
                 subaccount=request.state.account.id,
                 subaccount_seed_phrase=request.state.seed_phrase,
                 should_encrypt=should_encrypt,
-                object_id=upload_id,
+                object_id=str(object_result["object_id"]),
             ),
             request.app.state.redis_client,
         )

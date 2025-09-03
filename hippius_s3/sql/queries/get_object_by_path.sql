@@ -1,7 +1,7 @@
 -- Get object by bucket and key path
 -- Parameters: $1: bucket_id, $2: object_key
 SELECT o.object_id, o.bucket_id, o.object_key,
-       COALESCE(c.cid, o.ipfs_cid) as ipfs_cid,
+       COALESCE(c.cid, o.ipfs_cid, '') as ipfs_cid,
        o.size_bytes, o.content_type, o.created_at, o.metadata, o.md5_hash,
        b.bucket_name
 FROM objects o
