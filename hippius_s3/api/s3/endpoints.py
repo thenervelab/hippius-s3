@@ -14,10 +14,9 @@ from fastapi import Depends
 from fastapi import Request
 from fastapi import Response
 from fastapi.security import HTTPBearer
-from lxml import etree as ET
-
 from hippius_sdk.errors import HippiusIPFSError
 from hippius_sdk.errors import HippiusSubstrateError
+from lxml import etree as ET
 
 from hippius_s3 import dependencies
 from hippius_s3 import utils
@@ -2047,9 +2046,6 @@ async def delete_object(
                 Key=object_key,
             )
 
-        # If we got here, the object was successfully deleted, so enqueue it for unpinning
-        ipfs_cid = result["ipfs_cid"]
-
         await enqueue_unpin_request(
             payload=UnpinChainRequest(
                 substrate_url=config.substrate_url,
@@ -2060,7 +2056,7 @@ async def delete_object(
                 bucket_name=bucket_name,
                 object_key=object_key,
                 should_encrypt=not bucket["is_public"],
-                cid=ipfs_cid or "",
+                cid=result.get("ipfs_cid", ""),
                 object_id=str(deleted_object["object_id"]),
             ),
             redis_client=redis_client,
@@ -2069,9 +2065,6 @@ async def delete_object(
 
         return Response(
             status_code=204,
-            headers={
-                "x-amz-request-id": ipfs_cid or "deleted",
-            },
         )
 
     except Exception:

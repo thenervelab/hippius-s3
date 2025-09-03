@@ -308,7 +308,7 @@ async def upload_part(
             request.app.state.redis_client,
         )
         if keys:
-            await request.state.redis_client.delete(*keys)
+            await request.app.state.redis_client.delete(*keys)
             logger.info(f"Cleaned up {len(keys)} cached parts for disconnected upload {upload_id}")
 
         return s3_error_response(

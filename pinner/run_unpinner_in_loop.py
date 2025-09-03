@@ -9,7 +9,6 @@ from pathlib import Path
 import aiofiles
 import httpx
 import redis.asyncio as async_redis
-
 from hippius_sdk import HippiusClient
 from hippius_sdk.substrate import SubstrateClient
 
@@ -51,6 +50,11 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
         manifest_objects.append({"cid": cid, "filename": file_name})
         logger.info(f"Added to unpin manifest: {subaccount=} {file_name=} {cid=}")
 
+    # Check if we have any objects to unpin
+    if not manifest_objects:
+        logger.info("No objects to unpin (all requests had empty CIDs)")
+        return True
+
     # Create manifest JSON file
     manifest_data = json.dumps(
         manifest_objects,
@@ -67,7 +71,8 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
         ipfs_gateway=config.ipfs_store_url,
         ipfs_api_url=api_url,
         substrate_url=config.substrate_url,
-        encrypt_by_default=False,  # Manifest doesn't need encryption
+        encrypt_by_default=False,
+        # Manifest doesn't need encryption
     )
 
     try:
@@ -132,6 +137,11 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
         Path(temp_path).unlink(missing_ok=True)
 
         # Submit manifest CID to substrate for cancellation
+        logger.info(f"Initializing SubstrateClient with seed_phrase: {'[PRESENT]' if seed_phrase else '[MISSING]'}")
+        if not seed_phrase:
+            logger.error("No seed phrase available for SubstrateClient initialization")
+            return False
+
         substrate_client = SubstrateClient(
             seed_phrase=seed_phrase,
             url=config.substrate_url,
