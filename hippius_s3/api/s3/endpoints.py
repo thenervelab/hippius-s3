@@ -1,5 +1,6 @@
 """S3-compatible API endpoints implementation for bucket and object operations."""
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -13,6 +14,7 @@ from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import Request
 from fastapi import Response
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer
 from hippius_sdk.errors import HippiusIPFSError
 from hippius_sdk.errors import HippiusSubstrateError
@@ -26,8 +28,11 @@ from hippius_s3.config import get_config
 from hippius_s3.dependencies import DBConnection
 from hippius_s3.ipfs_service import IPFSService
 from hippius_s3.queue import Chunk
+from hippius_s3.queue import ChunkToDownload
+from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import SimpleUploadChainRequest
 from hippius_s3.queue import UnpinChainRequest
+from hippius_s3.queue import enqueue_download_request
 from hippius_s3.queue import enqueue_unpin_request
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.utils import get_query
@@ -1853,7 +1858,7 @@ async def get_object(
     Get an object using S3 protocol (GET /{bucket_name}/{object_key}).
     Also handles getting object tags (GET /{bucket_name}/{object_key}?tagging).
 
-    This endpoint is compatible with the S3 protocol used by MinIO and other S3 clients.
+    This endpoint now uses a queuing system for downloads to handle IPFS retrieval asynchronously.
     """
     # If tagging is in query params, handle object tags request
     if "tagging" in request.query_params:
@@ -1865,92 +1870,138 @@ async def get_object(
             request.state.account.main_account,
         )
 
+    config = get_config()
+
     try:
-        result = await _get_object(
+        # Get user for user-scoped bucket lookup
+        user = await db.fetchrow(
+            get_query("get_or_create_user_by_main_account"),
+            request.state.account.main_account,
+            datetime.now(UTC),
+        )
+
+        bucket = await db.fetchrow(
+            get_query("get_bucket_by_name_and_owner"),
+            bucket_name,
+            user["main_account_id"],
+        )
+
+        if not bucket:
+            return create_xml_error_response(
+                "NoSuchBucket",
+                f"The specified bucket {bucket_name} does not exist",
+                status_code=404,
+                BucketName=bucket_name,
+            )
+
+        # Get object info for download
+        object_info = await db.fetchrow(
+            get_query("get_object_for_download"),
+            bucket["bucket_id"],
+            object_key,
+            request.state.account.main_account,
+        )
+
+        if not object_info:
+            return create_xml_error_response(
+                "NoSuchKey",
+                f"The specified key {object_key} does not exist",
+                status_code=404,
+                Key=object_key,
+            )
+
+        download_chunks = json.loads(object_info["download_chunks"])
+
+        # Check if all chunks have CIDs - if not, object is still being processed
+        if not download_chunks:
+            return create_xml_error_response(
+                "ServiceUnavailable",
+                "Object publish is in progress. Please retry shortly.",
+                status_code=503,
+            )
+
+        # Check if any chunk is missing a CID (still being processed)
+        missing_cids = [chunk for chunk in download_chunks if not chunk.get("cid")]
+        if missing_cids:
+            return create_xml_error_response(
+                "ServiceUnavailable",
+                "Object publish is in progress. Please retry shortly.",
+                status_code=503,
+            )
+
+        # Create ChunkToDownload objects with redis keys
+        chunks = []
+        request_uuid = str(uuid.uuid4())
+        for chunk_info in download_chunks:
+            redis_key = f"downloaded:{object_key}:{chunk_info['part_number']}:{request_uuid}"
+            chunks.append(
+                ChunkToDownload(
+                    cid=chunk_info["cid"],
+                    part_id=chunk_info["part_number"],
+                    redis_key=redis_key,
+                )
+            )
+
+        # Create download request
+        download_request = DownloadChainRequest(
+            request_id=request_uuid,
+            object_id=str(object_info["object_id"]),
+            object_key=object_info["object_key"],
+            bucket_name=object_info["bucket_name"],
+            address=request.state.account.main_account,
+            subaccount=request.state.account.id,
+            subaccount_seed_phrase=request.state.seed_phrase,
+            substrate_url=config.substrate_url,
+            ipfs_node=config.ipfs_store_url,
+            should_decrypt=object_info["should_decrypt"],
+            size=object_info["size_bytes"],
+            multipart=object_info["multipart"],
+            chunks=chunks,
+        )
+
+        # Enqueue download request
+        await enqueue_download_request(download_request, request.app.state.redis_client)
+        logger.info(f"Enqueued download request for {bucket_name}/{object_key}")
+
+        # Create streaming generator
+        async def generate_chunks():
+            """Stream downloaded chunks as they become available in Redis."""
+            for chunk in chunks:
+                # Wait for chunk to appear in Redis with 60s timeout
+                timeout = 60
+                chunk_data = None
+
+                for _ in range(timeout):
+                    chunk_data = await request.app.state.redis_client.get(chunk.redis_key)
+                    if chunk_data:
+                        logger.debug(f"Got chunk {chunk.part_id} from Redis")
+                        break
+                    await asyncio.sleep(1)
+
+                if not chunk_data:
+                    logger.error(f"Timeout waiting for chunk {chunk.part_id}")
+                    # For streaming responses, we can't easily convert to XML error
+                    # Instead, we'll raise a RuntimeError that will be handled by FastAPI
+                    raise RuntimeError(f"Timeout waiting for chunk {chunk.part_id} to download")
+
+                # Clean up Redis key after consuming
+                await request.app.state.redis_client.delete(chunk.redis_key)
+                yield chunk_data
+
+        # Get object metadata for headers
+        object_result = await _get_object(
             bucket_name,
             object_key,
             db,
             request.state.account.main_account,
         )
 
-        # Get bucket info to check if it's public (determines encryption)
-        bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
-            bucket_name,
-            request.state.account.main_account,
-        )
-
-        metadata = json.loads(result["metadata"])
-        ipfs_cid = result["ipfs_cid"]
-        object_id = result["id"]
-        is_multipart = result.get("multipart", False)
-
-        logger.debug(f"Getting object {bucket_name}/{object_key} with CID: {ipfs_cid}, multipart: {is_multipart}")
-
-        # Check if file was encrypted based on bucket public status
-        # Public buckets = no encryption, private buckets = encryption
-        is_encrypted = not bucket["is_public"]
-
-        if is_multipart:
-            # For multipart objects, reconstruct from individual chunks
-            logger.info(f"Reconstructing multipart object {object_key} from chunks")
-
-            # Get all chunks in correct order
-            chunks = await db.fetch(get_query("get_multipart_chunks"), object_id)
-
-            if not chunks:
-                logger.error(f"No chunks found for multipart object {object_id}")
-                raise errors.S3Error(
-                    code="NoSuchKey",
-                    status_code=404,
-                    message="Multipart object chunks not found",
-                )
-
-            # Download and concatenate all chunks
-            file_data = b""
-            for chunk in chunks:
-                chunk_cid = chunk["cid"]
-                logger.debug(f"Downloading chunk {chunk['part_number']} with CID: {chunk_cid}")
-
-                chunk_data = await ipfs_service.download_file(
-                    cid=chunk_cid,
-                    subaccount_id=request.state.account.main_account,
-                    bucket_name=bucket_name,
-                    decrypt=is_encrypted,
-                )
-                file_data += chunk_data
-
-            logger.debug(f"Reconstructed multipart file: {len(file_data)} bytes from {len(chunks)} chunks")
-        else:
-            # Simple object - direct download
-            file_data = await ipfs_service.download_file(
-                cid=ipfs_cid,
-                subaccount_id=request.state.account.main_account,
-                bucket_name=bucket_name,
-                decrypt=is_encrypted,
-            )
-            logger.debug(f"Downloaded {len(file_data)} bytes from IPFS CID: {ipfs_cid}")
-
-        # Handle HTTP Range requests for partial content
-        range_header = request.headers.get("range")
-        if range_header:
-            return _handle_range_request(
-                file_data,
-                range_header,
-                dict(result),
-                metadata,
-                object_key,
-                ipfs_cid,
-            )
-
+        metadata = json.loads(object_result["metadata"])
         headers = {
-            "Content-Type": result["content_type"],
-            "Content-Length": str(len(file_data)),
-            "ETag": f'"{result["md5_hash"]}"',
-            "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
+            "Content-Type": object_result["content_type"],
+            "ETag": f'"{object_result["md5_hash"]}"',
+            "Last-Modified": object_result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
-            "x-amz-ipfs-cid": ipfs_cid or "pending",
-            "x-amz-object-status": result.get("status", "unknown"),
             "Accept-Ranges": "bytes",
         }
 
@@ -1958,32 +2009,18 @@ async def get_object(
             if key != "ipfs" and not isinstance(value, dict):
                 headers[f"x-amz-meta-{key}"] = str(value)
 
-        return Response(
-            content=file_data,
+        return StreamingResponse(
+            generate_chunks(),
+            media_type=object_result["content_type"],
             headers=headers,
         )
 
     except errors.S3Error as e:
         logger.exception(f"S3 Error getting object {bucket_name}/{object_key}: {e.message}")
         return create_xml_error_response(
+            e.code,
             e.message,
-            f"The object could not be retrieved: {e.message}",
             status_code=e.status_code,
-        )
-
-    except RuntimeError as e:
-        # Handle specific RuntimeError from IPFS service
-        if "Failed to download file with CID" in str(e):
-            return create_xml_error_response(
-                "ServiceUnavailable",
-                f"The IPFS network is currently experiencing issues. Please try again later. ({str(e)})",
-                status_code=503,
-            )
-        logger.exception(f"Runtime error getting object {bucket_name}/{object_key}: {e}")
-        return create_xml_error_response(
-            "InternalError",
-            f"We encountered an internal runtime error: {str(e)}",
-            status_code=500,
         )
 
     except Exception as e:
