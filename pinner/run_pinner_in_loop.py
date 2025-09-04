@@ -3,6 +3,7 @@ import asyncio  # noqa: I001
 import hashlib
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Union
@@ -124,7 +125,7 @@ async def _process_multipart_upload(
     db: asyncpg.Connection,
     ipfs_service: IPFSService,
     redis_client: async_redis.Redis,
-) -> list[S3PublishPin]:
+) -> tuple[list[S3PublishPin], S3PublishPin]:
     semaphore = asyncio.Semaphore(5)
 
     async def process_chunk_with_semaphore(chunk: Chunk) -> tuple[S3PublishPin, Chunk]:
@@ -256,6 +257,19 @@ async def process_upload_request(
                     file_name=result.file_name,
                 )
             )
+
+    # Optionally skip substrate publish for ipfs-only mode
+    if os.getenv("HIPPIUS_PUBLISH_MODE", "full") == "ipfs_only":
+        logger.info(
+            "Skipping substrate publish because HIPPIUS_PUBLISH_MODE=ipfs_only; marking objects as uploaded"
+        )
+        for payload in upload_requests:
+            await db.execute(
+                "UPDATE objects SET status = 'uploaded' WHERE object_id = $1",
+                payload.object_id,
+            )
+            logger.info(f"Updated object {payload.object_id} status to 'uploaded'")
+        return True
 
     # Create substrate storage request
     substrate_client = SubstrateClient(

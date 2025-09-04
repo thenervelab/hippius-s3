@@ -9,6 +9,7 @@ from typing import Optional
 
 import redis.asyncio as async_redis
 from dotenv import load_dotenv
+
 from hippius_sdk.substrate import SubstrateClient
 
 

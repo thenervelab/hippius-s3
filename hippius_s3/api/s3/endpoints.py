@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import os
 import uuid
 from datetime import UTC
 from datetime import datetime
@@ -14,9 +15,10 @@ from fastapi import Depends
 from fastapi import Request
 from fastapi import Response
 from fastapi.security import HTTPBearer
+from lxml import etree as ET
+
 from hippius_sdk.errors import HippiusIPFSError
 from hippius_sdk.errors import HippiusSubstrateError
-from lxml import etree as ET
 
 from hippius_s3 import dependencies
 from hippius_s3 import utils
@@ -1315,11 +1317,11 @@ async def delete_bucket(
                 payload=UnpinChainRequest(
                     substrate_url=config.substrate_url,
                     ipfs_node=config.ipfs_store_url,
-                    address=request.state.account_main_account,
+                    address=request.state.account.main_account,
                     subaccount=request.state.account.id,
                     subaccount_seed_phrase=request.state.seed_phrase,
                     bucket_name=bucket_name,
-                    object_key=obj["key"],
+                    object_key=obj["object_key"],
                     cid=obj["ipfs_cid"],
                 ),
                 redis_client=redis_client,
@@ -1429,7 +1431,7 @@ async def _copy_object(
                 store_node=config.ipfs_store_url,
                 pin_node=config.ipfs_store_url,
                 substrate_url=config.substrate_url,
-                publish=True,
+                publish=(os.getenv("HIPPIUS_PUBLISH_MODE", "full") != "ipfs_only"),
             )
 
             ipfs_cid = s3_result.cid
@@ -1787,7 +1789,6 @@ async def head_object(
                 bucket_name,
                 object_key,
                 db,
-                request.state.seed_phrase,
                 request.state.account.main_account,
             )
             return Response(status_code=200)
@@ -1848,6 +1849,7 @@ async def get_object(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
+    redis_client=Depends(dependencies.get_redis),
 ) -> Response:
     """
     Get an object using S3 protocol (GET /{bucket_name}/{object_key}).
@@ -1882,7 +1884,7 @@ async def get_object(
 
         metadata = json.loads(result["metadata"])
         ipfs_cid = result["ipfs_cid"]
-        object_id = result["id"]
+        object_id = result["object_id"]
         is_multipart = result.get("multipart", False)
 
         logger.debug(f"Getting object {bucket_name}/{object_key} with CID: {ipfs_cid}, multipart: {is_multipart}")
@@ -1922,7 +1924,13 @@ async def get_object(
 
             logger.debug(f"Reconstructed multipart file: {len(file_data)} bytes from {len(chunks)} chunks")
         else:
-            # Simple object - direct download
+            # Simple object - require CID to be available; if missing, return 503 PendingUpload
+            if not ipfs_cid:
+                return create_xml_error_response(
+                    "ServiceUnavailable",
+                    "Object publish is in progress. Please retry shortly.",
+                    status_code=503,
+                )
             file_data = await ipfs_service.download_file(
                 cid=ipfs_cid,
                 subaccount_id=request.state.account.main_account,
