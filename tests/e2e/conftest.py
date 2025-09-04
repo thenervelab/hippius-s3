@@ -6,37 +6,41 @@ import secrets
 import subprocess
 import time
 import uuid
-
-import boto3
-import pytest
-from botocore.config import Config
 from pathlib import Path
+from typing import Any
+from typing import Callable
+from typing import Iterator
+
+import boto3  # type: ignore[import-untyped]
+import pytest
+from botocore.config import Config  # type: ignore[import-untyped]
 
 
+  # type: ignore[import-untyped]
 # Note: event_loop fixture removed as it's not needed for synchronous tests
 
 
 @pytest.fixture(scope="session")
-def test_run_id():
+def test_run_id() -> str:
     """Generate a unique ID for this test run to ensure isolation."""
     return str(uuid.uuid4())[:8]
 
 
 @pytest.fixture(scope="session")
-def test_seed_phrase():
+def test_seed_phrase() -> str:
     """Generate a unique seed phrase for this test run."""
     # For now, use a fixed test seed. In production, generate or load from secure source.
     return "test twelve word seed phrase for e2e testing purposes only"
 
 
 @pytest.fixture(scope="session")
-def compose_project_name(test_run_id):
+def compose_project_name(test_run_id: str) -> str:
     """Unique docker compose project name for isolation."""
     return f"hippius-e2e-{test_run_id}"
 
 
 @pytest.fixture(scope="session")
-def docker_services(compose_project_name):
+def docker_services(compose_project_name: str) -> Iterator[None]:
     """Start docker services for e2e tests."""
     env = os.environ.copy()
     env["COMPOSE_PROJECT_NAME"] = compose_project_name
@@ -46,7 +50,7 @@ def docker_services(compose_project_name):
         ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.e2e.yml", "up", "-d", "--wait"],
         env=env,
         check=True,
-        cwd=str(Path(__file__).resolve().parents[2])
+        cwd=str(Path(__file__).resolve().parents[2]),
     )
 
     # Wait for services to be ready
@@ -54,7 +58,7 @@ def docker_services(compose_project_name):
     time.sleep(15)  # Increased wait time
 
     # Health check for API service
-    import requests
+    import requests  # type: ignore[import-untyped]
     max_retries = 10
     for attempt in range(max_retries):
         try:
@@ -74,14 +78,12 @@ def docker_services(compose_project_name):
     subprocess.run(
         ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.e2e.yml", "down", "-v"],
         env=env,
-        cwd=str(Path(__file__).resolve().parents[2])
+        cwd=str(Path(__file__).resolve().parents[2]),
     )
 
 
-
-
 @pytest.fixture
-def boto3_client(test_seed_phrase):
+def boto3_client(test_seed_phrase: str) -> Any:
     """Create a boto3 S3 client configured for testing."""
     access_key = base64.b64encode(test_seed_phrase.encode()).decode()
     secret_key = test_seed_phrase
@@ -100,11 +102,11 @@ def boto3_client(test_seed_phrase):
 
 
 @pytest.fixture
-def cleanup_buckets(boto3_client):
+def cleanup_buckets(boto3_client: Any) -> Iterator[Callable[[str], None]]:
     """Cleanup function to remove test buckets after tests."""
     created_buckets = []
 
-    def track_bucket(bucket_name):
+    def track_bucket(bucket_name: str) -> None:
         created_buckets.append(bucket_name)
 
     yield track_bucket
@@ -125,8 +127,10 @@ def cleanup_buckets(boto3_client):
 
 
 @pytest.fixture
-def unique_bucket_name(test_run_id):
+def unique_bucket_name(test_run_id: str) -> Callable[[str], str]:
     """Generate a unique bucket name for each test."""
-    def _unique_name(base_name="test-bucket"):
+
+    def _unique_name(base_name: str = "test-bucket") -> str:
         return f"{base_name}-{test_run_id}-{secrets.token_hex(4)}"
+
     return _unique_name

@@ -7,9 +7,8 @@ import redis.asyncio as async_redis
 from cachetools import TTLCache
 from fastapi import HTTPException
 from fastapi import Request
-from starlette import status
-
 from hippius_sdk.substrate import SubstrateClient
+from starlette import status
 
 from hippius_s3.config import Config
 from hippius_s3.ipfs_service import IPFSService

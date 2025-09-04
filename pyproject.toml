@@ -48,10 +48,8 @@ packages = ["hippius_s3"]
 
 [tool.ruff]
 line-length = 120
-target-version = "py311"
-exclude = [
-    "examples/",
-]
+target-version = "py312"
+exclude = ["examples/"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -86,9 +84,11 @@ ignore = [
     "B008",
 ]
 
+
 [tool.ruff.lint.isort]
 force-single-line   = true
-known-local-folder  = ["hippius_s3"]
+known-first-party = ["hippius_s3"]
+known-third-party = ["hippius_sdk", "hippius"]
 lines-after-imports = 2
 
 [tool.ruff.lint.mccabe]

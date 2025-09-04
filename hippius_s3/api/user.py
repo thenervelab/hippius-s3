@@ -9,9 +9,8 @@ from fastapi import Depends
 from fastapi import HTTPException
 from fastapi import Query
 from fastapi.responses import JSONResponse
-from starlette import status
-
 from hippius_sdk.substrate import SubstrateClient
+from starlette import status
 
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import get_postgres

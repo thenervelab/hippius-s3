@@ -260,9 +260,7 @@ async def process_upload_request(
 
     # Optionally skip substrate publish for ipfs-only mode
     if os.getenv("HIPPIUS_PUBLISH_MODE", "full") == "ipfs_only":
-        logger.info(
-            "Skipping substrate publish because HIPPIUS_PUBLISH_MODE=ipfs_only; marking objects as uploaded"
-        )
+        logger.info("Skipping substrate publish because HIPPIUS_PUBLISH_MODE=ipfs_only; marking objects as uploaded")
         for payload in upload_requests:
             await db.execute(
                 "UPDATE objects SET status = 'uploaded' WHERE object_id = $1",

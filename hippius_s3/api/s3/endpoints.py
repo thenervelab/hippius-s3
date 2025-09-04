@@ -15,10 +15,9 @@ from fastapi import Depends
 from fastapi import Request
 from fastapi import Response
 from fastapi.security import HTTPBearer
-from lxml import etree as ET
-
 from hippius_sdk.errors import HippiusIPFSError
 from hippius_sdk.errors import HippiusSubstrateError
+from lxml import etree as ET
 
 from hippius_s3 import dependencies
 from hippius_s3 import utils

@@ -34,7 +34,7 @@ def wait_for_database(database_url: str, timeout: int = 60, interval: int = 2) -
 
             import asyncpg
 
-            async def test_connection():
+            async def test_connection() -> bool:
                 conn = await asyncpg.connect(database_url)
                 await conn.close()
                 return True
@@ -125,7 +125,7 @@ def parse_database_url(url: str) -> dict[str, str]:
         "DB_USER": user,
         "DB_PASSWORD": password,
         "DB_NAME": database,
-        "DB_SSLMODE": sslmode
+        "DB_SSLMODE": sslmode,
     }
 
 
@@ -142,6 +142,7 @@ def setup_keystore(key_store_url: str) -> None:
 
     try:
         import hippius_sdk  # type: ignore
+
         migrations_dir = Path(hippius_sdk.__file__).parent / "db" / "migrations"
         if not migrations_dir.exists():
             raise FileNotFoundError(f"Keystore migrations directory not found at {migrations_dir}")
@@ -190,17 +191,11 @@ def main() -> None:
     # Configure IPFS if environment variables are set
     if os.environ.get("HIPPIUS_IPFS_STORE_URL"):
         logger.info(f"Setting IPFS store URL: {os.environ['HIPPIUS_IPFS_STORE_URL']}")
-        run_command([
-            "hippius", "config", "set", "ipfs", "api_url",
-            os.environ["HIPPIUS_IPFS_STORE_URL"]
-        ])
+        run_command(["hippius", "config", "set", "ipfs", "api_url", os.environ["HIPPIUS_IPFS_STORE_URL"]])
 
     if os.environ.get("HIPPIUS_IPFS_GET_URL"):
         logger.info(f"Setting IPFS gateway URL: {os.environ['HIPPIUS_IPFS_GET_URL']}")
-        run_command([
-            "hippius", "config", "set", "ipfs", "gateway",
-            os.environ["HIPPIUS_IPFS_GET_URL"]
-        ])
+        run_command(["hippius", "config", "set", "ipfs", "gateway", os.environ["HIPPIUS_IPFS_GET_URL"]])
 
     logger.info("Migration process completed successfully")
 
