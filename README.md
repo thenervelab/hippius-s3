@@ -60,7 +60,8 @@ Works with standard S3 clients including:
 
 2. **Create environment configuration**:
    ```bash
-   # Create .env file with required variables (see Configuration section)
+   cp .env.example .env
+   # Edit .env with your specific values (database URL, HMAC secret, etc.)
    ```
 
 3. **Start all services**:
@@ -68,59 +69,20 @@ Works with standard S3 clients including:
    docker compose up -d
    ```
 
-4. **Verify the setup**:
+4. **Run database migrations**:
    ```bash
-   curl http://localhost:8000/docs
+   docker compose exec api dbmate up
    ```
 
-```bash
+   ```bash
 docker compose -f docker-compose.prod.yml up -d
-```
+   ```
 
 ## Configuration
 
 ### Required Environment Variables
-Create a `.env` file with the following required variables:
 
-```bash
-# Database
-DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius
-
-# IPFS Configuration
-HIPPIUS_IPFS_GET_URL=http://ipfs:8080
-HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
-
-# Security
-FRONTEND_HMAC_SECRET=your-secret-key-here
-RATE_LIMIT_PER_MINUTE=100
-MAX_REQUEST_SIZE_MB=100
-
-# Server
-HOST=0.0.0.0
-PORT=8000
-ENVIRONMENT=development
-DEBUG=true
-LOG_LEVEL=DEBUG
-
-# Features
-ENABLE_AUDIT_LOGGING=true
-ENABLE_STRICT_VALIDATION=true
-ENABLE_API_DOCS=true
-ENABLE_REQUEST_PROFILING=false
-
-# S3 Limits
-MIN_BUCKET_NAME_LENGTH=3
-MAX_BUCKET_NAME_LENGTH=63
-MAX_OBJECT_KEY_LENGTH=1024
-MAX_METADATA_SIZE=2048
-
-# Blockchain
-HIPPIUS_SUBSTRATE_URL=your-substrate-endpoint
-HIPPIUS_VALIDATOR_REGION=your-region
-
-# Redis
-REDIS_URL=redis://redis:6379/0
-```
+Create a `.env` file with the required variables. See [`.env.example`](.env.example) for all configuration options and their descriptions.
 
 ## Usage Examples
 
@@ -139,7 +101,7 @@ client = Minio(
     "http://localhost:8000",
     access_key=encoded_key,
     secret_key=seed_phrase,
-    secure=True,
+    secure=False,
     region="decentralized"
 )
 
@@ -162,10 +124,8 @@ aws configure set aws_secret_access_key "your-seed-phrase"
 aws configure set default.region "decentralized"
 aws configure set default.s3.signature_version "s3v4"
 
-# Upload file with encryption
-aws s3 cp file.txt s3://my-bucket/ \
-  --endpoint-url https://s3.hippius.com \
-  --server-side-encryption AES256
+aws s3 mb s3://my-bucket/ --endpoint-url http://localhost:8000 --no-verify-ssl
+aws s3 cp file.txt s3://my-bucket/ --endpoint-url http://localhost:8000 --no-verify-ssl
 ```
 
 ## API Reference
