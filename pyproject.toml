@@ -46,6 +46,7 @@ packages = ["hippius_s3"]
 [tool.ruff]
 line-length = 120
 target-version = "py311"
+exclude = ["examples/"]
 
 [tool.ruff.format]
 quote-style = "double"
