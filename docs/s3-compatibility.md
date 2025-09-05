@@ -9,8 +9,8 @@ Notes:
 
 ### All AWS S3 actions
 
-| Action                                          | Supported | Notes                                                     | Endpoint(s)                                   | Test                                 |
-| ----------------------------------------------- | --------- | --------------------------------------------------------- | --------------------------------------------- | ------------------------------------ |
+| Action                                          | Supported | Notes                                                     | Endpoint(s)                                   | Test                 |
+| ----------------------------------------------- | --------- | --------------------------------------------------------- | --------------------------------------------- | -------------------- |
 | AbortMultipartUpload                            | ✔         | Aborts upload and cleans up                               | DELETE /{bucket}/{key}?uploadId=...           |
 | CompleteMultipartUpload                         | ✔         | Computes combined ETag                                    | POST /{bucket}/{key}?uploadId=...             |
 | CopyObject                                      | ✔         | Via x-amz-copy-source header                              | PUT /{bucket}/{key}                           |
@@ -34,7 +34,7 @@ Notes:
 | DeleteBucketReplication                         |           |                                                           |                                               |
 | DeleteBucketTagging                             | ✔         | Deletes all tags                                          | DELETE /{bucket}?tagging                      |
 | DeleteBucketWebsite                             |           |                                                           |                                               |
-| DeleteObject                                    | ✔         | Idempotent 204                                            | DELETE /{bucket}/{key}                        | tests/e2e/test_single_file_upload.py |
+| DeleteObject                                    | ✔         | Idempotent 204                                            | DELETE /{bucket}/{key}                        |                      |
 | DeleteObjects                                   |           | Batch delete not supported                                |                                               |
 | DeleteObjectTagging                             | ✔         | Deletes all tags                                          | DELETE /{bucket}/{key}?tagging                |
 | DeletePublicAccessBlock                         |           |                                                           |                                               |
@@ -45,9 +45,9 @@ Notes:
 | GetBucketEncryption                             |           |                                                           |                                               |
 | GetBucketIntelligentTieringConfiguration        |           |                                                           |                                               |
 | GetBucketInventoryConfiguration                 |           |                                                           |                                               |
-| GetBucketLifecycle                              | ✔         | Minimal default lifecycle XML                             | GET /{bucket}?lifecycle                       |                                      |
-| GetBucketLifecycleConfiguration                 | ✔         | Same as above (compat)                                    | GET /{bucket}?lifecycle                       |                                      |
-| GetBucketLocation                               | ✔         | Always returns us-east-1 XML                              | GET /{bucket}?location                        |                                      |
+| GetBucketLifecycle                              | ✔         | Minimal default lifecycle XML                             | GET /{bucket}?lifecycle                       |                      |
+| GetBucketLifecycleConfiguration                 | ✔         | Same as above (compat)                                    | GET /{bucket}?lifecycle                       |                      |
+| GetBucketLocation                               | ✔         | Always returns us-east-1 XML                              | GET /{bucket}?location                        |                      |
 | GetBucketLogging                                |           |                                                           |                                               |
 | GetBucketMetadataConfiguration                  |           |                                                           |                                               |
 | GetBucketMetadataTableConfiguration             |           |                                                           |                                               |
@@ -62,7 +62,7 @@ Notes:
 | GetBucketTagging                                | ✔         | XML response                                              | GET /{bucket}?tagging                         |
 | GetBucketVersioning                             |           |                                                           |                                               |
 | GetBucketWebsite                                |           |                                                           |                                               |
-| GetObject                                       | ✔         | Supports Range; S3-like headers                           | GET /{bucket}/{key}                           | tests/e2e/test_single_file_upload.py |
+| GetObject                                       | ✔         | Supports Range; S3-like headers                           | GET /{bucket}/{key}                           | test_GetObject.py    |
 | GetObjectAcl                                    |           |                                                           |                                               |
 | GetObjectAttributes                             |           |                                                           |                                               |
 | GetObjectLegalHold                              |           |                                                           |                                               |
@@ -71,16 +71,16 @@ Notes:
 | GetObjectTagging                                | ✔         | XML response                                              | GET /{bucket}/{key}?tagging                   |
 | GetObjectTorrent                                |           |                                                           |                                               |
 | GetPublicAccessBlock                            |           |                                                           |                                               |
-| HeadBucket                                      | ✔         | 200 if exists, 404 if not (empty body)                    | HEAD /{bucket}                                | tests/e2e/test_single_file_upload.py |
-| HeadObject                                      | ✔         | Returns metadata headers                                  | HEAD /{bucket}/{key}                          | tests/e2e/test_single_file_upload.py |
+| HeadBucket                                      | ✔         | 200 if exists, 404 if not (empty body)                    | HEAD /{bucket}                                | test_CreateBucket.py |
+| HeadObject                                      | ✔         | Returns metadata headers                                  | HEAD /{bucket}/{key}                          | test_HeadObject.py   |
 | ListBucketAnalyticsConfigurations               |           |                                                           |                                               |
 | ListBucketIntelligentTieringConfigurations      |           |                                                           |                                               |
 | ListBucketInventoryConfigurations               |           |                                                           |                                               |
 | ListBucketMetricsConfigurations                 |           |                                                           |                                               |
-| ListBuckets                                     | ✔         | Lists buckets owned by the authenticated account          | GET /                                         | tests/e2e/test_single_file_upload.py |
+| ListBuckets                                     | ✔         | Lists buckets owned by the authenticated account          | GET /                                         | test_CreateBucket.py |
 | ListDirectoryBuckets                            |           |                                                           |                                               |
 | ListMultipartUploads                            | ✔         | Lists ongoing multipart uploads                           | GET /{bucket}?uploads                         |
-| ListObjects                                     | ✔         | Optional prefix filtering                                 | GET /{bucket}                                 | tests/e2e/test_single_file_upload.py |
+| ListObjects                                     | ✔         | Optional prefix filtering                                 | GET /{bucket}                                 | test_ListObjects.py  |
 | ListObjectsV2                                   |           |                                                           |                                               |
 | ListObjectVersions                              |           |                                                           |                                               |
 | ListParts                                       |           |                                                           |                                               |
@@ -104,7 +104,7 @@ Notes:
 | PutBucketTagging                                | ✔         | XML request                                               | PUT /{bucket}?tagging                         |
 | PutBucketVersioning                             |           |                                                           |                                               |
 | PutBucketWebsite                                |           |                                                           |                                               |
-| PutObject                                       | ✔         | MD5 as ETag; x-amz-meta-\*                                | PUT /{bucket}/{key}                           | tests/e2e/test_single_file_upload.py |
+| PutObject                                       | ✔         | MD5 as ETag; x-amz-meta-\*                                | PUT /{bucket}/{key}                           | test_PutObject.py    |
 | PutObjectAcl                                    |           |                                                           |                                               |
 | PutObjectLegalHold                              |           |                                                           |                                               |
 | PutObjectLockConfiguration                      |           |                                                           |                                               |
