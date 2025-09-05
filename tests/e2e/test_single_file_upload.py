@@ -14,7 +14,12 @@ from typing import Callable
 import pytest
 
 
-def test_single_file_upload_download(docker_services: Any, boto3_client: Any, unique_bucket_name: Callable[[str], str], cleanup_buckets: Callable[[str], None]) -> None:
+def test_single_file_upload_download(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+) -> None:
     """Test uploading a single file and downloading it back."""
     # Generate unique bucket name
     bucket_name = unique_bucket_name("single-file-test")
@@ -88,7 +93,12 @@ def test_single_file_upload_download(docker_services: Any, boto3_client: Any, un
         pass
 
 
-def test_bucket_operations(docker_services: Any, boto3_client: Any, unique_bucket_name: Callable[[str], str], cleanup_buckets: Callable[[str], None]) -> None:
+def test_bucket_operations(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+) -> None:
     """Test bucket creation, listing, and deletion."""
     bucket_name = unique_bucket_name("bucket-ops-test")
 
@@ -118,7 +128,12 @@ def test_bucket_operations(docker_services: Any, boto3_client: Any, unique_bucke
         pass
 
 
-def test_error_cases(docker_services: Any, boto3_client: Any, unique_bucket_name: Callable[[str], str], cleanup_buckets: Callable[[str], None]) -> None:
+def test_error_cases(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+) -> None:
     """Test error cases and edge conditions."""
     bucket_name = unique_bucket_name("error-test")
     nonexistent_bucket = unique_bucket_name("nonexistent")

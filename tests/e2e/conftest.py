@@ -16,7 +16,7 @@ import pytest
 from botocore.config import Config  # type: ignore[import-untyped]
 
 
-  # type: ignore[import-untyped]
+# type: ignore[import-untyped]
 # Note: event_loop fixture removed as it's not needed for synchronous tests
 
 
@@ -59,6 +59,7 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
 
     # Health check for API service
     import requests  # type: ignore[import-untyped]
+
     max_retries = 10
     for attempt in range(max_retries):
         try:
