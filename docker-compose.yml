@@ -9,6 +9,7 @@ services:
       - db
       - ipfs
       - redis
+      - redis-accounts
     volumes:
       - .:/app
     restart: unless-stopped
@@ -18,6 +19,8 @@ services:
       - DEBUG=true
       - HIPPIUS_IPFS_GET_URL=https://get.hippius.network
       - HIPPIUS_IPFS_STORE_URL=https://store.hippius.network
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
 
   db:
     image: postgres:15
@@ -68,6 +71,21 @@ services:
       timeout: 3s
       retries: 5
 
+  redis-accounts:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - redis_accounts_data:/data
+      - ./redis-accounts.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   pinner:
     build:
       context: .
@@ -104,3 +122,4 @@ volumes:
   postgres_data:
   ipfs_data:
   redis_data:
+  redis_accounts_data:

@@ -9,15 +9,14 @@ from typing import Optional
 
 from fastapi import Request
 from fastapi import Response
+from hippius_sdk.substrate import SubstrateClient
 from pydantic import BaseModel
 from starlette import status
-
-from hippius_sdk.substrate import SubstrateClient
 
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import check_account_has_credit
-from hippius_s3.dependencies import get_redis
+from hippius_s3.dependencies import get_redis_accounts
 
 
 config = get_config()
@@ -52,11 +51,11 @@ async def fetch_account_from_cache(
     Returns:
         HippiusAccount if found in cache, None if not found or cache miss
     """
-    redis_client = get_redis(request)
+    redis_accounts_client = get_redis_accounts(request)
 
     # Cache seed phrase to subaccount_id mapping to avoid substrate connection
     seed_cache_key = f"hippius_seed_to_subaccount:{hash(seed_phrase)}"
-    cached_subaccount_id = await redis_client.get(seed_cache_key)
+    cached_subaccount_id = await redis_accounts_client.get(seed_cache_key)
 
     if cached_subaccount_id:
         subaccount_id = cached_subaccount_id.decode()
@@ -71,12 +70,12 @@ async def fetch_account_from_cache(
         subaccount_id = client._account_address
 
         # Cache the seed phrase to subaccount_id mapping for 2 hour
-        await redis_client.setex(seed_cache_key, 7200, subaccount_id)
+        await redis_accounts_client.setex(seed_cache_key, 7200, subaccount_id)
         logger.debug(f"Cached seed phrase hash -> {subaccount_id}")
 
     # Try to get cached subaccount data
     cache_key = f"hippius_subaccount_cache:{subaccount_id}"
-    cached_data = await redis_client.get(cache_key)
+    cached_data = await redis_accounts_client.get(cache_key)
 
     if cached_data:
         data = json.loads(cached_data)
@@ -113,9 +112,9 @@ async def fetch_account(
         return cached_account
 
     # Get or cache the subaccount_id from seed phrase
-    redis_client = get_redis(request)
+    redis_accounts_client = get_redis_accounts(request)
     seed_cache_key = f"hippius_seed_to_subaccount:{hash(seed_phrase)}"
-    cached_subaccount_id = await redis_client.get(seed_cache_key)
+    cached_subaccount_id = await redis_accounts_client.get(seed_cache_key)
 
     if cached_subaccount_id:
         subaccount_id = cached_subaccount_id.decode()
@@ -138,7 +137,7 @@ async def fetch_account(
         subaccount_id = client._account_address
 
         # Cache for future use
-        await redis_client.setex(seed_cache_key, 3600, subaccount_id)
+        await redis_accounts_client.setex(seed_cache_key, 3600, subaccount_id)
         logger.debug(f"Cached new subaccount_id: {subaccount_id}")
 
     # If we reach here, it means we have a cache miss for the full subaccount data
@@ -159,7 +158,7 @@ async def fetch_account(
 
     # Check if we have main account credits cached
     main_cache_key = f"hippius_main_account_credits:{main_account}"
-    cached_credits = await redis_client.get(main_cache_key)
+    cached_credits = await redis_accounts_client.get(main_cache_key)
 
     if cached_credits:
         credits_data = json.loads(cached_credits)
@@ -207,7 +206,13 @@ async def check_credit_for_all_operations(request: Request, call_next: Callable)
     if hasattr(request.state, "seed_phrase"):
         seed_phrase = request.state.seed_phrase
 
+        cached_account = None
         try:
+            cached_account = await fetch_account_from_cache(
+                seed_phrase,
+                request,
+            )
+
             request.state.account = await fetch_account(
                 seed_phrase,
                 substrate_url=config.substrate_url,
@@ -244,6 +249,14 @@ async def check_credit_for_all_operations(request: Request, call_next: Callable)
             )
         except Exception as e:
             logger.exception(f"Error in account verification for {request.method} {path}: {e}")
+
+            # Check if this is a cache miss scenario (account not found)
+            if cached_account is None:
+                return s3_error_response(
+                    code="NoSuchKey",
+                    message="Your account does not exist",
+                    status_code=status.HTTP_404_NOT_FOUND,
+                )
 
             # Extract bucket name for better error response
             bucket_name = None
