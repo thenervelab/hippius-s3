@@ -54,7 +54,11 @@ async def get_subaccount_id_from_seed(seed_phrase: str, substrate_url: str) -> s
             url=substrate_url,
         )
         client.connect(seed_phrase=seed_phrase)
-        if client.is_main_account:
+        logger.info(f"Connected to Substrate client {dir(client)=}")
+        if client.is_main_account(
+            account_id=client._account_address,
+            seed_phrase=seed_phrase,
+        ):
             return None
         return client._account_address
 
@@ -96,7 +100,7 @@ async def fetch_account(
         if subaccount_id is None:
             # This is a main account seed phrase, cache False to avoid future lookups
             await redis_accounts_client.set(seed_cache_key, "False")
-            logger.error("Cached main account detection (False) for seed phrase hash")
+            logger.error("Cached main account detection (False)")
             raise MainAccountError("Please use a Hippius subaccount seed phrase for S3 operations")
 
         # Cache the seed phrase to subaccount_id mapping for 2 hour
