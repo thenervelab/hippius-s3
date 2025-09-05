@@ -7,7 +7,6 @@ from typing import Optional
 from typing import Union
 
 import redis.asyncio as async_redis
-
 from hippius_sdk.client import HippiusClient
 
 from hippius_s3.config import Config
