@@ -42,9 +42,9 @@ services:
   ipfs:
     image: ipfs/kubo:latest
     ports:
-      - "4001:4001"      # IPFS swarm port
-      - "5001:5001"      # IPFS API port
-      - "8080:8080"      # IPFS gateway port
+      - "4001:4001" # IPFS swarm port
+      - "5001:5001" # IPFS API port
+      - "8080:8080" # IPFS gateway port
     volumes:
       - ipfs_data:/data/ipfs
     restart: unless-stopped
@@ -96,11 +96,12 @@ services:
     depends_on:
       - redis
     deploy:
-      replicas: 1  # can't scale up otherwise we get transaction conflicts for the same user
+      replicas: 1 # can't scale up otherwise we get transaction conflicts for the same user
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
+      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
 
   unpinner:
     build:
@@ -117,6 +118,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
+      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
 
 volumes:
   postgres_data:
