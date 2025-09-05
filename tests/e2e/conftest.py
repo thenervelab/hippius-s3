@@ -35,27 +35,46 @@ def test_seed_phrase() -> str:
 
 @pytest.fixture(scope="session")
 def compose_project_name(test_run_id: str) -> str:
-    """Unique docker compose project name for isolation."""
-    return f"hippius-e2e-{test_run_id}"
+    """Static docker compose project name for e2e runs."""
+    return "hippius-e2e"
 
 
 @pytest.fixture(scope="session")
 def docker_services(compose_project_name: str) -> Iterator[None]:
-    """Start docker services for e2e tests."""
+    """Ensure e2e services are running for tests.
+
+    Behavior:
+    - Uses a static compose project name for faster hot reload cycles.
+    - If the project is not running, it will be started.
+    - Teardown is controlled by HIPPIUS_E2E_TEARDOWN (default 1). Set to 0 to skip teardown.
+    """
     env = os.environ.copy()
     env["COMPOSE_PROJECT_NAME"] = compose_project_name
+    project_root = str(Path(__file__).resolve().parents[2])
 
-    # Start services with e2e override
-    subprocess.run(
-        ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.e2e.yml", "up", "-d", "--wait"],
-        env=env,
-        check=True,
-        cwd=str(Path(__file__).resolve().parents[2]),
-    )
+    def compose_cmd(args: list[str]) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.e2e.yml", *args],
+            env=env,
+            cwd=project_root,
+            check=False,
+            capture_output=True,
+        )
 
-    # Wait for services to be ready
-    print("Waiting for services to be ready...")
-    time.sleep(15)  # Increased wait time
+    # Determine if environment is already running (any container for this project)
+    ps = compose_cmd(["ps", "-q"])
+    already_running = ps.returncode == 0 and bool(ps.stdout.strip())
+
+    if not already_running:
+        # Start services with e2e override
+        subprocess.run(
+            ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.e2e.yml", "up", "-d", "--wait"],
+            env=env,
+            check=True,
+            cwd=project_root,
+        )
+        print("Waiting for services to be ready...")
+        time.sleep(10)
 
     # Health check for API service
     import requests  # type: ignore[import-untyped]
@@ -75,12 +94,14 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
 
     yield
 
-    # Cleanup
-    subprocess.run(
-        ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.e2e.yml", "down", "-v"],
-        env=env,
-        cwd=str(Path(__file__).resolve().parents[2]),
-    )
+    # Teardown based on env flag (default: teardown)
+    teardown = env.get("HIPPIUS_E2E_TEARDOWN", "1") not in {"0", "false", "FALSE", "no", "NO"}
+    if teardown:
+        subprocess.run(
+            ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.e2e.yml", "down", "-v"],
+            env=env,
+            cwd=project_root,
+        )
 
 
 @pytest.fixture

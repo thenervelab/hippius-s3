@@ -40,6 +40,8 @@ dev = [
     "pre-commit>=3.5.0",
     "minio>=7.1.15",
     "boto3>=1.34.0",
+    "types-boto3",
+    "types-botocore",
     "requests>=2.31.0",
 ]
 
@@ -177,6 +179,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "cachetools.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "redis.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

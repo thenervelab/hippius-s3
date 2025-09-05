@@ -158,6 +158,10 @@ The service implements S3-compatible endpoints:
 
 All endpoints support standard S3 headers and return S3-compatible XML responses.
 
+### S3 Compatibility Matrix
+
+See the compatibility list of supported S3 features in [docs/s3-compatibility.md](docs/s3-compatibility.md).
+
 ## Architecture
 
 ```
