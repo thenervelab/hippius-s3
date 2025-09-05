@@ -953,37 +953,12 @@ async def get_bucket_lifecycle(
                 BucketName=bucket_name,
             )
 
-        # todo
-        # Create a lifecycle configuration with a minimal default rule
-        # This is required for compatibility with the MinIO client
-        # In a complete implementation, we would retrieve the actual configuration from the database
-        root = ET.Element(
-            "LifecycleConfiguration",
-            xmlns="http://s3.amazonaws.com/doc/2006-03-01/",
-        )
-
-        rule = ET.SubElement(root, "Rule")
-        rule_id = ET.SubElement(rule, "ID")
-        rule_id.text = "default-rule"
-        status = ET.SubElement(rule, "Status")
-        status.text = "Enabled"
-        filter_elem = ET.SubElement(rule, "Filter")
-        prefix = ET.SubElement(filter_elem, "Prefix")
-        prefix.text = "tmp/"  # Default prefix
-        expiration = ET.SubElement(rule, "Expiration")
-        days = ET.SubElement(expiration, "Days")
-        days.text = "7"  # Default expiration in days
-
-        xml_content = ET.tostring(
-            root,
-            encoding="UTF-8",
-            xml_declaration=True,
-            pretty_print=True,
-        )
-
-        return Response(
-            content=xml_content,
-            media_type="application/xml",
+        # Not persisted yet: align with AWS and return NoSuchLifecycleConfiguration when not configured
+        return create_xml_error_response(
+            "NoSuchLifecycleConfiguration",
+            "The lifecycle configuration does not exist",
+            status_code=404,
+            BucketName=bucket_name,
         )
 
     except Exception:
@@ -1125,8 +1100,13 @@ async def create_bucket(
 
             try:
                 parsed_xml = ET.fromstring(xml_data)
-                rules = parsed_xml.findall(".//Rule")
-                rule_ids = [rule.find("ID").text for rule in rules if rule.find("ID") is not None]
+                # Accept namespaced and non-namespaced lifecycle XML
+                rules = parsed_xml.xpath(".//*[local-name()='Rule']")  # type: ignore[attr-defined]
+                rule_ids = []
+                for rule in rules:
+                    id_nodes = rule.xpath("./*[local-name()='ID']")  # type: ignore[attr-defined]
+                    if id_nodes and id_nodes[0] is not None and id_nodes[0].text:
+                        rule_ids.append(id_nodes[0].text)
 
                 # todo: For now, just acknowledge receipt
                 logger.info(f"Received lifecycle configuration with {len(rules)} rules: {rule_ids}")
