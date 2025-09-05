@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import re
 from typing import Callable
 
@@ -145,6 +146,22 @@ async def check_credit_for_all_operations(request: Request, call_next: Callable)
     """
     path = request.url.path
 
+    # Test bypass: short-circuit credit and substrate/redis access entirely
+    if os.getenv("HIPPIUS_BYPASS_CREDIT_CHECK", "false").lower() == "true":
+        # Ensure downstream code has an account object
+        from contextlib import suppress
+
+        with suppress(Exception):
+            request.state.account = HippiusAccount(
+                seed=getattr(request.state, "seed_phrase", ""),
+                id="bypass",
+                main_account="bypass",
+                has_credits=True,
+                upload=True,
+                delete=True,
+            )
+        return await call_next(request)
+
     # Skip credit checks for frontend user endpoints and docs
     if path.startswith("/user/") or path in ["/docs", "/openapi.json", "/redoc"] or path.startswith("/docs/"):
         return await call_next(request)
@@ -166,9 +183,11 @@ async def check_credit_for_all_operations(request: Request, call_next: Callable)
                 if not request.state.account.delete and request.method == "DELETE":
                     raise BadAccount("This account does not have DELETE permissions")
 
-                if not request.state.account.has_credits:
+                # Bypass for testing if enabled
+                if os.getenv("HIPPIUS_BYPASS_CREDIT_CHECK", "false").lower() == "true":
+                    logger.info("Credit check bypassed for testing")
+                elif not request.state.account.has_credits:
                     logger.warning(f"Account does not have credit for {request.method} operation: {path}")
-
                     # Extract bucket name for better error response
                     bucket_name = None
                     bucket_match = re.match(r"^/([^/]+)", path)
@@ -201,7 +220,6 @@ async def check_credit_for_all_operations(request: Request, call_next: Callable)
                 message="Something went wrong when verifying your account. Please try again later.",
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
-
     # Continue with the request
     response: Response = await call_next(request)
     return response

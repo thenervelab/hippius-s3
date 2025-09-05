@@ -1,0 +1,16 @@
+services:
+  api:
+    environment:
+      - HIPPIUS_BYPASS_CREDIT_CHECK=true
+      - HIPPIUS_PUBLISH_MODE=ipfs_only
+      - ENABLE_REQUEST_PROFILING=false
+  pinner:
+    environment:
+      - ENABLE_REQUEST_PROFILING=false
+      - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
+      - HIPPIUS_PUBLISH_MODE=ipfs_only
+  unpinner:
+    environment:
+      - ENABLE_REQUEST_PROFILING=false
+      - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
+      - HIPPIUS_PUBLISH_MODE=ipfs_only
