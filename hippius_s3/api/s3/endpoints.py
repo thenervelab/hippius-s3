@@ -1234,12 +1234,20 @@ async def create_bucket(
     # Handle standard bucket creation if not a tagging, lifecycle, or policy request
     else:
         try:
+            # Reject ACLs to match AWS when ObjectOwnership is BucketOwnerEnforced
+            acl_header = request.headers.get("x-amz-acl")
+            if acl_header:
+                return create_xml_error_response(
+                    "InvalidBucketAclWithObjectOwnership",
+                    "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting",
+                    status_code=400,
+                )
+
             bucket_id = str(uuid.uuid4())
             created_at = datetime.now(UTC)
 
-            # Check if bucket should be public based on ACL header
-            acl_header = request.headers.get("x-amz-acl", "private")
-            is_public = acl_header in ["public-read", "public-read-write"]
+            # Bucket public/private is managed via policy, not ACL
+            is_public = False
 
             # Get or create user record for the main account
             main_account_id = request.state.account.main_account

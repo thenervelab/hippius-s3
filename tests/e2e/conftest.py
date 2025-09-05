@@ -48,6 +48,11 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
     - If the project is not running, it will be started.
     - Teardown is controlled by HIPPIUS_E2E_TEARDOWN (default 1). Set to 0 to skip teardown.
     """
+    # When running against real AWS, do not start local docker compose stack
+    if os.getenv("RUN_REAL_AWS") == "1":
+        yield
+        return
+
     env = os.environ.copy()
     env["COMPOSE_PROJECT_NAME"] = compose_project_name
     project_root = str(Path(__file__).resolve().parents[2])
