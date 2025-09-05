@@ -53,9 +53,9 @@ async def cors_middleware(
     # CSP and other headers...
     path = request.url.path
     if path in ["/docs", "/redoc"] or path.startswith("/docs/"):
-        response.headers[
-            "Content-Security-Policy"
-        ] = "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: https:; frame-ancestors 'none';"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: https:; frame-ancestors 'none';"
+        )
     else:
         response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none';"
 
