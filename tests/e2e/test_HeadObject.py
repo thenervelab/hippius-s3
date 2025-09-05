@@ -4,8 +4,6 @@ import time
 from typing import Any
 from typing import Callable
 
-import pytest
-
 
 def test_head_object_returns_metadata(
     docker_services: Any,
@@ -46,4 +44,3 @@ def test_head_object_returns_metadata(
     assert resp["ContentType"] == content_type
     assert resp["ContentLength"] == len(content)
     assert resp["Metadata"]["test-meta"] == "test-value"
-

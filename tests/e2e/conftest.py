@@ -52,8 +52,6 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
     env["COMPOSE_PROJECT_NAME"] = compose_project_name
     project_root = str(Path(__file__).resolve().parents[2])
 
-    started_here = False
-
     def compose_cmd(args: list[str]) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
             ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.e2e.yml", *args],
@@ -75,7 +73,6 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
             check=True,
             cwd=project_root,
         )
-        started_here = True
         print("Waiting for services to be ready...")
         time.sleep(10)
 

@@ -3,8 +3,6 @@
 from typing import Any
 from typing import Callable
 
-import pytest
-
 
 def test_put_object_returns_etag(
     docker_services: Any,
@@ -28,4 +26,3 @@ def test_put_object_returns_etag(
 
     assert "ETag" in response
     assert isinstance(response["ETag"], str)
-

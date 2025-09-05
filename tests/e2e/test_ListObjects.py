@@ -3,8 +3,6 @@
 from typing import Any
 from typing import Callable
 
-import pytest
-
 
 def test_list_objects_with_prefix(
     docker_services: Any,
@@ -34,4 +32,3 @@ def test_list_objects_with_prefix(
     pref = boto3_client.list_objects_v2(Bucket=bucket_name, Prefix="docs/")
     pref_keys = {o["Key"] for o in pref.get("Contents", [])}
     assert pref_keys == {"docs/readme.txt", "docs/guide.txt"}
-

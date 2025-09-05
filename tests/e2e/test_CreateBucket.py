@@ -11,6 +11,7 @@ from typing import Any
 from typing import Callable
 
 import pytest
+from botocore.exceptions import ClientError
 
 
 @pytest.mark.parametrize("acl_header,is_public", [("private", False), ("public-read", True)])
@@ -47,8 +48,8 @@ def test_create_bucket_head_list_location(
     constraint = loc.get("LocationConstraint")
     assert constraint in (None, "us-east-1", "EU", "") or isinstance(constraint, str)
 
-    # Creating the same bucket again should raise an error
-    with pytest.raises(Exception):
+    # Creating the same bucket again should raise a client error (conflict)
+    with pytest.raises(ClientError) as excinfo:
         boto3_client.create_bucket(Bucket=bucket_name)
-
-
+    code = excinfo.value.response.get("Error", {}).get("Code")
+    assert code in {"BucketAlreadyExists", "BucketAlreadyOwnedByYou"}

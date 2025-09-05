@@ -4,6 +4,7 @@ from typing import Any
 from typing import Callable
 
 import pytest
+from botocore.exceptions import ClientError
 
 
 def test_delete_object_idempotent(
@@ -34,7 +35,8 @@ def test_delete_object_idempotent(
     assert resp2["ResponseMetadata"]["HTTPStatusCode"] in (200, 204)
 
     # And head should now fail
-    with pytest.raises(Exception):
+    with pytest.raises(ClientError) as excinfo:
         boto3_client.head_object(Bucket=bucket_name, Key=key)
-
-
+    # Expect a 404-style error
+    status = excinfo.value.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    assert status in (404,)

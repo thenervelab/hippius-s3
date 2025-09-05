@@ -4,8 +4,6 @@ import time
 from typing import Any
 from typing import Callable
 
-import pytest
-
 
 def test_get_object_downloads_and_matches_headers(
     docker_services: Any,
@@ -48,4 +46,3 @@ def test_get_object_downloads_and_matches_headers(
     assert resp["Metadata"]["test-meta"] == "test-value"
     assert "ETag" in resp
     assert "LastModified" in resp
-
