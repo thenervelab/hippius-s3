@@ -24,6 +24,26 @@ These bypasses allow tests to run without:
 pytest tests/e2e/ -v
 ```
 
+### Run against real AWS (optional)
+
+You can run the same tests against AWS S3 to validate test expectations.
+
+Requirements:
+
+- AWS credentials configured (env vars, default profile, or other supported methods)
+- A region with S3 enabled (default: us-east-1)
+
+Command:
+
+```bash
+RUN_REAL_AWS=1 AWS_REGION=us-east-1 pytest tests/e2e -v -m 'not local_only'
+```
+
+Notes:
+
+- Some tests may be marked `local_only` if they exercise Hippius-specific endpoints/behaviors.
+- Buckets are created with globally unique names and cleaned up after tests, but charges may apply.
+
 ## Making Tests Truly E2E (Removing Bypasses)
 
 To make the tests truly end-to-end, you need to:

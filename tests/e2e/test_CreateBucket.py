@@ -51,5 +51,6 @@ def test_create_bucket_head_list_location(
     # Creating the same bucket again should raise a client error (conflict)
     with pytest.raises(ClientError) as excinfo:
         boto3_client.create_bucket(Bucket=bucket_name)
-    code = excinfo.value.response.get("Error", {}).get("Code")
+    # boto3 may put the error code in different locations depending on parsing
+    code = excinfo.value.response.get("Error", {}).get("Code") or excinfo.value.response.get("Code")
     assert code in {"BucketAlreadyExists", "BucketAlreadyOwnedByYou"}
