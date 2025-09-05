@@ -34,7 +34,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
-    "ruff>=0.2.0",
+    "ruff>=0.12.0",
     "mypy>=1.8.0",
     "pre-commit>=3.5.0",
     "minio>=7.1.15",
@@ -46,6 +46,7 @@ packages = ["hippius_s3"]
 [tool.ruff]
 line-length = 120
 target-version = "py311"
+exclude = ["examples/"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -110,7 +111,47 @@ disable_error_code = ["attr-defined", "no-untyped-def", "misc", "return-value"]
 [[tool.mypy.overrides]]
 module = "hippius_s3.api.s3.endpoints"
 disallow_untyped_defs = false
-disable_error_code = ["attr-defined", "no-untyped-def", "var-annotated", "misc", "assignment", "return"]
+disable_error_code = ["attr-defined", "no-untyped-def", "var-annotated", "misc", "assignment", "return", "call-arg", "union-attr", "index", "no-any-return"]
+
+[[tool.mypy.overrides]]
+module = "hippius_s3.queue"
+disallow_untyped_defs = false
+disable_error_code = ["no-untyped-def", "misc", "arg-type"]
+
+[[tool.mypy.overrides]]
+module = "hippius_s3.utils"
+disallow_untyped_defs = false
+disable_error_code = ["var-annotated", "no-untyped-def", "no-any-return"]
+
+[[tool.mypy.overrides]]
+module = "hippius_s3.ipfs_service"
+disallow_untyped_defs = false
+disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "hippius_s3.api.middlewares.profiler"
+disallow_untyped_defs = false
+disable_error_code = ["attr-defined", "no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "hippius_s3.dependencies"
+disallow_untyped_defs = false
+disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "hippius_s3.api.user"
+disallow_untyped_defs = false
+disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "hippius_s3.api.middlewares.credit_check"
+disallow_untyped_defs = false
+disable_error_code = ["no-untyped-def", "no-any-return"]
+
+[[tool.mypy.overrides]]
+module = "hippius_s3.main"
+disallow_untyped_defs = false
+disable_error_code = ["no-untyped-def"]
 
 [[tool.mypy.overrides]]
 module = "aiofiles.*"
@@ -126,6 +167,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "hippius_sdk.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "cachetools.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

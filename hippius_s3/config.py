@@ -53,6 +53,9 @@ class Config:
     # Redis for caching/rate limiting
     redis_url: str = env("REDIS_URL")
 
+    # Redis for account caching (persistent)
+    redis_accounts_url: str = env("REDIS_ACCOUNTS_URL")
+
     # API signing key for pre-signed URLs
     # Generated on first run if not provided
     api_signing_key: str = env("API_SIGNING_KEY:" + str(uuid.uuid4()))
