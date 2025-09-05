@@ -45,11 +45,18 @@ def test_single_file_upload_download(
         )
         print(f"Uploaded object: {bucket_name}/{object_key}")
 
-        # Wait a moment for consistency
-        time.sleep(2)
-
-        # Verify upload by getting object
-        response = boto3_client.get_object(Bucket=bucket_name, Key=object_key)
+        # Wait for eventual consistency / background processing
+        deadline = time.time() + 30
+        last_exc: Exception | None = None
+        while time.time() < deadline:
+            try:
+                response = boto3_client.get_object(Bucket=bucket_name, Key=object_key)
+                break
+            except Exception as e:  # noqa: PERF203
+                last_exc = e
+                time.sleep(0.5)
+        else:
+            raise last_exc if last_exc else RuntimeError("GET object did not become available in time")
 
         # Check response
         assert response["Body"].read() == test_content
