@@ -1,3 +1,4 @@
+-- migrate:up
 -- Add object_id column to parts table to link parts directly to objects
 ALTER TABLE parts ADD COLUMN object_id UUID REFERENCES objects(object_id) ON DELETE CASCADE;
 

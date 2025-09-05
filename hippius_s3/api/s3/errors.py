@@ -44,7 +44,7 @@ def s3_error_response(code: str, message: str, request_id: str = "", status_code
         request_id = str(uuid.uuid4())
 
     # Create XML using lxml for better compatibility with S3 clients
-    root = ET.Element("Error", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+    root = ET.Element("Error")
 
     code_elem = ET.SubElement(root, "Code")
     code_elem.text = code
@@ -58,7 +58,7 @@ def s3_error_response(code: str, message: str, request_id: str = "", status_code
     host_id_elem = ET.SubElement(root, "HostId")
     host_id_elem.text = "hippius-s3"
 
-    # Add any additional elements
+    # Add any additional elements inside the Error element
     for key, value in kwargs.items():
         elem = ET.SubElement(root, key)
         elem.text = str(value)

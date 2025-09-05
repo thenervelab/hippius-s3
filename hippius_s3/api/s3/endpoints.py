@@ -1238,11 +1238,10 @@ async def create_bucket(
             return Response(status_code=200)
 
         except asyncpg.UniqueViolationError:
-            return create_xml_error_response(
+            return errors.s3_error_response(
                 "BucketAlreadyExists",
                 f"The requested bucket {bucket_name} already exists",
                 status_code=409,
-                BucketName=bucket_name,
             )
         except Exception:
             logger.exception("Error creating bucket via S3 protocol")

@@ -4,6 +4,7 @@ services:
       - HIPPIUS_BYPASS_CREDIT_CHECK=true
       - HIPPIUS_PUBLISH_MODE=ipfs_only
       - ENABLE_REQUEST_PROFILING=false
+      - RATE_LIMIT_PER_MINUTE=1000
   pinner:
     environment:
       - ENABLE_REQUEST_PROFILING=false
@@ -15,4 +16,9 @@ services:
       - ENABLE_REQUEST_PROFILING=false
       - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - HIPPIUS_PUBLISH_MODE=ipfs_only
+      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
+  downloader:
+    environment:
+      - ENABLE_REQUEST_PROFILING=false
+      - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
