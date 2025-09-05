@@ -34,7 +34,7 @@ Notes:
 | DeleteBucketReplication                         |           |                                                           |                                               |
 | DeleteBucketTagging                             | ✔         | Deletes all tags                                          | DELETE /{bucket}?tagging                      |
 | DeleteBucketWebsite                             |           |                                                           |                                               |
-| DeleteObject                                    | ✔         | Idempotent 204                                            | DELETE /{bucket}/{key}                        |                      |
+| DeleteObject                                    | ✔         | Idempotent 204                                            | DELETE /{bucket}/{key}                        | test_DeleteObject.py |
 | DeleteObjects                                   |           | Batch delete not supported                                |                                               |
 | DeleteObjectTagging                             | ✔         | Deletes all tags                                          | DELETE /{bucket}/{key}?tagging                |
 | DeletePublicAccessBlock                         |           |                                                           |                                               |
