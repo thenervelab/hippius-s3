@@ -47,7 +47,7 @@ async def process_download_request(
                 # Download the chunk using hippius_sdk
                 chunk_data = await hippius_client.s3_download(
                     cid=chunk.cid,
-                    subaccount_id=download_request.address,
+                    subaccount_id=download_request.subaccount,
                     bucket_name=download_request.bucket_name,
                     auto_decrypt=download_request.should_decrypt,
                     download_node=download_request.ipfs_node,
