@@ -48,6 +48,11 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
     - If the project is not running, it will be started.
     - Teardown is controlled by HIPPIUS_E2E_TEARDOWN (default 1). Set to 0 to skip teardown.
     """
+    # When running against real AWS, do not start local docker compose stack
+    if os.getenv("RUN_REAL_AWS") == "1":
+        yield
+        return
+
     env = os.environ.copy()
     env["COMPOSE_PROJECT_NAME"] = compose_project_name
     project_root = str(Path(__file__).resolve().parents[2])
@@ -106,7 +111,21 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
 
 @pytest.fixture
 def boto3_client(test_seed_phrase: str) -> Any:
-    """Create a boto3 S3 client configured for testing."""
+    """Create a boto3 S3 client configured for testing.
+
+    RUN_REAL_AWS=1 to run against real AWS. Otherwise uses local endpoint.
+    """
+    if os.getenv("RUN_REAL_AWS") == "1":
+        return boto3.client(
+            "s3",
+            region_name=os.getenv("AWS_REGION", "us-east-1"),
+            config=Config(
+                signature_version="s3v4",
+                # Use default virtual host addressing on AWS
+            ),
+            # Credentials resolved via default AWS chain
+        )
+
     access_key = base64.b64encode(test_seed_phrase.encode()).decode()
     secret_key = test_seed_phrase
 

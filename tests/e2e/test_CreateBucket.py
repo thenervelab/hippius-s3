@@ -14,23 +14,17 @@ import pytest
 from botocore.exceptions import ClientError
 
 
-@pytest.mark.parametrize("acl_header,is_public", [("private", False), ("public-read", True)])
 def test_create_bucket_head_list_location(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
-    acl_header: str,
-    is_public: bool,
 ) -> None:
     bucket_name = unique_bucket_name("create-bucket")
     cleanup_buckets(bucket_name)
 
-    # Create bucket with optional ACL header
-    if acl_header == "private":
-        boto3_client.create_bucket(Bucket=bucket_name)
-    else:
-        boto3_client.create_bucket(Bucket=bucket_name, ACL=acl_header)
+    # Create bucket (no ACL to match modern AWS behavior with ObjectOwnership enforced)
+    boto3_client.create_bucket(Bucket=bucket_name)
 
     # HeadBucket should succeed
     boto3_client.head_bucket(Bucket=bucket_name)
@@ -48,8 +42,27 @@ def test_create_bucket_head_list_location(
     constraint = loc.get("LocationConstraint")
     assert constraint in (None, "us-east-1", "EU", "") or isinstance(constraint, str)
 
-    # Creating the same bucket again should raise a client error (conflict)
-    with pytest.raises(ClientError) as excinfo:
+    # Creating the same bucket again: some S3 deployments return a conflict error, some are idempotent
+    try:
         boto3_client.create_bucket(Bucket=bucket_name)
-    code = excinfo.value.response.get("Error", {}).get("Code")
-    assert code in {"BucketAlreadyExists", "BucketAlreadyOwnedByYou"}
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code") or exc.response.get("Code")
+        assert code in {"BucketAlreadyExists", "BucketAlreadyOwnedByYou"}
+    else:
+        # If no error, ensure bucket still accessible
+        boto3_client.head_bucket(Bucket=bucket_name)
+
+
+def test_create_bucket_rejects_acl_with_object_ownership(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+) -> None:
+    """Creating a bucket with ACL must fail under BucketOwnerEnforced ownership."""
+    bucket_name = unique_bucket_name("create-bucket-acl")
+
+    with pytest.raises(ClientError) as excinfo:
+        boto3_client.create_bucket(Bucket=bucket_name, ACL="public-read")
+
+    code = excinfo.value.response.get("Error", {}).get("Code") or excinfo.value.response.get("Code")
+    assert code == "InvalidBucketAclWithObjectOwnership"

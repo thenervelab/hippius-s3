@@ -150,7 +150,7 @@ def create_xml_error_response(
     **kwargs,
 ) -> Response:
     """Generate a standardized XML error response using lxml."""
-    error_root = ET.Element("e")
+    error_root = ET.Element("Error", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
 
     code_elem = ET.SubElement(error_root, "Code")
     code_elem.text = code
@@ -162,9 +162,10 @@ def create_xml_error_response(
         elem = ET.SubElement(error_root, key)
         elem.text = str(value)
 
+    # Add RequestId and HostId if not provided
     if "RequestId" not in kwargs:
         request_id = ET.SubElement(error_root, "RequestId")
-        request_id.text = "N/A"
+        request_id.text = str(uuid.uuid4())
 
     if "HostId" not in kwargs:
         host_id = ET.SubElement(error_root, "HostId")
@@ -181,6 +182,10 @@ def create_xml_error_response(
         content=xml_error,
         media_type="application/xml",
         status_code=status_code,
+        headers={
+            "Content-Type": "application/xml; charset=utf-8",
+            "x-amz-request-id": str(uuid.uuid4()),
+        },
     )
 
 
@@ -292,6 +297,15 @@ async def get_bucket(
             tags = bucket.get("tags", {})
             if isinstance(tags, str):
                 tags = json.loads(tags)
+
+            # If no tags present, S3 returns
+            if not tags:
+                return errors.s3_error_response(
+                    code="NoSuchTagSet",
+                    message="The TagSet does not exist",
+                    status_code=404,
+                    BucketName=bucket_name,
+                )
 
             # Add tags to the XML response
             for key, value in tags.items():
@@ -676,17 +690,23 @@ async def set_object_tags(
                 # Parse XML using lxml
                 root = ET.fromstring(xml_data)
 
-                # Extract tags
+                # Use S3 namespace for Tagging XML
+                ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
                 tag_dict = {}
-                # Find all Tag elements under TagSet
-                tag_elements = root.findall(".//TagSet/Tag")
+                tag_elements = root.xpath(".//s3:Tag", namespaces=ns)  # type: ignore[attr-defined]
 
                 for tag_elem in tag_elements:
-                    key_elem = tag_elem.find("Key")
-                    value_elem = tag_elem.find("Value")
-
-                    if key_elem is not None and key_elem.text and value_elem is not None and value_elem.text:
-                        tag_dict[key_elem.text] = value_elem.text
+                    key_nodes = tag_elem.xpath("./s3:Key", namespaces=ns)  # type: ignore[attr-defined]
+                    value_nodes = tag_elem.xpath("./s3:Value", namespaces=ns)  # type: ignore[attr-defined]
+                    if (
+                        key_nodes
+                        and value_nodes
+                        and key_nodes[0] is not None
+                        and value_nodes[0] is not None
+                        and key_nodes[0].text
+                        and value_nodes[0].text
+                    ):
+                        tag_dict[str(key_nodes[0].text)] = str(value_nodes[0].text)
             except Exception:
                 logger.exception("Error parsing XML tags")
                 return create_xml_error_response(
@@ -768,8 +788,13 @@ async def delete_object_tags(
         )
 
         if not object_info:
-            # S3 returns 204 even if the object doesn't exist for DELETE operations
-            return Response(status_code=204)
+            # For S3 compatibility, return NoSuchKey when deleting tags for a missing object
+            return create_xml_error_response(
+                "NoSuchKey",
+                f"The specified key {object_key} does not exist",
+                status_code=404,
+                Key=object_key,
+            )
 
         # Update the object's metadata to remove tags
         metadata = object_info.get("metadata", {})
@@ -1157,20 +1182,26 @@ async def create_bucket(
                 tag_dict = {}
             else:
                 try:
-                    # Parse XML using lxml
+                    # Parse XML using lxml with S3 namespace
                     root = ET.fromstring(xml_data)
+                    ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
 
-                    # Extract tags
+                    # Namespace-qualified selection
                     tag_dict = {}
-                    # Find all Tag elements under TagSet
-                    tag_elements = root.findall(".//TagSet/Tag")
+                    tag_elements = root.xpath(".//s3:Tag", namespaces=ns)  # type: ignore[attr-defined]
 
                     for tag_elem in tag_elements:
-                        key_elem = tag_elem.find("Key")
-                        value_elem = tag_elem.find("Value")
-
-                        if key_elem is not None and key_elem.text and value_elem is not None and value_elem.text:
-                            tag_dict[key_elem.text] = value_elem.text
+                        key_nodes = tag_elem.xpath("./s3:Key", namespaces=ns)  # type: ignore[attr-defined]
+                        value_nodes = tag_elem.xpath("./s3:Value", namespaces=ns)  # type: ignore[attr-defined]
+                        if (
+                            key_nodes
+                            and value_nodes
+                            and key_nodes[0] is not None
+                            and value_nodes[0] is not None
+                            and key_nodes[0].text
+                            and value_nodes[0].text
+                        ):
+                            tag_dict[str(key_nodes[0].text)] = str(value_nodes[0].text)
                 except Exception:
                     logger.exception("Error parsing XML tags")
                     return create_xml_error_response(
@@ -1203,12 +1234,20 @@ async def create_bucket(
     # Handle standard bucket creation if not a tagging, lifecycle, or policy request
     else:
         try:
+            # Reject ACLs to match AWS when ObjectOwnership is BucketOwnerEnforced
+            acl_header = request.headers.get("x-amz-acl")
+            if acl_header:
+                return create_xml_error_response(
+                    "InvalidBucketAclWithObjectOwnership",
+                    "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting",
+                    status_code=400,
+                )
+
             bucket_id = str(uuid.uuid4())
             created_at = datetime.now(UTC)
 
-            # Check if bucket should be public based on ACL header
-            acl_header = request.headers.get("x-amz-acl", "private")
-            is_public = acl_header in ["public-read", "public-read-write"]
+            # Bucket public/private is managed via policy, not ACL
+            is_public = False
 
             # Get or create user record for the main account
             main_account_id = request.state.account.main_account
