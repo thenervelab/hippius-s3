@@ -9,6 +9,7 @@ services:
       - db
       - ipfs
       - redis
+      - redis-accounts
     volumes:
       - .:/app
     restart: unless-stopped
@@ -18,6 +19,8 @@ services:
       - DEBUG=true
       - HIPPIUS_IPFS_GET_URL=https://get.hippius.network
       - HIPPIUS_IPFS_STORE_URL=https://store.hippius.network
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
 
   db:
     image: postgres:15
@@ -39,9 +42,9 @@ services:
   ipfs:
     image: ipfs/kubo:latest
     ports:
-      - "4001:4001"      # IPFS swarm port
-      - "5001:5001"      # IPFS API port
-      - "8080:8080"      # IPFS gateway port
+      - "4001:4001" # IPFS swarm port
+      - "5001:5001" # IPFS API port
+      - "8080:8080" # IPFS gateway port
     volumes:
       - ipfs_data:/data/ipfs
     restart: unless-stopped
@@ -68,6 +71,21 @@ services:
       timeout: 3s
       retries: 5
 
+  redis-accounts:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - redis_accounts_data:/data
+      - ./redis.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   pinner:
     build:
       context: .
@@ -78,11 +96,12 @@ services:
     depends_on:
       - redis
     deploy:
-      replicas: 1  # can't scale up otherwise we get transaction conflicts for the same user
+      replicas: 1 # can't scale up otherwise we get transaction conflicts for the same user
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
+      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
 
   unpinner:
     build:
@@ -99,6 +118,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
+      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
 
   downloader:
     build:
@@ -111,7 +131,7 @@ services:
       - redis
       - db
     deploy:
-      replicas: 1
+      replicas: 3
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
@@ -121,3 +141,4 @@ volumes:
   postgres_data:
   ipfs_data:
   redis_data:
+  redis_accounts_data:

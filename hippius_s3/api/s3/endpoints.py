@@ -4,9 +4,14 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import re
 import uuid
 from datetime import UTC
 from datetime import datetime
+from typing import Dict
+from typing import List
+from typing import Tuple
 
 import asyncpg
 import fastapi
@@ -137,6 +142,99 @@ def _handle_range_request(
         )
 
 
+def parse_range_header(range_header: str, total_size: int) -> Tuple[int, int]:
+    """Parse Range header and return start and end bytes."""
+    # Support both "bytes=start-end" and "bytes=start-" (open-ended)
+    range_match = re.match(r"bytes=(\d+)-(\d*)", range_header.lower())
+    if not range_match:
+        raise ValueError(f"Invalid range format: {range_header}")
+
+    start = int(range_match.group(1))
+    end_str = range_match.group(2)
+
+    # Open-ended range: "bytes=start-" means from start to end of file
+    end = int(end_str) if end_str else total_size - 1
+
+    return start, end
+
+
+def calculate_chunks_for_range(start_byte: int, end_byte: int, parts_info: List[Dict]) -> List[int]:
+    """Calculate which parts contain the requested byte range."""
+    needed_parts = []
+    current_offset = 0
+
+    for part in parts_info:
+        part_start = current_offset
+        part_end = current_offset + part["size_bytes"] - 1
+
+        # Check if this part overlaps with requested range
+        if part_end >= start_byte and part_start <= end_byte:
+            needed_parts.append(part["part_number"])
+
+        current_offset += part["size_bytes"]
+
+        # Stop if we've passed the end of requested range
+        if part_start > end_byte:
+            break
+
+    return needed_parts
+
+
+def extract_range_from_chunks(
+    chunks_data: List[bytes], start_byte: int, end_byte: int, parts_info: List[Dict], needed_parts: List[int]
+) -> bytes:
+    """Extract the specific byte range from downloaded chunks."""
+    current_offset = 0
+    range_data = b""
+    chunk_idx = 0
+
+    logger.debug(f"Starting range extraction: {start_byte}-{end_byte}")
+
+    for part in parts_info:
+        part_start = current_offset
+        part_end = current_offset + part["size_bytes"] - 1
+
+        logger.debug(
+            f"Processing part {part['part_number']}: offset {part_start}-{part_end}, size {part['size_bytes']}"
+        )
+
+        if part["part_number"] in needed_parts:
+            chunk_data = chunks_data[chunk_idx]
+
+            # Calculate precise slice boundaries within this chunk
+            # slice_start: where to start reading within this chunk (0-based)
+            slice_start = max(0, start_byte - part_start)
+            # slice_end: where to stop reading within this chunk (exclusive, for slicing)
+            slice_end = min(part["size_bytes"], end_byte - part_start + 1)
+
+            logger.debug(
+                f"Part {part['part_number']}: slice_start={slice_start}, slice_end={slice_end}, chunk_len={len(chunk_data)}"
+            )
+
+            # Extract the slice and add to range data
+            chunk_slice = chunk_data[slice_start:slice_end]
+            logger.debug(f"Part {part['part_number']}: extracted {len(chunk_slice)} bytes")
+            range_data += chunk_slice
+            chunk_idx += 1
+
+        current_offset += part["size_bytes"]
+
+        # Stop if we've passed the end of requested range
+        if current_offset > end_byte:
+            break
+
+    # Verify we extracted exactly the right amount
+    expected_length = end_byte - start_byte + 1
+    if len(range_data) != expected_length:
+        logger.error(f"Range extraction mismatch: got {len(range_data)} bytes, expected {expected_length}")
+        logger.error(
+            f"Range: {start_byte}-{end_byte}, Parts info: {[(p['part_number'], p['size_bytes']) for p in parts_info]}"
+        )
+        logger.error(f"Needed parts: {needed_parts}, Chunks data lengths: {[len(c) for c in chunks_data]}")
+
+    return range_data
+
+
 config = get_config()
 security = HTTPBearer()
 router = APIRouter(tags=["s3"])
@@ -154,7 +252,7 @@ def create_xml_error_response(
     **kwargs,
 ) -> Response:
     """Generate a standardized XML error response using lxml."""
-    error_root = ET.Element("e")
+    error_root = ET.Element("Error", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
 
     code_elem = ET.SubElement(error_root, "Code")
     code_elem.text = code
@@ -166,9 +264,10 @@ def create_xml_error_response(
         elem = ET.SubElement(error_root, key)
         elem.text = str(value)
 
+    # Add RequestId and HostId if not provided
     if "RequestId" not in kwargs:
         request_id = ET.SubElement(error_root, "RequestId")
-        request_id.text = "N/A"
+        request_id.text = str(uuid.uuid4())
 
     if "HostId" not in kwargs:
         host_id = ET.SubElement(error_root, "HostId")
@@ -185,6 +284,10 @@ def create_xml_error_response(
         content=xml_error,
         media_type="application/xml",
         status_code=status_code,
+        headers={
+            "Content-Type": "application/xml; charset=utf-8",
+            "x-amz-request-id": str(uuid.uuid4()),
+        },
     )
 
 
@@ -296,6 +399,15 @@ async def get_bucket(
             tags = bucket.get("tags", {})
             if isinstance(tags, str):
                 tags = json.loads(tags)
+
+            # If no tags present, S3 returns
+            if not tags:
+                return errors.s3_error_response(
+                    code="NoSuchTagSet",
+                    message="The TagSet does not exist",
+                    status_code=404,
+                    BucketName=bucket_name,
+                )
 
             # Add tags to the XML response
             for key, value in tags.items():
@@ -680,17 +792,23 @@ async def set_object_tags(
                 # Parse XML using lxml
                 root = ET.fromstring(xml_data)
 
-                # Extract tags
+                # Use S3 namespace for Tagging XML
+                ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
                 tag_dict = {}
-                # Find all Tag elements under TagSet
-                tag_elements = root.findall(".//TagSet/Tag")
+                tag_elements = root.xpath(".//s3:Tag", namespaces=ns)  # type: ignore[attr-defined]
 
                 for tag_elem in tag_elements:
-                    key_elem = tag_elem.find("Key")
-                    value_elem = tag_elem.find("Value")
-
-                    if key_elem is not None and key_elem.text and value_elem is not None and value_elem.text:
-                        tag_dict[key_elem.text] = value_elem.text
+                    key_nodes = tag_elem.xpath("./s3:Key", namespaces=ns)  # type: ignore[attr-defined]
+                    value_nodes = tag_elem.xpath("./s3:Value", namespaces=ns)  # type: ignore[attr-defined]
+                    if (
+                        key_nodes
+                        and value_nodes
+                        and key_nodes[0] is not None
+                        and value_nodes[0] is not None
+                        and key_nodes[0].text
+                        and value_nodes[0].text
+                    ):
+                        tag_dict[str(key_nodes[0].text)] = str(value_nodes[0].text)
             except Exception:
                 logger.exception("Error parsing XML tags")
                 return create_xml_error_response(
@@ -772,8 +890,13 @@ async def delete_object_tags(
         )
 
         if not object_info:
-            # S3 returns 204 even if the object doesn't exist for DELETE operations
-            return Response(status_code=204)
+            # For S3 compatibility, return NoSuchKey when deleting tags for a missing object
+            return create_xml_error_response(
+                "NoSuchKey",
+                f"The specified key {object_key} does not exist",
+                status_code=404,
+                Key=object_key,
+            )
 
         # Update the object's metadata to remove tags
         metadata = object_info.get("metadata", {})
@@ -932,37 +1055,12 @@ async def get_bucket_lifecycle(
                 BucketName=bucket_name,
             )
 
-        # todo
-        # Create a lifecycle configuration with a minimal default rule
-        # This is required for compatibility with the MinIO client
-        # In a complete implementation, we would retrieve the actual configuration from the database
-        root = ET.Element(
-            "LifecycleConfiguration",
-            xmlns="http://s3.amazonaws.com/doc/2006-03-01/",
-        )
-
-        rule = ET.SubElement(root, "Rule")
-        rule_id = ET.SubElement(rule, "ID")
-        rule_id.text = "default-rule"
-        status = ET.SubElement(rule, "Status")
-        status.text = "Enabled"
-        filter_elem = ET.SubElement(rule, "Filter")
-        prefix = ET.SubElement(filter_elem, "Prefix")
-        prefix.text = "tmp/"  # Default prefix
-        expiration = ET.SubElement(rule, "Expiration")
-        days = ET.SubElement(expiration, "Days")
-        days.text = "7"  # Default expiration in days
-
-        xml_content = ET.tostring(
-            root,
-            encoding="UTF-8",
-            xml_declaration=True,
-            pretty_print=True,
-        )
-
-        return Response(
-            content=xml_content,
-            media_type="application/xml",
+        # Not persisted yet: align with AWS and return NoSuchLifecycleConfiguration when not configured
+        return create_xml_error_response(
+            "NoSuchLifecycleConfiguration",
+            "The lifecycle configuration does not exist",
+            status_code=404,
+            BucketName=bucket_name,
         )
 
     except Exception:
@@ -1104,8 +1202,13 @@ async def create_bucket(
 
             try:
                 parsed_xml = ET.fromstring(xml_data)
-                rules = parsed_xml.findall(".//Rule")
-                rule_ids = [rule.find("ID").text for rule in rules if rule.find("ID") is not None]
+                # Accept namespaced and non-namespaced lifecycle XML
+                rules = parsed_xml.xpath(".//*[local-name()='Rule']")  # type: ignore[attr-defined]
+                rule_ids = []
+                for rule in rules:
+                    id_nodes = rule.xpath("./*[local-name()='ID']")  # type: ignore[attr-defined]
+                    if id_nodes and id_nodes[0] is not None and id_nodes[0].text:
+                        rule_ids.append(id_nodes[0].text)
 
                 # todo: For now, just acknowledge receipt
                 logger.info(f"Received lifecycle configuration with {len(rules)} rules: {rule_ids}")
@@ -1161,20 +1264,26 @@ async def create_bucket(
                 tag_dict = {}
             else:
                 try:
-                    # Parse XML using lxml
+                    # Parse XML using lxml with S3 namespace
                     root = ET.fromstring(xml_data)
+                    ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
 
-                    # Extract tags
+                    # Namespace-qualified selection
                     tag_dict = {}
-                    # Find all Tag elements under TagSet
-                    tag_elements = root.findall(".//TagSet/Tag")
+                    tag_elements = root.xpath(".//s3:Tag", namespaces=ns)  # type: ignore[attr-defined]
 
                     for tag_elem in tag_elements:
-                        key_elem = tag_elem.find("Key")
-                        value_elem = tag_elem.find("Value")
-
-                        if key_elem is not None and key_elem.text and value_elem is not None and value_elem.text:
-                            tag_dict[key_elem.text] = value_elem.text
+                        key_nodes = tag_elem.xpath("./s3:Key", namespaces=ns)  # type: ignore[attr-defined]
+                        value_nodes = tag_elem.xpath("./s3:Value", namespaces=ns)  # type: ignore[attr-defined]
+                        if (
+                            key_nodes
+                            and value_nodes
+                            and key_nodes[0] is not None
+                            and value_nodes[0] is not None
+                            and key_nodes[0].text
+                            and value_nodes[0].text
+                        ):
+                            tag_dict[str(key_nodes[0].text)] = str(value_nodes[0].text)
                 except Exception:
                     logger.exception("Error parsing XML tags")
                     return create_xml_error_response(
@@ -1207,12 +1316,20 @@ async def create_bucket(
     # Handle standard bucket creation if not a tagging, lifecycle, or policy request
     else:
         try:
+            # Reject ACLs to match AWS when ObjectOwnership is BucketOwnerEnforced
+            acl_header = request.headers.get("x-amz-acl")
+            if acl_header:
+                return create_xml_error_response(
+                    "InvalidBucketAclWithObjectOwnership",
+                    "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting",
+                    status_code=400,
+                )
+
             bucket_id = str(uuid.uuid4())
             created_at = datetime.now(UTC)
 
-            # Check if bucket should be public based on ACL header
-            acl_header = request.headers.get("x-amz-acl", "private")
-            is_public = acl_header in ["public-read", "public-read-write"]
+            # Bucket public/private is managed via policy, not ACL
+            is_public = False
 
             # Get or create user record for the main account
             main_account_id = request.state.account.main_account
@@ -1320,11 +1437,11 @@ async def delete_bucket(
                 payload=UnpinChainRequest(
                     substrate_url=config.substrate_url,
                     ipfs_node=config.ipfs_store_url,
-                    address=request.state.account_main_account,
+                    address=request.state.account.main_account,
                     subaccount=request.state.account.id,
                     subaccount_seed_phrase=request.state.seed_phrase,
                     bucket_name=bucket_name,
-                    object_key=obj["key"],
+                    object_key=obj["object_key"],
                     cid=obj["ipfs_cid"],
                 ),
                 redis_client=redis_client,
@@ -1434,7 +1551,7 @@ async def _copy_object(
                 store_node=config.ipfs_store_url,
                 pin_node=config.ipfs_store_url,
                 substrate_url=config.substrate_url,
-                publish=True,
+                publish=(os.getenv("HIPPIUS_PUBLISH_MODE", "full") != "ipfs_only"),
             )
 
             ipfs_cid = s3_result.cid
@@ -1761,6 +1878,71 @@ async def _get_object(
     return object
 
 
+async def _get_object_with_permissions(
+    bucket_name: str,
+    object_key: str,
+    db: dependencies.DBConnection,
+    main_account_id: str,
+) -> asyncpg.Record:
+    """Get object with proper permission checks for both public and private buckets."""
+    logger.debug(f"Getting object with permissions {bucket_name}/{object_key}")
+
+    # Get user for user-scoped bucket lookup
+    user = await db.fetchrow(
+        get_query("get_or_create_user_by_main_account"),
+        main_account_id,
+        datetime.now(UTC),
+    )
+
+    # First check if bucket exists and get its permissions
+    bucket = await db.fetchrow(
+        get_query("get_bucket_by_name"),
+        bucket_name,
+    )
+
+    if not bucket:
+        logger.info(f"Bucket not found: {bucket_name}")
+        raise errors.S3Error(
+            code="NoSuchBucket",
+            status_code=404,
+            message=f"The specified bucket {bucket_name} does not exist",
+        )
+
+    # Check if user has access to this bucket (either owner or bucket is public)
+    if not bucket["is_public"]:
+        # Private bucket - check ownership
+        owner_bucket = await db.fetchrow(
+            get_query("get_bucket_by_name_and_owner"),
+            bucket_name,
+            user["main_account_id"],
+        )
+        if not owner_bucket:
+            logger.info(f"Access denied to private bucket: {bucket_name}")
+            raise errors.S3Error(
+                code="NoSuchBucket",
+                status_code=404,
+                message=f"The specified bucket {bucket_name} does not exist",
+            )
+
+    # Get object by path
+    object = await db.fetchrow(
+        get_query("get_object_by_path"),
+        bucket["bucket_id"],
+        object_key,
+    )
+
+    if not object:
+        logger.info(f"Object not found: {bucket_name}/{object_key}")
+        raise errors.S3Error(
+            code="NoSuchKey",
+            status_code=404,
+            message=f"The specified key {object_key} does not exist",
+        )
+
+    logger.debug(f"Found object with permissions: {bucket_name}/{object_key}")
+    return object
+
+
 @router.head(
     "/{bucket_name}/{object_key:path}/",
     status_code=200,
@@ -1788,11 +1970,10 @@ async def head_object(
     if "tagging" in request.query_params:
         try:
             # Just check if the object exists, don't return the tags content for HEAD
-            await _get_object(
+            await _get_object_with_permissions(
                 bucket_name,
                 object_key,
                 db,
-                request.state.seed_phrase,
                 request.state.account.main_account,
             )
             return Response(status_code=200)
@@ -1808,7 +1989,7 @@ async def head_object(
 
     # Default HEAD behavior for regular object metadata
     try:
-        result = await _get_object(
+        result = await _get_object_with_permissions(
             bucket_name,
             object_key,
             db,
@@ -1818,13 +1999,23 @@ async def head_object(
         metadata = json.loads(result["metadata"])
         ipfs_cid = result["ipfs_cid"]
 
+        # Check object status and return 202 if still processing
+        object_status = result.get("status", "unknown")
+        if object_status in ["pending", "pinning"]:
+            retry_after = "60" if result.get("multipart") else "30"
+            headers = {
+                "Retry-After": retry_after,
+                "x-amz-object-status": object_status,
+            }
+            return Response(status_code=202, headers=headers)
+
         headers = {
             "Content-Type": result["content_type"],
             "Content-Length": str(result["size_bytes"]),
             "ETag": f'"{result["md5_hash"]}"',
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "x-amz-ipfs-cid": ipfs_cid or "pending",
-            "x-amz-object-status": result.get("status", "unknown"),
+            "x-amz-object-status": object_status,
         }
 
         for key, value in metadata.items():
@@ -1853,6 +2044,7 @@ async def get_object(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
+    redis_client=Depends(dependencies.get_redis),
 ) -> Response:
     """
     Get an object using S3 protocol (GET /{bucket_name}/{object_key}).
@@ -1870,34 +2062,22 @@ async def get_object(
             request.state.account.main_account,
         )
 
-    config = get_config()
+    # Check for Range header - handle partial content requests
+    range_header = request.headers.get("Range") or request.headers.get("range")
 
     try:
-        # Get user for user-scoped bucket lookup
-        user = await db.fetchrow(
+        # Get user for user-scoped bucket lookup (creates user if not exists)
+        await db.fetchrow(
             get_query("get_or_create_user_by_main_account"),
             request.state.account.main_account,
             datetime.now(UTC),
         )
 
-        bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
-            bucket_name,
-            user["main_account_id"],
-        )
-
-        if not bucket:
-            return create_xml_error_response(
-                "NoSuchBucket",
-                f"The specified bucket {bucket_name} does not exist",
-                status_code=404,
-                BucketName=bucket_name,
-            )
-
-        # Get object info for download
+        # Get object info for download with permission checks
+        # This query handles both public buckets (accessible by anyone) and private buckets (owner only)
         object_info = await db.fetchrow(
-            get_query("get_object_for_download"),
-            bucket["bucket_id"],
+            get_query("get_object_for_download_with_permissions"),
+            bucket_name,
             object_key,
             request.state.account.main_account,
         )
@@ -1905,7 +2085,7 @@ async def get_object(
         if not object_info:
             return create_xml_error_response(
                 "NoSuchKey",
-                f"The specified key {object_key} does not exist",
+                f"The specified key {object_key} does not exist or you don't have permission to access it",
                 status_code=404,
                 Key=object_key,
             )
@@ -1929,10 +2109,23 @@ async def get_object(
                 status_code=503,
             )
 
+        # Handle range requests by calculating needed chunks
+        if range_header:
+            start_byte, end_byte = parse_range_header(range_header, object_info["size_bytes"])
+            needed_parts = calculate_chunks_for_range(start_byte, end_byte, download_chunks)
+            filtered_chunks = [chunk for chunk in download_chunks if chunk["part_number"] in needed_parts]
+        else:
+            filtered_chunks = download_chunks
+            start_byte = end_byte = None
+
         # Create ChunkToDownload objects with redis keys
+        # Use deterministic request ID so multiple requests for same object reuse same download
+        request_uuid = f"{object_info['object_id']}_{request.state.account.main_account}"
+        if range_header:
+            request_uuid += f"_{start_byte}_{end_byte}"  # Make range requests unique
+
         chunks = []
-        request_uuid = str(uuid.uuid4())
-        for chunk_info in download_chunks:
+        for chunk_info in filtered_chunks:
             redis_key = f"downloaded:{object_key}:{chunk_info['part_number']}:{request_uuid}"
             chunks.append(
                 ChunkToDownload(
@@ -1943,6 +2136,7 @@ async def get_object(
             )
 
         # Create download request
+        config = get_config()
         download_request = DownloadChainRequest(
             request_id=request_uuid,
             object_id=str(object_info["object_id"]),
@@ -1959,15 +2153,73 @@ async def get_object(
             chunks=chunks,
         )
 
-        # Enqueue download request
-        await enqueue_download_request(download_request, request.app.state.redis_client)
-        logger.info(f"Enqueued download request for {bucket_name}/{object_key}")
+        # Check if download is already in progress using a Redis flag
+        download_flag_key = f"download_in_progress:{request_uuid}"
 
-        # Create streaming generator
+        # Try to set the flag atomically (NX = only set if not exists, EX = expiration in seconds)
+        flag_set = await request.app.state.redis_client.set(download_flag_key, "1", nx=True, ex=300)  # 5 min expiry
+
+        if flag_set:
+            # We successfully set the flag, so we're the first request - enqueue the download
+            await enqueue_download_request(download_request, request.app.state.redis_client)
+            logger.info(f"Enqueued download request for {bucket_name}/{object_key}")
+        else:
+            logger.info(f"Download already in progress for {bucket_name}/{object_key}, reusing existing request")
+
+        # Handle range vs full download
+        if range_header and start_byte is not None and end_byte is not None:
+            # For range requests, download all chunks first then extract range
+            async def generate_range():
+                """Download chunks and extract specific byte range."""
+                chunks_data = []
+
+                # Download all needed chunks
+                for chunk in chunks:
+                    timeout = 60
+                    chunk_data = None
+
+                    for _ in range(timeout):
+                        chunk_data = await request.app.state.redis_client.get(chunk.redis_key)
+                        if chunk_data:
+                            logger.debug(f"Got chunk {chunk.part_id} from Redis")
+                            break
+                        await asyncio.sleep(1)
+
+                    if not chunk_data:
+                        raise RuntimeError(f"Timeout waiting for chunk {chunk.part_id} to download")
+
+                    chunks_data.append(chunk_data)
+
+                # Extract the specific range from chunks
+                logger.debug(f"Extracting range {start_byte}-{end_byte} from {len(filtered_chunks)} chunks")
+                range_data = extract_range_from_chunks(chunks_data, start_byte, end_byte, download_chunks, needed_parts)
+                logger.debug(f"Extracted {len(range_data)} bytes for range {start_byte}-{end_byte}")
+
+                # Yield the range data in smaller chunks to avoid streaming issues
+                chunk_size = 64 * 1024  # 64KB chunks
+                for i in range(0, len(range_data), chunk_size):
+                    yield range_data[i : i + chunk_size]
+
+            # Range request headers
+            content_length = end_byte - start_byte + 1
+            headers = {
+                "Content-Type": object_info["content_type"],
+                "Content-Range": f"bytes {start_byte}-{end_byte}/{object_info['size_bytes']}",
+                "Content-Length": str(content_length),
+                "Accept-Ranges": "bytes",
+            }
+
+            return StreamingResponse(
+                generate_range(),
+                status_code=206,
+                media_type=object_info["content_type"],
+                headers=headers,
+            )
+
+        # Full file download
         async def generate_chunks():
             """Stream downloaded chunks as they become available in Redis."""
             for chunk in chunks:
-                # Wait for chunk to appear in Redis with 60s timeout
                 timeout = 60
                 chunk_data = None
 
@@ -1979,39 +2231,21 @@ async def get_object(
                     await asyncio.sleep(1)
 
                 if not chunk_data:
-                    logger.error(f"Timeout waiting for chunk {chunk.part_id}")
-                    # For streaming responses, we can't easily convert to XML error
-                    # Instead, we'll raise a RuntimeError that will be handled by FastAPI
                     raise RuntimeError(f"Timeout waiting for chunk {chunk.part_id} to download")
 
-                # Clean up Redis key after consuming
-                await request.app.state.redis_client.delete(chunk.redis_key)
                 yield chunk_data
 
-        # Get object metadata for headers
-        object_result = await _get_object(
-            bucket_name,
-            object_key,
-            db,
-            request.state.account.main_account,
-        )
-
-        metadata = json.loads(object_result["metadata"])
+        # Full file headers
         headers = {
-            "Content-Type": object_result["content_type"],
-            "ETag": f'"{object_result["md5_hash"]}"',
-            "Last-Modified": object_result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
+            "Content-Type": object_info["content_type"],
+            "Content-Length": str(object_info["size_bytes"]),
             "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
             "Accept-Ranges": "bytes",
         }
 
-        for key, value in metadata.items():
-            if key != "ipfs" and not isinstance(value, dict):
-                headers[f"x-amz-meta-{key}"] = str(value)
-
         return StreamingResponse(
             generate_chunks(),
-            media_type=object_result["content_type"],
+            media_type=object_info["content_type"],
             headers=headers,
         )
 

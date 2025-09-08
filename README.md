@@ -9,13 +9,15 @@ Hippius S3 is a production-ready S3-compatible API that stores data on IPFS whil
 ## Features
 
 ### ✅ Core S3 Operations
+
 - **Bucket Management**: Create, list, delete, and check bucket existence
 - **Object Operations**: Upload, download, list, delete, and copy objects
 - **Multipart Uploads**: Complete support for large file uploads with part assembly
-- **Metadata**: Custom metadata support with x-amz-meta-* headers
+- **Metadata**: Custom metadata support with x-amz-meta-\* headers
 - **Tagging**: Bucket and object tagging with full CRUD operations
 
 ### ✅ Security & Authentication
+
 - **HMAC Authentication**: Full HMAC signature verification with seed phrase credentials
 - **Frontend/Backend HMAC**: Separate HMAC verification for different endpoints
 - **Account Credits**: Automatic credit verification for all operations
@@ -24,12 +26,14 @@ Hippius S3 is a production-ready S3-compatible API that stores data on IPFS whil
 - **Input Validation**: AWS S3 compliance validation middleware
 
 ### ✅ Blockchain Integration
+
 - **IPFS Storage**: Automatic file storage and pinning via Hippius SDK
 - **Blockchain Publishing**: Files automatically published to Hippius marketplace
 - **Transaction Tracking**: Blockchain transaction hashes stored in metadata
 - **Decentralized Access**: Files remain accessible via IPFS network
 
 ### ✅ Production Features
+
 - **Audit Logging**: Comprehensive audit trails for all operations
 - **Performance Profiling**: Optional request profiling with Speedscope integration
 - **Multi-tenant**: User-scoped buckets with isolated storage
@@ -37,7 +41,9 @@ Hippius S3 is a production-ready S3-compatible API that stores data on IPFS whil
 - **CORS Support**: Configurable cross-origin request handling
 
 ### ✅ S3 Client Compatibility
+
 Works with standard S3 clients including:
+
 - AWS CLI
 - MinIO Client (minio-py)
 - boto3
@@ -53,29 +59,30 @@ Works with standard S3 clients including:
 ### Quick Start with Docker
 
 1. **Clone the repository**:
+
    ```bash
    git clone <repository-url>
    cd hippius-s3
    ```
 
 2. **Create environment configuration**:
+
    ```bash
    cp .env.example .env
    # Edit .env with your specific values (database URL, HMAC secret, etc.)
    ```
 
 3. **Start all services**:
+
    ```bash
    docker compose up -d
    ```
 
-4. **Run database migrations**:
-   ```bash
-   docker compose exec api dbmate up
-   ```
+   Note: Database migrations and keystore setup run automatically on container startup (via `hippius_s3.scripts.migrate`).
 
+4. **(Optional) Start with production compose**:
    ```bash
-docker compose -f docker-compose.prod.yml up -d
+   docker compose -f docker-compose.prod.yml up -d
    ```
 
 ## Configuration
@@ -83,6 +90,13 @@ docker compose -f docker-compose.prod.yml up -d
 ### Required Environment Variables
 
 Create a `.env` file with the required variables. See [`.env.example`](.env.example) for all configuration options and their descriptions.
+
+### IPFS URLs (optional)
+
+- `HIPPIUS_IPFS_STORE_URL`: IPFS API URL used for storing/pinning (e.g., `http://ipfs:5001` in Docker Compose)
+- `HIPPIUS_IPFS_GET_URL`: IPFS gateway URL used for reads (e.g., `http://ipfs:8080` in Docker Compose)
+
+These can be set via environment variables (see `docker-compose.yml`).
 
 ## Usage Examples
 
@@ -144,6 +158,10 @@ The service implements S3-compatible endpoints:
 
 All endpoints support standard S3 headers and return S3-compatible XML responses.
 
+### S3 Compatibility Matrix
+
+See the compatibility list of supported S3 features in [docs/s3-compatibility.md](docs/s3-compatibility.md).
+
 ## Architecture
 
 ```
@@ -173,6 +191,18 @@ ruff format .
 # Type checking
 mypy hippius_s3
 ```
+
+### E2E testing
+
+See `tests/e2e/README.md` for end-to-end test setup. The e2e configuration uses an override compose file to run with:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.e2e.yml up -d
+pytest tests/e2e -v
+docker compose -f docker-compose.yml -f docker-compose.e2e.yml down -v
+```
+
+Note: The e2e override may enable `HIPPIUS_BYPASS_CREDIT_CHECK=true` and `HIPPIUS_PUBLISH_MODE=ipfs_only` for faster runs without chain publishing.
 
 ## TODO Features
 

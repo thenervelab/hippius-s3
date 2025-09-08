@@ -1,27 +1,54 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.2.0
+    rev: v0.12.12
     hooks:
       - id: ruff
-        args: [ --fix ]
-        stages: [ commit ]
-        files: ^hippius_s3/
+        args: []
+        stages: [pre-commit]
+        files: ^(hippius_s3/|tests/)
       - id: ruff-format
-        stages: [ commit ]
-        files: ^hippius_s3/
+        args: [--check]
+        stages: [pre-commit]
+        files: ^(hippius_s3/|tests/)
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.5.0
+    rev: v6.0.0
     hooks:
       - id: trailing-whitespace
-        stages: [ commit ]
+        stages: [pre-commit]
       - id: end-of-file-fixer
-        stages: [ commit ]
+        stages: [pre-commit]
       - id: check-yaml
-        stages: [ commit ]
+        stages: [pre-commit]
       - id: check-added-large-files
-        stages: [ commit ]
+        stages: [pre-commit]
       - id: debug-statements
-        stages: [ commit ]
+        stages: [pre-commit]
       - id: check-toml
-        stages: [ commit ]
+        stages: [pre-commit]
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.11.2
+    hooks:
+      - id: mypy
+        name: mypy (src)
+        stages: [pre-commit]
+        pass_filenames: false
+        additional_dependencies:
+          - fastapi
+          - starlette
+          - python-dotenv
+          - pyinstrument
+          - pytest
+          - pydantic
+          - pydantic-core
+          - types-redis
+          - types-requests
+          - types-boto3
+          - types-botocore
+        args:
+          - --config-file=pyproject.toml
+          - --show-error-codes
+          - --pretty
+          - hippius_s3
+          - tests

@@ -53,6 +53,9 @@ class Config:
     # Redis for caching/rate limiting
     redis_url: str = env("REDIS_URL")
 
+    # Redis for account caching (persistent)
+    redis_accounts_url: str = env("REDIS_ACCOUNTS_URL")
+
     # API signing key for pre-signed URLs
     # Generated on first run if not provided
     api_signing_key: str = env("API_SIGNING_KEY:" + str(uuid.uuid4()))
@@ -62,9 +65,9 @@ class Config:
     max_multipart_chunk_size = 128 * 1024 * 1024  # 128 MB
 
     # worker specific settings
-    pinner_sleep_loop = 10
-    unpinner_sleep_loop = 10
-    downloader_sleep_loop = 10
+    pinner_sleep_loop = 1
+    unpinner_sleep_loop = 5
+    downloader_sleep_loop = 0.01
 
 
 def get_config() -> Config:

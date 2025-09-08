@@ -721,7 +721,7 @@ async def complete_multipart_upload(
 
         # Create the object in database (without CID initially for multipart uploads)
         object_result = await db.fetchrow(
-            get_query("upsert_object_basic"),
+            get_query("upsert_object_multipart"),
             upload_id,
             bucket_id,
             object_key,

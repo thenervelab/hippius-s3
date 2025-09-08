@@ -36,8 +36,8 @@ async def process_download_request(
 
     logger.info(f"Processing download request for {download_request.name} with {len(download_request.chunks)} chunks")
 
-    # Process all chunks concurrently with semaphore to limit concurrency
-    semaphore = asyncio.Semaphore(5)  # Limit to 5 concurrent downloads
+    # Process all chunks concurrently with higher concurrency for better IPFS utilization
+    semaphore = asyncio.Semaphore(10)  # Increased for better parallel downloads
 
     async def download_chunk(chunk):
         async with semaphore:
@@ -81,6 +81,15 @@ async def process_download_request(
         return False
 
 
+async def process_and_log_download(download_request, redis_client):
+    """Process download request with logging - runs as background task."""
+    success = await process_download_request(download_request, redis_client)
+    if success:
+        logger.info(f"Successfully processed download request {download_request.name}")
+    else:
+        logger.error(f"Failed to process download request {download_request.name}")
+
+
 async def run_downloader_loop():
     """Main loop for downloader service."""
     redis_client = async_redis.from_url(config.redis_url)
@@ -93,14 +102,11 @@ async def run_downloader_loop():
             download_request = await dequeue_download_request(redis_client)
 
             if download_request:
-                success = await process_download_request(download_request, redis_client)
-                if success:
-                    logger.info(f"Successfully processed download request {download_request.name}")
-                else:
-                    logger.error(f"Failed to process download request {download_request.name}")
+                # Process download request without blocking the loop
+                asyncio.create_task(process_and_log_download(download_request, redis_client))
             else:
-                # No items in queue, wait a bit before checking again
-                await asyncio.sleep(config.pinner_sleep_loop)
+                # Tighter loop for faster queue processing
+                await asyncio.sleep(config.downloader_sleep_loop)
 
     except KeyboardInterrupt:
         logger.info("Downloader service stopping...")

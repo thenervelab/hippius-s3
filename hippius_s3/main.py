@@ -68,6 +68,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.redis_client = async_redis.from_url(config.redis_url)
         logger.info("Redis client initialized")
 
+        app.state.redis_accounts_client = async_redis.from_url(config.redis_accounts_url)
+        logger.info("Redis accounts client initialized")
+
         app.state.rate_limit_service = RateLimitService(app.state.redis_client)
         logger.info("Rate limiting service initialized")
 
@@ -85,6 +88,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.info("Redis client closed")
         except Exception:
             logger.exception("Error shutting down Redis client")
+
+        try:
+            await app.state.redis_accounts_client.close()
+            logger.info("Redis accounts client closed")
+        except Exception:
+            logger.exception("Error shutting down Redis accounts client")
 
         try:
             await app.state.postgres_pool.close()

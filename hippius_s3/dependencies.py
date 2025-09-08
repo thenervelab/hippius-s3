@@ -74,6 +74,12 @@ def get_redis(request: Request) -> async_redis.Redis:
     return redis_client
 
 
+def get_redis_accounts(request: Request) -> async_redis.Redis:
+    """Extract the Redis accounts client from the request."""
+    redis_accounts_client: async_redis.Redis = request.app.state.redis_accounts_client
+    return redis_accounts_client
+
+
 async def extract_seed_phrase(request: Request) -> str:
     """
     FastAPI dependency that extracts the seed phrase from request.state.

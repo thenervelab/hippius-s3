@@ -161,7 +161,7 @@ async def dequeue_download_request(
     """Get the next download request from the Redis queue."""
     result = await redis_client.brpop(
         DOWNLOAD_QUEUE,
-        timeout=3,
+        timeout=5,
     )
     if result:
         _, queue_data = result

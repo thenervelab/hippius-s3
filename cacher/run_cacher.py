@@ -271,12 +271,12 @@ async def main():
     try:
         # Load environment variables directly
         substrate_url = os.getenv("HIPPIUS_SUBSTRATE_URL")
-        redis_url = "redis://127.0.0.1:6379/0"
+        redis_url = os.getenv("REDIS_ACCOUNTS_URL", "redis://127.0.0.1:6380/0")
 
         if not substrate_url:
             raise ValueError("HIPPIUS_SUBSTRATE_URL environment variable is required")
         if not redis_url:
-            raise ValueError("REDIS_URL environment variable is required")
+            raise ValueError("REDIS_ACCOUNTS_URL environment variable is required")
 
         cacher = SubstrateCacher(
             substrate_url=substrate_url,
