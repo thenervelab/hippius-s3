@@ -73,12 +73,12 @@ async def process_download_request(
     if success_count == total_chunks:
         logger.info(f"Successfully downloaded all {total_chunks} chunks for {download_request.name}")
         return True
-    else:
-        logger.error(f"Only downloaded {success_count}/{total_chunks} chunks for {download_request.name}")
-        # Clean up any successfully downloaded chunks to prevent partial downloads
-        for chunk in download_request.chunks:
-            await redis_client.delete(chunk.redis_key)
-        return False
+
+    logger.error(f"Only downloaded {success_count}/{total_chunks} chunks for {download_request.name}")
+    # Clean up any successfully downloaded chunks to prevent partial downloads
+    for chunk in download_request.chunks:
+        await redis_client.delete(chunk.redis_key)
+    return False
 
 
 async def process_and_log_download(download_request, redis_client):
