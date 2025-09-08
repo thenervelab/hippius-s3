@@ -2,49 +2,112 @@ name: Test and Lint
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.12"]  # Only using the latest Python version
+        python-version: ["3.12"] # Only using the latest Python version
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
 
-    - name: Install uv
-      run: |
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-    - name: Install dependencies
-      run: |
-        uv venv
-        source .venv/bin/activate
-        uv pip install -e ".[dev]"
+      - name: Install dependencies
+        run: |
+          uv venv
+          source .venv/bin/activate
+          uv pip install -e ".[dev]"
 
-    - name: Lint with ruff
-      run: |
-        source .venv/bin/activate
-        ruff check .
-        ruff format --check .
+      - name: Lint with ruff
+        run: |
+          source .venv/bin/activate
+          ruff check .
+          ruff format --check .
 
-    - name: Type check with mypy
-      run: |
-        source .venv/bin/activate
-        mypy hippius_s3 tests
+      - name: Type check with mypy
+        run: |
+          source .venv/bin/activate
+          mypy hippius_s3 tests
 
-    # Temporarily commenting out tests until we have actual tests
-    # - name: Test with pytest
-    #   run: |
-    #     source .venv/bin/activate
-    #     pytest
+  e2e:
+    name: E2E Tests (docker-compose)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DOCKER_BUILDKIT: "1"
+      COMPOSE_DOCKER_CLI_BUILD: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Install dependencies
+        run: |
+          uv venv
+          source .venv/bin/activate
+          uv pip install -e ".[dev]"
+
+      - name: Check Docker & Compose
+        run: |
+          docker --version
+          docker compose version
+
+      - name: Prepare .env for docker-compose
+        run: |
+          if [ -f .env.example ]; then cp .env.example .env; else touch .env; fi
+
+      - name: Run E2E tests
+        run: |
+          mkdir -p reports artifacts
+          source .venv/bin/activate
+          pytest tests/e2e -v --maxfail=1 --junitxml=reports/e2e-junit.xml
+
+      - name: Collect diagnostics (docker ps, logs)
+        if: always()
+        run: |
+          echo "== docker compose ps ==" > artifacts/ps.txt
+          docker compose -f docker-compose.yml -f docker-compose.e2e.yml ps >> artifacts/ps.txt || true
+          echo "== docker compose logs ==" > artifacts/docker-compose.log
+          docker compose -f docker-compose.yml -f docker-compose.e2e.yml logs --no-color >> artifacts/docker-compose.log || true
+          docker images --digests > artifacts/images.txt || true
+
+      - name: Upload test reports and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts-${{ github.run_id }}
+          path: |
+            reports/e2e-junit.xml
+            artifacts/**
+
+      - name: Cleanup docker compose
+        if: always()
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.e2e.yml down -v || true
