@@ -15,6 +15,7 @@ from mnemonic import Mnemonic
 from pydantic import BaseModel
 from starlette import status
 
+from hippius_s3.api.s3.endpoints import create_xml_error_response
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import get_redis_accounts
@@ -72,6 +73,10 @@ class MainAccountError(Exception):
     pass
 
 
+class InvalidSeedPhraseError(Exception):
+    pass
+
+
 async def fetch_account(
     seed_phrase: str,
     request: Request,
@@ -80,8 +85,7 @@ async def fetch_account(
     # Validate seed phrase format before any processing
     m = Mnemonic("english")
     if not m.check(seed_phrase):
-        logger.warning("Invalid seed phrase provided")
-        raise ValueError("Invalid seed phrase format")
+        raise InvalidSeedPhraseError("Invalid seed phrase format")
 
     redis_accounts_client = get_redis_accounts(request)
 
@@ -210,6 +214,12 @@ async def check_credit_for_all_operations(request: Request, call_next: Callable)
                 code="InvalidAccessKeyId",
                 message=str(e),
                 status_code=status.HTTP_403_FORBIDDEN,
+            )
+        except InvalidSeedPhraseError:
+            return create_xml_error_response(
+                code="InvalidAccessKeyId",
+                message="The AWS Access Key Id you provided does not exist in our records.",
+                status_code=403,
             )
         except BadAccount as e:
             return s3_error_response(
