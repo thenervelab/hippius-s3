@@ -288,16 +288,29 @@ def create_xml_error_response(
     message_elem = ET.SubElement(error_root, "Message")
     message_elem.text = message
 
+    # Separate HTTP headers from XML attributes
+    http_headers = {}
+    xml_attributes = {}
+
     for key, value in kwargs.items():
+        # Headers that should go into HTTP response headers (not XML body)
+        if key in ["Retry-After", "x-hippius-retry-count", "x-hippius-max-retries"]:
+            http_headers[key] = str(value)
+        else:
+            # Standard S3 XML attributes
+            xml_attributes[key] = value
+
+    # Add XML attributes to the error body
+    for key, value in xml_attributes.items():
         elem = ET.SubElement(error_root, key)
         elem.text = str(value)
 
     # Add RequestId and HostId if not provided
-    if "RequestId" not in kwargs:
+    if "RequestId" not in xml_attributes:
         request_id = ET.SubElement(error_root, "RequestId")
         request_id.text = str(uuid.uuid4())
 
-    if "HostId" not in kwargs:
+    if "HostId" not in xml_attributes:
         host_id = ET.SubElement(error_root, "HostId")
         host_id.text = "hippius-s3"
 
@@ -308,14 +321,18 @@ def create_xml_error_response(
         pretty_print=True,
     )
 
+    # Merge default headers with custom headers
+    response_headers = {
+        "Content-Type": "application/xml; charset=utf-8",
+        "x-amz-request-id": str(uuid.uuid4()),
+    }
+    response_headers.update(http_headers)
+
     return Response(
         content=xml_error,
         media_type="application/xml",
         status_code=status_code,
-        headers={
-            "Content-Type": "application/xml; charset=utf-8",
-            "x-amz-request-id": str(uuid.uuid4()),
-        },
+        headers=response_headers,
     )
 
 
@@ -1858,54 +1875,6 @@ async def put_object(
         )
 
 
-async def _get_object(
-    bucket_name: str,
-    object_key: str,
-    db: dependencies.DBConnection,
-    main_account_id: str,
-) -> asyncpg.Record:
-    logger.debug(f"Getting object {bucket_name}/{object_key}")
-
-    # Get user for user-scoped bucket lookup
-    user = await db.fetchrow(
-        get_query("get_or_create_user_by_main_account"),
-        main_account_id,
-        datetime.now(UTC),
-    )
-
-    bucket = await db.fetchrow(
-        get_query("get_bucket_by_name_and_owner"),
-        bucket_name,
-        user["main_account_id"],
-    )
-
-    if not bucket:
-        logger.info(f"Bucket not found: {bucket_name}")
-        raise errors.S3Error(
-            code="NoSuchBucket",
-            status_code=404,
-            message=f"The specified bucket {bucket_name} does not exist",
-        )
-
-    # Get object by path
-    object = await db.fetchrow(
-        get_query("get_object_by_path"),
-        bucket["bucket_id"],
-        object_key,
-    )
-
-    if not object:
-        logger.info(f"Object not found: {bucket_name}/{object_key}")
-        raise errors.S3Error(
-            code="NoSuchKey",
-            status_code=404,
-            message=f"The specified key {object_key} does not exist",
-        )
-
-    logger.debug(f"Found object: {bucket_name}/{object_key}")
-    return object
-
-
 async def _get_object_with_permissions(
     bucket_name: str,
     object_key: str,
@@ -2122,19 +2091,51 @@ async def get_object(
 
         # Check if all chunks have CIDs - if not, object is still being processed
         if not download_chunks:
+            # Track retry attempts using request headers
+            retry_count = int(request.headers.get("x-hippius-retry-count", "0"))
+            max_retries = 5
+
+            if retry_count >= max_retries:
+                return create_xml_error_response(
+                    "ServiceUnavailable",
+                    "Object publish failed after maximum retries. Please check object status.",
+                    status_code=503,
+                )
+
             return create_xml_error_response(
                 "ServiceUnavailable",
                 "Object publish is in progress. Please retry shortly.",
                 status_code=503,
+                **{
+                    "Retry-After": "30",
+                    "x-hippius-retry-count": str(retry_count),
+                    "x-hippius-max-retries": str(max_retries),
+                },
             )
 
         # Check if any chunk is missing a CID (still being processed)
         missing_cids = [chunk for chunk in download_chunks if not chunk.get("cid")]
         if missing_cids:
+            # Track retry attempts using request headers
+            retry_count = int(request.headers.get("x-hippius-retry-count", "0"))
+            max_retries = 5
+
+            if retry_count >= max_retries:
+                return create_xml_error_response(
+                    "ServiceUnavailable",
+                    "Object publish failed after maximum retries. Please check object status.",
+                    status_code=503,
+                )
+
             return create_xml_error_response(
                 "ServiceUnavailable",
                 "Object publish is in progress. Please retry shortly.",
                 status_code=503,
+                **{
+                    "Retry-After": "30",
+                    "x-hippius-retry-count": str(retry_count),
+                    "x-hippius-max-retries": str(max_retries),
+                },
             )
 
         # Handle range requests by calculating needed chunks

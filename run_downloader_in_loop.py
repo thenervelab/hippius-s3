@@ -32,7 +32,7 @@ async def process_download_request(
     # In e2e test mode, return mock data immediately
     if os.getenv("HIPPIUS_E2E_TESTS") == "true":
         test_content = os.getenv("HIPPIUS_E2E_GET_OBJECT_CONTENT", "test content").encode()
-        logger.info(f"E2E Mode: Processing download request for {download_request.name} with mock data")
+        logger.info(f"E2E Mode: Processing download request for {download_request.bucket_name}/{download_request.object_key} with mock data")
 
         # Store mock data for all chunks
         for chunk in download_request.chunks:
@@ -40,7 +40,7 @@ async def process_download_request(
             logger.debug(f"E2E Mode: Stored mock data for chunk {chunk.part_id} with key: {chunk.redis_key}")
 
         logger.info(
-            f"E2E Mode: Successfully processed {len(download_request.chunks)} chunks for {download_request.name}"
+            f"E2E Mode: Successfully processed {len(download_request.chunks)} chunks for {download_request.bucket_name}/{download_request.object_key}"
         )
         return True
 
@@ -52,7 +52,9 @@ async def process_download_request(
         encrypt_by_default=False,
     )
 
-    logger.info(f"Processing download request for {download_request.name} with {len(download_request.chunks)} chunks")
+    # Use shorter identifier for logging
+    short_id = f"{download_request.bucket_name}/{download_request.object_key}"
+    logger.info(f"Processing download request for {short_id} with {len(download_request.chunks)} chunks")
 
     # Process all chunks concurrently with higher concurrency for better IPFS utilization
     semaphore = asyncio.Semaphore(10)  # Increased for better parallel downloads
@@ -89,13 +91,12 @@ async def process_download_request(
     total_chunks = len(download_request.chunks)
 
     if success_count == total_chunks:
-        logger.info(f"Successfully downloaded all {total_chunks} chunks for {download_request.name}")
+        logger.info(f"Successfully downloaded all {total_chunks} chunks for {short_id}")
         return True
 
-    logger.error(f"Only downloaded {success_count}/{total_chunks} chunks for {download_request.name}")
-    # Clean up any successfully downloaded chunks to prevent partial downloads
-    for chunk in download_request.chunks:
-        await redis_client.delete(chunk.redis_key)
+    logger.error(f"Only downloaded {success_count}/{total_chunks} chunks for {short_id}")
+    # Don't delete existing chunks as they might be in use by ongoing downloads
+    # Let Redis TTL handle cleanup naturally
     return False
 
 
@@ -103,9 +104,9 @@ async def process_and_log_download(download_request, redis_client):
     """Process download request with logging - runs as background task."""
     success = await process_download_request(download_request, redis_client)
     if success:
-        logger.info(f"Successfully processed download request {download_request.name}")
+        logger.info(f"Successfully processed download request {download_request.bucket_name}/{download_request.object_key}")
     else:
-        logger.error(f"Failed to process download request {download_request.name}")
+        logger.error(f"Failed to process download request {download_request.bucket_name}/{download_request.object_key}")
 
 
 async def run_downloader_loop():
@@ -122,9 +123,9 @@ async def run_downloader_loop():
             if download_request:
                 success = await process_download_request(download_request, redis_client)
                 if success:
-                    logger.info(f"Successfully processed download request {download_request.name}")
+                    logger.info(f"Successfully processed download request {download_request.bucket_name}/{download_request.object_key}")
                 else:
-                    logger.error(f"Failed to process download request {download_request.name}")
+                    logger.error(f"Failed to process download request {download_request.bucket_name}/{download_request.object_key}")
             else:
                 # Wait a bit before checking again
                 await asyncio.sleep(config.downloader_sleep_loop)
