@@ -18,8 +18,6 @@ async def cors_middleware(
     """
     Custom CORS middleware that adds CORS headers without intercepting exceptions.
     """
-    logger.info(f"CORS middleware: {request.method} {request.url.path}")
-
     # Handle preflight OPTIONS requests
     if request.method == "OPTIONS":
         logger.info("Handling OPTIONS request")

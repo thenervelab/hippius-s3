@@ -95,7 +95,6 @@ async def fetch_account(
             # This seed phrase is for a main account, not allowed for S3
             raise MainAccountError("Please use a Hippius subaccount seed phrase for S3 operations")
         subaccount_id = cached_value
-        logger.info(f"Cache hit for seed phrase hash -> {subaccount_id}")
     else:
         # Only connect to substrate if we don't have the subaccount_id cached
         # Run substrate connection in a separate thread to avoid blocking
@@ -112,7 +111,6 @@ async def fetch_account(
 
         # Cache the seed phrase to subaccount_id mapping for 2 hour
         await redis_accounts_client.set(seed_cache_key, subaccount_id)
-        logger.debug(f"Cached seed phrase hash -> {subaccount_id}")
 
     # Try to get cached subaccount data
     cache_key = f"hippius_subaccount_cache:{subaccount_id}"
@@ -121,7 +119,6 @@ async def fetch_account(
 
     if cached_data:
         data = json.loads(cached_data)
-        logger.debug(f"Cache hit for subaccount {subaccount_id}")
 
         # Extract role information
         role = data.get("role", "Unknown")
@@ -140,7 +137,6 @@ async def fetch_account(
         )
 
     # If we reach here, account is not in cache - raise exception
-    logger.debug(f"Cache miss for subaccount {subaccount_id}")
     raise BadAccount("Your account does not exist")
 
 
