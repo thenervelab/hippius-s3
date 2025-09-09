@@ -114,7 +114,6 @@ async def fetch_account(
 
     # Try to get cached subaccount data
     cache_key = f"hippius_subaccount_cache:{subaccount_id}"
-    logger.info(f"Getting account cache for {cache_key=}")
     cached_data = await redis_accounts_client.get(cache_key)
 
     if cached_data:
