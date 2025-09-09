@@ -102,10 +102,13 @@ async def run_downloader_loop():
             download_request = await dequeue_download_request(redis_client)
 
             if download_request:
-                # Process download request without blocking the loop
-                asyncio.create_task(process_and_log_download(download_request, redis_client))
+                success = await process_download_request(download_request, redis_client)
+                if success:
+                    logger.info(f"Successfully processed download request {download_request.name}")
+                else:
+                    logger.error(f"Failed to process download request {download_request.name}")
             else:
-                # Tighter loop for faster queue processing
+                # Wait a bit before checking again
                 await asyncio.sleep(config.downloader_sleep_loop)
 
     except KeyboardInterrupt:
