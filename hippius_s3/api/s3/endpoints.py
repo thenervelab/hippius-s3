@@ -1,12 +1,17 @@
 """S3-compatible API endpoints implementation for bucket and object operations."""
 
+import asyncio
 import hashlib
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import UTC
 from datetime import datetime
+from typing import Dict
+from typing import List
+from typing import Tuple
 
 import asyncpg
 import fastapi
@@ -14,6 +19,7 @@ from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import Request
 from fastapi import Response
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer
 from hippius_sdk.errors import HippiusIPFSError
 from hippius_sdk.errors import HippiusSubstrateError
@@ -27,11 +33,17 @@ from hippius_s3.config import get_config
 from hippius_s3.dependencies import DBConnection
 from hippius_s3.ipfs_service import IPFSService
 from hippius_s3.queue import Chunk
+from hippius_s3.queue import ChunkToDownload
+from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import SimpleUploadChainRequest
 from hippius_s3.queue import UnpinChainRequest
+from hippius_s3.queue import enqueue_download_request
 from hippius_s3.queue import enqueue_unpin_request
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.utils import get_query
+
+
+logger = logging.getLogger(__name__)
 
 
 def format_s3_timestamp(dt):
@@ -39,11 +51,32 @@ def format_s3_timestamp(dt):
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-logger = logging.getLogger(__name__)
+async def get_chunk_from_redis(redis_client, chunk: ChunkToDownload) -> bytes:
+    """Get a chunk from Redis with timeout."""
+    for _ in range(config.http_redis_get_retries):
+        chunk_data = await asyncio.wait_for(
+            redis_client.get(chunk.redis_key),
+            timeout=config.redis_read_chunk_timeout,
+        )
+        if chunk_data:
+            logger.debug(f"Got chunk {chunk.part_id} from Redis")
+            break
+
+        await asyncio.sleep(config.http_download_sleep_loop)
+
+    else:
+        raise RuntimeError(f"Chunk {chunk.part_id} not found in Redis")
+
+    return chunk_data
 
 
 def _handle_range_request(
-    file_data: bytes, range_header: str, result: dict, metadata: dict, object_key: str, ipfs_cid: str
+    file_data: bytes,
+    range_header: str,
+    result: dict,
+    metadata: dict,
+    object_key: str,
+    ipfs_cid: str,
 ) -> Response:
     """
     Handle HTTP Range requests for partial content downloads.
@@ -131,6 +164,103 @@ def _handle_range_request(
             content=f"Range not satisfiable: {range_header}",
             headers={"Content-Range": f"bytes */{file_size}"},
         )
+
+
+def parse_range_header(range_header: str, total_size: int) -> Tuple[int, int]:
+    """Parse Range header and return start and end bytes."""
+    # Support both "bytes=start-end" and "bytes=start-" (open-ended)
+    range_match = re.match(r"bytes=(\d+)-(\d*)", range_header.lower())
+    if not range_match:
+        raise ValueError(f"Invalid range format: {range_header}")
+
+    start = int(range_match.group(1))
+    end_str = range_match.group(2)
+
+    # Open-ended range: "bytes=start-" means from start to end of file
+    end = int(end_str) if end_str else total_size - 1
+
+    return start, end
+
+
+def calculate_chunks_for_range(start_byte: int, end_byte: int, parts_info: List[Dict]) -> List[int]:
+    """Calculate which parts contain the requested byte range."""
+    needed_parts = []
+    current_offset = 0
+
+    for part in parts_info:
+        part_start = current_offset
+        part_end = current_offset + part["size_bytes"] - 1
+
+        # Check if this part overlaps with requested range
+        if part_end >= start_byte and part_start <= end_byte:
+            needed_parts.append(part["part_number"])
+
+        current_offset += part["size_bytes"]
+
+        # Stop if we've passed the end of requested range
+        if part_start > end_byte:
+            break
+
+    return needed_parts
+
+
+def extract_range_from_chunks(
+    chunks_data: List[bytes],
+    start_byte: int,
+    end_byte: int,
+    parts_info: List[Dict],
+    needed_parts: List[int],
+) -> bytes:
+    """Extract the specific byte range from downloaded chunks."""
+    current_offset = 0
+    range_data = b""
+    chunk_idx = 0
+
+    logger.debug(f"Starting range extraction: {start_byte}-{end_byte}")
+
+    for part in parts_info:
+        part_start = current_offset
+        part_end = current_offset + part["size_bytes"] - 1
+
+        logger.debug(
+            f"Processing part {part['part_number']}: offset {part_start}-{part_end}, size {part['size_bytes']}"
+        )
+
+        if part["part_number"] in needed_parts:
+            chunk_data = chunks_data[chunk_idx]
+
+            # Calculate precise slice boundaries within this chunk
+            # slice_start: where to start reading within this chunk (0-based)
+            slice_start = max(0, start_byte - part_start)
+            # slice_end: where to stop reading within this chunk (exclusive, for slicing)
+            slice_end = min(part["size_bytes"], end_byte - part_start + 1)
+
+            logger.debug(
+                f"Part {part['part_number']}: slice_start={slice_start}, slice_end={slice_end}, chunk_len={len(chunk_data)}"
+            )
+
+            # Extract the slice and add to range data
+            chunk_slice = chunk_data[slice_start:slice_end]
+            logger.debug(f"Part {part['part_number']}: extracted {len(chunk_slice)} bytes")
+            range_data += chunk_slice
+            chunk_idx += 1
+
+        current_offset += part["size_bytes"]
+
+        # Stop if we've passed the end of requested range
+        if current_offset > end_byte:
+            break
+
+    # Verify we extracted exactly the right amount
+    expected_length = end_byte - start_byte + 1
+    if len(range_data) != expected_length:
+        logger.error(f"Range extraction mismatch: got {len(range_data)} bytes, expected {expected_length}")
+        logger.error(
+            f"Range: {start_byte}-{end_byte}, Parts info: {[(p['part_number'], p['size_bytes']) for p in parts_info]}"
+        )
+        logger.error(f"Needed parts: {needed_parts}, Chunks data lengths: {[len(c) for c in chunks_data]}")
+
+    return range_data
 
 
 config = get_config()
@@ -1776,6 +1906,71 @@ async def _get_object(
     return object
 
 
+async def _get_object_with_permissions(
+    bucket_name: str,
+    object_key: str,
+    db: dependencies.DBConnection,
+    main_account_id: str,
+) -> asyncpg.Record:
+    """Get object with proper permission checks for both public and private buckets."""
+    logger.debug(f"Getting object with permissions {bucket_name}/{object_key}")
+
+    # Get user for user-scoped bucket lookup
+    user = await db.fetchrow(
+        get_query("get_or_create_user_by_main_account"),
+        main_account_id,
+        datetime.now(UTC),
+    )
+
+    # First check if bucket exists and get its permissions
+    bucket = await db.fetchrow(
+        get_query("get_bucket_by_name"),
+        bucket_name,
+    )
+
+    if not bucket:
+        logger.info(f"Bucket not found: {bucket_name}")
+        raise errors.S3Error(
+            code="NoSuchBucket",
+            status_code=404,
+            message=f"The specified bucket {bucket_name} does not exist",
+        )
+
+    # Check if user has access to this bucket (either owner or bucket is public)
+    if not bucket["is_public"]:
+        # Private bucket - check ownership
+        owner_bucket = await db.fetchrow(
+            get_query("get_bucket_by_name_and_owner"),
+            bucket_name,
+            user["main_account_id"],
+        )
+        if not owner_bucket:
+            logger.info(f"Access denied to private bucket: {bucket_name}")
+            raise errors.S3Error(
+                code="NoSuchBucket",
+                status_code=404,
+                message=f"The specified bucket {bucket_name} does not exist",
+            )
+
+    # Get object by path
+    object = await db.fetchrow(
+        get_query("get_object_by_path"),
+        bucket["bucket_id"],
+        object_key,
+    )
+
+    if not object:
+        logger.info(f"Object not found: {bucket_name}/{object_key}")
+        raise errors.S3Error(
+            code="NoSuchKey",
+            status_code=404,
+            message=f"The specified key {object_key} does not exist",
+        )
+
+    logger.debug(f"Found object with permissions: {bucket_name}/{object_key}")
+    return object
+
+
 @router.head(
     "/{bucket_name}/{object_key:path}/",
     status_code=200,
@@ -1803,7 +1998,7 @@ async def head_object(
     if "tagging" in request.query_params:
         try:
             # Just check if the object exists, don't return the tags content for HEAD
-            await _get_object(
+            await _get_object_with_permissions(
                 bucket_name,
                 object_key,
                 db,
@@ -1822,7 +2017,7 @@ async def head_object(
 
     # Default HEAD behavior for regular object metadata
     try:
-        result = await _get_object(
+        result = await _get_object_with_permissions(
             bucket_name,
             object_key,
             db,
@@ -1832,13 +2027,23 @@ async def head_object(
         metadata = json.loads(result["metadata"])
         ipfs_cid = result["ipfs_cid"]
 
+        # Check object status and return 202 if still processing
+        object_status = result.get("status", "unknown")
+        if object_status in ["pending", "pinning"]:
+            retry_after = "60" if result.get("multipart") else "30"
+            headers = {
+                "Retry-After": retry_after,
+                "x-amz-object-status": object_status,
+            }
+            return Response(status_code=202, headers=headers)
+
         headers = {
             "Content-Type": result["content_type"],
             "Content-Length": str(result["size_bytes"]),
             "ETag": f'"{result["md5_hash"]}"',
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "x-amz-ipfs-cid": ipfs_cid or "pending",
-            "x-amz-object-status": result.get("status", "unknown"),
+            "x-amz-object-status": object_status,
         }
 
         for key, value in metadata.items():
@@ -1873,7 +2078,7 @@ async def get_object(
     Get an object using S3 protocol (GET /{bucket_name}/{object_key}).
     Also handles getting object tags (GET /{bucket_name}/{object_key}?tagging).
 
-    This endpoint is compatible with the S3 protocol used by MinIO and other S3 clients.
+    This endpoint now uses a queuing system for downloads to handle IPFS retrieval asynchronously.
     """
     # If tagging is in query params, handle object tags request
     if "tagging" in request.query_params:
@@ -1885,131 +2090,188 @@ async def get_object(
             request.state.account.main_account,
         )
 
+    # Check for Range header - handle partial content requests
+    range_header = request.headers.get("Range") or request.headers.get("range")
+
     try:
-        result = await _get_object(
+        # Get user for user-scoped bucket lookup (creates user if not exists)
+        await db.fetchrow(
+            get_query("get_or_create_user_by_main_account"),
+            request.state.account.main_account,
+            datetime.now(UTC),
+        )
+
+        # Get object info for download with permission checks
+        # This query handles both public buckets (accessible by anyone) and private buckets (owner only)
+        object_info = await db.fetchrow(
+            get_query("get_object_for_download_with_permissions"),
             bucket_name,
             object_key,
-            db,
             request.state.account.main_account,
         )
 
-        # Get bucket info to check if it's public (determines encryption)
-        bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
-            bucket_name,
-            request.state.account.main_account,
-        )
-
-        metadata = json.loads(result["metadata"])
-        ipfs_cid = result["ipfs_cid"]
-        object_id = result["object_id"]
-        is_multipart = result.get("multipart", False)
-
-        logger.debug(f"Getting object {bucket_name}/{object_key} with CID: {ipfs_cid}, multipart: {is_multipart}")
-
-        # Check if file was encrypted based on bucket public status
-        # Public buckets = no encryption, private buckets = encryption
-        is_encrypted = not bucket["is_public"]
-
-        if is_multipart:
-            # For multipart objects, reconstruct from individual chunks
-            logger.info(f"Reconstructing multipart object {object_key} from chunks")
-
-            # Get all chunks in correct order
-            chunks = await db.fetch(get_query("get_multipart_chunks"), object_id)
-
-            if not chunks:
-                logger.error(f"No chunks found for multipart object {object_id}")
-                raise errors.S3Error(
-                    code="NoSuchKey",
-                    status_code=404,
-                    message="Multipart object chunks not found",
-                )
-
-            # Download and concatenate all chunks
-            file_data = b""
-            for chunk in chunks:
-                chunk_cid = chunk["cid"]
-                logger.debug(f"Downloading chunk {chunk['part_number']} with CID: {chunk_cid}")
-
-                chunk_data = await ipfs_service.download_file(
-                    cid=chunk_cid,
-                    subaccount_id=request.state.account.main_account,
-                    bucket_name=bucket_name,
-                    decrypt=is_encrypted,
-                )
-                file_data += chunk_data
-
-            logger.debug(f"Reconstructed multipart file: {len(file_data)} bytes from {len(chunks)} chunks")
-        else:
-            # Simple object - require CID to be available; if missing, return 503 PendingUpload
-            if not ipfs_cid:
-                return create_xml_error_response(
-                    "ServiceUnavailable",
-                    "Object publish is in progress. Please retry shortly.",
-                    status_code=503,
-                )
-            file_data = await ipfs_service.download_file(
-                cid=ipfs_cid,
-                subaccount_id=request.state.account.main_account,
-                bucket_name=bucket_name,
-                decrypt=is_encrypted,
+        if not object_info:
+            return create_xml_error_response(
+                "NoSuchKey",
+                f"The specified key {object_key} does not exist or you don't have permission to access it",
+                status_code=404,
+                Key=object_key,
             )
-            logger.debug(f"Downloaded {len(file_data)} bytes from IPFS CID: {ipfs_cid}")
 
-        # Handle HTTP Range requests for partial content
-        range_header = request.headers.get("range")
+        download_chunks = json.loads(object_info["download_chunks"])
+
+        # Check if all chunks have CIDs - if not, object is still being processed
+        if not download_chunks:
+            return create_xml_error_response(
+                "ServiceUnavailable",
+                "Object publish is in progress. Please retry shortly.",
+                status_code=503,
+            )
+
+        # Check if any chunk is missing a CID (still being processed)
+        missing_cids = [chunk for chunk in download_chunks if not chunk.get("cid")]
+        if missing_cids:
+            return create_xml_error_response(
+                "ServiceUnavailable",
+                "Object publish is in progress. Please retry shortly.",
+                status_code=503,
+            )
+
+        # Handle range requests by calculating needed chunks
         if range_header:
-            return _handle_range_request(
-                file_data,
-                range_header,
-                dict(result),
-                metadata,
-                object_key,
-                ipfs_cid,
+            start_byte, end_byte = parse_range_header(range_header, object_info["size_bytes"])
+            needed_parts = calculate_chunks_for_range(start_byte, end_byte, download_chunks)
+            filtered_chunks = [chunk for chunk in download_chunks if chunk["part_number"] in needed_parts]
+        else:
+            filtered_chunks = download_chunks
+            start_byte = end_byte = None
+
+        # Create ChunkToDownload objects with redis keys
+        # Use deterministic request ID so multiple requests for same object reuse same download
+        request_uuid = f"{object_info['object_id']}_{request.state.account.main_account}"
+        if range_header:
+            request_uuid += f"_{start_byte}_{end_byte}"  # Make range requests unique
+
+        chunks = []
+        for chunk_info in filtered_chunks:
+            redis_key = f"downloaded:{object_key}:{chunk_info['part_number']}:{request_uuid}"
+            chunks.append(
+                ChunkToDownload(
+                    cid=chunk_info["cid"],
+                    part_id=chunk_info["part_number"],
+                    redis_key=redis_key,
+                )
             )
 
+        # Create download request
+        config = get_config()
+        download_request = DownloadChainRequest(
+            request_id=request_uuid,
+            object_id=str(object_info["object_id"]),
+            object_key=object_info["object_key"],
+            bucket_name=object_info["bucket_name"],
+            address=request.state.account.main_account,
+            subaccount=request.state.account.id,
+            subaccount_seed_phrase=request.state.seed_phrase,
+            substrate_url=config.substrate_url,
+            ipfs_node=config.ipfs_get_url,
+            should_decrypt=object_info["should_decrypt"],
+            size=object_info["size_bytes"],
+            multipart=object_info["multipart"],
+            chunks=chunks,
+        )
+
+        # Check if download is already in progress using a Redis flag
+        download_flag_key = f"download_in_progress:{request_uuid}"
+
+        # Try to set the flag atomically (NX = only set if not exists, EX = expiration in seconds)
+        flag_set = await request.app.state.redis_client.set(download_flag_key, "1", nx=True, ex=300)  # 5 min expiry
+
+        if flag_set:
+            # We successfully set the flag, so we're the first request - enqueue the download
+            await enqueue_download_request(download_request, request.app.state.redis_client)
+            logger.info(f"Enqueued download request for {bucket_name}/{object_key}")
+        else:
+            logger.info(f"Download already in progress for {bucket_name}/{object_key}, reusing existing request")
+
+        # Handle range vs full download
+        if range_header and start_byte is not None and end_byte is not None:
+            # For range requests, download all chunks first then extract range
+            async def generate_range():
+                """Download chunks and extract specific byte range."""
+                chunks_data = []
+
+                # Download all needed chunks
+                for chunk in chunks:
+                    chunk_data = await get_chunk_from_redis(
+                        request.app.state.redis_client,
+                        chunk,
+                    )
+                    chunks_data.append(chunk_data)
+
+                # Extract the specific range from chunks
+                logger.debug(f"Extracting range {start_byte}-{end_byte} from {len(filtered_chunks)} chunks")
+                range_data = extract_range_from_chunks(chunks_data, start_byte, end_byte, download_chunks, needed_parts)
+                logger.debug(f"Extracted {len(range_data)} bytes for range {start_byte}-{end_byte}")
+
+                # Yield the range data in smaller chunks to avoid streaming issues
+                chunk_size = 64 * 1024  # 64KB chunks
+                for i in range(0, len(range_data), chunk_size):
+                    yield range_data[i : i + chunk_size]
+
+            # Range request headers
+            headers = {
+                "Content-Type": object_info["content_type"],
+                "Content-Range": f"bytes {start_byte}-{end_byte}/{object_info['size_bytes']}",
+                "Accept-Ranges": "bytes",
+            }
+
+            return StreamingResponse(
+                generate_range(),
+                status_code=206,
+                media_type=object_info["content_type"],
+                headers=headers,
+            )
+
+        # Full file download
+        async def generate_chunks():
+            """Stream downloaded chunks as they become available in Redis."""
+            for chunk in chunks:
+                chunk_data = await get_chunk_from_redis(
+                    request.app.state.redis_client,
+                    chunk,
+                )
+                yield chunk_data
+
+        # Full file headers
         headers = {
-            "Content-Type": result["content_type"],
-            "Content-Length": str(len(file_data)),
-            "ETag": f'"{result["md5_hash"]}"',
-            "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
+            "Content-Type": object_info["content_type"],
             "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
-            "x-amz-ipfs-cid": ipfs_cid or "pending",
-            "x-amz-object-status": result.get("status", "unknown"),
             "Accept-Ranges": "bytes",
+            "ETag": f'"{object_info["md5_hash"]}"',
+            "Last-Modified": object_info["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
         }
 
+        # Add custom metadata headers
+        metadata = object_info.get("metadata") or {}
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
         for key, value in metadata.items():
             if key != "ipfs" and not isinstance(value, dict):
                 headers[f"x-amz-meta-{key}"] = str(value)
 
-        return Response(
-            content=file_data,
+        return StreamingResponse(
+            generate_chunks(),
+            media_type=object_info["content_type"],
             headers=headers,
         )
 
     except errors.S3Error as e:
         logger.exception(f"S3 Error getting object {bucket_name}/{object_key}: {e.message}")
         return create_xml_error_response(
+            e.code,
             e.message,
-            f"The object could not be retrieved: {e.message}",
             status_code=e.status_code,
-        )
-
-    except RuntimeError as e:
-        # Handle specific RuntimeError from IPFS service
-        if "Failed to download file with CID" in str(e):
-            return create_xml_error_response(
-                "ServiceUnavailable",
-                f"The IPFS network is currently experiencing issues. Please try again later. ({str(e)})",
-                status_code=503,
-            )
-        logger.exception(f"Runtime error getting object {bucket_name}/{object_key}: {e}")
-        return create_xml_error_response(
-            "InternalError",
-            f"We encountered an internal runtime error: {str(e)}",
-            status_code=500,
         )
 
     except Exception as e:

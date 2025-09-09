@@ -9,6 +9,10 @@ services:
   redis:
     command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--maxmemory", "200gb"]
 
+  downloader:
+    deploy:
+      replicas: 20
+
   ipfs:
     volumes:
       - /ipfs:/data/ipfs

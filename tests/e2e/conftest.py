@@ -120,10 +120,8 @@ def boto3_client(test_seed_phrase: str) -> Any:
             "s3",
             region_name=os.getenv("AWS_REGION", "us-east-1"),
             config=Config(
-                signature_version="s3v4",
-                # Use default virtual host addressing on AWS
-            ),
-            # Credentials resolved via default AWS chain
+                signature_version="s3v4",  # Use default virtual host addressing on AWS
+            ),  # Credentials resolved via default AWS chain
         )
 
     access_key = base64.b64encode(test_seed_phrase.encode()).decode()

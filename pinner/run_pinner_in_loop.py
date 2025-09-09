@@ -63,7 +63,8 @@ async def _process_simple_upload(
         publish=False,
     )
 
-    logger.info(f"Encrypted simple upload -> CID: {s3_result.cid}")
+    encryption_status = "encrypted" if payload.should_encrypt else "unencrypted"
+    logger.info(f"Processed {encryption_status} simple upload -> CID: {s3_result.cid}")
 
     # Update objects table with CID
     await db.execute(
@@ -112,7 +113,8 @@ async def _process_multipart_chunk(
         publish=False,
     )
 
-    logger.info(f"Encrypted multipart chunk {chunk.id} -> CID: {s3_result.cid}")
+    encryption_status = "encrypted" if payload.should_encrypt else "unencrypted"
+    logger.info(f"Processed {encryption_status} multipart chunk {chunk.id} -> CID: {s3_result.cid}")
 
     # Clean up Redis chunk data
     await redis_client.delete(chunk.redis_key)

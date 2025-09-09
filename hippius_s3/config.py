@@ -65,9 +65,14 @@ class Config:
     max_multipart_chunk_size = 128 * 1024 * 1024  # 128 MB
 
     # worker specific settings
-    pinner_sleep_loop = 10
-    unpinner_sleep_loop = 10
-    downloader_sleep_loop = 10
+    pinner_sleep_loop = 1
+    unpinner_sleep_loop = 5
+    downloader_sleep_loop = 0.01
+
+    # endpoint chunk download settings, quite aggressive
+    redis_read_chunk_timeout = 60
+    http_download_sleep_loop = 0.1
+    http_redis_get_retries = int(60 / http_download_sleep_loop)
 
 
 def get_config() -> Config:

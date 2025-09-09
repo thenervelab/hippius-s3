@@ -1,16 +1,20 @@
--- Get complete download information for an object (handles both simple and multipart)
--- Parameters: $1: bucket_name, $2: object_key, $3: main_account_id
+-- Get object info for download with chunks data
+-- Parameters: $1: bucket_id, $2: object_key, $3: main_account_id
 WITH object_info AS (
     SELECT
         o.object_id,
+        o.object_key,
+        o.size_bytes,
         o.multipart,
-        o.cid_id as simple_cid_id,
+        o.status,
+        o.content_type,
+        b.bucket_name,
         b.is_public,
         c.cid as simple_cid
     FROM objects o
     JOIN buckets b ON o.bucket_id = b.bucket_id
     LEFT JOIN cids c ON o.cid_id = c.id
-    WHERE b.bucket_name = $1
+    WHERE o.bucket_id = $1
       AND o.object_key = $2
       AND b.main_account_id = $3
 ),
@@ -28,17 +32,27 @@ multipart_chunks AS (
 )
 SELECT
     oi.object_id,
+    oi.object_key,
+    oi.size_bytes,
     oi.multipart,
-    NOT oi.is_public as needs_decryption,
+    oi.status,
+    oi.content_type,
+    oi.bucket_name,
+    NOT oi.is_public as should_decrypt,
     CASE
         WHEN oi.multipart = FALSE THEN
-            JSON_BUILD_ARRAY(
-                JSON_BUILD_OBJECT(
-                    'part_number', 1,
-                    'cid', oi.simple_cid,
-                    'size_bytes', NULL
-                )
-            )
+            CASE
+                WHEN oi.simple_cid IS NOT NULL THEN
+                    JSON_BUILD_ARRAY(
+                        JSON_BUILD_OBJECT(
+                            'part_number', 1,
+                            'cid', oi.simple_cid,
+                            'size_bytes', oi.size_bytes
+                        )
+                    )
+                ELSE
+                    '[]'::json
+            END
         ELSE
             COALESCE(
                 (SELECT JSON_AGG(

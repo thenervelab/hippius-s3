@@ -11,6 +11,7 @@ from typing import Callable
 from fastapi import Request
 from fastapi import Response
 from hippius_sdk.substrate import SubstrateClient
+from mnemonic import Mnemonic
 from pydantic import BaseModel
 from starlette import status
 
@@ -55,7 +56,6 @@ async def get_subaccount_id_from_seed(seed_phrase: str, substrate_url: str) -> s
             url=substrate_url,
         )
         client.connect(seed_phrase=seed_phrase)
-        logger.info(f"Connected to Substrate client {dir(client)=}")
         if client.is_main_account(
             account_id=client._account_address,
             seed_phrase=seed_phrase,
@@ -77,6 +77,12 @@ async def fetch_account(
     request: Request,
 ) -> HippiusAccount:
     """Fetch account information with full caching logic handled internally."""
+    # Validate seed phrase format before any processing
+    m = Mnemonic("english")
+    if not m.check(seed_phrase):
+        logger.warning("Invalid seed phrase provided")
+        raise ValueError("Invalid seed phrase format")
+
     redis_accounts_client = get_redis_accounts(request)
 
     # Cache seed phrase to subaccount_id mapping to avoid substrate connection

@@ -14,6 +14,12 @@ class Chunk(BaseModel):
     redis_key: str
 
 
+class ChunkToDownload(BaseModel):
+    cid: str
+    part_id: int
+    redis_key: str
+
+
 class ChainRequest(BaseModel):
     substrate_url: str
     ipfs_node: str
@@ -44,6 +50,26 @@ class SimpleUploadChainRequest(ChainRequest):
 
 class UnpinChainRequest(ChainRequest):
     cid: str
+
+
+class DownloadChainRequest(BaseModel):
+    request_id: str
+    object_id: str
+    object_key: str
+    bucket_name: str
+    address: str
+    subaccount: str
+    subaccount_seed_phrase: str
+    substrate_url: str
+    ipfs_node: str
+    should_decrypt: bool
+    size: int
+    multipart: bool
+    chunks: list[ChunkToDownload]
+
+    @property
+    def name(self):
+        return f"download::{self.request_id}::{self.object_id}::{self.address}"
 
 
 async def enqueue_upload_request(
@@ -110,5 +136,35 @@ async def dequeue_unpin_request(
     if result:
         _, queue_data = result
         return UnpinChainRequest.model_validate_json(queue_data)
+
+    return None
+
+
+DOWNLOAD_QUEUE = "download_requests"
+
+
+async def enqueue_download_request(
+    payload: DownloadChainRequest,
+    redis_client: async_redis.Redis,
+) -> None:
+    """Add a download request to the Redis queue for processing by downloader."""
+    await redis_client.lpush(
+        DOWNLOAD_QUEUE,
+        payload.model_dump_json(),
+    )
+    logger.info(f"Enqueued download request {payload.name=}")
+
+
+async def dequeue_download_request(
+    redis_client: async_redis.Redis,
+) -> Union[DownloadChainRequest, None]:
+    """Get the next download request from the Redis queue."""
+    result = await redis_client.brpop(
+        DOWNLOAD_QUEUE,
+        timeout=5,
+    )
+    if result:
+        _, queue_data = result
+        return DownloadChainRequest.model_validate_json(queue_data)
 
     return None
