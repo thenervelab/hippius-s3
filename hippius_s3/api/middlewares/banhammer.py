@@ -127,7 +127,7 @@ async def banhammer_middleware(
         # Check if IP is currently banned
         ban_ttl = await banhammer_service.is_blocked(client_ip)
         if ban_ttl:
-            logger.warning(f"Blocked request from banned IP {client_ip} ({ban_ttl}s remaining)")
+            logger.debug(f"Blocked request from banned IP {client_ip} ({ban_ttl}s remaining)")
             return s3_error_response(
                 code="AccessDenied",
                 message=f"Your IP address has been temporarily banned due to suspicious activity. Try again in {ban_ttl} seconds.",
