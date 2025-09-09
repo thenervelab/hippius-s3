@@ -43,16 +43,40 @@ from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.utils import get_query
 
 
+logger = logging.getLogger(__name__)
+
+
 def format_s3_timestamp(dt):
     """Format datetime to AWS S3 compatible timestamp: YYYY-MM-DDThh:mm:ss.sssZ"""
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-logger = logging.getLogger(__name__)
+async def get_chunk_from_redis(redis_client, chunk: ChunkToDownload) -> bytes:
+    """Get a chunk from Redis with timeout."""
+    for _ in range(config.http_redis_get_retries):
+        chunk_data = await asyncio.wait_for(
+            redis_client.get(chunk.redis_key),
+            timeout=config.redis_read_chunk_timeout,
+        )
+        if chunk_data:
+            logger.debug(f"Got chunk {chunk.part_id} from Redis")
+            break
+
+        await asyncio.sleep(config.http_download_sleep_loop)
+
+    else:
+        raise RuntimeError(f"Chunk {chunk.part_id} not found in Redis")
+
+    return chunk_data
 
 
 def _handle_range_request(
-    file_data: bytes, range_header: str, result: dict, metadata: dict, object_key: str, ipfs_cid: str
+    file_data: bytes,
+    range_header: str,
+    result: dict,
+    metadata: dict,
+    object_key: str,
+    ipfs_cid: str,
 ) -> Response:
     """
     Handle HTTP Range requests for partial content downloads.
@@ -181,7 +205,11 @@ def calculate_chunks_for_range(start_byte: int, end_byte: int, parts_info: List[
 
 
 def extract_range_from_chunks(
-    chunks_data: List[bytes], start_byte: int, end_byte: int, parts_info: List[Dict], needed_parts: List[int]
+    chunks_data: List[bytes],
+    start_byte: int,
+    end_byte: int,
+    parts_info: List[Dict],
+    needed_parts: List[int],
 ) -> bytes:
     """Extract the specific byte range from downloaded chunks."""
     current_offset = 0
@@ -2146,7 +2174,7 @@ async def get_object(
             subaccount=request.state.account.id,
             subaccount_seed_phrase=request.state.seed_phrase,
             substrate_url=config.substrate_url,
-            ipfs_node=config.ipfs_store_url,
+            ipfs_node=config.ipfs_get_url,
             should_decrypt=object_info["should_decrypt"],
             size=object_info["size_bytes"],
             multipart=object_info["multipart"],
@@ -2175,19 +2203,10 @@ async def get_object(
 
                 # Download all needed chunks
                 for chunk in chunks:
-                    timeout = 60
-                    chunk_data = None
-
-                    for _ in range(timeout):
-                        chunk_data = await request.app.state.redis_client.get(chunk.redis_key)
-                        if chunk_data:
-                            logger.debug(f"Got chunk {chunk.part_id} from Redis")
-                            break
-                        await asyncio.sleep(1)
-
-                    if not chunk_data:
-                        raise RuntimeError(f"Timeout waiting for chunk {chunk.part_id} to download")
-
+                    chunk_data = await get_chunk_from_redis(
+                        request.app.state.redis_client,
+                        chunk,
+                    )
                     chunks_data.append(chunk_data)
 
                 # Extract the specific range from chunks
@@ -2201,11 +2220,9 @@ async def get_object(
                     yield range_data[i : i + chunk_size]
 
             # Range request headers
-            content_length = end_byte - start_byte + 1
             headers = {
                 "Content-Type": object_info["content_type"],
                 "Content-Range": f"bytes {start_byte}-{end_byte}/{object_info['size_bytes']}",
-                "Content-Length": str(content_length),
                 "Accept-Ranges": "bytes",
             }
 
@@ -2220,28 +2237,28 @@ async def get_object(
         async def generate_chunks():
             """Stream downloaded chunks as they become available in Redis."""
             for chunk in chunks:
-                timeout = 60
-                chunk_data = None
-
-                for _ in range(timeout):
-                    chunk_data = await request.app.state.redis_client.get(chunk.redis_key)
-                    if chunk_data:
-                        logger.debug(f"Got chunk {chunk.part_id} from Redis")
-                        break
-                    await asyncio.sleep(1)
-
-                if not chunk_data:
-                    raise RuntimeError(f"Timeout waiting for chunk {chunk.part_id} to download")
-
+                chunk_data = await get_chunk_from_redis(
+                    request.app.state.redis_client,
+                    chunk,
+                )
                 yield chunk_data
 
         # Full file headers
         headers = {
             "Content-Type": object_info["content_type"],
-            "Content-Length": str(object_info["size_bytes"]),
             "Content-Disposition": f'inline; filename="{object_key.split("/")[-1]}"',
             "Accept-Ranges": "bytes",
+            "ETag": f'"{object_info["md5_hash"]}"',
+            "Last-Modified": object_info["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
         }
+
+        # Add custom metadata headers
+        metadata = object_info.get("metadata") or {}
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        for key, value in metadata.items():
+            if key != "ipfs" and not isinstance(value, dict):
+                headers[f"x-amz-meta-{key}"] = str(value)
 
         return StreamingResponse(
             generate_chunks(),

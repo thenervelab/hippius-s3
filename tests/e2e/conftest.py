@@ -9,10 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 from typing import Callable
-from typing import Generator
 from typing import Iterator
-from unittest.mock import AsyncMock
-from unittest.mock import patch
 
 import boto3  # type: ignore[import-untyped]
 import pytest
@@ -176,42 +173,3 @@ def unique_bucket_name(test_run_id: str) -> Callable[[str], str]:
         return f"{base_name}-{test_run_id}-{secrets.token_hex(4)}"
 
     return _unique_name
-
-
-@pytest.fixture(autouse=True)
-def mock_download_system() -> Generator[None, None, None]:
-    """Mock the download queue system for e2e tests.
-
-    This fixture:
-    1. Mocks enqueue_download_request to do nothing (skip queueing)
-    2. Mocks Redis get to return test content based on object key
-    """
-
-    async def mock_enqueue(*args: Any, **kwargs: Any) -> None:
-        """Mock enqueue - do nothing, download system is mocked"""
-        pass
-
-    async def mock_redis_get(key: str) -> bytes | None:
-        """Mock Redis get to return appropriate test content"""
-        # Extract object info from Redis key pattern: downloaded:{object_key}:{part}:{request_uuid}
-        if key.startswith("downloaded:"):
-            parts = key.split(":")
-            if len(parts) >= 2:
-                object_key = parts[1]
-
-                # Return appropriate test content based on object key
-                if object_key == "file.txt":
-                    return b"hello get object"
-
-                # Default test content for other files
-                return f"test content for {object_key}".encode()
-
-        # For non-download keys, return None (not found)
-        return None
-
-    # Apply patches
-    with (
-        patch("hippius_s3.queue.enqueue_download_request", new=AsyncMock(side_effect=mock_enqueue)),
-        patch("redis.asyncio.Redis.get", new=AsyncMock(side_effect=mock_redis_get)),
-    ):
-        yield

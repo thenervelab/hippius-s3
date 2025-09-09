@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -27,6 +28,23 @@ async def process_download_request(
     redis_client: async_redis.Redis,
 ) -> bool:
     """Process a download request by downloading each chunk and storing in Redis."""
+
+    # In e2e test mode, return mock data immediately
+    if os.getenv("HIPPIUS_E2E_TESTS") == "true":
+        test_content = os.getenv("HIPPIUS_E2E_GET_OBJECT_CONTENT", "test content").encode()
+        logger.info(f"E2E Mode: Processing download request for {download_request.name} with mock data")
+
+        # Store mock data for all chunks
+        for chunk in download_request.chunks:
+            await redis_client.set(chunk.redis_key, test_content)
+            logger.debug(f"E2E Mode: Stored mock data for chunk {chunk.part_id} with key: {chunk.redis_key}")
+
+        logger.info(
+            f"E2E Mode: Successfully processed {len(download_request.chunks)} chunks for {download_request.name}"
+        )
+        return True
+
+    # Normal production logic
     hippius_client = HippiusClient(
         ipfs_gateway=config.ipfs_get_url,
         ipfs_api_url=config.ipfs_store_url,

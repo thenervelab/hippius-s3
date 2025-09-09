@@ -69,6 +69,11 @@ class Config:
     unpinner_sleep_loop = 5
     downloader_sleep_loop = 0.01
 
+    # endpoint chunk download settings, quite aggressive
+    redis_read_chunk_timeout = 60
+    http_download_sleep_loop = 0.1
+    http_redis_get_retries = int(60 / http_download_sleep_loop)
+
 
 def get_config() -> Config:
     """Get application configuration."""
