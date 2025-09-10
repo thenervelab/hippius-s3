@@ -214,7 +214,6 @@ def extract_range_from_chunks(
     """Extract the specific byte range from downloaded chunks."""
     current_offset = 0
     range_data = b""
-    chunk_idx = 0
 
     logger.debug(f"Starting range extraction: {start_byte}-{end_byte}")
 
@@ -227,6 +226,17 @@ def extract_range_from_chunks(
         )
 
         if part["part_number"] in needed_parts:
+            # Find the correct position of this part in chunks_data
+            # chunks_data is ordered the same as filtered parts_info (passed as parts_info parameter)
+            chunk_idx = None
+            for i, filtered_part in enumerate(parts_info):
+                if filtered_part["part_number"] == part["part_number"]:
+                    chunk_idx = i
+                    break
+
+            if chunk_idx is None:
+                raise ValueError(f"Part {part['part_number']} not found in filtered parts")
+
             chunk_data = chunks_data[chunk_idx]
 
             # Calculate precise slice boundaries within this chunk
@@ -236,14 +246,13 @@ def extract_range_from_chunks(
             slice_end = min(part["size_bytes"], end_byte - part_start + 1)
 
             logger.debug(
-                f"Part {part['part_number']}: slice_start={slice_start}, slice_end={slice_end}, chunk_len={len(chunk_data)}"
+                f"Part {part['part_number']}: chunk_idx={chunk_idx}, slice_start={slice_start}, slice_end={slice_end}, chunk_len={len(chunk_data)}"
             )
 
             # Extract the slice and add to range data
             chunk_slice = chunk_data[slice_start:slice_end]
             logger.debug(f"Part {part['part_number']}: extracted {len(chunk_slice)} bytes")
             range_data += chunk_slice
-            chunk_idx += 1
 
         current_offset += part["size_bytes"]
 
@@ -2212,7 +2221,7 @@ async def get_object(
 
                 # Extract the specific range from chunks
                 logger.debug(f"Extracting range {start_byte}-{end_byte} from {len(filtered_chunks)} chunks")
-                range_data = extract_range_from_chunks(chunks_data, start_byte, end_byte, download_chunks, needed_parts)
+                range_data = extract_range_from_chunks(chunks_data, start_byte, end_byte, filtered_chunks, needed_parts)
                 logger.debug(f"Extracted {len(range_data)} bytes for range {start_byte}-{end_byte}")
 
                 # Yield the range data in smaller chunks to avoid streaming issues
