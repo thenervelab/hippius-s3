@@ -41,14 +41,14 @@ async def get_request_body(request: Request) -> bytes:
 
     raw_body = b"".join(chunks)
     body_time = time.time() - start_time
-    logger.info(f"Streaming read took {body_time:.3f}s, {chunk_count} chunks, size: {len(raw_body)} bytes")
+    logger.debug(f"Streaming read took {body_time:.3f}s, {chunk_count} chunks, size: {len(raw_body)} bytes")
 
     # Check if body needs de-chunking
     if _is_aws_chunked_body(raw_body, request):
         decode_start = time.time()
         decoded_body, trailers = _decode_aws_chunked_body(raw_body)
         decode_time = time.time() - decode_start
-        logger.info(f"AWS chunked decode took {decode_time:.3f}s: {len(raw_body)} -> {len(decoded_body)} bytes")
+        logger.debug(f"AWS chunked decode took {decode_time:.3f}s: {len(raw_body)} -> {len(decoded_body)} bytes")
         if trailers:
             logger.debug(f"Found trailers: {trailers}")
         return decoded_body

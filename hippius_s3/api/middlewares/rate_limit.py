@@ -68,7 +68,7 @@ async def rate_limit_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
     rate_limit_service: RateLimitService,
-    max_requests: int = 600,
+    max_requests: int = 7200,
     window_seconds: int = 60,
 ) -> Response:
     """
