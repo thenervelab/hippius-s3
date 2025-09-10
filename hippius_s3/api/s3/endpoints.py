@@ -2172,6 +2172,8 @@ async def get_object(
             object_key=object_info["object_key"],
             bucket_name=object_info["bucket_name"],
             address=request.state.account.main_account,
+            # use account id instead of subaccount id, to make encryption key be account based
+            # not subaccount based. this way, all subaccounts can read the main account's buckets
             subaccount=request.state.account.id,
             subaccount_seed_phrase=request.state.seed_phrase,
             substrate_url=config.substrate_url,
