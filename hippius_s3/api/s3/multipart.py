@@ -298,7 +298,7 @@ async def upload_part(
         body_start = time.time()
         file_data = await get_request_body(request)
         body_time = time.time() - body_start
-        logger.info(f"Part {part_number}: Got request body in {body_time:.3f}s, size: {len(file_data)} bytes")
+        logger.debug(f"Part {part_number}: Got request body in {body_time:.3f}s, size: {len(file_data)} bytes")
     except ClientDisconnect:
         logger.warning(f"Client disconnected during part {part_number} upload for upload {upload_id}")
 
@@ -352,7 +352,7 @@ async def upload_part(
                 status_code=408,
             )
         disconnect_time = time.time() - disconnect_start
-        logger.info(f"Part {part_number}: Disconnect check took {disconnect_time:.3f}s")
+        logger.debug(f"Part {part_number}: Disconnect check took {disconnect_time:.3f}s")
 
         # Store in Redis
         redis_start = time.time()
@@ -362,7 +362,7 @@ async def upload_part(
             file_data,
         )  # 30 minute TTL
         redis_time = time.time() - redis_start
-        logger.info(f"Part {part_number}: Redis setex took {redis_time:.3f}s")
+        logger.debug(f"Part {part_number}: Redis setex took {redis_time:.3f}s")
 
         # Create mock part result (no IPFS upload needed for individual parts)
         md5_start = time.time()
