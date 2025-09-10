@@ -1801,7 +1801,7 @@ async def put_object(
         part_index = 0
         redis_key = f"simple:{object_id}:part:{part_index}"
 
-        # Store file data in Redis for the pinner to process
+        # Store file data in Redis for the workers to process
         await redis_client.set(redis_key, file_data)
 
         await enqueue_upload_request(

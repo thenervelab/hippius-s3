@@ -89,8 +89,8 @@ services:
   pinner:
     build:
       context: .
-      dockerfile: pinner/Dockerfile
-    command: ["python", "pinner/run_pinner_in_loop.py"]
+      dockerfile: workers/Dockerfile
+    command: ["python", "workers/run_pinner_in_loop.py"]
     env_file:
       - .env
     depends_on:
@@ -106,8 +106,8 @@ services:
   unpinner:
     build:
       context: .
-      dockerfile: pinner/Dockerfile
-    command: ["python", "pinner/run_unpinner_in_loop.py"]
+      dockerfile: workers/Dockerfile
+    command: ["python", "workers/run_unpinner_in_loop.py"]
     env_file:
       - .env
     depends_on:
@@ -123,8 +123,8 @@ services:
   downloader:
     build:
       context: .
-      dockerfile: pinner/Dockerfile
-    command: ["python", "run_downloader_in_loop.py"]
+      dockerfile: workers/Dockerfile
+    command: ["python", "workers/run_downloader_in_loop.py"]
     env_file:
       - .env
     depends_on:

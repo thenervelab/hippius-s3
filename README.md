@@ -176,6 +176,13 @@ Hippius SDK
 IPFS Network + Blockchain
 ```
 
+### Project Structure
+
+- **`hippius_s3/`** - Main API application with S3-compatible endpoints
+- **`workers/`** - Background workers for async operations ([see workers README](workers/README.md))
+- **`tests/`** - Test suites including end-to-end S3 client testing
+- **`docs/`** - Documentation and API reference
+
 ## Development
 
 ```bash

@@ -79,7 +79,7 @@ async def enqueue_upload_request(
     ],
     redis_client: async_redis.Redis,
 ) -> None:
-    """Add an upload request to the Redis queue for processing by pinner."""
+    """Add an upload request to the Redis queue for processing by workers."""
     await redis_client.lpush(
         "upload_requests",
         payload.model_dump_json(),

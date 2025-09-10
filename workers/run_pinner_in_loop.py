@@ -310,7 +310,7 @@ async def run_pinner_loop():
     redis_client = async_redis.from_url(config.redis_url)
     db = await asyncpg.connect(config.database_url)
 
-    logger.info("Starting pinner service...")
+    logger.info("Starting workers service...")
     logger.info(f"Redis URL: {config.redis_url}")
     logger.info(f"Database connected: {config.database_url}")
     user_upload_requests = {}
@@ -344,7 +344,7 @@ async def run_pinner_loop():
     except KeyboardInterrupt:
         logger.info("Pinner service stopping...")
     except Exception as e:
-        logger.error(f"Error in pinner loop: {e}")
+        logger.error(f"Error in workers loop: {e}")
         raise
     finally:
         await redis_client.aclose()

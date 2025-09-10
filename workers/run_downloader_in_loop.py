@@ -32,7 +32,9 @@ async def process_download_request(
     # In e2e test mode, return mock data immediately
     if os.getenv("HIPPIUS_E2E_TESTS") == "true":
         test_content = os.getenv("HIPPIUS_E2E_GET_OBJECT_CONTENT", "test content").encode()
-        logger.info(f"E2E Mode: Processing download request for {download_request.bucket_name}/{download_request.object_key} with mock data")
+        logger.info(
+            f"E2E Mode: Processing download request for {download_request.bucket_name}/{download_request.object_key} with mock data"
+        )
 
         # Store mock data for all chunks
         for chunk in download_request.chunks:
@@ -104,7 +106,9 @@ async def process_and_log_download(download_request, redis_client):
     """Process download request with logging - runs as background task."""
     success = await process_download_request(download_request, redis_client)
     if success:
-        logger.info(f"Successfully processed download request {download_request.bucket_name}/{download_request.object_key}")
+        logger.info(
+            f"Successfully processed download request {download_request.bucket_name}/{download_request.object_key}"
+        )
     else:
         logger.error(f"Failed to process download request {download_request.bucket_name}/{download_request.object_key}")
 
@@ -123,9 +127,13 @@ async def run_downloader_loop():
             if download_request:
                 success = await process_download_request(download_request, redis_client)
                 if success:
-                    logger.info(f"Successfully processed download request {download_request.bucket_name}/{download_request.object_key}")
+                    logger.info(
+                        f"Successfully processed download request {download_request.bucket_name}/{download_request.object_key}"
+                    )
                 else:
-                    logger.error(f"Failed to process download request {download_request.bucket_name}/{download_request.object_key}")
+                    logger.error(
+                        f"Failed to process download request {download_request.bucket_name}/{download_request.object_key}"
+                    )
             else:
                 # Wait a bit before checking again
                 await asyncio.sleep(config.downloader_sleep_loop)
