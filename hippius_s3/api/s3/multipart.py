@@ -370,7 +370,7 @@ async def upload_part(
         loop = asyncio.get_event_loop()
         md5_hash = await loop.run_in_executor(None, lambda: hashlib.md5(file_data).hexdigest())
         md5_time = time.time() - md5_start
-        logger.info(f"Part {part_number}: MD5 calculation took {md5_time:.3f}s (threaded)")
+        logger.debug(f"Part {part_number}: MD5 calculation took {md5_time:.3f}s (threaded)")
 
         etag = f"{md5_hash}-{part_number}"
 
@@ -394,10 +394,10 @@ async def upload_part(
             datetime.now(UTC),
         )
         db_time = time.time() - db_start
-        logger.info(f"Part {part_number}: Database insert took {db_time:.3f}s")
+        logger.debug(f"Part {part_number}: Database insert took {db_time:.3f}s")
 
         total_time = time.time() - start_time
-        logger.info(f"Part {part_number}: TOTAL processing time: {total_time:.3f}s")
+        logger.debug(f"Part {part_number}: TOTAL processing time: {total_time:.3f}s")
 
         # Return the part's ETag in the response header
         return Response(
