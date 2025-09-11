@@ -35,7 +35,15 @@ def test_seed_phrase() -> str:
 
 @pytest.fixture(scope="session")
 def compose_project_name(test_run_id: str) -> str:
-    """Static docker compose project name for e2e runs."""
+    """Docker compose project name for e2e runs.
+
+    Allows overriding via HIPPIUS_E2E_PROJECT to reuse an already running stack
+    (e.g., the default project name from manual `docker compose up`).
+    Defaults to a stable name to keep hot reload cycles fast.
+    """
+    override = os.environ.get("HIPPIUS_E2E_PROJECT")
+    if override and override.strip():
+        return override.strip()
     return "hippius-e2e"
 
 
