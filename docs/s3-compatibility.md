@@ -9,12 +9,12 @@ Notes:
 
 ### All AWS S3 actions
 
-| Action                                          | Supported | Notes                                                      | Endpoint(s)                                   | Test                    |
-| ----------------------------------------------- | --------- | ---------------------------------------------------------- | --------------------------------------------- | ----------------------- |
+| Action                                          | Supported | Notes                                                      | Endpoint(s)                                   | Test                                       |
+| ----------------------------------------------- | --------- | ---------------------------------------------------------- | --------------------------------------------- | ------------------------------------------ |
 | AbortMultipartUpload                            | ✔         | Aborts upload and cleans up                                | DELETE /{bucket}/{key}?uploadId=...           |
 | CompleteMultipartUpload                         | ✔         | Computes combined ETag                                     | POST /{bucket}/{key}?uploadId=...             |
-| CopyObject                                      | ✔         | Via x-amz-copy-source header                               | PUT /{bucket}/{key}                           |
-| CreateBucket                                    | ✔         | Rejects x-amz-acl with InvalidBucketAclWithObjectOwnership | PUT /{bucket}                                 | test_CreateBucket.py    |
+| CopyObject                                      | ✔         | Via x-amz-copy-source header                               | PUT /{bucket}/{key}                           | test_CopyObject.py                         |
+| CreateBucket                                    | ✔         | Rejects x-amz-acl with InvalidBucketAclWithObjectOwnership | PUT /{bucket}                                 | test_CreateBucket.py                       |
 | CreateBucketMetadataConfiguration               |           |                                                            |                                               |
 | CreateBucketMetadataTableConfiguration          |           |                                                            |                                               |
 | CreateMultipartUpload                           | ✔         | Initiate multipart upload                                  | POST /{bucket}/{key}?uploads                  |
@@ -32,11 +32,11 @@ Notes:
 | DeleteBucketOwnershipControls                   |           |                                                            |                                               |
 | DeleteBucketPolicy                              |           |                                                            |                                               |
 | DeleteBucketReplication                         |           |                                                            |                                               |
-| DeleteBucketTagging                             | ✔         | Deletes all tags                                           | DELETE /{bucket}?tagging                      | test_BucketTagging.py   |
+| DeleteBucketTagging                             | ✔         | Deletes all tags                                           | DELETE /{bucket}?tagging                      | test_BucketTagging.py                      |
 | DeleteBucketWebsite                             |           |                                                            |                                               |
-| DeleteObject                                    | ✔         | Idempotent 204                                             | DELETE /{bucket}/{key}                        | test_DeleteObject.py    |
+| DeleteObject                                    | ✔         | Idempotent 204                                             | DELETE /{bucket}/{key}                        | test_DeleteObject.py                       |
 | DeleteObjects                                   |           | Batch delete not supported                                 |                                               |
-| DeleteObjectTagging                             | ✔         | Deletes all tags                                           | DELETE /{bucket}/{key}?tagging                | test_ObjectTagging.py   |
+| DeleteObjectTagging                             | ✔         | Deletes all tags                                           | DELETE /{bucket}/{key}?tagging                | test_ObjectTagging.py                      |
 | DeletePublicAccessBlock                         |           |                                                            |                                               |
 | GetBucketAccelerateConfiguration                |           |                                                            |                                               |
 | GetBucketAcl                                    |           |                                                            |                                               |
@@ -45,9 +45,9 @@ Notes:
 | GetBucketEncryption                             |           |                                                            |                                               |
 | GetBucketIntelligentTieringConfiguration        |           |                                                            |                                               |
 | GetBucketInventoryConfiguration                 |           |                                                            |                                               |
-| GetBucketLifecycle                              | ✔         | 404 NoSuchLifecycleConfiguration when not configured       | GET /{bucket}?lifecycle                       | test_BucketLifecycle.py |
-| GetBucketLifecycleConfiguration                 | ✔         | 404 NoSuchLifecycleConfiguration when not configured       | GET /{bucket}?lifecycle                       | test_BucketLifecycle.py |
-| GetBucketLocation                               | ✔         | Always returns us-east-1 XML                               | GET /{bucket}?location                        |                         |
+| GetBucketLifecycle                              | ✔         | 404 NoSuchLifecycleConfiguration when not configured       | GET /{bucket}?lifecycle                       | test_BucketLifecycle.py                    |
+| GetBucketLifecycleConfiguration                 | ✔         | 404 NoSuchLifecycleConfiguration when not configured       | GET /{bucket}?lifecycle                       | test_BucketLifecycle.py                    |
+| GetBucketLocation                               | ✔         | Always returns us-east-1 XML                               | GET /{bucket}?location                        |                                            |
 | GetBucketLogging                                |           |                                                            |                                               |
 | GetBucketMetadataConfiguration                  |           |                                                            |                                               |
 | GetBucketMetadataTableConfiguration             |           |                                                            |                                               |
@@ -55,32 +55,32 @@ Notes:
 | GetBucketNotification                           |           |                                                            |                                               |
 | GetBucketNotificationConfiguration              |           |                                                            |                                               |
 | GetBucketOwnershipControls                      |           |                                                            |                                               |
-| GetBucketPolicy                                 | ✔         | Only for public buckets                                    | GET /{bucket}?policy                          |
+| GetBucketPolicy                                 | ✔         | Only for public buckets                                    | GET /{bucket}?policy                          | test_BucketPolicy.py                       |
 | GetBucketPolicyStatus                           |           |                                                            |                                               |
 | GetBucketReplication                            |           |                                                            |                                               |
 | GetBucketRequestPayment                         |           |                                                            |                                               |
-| GetBucketTagging                                | ✔         | XML response                                               | GET /{bucket}?tagging                         | test_BucketTagging.py   |
+| GetBucketTagging                                | ✔         | XML response                                               | GET /{bucket}?tagging                         | test_BucketTagging.py                      |
 | GetBucketVersioning                             |           |                                                            |                                               |
 | GetBucketWebsite                                |           |                                                            |                                               |
-| GetObject                                       | ✔         | Supports Range; S3-like headers                            | GET /{bucket}/{key}                           | test_GetObject.py       |
+| GetObject                                       | ✔         | Supports Range; S3-like headers                            | GET /{bucket}/{key}                           | test_GetObject.py, test_GetObject_Range.py |
 | GetObjectAcl                                    |           |                                                            |                                               |
 | GetObjectAttributes                             |           |                                                            |                                               |
 | GetObjectLegalHold                              |           |                                                            |                                               |
 | GetObjectLockConfiguration                      |           |                                                            |                                               |
 | GetObjectRetention                              |           |                                                            |                                               |
-| GetObjectTagging                                | ✔         | XML response                                               | GET /{bucket}/{key}?tagging                   | test_ObjectTagging.py   |
+| GetObjectTagging                                | ✔         | XML response                                               | GET /{bucket}/{key}?tagging                   | test_ObjectTagging.py                      |
 | GetObjectTorrent                                |           |                                                            |                                               |
 | GetPublicAccessBlock                            |           |                                                            |                                               |
-| HeadBucket                                      | ✔         | 200 if exists, 404 if not (empty body)                     | HEAD /{bucket}                                | test_CreateBucket.py    |
-| HeadObject                                      | ✔         | Returns metadata headers                                   | HEAD /{bucket}/{key}                          | test_HeadObject.py      |
+| HeadBucket                                      | ✔         | 200 if exists, 404 if not (empty body)                     | HEAD /{bucket}                                | test_CreateBucket.py                       |
+| HeadObject                                      | ✔         | Returns metadata headers                                   | HEAD /{bucket}/{key}                          | test_HeadObject.py                         |
 | ListBucketAnalyticsConfigurations               |           |                                                            |                                               |
 | ListBucketIntelligentTieringConfigurations      |           |                                                            |                                               |
 | ListBucketInventoryConfigurations               |           |                                                            |                                               |
 | ListBucketMetricsConfigurations                 |           |                                                            |                                               |
-| ListBuckets                                     | ✔         | Lists buckets owned by the authenticated account           | GET /                                         | test_CreateBucket.py    |
+| ListBuckets                                     | ✔         | Lists buckets owned by the authenticated account           | GET /                                         | test_CreateBucket.py                       |
 | ListDirectoryBuckets                            |           |                                                            |                                               |
 | ListMultipartUploads                            | ✔         | Lists ongoing multipart uploads                            | GET /{bucket}?uploads                         |
-| ListObjects                                     | ✔         | Optional prefix filtering                                  | GET /{bucket}                                 | test_ListObjects.py     |
+| ListObjects                                     | ✔         | Optional prefix filtering                                  | GET /{bucket}                                 | test_ListObjects.py                        |
 | ListObjectsV2                                   |           |                                                            |                                               |
 | ListObjectVersions                              |           |                                                            |                                               |
 | ListParts                                       |           |                                                            |                                               |
@@ -91,25 +91,25 @@ Notes:
 | PutBucketEncryption                             |           |                                                            |                                               |
 | PutBucketIntelligentTieringConfiguration        |           |                                                            |                                               |
 | PutBucketInventoryConfiguration                 |           |                                                            |                                               |
-| PutBucketLifecycle                              | ✔         | Accepts config; not persisted yet (ack only)               | PUT /{bucket}?lifecycle                       | test_BucketLifecycle.py |
-| PutBucketLifecycleConfiguration                 | ✔         | Accepts config; not persisted yet (ack only)               | PUT /{bucket}?lifecycle                       | test_BucketLifecycle.py |
+| PutBucketLifecycle                              | ✔         | Accepts config; not persisted yet (ack only)               | PUT /{bucket}?lifecycle                       | test_BucketLifecycle.py                    |
+| PutBucketLifecycleConfiguration                 | ✔         | Accepts config; not persisted yet (ack only)               | PUT /{bucket}?lifecycle                       | test_BucketLifecycle.py                    |
 | PutBucketLogging                                |           |                                                            |                                               |
 | PutBucketMetricsConfiguration                   |           |                                                            |                                               |
 | PutBucketNotification                           |           |                                                            |                                               |
 | PutBucketNotificationConfiguration              |           |                                                            |                                               |
 | PutBucketOwnershipControls                      |           |                                                            |                                               |
-| PutBucketPolicy                                 | ✔         | Public-read helper only                                    | PUT /{bucket}?policy                          |
+| PutBucketPolicy                                 | ✔         | Public-read helper only                                    | PUT /{bucket}?policy                          | test_BucketPolicy.py                       |
 | PutBucketReplication                            |           |                                                            |                                               |
 | PutBucketRequestPayment                         |           |                                                            |                                               |
-| PutBucketTagging                                | ✔         | XML request                                                | PUT /{bucket}?tagging                         | test_BucketTagging.py   |
+| PutBucketTagging                                | ✔         | XML request                                                | PUT /{bucket}?tagging                         | test_BucketTagging.py                      |
 | PutBucketVersioning                             |           |                                                            |                                               |
 | PutBucketWebsite                                |           |                                                            |                                               |
-| PutObject                                       | ✔         | MD5 as ETag; x-amz-meta-\*                                 | PUT /{bucket}/{key}                           | test_PutObject.py       |
+| PutObject                                       | ✔         | MD5 as ETag; x-amz-meta-\*                                 | PUT /{bucket}/{key}                           | test_PutObject.py                          |
 | PutObjectAcl                                    |           |                                                            |                                               |
 | PutObjectLegalHold                              |           |                                                            |                                               |
 | PutObjectLockConfiguration                      |           |                                                            |                                               |
 | PutObjectRetention                              |           |                                                            |                                               |
-| PutObjectTagging                                | ✔         | XML request                                                | PUT /{bucket}/{key}?tagging                   | test_ObjectTagging.py   |
+| PutObjectTagging                                | ✔         | XML request                                                | PUT /{bucket}/{key}?tagging                   | test_ObjectTagging.py                      |
 | PutPublicAccessBlock                            |           |                                                            |                                               |
 | RenameObject                                    |           |                                                            |                                               |
 | RestoreObject                                   |           |                                                            |                                               |
@@ -146,6 +146,10 @@ Notes:
 
   - `PUT /{bucket}?policy` — Accepts a standard public-read JSON policy; marks bucket public
   - `GET /{bucket}?policy` — Returns policy JSON for public buckets; 404 `NoSuchBucketPolicy` for private buckets
+
+Notes:
+
+- Block Public Access (Bucket/Account PublicAccessBlock) is not currently supported. As a result, public policies are accepted by default. A future version will add `PutPublicAccessBlock`/`GetPublicAccessBlock` and enforcement; tests are prepared to re-enable assertions when implemented.
 
 - **Bucket lifecycle (minimal support)**
 

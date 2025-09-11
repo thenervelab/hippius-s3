@@ -5,7 +5,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import uuid
 from datetime import UTC
 from datetime import datetime
@@ -84,50 +83,10 @@ def _handle_range_request(
     Parses Range header and returns appropriate 206 Partial Content response
     or 416 Range Not Satisfiable if invalid range.
     """
-    import re
 
     file_size = len(file_data)
-
-    # Parse range header - format: "bytes=start-end" or "bytes=start-" or "bytes=-suffix"
-    range_match = re.match(r"bytes=(\d*)-(\d*)", range_header.lower())
-    if not range_match:
-        # Invalid range format
-        return Response(
-            status_code=416,
-            content=f"Invalid range format: {range_header}",
-            headers={"Content-Range": f"bytes */{file_size}"},
-        )
-
-    start_str, end_str = range_match.groups()
-
     try:
-        # Handle different range formats
-        if start_str and end_str:
-            start = int(start_str)
-            end = int(end_str)
-        elif start_str and not end_str:
-            # Format: bytes=start- (from start to end of file)
-            start = int(start_str)
-            end = file_size - 1
-        elif not start_str and end_str:
-            # Format: bytes=-suffix (last N bytes)
-            suffix = int(end_str)
-            start = max(0, file_size - suffix)
-            end = file_size - 1
-        else:
-            # Invalid: bytes=-
-            raise ValueError("Invalid range")
-
-        # Validate range
-        if start < 0 or end < 0 or start > end or start >= file_size:
-            return Response(
-                status_code=416,
-                content=f"Range not satisfiable: {range_header}",
-                headers={"Content-Range": f"bytes */{file_size}"},
-            )
-
-        # Clamp end to file size
-        end = min(end, file_size - 1)
+        start, end = parse_range_header(range_header, file_size)
         content_length = end - start + 1
 
         # Extract the requested byte range
@@ -151,35 +110,77 @@ def _handle_range_request(
             if key != "ipfs" and not isinstance(value, dict):
                 headers[f"x-amz-meta-{key}"] = str(value)
 
-        return Response(
-            content=range_data,
-            status_code=206,  # Partial Content
-            headers=headers,
-        )
+        return Response(content=range_data, status_code=206, headers=headers)
 
-    except (ValueError, TypeError) as e:
+    except ValueError:
+        return Response(
+            status_code=416,
+            headers={
+                "Content-Range": f"bytes */{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": "0",
+            },
+        )
+    except TypeError as e:
         logger.warning(f"Invalid range request '{range_header}': {e}")
         return Response(
             status_code=416,
-            content=f"Range not satisfiable: {range_header}",
-            headers={"Content-Range": f"bytes */{file_size}"},
+            headers={
+                "Content-Range": f"bytes */{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": "0",
+            },
         )
 
 
 def parse_range_header(range_header: str, total_size: int) -> Tuple[int, int]:
-    """Parse Range header and return start and end bytes."""
-    # Support both "bytes=start-end" and "bytes=start-" (open-ended)
-    range_match = re.match(r"bytes=(\d+)-(\d*)", range_header.lower())
-    if not range_match:
+    """Parse Range header and return inclusive (start, end) byte positions.
+
+    Supports:
+    - bytes=start-end
+    - bytes=start-
+    - bytes=-suffix
+    """
+    header = range_header.lower().strip()
+    if not header.startswith("bytes="):
         raise ValueError(f"Invalid range format: {range_header}")
 
-    start = int(range_match.group(1))
-    end_str = range_match.group(2)
+    spec = header[len("bytes=") :]
 
-    # Open-ended range: "bytes=start-" means from start to end of file
-    end = int(end_str) if end_str else total_size - 1
+    # The suffix: bytes=-N
+    if spec.startswith("-"):
+        try:
+            suffix = int(spec[1:])
+        except ValueError as e:
+            raise ValueError(f"Invalid range suffix: {range_header}") from e
+        if suffix <= 0:
+            raise ValueError(f"Invalid range suffix: {range_header}")
+        end = total_size - 1
+        start = max(0, total_size - suffix)
+        return start, end
 
-    return start, end
+    # Start-end or start-
+    parts = spec.split("-", 1)
+    if len(parts) != 2 or not parts[0].isdigit():
+        raise ValueError(f"Invalid range format: {range_header}")
+
+    start = int(parts[0])
+    if start >= total_size:
+        # Unsatisfiable
+        raise ValueError("Range start beyond file size")
+
+    if parts[1]:
+        # start-end
+        if not parts[1].isdigit():
+            raise ValueError(f"Invalid range end: {range_header}")
+        end = int(parts[1])
+        if end < start:
+            raise ValueError("Range end before start")
+        end = min(end, total_size - 1)
+        return start, end
+
+    # start- (to EOF)
+    return start, total_size - 1
 
 
 def calculate_chunks_for_range(start_byte: int, end_byte: int, parts_info: List[Dict]) -> List[int]:
@@ -1507,6 +1508,7 @@ async def _copy_object(
     source_bucket: dict,
     destination_bucket: dict,
     source_object_key: str,
+    destination_object_key: str,
     request: fastapi.Request,
     db: DBConnection,
     ipfs_service: IPFSService,
@@ -1615,7 +1617,7 @@ async def _copy_object(
             get_query("upsert_object_with_cid"),
             object_id,
             destination_bucket["bucket_id"],
-            source_object_key,
+            destination_object_key,
             cid_id,
             file_size,
             content_type,
@@ -1755,6 +1757,7 @@ async def put_object(
             source_bucket=source_bucket,
             destination_bucket=dest_bucket,
             source_object_key=source_object_key,
+            destination_object_key=object_key,
             request=request,
             db=db,
             ipfs_service=ipfs_service,
@@ -2089,11 +2092,23 @@ async def get_object(
                 Key=object_key,
             )
 
+        if range_header:
+            try:
+                start_byte, end_byte = parse_range_header(range_header, object_info["size_bytes"])
+            except ValueError:
+                return Response(
+                    status_code=416,
+                    headers={
+                        "Content-Range": f"bytes */{object_info['size_bytes']}",
+                        "Accept-Ranges": "bytes",
+                        "Content-Length": "0",
+                    },
+                )
+        # Load chunk metadata after range validation to avoid returning 503 for syntactically invalid ranges
         download_chunks = json.loads(object_info["download_chunks"])
 
         # Check if all chunks have CIDs - if not, object is still being processed
         if not download_chunks:
-            # Track retry attempts using request headers
             retry_count = int(request.headers.get("x-hippius-retry-count", "0"))
             max_retries = 5
 
@@ -2118,7 +2133,6 @@ async def get_object(
         # Check if any chunk is missing a CID (still being processed)
         missing_cids = [chunk for chunk in download_chunks if not chunk.get("cid")]
         if missing_cids:
-            # Track retry attempts using request headers
             retry_count = int(request.headers.get("x-hippius-retry-count", "0"))
             max_retries = 5
 
@@ -2142,7 +2156,6 @@ async def get_object(
 
         # Handle range requests by calculating needed chunks
         if range_header:
-            start_byte, end_byte = parse_range_header(range_header, object_info["size_bytes"])
             needed_parts = calculate_chunks_for_range(start_byte, end_byte, download_chunks)
             filtered_chunks = [chunk for chunk in download_chunks if chunk["part_number"] in needed_parts]
         else:
