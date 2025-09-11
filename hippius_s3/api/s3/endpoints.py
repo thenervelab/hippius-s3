@@ -1577,36 +1577,22 @@ async def _copy_object(
                 f"Slow copy: different encryption (source public={source_is_public}, dest public={dest_is_public})"
             )
 
-            file_data: bytes | None = None
-
-            # If CID is available, download via IPFS; otherwise, try Redis fallback
+            # If CID is not yet available, return 503 and let client retry
             source_cid = (source_object.get("ipfs_cid") or "").strip()
-            if source_cid:
-                # Download file from source bucket with source encryption
-                file_data = await ipfs_service.download_file(
-                    cid=source_cid,
-                    subaccount_id=request.state.account.main_account,
-                    bucket_name=source_bucket_name,
-                    decrypt=not source_is_public,  # Decrypt if source was encrypted
-                )
-            else:
-                # Fallback: object may still be pending publish. Try raw bytes from Redis produced by PUT.
-                # Simple uploads cache the payload at key: "simple:{object_id}:part:0"
-                try:
-                    redis_key = f"simple:{source_object['object_id']}:part:0"
-                    file_data = await redis_client.get(redis_key)
-                    if file_data is None:
-                        logger.info(f"Redis fallback miss for pending source object: key={redis_key}")
-                except Exception as redis_error:
-                    logger.warning(f"Redis fallback error while copying object: {redis_error}")
-
-            if file_data is None:
-                # Could not get data yet; surface a retriable error matching S3 transient behavior
+            if not source_cid:
                 return create_xml_error_response(
                     "ServiceUnavailable",
                     "Source object is not yet available for copying. Please retry shortly.",
                     status_code=503,
                 )
+
+            # Download file from source bucket with source encryption
+            file_data: bytes = await ipfs_service.download_file(
+                cid=source_cid,
+                subaccount_id=request.state.account.main_account,
+                bucket_name=source_bucket_name,
+                decrypt=not source_is_public,  # Decrypt if source was encrypted
+            )
 
             # Calculate MD5 hash for ETag compatibility
             md5_hash = hashlib.md5(file_data).hexdigest()

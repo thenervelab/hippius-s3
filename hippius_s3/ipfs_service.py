@@ -116,7 +116,7 @@ class IPFSService:
                 subaccount_id=subaccount_id,
                 bucket_name=bucket_name,
                 auto_decrypt=decrypt,
-                download_node=self.config.ipfs_store_url,
+                download_node=self.config.ipfs_get_url,
                 streaming=True,
             )
         # Use return_bytes mode instead of temp file to avoid file I/O issues
@@ -126,7 +126,7 @@ class IPFSService:
                 subaccount_id=subaccount_id,
                 bucket_name=bucket_name,
                 auto_decrypt=decrypt,
-                download_node=self.config.ipfs_store_url,
+                download_node=self.config.ipfs_get_url,
                 return_bytes=True,
             )
 
