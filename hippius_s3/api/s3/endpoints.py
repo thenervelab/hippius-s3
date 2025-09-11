@@ -27,6 +27,7 @@ from lxml import etree as ET
 from hippius_s3 import dependencies
 from hippius_s3 import utils
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.multipart import list_parts_internal
 from hippius_s3.api.s3.multipart import upload_part
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import DBConnection
@@ -2103,6 +2104,10 @@ async def get_object(
             request.state.seed_phrase,
             request.state.account.main_account,
         )
+
+    # List parts for an ongoing multipart upload
+    if "uploadId" in request.query_params:
+        return await list_parts_internal(bucket_name, object_key, request, db)
 
     # Check for Range header - handle partial content requests
     range_header = request.headers.get("Range") or request.headers.get("range")

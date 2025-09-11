@@ -111,6 +111,86 @@ async def handle_post_object(
     return None
 
 
+async def list_parts_internal(
+    bucket_name: str,
+    object_key: str,
+    request: Request,
+    db: dependencies.DBConnection,
+) -> Response:
+    """List parts for an ongoing multipart upload (?uploadId=...)."""
+    upload_id = request.query_params.get("uploadId")
+    if not upload_id:
+        return s3_error_response("InvalidRequest", "Missing uploadId", status_code=400)
+
+    # Validate the multipart upload exists and matches bucket/key
+    mpu = await db.fetchrow(get_query("get_multipart_upload"), upload_id)
+    if not mpu:
+        return s3_error_response("NoSuchUpload", "The specified upload does not exist", status_code=404)
+    if mpu["is_completed"]:
+        return s3_error_response("InvalidRequest", "Upload already completed", status_code=400)
+
+    # Check bucket and key
+    if mpu["object_key"] != object_key:
+        return s3_error_response("InvalidRequest", "Object key does not match upload", status_code=400)
+
+    user = await db.fetchrow(
+        get_query("get_or_create_user_by_main_account"), request.state.account.main_account, datetime.now(UTC)
+    )
+    bucket = await db.fetchrow(get_query("get_bucket_by_name_and_owner"), bucket_name, user["main_account_id"])
+    if not bucket or bucket["bucket_id"] != mpu["bucket_id"]:
+        return s3_error_response("NoSuchBucket", f"Bucket {bucket_name} does not exist", status_code=404)
+
+    # Pagination params
+    max_parts_str = request.query_params.get("max-parts")
+    part_marker_str = request.query_params.get("part-number-marker")
+    try:
+        max_parts = int(max_parts_str) if max_parts_str else 1000
+    except ValueError:
+        max_parts = 1000
+    try:
+        part_marker = int(part_marker_str) if part_marker_str else 0
+    except ValueError:
+        part_marker = 0
+
+    # Fetch all parts and then apply simple pagination (DB already orders)
+    all_parts = await db.fetch(get_query("list_parts"), upload_id)
+    visible_parts = [p for p in all_parts if p["part_number"] > part_marker][:max_parts]
+
+    is_truncated = len(visible_parts) < len([p for p in all_parts if p["part_number"] > part_marker])
+    next_part_marker = visible_parts[-1]["part_number"] if visible_parts else part_marker
+
+    # Build XML per S3 ListParts
+    root = ET.Element("ListPartsResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+    ET.SubElement(root, "Bucket").text = bucket_name
+    ET.SubElement(root, "Key").text = object_key
+    ET.SubElement(root, "UploadId").text = upload_id
+    ET.SubElement(root, "PartNumberMarker").text = str(part_marker)
+    ET.SubElement(root, "NextPartNumberMarker").text = str(next_part_marker)
+    ET.SubElement(root, "MaxParts").text = str(max_parts)
+    ET.SubElement(root, "IsTruncated").text = "true" if is_truncated else "false"
+
+    for part in visible_parts:
+        p = ET.SubElement(root, "Part")
+        ET.SubElement(p, "PartNumber").text = str(part["part_number"])
+        ET.SubElement(p, "ETag").text = f'"{part["etag"]}"'
+        ET.SubElement(p, "Size").text = str(part["size_bytes"])
+        # Use CreatedAt as LastModified if available
+        ts = part.get("created_at")
+        if ts:
+            ET.SubElement(p, "LastModified").text = ts.isoformat()
+
+    xml_content = ET.tostring(root, encoding="UTF-8", xml_declaration=True, pretty_print=True)
+    return Response(
+        content=xml_content,
+        media_type="application/xml",
+        headers={
+            "Content-Type": "application/xml; charset=utf-8",
+            "x-amz-request-id": str(uuid.uuid4()),
+            "Content-Length": str(len(xml_content)),
+        },
+    )
+
+
 async def initiate_multipart_upload(
     bucket_name: str,
     object_key: str,
