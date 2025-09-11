@@ -5,7 +5,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import uuid
 from datetime import UTC
 from datetime import datetime
@@ -86,49 +85,8 @@ def _handle_range_request(
     """
 
     file_size = len(file_data)
-
-    # Parse range header - format: "bytes=start-end" or "bytes=start-" or "bytes=-suffix"
-    range_match = re.match(r"bytes=(\d*)-(\d*)", range_header.lower())
-    if not range_match:
-        # Invalid range format
-        return Response(
-            status_code=416,
-            content=f"Invalid range format: {range_header}",
-            headers={"Content-Range": f"bytes */{file_size}"},
-        )
-
-    start_str, end_str = range_match.groups()
-
     try:
-        # Handle different range formats
-        if start_str and end_str:
-            start = int(start_str)
-            end = int(end_str)
-        elif start_str and not end_str:
-            # Format: bytes=start- (from start to end of file)
-            start = int(start_str)
-            end = file_size - 1
-        elif not start_str and end_str:
-            # Format: bytes=-suffix (last N bytes)
-            suffix = int(end_str)
-            if suffix <= 0:
-                raise ValueError("Invalid suffix")
-            start = max(0, file_size - suffix)
-            end = file_size - 1
-        else:
-            # Invalid: bytes=-
-            raise ValueError("Invalid range")
-
-        # Validate range
-        if start < 0 or end < 0 or start > end or start >= file_size:
-            return Response(
-                status_code=416,
-                content=f"Range not satisfiable: {range_header}",
-                headers={"Content-Range": f"bytes */{file_size}"},
-            )
-
-        # Clamp end to file size
-        end = min(end, file_size - 1)
+        start, end = parse_range_header(range_header, file_size)
         content_length = end - start + 1
 
         # Extract the requested byte range
@@ -152,18 +110,26 @@ def _handle_range_request(
             if key != "ipfs" and not isinstance(value, dict):
                 headers[f"x-amz-meta-{key}"] = str(value)
 
-        return Response(
-            content=range_data,
-            status_code=206,  # Partial Content
-            headers=headers,
-        )
+        return Response(content=range_data, status_code=206, headers=headers)
 
-    except (ValueError, TypeError) as e:
+    except ValueError:
+        return Response(
+            status_code=416,
+            headers={
+                "Content-Range": f"bytes */{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": "0",
+            },
+        )
+    except TypeError as e:
         logger.warning(f"Invalid range request '{range_header}': {e}")
         return Response(
             status_code=416,
-            content=f"Range not satisfiable: {range_header}",
-            headers={"Content-Range": f"bytes */{file_size}"},
+            headers={
+                "Content-Range": f"bytes */{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": "0",
+            },
         )
 
 
