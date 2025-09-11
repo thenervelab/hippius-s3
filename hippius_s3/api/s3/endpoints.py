@@ -583,9 +583,9 @@ async def get_bucket(
             size = ET.SubElement(content, "Size")
             size.text = str(obj["size_bytes"])
 
-            # Use StorageClass (always STANDARD for AWS CLI compatibility)
+            # Use StorageClass based on whether object is multipart
             storage_class = ET.SubElement(content, "StorageClass")
-            storage_class.text = "STANDARD"
+            storage_class.text = "multipart" if obj.get("multipart") else "standard"
 
             # Use Owner for IPFS CID and account ID
             owner = ET.SubElement(content, "Owner")
@@ -1809,7 +1809,9 @@ async def put_object(
                 substrate_url=config.substrate_url,
                 ipfs_node=config.ipfs_store_url,
                 address=request.state.account.main_account,
-                subaccount=request.state.account.id,
+                # use main account instead of subaccount to make encryption
+                # be based on main account not only readable by subaccounts
+                subaccount=request.state.account.main_account,
                 subaccount_seed_phrase=request.state.seed_phrase,
                 bucket_name=bucket_name,
                 object_key=object_key,

@@ -760,8 +760,10 @@ async def complete_multipart_upload(
                 ],
                 substrate_url=config.substrate_url,
                 ipfs_node=config.ipfs_store_url,
-                address=request.state.account.main_account,
-                subaccount=request.state.account.id,
+                address=request.state.account.id,
+                # use main account instead of subaccount to make encryption
+                # be based on main account not only readable by subaccounts
+                subaccount=request.state.account.main_account,
                 subaccount_seed_phrase=request.state.seed_phrase,
                 should_encrypt=should_encrypt,
                 object_id=str(object_result["object_id"]),
