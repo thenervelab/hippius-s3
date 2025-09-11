@@ -39,6 +39,7 @@ class Config:
     enable_strict_validation: bool = env("ENABLE_STRICT_VALIDATION", convert=lambda x: x.lower() == "true")
     enable_api_docs: bool = env("ENABLE_API_DOCS", convert=lambda x: x.lower() == "true")
     enable_request_profiling: bool = env("ENABLE_REQUEST_PROFILING", convert=lambda x: x.lower() == "true")
+    enable_banhammer: bool = env("ENABLE_BANHAMMER:true", convert=lambda x: x.lower() == "true")
 
     # S3 Validation Limits
     min_bucket_name_length: int = env("MIN_BUCKET_NAME_LENGTH", convert=int)

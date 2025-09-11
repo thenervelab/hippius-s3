@@ -35,7 +35,15 @@ def test_seed_phrase() -> str:
 
 @pytest.fixture(scope="session")
 def compose_project_name(test_run_id: str) -> str:
-    """Static docker compose project name for e2e runs."""
+    """Docker compose project name for e2e runs.
+
+    Allows overriding via HIPPIUS_E2E_PROJECT to reuse an already running stack
+    (e.g., the default project name from manual `docker compose up`).
+    Defaults to a stable name to keep hot reload cycles fast.
+    """
+    override = os.environ.get("HIPPIUS_E2E_PROJECT")
+    if override and override.strip():
+        return override.strip()
     return "hippius-e2e"
 
 
@@ -98,6 +106,26 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
         raise RuntimeError("API service failed to start within timeout")
 
     yield
+
+    # Always attempt to dump service state/logs before teardown when in CI or explicitly requested
+    try:
+        dump_logs = os.environ.get("CI", "").lower() in {"true", "1", "yes"} or os.environ.get(
+            "HIPPIUS_E2E_DUMP_LOGS", ""
+        ).lower() in {"true", "1", "yes"}
+        if dump_logs:
+            artifacts_dir = Path(project_root) / "artifacts"
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+            # docker compose ps
+            ps_out = compose_cmd(["ps"]).stdout
+            (artifacts_dir / "ps.txt").write_bytes(ps_out or b"")
+
+            # service logs (best-effort)
+            for svc in ["api", "downloader", "pinner", "unpinner"]:
+                result = compose_cmd(["logs", svc])
+                (artifacts_dir / f"{svc}.log").write_bytes(result.stdout or b"")
+    except Exception as e:  # noqa: PERF203
+        print(f"Warning: failed to dump logs: {e}")
 
     # Teardown based on env flag (default: teardown)
     teardown = env.get("HIPPIUS_E2E_TEARDOWN", "1") not in {"0", "false", "FALSE", "no", "NO"}

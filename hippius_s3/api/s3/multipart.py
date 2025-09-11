@@ -523,8 +523,13 @@ async def list_multipart_uploads(
         # Add Upload elements
         for upload in uploads:
             upload_elem = ET.SubElement(root, "Upload")
-            ET.SubElement(upload_elem, "Key").text = upload["object_key"]
-            ET.SubElement(upload_elem, "UploadId").text = upload["upload_id"]
+            ET.SubElement(upload_elem, "Key").text = (
+                str(upload["object_key"]) if upload.get("object_key") is not None else ""
+            )
+            # Ensure UploadId is a string (DB may return uuid.UUID)
+            ET.SubElement(upload_elem, "UploadId").text = (
+                str(upload["upload_id"]) if upload.get("upload_id") is not None else ""
+            )
             ET.SubElement(upload_elem, "Initiated").text = upload["initiated_at"].isoformat()
 
         # Generate XML with proper declaration
