@@ -72,3 +72,21 @@ def test_bucket_policy_invalid_document(
         boto3_client.put_bucket_policy(Bucket=bucket, Policy=json.dumps(bad_policy))
     code = excinfo.value.response.get("Error", {}).get("Code") or excinfo.value.response.get("Code")
     assert code in {"InvalidPolicyDocument", "MalformedPolicy"}
+
+
+def test_get_bucket_policy_private_bucket_returns_404(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+) -> None:
+    bucket = unique_bucket_name("policy-none")
+    cleanup_buckets(bucket)
+
+    boto3_client.create_bucket(Bucket=bucket)
+
+    # No policy set → should be 404 NoSuchBucketPolicy
+    with pytest.raises(ClientError) as excinfo:
+        boto3_client.get_bucket_policy(Bucket=bucket)
+    code = excinfo.value.response.get("Error", {}).get("Code") or excinfo.value.response.get("Code")
+    assert code == "NoSuchBucketPolicy"
