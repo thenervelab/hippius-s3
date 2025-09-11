@@ -37,3 +37,13 @@ def test_list_multipart_uploads_shows_initiated_upload(
     if not uploads and last_exc:
         raise last_exc
     assert any(u.get("Key") == key and u.get("UploadId") == upload_id for u in uploads)
+
+    # Prefix filter should include our key
+    listed_pref = boto3_client.list_multipart_uploads(Bucket=bucket, Prefix="large")
+    uploads_pref = listed_pref.get("Uploads", [])
+    assert any(u.get("Key") == key for u in uploads_pref)
+
+    # Abort and ensure it disappears
+    boto3_client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+    listed_after = boto3_client.list_multipart_uploads(Bucket=bucket)
+    assert not any(u.get("UploadId") == upload_id for u in listed_after.get("Uploads", []))
