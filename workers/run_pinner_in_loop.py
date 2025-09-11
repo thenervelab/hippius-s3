@@ -221,44 +221,64 @@ async def process_upload_request(
         logger.info(f"Processing upload request for object_key={payload.object_key}, object_id={payload.object_id}")
 
         if hasattr(payload, "chunks"):  # Multipart upload
-            chunk_results, manifest_result = await _process_multipart_upload(
-                payload=payload,
-                db=db,
-                ipfs_service=ipfs_service,
-                redis_client=redis_client,
-            )
+            try:
+                chunk_results, manifest_result = await _process_multipart_upload(
+                    payload=payload,
+                    db=db,
+                    ipfs_service=ipfs_service,
+                    redis_client=redis_client,
+                )
 
-            # Add individual chunk CIDs
-            files.extend(
-                [
+                # Add individual chunk CIDs
+                files.extend(
+                    [
+                        FileInput(
+                            file_hash=result.cid,
+                            file_name=result.file_name,
+                        )
+                        for result in chunk_results
+                    ]
+                )
+
+                # Add manifest CID
+                files.append(
+                    FileInput(
+                        file_hash=manifest_result.cid,
+                        file_name=manifest_result.file_name,
+                    )
+                )
+            except Exception as e:
+                logger.error(f"Failed to process multipart upload for object_id={payload.object_id}, object_key={payload.object_key}: {e}")
+                # Mark all objects in this batch as failed
+                for req in upload_requests:
+                    await db.execute(
+                        "UPDATE objects SET status = 'failed' WHERE object_id = $1",
+                        req.object_id,
+                    )
+                return False
+        else:  # Simple upload
+            try:
+                result = await _process_simple_upload(
+                    payload=payload,
+                    db=db,
+                    ipfs_service=ipfs_service,
+                    redis_client=redis_client,
+                )
+                files.append(
                     FileInput(
                         file_hash=result.cid,
                         file_name=result.file_name,
                     )
-                    for result in chunk_results
-                ]
-            )
-
-            # Add manifest CID
-            files.append(
-                FileInput(
-                    file_hash=manifest_result.cid,
-                    file_name=manifest_result.file_name,
                 )
-            )
-        else:  # Simple upload
-            result = await _process_simple_upload(
-                payload=payload,
-                db=db,
-                ipfs_service=ipfs_service,
-                redis_client=redis_client,
-            )
-            files.append(
-                FileInput(
-                    file_hash=result.cid,
-                    file_name=result.file_name,
-                )
-            )
+            except Exception as e:
+                logger.error(f"Failed to process simple upload for object_id={payload.object_id}, object_key={payload.object_key}: {e}")
+                # Mark all objects in this batch as failed
+                for req in upload_requests:
+                    await db.execute(
+                        "UPDATE objects SET status = 'failed' WHERE object_id = $1",
+                        req.object_id,
+                    )
+                return False
 
     # Optionally skip substrate publish for ipfs-only mode
     if os.getenv("HIPPIUS_PUBLISH_MODE", "full") == "ipfs_only":
