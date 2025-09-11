@@ -2090,11 +2090,23 @@ async def get_object(
                 Key=object_key,
             )
 
+        if range_header:
+            try:
+                start_byte, end_byte = parse_range_header(range_header, object_info["size_bytes"])
+            except ValueError:
+                return Response(
+                    status_code=416,
+                    headers={
+                        "Content-Range": f"bytes */{object_info['size_bytes']}",
+                        "Accept-Ranges": "bytes",
+                        "Content-Length": "0",
+                    },
+                )
+        # Load chunk metadata after range validation to avoid returning 503 for syntactically invalid ranges
         download_chunks = json.loads(object_info["download_chunks"])
 
         # Check if all chunks have CIDs - if not, object is still being processed
         if not download_chunks:
-            # Track retry attempts using request headers
             retry_count = int(request.headers.get("x-hippius-retry-count", "0"))
             max_retries = 5
 
@@ -2119,7 +2131,6 @@ async def get_object(
         # Check if any chunk is missing a CID (still being processed)
         missing_cids = [chunk for chunk in download_chunks if not chunk.get("cid")]
         if missing_cids:
-            # Track retry attempts using request headers
             retry_count = int(request.headers.get("x-hippius-retry-count", "0"))
             max_retries = 5
 
@@ -2143,17 +2154,6 @@ async def get_object(
 
         # Handle range requests by calculating needed chunks
         if range_header:
-            try:
-                start_byte, end_byte = parse_range_header(range_header, object_info["size_bytes"])
-            except ValueError:
-                # Return 416 Range Not Satisfiable per S3 semantics
-                return Response(
-                    status_code=416,
-                    headers={
-                        "Content-Range": f"bytes */{object_info['size_bytes']}",
-                    },
-                )
-
             needed_parts = calculate_chunks_for_range(start_byte, end_byte, download_chunks)
             filtered_chunks = [chunk for chunk in download_chunks if chunk["part_number"] in needed_parts]
         else:
