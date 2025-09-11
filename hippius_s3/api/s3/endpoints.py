@@ -2189,7 +2189,7 @@ async def get_object(
             address=request.state.account.main_account,
             # use account id instead of subaccount id, to make encryption key be account based
             # not subaccount based. this way, all subaccounts can read the main account's buckets
-            subaccount=request.state.account.id,
+            subaccount=request.state.account.main_account,
             subaccount_seed_phrase=request.state.seed_phrase,
             substrate_url=config.substrate_url,
             ipfs_node=config.ipfs_get_url,
