@@ -7,6 +7,7 @@ services:
       - HIPPIUS_PUBLISH_MODE=ipfs_only
       - ENABLE_REQUEST_PROFILING=false
       - ENABLE_BANHAMMER=false
+      - RATE_LIMIT_PER_MINUTE=100000
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
 

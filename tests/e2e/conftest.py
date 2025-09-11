@@ -107,6 +107,26 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
 
     yield
 
+    # Always attempt to dump service state/logs before teardown when in CI or explicitly requested
+    try:
+        dump_logs = os.environ.get("CI", "").lower() in {"true", "1", "yes"} or os.environ.get(
+            "HIPPIUS_E2E_DUMP_LOGS", ""
+        ).lower() in {"true", "1", "yes"}
+        if dump_logs:
+            artifacts_dir = Path(project_root) / "artifacts"
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+            # docker compose ps
+            ps_out = compose_cmd(["ps"]).stdout
+            (artifacts_dir / "ps.txt").write_bytes(ps_out or b"")
+
+            # service logs (best-effort)
+            for svc in ["api", "downloader", "pinner", "unpinner"]:
+                result = compose_cmd(["logs", svc])
+                (artifacts_dir / f"{svc}.log").write_bytes(result.stdout or b"")
+    except Exception as e:  # noqa: PERF203
+        print(f"Warning: failed to dump logs: {e}")
+
     # Teardown based on env flag (default: teardown)
     teardown = env.get("HIPPIUS_E2E_TEARDOWN", "1") not in {"0", "false", "FALSE", "no", "NO"}
     if teardown:
