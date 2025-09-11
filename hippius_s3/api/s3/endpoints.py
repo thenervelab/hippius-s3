@@ -1512,8 +1512,10 @@ async def _copy_object(
     request: fastapi.Request,
     db: DBConnection,
     ipfs_service: IPFSService,
+    redis_client,
 ):
-    source_bucket_name = source_bucket["bucket_id"]
+    # Use bucket names for external-facing operations; IDs are internal
+    source_bucket_name = source_bucket["bucket_name"]
     try:
         logger.info(f"Copying {source_bucket}/{source_object_key} to {destination_bucket}")
 
@@ -1575,13 +1577,36 @@ async def _copy_object(
                 f"Slow copy: different encryption (source public={source_is_public}, dest public={dest_is_public})"
             )
 
-            # Download file from source bucket with source encryption
-            file_data = await ipfs_service.download_file(
-                cid=source_object["ipfs_cid"],
-                subaccount_id=request.state.account.main_account,
-                bucket_name=source_bucket_name,
-                decrypt=not source_is_public,  # Decrypt if source was encrypted
-            )
+            file_data: bytes | None = None
+
+            # If CID is available, download via IPFS; otherwise, try Redis fallback
+            source_cid = (source_object.get("ipfs_cid") or "").strip()
+            if source_cid:
+                # Download file from source bucket with source encryption
+                file_data = await ipfs_service.download_file(
+                    cid=source_cid,
+                    subaccount_id=request.state.account.main_account,
+                    bucket_name=source_bucket_name,
+                    decrypt=not source_is_public,  # Decrypt if source was encrypted
+                )
+            else:
+                # Fallback: object may still be pending publish. Try raw bytes from Redis produced by PUT.
+                # Simple uploads cache the payload at key: "simple:{object_id}:part:0"
+                try:
+                    redis_key = f"simple:{source_object['object_id']}:part:0"
+                    file_data = await redis_client.get(redis_key)
+                    if file_data is None:
+                        logger.info(f"Redis fallback miss for pending source object: key={redis_key}")
+                except Exception as redis_error:
+                    logger.warning(f"Redis fallback error while copying object: {redis_error}")
+
+            if file_data is None:
+                # Could not get data yet; surface a retriable error matching S3 transient behavior
+                return create_xml_error_response(
+                    "ServiceUnavailable",
+                    "Source object is not yet available for copying. Please retry shortly.",
+                    status_code=503,
+                )
 
             # Calculate MD5 hash for ETag compatibility
             md5_hash = hashlib.md5(file_data).hexdigest()
@@ -1593,7 +1618,8 @@ async def _copy_object(
                 encrypt=should_encrypt,
                 seed_phrase=request.state.seed_phrase,
                 subaccount_id=request.state.account.main_account,
-                bucket_name=source_bucket_name,
+                # Publish under destination bucket
+                bucket_name=destination_bucket["bucket_name"],
                 file_name=source_object_key,
                 store_node=config.ipfs_store_url,
                 pin_node=config.ipfs_store_url,
@@ -1701,14 +1727,16 @@ async def put_object(
     if request.headers.get("x-amz-copy-source"):
         # Parse the copy source in format /source-bucket/source-key
         copy_source = request.headers.get("x-amz-copy-source")
-        if not copy_source.startswith("/"):
-            return create_xml_error_response(
-                "InvalidArgument",
-                "x-amz-copy-source must start with /",
-                status_code=400,
-            )
+        # Support both "/bucket/key" and "bucket/key" forms
+        if copy_source is None:
+            return create_xml_error_response("InvalidArgument", "x-amz-copy-source missing", status_code=400)
 
-        source_parts = copy_source[1:].split("/", 1)
+        # Trim any query (e.g., versionId) if present
+        copy_source_path = copy_source.split("?", 1)[0]
+        if copy_source_path.startswith("/"):
+            copy_source_path = copy_source_path[1:]
+
+        source_parts = copy_source_path.split("/", 1)
         if len(source_parts) != 2:
             return create_xml_error_response(
                 "InvalidArgument",
@@ -1761,6 +1789,7 @@ async def put_object(
             request=request,
             db=db,
             ipfs_service=ipfs_service,
+            redis_client=redis_client,
         )
 
     try:
@@ -2314,6 +2343,16 @@ async def delete_object(
 
     This endpoint is compatible with the S3 protocol used by MinIO and other S3 clients.
     """
+    # If this is an AbortMultipartUpload (DELETE with uploadId), delegate to multipart handler
+    if "uploadId" in request.query_params:
+        from hippius_s3.api.s3.multipart import abort_multipart_upload  # local import to avoid circular deps
+
+        return await abort_multipart_upload(
+            bucket_name,
+            object_key,
+            request,
+            db,
+        )
     # If tagging is in query params, handle deleting object tags
     if "tagging" in request.query_params:
         return await delete_object_tags(

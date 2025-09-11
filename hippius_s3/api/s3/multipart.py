@@ -458,11 +458,15 @@ async def abort_multipart_upload(
                     *redis_keys_to_delete,
                 )
 
-        # Delete the multipart upload from the database
-        await db.fetchrow(
-            get_query("abort_multipart_upload"),
-            upload_id,
-        )
+        # Fully remove the multipart upload (and cascade parts) so it disappears from listings immediately
+        async with db.transaction():
+            await db.fetchrow(
+                get_query("abort_multipart_upload"),
+                upload_id,
+            )
+        # Mark aborted in Redis so listings immediately hide this upload (defensive against read lag)
+        with contextlib.suppress(Exception):
+            await request.app.state.redis_client.setex(f"aborted_mpu:{upload_id}", 300, "1")
         return Response(status_code=204)
 
     except Exception as e:
@@ -509,6 +513,20 @@ async def list_multipart_uploads(
         uploads = await db.fetch(
             get_query("list_multipart_uploads"), bucket["bucket_id"], request.query_params.get("prefix")
         )
+
+        # Filter out any uploads that were very recently aborted (defensive cache for race conditions)
+        try:
+            redis_client: Redis = request.app.state.redis_client
+            filtered_uploads = []
+            for upload in uploads:
+                aborted_flag = await redis_client.get(f"aborted_mpu:{str(upload['upload_id'])}")
+                if aborted_flag:
+                    continue
+                filtered_uploads.append(upload)
+            uploads = filtered_uploads
+        except Exception as _:
+            # If Redis not available, proceed with DB results
+            pass
 
         # Generate the response XML
         root = ET.Element("ListMultipartUploadsResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
