@@ -6,6 +6,7 @@ services:
       - HIPPIUS_BYPASS_CREDIT_CHECK=true
       - HIPPIUS_PUBLISH_MODE=ipfs_only
       - ENABLE_REQUEST_PROFILING=false
+      - ENABLE_BANHAMMER=false
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
 

@@ -152,7 +152,8 @@ app.middleware("http")(verify_hmac_middleware)
 # 6. Input validation (AWS S3 compliance - executes FOURTH)
 # app.middleware("http")(input_validation_middleware)  # noqa: ERA001
 # 7. Banhammer (IP-based protection - executes THIRD)
-app.middleware("http")(banhammer_wrapper)
+if config.enable_banhammer:
+    app.middleware("http")(banhammer_wrapper)
 # 8. CORS (executes SECOND)
 app.middleware("http")(cors_middleware)
 if config.enable_request_profiling:
