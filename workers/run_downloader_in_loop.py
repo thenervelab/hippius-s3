@@ -56,7 +56,10 @@ async def process_download_request(
 
     # Use shorter identifier for logging
     short_id = f"{download_request.bucket_name}/{download_request.object_key}"
-    logger.info(f"Processing download request for {short_id} with {len(download_request.chunks)} chunks")
+    logger.info(
+        f"Processing download request for {short_id} with {len(download_request.chunks)} chunks; "
+        f"should_decrypt={download_request.should_decrypt} subaccount={download_request.subaccount[:8]}..."
+    )
 
     # Process all chunks concurrently with higher concurrency for better IPFS utilization
     semaphore = asyncio.Semaphore(10)  # Increased for better parallel downloads
@@ -74,6 +77,15 @@ async def process_download_request(
                     auto_decrypt=download_request.should_decrypt,
                     download_node=download_request.ipfs_node,
                     return_bytes=True,
+                )
+                import hashlib as _hashlib
+
+                md5 = _hashlib.md5(chunk_data).hexdigest()
+                head_hex = chunk_data[:8].hex() if chunk_data else ""
+                tail_hex = chunk_data[-8:].hex() if len(chunk_data) >= 8 else head_hex
+                logger.debug(
+                    f"Downloaded chunk {chunk.part_id} cid={chunk.cid[:10]}... len={len(chunk_data)} md5={md5} "
+                    f"head8={head_hex} tail8={tail_hex}"
                 )
 
                 # Store the chunk data in Redis with the expected key

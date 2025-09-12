@@ -93,6 +93,20 @@ async def _process_multipart_chunk(
     if not chunk_data:
         raise ValueError(f"Multipart chunk not found for key: {chunk.redis_key}")
 
+    # Debug: compute md5 and show first/last bytes for validation
+    import hashlib as _hashlib
+    import re as _re
+
+    md5_pre = _hashlib.md5(chunk_data).hexdigest()
+    head_hex = chunk_data[:8].hex() if chunk_data else ""
+    tail_hex = chunk_data[-8:].hex() if len(chunk_data) >= 8 else head_hex
+    m = _re.search(r":part:(\d+)$", chunk.redis_key)
+    part_number_db = int(m.group(1)) if m else chunk.id
+    logger.debug(
+        f"Redis multipart read: part={part_number_db} key={chunk.redis_key} len={len(chunk_data)} "
+        f"md5={md5_pre} head8={head_hex} tail8={tail_hex}"
+    )
+
     # Mangle filename if encrypting
     file_name = payload.object_key
     if payload.should_encrypt:
@@ -113,8 +127,16 @@ async def _process_multipart_chunk(
         publish=False,
     )
 
+    import hashlib as _hashlib
+
     encryption_status = "encrypted" if payload.should_encrypt else "unencrypted"
-    logger.info(f"Processed {encryption_status} multipart chunk {chunk.id} -> CID: {s3_result.cid}")
+    md5_post = _hashlib.md5(chunk_data).hexdigest()
+    head_hex_post = chunk_data[:8].hex() if chunk_data else ""
+    tail_hex_post = chunk_data[-8:].hex() if len(chunk_data) >= 8 else head_hex_post
+    logger.debug(
+        f"After encrypt/publish: part={part_number_db} status={encryption_status} cid={s3_result.cid} "
+        f"md5={md5_post} head8={head_hex_post} tail8={tail_hex_post}"
+    )
 
     # Clean up Redis chunk data
     await redis_client.delete(chunk.redis_key)
@@ -140,23 +162,43 @@ async def _process_multipart_upload(
                 redis_client=redis_client,
             )
 
-    tasks = [process_chunk_with_semaphore(chunk) for chunk in payload.chunks]
-    chunk_results = await asyncio.gather(*tasks)
+    # Process first part synchronously to ensure encryption key is generated once,
+    # then parallelize the remaining parts to avoid key-generation races.
+    chunks_sorted = sorted(payload.chunks, key=lambda c: c.id)
+    first_result = await process_chunk_with_semaphore(chunks_sorted[0])
+    logger.info(f"Primed encryption key by processing first part synchronously: part={chunks_sorted[0].id}")
+    tasks = [process_chunk_with_semaphore(chunk) for chunk in chunks_sorted[1:]]
+    other_results = await asyncio.gather(*tasks) if tasks else []
+    chunk_results = [first_result] + other_results
 
     # Update parts table with CIDs for all chunks
+    import re as _re
+
     for s3_result, chunk in chunk_results:
+        # Derive authoritative part_number from redis_key to avoid any client-side mismatch
+        m = _re.search(r":part:(\d+)$", chunk.redis_key)
+        part_number_db = int(m.group(1)) if m else chunk.id
+        if part_number_db != chunk.id:
+            logger.warning(
+                f"Part number mismatch detected: chunk.id={chunk.id} redis_key={chunk.redis_key} -> using {part_number_db}"
+            )
         cid_id = await upsert_cid_and_get_id(db, s3_result.cid)
         await db.execute(
             "UPDATE parts SET cid_id = $1 WHERE object_id = $2 AND part_number = $3",
             cid_id,
             payload.object_id,
-            chunk.id,
+            part_number_db,
+        )
+        logger.debug(
+            f"Updated parts mapping: object_id={payload.object_id} part_number={part_number_db} cid={s3_result.cid}"
         )
 
     # Create manifest with chunk indices and CIDs
     manifest = []
     for s3_result, chunk in chunk_results:
-        manifest.append([chunk.id, s3_result.cid])
+        m = _re.search(r":part:(\d+)$", chunk.redis_key)
+        part_number_db = int(m.group(1)) if m else chunk.id
+        manifest.append([part_number_db, s3_result.cid])
 
     # Sort manifest by chunk index to ensure proper order
     manifest.sort(key=lambda x: x[0])
@@ -218,7 +260,10 @@ async def process_upload_request(
         logger.info(f"Updated object {payload.object_id} status to 'pinning'")
 
     for payload in upload_requests:
-        logger.info(f"Processing upload request for object_key={payload.object_key}, object_id={payload.object_id}")
+        logger.info(
+            f"Processing upload request for object_key={payload.object_key}, object_id={payload.object_id}, "
+            f"should_encrypt={payload.should_encrypt}, chunks={len(getattr(payload, 'chunks', [])) or 1}"
+        )
 
         if hasattr(payload, "chunks"):  # Multipart upload
             try:

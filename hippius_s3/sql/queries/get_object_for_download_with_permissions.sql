@@ -46,6 +46,13 @@ SELECT
     oi.md5_hash,
     oi.bucket_name,
     NOT oi.is_public as should_decrypt,
+    (
+        SELECT mu.upload_id
+        FROM multipart_uploads mu
+        WHERE mu.object_id = oi.object_id
+        ORDER BY mu.initiated_at DESC
+        LIMIT 1
+    ) AS upload_id,
     CASE
         WHEN oi.multipart = FALSE THEN
             CASE
