@@ -11,6 +11,7 @@ WITH object_info AS (
         o.metadata,
         o.created_at,
         o.md5_hash,
+        o.append_version,
         b.bucket_name,
         b.is_public,
         b.main_account_id as bucket_owner_id,

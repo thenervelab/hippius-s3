@@ -20,6 +20,17 @@ from botocore.config import Config  # type: ignore[import-untyped]
 # Note: event_loop fixture removed as it's not needed for synchronous tests
 
 
+def pytest_collection_modifyitems(config, items):  # type: ignore[no-untyped-def]
+    """Skip s4-marked tests when running against real AWS."""
+    run_real = os.getenv("RUN_REAL_AWS") == "1" or os.getenv("AWS") == "1"
+    if not run_real:
+        return
+    skip_s4 = pytest.mark.skip(reason="S4 extensions not supported on real AWS")
+    for item in items:
+        if item.get_closest_marker("s4"):
+            item.add_marker(skip_s4)
+
+
 @pytest.fixture(scope="session")
 def test_run_id() -> str:
     """Generate a unique ID for this test run to ensure isolation."""
@@ -143,7 +154,7 @@ def boto3_client(test_seed_phrase: str) -> Any:
 
     RUN_REAL_AWS=1 to run against real AWS. Otherwise uses local endpoint.
     """
-    if os.getenv("RUN_REAL_AWS") == "1":
+    if os.getenv("RUN_REAL_AWS") == "1" or os.getenv("AWS") == "1":
         return boto3.client(
             "s3",
             region_name=os.getenv("AWS_REGION", "us-east-1"),
@@ -166,6 +177,33 @@ def boto3_client(test_seed_phrase: str) -> Any:
             signature_version="s3v4",
         ),
     )
+
+
+@pytest.fixture
+def wait_until_readable(boto3_client: Any) -> Callable[[str, str, float], None]:
+    """Poll HEAD until object is readable (HEAD 200 with non-pending CID).
+
+    Usage: wait_until_readable(bucket, key, timeout_seconds)
+    """
+
+    def _wait(bucket: str, key: str, timeout_seconds: float = 60.0) -> None:
+        deadline = time.time() + timeout_seconds
+        last_err: Exception | None = None
+        while time.time() < deadline:
+            try:
+                head = boto3_client.head_object(Bucket=bucket, Key=key)
+                headers = head.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+                cid = headers.get("x-amz-ipfs-cid", "pending")
+                if cid and cid != "pending":
+                    return
+            except Exception as e:  # noqa: PERF203
+                last_err = e
+            time.sleep(0.5)
+        if last_err:
+            raise last_err
+        raise RuntimeError(f"Object {bucket}/{key} not readable within timeout")
+
+    return _wait
 
 
 @pytest.fixture

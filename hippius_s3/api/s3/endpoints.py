@@ -8,9 +8,6 @@ import os
 import uuid
 from datetime import UTC
 from datetime import datetime
-from typing import Dict
-from typing import List
-from typing import Tuple
 
 import asyncpg
 import fastapi
@@ -27,8 +24,12 @@ from lxml import etree as ET
 from hippius_s3 import dependencies
 from hippius_s3 import utils
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.extensions.append import handle_append
 from hippius_s3.api.s3.multipart import list_parts_internal
 from hippius_s3.api.s3.multipart import upload_part
+from hippius_s3.api.s3.range_utils import calculate_chunks_for_range
+from hippius_s3.api.s3.range_utils import extract_range_from_chunks
+from hippius_s3.api.s3.range_utils import parse_range_header
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import DBConnection
 from hippius_s3.ipfs_service import IPFSService
@@ -134,135 +135,10 @@ def _handle_range_request(
         )
 
 
-def parse_range_header(range_header: str, total_size: int) -> Tuple[int, int]:
-    """Parse Range header and return inclusive (start, end) byte positions.
-
-    Supports:
-    - bytes=start-end
-    - bytes=start-
-    - bytes=-suffix
-    """
-    header = range_header.lower().strip()
-    if not header.startswith("bytes="):
-        raise ValueError(f"Invalid range format: {range_header}")
-
-    spec = header[len("bytes=") :]
-
-    # The suffix: bytes=-N
-    if spec.startswith("-"):
-        try:
-            suffix = int(spec[1:])
-        except ValueError as e:
-            raise ValueError(f"Invalid range suffix: {range_header}") from e
-        if suffix <= 0:
-            raise ValueError(f"Invalid range suffix: {range_header}")
-        end = total_size - 1
-        start = max(0, total_size - suffix)
-        return start, end
-
-    # Start-end or start-
-    parts = spec.split("-", 1)
-    if len(parts) != 2 or not parts[0].isdigit():
-        raise ValueError(f"Invalid range format: {range_header}")
-
-    start = int(parts[0])
-    if start >= total_size:
-        # Unsatisfiable
-        raise ValueError("Range start beyond file size")
-
-    if parts[1]:
-        # start-end
-        if not parts[1].isdigit():
-            raise ValueError(f"Invalid range end: {range_header}")
-        end = int(parts[1])
-        if end < start:
-            raise ValueError("Range end before start")
-        end = min(end, total_size - 1)
-        return start, end
-
-    # start- (to EOF)
-    return start, total_size - 1
-
-
-def calculate_chunks_for_range(start_byte: int, end_byte: int, parts_info: List[Dict]) -> List[int]:
-    """Calculate which parts contain the requested byte range."""
-    needed_parts = []
-    current_offset = 0
-
-    for part in parts_info:
-        part_start = current_offset
-        part_end = current_offset + part["size_bytes"] - 1
-
-        # Check if this part overlaps with requested range
-        if part_end >= start_byte and part_start <= end_byte:
-            needed_parts.append(part["part_number"])
-
-        current_offset += part["size_bytes"]
-
-        # Stop if we've passed the end of requested range
-        if part_start > end_byte:
-            break
-
-    return needed_parts
-
-
-def extract_range_from_chunks(
-    chunks_data: List[bytes],
-    start_byte: int,
-    end_byte: int,
-    parts_info: List[Dict],
-    needed_parts: List[int],
-) -> bytes:
-    """Extract the specific byte range from downloaded chunks."""
-    current_offset = 0
-    range_data = b""
-    chunk_idx = 0
-
-    logger.debug(f"Starting range extraction: {start_byte}-{end_byte}")
-
-    for part in parts_info:
-        part_start = current_offset
-        part_end = current_offset + part["size_bytes"] - 1
-
-        logger.debug(
-            f"Processing part {part['part_number']}: offset {part_start}-{part_end}, size {part['size_bytes']}"
-        )
-
-        if part["part_number"] in needed_parts:
-            chunk_data = chunks_data[chunk_idx]
-
-            # Calculate precise slice boundaries within this chunk
-            # slice_start: where to start reading within this chunk (0-based)
-            slice_start = max(0, start_byte - part_start)
-            # slice_end: where to stop reading within this chunk (exclusive, for slicing)
-            slice_end = min(part["size_bytes"], end_byte - part_start + 1)
-
-            logger.debug(
-                f"Part {part['part_number']}: slice_start={slice_start}, slice_end={slice_end}, chunk_len={len(chunk_data)}"
-            )
-
-            # Extract the slice and add to range data
-            chunk_slice = chunk_data[slice_start:slice_end]
-            logger.debug(f"Part {part['part_number']}: extracted {len(chunk_slice)} bytes")
-            range_data += chunk_slice
-            chunk_idx += 1
-
-        current_offset += part["size_bytes"]
-
-        # Stop if we've passed the end of requested range
-        if current_offset > end_byte:
-            break
-
-    # Verify we extracted exactly the right amount
-    expected_length = end_byte - start_byte + 1
-    if len(range_data) != expected_length:
-        logger.error(f"Range extraction mismatch: got {len(range_data)} bytes, expected {expected_length}")
-        logger.error(
-            f"Range: {start_byte}-{end_byte}, Parts info: {[(p['part_number'], p['size_bytes']) for p in parts_info]}"
-        )
-        logger.error(f"Needed parts: {needed_parts}, Chunks data lengths: {[len(c) for c in chunks_data]}")
-
-    return range_data
+"""
+Range helpers moved to hippius_s3.api.s3.range_utils.
+Keep imports at top; remove local shims to avoid redefinitions.
+"""
 
 
 config = get_config()
@@ -1829,22 +1705,34 @@ async def put_object(
         bucket_id = bucket["bucket_id"]
 
         # Read request body properly handling chunked encoding
-        file_data = await get_request_body(request)
-        file_size = len(file_data)
+        incoming_bytes = await get_request_body(request)
         content_type = request.headers.get("Content-Type", "application/octet-stream")
 
-        # Calculate MD5 hash for ETag compatibility
+        # Detect S4 append semantics via metadata
+        meta_append = request.headers.get("x-amz-meta-append", "").lower() == "true"
+        if meta_append:
+            return await handle_append(
+                request,
+                db,
+                ipfs_service,
+                redis_client,
+                bucket=bucket,
+                bucket_id=bucket_id,
+                bucket_name=bucket_name,
+                object_key=object_key,
+                incoming_bytes=incoming_bytes,
+            )
+
+        # Regular non-append PutObject path
+        file_data = incoming_bytes
+        file_size = len(file_data)
         md5_hash = hashlib.md5(file_data).hexdigest()
         logger.info(f"PUT {bucket_name}/{object_key}: size={len(file_data)}, md5={md5_hash}")
         object_id = str(uuid.uuid4())
-
-        # Only encrypt if bucket is private
         should_encrypt = not bucket["is_public"]
-
         part_index = 0
         redis_key = f"simple:{object_id}:part:{part_index}"
 
-        # Store file data in Redis for the workers to process
         await redis_client.set(redis_key, file_data)
 
         await enqueue_upload_request(
@@ -1852,8 +1740,6 @@ async def put_object(
                 substrate_url=config.substrate_url,
                 ipfs_node=config.ipfs_store_url,
                 address=request.state.account.main_account,
-                # use main account instead of subaccount to make encryption
-                # be based on main account not only readable by subaccounts
                 subaccount=request.state.account.main_account,
                 subaccount_seed_phrase=request.state.seed_phrase,
                 bucket_name=bucket_name,
@@ -1870,14 +1756,21 @@ async def put_object(
 
         created_at = datetime.now(UTC)
 
-        # Extract user metadata from headers
         metadata = {}
         for key, value in request.headers.items():
             if key.lower().startswith("x-amz-meta-"):
                 meta_key = key[11:]
-                metadata[meta_key] = value
+                # Do not persist append control metadata as user metadata
+                if meta_key not in {"append", "append-id", "append-if-version"}:
+                    metadata[meta_key] = value
 
-        # Begin a transaction to ensure atomic operation
+        # Capture previous object (to clean up multipart parts if overwriting)
+        prev = await db.fetchrow(
+            get_query("get_object_by_path"),
+            bucket_id,
+            object_key,
+        )
+
         async with db.transaction():
             await db.fetchrow(
                 get_query("upsert_object_basic"),
@@ -1890,6 +1783,13 @@ async def put_object(
                 file_size,
                 created_at,
             )
+
+            # If overwriting a previous multipart object, remove stale parts
+            try:
+                if prev and (prev.get("multipart") or False):
+                    await db.execute("DELETE FROM parts WHERE object_id = $1", prev["object_id"])  # type: ignore[index]
+            except Exception:
+                logger.debug("Failed to cleanup previous parts on overwrite", exc_info=True)
 
         return Response(
             status_code=200,
@@ -2058,6 +1958,9 @@ async def head_object(
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "x-amz-ipfs-cid": ipfs_cid or "pending",
         }
+        # Expose append version if present (for S4 version-based CAS)
+        if "append_version" in result and result["append_version"] is not None:
+            headers["x-amz-meta-append-version"] = str(result["append_version"])
         # Only include object status header if known
         if object_status != "unknown":
             headers["x-amz-object-status"] = object_status

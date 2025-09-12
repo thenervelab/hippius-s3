@@ -76,6 +76,9 @@ def s3_error_response(code: str, message: str, request_id: str = "", status_code
         "Content-Type": "application/xml; charset=utf-8",
         "x-amz-request-id": request_id,
         "Content-Length": str(len(xml_content)),
+        # Help SDKs parse error type/message even when they don't parse XML body
+        "x-amz-error-code": code,
+        "x-amz-error-message": message,
     }
 
     return Response(content=xml_content, media_type="application/xml", status_code=status_code, headers=headers)
