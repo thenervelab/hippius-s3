@@ -52,7 +52,13 @@ async def postgres_create_pool(database_url: str) -> asyncpg.Pool:
     Returns:
         Connection pool for Postgres
     """
-    return await asyncpg.create_pool(database_url)
+    return await asyncpg.create_pool(
+        database_url,
+        min_size=5,
+        max_size=20,
+        max_queries=50000,
+        max_inactive_connection_lifetime=300,
+    )
 
 
 @asynccontextmanager
