@@ -72,7 +72,7 @@ class BanHammerService:
         count_key = f"hippius_banhammer:infringements:{ip}:{window_bucket}"
         count = await self.redis.incr(count_key)
         if count == 1:
-            await self.redis.expire(count_key, self.infringement_window_seconds + 1)
+            await self.redis.expire(count_key, self.infringement_window_seconds)
 
         logger.info(f"Added infringement for {ip}: {reason}")
         logger.debug(f"IP {ip} has {count}/{self.infringement_max} infringements in current window")
