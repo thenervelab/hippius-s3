@@ -117,7 +117,7 @@ Notes:
 | UpdateBucketMetadataInventoryTableConfiguration |           |                                                            |                                               |                                                                      |
 | UpdateBucketMetadataJournalTableConfiguration   |           |                                                            |                                               |                                                                      |
 | UploadPart                                      | ✔         | Returns part ETag                                          | PUT /{bucket}/{key}?uploadId=...&partNumber=N | test_UploadPart.py                                                   |
-| UploadPartCopy                                  |           |                                                            |                                               |                                                                      |
+| UploadPartCopy                                  | ✔         | Not supported for encrypted sources (temporary limitation) | PUT /{bucket}/{key}?uploadId=...&partNumber=N | test_UploadPartCopy.py                                               |
 | WriteGetObjectResponse                          |           |                                                            |                                               |                                                                      |
 
 ### Supported

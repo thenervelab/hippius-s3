@@ -1508,7 +1508,7 @@ async def delete_bucket(
                     substrate_url=config.substrate_url,
                     ipfs_node=config.ipfs_store_url,
                     address=request.state.account.main_account,
-                    subaccount=request.state.account.id,
+                    subaccount=request.state.account.main_account,
                     subaccount_seed_phrase=request.state.seed_phrase,
                     bucket_name=bucket_name,
                     object_key=obj["object_key"],
@@ -1720,6 +1720,7 @@ async def put_object(
         return await upload_part(
             request,
             db,
+            ipfs_service,
         )
 
     if "tagging" in request.query_params:
@@ -2154,6 +2155,53 @@ async def get_object(
 
         # Check if all chunks have CIDs - if not, object is still being processed
         if not download_chunks:
+            # Fallback for simple objects: stream directly from Redis cache while publish is in progress
+            if object_info["multipart"] is False:
+                simple_key = f"simple:{object_info['object_id']}:part:0"
+                data = await request.app.state.redis_client.get(simple_key)
+                if data:
+                    # Support range on simple cached bytes
+                    if range_header and start_byte is not None and end_byte is not None:
+                        total_size = len(data)
+                        # Safety: ensure range is within bounds (already parsed earlier)
+                        range_data = data[start_byte : end_byte + 1]
+                        headers = {
+                            "Content-Type": object_info["content_type"],
+                            "Content-Range": f"bytes {start_byte}-{end_byte}/{total_size}",
+                            "Accept-Ranges": "bytes",
+                        }
+                        return StreamingResponse(
+                            iter([range_data]),
+                            status_code=206,
+                            media_type=object_info["content_type"],
+                            headers=headers,
+                        )
+
+                    # Full object from cache
+                    file_name_cache = object_key.rsplit("/", 1)[-1]
+                    headers = {
+                        "Content-Type": object_info["content_type"],
+                        "Content-Disposition": f'inline; filename="{file_name_cache}"',
+                        "Accept-Ranges": "bytes",
+                        "ETag": f'"{object_info["md5_hash"]}"',
+                        "Last-Modified": object_info["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
+                    }
+                    # Include metadata headers so boto3 populates Metadata dict
+                    metadata = object_info.get("metadata") or {}
+                    if isinstance(metadata, str):
+                        try:
+                            metadata = json.loads(metadata)
+                        except Exception:
+                            metadata = {}
+                    if isinstance(metadata, dict):
+                        for k, v in metadata.items():
+                            headers[f"x-amz-meta-{k}"] = v
+                    return StreamingResponse(
+                        iter([data]),
+                        status_code=200,
+                        media_type=object_info["content_type"],
+                        headers=headers,
+                    )
             retry_count = int(request.headers.get("x-hippius-retry-count", "0"))
             max_retries = 5
 
@@ -2223,6 +2271,23 @@ async def get_object(
                     redis_key=redis_key,
                 )
             )
+            logger.debug(
+                f"GET enqueue chunk: key={object_key} part={chunk_info['part_number']} cid={chunk_info['cid'][:10]}... "
+                f"size={chunk_info.get('size_bytes')}"
+            )
+
+        try:
+            # Debug: log expected ETags for parts
+            upload_id = object_info["upload_id"] if "upload_id" in object_info and object_info["upload_id"] else None
+            if upload_id:
+                parts_etags = await db.fetch(get_query("get_parts_etags"), upload_id)
+                etag_map = {p["part_number"]: p["etag"] for p in parts_etags}
+                logger.debug(
+                    f"GET manifest: key={object_key} multipart={object_info['multipart']} "
+                    f"chunks={[(c.part_id, c.cid[:10]) for c in chunks]} expected_etags={etag_map}"
+                )
+        except Exception:
+            logger.debug("Failed to log expected part ETags", exc_info=True)
 
         # Create download request
         config = get_config()
@@ -2296,9 +2361,58 @@ async def get_object(
                 headers=headers,
             )
 
-        # Full file download
+        # Precompute expected part ETags (MD5s) if available for integrity checking
+        precomputed_etag_map = {}
+        try:
+            pre_upload_id = (
+                object_info["upload_id"] if "upload_id" in object_info and object_info["upload_id"] else None
+            )
+            if pre_upload_id:
+                pre_parts_etags = await db.fetch(get_query("get_parts_etags"), pre_upload_id)
+                precomputed_etag_map = {p["part_number"]: p["etag"].split("-")[0] for p in pre_parts_etags}
+        except Exception:
+            logger.debug("Failed to precompute part ETags for integrity check", exc_info=True)
+
+        # Pre-validate readiness and integrity BEFORE starting the streaming response
+        # Readiness: ensure every expected chunk is available
+        for chunk in chunks:
+            for _ in range(config.http_redis_get_retries):
+                exists = await request.app.state.redis_client.exists(chunk.redis_key)
+                if exists:
+                    break
+                await asyncio.sleep(config.http_download_sleep_loop)
+            else:
+                return errors.s3_error_response(
+                    "ServiceUnavailable",
+                    f"Object not ready: missing chunk {chunk.part_id}",
+                    status_code=503,
+                )
+
+        # Integrity: verify MD5 of each chunk against expected ETag (if available)
+        if precomputed_etag_map:
+            import hashlib as _hashlib
+
+            for chunk in chunks:
+                data = await request.app.state.redis_client.get(chunk.redis_key)
+                if data is None:
+                    return errors.s3_error_response(
+                        "ServiceUnavailable",
+                        f"Object not ready: missing chunk {chunk.part_id}",
+                        status_code=503,
+                    )
+                expected = precomputed_etag_map.get(chunk.part_id)
+                if expected:
+                    md5 = _hashlib.md5(data).hexdigest()
+                    if md5 != expected:
+                        logger.error(f"Chunk MD5 mismatch part={chunk.part_id} got={md5} expected={expected}")
+                        return errors.s3_error_response(
+                            "ServiceUnavailable",
+                            "Object not ready: chunk integrity mismatch",
+                            status_code=503,
+                        )
+
+        # Full file download: after validation, stream chunks sequentially
         async def generate_chunks():
-            """Stream downloaded chunks as they become available in Redis."""
             for chunk in chunks:
                 chunk_data = await get_chunk_from_redis(
                     request.app.state.redis_client,
@@ -2448,7 +2562,7 @@ async def delete_object(
                 substrate_url=config.substrate_url,
                 ipfs_node=config.ipfs_store_url,
                 address=request.state.account.main_account,
-                subaccount=request.state.account.id,
+                subaccount=request.state.account.main_account,
                 subaccount_seed_phrase=request.state.seed_phrase,
                 bucket_name=bucket_name,
                 object_key=object_key,

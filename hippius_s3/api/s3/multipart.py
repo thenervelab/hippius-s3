@@ -10,6 +10,7 @@ import time
 import uuid
 from datetime import UTC
 from datetime import datetime
+from urllib.parse import unquote
 
 from fastapi import APIRouter
 from fastapi import Depends
@@ -321,6 +322,7 @@ async def get_all_cached_chunks(
 async def upload_part(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    ipfs_service=Depends(dependencies.get_ipfs_service),
 ) -> Response:
     """Upload a part for a multipart upload (PUT with partNumber & uploadId)."""
     # These two parameters are required for multipart upload parts
@@ -370,32 +372,132 @@ async def upload_part(
             status_code=400,
         )
 
-    # Upload the part data to IPFS
     start_time = time.time()
     logger.info(f"Starting part {part_number} upload for upload {upload_id}")
 
-    try:
-        body_start = time.time()
-        file_data = await get_request_body(request)
-        body_time = time.time() - body_start
-        logger.debug(f"Part {part_number}: Got request body in {body_time:.3f}s, size: {len(file_data)} bytes")
-    except ClientDisconnect:
-        logger.warning(f"Client disconnected during part {part_number} upload for upload {upload_id}")
+    # Support UploadPartCopy via x-amz-copy-source
+    copy_source = request.headers.get("x-amz-copy-source")
+    if copy_source:
+        # Parse source bucket/key (may be /bucket/key or bucket/key, URL-encoded)
+        src = unquote(copy_source.strip())
+        if src.startswith("/"):
+            src = src[1:]
+        if "/" not in src:
+            return s3_error_response(
+                "InvalidArgument", "x-amz-copy-source must be in format /bucket/key", status_code=400
+            )
+        source_bucket_name, source_object_key = src.split("/", 1)
 
-        # Clean up any cached parts for this upload when client disconnects
-        keys = await get_all_cached_chunks(
-            upload_id,
-            request.app.state.redis_client,
-        )
-        if keys:
-            await request.app.state.redis_client.delete(*keys)
-            logger.info(f"Cleaned up {len(keys)} cached parts for disconnected upload {upload_id}")
+        # Optional range header: x-amz-copy-source-range: bytes=start-end
+        range_header = request.headers.get("x-amz-copy-source-range")
+        range_start = None
+        range_end = None
+        if range_header:
+            m = re.match(r"bytes=(\d+)-(\d+)$", range_header)
+            if not m:
+                return s3_error_response("InvalidArgument", "Invalid copy range", status_code=400)
+            range_start = int(m.group(1))
+            range_end = int(m.group(2))
 
-        return s3_error_response(
-            "RequestTimeout",
-            "Client disconnected during upload",
-            status_code=408,
+        # Resolve source object and fetch bytes from IPFS (require CID available)
+        user = await db.fetchrow(
+            get_query("get_or_create_user_by_main_account"), request.state.account.main_account, datetime.now(UTC)
         )
+        source_bucket = await db.fetchrow(
+            get_query("get_bucket_by_name_and_owner"), source_bucket_name, user["main_account_id"]
+        )
+        if not source_bucket:
+            return s3_error_response("NoSuchBucket", f"Bucket {source_bucket_name} does not exist", status_code=404)
+
+        source_obj = await db.fetchrow(get_query("get_object_by_path"), source_bucket["bucket_id"], source_object_key)
+        if not source_obj:
+            return s3_error_response("NoSuchKey", f"Key {source_object_key} not found", status_code=404)
+
+        # Prefer raw Redis bytes from simple upload cache to avoid decrypt/range issues
+        source_bytes = None
+        redis_client = request.app.state.redis_client
+        try:
+            redis_key = f"simple:{source_obj['object_id']}:part:0"
+            cached = await redis_client.get(redis_key)
+            if cached:
+                source_bytes = cached
+        except Exception as e:
+            logger.debug(f"Redis read miss for source simple bytes: {e}")
+
+        if source_bytes is None:
+            source_cid = (source_obj.get("ipfs_cid") or "").strip()
+            if not source_cid:
+                return s3_error_response(
+                    "ServiceUnavailable",
+                    "Source object not yet available for copy",
+                    status_code=503,
+                )
+
+            # Download full bytes then slice per range if provided
+            # Do not support UploadPartCopy from encrypted sources yet
+            if not source_bucket.get("is_public"):
+                return s3_error_response(
+                    "NotImplemented",
+                    "UploadPartCopy is not supported for encrypted source objects yet",
+                    status_code=501,
+                )
+            decrypt = False
+            try:
+                source_bytes = await ipfs_service.download_file(
+                    cid=source_cid,
+                    subaccount_id=request.state.account.main_account,
+                    bucket_name=source_bucket_name,
+                    decrypt=decrypt,
+                    seed_phrase=request.state.seed_phrase,
+                )
+            except Exception as e:
+                logger.warning(f"UploadPartCopy failed to download source: {e}")
+                return s3_error_response("ServiceUnavailable", "Failed to read source", status_code=503)
+
+        if range_start is not None and range_end is not None:
+            if range_start < 0 or range_end < range_start or range_end >= len(source_bytes):
+                return s3_error_response("InvalidRange", "Copy range invalid", status_code=416)
+            part_bytes = source_bytes[range_start : range_end + 1]
+        else:
+            part_bytes = source_bytes
+
+        file_data = part_bytes
+        # Debug: log copy slice info
+        try:
+            md5_copy = hashlib.md5(file_data).hexdigest()
+            logger.info(
+                f"UploadPartCopy slice: upload_id={upload_id} part={part_number} src={source_bucket_name}/{source_object_key} "
+                f"range={range_start}-{range_end} len={len(file_data)} md5={md5_copy}"
+            )
+        except Exception:
+            logger.debug("Failed to compute md5 for copy slice", exc_info=True)
+        # Proceed as normal part write below
+    else:
+        # Read request body for regular UploadPart
+        try:
+            body_start = time.time()
+            file_data = await get_request_body(request)
+            body_time = time.time() - body_start
+            logger.debug(f"Part {part_number}: Got request body in {body_time:.3f}s, size: {len(file_data)} bytes")
+        except ClientDisconnect:
+            logger.warning(f"Client disconnected during part {part_number} upload for upload {upload_id}")
+
+            # Clean up any cached parts for this upload when client disconnects
+            keys = await get_all_cached_chunks(
+                upload_id,
+                request.app.state.redis_client,
+            )
+            if keys:
+                await request.app.state.redis_client.delete(*keys)
+                logger.info(f"Cleaned up {len(keys)} cached parts for disconnected upload {upload_id}")
+
+            return s3_error_response(
+                "RequestTimeout",
+                "Client disconnected during upload",
+                status_code=408,
+            )
+
+    # (file_data is set either by copy path or regular body read)
 
     # Enforce AWS S3 minimum part size (except for final part)
     # Allow parts smaller than 5MB - AWS S3 allows this for the final part
@@ -434,6 +536,18 @@ async def upload_part(
         disconnect_time = time.time() - disconnect_start
         logger.debug(f"Part {part_number}: Disconnect check took {disconnect_time:.3f}s")
 
+        # Store in Redis (debug: log about to cache)
+        try:
+            import hashlib as _hashlib
+
+            md5_pre_cache = _hashlib.md5(file_data).hexdigest()
+            head_hex = file_data[:8].hex() if file_data else ""
+            tail_hex = file_data[-8:].hex() if len(file_data) >= 8 else head_hex
+            logger.debug(
+                f"About to cache part: upload_id={upload_id} part={part_number} len={len(file_data)} md5={md5_pre_cache} head8={head_hex} tail8={tail_hex}"
+            )
+        except Exception:
+            logger.debug("Failed to compute md5 for pre-cache log", exc_info=True)
         # Store in Redis
         redis_start = time.time()
         await redis_client.setex(
@@ -442,7 +556,7 @@ async def upload_part(
             file_data,
         )  # 30 minute TTL
         redis_time = time.time() - redis_start
-        logger.debug(f"Part {part_number}: Redis setex took {redis_time:.3f}s")
+        logger.debug(f"Part {part_number}: Redis setex took {redis_time:.3f}s (key={part_key})")
 
         # Create mock part result (no IPFS upload needed for individual parts)
         md5_start = time.time()
@@ -450,9 +564,9 @@ async def upload_part(
         loop = asyncio.get_event_loop()
         md5_hash = await loop.run_in_executor(None, lambda: hashlib.md5(file_data).hexdigest())
         md5_time = time.time() - md5_start
-        logger.debug(f"Part {part_number}: MD5 calculation took {md5_time:.3f}s (threaded)")
+        logger.debug(f"Part {part_number}: MD5 calculation took {md5_time:.3f}s (threaded) md5={md5_hash}")
 
-        etag = f"{md5_hash}-{part_number}"
+        etag = f"{md5_hash}-{part_number}" if not copy_source else md5_hash
 
         part_result = {
             "size_bytes": file_size,
@@ -479,9 +593,18 @@ async def upload_part(
         total_time = time.time() - start_time
         logger.debug(f"Part {part_number}: TOTAL processing time: {total_time:.3f}s")
 
-        # Return the part's ETag in the response header
+        # Return response
+        if copy_source:
+            # AWS-style XML body for UploadPartCopy
+            xml = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<CopyPartResult>
+  <ETag>\"{part_result["etag"]}\"</ETag>
+  <LastModified>{datetime.now(UTC).isoformat()}</LastModified>
+</CopyPartResult>
+""".encode("utf-8")
+            return Response(content=xml, media_type="application/xml", status_code=200)
         return Response(
-            status_code=200,  # etag needs to be double-quoted?
+            status_code=200,
             headers={"ETag": f'"{part_result["etag"]}"'},
         )
 
@@ -780,8 +903,10 @@ async def complete_multipart_upload(
             upload_id,
             db,
         )
+        logger.info(f"MPU complete: upload_id={upload_id} key={object_key} final_etag={final_md5_hash}")
 
         # Upload concatenated file to IPFS
+        # Re-enable encryption for multipart uploads based on bucket privacy
         should_encrypt = not bucket["is_public"]
 
         # Prepare metadata
@@ -821,6 +946,23 @@ async def complete_multipart_upload(
             upload_id,
         )
         total_size = sum(part["size_bytes"] for part in parts)
+        logger.info(
+            f"MPU sizes: upload_id={upload_id} total_size={total_size} parts={[p['size_bytes'] for p in parts]}"
+        )
+        # Also log each part's ETag and size for debugging
+        try:
+            part_rows = await db.fetch(get_query("list_parts"), upload_id)
+            dbg = [
+                {
+                    "part": r["part_number"],
+                    "size": r["size_bytes"],
+                    "etag": r["etag"],
+                }
+                for r in part_rows
+            ]
+            logger.info(f"MPU parts detail: upload_id={upload_id} parts={dbg}")
+        except Exception:
+            logger.debug("Failed to log parts detail after MPU", exc_info=True)
 
         # Create the object in database (without CID initially for multipart uploads)
         object_result = await db.fetchrow(
