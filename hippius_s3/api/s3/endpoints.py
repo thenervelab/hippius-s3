@@ -2460,22 +2460,27 @@ async def delete_object(
                 Key=object_key,
             )
 
-        await enqueue_unpin_request(
-            payload=UnpinChainRequest(
-                substrate_url=config.substrate_url,
-                ipfs_node=config.ipfs_store_url,
-                address=request.state.account.main_account,
-                subaccount=request.state.account.main_account,
-                subaccount_seed_phrase=request.state.seed_phrase,
-                bucket_name=bucket_name,
-                object_key=object_key,
-                should_encrypt=not bucket["is_public"],
-                cid=result.get("ipfs_cid") or "",
-                object_id=str(deleted_object["object_id"]),
-            ),
-            redis_client=redis_client,
-        )
-        logger.info(f"Enqueued unpin request for deleted object {object_key}")
+        # Only enqueue unpin if object has a valid CID
+        cid = deleted_object.get("ipfs_cid") or ""
+        if cid and cid.strip():
+            await enqueue_unpin_request(
+                payload=UnpinChainRequest(
+                    substrate_url=config.substrate_url,
+                    ipfs_node=config.ipfs_store_url,
+                    address=request.state.account.main_account,
+                    subaccount=request.state.account.main_account,
+                    subaccount_seed_phrase=request.state.seed_phrase,
+                    bucket_name=bucket_name,
+                    object_key=object_key,
+                    should_encrypt=not bucket["is_public"],
+                    cid=cid,
+                    object_id=str(deleted_object["object_id"]),
+                ),
+                redis_client=redis_client,
+            )
+            logger.info(f"Enqueued unpin request for deleted object {object_key} with CID {cid}")
+        else:
+            logger.info(f"Skipped unpin for deleted object {object_key} - no CID available")
 
         return Response(
             status_code=204,

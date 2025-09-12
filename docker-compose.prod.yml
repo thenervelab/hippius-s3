@@ -1,13 +1,6 @@
 services:
   api:
     command: ["sh", "-c", "python -m hippius_s3.scripts.migrate && gunicorn hippius_s3.main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --worker-connections 1000 --max-requests 10000 --max-requests-jitter 1000 --preload --log-level info --access-logfile -"]
-    ports:
-      - "8000-8001:8000"
-    deploy:
-      replicas: 2
-      resources:
-        limits:
-          cpus: '6'
     environment:
       - UVICORN_LOG_LEVEL=info
       - DEBUG=false
