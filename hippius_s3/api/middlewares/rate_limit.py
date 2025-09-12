@@ -1,5 +1,5 @@
 import logging
-import secrets
+import time
 from typing import Awaitable
 from typing import Callable
 
@@ -21,47 +21,24 @@ class RateLimitService:
         self.redis = redis
         logger.info("RateLimitService was instantiated")
 
-    async def log_request(
+    async def increment_and_get_count(
         self,
         main_account_id: str,
-        ttl_seconds: int,
-    ) -> None:
-        """Logs a request for a given main account.
-
-        Args:
-            main_account_id (str): The main account identifier.
-            ttl_seconds (int): The time span for which the request count is valid.
-        """
-        # Use main_account_id directly (no need to base64 encode)
-        key = f"hippius_rate_limit:{main_account_id}:{secrets.token_hex(8)}"
-        await self.redis.set(key, "", ex=ttl_seconds)
-        logger.debug(f"{key=}")
-
-    async def count_requests(
-        self,
-        main_account_id: str,
+        window_seconds: int,
     ) -> int:
-        """Get the total number of logged requests for a main account.
+        """Atomically increment and return the request count in the current window.
 
-        Args:
-            main_account_id (str): The main account to count requests for.
-
-        Returns:
-            int: The total number of requests made by the specified main account.
+        Uses a fixed window counter implemented with INCR and EXPIRE for O(1) performance.
         """
-        pattern = f"hippius_rate_limit:{main_account_id}:*"
+        # Fixed window bucket (e.g., per 60s)
+        window_bucket = int(time.time()) // window_seconds
+        key = f"hippius_rate_limit:{main_account_id}:{window_bucket}"
 
-        cursor = 0
-        requests = []
-
-        cursor, items = await self.redis.scan(cursor=cursor, match=pattern)
-        requests.extend(items)
-
-        while cursor != 0:
-            cursor, items = await self.redis.scan(cursor=cursor, match=pattern)
-            requests.extend(items)
-
-        return len(requests)
+        # INCR returns the incremented value; set TTL only when the key is first created
+        count = await self.redis.incr(key)
+        if count == 1:
+            await self.redis.expire(key, window_seconds)
+        return int(count)
 
 
 async def rate_limit_middleware(
@@ -105,20 +82,15 @@ async def rate_limit_middleware(
     main_account_id = request.state.account.main_account
 
     try:
-        current_count = await rate_limit_service.count_requests(main_account_id)
+        current_count = await rate_limit_service.increment_and_get_count(main_account_id, window_seconds)
 
-        if current_count >= max_requests:
+        if current_count > max_requests:
             logger.warning(f"Main account '{main_account_id}' rate limit exceeded ({current_count}/{max_requests})")
             return s3_error_response(
                 code="SlowDown",
                 message=f"Rate limit exceeded. Maximum {max_requests} requests per {window_seconds} seconds allowed.",
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
-
-        await rate_limit_service.log_request(
-            main_account_id,
-            window_seconds,
-        )
 
         return await call_next(request)
 
