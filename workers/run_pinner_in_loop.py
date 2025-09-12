@@ -49,7 +49,7 @@ async def _process_simple_upload(
         filename_hash = hashlib.md5(f"{payload.object_key}_md5".encode()).hexdigest()
         file_name = f"{filename_hash}.chunk"
 
-    # Encrypt chunk using s3_publish (debug: before encryption already logged)
+    # Encrypt chunk using s3_publish
     s3_result = await ipfs_service.client.s3_publish(
         content=chunk_data,
         encrypt=payload.should_encrypt,
