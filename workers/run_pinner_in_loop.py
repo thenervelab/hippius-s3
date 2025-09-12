@@ -248,7 +248,9 @@ async def process_upload_request(
                     )
                 )
             except Exception as e:
-                logger.error(f"Failed to process multipart upload for object_id={payload.object_id}, object_key={payload.object_key}: {e}")
+                logger.error(
+                    f"Failed to process multipart upload for object_id={payload.object_id}, object_key={payload.object_key}: {e}"
+                )
                 # Mark all objects in this batch as failed
                 for req in upload_requests:
                     await db.execute(
@@ -271,7 +273,9 @@ async def process_upload_request(
                     )
                 )
             except Exception as e:
-                logger.error(f"Failed to process simple upload for object_id={payload.object_id}, object_key={payload.object_key}: {e}")
+                logger.error(
+                    f"Failed to process simple upload for object_id={payload.object_id}, object_key={payload.object_key}: {e}"
+                )
                 # Mark all objects in this batch as failed
                 for req in upload_requests:
                     await db.execute(

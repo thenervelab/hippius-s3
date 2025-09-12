@@ -1,5 +1,5 @@
 import logging
-import secrets
+import time
 from typing import Awaitable
 from typing import Callable
 
@@ -63,43 +63,29 @@ class BanHammerService:
         return None
 
     async def add_infringement(self, ip: str, reason: str = "") -> None:
-        """Add an infringement for an IP and check if it should be banned."""
-        # Add an infringement with unique key
-        infringement_key = f"hippius_banhammer:infringement:{ip}:{secrets.token_hex(8)}"
-        await self.redis.set(infringement_key, reason, ex=self.infringement_window_seconds)
+        """Add an infringement for an IP and check if it should be banned.
+
+        Uses a fixed-window counter (INCR + EXPIRE) for O(1) performance.
+        """
+        # Increment counter for the current window bucket
+        window_bucket = int(time.time()) // self.infringement_window_seconds
+        count_key = f"hippius_banhammer:infringements:{ip}:{window_bucket}"
+        count = await self.redis.incr(count_key)
+        if count == 1:
+            await self.redis.expire(count_key, self.infringement_window_seconds + 1)
+
         logger.info(f"Added infringement for {ip}: {reason}")
-
-        pattern = f"hippius_banhammer:infringement:{ip}:*"
-        cursor = 0
-        infringements = []
-
-        cursor, items = await self.redis.scan(
-            cursor=cursor,
-            match=pattern,
-        )
-        infringements.extend(items)
-
-        while cursor != 0:
-            cursor, items = await self.redis.scan(
-                cursor=cursor,
-                match=pattern,
-            )
-            infringements.extend(items)
-
-        infringement_count = len(infringements)
-        logger.debug(f"IP {ip} has {infringement_count}/{self.infringement_max} infringements")
+        logger.debug(f"IP {ip} has {count}/{self.infringement_max} infringements in current window")
 
         # Ban if threshold exceeded
-        if infringement_count >= self.infringement_max:
+        if count >= self.infringement_max:
             block_key = f"hippius_banhammer:block:{ip}"
             await self.redis.set(
                 block_key,
-                f"banned_for_{infringement_count}_infringements",
+                f"banned_for_{count}_infringements",
                 ex=self.infringement_cooldown_seconds,
             )
-            logger.warning(
-                f"BANNED IP {ip} for {self.infringement_cooldown_seconds}s due to {infringement_count} infringements"
-            )
+            logger.warning(f"BANNED IP {ip} for {self.infringement_cooldown_seconds}s due to {count} infringements")
 
 
 async def banhammer_middleware(
