@@ -162,6 +162,10 @@ All endpoints support standard S3 headers and return S3-compatible XML responses
 
 See the compatibility list of supported S3 features in [docs/s3-compatibility.md](docs/s3-compatibility.md).
 
+### S4 Extensions (Because Hippius is more than S3)
+
+See the features beyond the scope of S3 in [docs/s4.md](docs/s4.md).
+
 ## Architecture
 
 ```
