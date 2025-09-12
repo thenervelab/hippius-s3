@@ -41,4 +41,9 @@ def test_complete_multipart_upload_returns_combined_etag(
     # Combined ETag should include -2 suffix for two parts
     assert "ETag" in completed
     assert isinstance(completed["ETag"], str)
-    assert completed["ETag"].rstrip('"').endswith("-2")
+    etag_xml = completed["ETag"].strip('"')
+    assert etag_xml.endswith("-2")
+
+    # HEAD should expose the same ETag
+    head = boto3_client.head_object(Bucket=bucket, Key=key)
+    assert head["ETag"].strip('"') == etag_xml

@@ -19,7 +19,7 @@ Notes:
 | CreateBucketMetadataTableConfiguration          |           |                                                            |                                               |                                                                      |
 | CreateMultipartUpload                           | ✔         | Initiate multipart upload                                  | POST /{bucket}/{key}?uploads                  | test_CreateMultipartUpload.py                                        |
 | CreateSession                                   |           |                                                            |                                               |                                                                      |
-| DeleteBucket                                    | ✔         | 404 if missing; 204 on success                             | DELETE /{bucket}                              |                                                                      |
+| DeleteBucket                                    | ✔         | 404 if missing; 204 on success; 409 if non-empty           | DELETE /{bucket}                              | test_DeleteBucket.py                                                 |
 | DeleteBucketAnalyticsConfiguration              |           |                                                            |                                               |                                                                      |
 | DeleteBucketCors                                |           |                                                            |                                               |                                                                      |
 | DeleteBucketEncryption                          |           |                                                            |                                               |                                                                      |
@@ -72,7 +72,7 @@ Notes:
 | GetObjectTorrent                                |           |                                                            |                                               |                                                                      |
 | GetPublicAccessBlock                            |           |                                                            |                                               |                                                                      |
 | HeadBucket                                      | ✔         | 200 if exists, 404 if not (empty body)                     | HEAD /{bucket}                                | test_CreateBucket.py                                                 |
-| HeadObject                                      | ✔         | Returns metadata headers                                   | HEAD /{bucket}/{key}                          | test_HeadObject.py                                                   |
+| HeadObject                                      | ✔         | Returns metadata headers; pending status header            | HEAD /{bucket}/{key}                          | test_HeadObject.py, test_HeadObject_Pending.py                       |
 | ListBucketAnalyticsConfigurations               |           |                                                            |                                               |                                                                      |
 | ListBucketIntelligentTieringConfigurations      |           |                                                            |                                               |                                                                      |
 | ListBucketInventoryConfigurations               |           |                                                            |                                               |                                                                      |
@@ -83,7 +83,7 @@ Notes:
 | ListObjects                                     | ✔         | Optional prefix filtering                                  | GET /{bucket}                                 | test_ListObjects.py                                                  |
 | ListObjectsV2                                   |           |                                                            |                                               |                                                                      |
 | ListObjectVersions                              |           |                                                            |                                               |                                                                      |
-| ListParts                                       |           |                                                            |                                               |                                                                      |
+| ListParts                                       | ✔         | Lists parts; supports pagination                           | GET /{bucket}/{key}?uploadId=...              | test_ListParts.py                                                    |
 | PutBucketAccelerateConfiguration                |           |                                                            |                                               |                                                                      |
 | PutBucketAcl                                    |           |                                                            |                                               |                                                                      |
 | PutBucketAnalyticsConfiguration                 |           |                                                            |                                               |                                                                      |
@@ -161,6 +161,11 @@ Notes:
   - `PUT /{bucket}/{key}` — Upload object (stores metadata, content type, MD5 as ETag)
   - `GET /{bucket}/{key}` — Download object (supports Range requests; returns S3-like headers)
   - `HEAD /{bucket}/{key}` — Object metadata (size, content type, ETag, Last-Modified)
+  - `x-amz-object-status` on HEAD:
+    - `pending` — object accepted, not yet published to IPFS
+    - `pinning` — publishing/pinning in progress
+    - `available` — content published and retrievable
+    - `unknown` — status not determined (header omitted)
   - `DELETE /{bucket}/{key}` — Delete object (idempotent 204)
   - User metadata: `x-amz-meta-*` stored and returned on HEAD/GET
   - ETag: MD5 of content for simple uploads (quoted in responses)

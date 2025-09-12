@@ -27,6 +27,7 @@ from lxml import etree as ET
 from hippius_s3 import dependencies
 from hippius_s3 import utils
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.multipart import list_parts_internal
 from hippius_s3.api.s3.multipart import upload_part
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import DBConnection
@@ -281,7 +282,8 @@ def create_xml_error_response(
     **kwargs,
 ) -> Response:
     """Generate a standardized XML error response using lxml."""
-    error_root = ET.Element("Error", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+    # S3 error bodies are simple XML without a namespace
+    error_root = ET.Element("Error")
 
     code_elem = ET.SubElement(error_root, "Code")
     code_elem.text = code
@@ -326,6 +328,9 @@ def create_xml_error_response(
     response_headers = {
         "Content-Type": "application/xml; charset=utf-8",
         "x-amz-request-id": str(uuid.uuid4()),
+        # Help SDKs that read error code/message from headers when body parsing is deferred
+        "x-amz-error-code": code,
+        "x-amz-error-message": message,
     }
     response_headers.update(http_headers)
 
@@ -1461,6 +1466,25 @@ async def delete_bucket(
             None,
         )
 
+        # S3 semantics: refuse to delete a non-empty bucket
+        if objects:
+            return create_xml_error_response(
+                "BucketNotEmpty",
+                "The bucket you tried to delete is not empty",
+                status_code=409,
+                BucketName=bucket_name,
+            )
+
+        # Also block deletion if there are ongoing multipart uploads (required)
+        ongoing_uploads = await db.fetch(get_query("list_multipart_uploads"), bucket["bucket_id"], None)
+        if ongoing_uploads:
+            return create_xml_error_response(
+                "BucketNotEmpty",
+                "The bucket has ongoing multipart uploads",
+                status_code=409,
+                BucketName=bucket_name,
+            )
+
         # Delete bucket (permission is checked via main_account_id ownership)
         deleted_bucket = await db.fetchrow(
             get_query("delete_bucket"),
@@ -2032,8 +2056,10 @@ async def head_object(
             "ETag": f'"{result["md5_hash"]}"',
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "x-amz-ipfs-cid": ipfs_cid or "pending",
-            "x-amz-object-status": object_status,
         }
+        # Only include object status header if known
+        if object_status != "unknown":
+            headers["x-amz-object-status"] = object_status
 
         for key, value in metadata.items():
             if key != "ipfs" and not isinstance(value, dict):
@@ -2078,6 +2104,10 @@ async def get_object(
             request.state.seed_phrase,
             request.state.account.main_account,
         )
+
+    # List parts for an ongoing multipart upload
+    if "uploadId" in request.query_params:
+        return await list_parts_internal(bucket_name, object_key, request, db)
 
     # Check for Range header - handle partial content requests
     range_header = request.headers.get("Range") or request.headers.get("range")

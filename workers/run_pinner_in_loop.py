@@ -309,7 +309,8 @@ async def process_upload_request(
     if not tx_hash or tx_hash == "0x" or len(tx_hash) < 10:
         logger.error(f"Invalid transaction hash received: {tx_hash}")
         raise HippiusSubstrateError(
-            f"Invalid transaction hash received: {tx_hash}. This might indicate insufficient credits or transaction failure."
+            f"Invalid transaction hash received: {tx_hash}. "
+            "This might indicate insufficient credits or transaction failure."
         )
 
     logger.info(f"Successfully published to substrate with transaction: {tx_hash}")

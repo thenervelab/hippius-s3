@@ -48,6 +48,12 @@ def test_get_object_range_valid(
     assert resp2["ContentRange"].startswith("bytes 5-25/")
     assert resp2["Body"].read() == data[5:]
 
+    # bytes=0- (open-ended) should return full object with 206
+    resp_open = boto3_client.get_object(Bucket=bucket, Key=key, Range="bytes=0-")
+    assert resp_open["ResponseMetadata"]["HTTPStatusCode"] == 206
+    assert resp_open["ContentRange"] == f"bytes 0-{len(data) - 1}/{len(data)}"
+    assert resp_open["Body"].read() == data
+
     # bytes=-5
     resp3 = boto3_client.get_object(Bucket=bucket, Key=key, Range="bytes=-5")
     assert resp3["ResponseMetadata"]["HTTPStatusCode"] == 206
@@ -77,3 +83,9 @@ def test_get_object_range_invalid(
         boto3_client.get_object(Bucket=bucket, Key=key, Range=invalid_range)
     status = excinfo.value.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
     assert status == 416
+
+    # bytes=-N with N > size should clamp to full content (common S3 behavior)
+    resp_clamp = boto3_client.get_object(Bucket=bucket, Key=key, Range=f"bytes=-{len(data) + 100}")
+    assert resp_clamp["ResponseMetadata"]["HTTPStatusCode"] == 206
+    assert resp_clamp["ContentRange"] == f"bytes 0-{len(data) - 1}/{len(data)}"
+    assert resp_clamp["Body"].read() == data

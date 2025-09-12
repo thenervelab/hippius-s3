@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: ["**"]
 
 permissions:
   contents: read
@@ -14,11 +14,48 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint-and-format:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python 3.12.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.11"
+
+      - name: Install Ruff 0.13.0
+        run: |
+          python -m pip install --upgrade pip
+          pip install "ruff==0.13.0"
+
+      - name: Print environment info
+        run: |
+          python --version
+          ruff --version
+
+      - name: Lint (ruff check)
+        run: |
+          ruff check . || (
+            echo "=== Ruff settings ===" && ruff check --show-settings | sed -n '1,200p' && exit 1
+          )
+
+      - name: Format (ruff format --check)
+        run: |
+          ruff format --check . || (
+            echo "=== Ruff format DIFF (all) ===" && ruff format --diff . | sed -n '1,400p' || true
+            exit 1
+          )
+
   test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.12"] # Only using the latest Python version
+        python-version: ["3.12.11"] # Pin patch to match formatter env
 
     steps:
       - uses: actions/checkout@v4
@@ -38,12 +75,6 @@ jobs:
           uv venv
           source .venv/bin/activate
           uv pip install -e ".[dev]"
-
-      - name: Lint with ruff
-        run: |
-          source .venv/bin/activate
-          ruff check .
-          ruff format --check .
 
       - name: Type check with mypy
         run: |

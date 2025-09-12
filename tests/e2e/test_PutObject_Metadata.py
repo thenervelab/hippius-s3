@@ -32,3 +32,15 @@ def test_put_object_metadata_roundtrip(
     assert returned.get("test-meta") == "test-value"
     assert returned.get("casepreserve") == "MiXeD"
     # Non-ASCII would be rejected by boto3; validated implicitly by absence here
+
+    # GET should also include metadata in both the structured dict and raw headers
+    got = boto3_client.get_object(Bucket=bucket, Key=key)
+    assert got["ResponseMetadata"]["HTTPStatusCode"] == 200
+    # Structured dict
+    got_meta = got["Metadata"]
+    assert got_meta.get("test-meta") == "test-value"
+    assert got_meta.get("casepreserve") == "MiXeD"
+    # Raw HTTP headers are all lower-case; verify presence of x-amz-meta-*
+    http_headers = got["ResponseMetadata"]["HTTPHeaders"]
+    assert http_headers.get("x-amz-meta-test-meta") == "test-value"
+    assert http_headers.get("x-amz-meta-casepreserve") == "MiXeD"
