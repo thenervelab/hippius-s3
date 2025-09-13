@@ -414,8 +414,9 @@ async def run_pinner_loop():
     except KeyboardInterrupt:
         logger.info("Pinner service stopping...")
     except Exception as e:
-        logger.error(f"Error in workers loop: {e}")
-        raise
+        logger.exception(f"Error in workers loop: {e}")
+        # Log and continue instead of exiting
+        await asyncio.sleep(5)  # Brief pause before retrying
     finally:
         await redis_client.aclose()
         await db.close()
