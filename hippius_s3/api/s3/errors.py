@@ -26,7 +26,15 @@ class S3Error(Exception):
         super().__init__(message)
 
 
-def s3_error_response(code: str, message: str, request_id: str = "", status_code: int = 400, **kwargs: str) -> Response:
+def s3_error_response(
+    code: str,
+    message: str,
+    request_id: str = "",
+    status_code: int = 400,
+    *,
+    extra_headers: dict[str, str] | None = None,
+    **kwargs: str,
+) -> Response:
     """Generate a standardized S3 error response in XML format.
 
     Args:
@@ -80,5 +88,8 @@ def s3_error_response(code: str, message: str, request_id: str = "", status_code
         "x-amz-error-code": code,
         "x-amz-error-message": message,
     }
+
+    if extra_headers:
+        headers.update(extra_headers)
 
     return Response(content=xml_content, media_type="application/xml", status_code=status_code, headers=headers)
