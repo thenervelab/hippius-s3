@@ -277,6 +277,15 @@ async def handle_append(
             composite_etag,
         )
 
+        # Write-through cache: store appended bytes for immediate reads
+        try:
+            cache_key = f"part_cache:{object_id}:{int(next_part)}"
+            # Cache for 30 minutes
+            await redis_client.setex(cache_key, 1800, incoming_bytes)
+        except Exception:
+            # Non-fatal: continue without cache if Redis unavailable
+            pass
+
         resp = Response(
             status_code=200,
             headers={
