@@ -1941,10 +1941,11 @@ async def head_object(
         metadata = json.loads(result["metadata"])
         ipfs_cid = result["ipfs_cid"]
 
-        # Check object status and return 202 if still processing
+        # Check object status; if IPFS CID exists, treat as readable (200) to enable early append/read.
         object_status = result.get("status", "unknown")
-        if object_status in ["pending", "pinning"]:
-            retry_after = "60" if result.get("multipart") else "30"
+        ipfs_cid = result.get("ipfs_cid")
+        if object_status in ["pending", "pinning"] and not (ipfs_cid and str(ipfs_cid).strip()):
+            retry_after = "1"
             headers = {
                 "Retry-After": retry_after,
                 "x-amz-object-status": object_status,
@@ -1956,7 +1957,7 @@ async def head_object(
             "Content-Length": str(result["size_bytes"]),
             "ETag": f'"{result["md5_hash"]}"',
             "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
-            "x-amz-ipfs-cid": ipfs_cid or "pending",
+            "x-amz-ipfs-cid": (ipfs_cid or "pending"),
         }
         # Expose append version if present (for S4 version-based CAS)
         if "append_version" in result and result["append_version"] is not None:

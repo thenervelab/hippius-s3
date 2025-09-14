@@ -78,10 +78,10 @@ async def handle_append(
             cached = await redis_client.get(id_key)
             if cached:
                 try:
-                    payload = json.loads(cached)
+                    payload = json.loads(cached.decode("utf-8"))
                     etag = payload.get("etag")
                     if etag:
-                        return Response(status_code=200, headers={"ETag": f'"{etag}"'})
+                        return Response(status_code=200, headers={"ETag": f'"{etag}"', "x-amz-append-replayed": "true"})
                 except Exception:
                     pass
         except Exception:
@@ -127,14 +127,8 @@ async def handle_append(
                 status_code=412,
             )
 
-        # Enforce readiness: object must be fully uploaded before allowing append
-        current_status = str(current.get("status") or "").lower()
-        if current_status not in {"uploaded"}:
-            return errors.s3_error_response(
-                code="ServiceUnavailable",
-                message="Object is not yet ready for append. Wait for HEAD 200 (readable) before appending.",
-                status_code=503,
-            )
+        # Enforce readiness: allow append once the object has an IPFS CID or is fully uploaded.
+        # Actual gating occurs below for non-multipart objects by verifying the presence of a simple CID.
 
         object_id = str(current["object_id"]) if current.get("object_id") else None
         if object_id is None:
@@ -182,6 +176,7 @@ async def handle_append(
                     code="ServiceUnavailable",
                     message="Object publish is in progress. Please retry shortly.",
                     status_code=503,
+                    extra_headers={"Retry-After": "1"},
                 )
             # Upsert CID and create part 1 referencing existing content
             cid_id = await _upsert_cid(db, simple_cid)
