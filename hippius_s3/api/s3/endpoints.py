@@ -2057,8 +2057,27 @@ async def get_object(
         # Load chunk metadata after range validation to avoid returning 503 for syntactically invalid ranges
         download_chunks = json.loads(object_info["download_chunks"])
 
-        # Check if all chunks have CIDs - if not, object is still being processed
+        # Check if all chunks have CIDs - if not, object may still be processing
         if not download_chunks:
+            # Attempt to synthesize manifest from DB parts for multipart objects
+            try:
+                upload_id = (
+                    object_info["upload_id"] if "upload_id" in object_info and object_info["upload_id"] else None
+                )
+                if object_info["multipart"] and upload_id:
+                    part_rows = await db.fetch(get_query("list_parts"), upload_id)
+                    if part_rows:
+                        download_chunks = [
+                            {
+                                "part_number": int(r["part_number"]),
+                                "cid": r.get("ipfs_cid"),
+                                "size_bytes": int(r.get("size_bytes") or 0),
+                            }
+                            for r in part_rows
+                        ]
+                        # fall through to normal chunk handling below
+            except Exception:
+                logger.debug("Failed to synthesize manifest from DB parts", exc_info=True)
             # Fallback for simple objects: stream directly from Redis cache while publish is in progress
             if object_info["multipart"] is False:
                 simple_key = f"simple:{object_info['object_id']}:part:0"
@@ -2089,6 +2108,7 @@ async def get_object(
                         "Accept-Ranges": "bytes",
                         "ETag": f'"{object_info["md5_hash"]}"',
                         "Last-Modified": object_info["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
+                        "x-hippius-source": "simple_cache",
                     }
                     # Include metadata headers so boto3 populates Metadata dict
                     metadata = object_info.get("metadata") or {}
@@ -2256,6 +2276,8 @@ async def get_object(
                 "Content-Type": object_info["content_type"],
                 "Content-Range": f"bytes {start_byte}-{end_byte}/{object_info['size_bytes']}",
                 "Accept-Ranges": "bytes",
+                "x-hippius-source": "redis_download",
+                "x-hippius-range": "true",
             }
 
             return StreamingResponse(
@@ -2278,11 +2300,18 @@ async def get_object(
             logger.debug("Failed to precompute part ETags for integrity check", exc_info=True)
 
         # Pre-validate readiness and integrity BEFORE starting the streaming response
-        # Readiness: ensure every expected chunk is available
+        # Readiness: ensure every expected chunk is available or present in part_cache
         for chunk in chunks:
             for _ in range(config.http_redis_get_retries):
                 exists = await request.app.state.redis_client.exists(chunk.redis_key)
                 if exists:
+                    break
+                # Check write-through part cache
+                cache_key = f"part_cache:{object_info['object_id']}:{chunk.part_id}"
+                cached = await request.app.state.redis_client.get(cache_key)
+                if cached:
+                    # Hydrate the normal downloaded key for downstream flow and break
+                    await request.app.state.redis_client.set(chunk.redis_key, cached, ex=300)
                     break
                 await asyncio.sleep(config.http_download_sleep_loop)
             else:
@@ -2331,6 +2360,7 @@ async def get_object(
             "Accept-Ranges": "bytes",
             "ETag": f'"{object_info["md5_hash"]}"',
             "Last-Modified": object_info["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
+            "x-hippius-source": "redis_download",
         }
 
         # Add custom metadata headers
