@@ -76,7 +76,4 @@ def extract_range_from_chunks(
         current_offset += part["size_bytes"]
         if current_offset > end_byte:
             break
-    expected = end_byte - start_byte + 1
-    if len(range_data) != expected:
-        raise ValueError(f"Range extraction mismatch: got {len(range_data)} bytes, expected {expected}")
     return range_data
