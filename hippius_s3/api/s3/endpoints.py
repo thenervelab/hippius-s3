@@ -45,6 +45,7 @@ from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
+config = get_config()
 
 
 def format_s3_timestamp(dt):
@@ -69,6 +70,136 @@ async def get_chunk_from_redis(redis_client, chunk: ChunkToDownload) -> bytes:
         raise RuntimeError(f"Chunk {chunk.part_id} not found in Redis")
 
     return chunk_data
+
+
+async def load_object_from_cache(
+    redis_client,
+    object_info: dict,
+    range_header: str | None = None,
+    start_byte: int | None = None,
+    end_byte: int | None = None,
+) -> StreamingResponse:
+    """Load object from Redis cache when CID is not available."""
+    is_multipart = object_info["multipart"]
+
+    if is_multipart:
+        upload_id = object_info["upload_id"]
+        if not upload_id:
+            raise RuntimeError("Missing upload_id for multipart object")
+
+        try:
+            download_chunks = json.loads(object_info["download_chunks"])
+        except (json.JSONDecodeError, KeyError) as e:
+            raise RuntimeError("Invalid download_chunks for multipart object") from e
+
+        if not download_chunks:
+            raise RuntimeError("Missing download_chunks for multipart object")
+
+        sorted_chunks = sorted(download_chunks, key=lambda x: x["part_number"])
+
+        if range_header and start_byte is not None and end_byte is not None:
+            # For range requests, we need to load chunks into memory to extract the range
+            needed_parts = calculate_chunks_for_range(start_byte, end_byte, download_chunks)
+            chunks_data = []
+            for chunk_info in sorted_chunks:
+                if chunk_info["part_number"] in needed_parts:
+                    cache_key = f"multipart:{upload_id}:part:{chunk_info['part_number']}"
+                    chunk_data = await redis_client.get(cache_key)
+                    if chunk_data is None:
+                        raise RuntimeError(f"Cache key missing: {cache_key}")
+                    chunks_data.append(chunk_data)
+
+            range_data = extract_range_from_chunks(chunks_data, start_byte, end_byte, download_chunks, needed_parts)
+
+            headers = {
+                "Content-Type": object_info["content_type"],
+                "Content-Range": f"bytes {start_byte}-{end_byte}/{object_info['size_bytes']}",
+                "Accept-Ranges": "bytes",
+            }
+
+            return StreamingResponse(
+                iter([range_data]),
+                status_code=206,
+                media_type=object_info["content_type"],
+                headers=headers,
+            )
+
+        # Stream chunks as they're retrieved from Redis
+        async def generate_chunks():
+            for chunk_info in sorted_chunks:
+                cache_key = f"multipart:{upload_id}:part:{chunk_info['part_number']}"
+                chunk_data = await redis_client.get(cache_key)
+                if chunk_data is None:
+                    raise RuntimeError(f"Cache key missing: {cache_key}")
+                yield chunk_data
+
+        headers = {
+            "Content-Type": object_info["content_type"],
+            "Content-Disposition": f'inline; filename="{object_info["object_key"].split("/")[-1]}"',
+            "Accept-Ranges": "bytes",
+            "ETag": f'"{object_info["md5_hash"]}"',
+            "Last-Modified": object_info["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
+        }
+
+        metadata = object_info.get("metadata") or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except json.JSONDecodeError:
+                metadata = {}
+        for key, value in metadata.items():
+            if key != "ipfs" and not isinstance(value, dict):
+                headers[f"x-amz-meta-{key}"] = str(value)
+
+        return StreamingResponse(
+            generate_chunks(),
+            media_type=object_info["content_type"],
+            headers=headers,
+        )
+
+    cache_key = f"simple:{object_info['object_id']}:part:0"
+    data = await redis_client.get(cache_key)
+    if data is None:
+        raise RuntimeError(f"Cache key missing: {cache_key}")
+
+    if range_header and start_byte is not None and end_byte is not None:
+        range_data = data[start_byte : end_byte + 1]
+        headers = {
+            "Content-Type": object_info["content_type"],
+            "Content-Range": f"bytes {start_byte}-{end_byte}/{len(data)}",
+            "Accept-Ranges": "bytes",
+        }
+        return StreamingResponse(
+            iter([range_data]),
+            status_code=206,
+            media_type=object_info["content_type"],
+            headers=headers,
+        )
+
+    headers = {
+        "Content-Type": object_info["content_type"],
+        "Content-Disposition": f'inline; filename="{object_info["object_key"].split("/")[-1]}"',
+        "Accept-Ranges": "bytes",
+        "ETag": f'"{object_info["md5_hash"]}"',
+        "Last-Modified": object_info["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
+    }
+
+    metadata = object_info.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except json.JSONDecodeError:
+            metadata = {}
+    for key, value in metadata.items():
+        if key != "ipfs" and not isinstance(value, dict):
+            headers[f"x-amz-meta-{key}"] = str(value)
+
+    return StreamingResponse(
+        iter([data]),
+        status_code=200,
+        media_type=object_info["content_type"],
+        headers=headers,
+    )
 
 
 def _handle_range_request(
@@ -140,8 +271,6 @@ Range helpers moved to hippius_s3.api.s3.range_utils.
 Keep imports at top; remove local shims to avoid redefinitions.
 """
 
-
-config = get_config()
 security = HTTPBearer()
 router = APIRouter(tags=["s3"])
 
@@ -1503,8 +1632,7 @@ async def _copy_object(
                 content=file_data,
                 encrypt=should_encrypt,
                 seed_phrase=request.state.seed_phrase,
-                subaccount_id=request.state.account.main_account,
-                # Publish under destination bucket
+                subaccount_id=request.state.account.main_account,  # Publish under destination bucket
                 bucket_name=destination_bucket["bucket_name"],
                 file_name=source_object_key,
                 store_node=config.ipfs_store_url,
@@ -2016,6 +2144,9 @@ async def get_object(
     # Check for Range header - handle partial content requests
     range_header = request.headers.get("Range") or request.headers.get("range")
 
+    # Check for cache-only header for testing/forcing cache retrieval
+    force_cache = request.headers.get("x-amz-meta-cache", "").lower() == "true"
+
     try:
         # Get user for user-scoped bucket lookup (creates user if not exists)
         await db.fetchrow(
@@ -2041,6 +2172,7 @@ async def get_object(
                 Key=object_key,
             )
 
+        start_byte = end_byte = None
         if range_header:
             try:
                 start_byte, end_byte = parse_range_header(range_header, object_info["size_bytes"])
@@ -2053,106 +2185,37 @@ async def get_object(
                         "Content-Length": "0",
                     },
                 )
+        else:
+            start_byte, end_byte = None, None
         # Load chunk metadata after range validation to avoid returning 503 for syntactically invalid ranges
         download_chunks = json.loads(object_info["download_chunks"])
 
-        # Check if all chunks have CIDs - if not, object is still being processed
-        if not download_chunks:
-            # Fallback for simple objects: stream directly from Redis cache while publish is in progress
-            if object_info["multipart"] is False:
-                simple_key = f"simple:{object_info['object_id']}:part:0"
-                data = await request.app.state.redis_client.get(simple_key)
-                if data:
-                    # Support range on simple cached bytes
-                    if range_header and start_byte is not None and end_byte is not None:
-                        total_size = len(data)
-                        # Safety: ensure range is within bounds (already parsed earlier)
-                        range_data = data[start_byte : end_byte + 1]
-                        headers = {
-                            "Content-Type": object_info["content_type"],
-                            "Content-Range": f"bytes {start_byte}-{end_byte}/{total_size}",
-                            "Accept-Ranges": "bytes",
-                        }
-                        return StreamingResponse(
-                            iter([range_data]),
-                            status_code=206,
-                            media_type=object_info["content_type"],
-                            headers=headers,
-                        )
+        # Check if main CID is missing (still being processed)
+        # If simple_cid is None, object hasn't been processed yet and chunks are in cache
+        main_cid_missing = object_info.get("simple_cid") is None
+        get_from_cache = force_cache or main_cid_missing
 
-                    # Full object from cache
-                    file_name_cache = object_key.rsplit("/", 1)[-1]
-                    headers = {
-                        "Content-Type": object_info["content_type"],
-                        "Content-Disposition": f'inline; filename="{file_name_cache}"',
-                        "Accept-Ranges": "bytes",
-                        "ETag": f'"{object_info["md5_hash"]}"',
-                        "Last-Modified": object_info["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
-                    }
-                    # Include metadata headers so boto3 populates Metadata dict
-                    metadata = object_info.get("metadata") or {}
-                    if isinstance(metadata, str):
-                        try:
-                            metadata = json.loads(metadata)
-                        except Exception:
-                            metadata = {}
-                    if isinstance(metadata, dict):
-                        for k, v in metadata.items():
-                            headers[f"x-amz-meta-{k}"] = v
-                    return StreamingResponse(
-                        iter([data]),
-                        status_code=200,
-                        media_type=object_info["content_type"],
-                        headers=headers,
-                    )
-            retry_count = int(request.headers.get("x-hippius-retry-count", "0"))
-            max_retries = 5
-
-            if retry_count >= max_retries:
-                return create_xml_error_response(
-                    "ServiceUnavailable",
-                    "Object publish failed after maximum retries. Please check object status.",
-                    status_code=503,
+        if get_from_cache:
+            # Try to load object from cache, fallback to regular download if cache fails
+            try:
+                return await load_object_from_cache(
+                    redis_client=request.app.state.redis_client,
+                    object_info=object_info,
+                    range_header=range_header,
+                    start_byte=start_byte,
+                    end_byte=end_byte,
                 )
-
-            return create_xml_error_response(
-                "ServiceUnavailable",
-                "Object publish is in progress. Please retry shortly.",
-                status_code=503,
-                **{
-                    "Retry-After": "30",
-                    "x-hippius-retry-count": str(retry_count),
-                    "x-hippius-max-retries": str(max_retries),
-                },
-            )
-
-        # Check if any chunk is missing a CID (still being processed)
-        missing_cids = [chunk for chunk in download_chunks if not chunk.get("cid")]
-        if missing_cids:
-            retry_count = int(request.headers.get("x-hippius-retry-count", "0"))
-            max_retries = 5
-
-            if retry_count >= max_retries:
-                return create_xml_error_response(
-                    "ServiceUnavailable",
-                    "Object publish failed after maximum retries. Please check object status.",
-                    status_code=503,
-                )
-
-            return create_xml_error_response(
-                "ServiceUnavailable",
-                "Object publish is in progress. Please retry shortly.",
-                status_code=503,
-                **{
-                    "Retry-After": "30",
-                    "x-hippius-retry-count": str(retry_count),
-                    "x-hippius-max-retries": str(max_retries),
-                },
-            )
+            except RuntimeError:
+                # Cache failed (missing keys), fall back to regular IPFS download
+                pass
 
         # Handle range requests by calculating needed chunks
-        if range_header:
-            needed_parts = calculate_chunks_for_range(start_byte, end_byte, download_chunks)
+        if range_header and start_byte is not None and end_byte is not None:
+            needed_parts = calculate_chunks_for_range(
+                start_byte,
+                end_byte,
+                download_chunks,
+            )
             filtered_chunks = [chunk for chunk in download_chunks if chunk["part_number"] in needed_parts]
         else:
             filtered_chunks = download_chunks
@@ -2193,7 +2256,6 @@ async def get_object(
             logger.debug("Failed to log expected part ETags", exc_info=True)
 
         # Create download request
-        config = get_config()
         download_request = DownloadChainRequest(
             request_id=request_uuid,
             object_id=str(object_info["object_id"]),
