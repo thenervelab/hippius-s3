@@ -250,6 +250,7 @@ async def submit_storage_request_for_user(
         files=files,
         miner_ids=[],
         seed_phrase=seed_phrase,
+        pallet_name="IpfsPallet",
         fn_name="submit_storage_request_for_user",
     )
 
