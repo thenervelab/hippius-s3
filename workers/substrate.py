@@ -252,6 +252,9 @@ async def submit_storage_request_for_user(
         seed_phrase=seed_phrase,
         pallet_name="IpfsPallet",
         fn_name="submit_storage_request_for_user",
+        extra_params={
+            "user": user,
+        },
     )
 
     logger.info(f"Submitted storage request for user {user} with {len(cids)} CIDs")
