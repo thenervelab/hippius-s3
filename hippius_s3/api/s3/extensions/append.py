@@ -282,6 +282,13 @@ async def handle_append(
             composite_etag,
         )
 
+        # Write-through cache: store appended bytes for immediate reads
+        from contextlib import suppress
+
+        with suppress(Exception):
+            # Single source of truth aligned with upload manifest
+            await redis_client.setex(f"multipart:{upload_id}:part:{int(next_part)}", 1800, incoming_bytes)
+
         resp = Response(
             status_code=200,
             headers={

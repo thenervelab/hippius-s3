@@ -6,11 +6,16 @@ services:
     env_file:
       - .env
     depends_on:
-      - db
-      - ipfs
-      - redis
-      - redis-accounts
-      - redis-chain
+      db:
+        condition: service_healthy
+      ipfs:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      redis-accounts:
+        condition: service_healthy
+      redis-chain:
+        condition: service_healthy
     volumes:
       - .:/app
     restart: unless-stopped
@@ -111,7 +116,10 @@ services:
     env_file:
       - .env
     depends_on:
-      - redis
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     deploy:
       replicas: 1 # can't scale up otherwise we get transaction conflicts for the same user
     restart: unless-stopped
@@ -128,7 +136,10 @@ services:
     env_file:
       - .env
     depends_on:
-      - redis
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     deploy:
       replicas: 1
     restart: unless-stopped
@@ -145,8 +156,10 @@ services:
     env_file:
       - .env
     depends_on:
-      - redis
-      - db
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     deploy:
       replicas: 3
     restart: unless-stopped
@@ -162,8 +175,10 @@ services:
     env_file:
       - .env
     depends_on:
-      - redis-chain
-      - db
+      db:
+        condition: service_healthy
+      redis-chain:
+        condition: service_healthy
     deploy:
       replicas: 1
     restart: unless-stopped
@@ -179,8 +194,10 @@ services:
     env_file:
       - .env
     depends_on:
-      - redis-chain
-      - db
+      db:
+        condition: service_healthy
+      redis-chain:
+        condition: service_healthy
     deploy:
       replicas: 1
     restart: unless-stopped

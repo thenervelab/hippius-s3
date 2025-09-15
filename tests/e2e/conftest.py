@@ -181,27 +181,11 @@ def boto3_client(test_seed_phrase: str) -> Any:
 
 @pytest.fixture
 def wait_until_readable(boto3_client: Any) -> Callable[[str, str, float], None]:
-    """Poll HEAD until object is readable (HEAD 200 with non-pending CID).
-
-    Usage: wait_until_readable(bucket, key, timeout_seconds)
-    """
+    """No-op fixture - objects are now immediately available from cache."""
 
     def _wait(bucket: str, key: str, timeout_seconds: float = 60.0) -> None:
-        deadline = time.time() + timeout_seconds
-        last_err: Exception | None = None
-        while time.time() < deadline:
-            try:
-                head = boto3_client.head_object(Bucket=bucket, Key=key)
-                headers = head.get("ResponseMetadata", {}).get("HTTPHeaders", {})
-                cid = headers.get("x-amz-ipfs-cid", "pending")
-                if cid and cid != "pending":
-                    return
-            except Exception as e:  # noqa: PERF203
-                last_err = e
-            time.sleep(0.5)
-        if last_err:
-            raise last_err
-        raise RuntimeError(f"Object {bucket}/{key} not readable within timeout")
+        # Objects are now immediately available via cache, no waiting needed
+        pass
 
     return _wait
 

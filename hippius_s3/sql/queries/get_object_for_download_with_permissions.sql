@@ -31,7 +31,7 @@ multipart_chunks AS (
         oi.object_id
     FROM object_info oi
     JOIN parts p ON p.object_id = oi.object_id
-    JOIN cids c ON p.cid_id = c.id
+    LEFT JOIN cids c ON p.cid_id = c.id
     WHERE oi.multipart = TRUE
     ORDER BY p.part_number ASC
 )
@@ -46,6 +46,7 @@ SELECT
     oi.created_at,
     oi.md5_hash,
     oi.bucket_name,
+    oi.simple_cid,
     NOT oi.is_public as should_decrypt,
     (
         SELECT mu.upload_id
