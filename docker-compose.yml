@@ -10,6 +10,7 @@ services:
       - ipfs
       - redis
       - redis-accounts
+      - redis-chain
     volumes:
       - .:/app
     restart: unless-stopped
@@ -21,6 +22,7 @@ services:
       - HIPPIUS_IPFS_STORE_URL=https://store.hippius.network
       - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
+      - REDIS_CHAIN_URL=redis://redis-chain:6379/0
 
   db:
     image: postgres:15
@@ -86,6 +88,21 @@ services:
       timeout: 3s
       retries: 5
 
+  redis-chain:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6381:6379"
+    volumes:
+      - redis_chain_data:/data
+      - ./redis.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   pinner:
     build:
       context: .
@@ -137,8 +154,43 @@ services:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
 
+  chain-pin-checker:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: ["python", "workers/chain_pin_checker.py"]
+    env_file:
+      - .env
+    depends_on:
+      - redis-chain
+      - db
+    deploy:
+      replicas: 1
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_CHAIN_URL=redis://redis-chain:6379/0
+
+  chain-profile-cacher:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: ["python", "workers/chain_profile_cacher.py"]
+    env_file:
+      - .env
+    depends_on:
+      - redis-chain
+      - db
+    deploy:
+      replicas: 1
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_CHAIN_URL=redis://redis-chain:6379/0
+
 volumes:
   postgres_data:
   ipfs_data:
   redis_data:
   redis_accounts_data:
+  redis_chain_data:

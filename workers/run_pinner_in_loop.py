@@ -10,10 +10,8 @@ from typing import Union
 
 import asyncpg
 import redis.asyncio as async_redis
-from hippius_sdk.errors import HippiusSubstrateError
 from hippius_sdk.ipfs import S3PublishPin
 from hippius_sdk.substrate import FileInput
-from hippius_sdk.substrate import SubstrateClient
 
 # Add parent directory to path to import hippius_s3 modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -25,6 +23,7 @@ from hippius_s3.queue import MultipartUploadChainRequest
 from hippius_s3.queue import SimpleUploadChainRequest
 from hippius_s3.queue import dequeue_upload_request
 from hippius_s3.utils import upsert_cid_and_get_id
+from workers.substrate import submit_storage_request
 
 
 config = get_config()
@@ -340,29 +339,15 @@ async def process_upload_request(
             logger.info(f"Updated object {payload.object_id} status to 'uploaded'")
         return True
 
-    # Create substrate storage request
-    substrate_client = SubstrateClient(
+    # Submit storage request to substrate
+    cids = [file.file_hash for file in files]
+    tx_hash = await submit_storage_request(
+        cids=cids,
         seed_phrase=seed_phrase,
-        url=config.substrate_url,
+        substrate_url=config.substrate_url
     )
 
-    tx_hash = await substrate_client.storage_request(
-        files=files,
-        miner_ids=[],
-        seed_phrase=seed_phrase,
-    )
-
-    logger.info(f"Processed {len(upload_requests)} upload requests")
-    logger.debug(f"Substrate call result: {tx_hash}")
-
-    if not tx_hash or tx_hash == "0x" or len(tx_hash) < 10:
-        logger.error(f"Invalid transaction hash received: {tx_hash}")
-        raise HippiusSubstrateError(
-            f"Invalid transaction hash received: {tx_hash}. "
-            "This might indicate insufficient credits or transaction failure."
-        )
-
-    logger.info(f"Successfully published to substrate with transaction: {tx_hash}")
+    logger.info(f"Processed {len(upload_requests)} upload requests with transaction: {tx_hash}")
 
     # Update all processed objects status to 'uploaded'
     for payload in upload_requests:
