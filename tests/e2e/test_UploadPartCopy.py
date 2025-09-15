@@ -1,6 +1,5 @@
 import contextlib
 import json as _json
-import time
 from typing import Any
 from typing import Callable
 
@@ -81,18 +80,7 @@ def test_upload_part_copy(
     )
     assert completed["ETag"].strip('"').endswith("-2")
 
-    # Poll until ready, then assert exact content
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        try:
-            obj = boto3_client.get_object(Bucket=dst_bucket, Key=key_dst)
-            body = obj["Body"].read()
-            if body == data:
-                break
-        except Exception:
-            pass
-        time.sleep(0.5)
-    # Once ready, content must match
+    # Content should be immediately available from cache
     obj = boto3_client.get_object(Bucket=dst_bucket, Key=key_dst)
     assert obj["Body"].read() == data
 

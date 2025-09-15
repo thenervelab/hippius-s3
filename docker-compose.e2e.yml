@@ -3,6 +3,7 @@ services:
     # Ensure CI does not depend on a local .env file
     env_file: []
     environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - HIPPIUS_BYPASS_CREDIT_CHECK=true
       - HIPPIUS_PUBLISH_MODE=ipfs_only
       - ENABLE_REQUEST_PROFILING=false
@@ -10,29 +11,60 @@ services:
       - RATE_LIMIT_PER_MINUTE=100000
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
+      - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
 
   pinner:
     env_file: []
     environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - ENABLE_REQUEST_PROFILING=false
       - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - HIPPIUS_PUBLISH_MODE=ipfs_only
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
+      - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
   unpinner:
     env_file: []
     environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - ENABLE_REQUEST_PROFILING=false
       - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - HIPPIUS_PUBLISH_MODE=ipfs_only
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
+      - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
 
   downloader:
     env_file: []
     environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
+      - ENABLE_REQUEST_PROFILING=false
+      - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
+      - HIPPIUS_PUBLISH_MODE=ipfs_only
+      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
+      - REDIS_URL=redis://redis:6379/0
+      - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
+      - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
+      - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
+
+  chain-pin-checker:
+    env_file: []
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
+      - ENABLE_REQUEST_PROFILING=false
+      - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
+      - HIPPIUS_PUBLISH_MODE=ipfs_only
+      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
+      - REDIS_URL=redis://redis:6379/0
+      - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
+      - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
+
+  chain-profile-cacher:
+    env_file: []
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - ENABLE_REQUEST_PROFILING=false
       - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - HIPPIUS_PUBLISH_MODE=ipfs_only

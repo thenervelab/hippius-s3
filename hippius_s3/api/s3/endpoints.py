@@ -2345,6 +2345,16 @@ async def get_object(
                 exists = await request.app.state.redis_client.exists(chunk.redis_key)
                 if exists:
                     break
+                # Try preferred caches and hydrate
+                try:
+                    upload_id = object_info.get("upload_id")
+                    if upload_id:
+                        cached = await request.app.state.redis_client.get(f"multipart:{upload_id}:part:{chunk.part_id}")
+                        if cached:
+                            await request.app.state.redis_client.set(chunk.redis_key, cached, ex=300)
+                            break
+                except Exception:
+                    pass
                 await asyncio.sleep(config.http_download_sleep_loop)
             else:
                 return errors.s3_error_response(
