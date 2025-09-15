@@ -137,9 +137,6 @@ async def _process_multipart_chunk(
         f"md5={md5_post} head8={head_hex_post} tail8={tail_hex_post}"
     )
 
-    # Clean up Redis chunk data
-    # await redis_client.delete(chunk.redis_key)
-
     return s3_result, chunk
 
 

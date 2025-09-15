@@ -110,7 +110,7 @@ class SubstrateClient:
             result = self.substrate.query_map(module="IpfsPallet", storage_function="UserStorageRequests")
 
             storage_requests = {}
-            for key, value in result:
+            for key, _value in result:
                 try:
                     # Handle double map key (owner_account_id, file_hash)
                     if isinstance(key, (tuple, list)) and len(key) >= 2:
