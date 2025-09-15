@@ -1,6 +1,5 @@
 """E2E test for GetObject (GET /{bucket}/{key})."""
 
-import time
 from typing import Any
 from typing import Callable
 
@@ -28,18 +27,8 @@ def test_get_object_downloads_and_matches_headers(
         Metadata={"test-meta": "test-value"},
     )
 
-    # Poll until available
-    deadline = time.time() + 20
-    last_exc: Exception | None = None
-    while time.time() < deadline:
-        try:
-            resp = boto3_client.get_object(Bucket=bucket_name, Key=key)
-            break
-        except Exception as e:  # noqa: PERF203
-            last_exc = e
-            time.sleep(0.5)
-    else:
-        raise last_exc if last_exc else RuntimeError("GET object not available in time")
+    # Objects are now immediately available from cache
+    resp = boto3_client.get_object(Bucket=bucket_name, Key=key)
 
     assert resp["Body"].read() == content
     assert resp["ContentType"] == content_type

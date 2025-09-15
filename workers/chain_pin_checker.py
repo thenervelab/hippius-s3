@@ -66,8 +66,7 @@ async def get_user_cids_from_db(
         user,
     )
 
-    for row in multipart_objects:
-        user_cids.append(row["cid"])
+    user_cids.extend(row["cid"] for row in multipart_objects)
 
     # Get all parts CIDs for multipart uploads of this user
     parts_cids = await db.fetch(
@@ -84,8 +83,7 @@ async def get_user_cids_from_db(
         user,
     )
 
-    for row in parts_cids:
-        user_cids.append(row["cid"])
+    user_cids.extend(row["cid"] for row in parts_cids)
 
     return list(set(user_cids))  # Remove duplicates
 

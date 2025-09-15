@@ -75,7 +75,7 @@ async def _process_simple_upload(
         payload.object_id,
     )
 
-    # Clean up Redis chunk data
+    # Now that main CID is set, clean up Redis chunk data
     await redis_client.delete(payload.chunk.redis_key)
 
     return s3_result
@@ -136,9 +136,6 @@ async def _process_multipart_chunk(
         f"After encrypt/publish: part={part_number_db} status={encryption_status} cid={s3_result.cid} "
         f"md5={md5_post} head8={head_hex_post} tail8={tail_hex_post}"
     )
-
-    # Clean up Redis chunk data
-    await redis_client.delete(chunk.redis_key)
 
     return s3_result, chunk
 
@@ -231,6 +228,10 @@ async def _process_multipart_upload(
         main_cid_id,
         payload.object_id,
     )
+
+    # Now that main CID is set, clean up Redis chunk data
+    for _, chunk in chunk_results:
+        await redis_client.delete(chunk.redis_key)
 
     return [result[0] for result in chunk_results], manifest_result
 
@@ -341,11 +342,7 @@ async def process_upload_request(
 
     # Submit storage request to substrate
     cids = [file.file_hash for file in files]
-    tx_hash = await submit_storage_request(
-        cids=cids,
-        seed_phrase=seed_phrase,
-        substrate_url=config.substrate_url
-    )
+    tx_hash = await submit_storage_request(cids=cids, seed_phrase=seed_phrase, substrate_url=config.substrate_url)
 
     logger.info(f"Processed {len(upload_requests)} upload requests with transaction: {tx_hash}")
 

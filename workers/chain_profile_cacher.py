@@ -27,7 +27,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 
-async def get_all_unique_users(db: asyncpg.Connection,) -> List[str]:
+async def get_all_unique_users(
+    db: asyncpg.Connection,
+) -> List[str]:
     """Get all unique users from the database."""
     users = await db.fetch("""
         SELECT DISTINCT main_account_id
@@ -38,7 +40,11 @@ async def get_all_unique_users(db: asyncpg.Connection,) -> List[str]:
     return [row["main_account_id"] for row in users]
 
 
-async def cache_user_chain_profile(redis_chain: async_redis.Redis, user: str, storage_requests_dict: dict,) -> None:
+async def cache_user_chain_profile(
+    redis_chain: async_redis.Redis,
+    user: str,
+    storage_requests_dict: dict,
+) -> None:
     """Download and cache chain profile data for a single user."""
     logger.debug(f"Caching chain profile for user {user}")
 

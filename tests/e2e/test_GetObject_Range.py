@@ -1,23 +1,10 @@
 """E2E tests for GetObject with Range requests."""
 
-import time
 from typing import Any
 from typing import Callable
 
 import pytest
 from botocore.exceptions import ClientError
-
-
-def _wait_get(boto3_client: Any, bucket: str, key: str, timeout: float = 20.0) -> Any:
-    deadline = time.time() + timeout
-    last_exc: Exception | None = None
-    while time.time() < deadline:
-        try:
-            return boto3_client.get_object(Bucket=bucket, Key=key)
-        except Exception as e:  # noqa: PERF203
-            last_exc = e
-            time.sleep(0.5)
-    raise last_exc if last_exc else RuntimeError("GET not available in time")
 
 
 def test_get_object_range_valid(
@@ -33,8 +20,6 @@ def test_get_object_range_valid(
     key = "range.txt"
     data = b"abcdefghijklmnopqrstuvwxyz"  # 26 bytes
     boto3_client.put_object(Bucket=bucket, Key=key, Body=data, ContentType="text/plain")
-
-    _wait_get(boto3_client, bucket, key)
 
     # bytes=0-4
     resp = boto3_client.get_object(Bucket=bucket, Key=key, Range="bytes=0-4")
@@ -73,8 +58,6 @@ def test_get_object_range_invalid(
     key = "range.txt"
     data = b"abc"
     boto3_client.put_object(Bucket=bucket, Key=key, Body=data, ContentType="text/plain")
-
-    _wait_get(boto3_client, bucket, key)
 
     # Deterministic: request a range starting beyond EOF to force 416 on AWS and local
     size = len(data)

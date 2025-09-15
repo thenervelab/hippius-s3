@@ -32,8 +32,7 @@ def test_append_single_writer(
     initial = b"hello\n"
     _put_object(boto3_client, bucket, key, initial)
 
-    # Wait until initial object is readable, then read append version for CAS
-    wait_until_readable(bucket, key, 60)
+    # Read append version for CAS directly from HEAD
     head = boto3_client.head_object(Bucket=bucket, Key=key)
     version = head["ResponseMetadata"]["HTTPHeaders"].get("x-amz-meta-append-version", "0")
 
@@ -71,8 +70,7 @@ def test_append_multi_writer_concurrent(
     initial = b"A\n"
     _put_object(boto3_client, bucket, key, initial)
 
-    # Ensure seed object is readable before concurrent appends
-    wait_until_readable(bucket, key, 60)
+    # Take initial version snapshot
     # Prepare concurrent appends
     deltas = [f"line-{i}\n".encode() for i in range(20)]
 
@@ -142,8 +140,7 @@ def test_append_stale_version_412(
     key = "log/append.txt"
     _put_object(boto3_client, bucket, key, b"X\n")
 
-    # Ensure object is readable; then take an initial append-version snapshot
-    wait_until_readable(bucket, key, 60)
+    # Take an initial append-version snapshot
     ver0 = boto3_client.head_object(Bucket=bucket, Key=key)["ResponseMetadata"]["HTTPHeaders"].get(
         "x-amz-meta-append-version", "0"
     )
@@ -191,7 +188,6 @@ def test_append_preserves_user_metadata(
         metadata={"foo": "bar", "append": "false"},
     )
 
-    wait_until_readable(bucket, key, 60)
     head = boto3_client.head_object(Bucket=bucket, Key=key)
     version = head["ResponseMetadata"]["HTTPHeaders"].get("x-amz-meta-append-version", "0")
 
@@ -262,8 +258,7 @@ def test_append_idempotency_append_id(
     key = "log/idem.txt"
     _put_object(boto3_client, bucket, key, b"base")
 
-    # Ensure seed object is readable before taking version snapshot
-    wait_until_readable(bucket, key, 60)
+    # Take version snapshot
     ver = boto3_client.head_object(Bucket=bucket, Key=key)["ResponseMetadata"]["HTTPHeaders"].get(
         "x-amz-meta-append-version", "0"
     )
