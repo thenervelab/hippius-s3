@@ -13,6 +13,19 @@ services:
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
       - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
 
+  # Avoid binding host ports in e2e runs; containers communicate internally
+  ipfs:
+    ports: []
+
+  redis:
+    ports: []
+
+  redis-accounts:
+    ports: []
+
+  redis-chain:
+    ports: []
+
   pinner:
     env_file: []
     environment:
@@ -60,6 +73,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
+      - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
 
   chain-profile-cacher:
     env_file: []
@@ -72,3 +86,4 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
+      - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only

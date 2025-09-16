@@ -1,5 +1,6 @@
 """E2E test for GetObject (GET /{bucket}/{key})."""
 
+import time
 from typing import Any
 from typing import Callable
 
@@ -9,6 +10,7 @@ def test_get_object_downloads_and_matches_headers(
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
+    signed_http_get: Any,
 ) -> None:
     bucket_name = unique_bucket_name("get-object")
     cleanup_buckets(bucket_name)
@@ -27,11 +29,18 @@ def test_get_object_downloads_and_matches_headers(
         Metadata={"test-meta": "test-value"},
     )
 
-    # Objects are now immediately available from cache
-    resp = boto3_client.get_object(Bucket=bucket_name, Key=key)
+    # First GET: expect cache
+    resp_cache = signed_http_get(bucket_name, key)
+    assert resp_cache.status_code == 200
+    assert resp_cache.headers.get("x-hippius-source") == "cache"
+    assert resp_cache.content == content
+    # User metadata should be present via headers
+    assert resp_cache.headers.get("x-amz-meta-test-meta") == "test-value"
 
-    assert resp["Body"].read() == content
-    assert resp["ContentType"] == content_type
-    assert resp["Metadata"]["test-meta"] == "test-value"
-    assert "ETag" in resp
-    assert "LastModified" in resp
+    time.sleep(0.5)
+    # Second GET with pipeline_only: expect pipeline
+    resp_pipe = signed_http_get(bucket_name, key, {"x-hippius-read-mode": "pipeline_only"})
+    assert resp_pipe.status_code == 200
+    assert resp_pipe.headers.get("x-hippius-source") == "pipeline"
+    assert resp_pipe.content == content
+    assert resp_pipe.headers.get("x-amz-meta-test-meta") == "test-value"

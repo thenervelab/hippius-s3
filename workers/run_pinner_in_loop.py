@@ -31,6 +31,9 @@ config = get_config()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# Keep Redis caches warm after pin by expiring instead of deleting
+_CACHE_TTL_SECONDS = int(os.getenv("HIPPIUS_CACHE_TTL", "1800"))
+
 
 async def _process_simple_upload(
     payload: SimpleUploadChainRequest,
@@ -75,8 +78,38 @@ async def _process_simple_upload(
         payload.object_id,
     )
 
-    # Now that main CID is set, clean up Redis chunk data
-    await redis_client.delete(payload.chunk.redis_key)
+    # If there is a provisional multipart part 1 row with missing or placeholder CID, backfill it
+    try:
+        base_cid_id = await upsert_cid_and_get_id(db, s3_result.cid)
+        base_md5 = hashlib.md5(chunk_data).hexdigest()
+        await db.execute(
+            """
+            UPDATE parts
+            SET ipfs_cid = $1,
+                cid_id = $2,
+                size_bytes = COALESCE(size_bytes, $3),
+                etag = COALESCE(etag, $4)
+            WHERE object_id = $5
+              AND part_number = 1
+              AND (
+                    ipfs_cid IS NULL OR ipfs_cid = '' OR ipfs_cid = 'pending' OR ipfs_cid = 'None'
+                  )
+            """,
+            s3_result.cid,
+            base_cid_id,
+            len(chunk_data),
+            base_md5,
+            payload.object_id,
+        )
+        logger.info(f"Backfilled base part CID for object_id={payload.object_id} cid={s3_result.cid}")
+    except Exception as e:
+        logger.debug(
+            f"Failed to backfill base part CID for object_id={payload.object_id}: {e}",
+            exc_info=True,
+        )
+
+    # Keep cache for a while to ensure immediate consistency on reads (unified multipart)
+    await redis_client.expire(f"multipart:{payload.object_id}:part:1", _CACHE_TTL_SECONDS)
 
     return s3_result
 
@@ -229,9 +262,9 @@ async def _process_multipart_upload(
         payload.object_id,
     )
 
-    # Now that main CID is set, clean up Redis chunk data
+    # Keep per-chunk caches for a while; GETs may still be assembling from cache
     for _, chunk in chunk_results:
-        await redis_client.delete(chunk.redis_key)
+        await redis_client.expire(chunk.redis_key, _CACHE_TTL_SECONDS)
 
     return [result[0] for result in chunk_results], manifest_result
 

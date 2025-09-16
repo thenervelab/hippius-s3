@@ -66,37 +66,59 @@ async def process_download_request(
 
     async def download_chunk(chunk):
         async with semaphore:
-            try:
-                logger.debug(f"Downloading chunk {chunk.part_id} with CID: {chunk.cid}")
-
-                # Download the chunk using hippius_sdk
-                chunk_data = await hippius_client.s3_download(
-                    cid=chunk.cid,
-                    subaccount_id=download_request.subaccount,
-                    bucket_name=download_request.bucket_name,
-                    auto_decrypt=download_request.should_decrypt,
-                    download_node=download_request.ipfs_node,
-                    return_bytes=True,
-                )
-                import hashlib as _hashlib
-
-                md5 = _hashlib.md5(chunk_data).hexdigest()
-                head_hex = chunk_data[:8].hex() if chunk_data else ""
-                tail_hex = chunk_data[-8:].hex() if len(chunk_data) >= 8 else head_hex
-                logger.debug(
-                    f"Downloaded chunk {chunk.part_id} cid={chunk.cid[:10]}... len={len(chunk_data)} md5={md5} "
-                    f"head8={head_hex} tail8={tail_hex}"
-                )
-
-                # Store the chunk data in Redis with the expected key
-                await redis_client.set(chunk.redis_key, chunk_data)
-                logger.debug(f"Stored chunk {chunk.part_id} in Redis with key: {chunk.redis_key}")
-
-                return True
-
-            except Exception as e:
-                logger.error(f"Failed to download chunk {chunk.part_id} (CID: {chunk.cid}): {e}")
+            # Guard invalid/placeholder CIDs
+            cid_str = str(chunk.cid or "").strip().lower()
+            if cid_str in {"", "none", "pending"}:
+                logger.error(f"Skipping download for chunk {chunk.part_id}: invalid CID '{chunk.cid}'")
                 return False
+
+            max_attempts = getattr(config, "downloader_chunk_retries", 5)
+            base_sleep = getattr(config, "downloader_retry_base_seconds", 0.25)
+            jitter = getattr(config, "downloader_retry_jitter_seconds", 0.2)
+
+            import hashlib as _hashlib
+            import random as _random
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    logger.debug(f"Downloading chunk {chunk.part_id} attempt={attempt}/{max_attempts} CID: {chunk.cid}")
+
+                    # Download the chunk using hippius_sdk
+                    chunk_data = await hippius_client.s3_download(
+                        cid=chunk.cid,
+                        subaccount_id=download_request.subaccount,
+                        bucket_name=download_request.bucket_name,
+                        auto_decrypt=download_request.should_decrypt,
+                        download_node=download_request.ipfs_node,
+                        return_bytes=True,
+                    )
+
+                    md5 = _hashlib.md5(chunk_data).hexdigest()
+                    head_hex = chunk_data[:8].hex() if chunk_data else ""
+                    tail_hex = chunk_data[-8:].hex() if len(chunk_data) >= 8 else head_hex
+                    logger.debug(
+                        f"Downloaded chunk {chunk.part_id} cid={str(chunk.cid)[:10]}... len={len(chunk_data)} md5={md5} "
+                        f"head8={head_hex} tail8={tail_hex}"
+                    )
+
+                    # Store the chunk data in Redis with the expected key
+                    await redis_client.set(chunk.redis_key, chunk_data)
+                    logger.debug(f"Stored chunk {chunk.part_id} in Redis with key: {chunk.redis_key}")
+
+                    return True
+
+                except Exception as e:
+                    if attempt == max_attempts:
+                        logger.error(
+                            f"Failed to download chunk {chunk.part_id} (CID: {chunk.cid}) after {max_attempts} attempts: {e}"
+                        )
+                        return False
+                    sleep_for = base_sleep * attempt + _random.uniform(0, jitter)
+                    logger.warning(
+                        f"Download error for chunk {chunk.part_id} (CID: {chunk.cid}) attempt {attempt}/{max_attempts}: {e}. Retrying in {sleep_for:.2f}s"
+                    )
+                    await asyncio.sleep(sleep_for)
+        return None
 
     # Download all chunks concurrently
     results = await asyncio.gather(*[download_chunk(chunk) for chunk in download_request.chunks])

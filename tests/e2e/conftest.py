@@ -13,7 +13,10 @@ from typing import Iterator
 
 import boto3  # type: ignore[import-untyped]
 import pytest
+from botocore.auth import SigV4Auth  # type: ignore[import-untyped]
+from botocore.awsrequest import AWSRequest  # type: ignore[import-untyped]
 from botocore.config import Config  # type: ignore[import-untyped]
+from botocore.credentials import Credentials  # type: ignore[import-untyped]
 
 
 # type: ignore[import-untyped]
@@ -177,6 +180,37 @@ def boto3_client(test_seed_phrase: str) -> Any:
             signature_version="s3v4",
         ),
     )
+
+
+@pytest.fixture
+def signed_http_get(test_seed_phrase: str) -> Any:
+    """Return a helper to perform SigV4-signed GET with custom headers.
+
+    Usage: signed_http_get(bucket, key, extra_headers={"x-hippius-read-mode": "pipeline_only"})
+    """
+    import requests  # type: ignore[import-untyped]
+
+    access_key = base64.b64encode(test_seed_phrase.encode()).decode()
+    secret_key = test_seed_phrase
+    endpoint = "http://localhost:8000"
+    region = "us-east-1"
+
+    def _get(bucket: str, key: str, extra_headers: dict[str, str] | None = None) -> Any:
+        url = f"{endpoint}/{bucket}/{key}"
+        headers: dict[str, str] = {
+            "Host": "localhost:8000",
+            # Required by backend HMAC middleware
+            "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+
+        req = AWSRequest(method="GET", url=url, headers=headers)
+        SigV4Auth(Credentials(access_key, secret_key), "s3", region).add_auth(req)
+        signed_headers = dict(req.headers.items())
+        return requests.get(url, headers=signed_headers, stream=True)
+
+    return _get
 
 
 @pytest.fixture

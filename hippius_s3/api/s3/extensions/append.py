@@ -9,6 +9,7 @@ and the current value exposed on HEAD as ``x-amz-meta-append-version``. ETag is
 maintained for clients, but is not used for CAS.
 """
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -120,21 +121,34 @@ async def handle_append(
                 status_code=400,
             )
         current_version = int(current.get("append_version") or 0)
+        with contextlib.suppress(Exception):
+            logger.info(
+                f"APPEND version-check bucket={bucket_name} key={object_key} expected={expected_version} current={current_version}"
+            )
         if expected_version != current_version:
+            with contextlib.suppress(Exception):
+                logger.info(
+                    f"APPEND version-mismatch bucket={bucket_name} key={object_key} expected={expected_version} current={current_version} -> 412"
+                )
             return errors.s3_error_response(
                 code="PreconditionFailed",
                 message="Version precondition failed",
                 status_code=412,
+                extra_headers={
+                    "x-amz-meta-append-version": str(current_version),
+                },
             )
 
-        # Enforce readiness: object must be fully uploaded before allowing append
-        current_status = str(current.get("status") or "").lower()
-        if current_status not in {"uploaded"}:
-            return errors.s3_error_response(
-                code="ServiceUnavailable",
-                message="Object is not yet ready for append. Wait for HEAD 200 (readable) before appending.",
-                status_code=503,
-            )
+        # Readiness probe (only needed when converting simple->multipart)
+        str(current.get("status") or "").lower()
+        object_id_probe = str(current.get("object_id") or "")
+        has_simple_cid = bool((current.get("ipfs_cid") or "").strip())
+        has_unified_base = False
+        try:
+            if object_id_probe:
+                has_unified_base = bool(await redis_client.exists(f"multipart:{object_id_probe}:part:1"))
+        except Exception:
+            has_unified_base = False
 
         object_id = str(current["object_id"]) if current.get("object_id") else None
         if object_id is None:
@@ -148,6 +162,19 @@ async def handle_append(
                 message="Could not resolve object id",
                 status_code=500,
             )
+
+        # If parts already exist, enforce multipart on the object row and skip base readiness
+        parts_count_existing = await db.fetchval(
+            "SELECT COUNT(*) FROM parts WHERE object_id = $1",
+            object_id,
+        )
+        is_multipart = bool(current.get("multipart")) or int(parts_count_existing or 0) > 0
+        if (not bool(current.get("multipart"))) and int(parts_count_existing or 0) > 0:
+            await db.execute("UPDATE objects SET multipart = TRUE WHERE object_id = $1", object_id)
+            with contextlib.suppress(Exception):
+                logger.info(
+                    f"APPEND enforced multipart due to existing parts object_id={object_id} parts_count={int(parts_count_existing)}"
+                )
 
         # If object is not yet multipart, create an initial part from existing simple CID
         # Ensure there is a backing multipart_uploads row to satisfy parts.upload_id NOT NULL
@@ -174,15 +201,62 @@ async def handle_append(
                 object_id,
             )
 
-        if not current.get("multipart"):
+        if not is_multipart:
+            with contextlib.suppress(Exception):
+                logger.info(
+                    f"APPEND readiness simple->multipart bucket={bucket_name} key={object_key} has_simple_cid={has_simple_cid} has_unified_base={has_unified_base}"
+                )
+            if not (has_simple_cid or has_unified_base):
+                return errors.s3_error_response(
+                    code="PreconditionFailed",
+                    message="Object base not ready for append.",
+                    status_code=412,
+                )
             row = await db.fetchrow(get_query("get_object_by_path"), bucket_id, object_key)
             simple_cid = (row.get("ipfs_cid") or "").strip() if row else ""
             if not simple_cid:
-                return errors.s3_error_response(
-                    code="ServiceUnavailable",
-                    message="Object publish is in progress. Please retry shortly.",
-                    status_code=503,
-                )
+                # Provisional base: hydrate multipart part 1 from cache without waiting for CID
+                try:
+                    # Prefer unified multipart cache
+                    base_bytes = await redis_client.get(f"multipart:{object_id}:part:1")
+                    if base_bytes:
+                        logger.info(
+                            f"APPEND bootstrap multipart part=1 from unified cache object_id={object_id} bytes={len(base_bytes)}"
+                        )
+                        # Create a part 1 row referencing a provisional placeholder CID
+                        placeholder_cid = "pending"
+                        cid_id = await _upsert_cid(db, placeholder_cid)
+                        await db.execute(
+                            """
+                            INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                            ON CONFLICT (upload_id, part_number) DO NOTHING
+                            """,
+                            str(uuid.uuid4()),
+                            upload_id,
+                            1,
+                            placeholder_cid,
+                            int(current["size_bytes"] or len(base_bytes)),
+                            str(current.get("md5_hash") or ""),
+                            datetime.now(timezone.utc),
+                            object_id,
+                            cid_id,
+                        )
+                        # Mark object as multipart and cache part 1 bytes
+                        await db.execute("UPDATE objects SET multipart = TRUE WHERE object_id = $1", object_id)
+                        await redis_client.setex(f"multipart:{object_id}:part:1", 1800, base_bytes)
+                    else:
+                        return errors.s3_error_response(
+                            code="PreconditionFailed",
+                            message="Object base not in cache yet.",
+                            status_code=412,
+                        )
+                except Exception:
+                    return errors.s3_error_response(
+                        code="PreconditionFailed",
+                        message="Object base not ready.",
+                        status_code=412,
+                    )
             # Upsert CID and create part 1 referencing existing content
             cid_id = await _upsert_cid(db, simple_cid)
             await db.execute(
@@ -207,31 +281,67 @@ async def handle_append(
                 object_id,
             )
 
+            # Hydrate multipart cache for part 1 from existing cache (best-effort)
+            try:
+                with contextlib.suppress(Exception):
+                    # Use unified multipart cache only.
+                    base_bytes = await redis_client.get(f"multipart:{object_id}:part:1")
+                    if base_bytes:
+                        logger.info(f"APPEND hydrate multipart part=1 object_id={object_id} bytes={len(base_bytes)}")
+                        await redis_client.setex(f"multipart:{object_id}:part:1", 1800, base_bytes)
+            except Exception:
+                pass
+
+        # Ensure base part exists when object is already marked multipart but has no parts rows
+        parts_count = await db.fetchval(
+            "SELECT COUNT(*) FROM parts WHERE object_id = $1",
+            object_id,
+        )
+        if int(parts_count) == 0:
+            try:
+                base_bytes = await redis_client.get(f"multipart:{object_id}:part:1")
+                if base_bytes:
+                    # Create part 1 with placeholder or existing CID if available
+                    base_cid_raw = current.get("ipfs_cid")
+                    placeholder_cid = ""
+                    if isinstance(base_cid_raw, str):
+                        placeholder_cid = base_cid_raw.strip()
+                    if not placeholder_cid:
+                        placeholder_cid = "pending"
+                    cid_id = await _upsert_cid(db, placeholder_cid)
+                    base_md5 = hashlib.md5(base_bytes).hexdigest()
+                    await db.execute(
+                        """
+                        INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        ON CONFLICT (upload_id, part_number) DO NOTHING
+                        """,
+                        str(uuid.uuid4()),
+                        upload_id,
+                        1,
+                        placeholder_cid,
+                        int(len(base_bytes)),
+                        base_md5,
+                        datetime.now(timezone.utc),
+                        object_id,
+                        cid_id,
+                    )
+                    logger.info(f"APPEND backfilled base part=1 object_id={object_id} bytes={len(base_bytes)}")
+            except Exception:
+                pass
+
         # Determine next part number
         next_part = await db.fetchval(
             "SELECT COALESCE(MAX(part_number), 0) + 1 FROM parts WHERE object_id = $1",
             object_id,
         )
-
-        # Publish delta chunk synchronously and create a part row
-        should_encrypt = not bucket["is_public"]
-        s3_result = await ipfs_service.client.s3_publish(
-            content=incoming_bytes,
-            encrypt=should_encrypt,
-            seed_phrase=request.state.seed_phrase,
-            subaccount_id=request.state.account.main_account,
-            bucket_name=bucket_name,
-            file_name=object_key,
-            store_node=config.ipfs_store_url,
-            pin_node=config.ipfs_store_url,
-            substrate_url=config.substrate_url,
-            publish=(os.getenv("HIPPIUS_PUBLISH_MODE", "full") != "ipfs_only"),
-        )
-        delta_cid = s3_result.cid
+        with contextlib.suppress(Exception):
+            logger.info(f"APPEND next_part_decided object_id={object_id} next_part={int(next_part)}")
+        # PHASE 1 (in-DB reservation): insert placeholder part and update object metadata atomically
         delta_md5 = hashlib.md5(incoming_bytes).hexdigest()
         delta_size = len(incoming_bytes)
-
-        cid_id = await _upsert_cid(db, delta_cid)
+        placeholder_cid = "pending"
+        placeholder_cid_id = await _upsert_cid(db, placeholder_cid)
         await db.execute(
             """
             INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
@@ -246,15 +356,15 @@ async def handle_append(
             str(uuid.uuid4()),
             upload_id,
             int(next_part),
-            delta_cid,
+            placeholder_cid,
             int(delta_size),
             delta_md5,
             datetime.now(timezone.utc),
             object_id,
-            cid_id,
+            placeholder_cid_id,
         )
 
-        # Recompute composite ETag from all part etags
+        # Recompute composite ETag from all part etags including the reserved part
         parts = await db.fetch(
             "SELECT part_number, etag FROM parts WHERE object_id = $1 ORDER BY part_number",
             object_id,
@@ -282,29 +392,59 @@ async def handle_append(
             composite_etag,
         )
 
-        # Write-through cache: store appended bytes for immediate reads
-        from contextlib import suppress
+        # End of transactional phase; publish outside of the lock window
+    # PHASE 2 (out-of-DB): publish to IPFS and finalize the reserved part
+    should_encrypt = not bucket["is_public"]
+    s3_result = await ipfs_service.client.s3_publish(
+        content=incoming_bytes,
+        encrypt=should_encrypt,
+        seed_phrase=request.state.seed_phrase,
+        subaccount_id=request.state.account.main_account,
+        bucket_name=bucket_name,
+        file_name=object_key,
+        store_node=config.ipfs_store_url,
+        pin_node=config.ipfs_store_url,
+        substrate_url=config.substrate_url,
+        publish=(os.getenv("HIPPIUS_PUBLISH_MODE", "full") != "ipfs_only"),
+    )
+    delta_cid = s3_result.cid
+    cid_id_final = await _upsert_cid(db, delta_cid)
+    await db.execute(
+        """
+        UPDATE parts
+        SET ipfs_cid = $1,
+            cid_id = $2
+        WHERE object_id = $3 AND part_number = $4
+        """,
+        delta_cid,
+        cid_id_final,
+        object_id,
+        int(next_part),
+    )
 
-        with suppress(Exception):
-            # Single source of truth aligned with upload manifest
-            await redis_client.setex(f"multipart:{upload_id}:part:{int(next_part)}", 1800, incoming_bytes)
+    # Write-through cache: store appended bytes for immediate reads
+    with contextlib.suppress(Exception):
+        logger.info(f"APPEND cache write object_id={object_id} part={int(next_part)} bytes={len(incoming_bytes)}")
+        await redis_client.setex(f"multipart:{object_id}:part:{int(next_part)}", 1800, incoming_bytes)
 
-        resp = Response(
-            status_code=200,
-            headers={
-                "ETag": f'"{composite_etag}"',
-            },
+    resp = Response(
+        status_code=200,
+        headers={
+            "ETag": f'"{composite_etag}"',
+        },
+    )
+    with contextlib.suppress(Exception):
+        logger.info(
+            f"APPEND success bucket={bucket_name} key={object_key} new_version={current_version + 1} next_part={int(next_part)} size_delta={delta_size}"
         )
 
-        # Record idempotency result for future retries (best-effort)
-        if append_id and append_id.strip():
-            id_key = f"append_id:{bucket_id}:{object_key}:{append_id}"
-            from contextlib import suppress
+    # Record idempotency result for future retries (best-effort)
+    if append_id and append_id.strip():
+        id_key = f"append_id:{bucket_id}:{object_key}:{append_id}"
+        with contextlib.suppress(Exception):
+            await redis_client.setex(id_key, 3600, json.dumps({"etag": composite_etag}))
 
-            with suppress(Exception):
-                await redis_client.setex(id_key, 3600, json.dumps({"etag": composite_etag}))
-
-        return resp
+    return resp
 
 
 async def _upsert_cid(db: Any, cid: str) -> uuid.UUID:

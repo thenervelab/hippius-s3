@@ -32,3 +32,5 @@ def test_head_object_returns_metadata(
     assert resp["ContentType"] == content_type
     assert resp["ContentLength"] == len(content)
     assert resp["Metadata"]["test-meta"] == "test-value"
+    # Source header should be present and indicate cache or pipeline
+    assert resp["ResponseMetadata"]["HTTPHeaders"].get("x-hippius-source") in {"cache", "pipeline"}
