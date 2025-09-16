@@ -12,6 +12,9 @@ from starlette import status
 
 from hippius_s3.config import Config
 from hippius_s3.ipfs_service import IPFSService
+from hippius_s3.repositories import BucketRepository
+from hippius_s3.repositories import ObjectRepository
+from hippius_s3.repositories import UserRepository
 from hippius_s3.services.object_reader import ObjectReader
 
 
@@ -84,6 +87,24 @@ def get_redis_accounts(request: Request) -> async_redis.Redis:
 def get_object_reader(request: Request) -> ObjectReader:
     """Provide an ObjectReader service configured with app Config."""
     return ObjectReader(request.app.state.config)
+
+
+def get_user_repo(db: Any = None):
+    if db is None:
+        raise RuntimeError("get_user_repo requires DB dependency injection")
+    return UserRepository(db)
+
+
+def get_bucket_repo(db: Any = None):
+    if db is None:
+        raise RuntimeError("get_bucket_repo requires DB dependency injection")
+    return BucketRepository(db)
+
+
+def get_object_repo(db: Any = None):
+    if db is None:
+        raise RuntimeError("get_object_repo requires DB dependency injection")
+    return ObjectRepository(db)
 
 
 async def extract_seed_phrase(request: Request) -> str:

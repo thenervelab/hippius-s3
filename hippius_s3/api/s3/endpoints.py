@@ -5,13 +5,11 @@ import contextlib
 import hashlib
 import json
 import logging
-import os
 import uuid
 from datetime import UTC
 from datetime import datetime
 
 import asyncpg
-import fastapi
 from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import Request
@@ -25,9 +23,11 @@ from lxml import etree as ET
 from hippius_s3 import dependencies
 from hippius_s3 import utils
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.copy_object_endpoint import handle_copy_object
 from hippius_s3.api.s3.extensions.append import _upsert_cid  # reuse CID upsert helper
 from hippius_s3.api.s3.extensions.append import handle_append
 from hippius_s3.api.s3.get_object_endpoint import handle_get_object
+from hippius_s3.api.s3.head_object_endpoint import handle_head_object
 from hippius_s3.api.s3.multipart import list_parts_internal
 from hippius_s3.api.s3.multipart import upload_part
 from hippius_s3.api.s3.range_utils import calculate_chunks_for_range
@@ -36,9 +36,7 @@ from hippius_s3.api.s3.range_utils import parse_range_header
 from hippius_s3.cache import RedisDownloadChunksCache
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
-from hippius_s3.dependencies import DBConnection
 from hippius_s3.dependencies import get_object_reader
-from hippius_s3.ipfs_service import IPFSService
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import ChunkToDownload
 from hippius_s3.queue import DownloadChainRequest
@@ -1610,229 +1608,7 @@ async def delete_bucket(
         )
 
 
-async def _copy_object(
-    source_bucket: dict,
-    destination_bucket: dict,
-    source_object_key: str,
-    destination_object_key: str,
-    request: fastapi.Request,
-    db: DBConnection,
-    ipfs_service: IPFSService,
-    redis_client,
-):
-    # Use bucket names for external-facing operations; IDs are internal
-    source_bucket_name = source_bucket["bucket_name"]
-    try:
-        logger.info(f"Copying {source_bucket}/{source_object_key} to {destination_bucket}")
-
-        # Get the source object
-        source_object = await db.fetchrow(
-            get_query("get_object_by_path"),
-            source_bucket["bucket_id"],
-            source_object_key,
-        )
-
-        if not source_object:
-            return create_xml_error_response(
-                "NoSuchKey",
-                f"The specified key {source_object_key} does not exist",
-                status_code=404,
-            )
-
-        # Check if we can do a fast copy (same encryption context) or need decrypt/re-encrypt
-        source_is_public = source_bucket["is_public"]
-        dest_is_public = destination_bucket["is_public"]
-        same_bucket = source_bucket["bucket_id"] == destination_bucket["bucket_id"]
-        same_encryption_context = source_is_public == dest_is_public and same_bucket
-        source_metadata = json.loads(source_object["metadata"])
-
-        # Check for multipart objects - skip copying them for now
-        if source_metadata.get("multipart"):
-            return create_xml_error_response(
-                "NotImplemented",
-                "Copying multipart objects is not currently supported",
-                status_code=501,
-            )
-
-        object_id = str(uuid.uuid4())
-        created_at = datetime.now(UTC)
-
-        if same_encryption_context:
-            # Fast path: same encryption context, reuse CID
-            logger.info(
-                f"Fast copy: same encryption context (same_bucket={same_bucket}, both_public={source_is_public})"
-            )
-            ipfs_cid = source_object["ipfs_cid"]
-            file_size = source_object["size_bytes"]
-            content_type = source_object["content_type"]
-            md5_hash = source_object["md5_hash"]  # Fallback to CID if no MD5
-
-            # Copy all metadata as-is
-            metadata = {
-                "ipfs": source_metadata.get("ipfs", {}),
-                "hippius": source_metadata.get("hippius", {}),
-            }
-
-            # Copy any user metadata (x-amz-meta-*)
-            for key, value in source_metadata.items():
-                if key not in ["ipfs", "hippius"]:
-                    metadata[key] = value  # noqa: PERF403
-        else:
-            # Slow path: different encryption context, decrypt and re-encrypt
-            logger.info(
-                f"Slow copy: different encryption (source public={source_is_public}, dest public={dest_is_public})"
-            )
-
-            # If CID is not yet available, return 503 and let client retry
-            source_cid = (source_object.get("ipfs_cid") or "").strip()
-            if not source_cid:
-                # Try unified cache for simple base bytes to avoid waiting on CID (part 0)
-                try:
-                    cached_bytes = await RedisObjectPartsCache(request.app.state.redis_client).get(
-                        str(source_object["object_id"]), 0
-                    )
-                except Exception:
-                    cached_bytes = None
-                if cached_bytes:
-                    file_data = cached_bytes
-                    md5_hash = hashlib.md5(file_data).hexdigest()
-                    should_encrypt = not dest_is_public
-                    s3_result = await ipfs_service.client.s3_publish(
-                        content=file_data,
-                        encrypt=should_encrypt,
-                        seed_phrase=request.state.seed_phrase,
-                        subaccount_id=request.state.account.main_account,
-                        bucket_name=destination_bucket["bucket_name"],
-                        file_name=source_object_key,
-                        store_node=config.ipfs_store_url,
-                        pin_node=config.ipfs_store_url,
-                        substrate_url=config.substrate_url,
-                        publish=(os.getenv("HIPPIUS_PUBLISH_MODE", "full") != "ipfs_only"),
-                    )
-                    ipfs_cid = s3_result.cid
-                    file_size = len(file_data)
-                    content_type = source_object["content_type"]
-                    # Create or update destination object
-                    cid_id = await utils.upsert_cid_and_get_id(db, ipfs_cid)
-                    await db.fetchrow(
-                        get_query("upsert_object_with_cid"),
-                        object_id,
-                        destination_bucket["bucket_id"],
-                        destination_object_key,
-                        cid_id,
-                        file_size,
-                        content_type,
-                        created_at,
-                        json.dumps({}),
-                        md5_hash,
-                    )
-                    # Prepare the XML response
-                    root = ET.Element("CopyObjectResult")
-                    etag = ET.SubElement(root, "ETag")
-                    etag.text = md5_hash
-                    last_modified = ET.SubElement(root, "LastModified")
-                    last_modified.text = format_s3_timestamp(created_at)
-                    xml_response = ET.tostring(
-                        root,
-                        encoding="utf-8",
-                        xml_declaration=True,
-                    )
-                    return Response(
-                        content=xml_response,
-                        media_type="application/xml",
-                        status_code=200,
-                        headers={
-                            "ETag": f'"{md5_hash}"',
-                            "x-amz-ipfs-cid": ipfs_cid,
-                        },
-                    )
-                return create_xml_error_response(
-                    "ServiceUnavailable",
-                    "Source object is not yet available for copying. Please retry shortly.",
-                    status_code=503,
-                )
-
-            # Download file from source bucket with source encryption
-            src_bytes: bytes = await ipfs_service.download_file(
-                cid=source_cid,
-                subaccount_id=request.state.account.main_account,
-                bucket_name=source_bucket_name,
-                decrypt=not source_is_public,  # Decrypt if source was encrypted
-            )
-
-            # Calculate MD5 hash for ETag compatibility
-            md5_hash = hashlib.md5(src_bytes).hexdigest()
-
-            # Re-encrypt for destination bucket
-            should_encrypt = not dest_is_public
-            s3_result = await ipfs_service.client.s3_publish(
-                content=src_bytes,
-                encrypt=should_encrypt,
-                seed_phrase=request.state.seed_phrase,
-                subaccount_id=request.state.account.main_account,  # Publish under destination bucket
-                bucket_name=destination_bucket["bucket_name"],
-                file_name=source_object_key,
-                store_node=config.ipfs_store_url,
-                pin_node=config.ipfs_store_url,
-                substrate_url=config.substrate_url,
-                publish=(os.getenv("HIPPIUS_PUBLISH_MODE", "full") != "ipfs_only"),
-            )
-
-            ipfs_cid = s3_result.cid
-            file_size = len(src_bytes)
-            content_type = source_object["content_type"]
-
-            # Create new metadata for destination
-            metadata = {}
-            # Copy any user metadata (x-amz-meta-*)
-            for key, value in source_metadata.items():
-                metadata[key] = value  # noqa: PERF403
-
-        # Create or update the object using upsert with CID table
-        cid_id = await utils.upsert_cid_and_get_id(db, ipfs_cid)
-        await db.fetchrow(
-            get_query("upsert_object_with_cid"),
-            object_id,
-            destination_bucket["bucket_id"],
-            destination_object_key,
-            cid_id,
-            file_size,
-            content_type,
-            created_at,
-            json.dumps(metadata),
-            md5_hash,
-        )
-
-        # Prepare the XML response
-        root = ET.Element("CopyObjectResult")
-        etag = ET.SubElement(root, "ETag")
-        etag.text = md5_hash
-        last_modified = ET.SubElement(root, "LastModified")
-        last_modified.text = format_s3_timestamp(created_at)
-
-        xml_response = ET.tostring(
-            root,
-            encoding="utf-8",
-            xml_declaration=True,
-        )
-
-        return Response(
-            content=xml_response,
-            media_type="application/xml",
-            status_code=200,
-            headers={
-                "ETag": f'"{md5_hash}"',
-                "x-amz-ipfs-cid": ipfs_cid,
-            },
-        )
-
-    except Exception as e:
-        logger.exception("Error copying object")
-        return create_xml_error_response(
-            "InternalError",
-            f"We encountered an internal error while copying the object: {str(e)}",
-            status_code=500,
-        )
+# (CopyObject implementation moved to copy_object_endpoint.py)
 
 
 @router.put("/{bucket_name}/{object_key:path}/", status_code=200)
@@ -1875,69 +1651,11 @@ async def put_object(
             request.state.account.main_account,
         )
 
-    # Check if this is a copy operation
+    # CopyObject path delegates to isolated handler
     if request.headers.get("x-amz-copy-source"):
-        # Parse the copy source in format /source-bucket/source-key
-        copy_source = request.headers.get("x-amz-copy-source")
-        # Support both "/bucket/key" and "bucket/key" forms
-        if copy_source is None:
-            return create_xml_error_response("InvalidArgument", "x-amz-copy-source missing", status_code=400)
-
-        # Trim any query (e.g., versionId) if present
-        copy_source_path = copy_source.split("?", 1)[0]
-        if copy_source_path.startswith("/"):
-            copy_source_path = copy_source_path[1:]
-
-        source_parts = copy_source_path.split("/", 1)
-        if len(source_parts) != 2:
-            return create_xml_error_response(
-                "InvalidArgument",
-                "x-amz-copy-source must be in format /source-bucket/source-key",
-                status_code=400,
-            )
-        source_bucket_name, source_object_key = source_parts
-
-        # Get user for user-scoped bucket lookup
-        user = await db.fetchrow(
-            get_query("get_or_create_user_by_main_account"),
-            request.state.account.main_account,
-            datetime.now(UTC),
-        )
-
-        # Get the source bucket
-        source_bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
-            source_bucket_name,
-            user["main_account_id"],
-        )
-
-        if not source_bucket:
-            return create_xml_error_response(
-                "NoSuchBucket",
-                f"The specified source bucket {source_bucket_name} does not exist",
-                status_code=404,
-                BucketName=source_bucket_name,
-            )
-
-        # Get the destination bucket (using same user as source)
-        dest_bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
-            bucket_name,
-            user["main_account_id"],
-        )
-
-        if not dest_bucket:
-            return create_xml_error_response(
-                "NoSuchBucket",
-                f"The specified destination bucket {bucket_name} does not exist",
-                status_code=404,
-                BucketName=bucket_name,
-            )
-        return await _copy_object(
-            source_bucket=source_bucket,
-            destination_bucket=dest_bucket,
-            source_object_key=source_object_key,
-            destination_object_key=object_key,
+        return await handle_copy_object(
+            bucket_name=bucket_name,
+            object_key=object_key,
             request=request,
             db=db,
             ipfs_service=ipfs_service,
@@ -2211,118 +1929,13 @@ async def head_object(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
 ) -> Response:
-    """
-    Get object metadata using S3 protocol (HEAD /{bucket_name}/{object_key}).
-    Also handles getting object tags (HEAD /{bucket_name}/{object_key}?tagging).
-
-    This endpoint is compatible with the S3 protocol used by MinIO and other S3 clients.
-    This endpoint only checks if the object exists in the database and IPFS without
-    downloading the entire object content.
-    """
-    # If tagging is in query params, handle object tags request (HEAD equivalent)
-    logger.debug(f"Request query params {request.query_params}")
-    if "tagging" in request.query_params:
-        try:
-            # Just check if the object exists, don't return the tags content for HEAD
-            await _get_object_with_permissions(
-                bucket_name,
-                object_key,
-                db,
-                request.state.account.main_account,
-            )
-            return Response(status_code=200)
-        except errors.S3Error as e:
-            logger.info(f"S3 error in HEAD tagging request: {e.code} - {e.message}")
-            return Response(status_code=e.status_code)
-        except Exception as e:
-            logger.exception(f"Error in HEAD tagging request: {e}")
-            return Response(status_code=500)
-
-    # Handle other query parameters similarly to GET
-    # Add other query param handlers as needed, matching the GET handler's structure
-
-    # Default HEAD behavior for regular object metadata
-    try:
-        result = await _get_object_with_permissions(
-            bucket_name,
-            object_key,
-            db,
-            main_account_id=request.state.account.main_account,
-        )
-
-        metadata = json.loads(result["metadata"])
-        ipfs_cid = result["ipfs_cid"]
-
-        # Check object status and return 202 if still processing
-        object_status = result.get("status", "unknown")
-        if object_status in ["pending", "pinning"]:
-            retry_after = "60" if result.get("multipart") else "30"
-            headers = {
-                "Retry-After": retry_after,
-                "x-amz-object-status": object_status,
-            }
-            return Response(status_code=202, headers=headers)
-
-        headers = {
-            "Content-Type": result["content_type"],
-            "Content-Length": str(result["size_bytes"]),
-            "ETag": f'"{result["md5_hash"]}"',
-            "Last-Modified": result["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
-            "x-amz-ipfs-cid": ipfs_cid or "pending",
-        }
-        # Add source header to indicate whether cache is primed
-        try:
-            obj_id_str = str(result["object_id"])  # type: ignore[index]
-            # Fast path: check part 1
-            # Probe any existing part key for this object to infer cache presence
-            has_cache = False
-            try:
-                _cursor, _keys = await request.app.state.redis_client.scan(
-                    cursor=0,
-                    match=f"obj:{obj_id_str}:part:*",
-                    count=1,
-                )
-                has_cache = bool(_keys)
-            except Exception:
-                has_cache = False
-            if not has_cache:
-                # Fallback: scan for any multipart part key (cheap, single-batch)
-                cursor, keys = await request.app.state.redis_client.scan(
-                    cursor=0,
-                    match=f"obj:{obj_id_str}:part:*",
-                    count=1,
-                )
-                has_cache = bool(keys)
-            headers["x-hippius-source"] = "cache" if has_cache else "pipeline"
-        except Exception:
-            headers["x-hippius-source"] = "pipeline"
-        # Expose append version if present (for S4 version-based CAS)
-        if "append_version" in result and result["append_version"] is not None:
-            headers["x-amz-meta-append-version"] = str(result["append_version"])
-            with contextlib.suppress(Exception):
-                logger.info(
-                    f"HEAD append-version bucket={bucket_name} key={object_key} version={result['append_version']} size={result['size_bytes']}"
-                )
-        # Only include object status header if known
-        if object_status != "unknown":
-            headers["x-amz-object-status"] = object_status
-
-        for key, value in metadata.items():
-            if key != "ipfs" and not isinstance(value, dict):
-                headers[f"x-amz-meta-{key}"] = str(value)
-
-        return Response(status_code=200, headers=headers)
-
-    except errors.S3Error as e:
-        # For HEAD requests, we should return just the status code without content
-        # Otherwise Minio client gets confused by XML in HEAD responses
-        logger.info(f"S3 error in HEAD request: {e.code} - {e.message}")
-        return Response(status_code=e.status_code)
-
-    except Exception as e:
-        logger.exception(f"Error getting object metadata: {e}")
-        # For HEAD requests, just return 500 without XML body
-        return Response(status_code=500)
+    """Delegates to the isolated HEAD handler."""
+    return await handle_head_object(
+        bucket_name=bucket_name,
+        object_key=object_key,
+        request=request,
+        db=db,
+    )
 
 
 @router.get("/{bucket_name}/{object_key:path}/", status_code=200)
