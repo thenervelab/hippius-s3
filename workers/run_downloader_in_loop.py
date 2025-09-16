@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
 import logging
-import os
 import sys
 from pathlib import Path
 
@@ -30,24 +29,6 @@ async def process_download_request(
 ) -> bool:
     """Process a download request by downloading each chunk and storing in Redis."""
 
-    # In e2e test mode, return mock data immediately
-    if os.getenv("HIPPIUS_E2E_TESTS") == "true":
-        test_content = os.getenv("HIPPIUS_E2E_GET_OBJECT_CONTENT", "test content").encode()
-        logger.info(
-            f"E2E Mode: Processing download request for {download_request.bucket_name}/{download_request.object_key} with mock data"
-        )
-
-        # Store mock data for all chunks
-        for chunk in download_request.chunks:
-            await redis_client.set(chunk.redis_key, test_content)
-            logger.debug(f"E2E Mode: Stored mock data for chunk {chunk.part_id} with key: {chunk.redis_key}")
-
-        logger.info(
-            f"E2E Mode: Successfully processed {len(download_request.chunks)} chunks for {download_request.bucket_name}/{download_request.object_key}"
-        )
-        return True
-
-    # Normal production logic
     dl_cache = RedisDownloadChunksCache(redis_client)
     hippius_client = HippiusClient(
         ipfs_gateway=config.ipfs_get_url,
@@ -61,6 +42,9 @@ async def process_download_request(
     logger.info(
         f"Processing download request for {short_id} with {len(download_request.chunks)} chunks; "
         f"should_decrypt={download_request.should_decrypt} subaccount={download_request.subaccount[:8]}..."
+    )
+    logger.info(
+        f"Download request ids: object_id={download_request.object_id} request_id={download_request.request_id} parts={[c.part_id for c in download_request.chunks]}"
     )
 
     # Process all chunks concurrently with higher concurrency for better IPFS utilization
@@ -108,8 +92,7 @@ async def process_download_request(
                         download_request.object_id, download_request.request_id, chunk.part_id, chunk_data
                     )
                     logger.debug(
-                        f"Stored chunk {chunk.part_id} in Redis with key: "
-                        f"{dl_cache.build_key(download_request.object_id, download_request.request_id, chunk.part_id)}"
+                        f"Stored chunk {chunk.part_id} in Redis for object={download_request.object_id} request={download_request.request_id}"
                     )
 
                     return True

@@ -42,9 +42,13 @@ async def _process_simple_upload(
     ipfs_service: IPFSService,
     redis_client: async_redis.Redis,
 ) -> S3PublishPin:
-    chunk_data = await redis_client.get(payload.chunk.redis_key)
+    from hippius_s3.cache import RedisObjectPartsCache
+
+    obj_cache = RedisObjectPartsCache(redis_client)
+    # For simple upload, the chunk id should be 0
+    chunk_data = await obj_cache.get(payload.object_id, int(payload.chunk.id))
     if not chunk_data:
-        raise ValueError(f"Simple upload chunk not found for key: {payload.chunk.redis_key}")
+        raise ValueError(f"Simple upload chunk not found: object_id={payload.object_id} part={int(payload.chunk.id)}")
 
     # Mangle filename if encrypting
     file_name = payload.object_key
@@ -79,7 +83,7 @@ async def _process_simple_upload(
         payload.object_id,
     )
 
-    # If there is a provisional multipart part 1 row with missing or placeholder CID, backfill it
+    # If there is a provisional multipart part 0 row with missing or placeholder CID, backfill it
     try:
         base_cid_id = await upsert_cid_and_get_id(db, s3_result.cid)
         base_md5 = hashlib.md5(chunk_data).hexdigest()
@@ -91,7 +95,7 @@ async def _process_simple_upload(
                 size_bytes = COALESCE(size_bytes, $3),
                 etag = COALESCE(etag, $4)
             WHERE object_id = $5
-              AND part_number = 1
+              AND part_number = 0
               AND (
                     ipfs_cid IS NULL OR ipfs_cid = '' OR ipfs_cid = 'pending' OR ipfs_cid = 'None'
                   )
@@ -102,7 +106,7 @@ async def _process_simple_upload(
             base_md5,
             payload.object_id,
         )
-        logger.info(f"Backfilled base part CID for object_id={payload.object_id} cid={s3_result.cid}")
+        logger.info(f"Backfilled base part(0) CID for object_id={payload.object_id} cid={s3_result.cid}")
     except Exception as e:
         logger.debug(
             f"Failed to backfill base part CID for object_id={payload.object_id}: {e}",
@@ -110,7 +114,7 @@ async def _process_simple_upload(
         )
 
     # Keep cache for a while to ensure immediate consistency on reads (unified multipart)
-    await redis_client.expire(f"obj:{payload.object_id}:part:1", _CACHE_TTL_SECONDS)
+    await redis_client.expire(f"obj:{payload.object_id}:part:0", _CACHE_TTL_SECONDS)
 
     return s3_result
 
@@ -124,10 +128,8 @@ async def _process_multipart_chunk(
 ) -> tuple[S3PublishPin, Chunk]:
     obj_cache = RedisObjectPartsCache(redis_client)
     # Derive part_number from key to drive both read and DB updates
-    import re as _re
 
-    m = _re.search(r":part:(\d+)$", chunk.redis_key)
-    part_number_db = int(m.group(1)) if m else chunk.id
+    part_number_db = int(chunk.id)
 
     chunk_data = await obj_cache.get(payload.object_id, part_number_db)
     if not chunk_data:
@@ -135,15 +137,13 @@ async def _process_multipart_chunk(
 
     # Debug: compute md5 and show first/last bytes for validation
     import hashlib as _hashlib
-    import re as _re
 
     md5_pre = _hashlib.md5(chunk_data).hexdigest()
     head_hex = chunk_data[:8].hex() if chunk_data else ""
     tail_hex = chunk_data[-8:].hex() if len(chunk_data) >= 8 else head_hex
     # part_number_db already computed above
     logger.debug(
-        f"Redis multipart read: part={part_number_db} key={chunk.redis_key} len={len(chunk_data)} "
-        f"md5={md5_pre} head8={head_hex} tail8={tail_hex}"
+        f"Multipart read: part={part_number_db} len={len(chunk_data)} md5={md5_pre} head8={head_hex} tail8={tail_hex}"
     )
 
     # Mangle filename if encrypting
@@ -208,15 +208,11 @@ async def _process_multipart_upload(
     chunk_results = [first_result] + other_results
 
     # Update parts table with CIDs for all chunks
-    import re as _re
 
     for s3_result, chunk in chunk_results:
-        m = _re.search(r":part:(\d+)$", chunk.redis_key)
-        part_number_db = int(m.group(1)) if m else chunk.id
+        part_number_db = int(chunk.id)
         if part_number_db != chunk.id:
-            logger.warning(
-                f"Part number mismatch detected: chunk.id={chunk.id} redis_key={chunk.redis_key} -> using {part_number_db}"
-            )
+            logger.warning(f"Part number mismatch detected: chunk.id={chunk.id} -> using {part_number_db}")
         cid_id = await upsert_cid_and_get_id(db, s3_result.cid)
         await db.execute(
             "UPDATE parts SET cid_id = $1 WHERE object_id = $2 AND part_number = $3",
@@ -231,8 +227,7 @@ async def _process_multipart_upload(
     # Create manifest with chunk indices and CIDs
     manifest = []
     for s3_result, chunk in chunk_results:
-        m = _re.search(r":part:(\d+)$", chunk.redis_key)
-        part_number_db = int(m.group(1)) if m else chunk.id
+        part_number_db = int(chunk.id)
         manifest.append([part_number_db, s3_result.cid])
 
     # Sort manifest by chunk index to ensure proper order
@@ -271,8 +266,7 @@ async def _process_multipart_upload(
     # Keep per-chunk caches for a while; GETs may still be assembling from cache
     obj_cache = RedisObjectPartsCache(redis_client)
     for _, chunk in chunk_results:
-        m = _re.search(r":part:(\d+)$", chunk.redis_key)
-        part_number_db = int(m.group(1)) if m else chunk.id
+        part_number_db = int(chunk.id)
         await obj_cache.expire(payload.object_id, part_number_db, ttl=_CACHE_TTL_SECONDS)
 
     return [result[0] for result in chunk_results], manifest_result
