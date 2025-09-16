@@ -127,8 +127,18 @@ async def fetch_account(
         role = data.get("role", "Unknown")
         upload = role in ["Upload", "UploadDelete"]
         delete = role == "UploadDelete"
-        has_credits = data.get("has_credits", False)
-        main_account_id = data.get("main_account_id")
+        main_account_id = data["main_account_id"]
+
+        # Get credits from main account cache
+        has_credits, free_credits = False, 0
+        main_account_cache_key = f"hippius_main_account_credits:{main_account_id}"
+        main_account_data = await redis_accounts_client.get(main_account_cache_key)
+        if main_account_data:
+            main_data = json.loads(main_account_data)
+            has_credits = main_data.get("has_credits", False)
+            free_credits = main_data.get("free_credits", 0)
+
+        logger.info(f"{subaccount_id}:{main_account_id}:{free_credits}")
 
         return HippiusAccount(
             seed=seed_phrase,
@@ -140,6 +150,7 @@ async def fetch_account(
         )
 
     # If we reach here, account is not in cache - raise exception
+    logger.error(f"No account cache found for subaccount {subaccount_id}")
     raise BadAccount("Your account does not exist")
 
 
