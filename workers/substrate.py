@@ -253,7 +253,7 @@ async def submit_storage_request_for_user(
         pallet_name="IpfsPallet",
         fn_name="submit_storage_request_for_user",
         extra_params={
-            "user": user,
+            "owner": user,
         },
     )
 
