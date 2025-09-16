@@ -70,7 +70,7 @@ class Config:
     unpinner_sleep_loop = 5
     downloader_sleep_loop = 0.01
     cacher_loop_sleep = 60  # 1 minute
-    pin_checker_loop_sleep = 300  # 5 minutes
+    pin_checker_loop_sleep = 60  # 1 minute
 
     # Resubmission settings
     resubmission_seed_phrase: str = env("RESUBMISSION_SEED_PHRASE")

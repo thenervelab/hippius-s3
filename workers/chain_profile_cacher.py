@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import List
 
 import asyncpg
+import httpx
 import redis.asyncio as async_redis
 from dotenv import load_dotenv
 
@@ -40,28 +41,91 @@ async def get_all_unique_users(
     return [row["main_account_id"] for row in users]
 
 
+async def fetch_profile_content(http_client: httpx.AsyncClient, cid: str, timeout: float = 15.0) -> dict:
+    """Fetch user profile JSON content from IPFS gateway with timeout."""
+    try:
+        gateway_url = "https://get.hippius.network"
+        url = f"{gateway_url}/ipfs/{cid}"
+        response = await http_client.get(url, timeout=timeout)
+
+        if response.status_code == 200:
+            profile_data = response.json()
+            logger.debug(f"Successfully fetched profile content for CID {cid}")
+            return profile_data
+        logger.warning(f"Failed to fetch profile {cid}: HTTP {response.status_code}")
+        return {}
+
+    except Exception as e:
+        logger.error(f"Error fetching profile content for CID {cid}: {e}")
+        return {}
+
+
+def extract_file_cids_from_profile(profile_data: dict) -> List[str]:
+    """Extract individual file CIDs from user profile JSON."""
+    file_cids = []
+
+    try:
+        if isinstance(profile_data, list):
+            for file_entry in profile_data:
+                if isinstance(file_entry, dict):
+                    file_hash = file_entry.get("file_hash", [])
+
+                    if isinstance(file_hash, list) and file_hash:
+                        try:
+                            cid_bytes = bytes(file_hash)
+                            cid_string = cid_bytes.decode("utf-8", errors="ignore")
+
+                            if cid_string and (cid_string.startswith("Qm") or cid_string.startswith("b")):
+                                file_cids.append(cid_string)
+                                logger.debug(f"Extracted file CID: {cid_string}")
+                        except Exception as e:
+                            logger.warning(f"Error converting file_hash to CID: {file_hash}, error: {e}")
+
+                    elif isinstance(file_hash, str) and file_hash:
+                        file_cids.append(file_hash)
+                        logger.debug(f"Extracted file CID: {file_hash}")
+
+        logger.debug(f"Extracted {len(file_cids)} file CIDs from profile")
+        return file_cids
+
+    except Exception as e:
+        logger.error(f"Error extracting file CIDs from profile: {e}")
+        return []
+
+
 async def cache_user_chain_profile(
     redis_chain: async_redis.Redis,
     user: str,
     storage_requests_dict: dict,
+    http_client: httpx.AsyncClient,
 ) -> None:
     """Download and cache chain profile data for a single user."""
     logger.debug(f"Caching chain profile for user {user}")
 
-    # Get pinned CIDs from chain for this specific user
-    pinned_cids = get_all_pinned_cids(user, config.substrate_url)
+    # Get profile CIDs from chain for this specific user
+    profile_cids = get_all_pinned_cids(user, config.substrate_url)
+
+    # Download and parse each profile to extract file CIDs
+    profile_file_cids = []
+    for profile_cid in profile_cids:
+        profile_data = await fetch_profile_content(http_client, profile_cid)
+        if profile_data:
+            file_cids = extract_file_cids_from_profile(profile_data)
+            profile_file_cids.extend(file_cids)
+            logger.debug(f"Profile {profile_cid} for {user}: extracted {len(file_cids)} file CIDs")
 
     # Get storage CIDs for this user from the pre-fetched dictionary
     storage_cids = storage_requests_dict.get(user, [])
 
-    # Merge the lists and remove duplicates
-    all_cids = list(set(pinned_cids + storage_cids))
+    # Merge all CIDs: profile CIDs + file CIDs from profiles + storage CIDs
+    all_cids = list(set(profile_cids + profile_file_cids + storage_cids))
 
     # Prepare cache data with timestamp
     cache_data = {
         "timestamp": time.time(),
         "cids": all_cids,
-        "pinned_count": len(pinned_cids),
+        "pinned_count": len(profile_cids),
+        "profile_file_count": len(profile_file_cids),
         "storage_count": len(storage_cids),
         "total_count": len(all_cids),
     }
@@ -77,7 +141,7 @@ async def cache_user_chain_profile(
     )
 
     logger.info(
-        f"Cached {len(all_cids)} CIDs for user {user} (pinned: {len(pinned_cids)}, storage: {len(storage_cids)})"
+        f"Cached {len(all_cids)} CIDs for user {user} (profile: {len(profile_cids)}, files: {len(profile_file_cids)}, storage: {len(storage_cids)})"
     )
 
 
@@ -90,28 +154,37 @@ async def run_chain_profile_cacher_loop():
     redis_chain_url = os.getenv("REDIS_CHAIN_URL", "redis://127.0.0.1:6381/0")
     redis_chain = async_redis.from_url(redis_chain_url)
 
+    # Create HTTP client for profile downloads
+    http_client = httpx.AsyncClient(timeout=30.0)
+
     logger.info("Starting chain profile cacher service...")
     logger.info(f"Database: {config.database_url}")
     logger.info(f"Redis Chain: {redis_chain_url}")
 
-    while True:
-        # Get all unique users
-        users = await get_all_unique_users(db)
-        logger.info(f"Caching chain profiles for {len(users)} users")
+    try:
+        while True:
+            # Get all unique users
+            users = await get_all_unique_users(db)
+            logger.info(f"Caching chain profiles for {len(users)} users")
 
-        # Pre-fetch all storage requests once (more efficient than per-user calls)
-        logger.info("Fetching all storage requests from chain...")
-        storage_requests_dict = get_all_storage_requests(config.substrate_url)
-        logger.info(f"Fetched storage requests for {len(storage_requests_dict)} users")
+            # Pre-fetch all storage requests once (more efficient than per-user calls)
+            logger.info("Fetching all storage requests from chain...")
+            storage_requests_dict = await get_all_storage_requests(config.substrate_url, http_client)
+            logger.info(f"Fetched storage requests for {len(storage_requests_dict)} users")
 
-        # Process each user
-        for user in users:
-            await cache_user_chain_profile(redis_chain, user, storage_requests_dict)
+            # Process each user
+            for user in users:
+                await cache_user_chain_profile(redis_chain, user, storage_requests_dict, http_client)
 
-        logger.info(f"Completed caching chain profiles for all {len(users)} users")
+            logger.info(f"Completed caching chain profiles for all {len(users)} users")
 
-        # Sleep before next iteration
-        await asyncio.sleep(config.cacher_loop_sleep)
+            # Sleep before next iteration
+            await asyncio.sleep(config.cacher_loop_sleep)
+
+    finally:
+        await http_client.aclose()
+        await redis_chain.aclose()
+        await db.close()
 
 
 if __name__ == "__main__":

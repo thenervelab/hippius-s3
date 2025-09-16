@@ -139,8 +139,11 @@ async def check_user_cids(
     chain_cids_set = set(chain_cids)
     missing_cids = list(db_cids_set - chain_cids_set)
 
+    # Log CID comparison for this user
+    logger.info(f"User {user}: S3={len(db_cids)} CIDs, Chain={len(chain_cids)} CIDs, Missing={len(missing_cids)} CIDs")
+
     if missing_cids:
-        logger.info(f"Found {len(missing_cids)} missing CIDs for user {user}")
+        logger.info(f"Resubmitting {len(missing_cids)} missing CIDs for user {user}")
         await resubmit_substrate_pinning_request(
             user,
             missing_cids,
@@ -148,7 +151,7 @@ async def check_user_cids(
             config.substrate_url,
         )
     else:
-        logger.debug(f"All CIDs for user {user} are properly pinned on chain")
+        logger.info(f"All S3 CIDs for user {user} are present on chain")
 
 
 async def get_all_users(

@@ -165,8 +165,9 @@ def get_all_pinned_cids(
         client.close()
 
 
-def get_all_storage_requests(
+async def get_all_storage_requests(
     substrate_url: str,
+    http_client,
 ) -> Dict[str, List[str]]:
     """Get all storage request CIDs for all users from substrate chain."""
     client = SubstrateClient(substrate_url)
@@ -174,10 +175,47 @@ def get_all_storage_requests(
     try:
         client.connect()
 
-        # Get all user storage requests
-        storage_requests = client.fetch_user_storage_requests()
+        # Query the storage double map directly
+        result = client.substrate.query_map(module="IpfsPallet", storage_function="UserStorageRequests")
 
-        logger.info(f"Found storage requests for {len(storage_requests)} users")
+        storage_requests = {}
+        for key, value in result:
+            try:
+                # Handle double map key (owner_account_id, file_hash)
+                if isinstance(key, (tuple, list)) and len(key) >= 2:
+                    account = str(key[0].value) if hasattr(key[0], "value") else str(key[0])
+                    file_hash_hex = str(key[1].value) if hasattr(key[1], "value") else str(key[1])
+
+                    # Convert hex-encoded file_hash to CID string
+                    storage_request_cid = _hex_to_cid(file_hash_hex) if file_hash_hex else None
+
+                    if account and storage_request_cid:
+                        if account not in storage_requests:
+                            storage_requests[account] = []
+
+                        # Download and parse the storage request JSON to extract individual CIDs
+                        try:
+                            gateway_url = "https://get.hippius.network"
+                            url = f"{gateway_url}/ipfs/{storage_request_cid}"
+                            response = await http_client.get(url, timeout=15.0)
+
+                            if response.status_code == 200:
+                                storage_data = response.json()
+                                if isinstance(storage_data, list):
+                                    for obj in storage_data:
+                                        if isinstance(obj, dict) and "cid" in obj:
+                                            storage_requests[account].append(obj["cid"])
+                                    logger.debug(f"Storage request {storage_request_cid}: extracted {len(storage_data)} CIDs for {account}")
+                            else:
+                                logger.warning(f"Failed to fetch storage request {storage_request_cid}: HTTP {response.status_code}")
+                        except Exception as e:
+                            logger.warning(f"Error fetching storage request {storage_request_cid}: {e}")
+
+            except Exception as e:
+                logger.warning(f"Error processing storage request key {key}: {e}")
+                continue
+
+        logger.info(f"Fetched storage requests for {len(storage_requests)} users with total {sum(len(cids) for cids in storage_requests.values())} request CIDs")
         return storage_requests
 
     except Exception as e:
@@ -185,6 +223,26 @@ def get_all_storage_requests(
         return {}
     finally:
         client.close()
+
+
+def _hex_to_cid(hex_string: str) -> str:
+    """Convert hex-encoded string to IPFS CID."""
+    try:
+        # If it's already a valid CID string, return as-is
+        if isinstance(hex_string, str) and (hex_string.startswith("Qm") or hex_string.startswith("b")):
+            return hex_string
+
+        # Convert hex string to bytes then to ASCII string (CID)
+        if hex_string.startswith("0x"):
+            hex_string = hex_string[2:]
+
+        # Convert hex to bytes, then decode as UTF-8
+        data = bytes.fromhex(hex_string)
+        return data.decode("utf-8", errors="ignore").strip()
+
+    except Exception as e:
+        logger.warning(f"Error converting to CID: {hex_string}, error: {e}")
+        return str(hex_string)
 
 
 async def submit_storage_request(
@@ -197,7 +255,7 @@ async def submit_storage_request(
         raise ValueError("CID list cannot be empty")
 
     # Create FileInput objects from CIDs
-    files = [FileInput(file_hash=cid, file_name=f"file_{cid[:8]}.data") for cid in cids]
+    files = [FileInput(file_hash=cid, file_name=f"s3_{cid}") for cid in cids]
 
     # Create substrate client for this request
     substrate_client = HippiusSubstrateClient(
@@ -237,7 +295,7 @@ async def submit_storage_request_for_user(
         raise ValueError("CID list cannot be empty")
 
     # Create FileInput objects from CIDs
-    files = [FileInput(file_hash=cid, file_name=f"resubmit_{cid[:8]}.data") for cid in cids]
+    files = [FileInput(file_hash=cid, file_name=f"s3_resubmission_{cid}") for cid in cids]
 
     # Create substrate client for this request
     substrate_client = HippiusSubstrateClient(
