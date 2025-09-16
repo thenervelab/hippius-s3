@@ -1861,7 +1861,7 @@ async def put_object(
         part_index = 0
         redis_key = f"simple:{object_id}:part:{part_index}"
 
-        await redis_client.set(redis_key, file_data)
+        await redis_client.setex(redis_key, 1800, file_data)  # 30 minute TTL
 
         await enqueue_upload_request(
             payload=SimpleUploadChainRequest(
