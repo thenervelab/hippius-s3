@@ -12,6 +12,7 @@ from starlette import status
 
 from hippius_s3.config import Config
 from hippius_s3.ipfs_service import IPFSService
+from hippius_s3.services.object_reader import ObjectReader
 
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,11 @@ def get_redis_accounts(request: Request) -> async_redis.Redis:
     """Extract the Redis accounts client from the request."""
     redis_accounts_client: async_redis.Redis = request.app.state.redis_accounts_client
     return redis_accounts_client
+
+
+def get_object_reader(request: Request) -> ObjectReader:
+    """Provide an ObjectReader service configured with app Config."""
+    return ObjectReader(request.app.state.config)
 
 
 async def extract_seed_phrase(request: Request) -> str:

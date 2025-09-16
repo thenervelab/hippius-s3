@@ -9,7 +9,6 @@ import os
 import uuid
 from datetime import UTC
 from datetime import datetime
-from typing import Any
 
 import asyncpg
 import fastapi
@@ -28,6 +27,7 @@ from hippius_s3 import utils
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.extensions.append import _upsert_cid  # reuse CID upsert helper
 from hippius_s3.api.s3.extensions.append import handle_append
+from hippius_s3.api.s3.get_object_endpoint import handle_get_object
 from hippius_s3.api.s3.multipart import list_parts_internal
 from hippius_s3.api.s3.multipart import upload_part
 from hippius_s3.api.s3.range_utils import calculate_chunks_for_range
@@ -37,6 +37,7 @@ from hippius_s3.cache import RedisDownloadChunksCache
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import DBConnection
+from hippius_s3.dependencies import get_object_reader
 from hippius_s3.ipfs_service import IPFSService
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import ChunkToDownload
@@ -46,6 +47,8 @@ from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import enqueue_download_request
 from hippius_s3.queue import enqueue_unpin_request
 from hippius_s3.queue import enqueue_upload_request
+from hippius_s3.services.manifest_service import ManifestService
+from hippius_s3.services.object_reader import ObjectReader
 from hippius_s3.utils import get_query
 
 
@@ -112,19 +115,15 @@ async def load_object_from_cache(
                     with contextlib.suppress(Exception):
                         entry["size_bytes"] = int(c["size_bytes"])  # type: ignore[index]
                 initial_parts.append(entry)
-        with contextlib.suppress(Exception):
-            logger.info(f"CACHE assemble initial_parts={initial_parts}")
+        # simplified: no verbose logging of initial_parts
         # Ensure base part(0) is considered if present in cache even when DB CID is pending
         try:
             obj_repo = RedisObjectPartsCache(redis_client)
             has_base0 = await obj_repo.exists(object_id_str, 0)
             if has_base0 and not any(int(p.get("part_number", -1)) == 0 for p in initial_parts):
-                logger.info(f"CACHE assemble: injecting base part 0 due to cache presence object_id={object_id_str}")
                 initial_parts.insert(0, {"part_number": 0})
             else:
-                logger.info(
-                    f"CACHE assemble: base0_present_in_cache={has_base0} initial_parts={[p.get('part_number') for p in initial_parts]}"
-                )
+                pass
         except Exception:
             pass
         # If DB manifest is empty, fallback to base-only assumption for simple objects
@@ -156,8 +155,7 @@ async def load_object_from_cache(
             enriched_chunks.append({"part_number": pn, "size_bytes": int(size_val)})
         # Sort by part_number
         enriched_chunks = sorted(enriched_chunks, key=lambda x: x["part_number"])
-        with contextlib.suppress(Exception):
-            logger.info(f"CACHE assemble enriched_chunks={enriched_chunks}")
+        # simplified: no verbose logging of enriched_chunks
 
         if range_header and start_byte is not None and end_byte is not None:
             # For range requests, we need to load chunks into memory to extract the range
@@ -2336,6 +2334,7 @@ async def get_object(
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
     redis_client=Depends(dependencies.get_redis),
+    object_reader: ObjectReader = Depends(get_object_reader),
 ) -> Response:
     """
     Get an object using S3 protocol (GET /{bucket_name}/{object_key}).
@@ -2343,6 +2342,16 @@ async def get_object(
 
     This endpoint now uses a queuing system for downloads to handle IPFS retrieval asynchronously.
     """
+    # Delegated implementation
+    return await handle_get_object(
+        bucket_name=bucket_name,
+        object_key=object_key,
+        request=request,
+        db=db,
+        ipfs_service=ipfs_service,
+        redis_client=redis_client,
+        object_reader=object_reader,
+    )
     # If tagging is in query params, handle object tags request
     if "tagging" in request.query_params:
         return await get_object_tags(
@@ -2414,78 +2423,13 @@ async def get_object(
 
         # Build manifest purely from DB parts (object_id), 0-based; inject base(0) from object CID if missing
         try:
-            part_rows2 = await db.fetch(
-                """
-                SELECT p.part_number, c.cid, p.size_bytes
-                FROM parts p
-                JOIN cids c ON p.cid_id = c.id
-                WHERE p.object_id = $1
-                ORDER BY p.part_number
-                """,
-                object_info["object_id"],
+            built_chunks = await ManifestService.build_initial_download_chunks(
+                db, object_info if isinstance(object_info, dict) else dict(object_info)
             )
-            built_chunks: list[dict] = [
-                {
-                    "part_number": int(r[0]),
-                    "cid": (r[1] or "").strip(),
-                    "size_bytes": int(r[2] or 0),
-                }
-                for r in part_rows2
-                if (r[1] or "").strip() and str(r[1]).strip().lower() not in {"none", "pending"}
-            ]
-            # If base(0) missing, try inject from object CID
-            try:
-                has_base0 = any(int(c.get("part_number", -1)) == 0 for c in built_chunks)
-            except Exception:
-                has_base0 = False
-            if not has_base0:
-                base_cid_row = await db.fetchval(
-                    "SELECT c.cid FROM objects o JOIN cids c ON o.cid_id = c.id WHERE o.object_id = $1",
-                    object_info["object_id"],
-                )
-                if base_cid_row:
-                    built_chunks.insert(
-                        0,
-                        {
-                            "part_number": 0,
-                            "cid": str(base_cid_row),
-                            "size_bytes": int(object_info.get("size_bytes") or 0),  # type: ignore[index]
-                        },
-                    )
             if built_chunks:
                 download_chunks = built_chunks
-                # Mark as multipart if any DB part exists (e.g., appended delta)
-                try:
-                    if not isinstance(object_info, dict):
-                        object_info = dict(object_info)
-                    if any(int(c.get("part_number", -1)) > 0 for c in built_chunks) or len(built_chunks) > 1:
-                        object_info["multipart"] = True  # type: ignore[index]
-                except Exception:
-                    pass
-            else:
-                # If DB parts are only placeholders, prefer object-level CID for base(0) when available
-                try:
-                    base_cid_row = await db.fetchval(
-                        "SELECT c.cid FROM objects o JOIN cids c ON o.cid_id = c.id WHERE o.object_id = $1",
-                        object_info["object_id"],
-                    )
-                    if not base_cid_row:
-                        base_cid_row = await db.fetchval(
-                            "SELECT ipfs_cid FROM objects WHERE object_id = $1",
-                            object_info["object_id"],
-                        )
-                    if base_cid_row and str(base_cid_row).strip().lower() not in {"", "none", "pending"}:
-                        download_chunks = [
-                            {
-                                "part_number": 0,
-                                "cid": str(base_cid_row),
-                                "size_bytes": int(object_info.get("size_bytes") or 0),  # type: ignore[index]
-                            }
-                        ]
-                except Exception:
-                    pass
         except Exception:
-            logger.debug("Failed to build manifest from parts table", exc_info=True)
+            logger.debug("Failed to build manifest from ManifestService", exc_info=True)
 
         # Attach manifest to object_info for cache assembly
         try:
@@ -2504,42 +2448,6 @@ async def get_object(
 
         # For simple objects (non-multipart), construct a single-part manifest (independent of cache)
         # Only if there are no part rows resolved yet
-        if not object_info.get("multipart") and (not download_chunks or len(download_chunks) == 0):
-            simple_cid_val = object_info.get("ipfs_cid") or object_info.get("simple_cid")
-            # Retry briefly for object-level CID to appear before returning 503
-            if not simple_cid_val:
-                try:
-                    for _ in range(50):  # up to ~5s with 100ms sleeps
-                        base_cid = await db.fetchval(
-                            "SELECT c.cid FROM objects o JOIN cids c ON o.cid_id = c.id WHERE o.object_id = $1",
-                            object_info["object_id"],
-                        )
-                        if not base_cid:
-                            base_cid = await db.fetchval(
-                                "SELECT ipfs_cid FROM objects WHERE object_id = $1",
-                                object_info["object_id"],
-                            )
-                        if base_cid and str(base_cid).strip().lower() not in {"", "none", "pending"}:
-                            simple_cid_val = str(base_cid)
-                            break
-                        await asyncio.sleep(0.1)
-                except Exception:
-                    pass
-            if not simple_cid_val:
-                # No CID yet for pipeline-only path
-                logger.debug(f"Simple object missing CID for pipeline: {bucket_name}/{object_key}")
-                return errors.s3_error_response(
-                    "ServiceUnavailable",
-                    "Object not ready: no CID",
-                    status_code=503,
-                )
-            download_chunks = [
-                {
-                    "part_number": 0,
-                    "cid": simple_cid_val,
-                    "size_bytes": int(object_info.get("size_bytes") or 0),
-                }
-            ]
 
         # Check if main CID is missing (still being processed)
         # If simple_cid is None, object hasn't been processed yet and chunks are in cache
@@ -2583,25 +2491,8 @@ async def get_object(
                 logger.info(f"GET cache miss for {bucket_name}/{object_key}, falling back to pipeline")
                 pass
         else:
-            # Do not override to cache if pipeline_only is requested
-            if not force_pipeline:
-                try:
-                    obj_id_str = str(object_info["object_id"])
-                    # Override to cache if any part exists in unified cache
-                    _c2, _keys2 = await request.app.state.redis_client.scan(
-                        cursor=0, match=f"obj:{obj_id_str}:part:*", count=1
-                    )
-                    if _keys2:
-                        logger.info(f"GET override to cache due to unified cache presence: {bucket_name}/{object_key}")
-                        return await load_object_from_cache(
-                            redis_client=request.app.state.redis_client,
-                            object_info=object_info,
-                            range_header=range_header,
-                            start_byte=start_byte,
-                            end_byte=end_byte,
-                        )
-                except Exception:
-                    pass
+            # No scan-based override; rely on initial cache probe only
+            pass
 
         # No cache fallback for pipeline_only
 
@@ -2656,108 +2547,26 @@ async def get_object(
                     _cid_val = chunk_info.get("cid")
                     if isinstance(_cid_val, str):
                         _cid_log = _cid_val[:10]
-                logger.debug(
-                    f"GET enqueue chunk: key={object_key} part={part_number_val} cid={_cid_log} "
-                    f"size={chunk_info.get('size_bytes') if isinstance(chunk_info, dict) else ''}"
-                )
+                # simplified: no per-chunk debug log
             except Exception:
                 pass
 
         # If any required parts are missing CIDs, retry briefly before 503; never enqueue without CIDs
         try:
             if required_parts and not required_parts.issubset(available_parts):
-                retry_attempts = 10
-                retry_interval_sec = 0.5
-                for _ in range(retry_attempts):
-                    try:
-                        await asyncio.sleep(retry_interval_sec)
-                    except Exception:
-                        break
-                    # Re-check DB for newly available CIDs
-                    try:
-                        rows_recheck = await db.fetch(
-                            """
-                            SELECT p.part_number, c.cid
-                            FROM parts p
-                            JOIN cids c ON p.cid_id = c.id
-                            WHERE p.object_id = $1
-                            """,
-                            object_info["object_id"],
-                        )
-
-                        def _valid(row: Any) -> bool:
-                            try:
-                                _cid = row["cid"]
-                                return isinstance(_cid, str) and _cid.strip().lower() not in {"", "none", "pending"}
-                            except Exception:
-                                return False
-
-                        available_parts = {int(r["part_number"]) for r in rows_recheck if _valid(r)}
-                        # If base(0) missing but object-level CID exists, treat it as part 0
-                        if 0 in required_parts and 0 not in available_parts:
-                            base_cid_row2 = await db.fetchval(
-                                "SELECT c.cid FROM objects o JOIN cids c ON o.cid_id = c.id WHERE o.object_id = $1",
-                                object_info["object_id"],
-                            )
-                            if base_cid_row2:
-                                # Build chunks from DB rows plus synthesized base(0)
-                                chunks = [
-                                    ChunkToDownload(cid=str(r["cid"]), part_id=int(r["part_number"]))
-                                    for r in rows_recheck
-                                    if int(r["part_number"]) in required_parts and _valid(r)
-                                ]
-                                chunks.insert(0, ChunkToDownload(cid=str(base_cid_row2), part_id=0))
-                                available_parts = available_parts | {0}
-                                break
-                        if required_parts.issubset(available_parts):
-                            # Rebuild chunks entirely from DB rows
-                            chunks = [
-                                ChunkToDownload(cid=str(r["cid"]), part_id=int(r["part_number"]))
-                                for r in rows_recheck
-                                if int(r["part_number"]) in required_parts and _valid(r)
-                            ]
-                            break
-                    except Exception:
-                        # If re-check fails, fall through to 503
-                        pass
-                if required_parts and not required_parts.issubset(available_parts):
-                    missing_set = required_parts - available_parts
-                    # If only base(0) is missing, allow final fallback to object-level CID
-                    try:
-                        if missing_set == {0}:
-                            base_try = await db.fetchval(
-                                "SELECT c.cid FROM objects o JOIN cids c ON o.cid_id = c.id WHERE o.object_id = $1",
-                                object_info["object_id"],
-                            )
-                            if not base_try:
-                                base_try = await db.fetchval(
-                                    "SELECT ipfs_cid FROM objects WHERE object_id = $1",
-                                    object_info["object_id"],
-                                )
-                            if base_try and str(base_try).strip().lower() not in {"", "none", "pending"}:
-                                # Skip returning 503 to let final fallback synthesize base(0)
-                                pass
-                            else:
-                                missing = sorted(missing_set)
-                                return errors.s3_error_response(
-                                    "ServiceUnavailable",
-                                    f"Object not ready: missing CIDs for parts {missing}",
-                                    status_code=503,
-                                )
-                        else:
-                            missing = sorted(missing_set)
-                            return errors.s3_error_response(
-                                "ServiceUnavailable",
-                                f"Object not ready: missing CIDs for parts {missing}",
-                                status_code=503,
-                            )
-                    except Exception:
-                        missing = sorted(missing_set)
-                        return errors.s3_error_response(
-                            "ServiceUnavailable",
-                            f"Object not ready: missing CIDs for parts {missing}",
-                            status_code=503,
-                        )
+                try:
+                    waited = await ManifestService.wait_for_cids(
+                        db,
+                        str(object_info["object_id"]),
+                        required_parts,
+                        attempts=10,
+                        interval_sec=0.5,
+                    )
+                    if waited:
+                        chunks = [ChunkToDownload(cid=str(c["cid"]), part_id=int(c["part_number"])) for c in waited]
+                        available_parts = {int(c["part_number"]) for c in waited}
+                except Exception:
+                    pass
         except Exception:
             # If we couldn't determine required parts, proceed with available ones
             pass
@@ -2980,7 +2789,10 @@ async def get_object(
                         chunk,
                     )
                 except RuntimeError:
-                    # Last-resort: try unified cache directly
+                    # For pipeline_only, do not fallback to unified cache; enforce pipeline path
+                    if force_pipeline:
+                        raise
+                    # Last-resort: try unified cache directly (non-pipeline_only only)
                     obj_id_str = str(object_info["object_id"])  # unified cache
                     cached = await RedisObjectPartsCache(request.app.state.redis_client).get(
                         obj_id_str, int(chunk.part_id)

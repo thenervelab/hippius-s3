@@ -58,8 +58,6 @@ def test_append_single_writer(
     assert resp_cache.headers.get("x-hippius-source") == "cache"
     assert resp_cache.content == initial + delta
 
-    # Allow pipeline to become ready; pipeline_only must not use cache
-    time.sleep(5)
     # Second GET: pipeline
     resp_pipe = signed_http_get(bucket, key, {"x-hippius-read-mode": "pipeline_only"})
     assert resp_pipe.status_code == 200

@@ -1,6 +1,5 @@
 """E2E test for GetObject (GET /{bucket}/{key})."""
 
-import time
 from typing import Any
 from typing import Callable
 
@@ -37,7 +36,6 @@ def test_get_object_downloads_and_matches_headers(
     # User metadata should be present via headers
     assert resp_cache.headers.get("x-amz-meta-test-meta") == "test-value"
 
-    time.sleep(0.5)
     # Second GET with pipeline_only: expect pipeline
     resp_pipe = signed_http_get(bucket_name, key, {"x-hippius-read-mode": "pipeline_only"})
     assert resp_pipe.status_code == 200

@@ -201,12 +201,14 @@ sequenceDiagram
 - Database repositories (encapsulate SQL; simplify testing and evolution):
 
   - ObjectsRepository
+
     - get_by_path(bucket_id, object_key)
     - upsert_basic(object_id, bucket_id, object_key, content_type, metadata, md5, size_bytes, created_at)
     - mark_multipart(object_id)
     - update_status(object_id, status)
 
   - PartsRepository
+
     - insert_placeholder(object_id, upload_id, part_number, size_bytes, etag, cid='pending')
     - update_cid(object_id, part_number, cid)
     - list_for_object(object_id) -> [{part_number, size_bytes, cid?}]
