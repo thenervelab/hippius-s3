@@ -25,6 +25,8 @@ from hippius_s3.api.middlewares.rate_limit import rate_limit_wrapper
 from hippius_s3.api.s3.endpoints import router as s3_router
 from hippius_s3.api.s3.multipart import router as multipart_router
 from hippius_s3.api.user import router as user_router
+from hippius_s3.cache import RedisDownloadChunksCache
+from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.ipfs_service import IPFSService
 
@@ -85,6 +87,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
         app.state.ipfs_service = IPFSService(config, app.state.redis_client)
         logger.info("IPFS service initialized with Redis client")
+
+        # Cache repositories
+        app.state.obj_cache = RedisObjectPartsCache(app.state.redis_client)
+        app.state.dl_cache = RedisDownloadChunksCache(app.state.redis_client)
+        logger.info("Cache repositories initialized")
 
         yield
 

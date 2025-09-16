@@ -12,6 +12,7 @@ from hippius_sdk.client import HippiusClient
 # Add parent directory to path to import hippius_s3 modules
 sys.path.insert(0, str(Path(__file__).parent))
 
+from hippius_s3.cache import RedisDownloadChunksCache
 from hippius_s3.config import get_config
 from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import dequeue_download_request
@@ -47,6 +48,7 @@ async def process_download_request(
         return True
 
     # Normal production logic
+    dl_cache = RedisDownloadChunksCache(redis_client)
     hippius_client = HippiusClient(
         ipfs_gateway=config.ipfs_get_url,
         ipfs_api_url=config.ipfs_store_url,
@@ -101,9 +103,14 @@ async def process_download_request(
                         f"head8={head_hex} tail8={tail_hex}"
                     )
 
-                    # Store the chunk data in Redis with the expected key
-                    await redis_client.set(chunk.redis_key, chunk_data)
-                    logger.debug(f"Stored chunk {chunk.part_id} in Redis with key: {chunk.redis_key}")
+                    # Store the chunk data in Redis using repo
+                    await dl_cache.set(
+                        download_request.object_id, download_request.request_id, chunk.part_id, chunk_data
+                    )
+                    logger.debug(
+                        f"Stored chunk {chunk.part_id} in Redis with key: "
+                        f"{dl_cache.build_key(download_request.object_id, download_request.request_id, chunk.part_id)}"
+                    )
 
                     return True
 

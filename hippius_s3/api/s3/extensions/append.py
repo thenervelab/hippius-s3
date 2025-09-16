@@ -24,6 +24,7 @@ from fastapi import Request
 from fastapi import Response
 
 from hippius_s3.api.s3 import errors
+from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.utils import get_query
 
@@ -146,7 +147,11 @@ async def handle_append(
         has_unified_base = False
         try:
             if object_id_probe:
-                has_unified_base = bool(await redis_client.exists(f"multipart:{object_id_probe}:part:1"))
+                obj_cache = RedisObjectPartsCache(redis_client)
+                # Prefer deterministic check without scan: presence of part 0 or 1
+                has_unified_base = await obj_cache.exists(object_id_probe, 0) or await obj_cache.exists(
+                    object_id_probe, 1
+                )
         except Exception:
             has_unified_base = False
 
@@ -217,8 +222,8 @@ async def handle_append(
             if not simple_cid:
                 # Provisional base: hydrate multipart part 1 from cache without waiting for CID
                 try:
-                    # Prefer unified multipart cache
-                    base_bytes = await redis_client.get(f"multipart:{object_id}:part:1")
+                    obj_cache = RedisObjectPartsCache(redis_client)
+                    base_bytes = await obj_cache.read_base_for_append(object_id)
                     if base_bytes:
                         logger.info(
                             f"APPEND bootstrap multipart part=1 from unified cache object_id={object_id} bytes={len(base_bytes)}"
@@ -244,7 +249,7 @@ async def handle_append(
                         )
                         # Mark object as multipart and cache part 1 bytes
                         await db.execute("UPDATE objects SET multipart = TRUE WHERE object_id = $1", object_id)
-                        await redis_client.setex(f"multipart:{object_id}:part:1", 1800, base_bytes)
+                        await RedisObjectPartsCache(redis_client).write_base_for_append(object_id, base_bytes, ttl=1800)
                     else:
                         return errors.s3_error_response(
                             code="PreconditionFailed",
@@ -284,11 +289,11 @@ async def handle_append(
             # Hydrate multipart cache for part 1 from existing cache (best-effort)
             try:
                 with contextlib.suppress(Exception):
-                    # Use unified multipart cache only.
-                    base_bytes = await redis_client.get(f"multipart:{object_id}:part:1")
+                    obj_cache = RedisObjectPartsCache(redis_client)
+                    base_bytes = await obj_cache.read_base_for_append(object_id)
                     if base_bytes:
                         logger.info(f"APPEND hydrate multipart part=1 object_id={object_id} bytes={len(base_bytes)}")
-                        await redis_client.setex(f"multipart:{object_id}:part:1", 1800, base_bytes)
+                        await obj_cache.write_base_for_append(object_id, base_bytes, ttl=1800)
             except Exception:
                 pass
 
@@ -299,7 +304,13 @@ async def handle_append(
         )
         if int(parts_count) == 0:
             try:
-                base_bytes = await redis_client.get(f"multipart:{object_id}:part:1")
+                obj_cache = RedisObjectPartsCache(redis_client)
+                # Debug: check cache presence for base part
+                exists_flag = await obj_cache.exists(object_id, 1)
+                logger.info(
+                    f"APPEND base-check object_id={object_id} exists={bool(exists_flag)} key={obj_cache.build_key(object_id, 1)}"
+                )
+                base_bytes = await obj_cache.read_base_for_append(object_id)
                 if base_bytes:
                     # Create part 1 with placeholder or existing CID if available
                     base_cid_raw = current.get("ipfs_cid")
@@ -425,7 +436,7 @@ async def handle_append(
     # Write-through cache: store appended bytes for immediate reads
     with contextlib.suppress(Exception):
         logger.info(f"APPEND cache write object_id={object_id} part={int(next_part)} bytes={len(incoming_bytes)}")
-        await redis_client.setex(f"multipart:{object_id}:part:{int(next_part)}", 1800, incoming_bytes)
+        await RedisObjectPartsCache(redis_client).set(object_id, int(next_part), incoming_bytes, ttl=1800)
 
     resp = Response(
         status_code=200,

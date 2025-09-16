@@ -108,6 +108,8 @@ async def load_object_from_cache(
                     with contextlib.suppress(Exception):
                         entry["size_bytes"] = int(c["size_bytes"])  # type: ignore[index]
                 initial_parts.append(entry)
+        with contextlib.suppress(Exception):
+            logger.info(f"CACHE assemble initial_parts={initial_parts}")
         # If DB manifest is empty, fallback to single-part assumption only for simple objects
         if not initial_parts:
             initial_parts = [{"part_number": 1}]
@@ -130,12 +132,14 @@ async def load_object_from_cache(
             if not isinstance(size_val, int):
                 try:
                     object_id_str = str(object_info["object_id"])  # type: ignore[index]
-                    size_val = await redis_client.strlen(f"multipart:{object_id_str}:part:{pn}")
+                    size_val = await redis_client.strlen(f"obj:{object_id_str}:part:{pn}")
                 except Exception:
                     size_val = 0
             enriched_chunks.append({"part_number": pn, "size_bytes": int(size_val)})
         # Sort by part_number
         enriched_chunks = sorted(enriched_chunks, key=lambda x: x["part_number"])
+        with contextlib.suppress(Exception):
+            logger.info(f"CACHE assemble enriched_chunks={enriched_chunks}")
 
         if range_header and start_byte is not None and end_byte is not None:
             # For range requests, we need to load chunks into memory to extract the range
@@ -144,7 +148,7 @@ async def load_object_from_cache(
             for chunk_info in enriched_chunks:
                 if chunk_info["part_number"] in needed_parts:
                     part_num = int(chunk_info["part_number"])
-                    cache_key = f"multipart:{object_id_str}:part:{part_num}"
+                    cache_key = f"obj:{object_id_str}:part:{part_num}"
                     chunk_data = await redis_client.get(cache_key)
                     if chunk_data is None and part_num == 1:
                         # Fallback to legacy simple base for part 1
@@ -175,7 +179,8 @@ async def load_object_from_cache(
         chunks_data: list[bytes] = []
         for chunk_info in enriched_chunks:
             part_num = int(chunk_info["part_number"])
-            cache_key = f"multipart:{object_id_str}:part:{part_num}"
+            cache_key = f"obj:{object_id_str}:part:{part_num}"
+            cache_key = f"obj:{object_id_str}:part:{part_num}"
             chunk_data = await redis_client.get(cache_key)
             if chunk_data is None and part_num == 1:
                 # unified only; do not attempt legacy
@@ -183,7 +188,9 @@ async def load_object_from_cache(
             if chunk_data is None:
                 raise RuntimeError(f"Cache key missing: {cache_key}")
             with contextlib.suppress(Exception):
-                logger.info(f"GET cache assemble object_id={object_id_str} part={part_num} bytes={len(chunk_data)}")
+                logger.info(
+                    f"GET cache assemble object_id={object_id_str} part={part_num} bytes={len(chunk_data)} key={cache_key}"
+                )
             chunks_data.append(chunk_data)
 
         headers = {
@@ -213,7 +220,7 @@ async def load_object_from_cache(
 
     # Unified cache for simple objects: read part 1
     object_id_str = str(object_info["object_id"])  # type: ignore[index]
-    cache_key = f"multipart:{object_id_str}:part:1"
+    cache_key = f"obj:{object_id_str}:part:0"
     data = await redis_client.get(cache_key)
     if data is None:
         # Optional legacy fallback if present
@@ -1672,6 +1679,65 @@ async def _copy_object(
             # If CID is not yet available, return 503 and let client retry
             source_cid = (source_object.get("ipfs_cid") or "").strip()
             if not source_cid:
+                # Try unified cache for simple base bytes to avoid waiting on CID
+                try:
+                    redis_key = f"obj:{source_object['object_id']}:part:1"
+                    cached_bytes = await request.app.state.redis_client.get(redis_key)
+                except Exception:
+                    cached_bytes = None
+                if cached_bytes:
+                    file_data = cached_bytes
+                    md5_hash = hashlib.md5(file_data).hexdigest()
+                    should_encrypt = not dest_is_public
+                    s3_result = await ipfs_service.client.s3_publish(
+                        content=file_data,
+                        encrypt=should_encrypt,
+                        seed_phrase=request.state.seed_phrase,
+                        subaccount_id=request.state.account.main_account,
+                        bucket_name=destination_bucket["bucket_name"],
+                        file_name=source_object_key,
+                        store_node=config.ipfs_store_url,
+                        pin_node=config.ipfs_store_url,
+                        substrate_url=config.substrate_url,
+                        publish=(os.getenv("HIPPIUS_PUBLISH_MODE", "full") != "ipfs_only"),
+                    )
+                    ipfs_cid = s3_result.cid
+                    file_size = len(file_data)
+                    content_type = source_object["content_type"]
+                    # Create or update destination object
+                    cid_id = await utils.upsert_cid_and_get_id(db, ipfs_cid)
+                    await db.fetchrow(
+                        get_query("upsert_object_with_cid"),
+                        object_id,
+                        destination_bucket["bucket_id"],
+                        destination_object_key,
+                        cid_id,
+                        file_size,
+                        content_type,
+                        created_at,
+                        json.dumps({}),
+                        md5_hash,
+                    )
+                    # Prepare the XML response
+                    root = ET.Element("CopyObjectResult")
+                    etag = ET.SubElement(root, "ETag")
+                    etag.text = md5_hash
+                    last_modified = ET.SubElement(root, "LastModified")
+                    last_modified.text = format_s3_timestamp(created_at)
+                    xml_response = ET.tostring(
+                        root,
+                        encoding="utf-8",
+                        xml_declaration=True,
+                    )
+                    return Response(
+                        content=xml_response,
+                        media_type="application/xml",
+                        status_code=200,
+                        headers={
+                            "ETag": f'"{md5_hash}"',
+                            "x-amz-ipfs-cid": ipfs_cid,
+                        },
+                    )
                 return create_xml_error_response(
                     "ServiceUnavailable",
                     "Source object is not yet available for copying. Please retry shortly.",
@@ -1679,7 +1745,7 @@ async def _copy_object(
                 )
 
             # Download file from source bucket with source encryption
-            file_data: bytes = await ipfs_service.download_file(
+            src_bytes: bytes = await ipfs_service.download_file(
                 cid=source_cid,
                 subaccount_id=request.state.account.main_account,
                 bucket_name=source_bucket_name,
@@ -1687,12 +1753,12 @@ async def _copy_object(
             )
 
             # Calculate MD5 hash for ETag compatibility
-            md5_hash = hashlib.md5(file_data).hexdigest()
+            md5_hash = hashlib.md5(src_bytes).hexdigest()
 
             # Re-encrypt for destination bucket
             should_encrypt = not dest_is_public
             s3_result = await ipfs_service.client.s3_publish(
-                content=file_data,
+                content=src_bytes,
                 encrypt=should_encrypt,
                 seed_phrase=request.state.seed_phrase,
                 subaccount_id=request.state.account.main_account,  # Publish under destination bucket
@@ -1705,7 +1771,7 @@ async def _copy_object(
             )
 
             ipfs_cid = s3_result.cid
-            file_size = len(file_data)
+            file_size = len(src_bytes)
             content_type = source_object["content_type"]
 
             # Create new metadata for destination
@@ -1921,8 +1987,8 @@ async def put_object(
         logger.info(f"PUT {bucket_name}/{object_key}: size={len(file_data)}, md5={md5_hash}")
         object_id = str(uuid.uuid4())
         should_encrypt = not bucket["is_public"]
-        # Unified cache: write part 1 to multipart:{object_id}:part:1
-        redis_key = f"multipart:{object_id}:part:1"
+        # Unified cache: write part 1 to obj:{object_id}:part:1
+        redis_key = f"obj:{object_id}:part:1"
         await redis_client.set(redis_key, file_data)
         logger.info(f"PUT cache unified write object_id={object_id} part=1 bytes={len(file_data)} key={redis_key}")
 
@@ -2010,11 +2076,11 @@ async def put_object(
 
         try:
             placeholder_cid = "pending"
-            await _upsert_cid(db, placeholder_cid)
+            placeholder_cid_id = await _upsert_cid(db, placeholder_cid)
             await db.execute(
                 """
-                INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (upload_id, part_number) DO NOTHING
                 """,
                 str(uuid.uuid4()),
@@ -2024,6 +2090,8 @@ async def put_object(
                 int(file_size),
                 md5_hash,
                 created_at,
+                object_id,
+                placeholder_cid_id,
             )
         except Exception:
             # Non-fatal; GET can still serve from cache, and append path will backfill if needed
@@ -2200,12 +2268,22 @@ async def head_object(
         try:
             obj_id_str = str(result["object_id"])  # type: ignore[index]
             # Fast path: check part 1
-            has_cache = await request.app.state.redis_client.exists(f"multipart:{obj_id_str}:part:1")
+            # Probe any existing part key for this object to infer cache presence
+            has_cache = False
+            try:
+                _cursor, _keys = await request.app.state.redis_client.scan(
+                    cursor=0,
+                    match=f"obj:{obj_id_str}:part:*",
+                    count=1,
+                )
+                has_cache = bool(_keys)
+            except Exception:
+                has_cache = False
             if not has_cache:
                 # Fallback: scan for any multipart part key (cheap, single-batch)
                 cursor, keys = await request.app.state.redis_client.scan(
                     cursor=0,
-                    match=f"multipart:{obj_id_str}:part:*",
+                    match=f"obj:{obj_id_str}:part:*",
                     count=1,
                 )
                 has_cache = bool(keys)
@@ -2369,12 +2447,12 @@ async def get_object(
                 for r in part_rows:
                     pn = int(r[0])
                     cid = (r[1] or "").strip()
-                    if (not cid) and pn == 1:
+                    if (not cid or cid.lower() in {"none", "pending"}) and pn == 1:
                         # Fallback to simple/base CID from object if available
                         base_cid = (object_info.get("ipfs_cid") or object_info.get("simple_cid") or "").strip()  # type: ignore[index]
                         cid = base_cid
                     sz = int(r[2] or 0)
-                    if cid:
+                    if cid and cid.lower() not in {"none", "pending"}:
                         refreshed_chunks.append({"part_number": pn, "cid": cid, "size_bytes": sz})
                 # If fewer than expected parts, allow brief wait for parts table to catch up
                 # For simple uploads, 1 part is sufficient; for true multipart there can be more.
@@ -2472,10 +2550,9 @@ async def get_object(
         has_cache = False
         try:
             obj_id_str = str(object_info["object_id"])
-            part1 = await request.app.state.redis_client.exists(f"multipart:{obj_id_str}:part:1")
-            # Heuristic: if any higher part exists, we also consider cache warm
-            part2 = await request.app.state.redis_client.exists(f"multipart:{obj_id_str}:part:2")
-            has_cache = bool(part1 or part2)
+            # Consider cache warm if any part exists
+            _c, _keys = await request.app.state.redis_client.scan(cursor=0, match=f"obj:{obj_id_str}:part:*", count=1)
+            has_cache = bool(_keys)
         except Exception:
             pass
         # Decide strategy honoring explicit read-mode header
@@ -2493,8 +2570,8 @@ async def get_object(
             else:
                 try:
                     obj_id_str = str(object_info["object_id"])  # type: ignore[index]
-                    has_part1 = await request.app.state.redis_client.exists(f"multipart:{obj_id_str}:part:1")
-                    has_part2 = await request.app.state.redis_client.exists(f"multipart:{obj_id_str}:part:2")
+                    has_part1 = await request.app.state.redis_client.exists(f"obj:{obj_id_str}:part:1")
+                    has_part2 = await request.app.state.redis_client.exists(f"obj:{obj_id_str}:part:2")
                     get_from_cache = bool(has_part1 or has_part2)
                 except Exception:
                     # Fall back to previous decision
@@ -2520,9 +2597,11 @@ async def get_object(
             if not force_pipeline:
                 try:
                     obj_id_str = str(object_info["object_id"])
-                    has_part1 = await request.app.state.redis_client.exists(f"multipart:{obj_id_str}:part:1")
-                    has_part2 = await request.app.state.redis_client.exists(f"multipart:{obj_id_str}:part:2")
-                    if has_part1 or has_part2:
+                    # Override to cache if any part exists in unified cache
+                    _c2, _keys2 = await request.app.state.redis_client.scan(
+                        cursor=0, match=f"obj:{obj_id_str}:part:*", count=1
+                    )
+                    if _keys2:
                         logger.info(f"GET override to cache due to unified cache presence: {bucket_name}/{object_key}")
                         return await load_object_from_cache(
                             redis_client=request.app.state.redis_client,
@@ -2730,20 +2809,35 @@ async def get_object(
             )
             await asyncio.sleep(delay_seconds)
 
-        # In pipeline_only, if no chunks were present initially, re-evaluate manifest after delay
-        if force_pipeline and not chunks:
+        # In pipeline_only, if no chunks or any placeholder CIDs were present initially,
+        # re-evaluate manifest after delay (pinner may have populated CIDs).
+        def _has_placeholder_chunks(_chunks: list[ChunkToDownload]) -> bool:
             try:
-                # Try parts first
-                part_rows = await db.fetch(
-                    "SELECT part_number, ipfs_cid, size_bytes FROM parts WHERE object_id = $1 ORDER BY part_number",
-                    object_info["object_id"],
-                )
-                refreshed_chunks2: list[dict] = [
-                    {"part_number": int(r[0]), "cid": (r[1] or "").strip(), "size_bytes": int(r[2] or 0)}
-                    for r in part_rows
-                    if (r[1] or "").strip()
-                ]
-                if not refreshed_chunks2:
+                for _c in _chunks:
+                    _cid = str(_c.cid or "").strip().lower()
+                    if _cid in {"", "none", "pending"}:
+                        return True
+            except Exception:
+                return True
+            return False
+
+        if force_pipeline and (not chunks or _has_placeholder_chunks(chunks)):
+            try:
+                refreshed_chunks2: list[dict] = []
+                # Retry loop up to ~5s to allow pinner to set CIDs
+                for _ in range(300):
+                    # Try parts first
+                    part_rows = await db.fetch(
+                        "SELECT part_number, ipfs_cid, size_bytes FROM parts WHERE object_id = $1 ORDER BY part_number",
+                        object_info["object_id"],
+                    )
+                    refreshed_chunks2 = [
+                        {"part_number": int(r[0]), "cid": (r[1] or "").strip(), "size_bytes": int(r[2] or 0)}
+                        for r in part_rows
+                        if (r[1] or "").strip() and str(r[1]).strip().lower() not in {"none", "pending"}
+                    ]
+                    if refreshed_chunks2:
+                        break
                     # Fall back to single-part using object CID if available now
                     base_cid_now = await db.fetchval(
                         "SELECT c.cid FROM objects o JOIN cids c ON o.cid_id = c.id WHERE o.object_id = $1",
@@ -2757,6 +2851,8 @@ async def get_object(
                                 "size_bytes": int(object_info.get("size_bytes") or 0),  # type: ignore[index]
                             }
                         ]
+                        break
+                    await asyncio.sleep(0.1)
                 if refreshed_chunks2:
                     # Rebuild ChunkToDownload list and enqueue
                     chunks = []
@@ -2803,9 +2899,7 @@ async def get_object(
                 if not force_pipeline:
                     try:
                         obj_id_str = str(object_info["object_id"])  # unified cache
-                        cached = await request.app.state.redis_client.get(
-                            f"multipart:{obj_id_str}:part:{chunk.part_id}"
-                        )
+                        cached = await request.app.state.redis_client.get(f"obj:{obj_id_str}:part:{chunk.part_id}")
                         if cached:
                             await request.app.state.redis_client.set(chunk.redis_key, cached, ex=300)
                             break
@@ -2853,7 +2947,7 @@ async def get_object(
                 except RuntimeError:
                     # Last-resort: try unified cache directly
                     obj_id_str = str(object_info["object_id"])  # unified cache
-                    cached = await request.app.state.redis_client.get(f"multipart:{obj_id_str}:part:{chunk.part_id}")
+                    cached = await request.app.state.redis_client.get(f"obj:{obj_id_str}:part:{chunk.part_id}")
                     if cached is None:
                         raise
                     chunk_data = cached

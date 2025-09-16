@@ -50,7 +50,7 @@ async def get_all_chunk_ids(
     for part in parts:
         chunk = Chunk(
             id=part["part_id"],
-            redis_key=f"multipart:{upload_id}:part:{part['part_number']}",
+            redis_key=f"obj:{upload_id}:part:{part['part_number']}",
         )
         chunks.append(chunk)
 
@@ -303,7 +303,7 @@ async def get_all_cached_chunks(
     redis_client: Redis,
 ):
     try:
-        keys_pattern = f"multipart:{upload_id}:part:*"
+        keys_pattern = f"obj:{upload_id}:part:*"
         return await redis_client.keys(keys_pattern)
     except Exception as e:
         logger.error(f"Failed to find any cached parts for {upload_id=}: {e}")
@@ -521,7 +521,7 @@ async def upload_part(
 
     # Cache raw part data for concatenation at completion (no IPFS upload for parts)
     redis_client = request.app.state.redis_client
-    part_key = f"multipart:{upload_id}:part:{part_number}"
+    part_key = f"obj:{upload_id}:part:{part_number}"
 
     try:
         # Check if client is still connected before proceeding
@@ -655,7 +655,7 @@ async def abort_multipart_upload(
         )
         if parts:
             redis_client = request.app.state.redis_client
-            redis_keys_to_delete = [f"multipart:{upload_id}:part:{part['part_number']}" for part in parts]
+            redis_keys_to_delete = [f"obj:{upload_id}:part:{part['part_number']}" for part in parts]
             if redis_keys_to_delete:
                 await redis_client.delete(
                     *redis_keys_to_delete,
@@ -999,7 +999,7 @@ async def complete_multipart_upload(
                 chunks=[
                     Chunk(
                         id=part["part_number"],
-                        redis_key=f"multipart:{upload_id}:part:{part['part_number']}",
+                        redis_key=f"obj:{upload_id}:part:{part['part_number']}",
                     )
                     for part in parts
                 ],

@@ -16,6 +16,7 @@ from hippius_sdk.substrate import FileInput
 # Add parent directory to path to import hippius_s3 modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.ipfs_service import IPFSService
 from hippius_s3.queue import Chunk
@@ -109,7 +110,7 @@ async def _process_simple_upload(
         )
 
     # Keep cache for a while to ensure immediate consistency on reads (unified multipart)
-    await redis_client.expire(f"multipart:{payload.object_id}:part:1", _CACHE_TTL_SECONDS)
+    await redis_client.expire(f"obj:{payload.object_id}:part:1", _CACHE_TTL_SECONDS)
 
     return s3_result
 
@@ -121,9 +122,16 @@ async def _process_multipart_chunk(
     ipfs_service: IPFSService,
     redis_client: async_redis.Redis,
 ) -> tuple[S3PublishPin, Chunk]:
-    chunk_data = await redis_client.get(chunk.redis_key)
+    obj_cache = RedisObjectPartsCache(redis_client)
+    # Derive part_number from key to drive both read and DB updates
+    import re as _re
+
+    m = _re.search(r":part:(\d+)$", chunk.redis_key)
+    part_number_db = int(m.group(1)) if m else chunk.id
+
+    chunk_data = await obj_cache.get(payload.object_id, part_number_db)
     if not chunk_data:
-        raise ValueError(f"Multipart chunk not found for key: {chunk.redis_key}")
+        raise ValueError(f"Multipart chunk not found for object_id={payload.object_id} part={part_number_db}")
 
     # Debug: compute md5 and show first/last bytes for validation
     import hashlib as _hashlib
@@ -132,8 +140,7 @@ async def _process_multipart_chunk(
     md5_pre = _hashlib.md5(chunk_data).hexdigest()
     head_hex = chunk_data[:8].hex() if chunk_data else ""
     tail_hex = chunk_data[-8:].hex() if len(chunk_data) >= 8 else head_hex
-    m = _re.search(r":part:(\d+)$", chunk.redis_key)
-    part_number_db = int(m.group(1)) if m else chunk.id
+    # part_number_db already computed above
     logger.debug(
         f"Redis multipart read: part={part_number_db} key={chunk.redis_key} len={len(chunk_data)} "
         f"md5={md5_pre} head8={head_hex} tail8={tail_hex}"
@@ -204,7 +211,6 @@ async def _process_multipart_upload(
     import re as _re
 
     for s3_result, chunk in chunk_results:
-        # Derive authoritative part_number from redis_key to avoid any client-side mismatch
         m = _re.search(r":part:(\d+)$", chunk.redis_key)
         part_number_db = int(m.group(1)) if m else chunk.id
         if part_number_db != chunk.id:
@@ -263,8 +269,11 @@ async def _process_multipart_upload(
     )
 
     # Keep per-chunk caches for a while; GETs may still be assembling from cache
+    obj_cache = RedisObjectPartsCache(redis_client)
     for _, chunk in chunk_results:
-        await redis_client.expire(chunk.redis_key, _CACHE_TTL_SECONDS)
+        m = _re.search(r":part:(\d+)$", chunk.redis_key)
+        part_number_db = int(m.group(1)) if m else chunk.id
+        await obj_cache.expire(payload.object_id, part_number_db, ttl=_CACHE_TTL_SECONDS)
 
     return [result[0] for result in chunk_results], manifest_result
 
