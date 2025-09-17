@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from dataclasses import dataclass
 from typing import Any
 from typing import AsyncGenerator
 
@@ -87,6 +88,19 @@ def get_redis_accounts(request: Request) -> async_redis.Redis:
 def get_object_reader(request: Request) -> ObjectReader:
     """Provide an ObjectReader service configured with app Config."""
     return ObjectReader(request.app.state.config)
+
+
+@dataclass
+class RequestContext:
+    main_account_id: str
+    seed_phrase: str
+
+
+def get_request_context(request: Request) -> RequestContext:
+    """Lightweight context extracted from request.state for passing to services."""
+    main_account_id = getattr(request.state.account, "main_account", "") or ""
+    seed_phrase = getattr(request.state, "seed_phrase", "")
+    return RequestContext(main_account_id=main_account_id, seed_phrase=seed_phrase)
 
 
 def get_user_repo(db: Any = None):

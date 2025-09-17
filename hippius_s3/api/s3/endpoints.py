@@ -2,7 +2,6 @@
 
 import asyncio
 import contextlib
-import hashlib
 import json
 import logging
 import uuid
@@ -16,35 +15,40 @@ from fastapi import Request
 from fastapi import Response
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer
-from hippius_sdk.errors import HippiusIPFSError
-from hippius_sdk.errors import HippiusSubstrateError
 from lxml import etree as ET
 
 from hippius_s3 import dependencies
 from hippius_s3 import utils
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.bucket_policy_endpoint import get_bucket_policy as policy_get_bucket_policy
+from hippius_s3.api.s3.bucket_policy_endpoint import set_bucket_policy as policy_set_bucket_policy
+from hippius_s3.api.s3.bucket_tagging_endpoint import get_bucket_tags as tags_get_bucket_tags
 from hippius_s3.api.s3.copy_object_endpoint import handle_copy_object
-from hippius_s3.api.s3.extensions.append import _upsert_cid  # reuse CID upsert helper
-from hippius_s3.api.s3.extensions.append import handle_append
+from hippius_s3.api.s3.delete_object_endpoint import handle_delete_object
 from hippius_s3.api.s3.get_object_endpoint import handle_get_object
 from hippius_s3.api.s3.head_object_endpoint import handle_head_object
+from hippius_s3.api.s3.list_buckets_endpoint import handle_list_buckets
+from hippius_s3.api.s3.list_objects_endpoint import handle_list_objects
 from hippius_s3.api.s3.multipart import list_parts_internal
 from hippius_s3.api.s3.multipart import upload_part
+from hippius_s3.api.s3.put_object_endpoint import handle_put_object
 from hippius_s3.api.s3.range_utils import calculate_chunks_for_range
 from hippius_s3.api.s3.range_utils import extract_range_from_chunks
 from hippius_s3.api.s3.range_utils import parse_range_header
+from hippius_s3.api.s3.tagging_endpoint import delete_object_tags as tags_delete_object_tags
+from hippius_s3.api.s3.tagging_endpoint import get_object_tags as tags_get_object_tags
+from hippius_s3.api.s3.tagging_endpoint import set_object_tags as tags_set_object_tags
 from hippius_s3.cache import RedisDownloadChunksCache
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
+from hippius_s3.dependencies import RequestContext
 from hippius_s3.dependencies import get_object_reader
-from hippius_s3.queue import Chunk
+from hippius_s3.dependencies import get_request_context
 from hippius_s3.queue import ChunkToDownload
 from hippius_s3.queue import DownloadChainRequest
-from hippius_s3.queue import SimpleUploadChainRequest
 from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import enqueue_download_request
 from hippius_s3.queue import enqueue_unpin_request
-from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.services.manifest_service import ManifestService
 from hippius_s3.services.object_reader import ObjectReader
 from hippius_s3.utils import get_query
@@ -424,59 +428,10 @@ def create_xml_error_response(
 
 @router.get("/", status_code=200)
 async def list_buckets(
-    request: Request,
+    ctx: RequestContext = Depends(get_request_context),
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
 ) -> Response:
-    """
-    List user's buckets using S3 protocol (GET /).
-
-    This endpoint is compatible with the S3 protocol used by MinIO and other S3 clients.
-    Returns only buckets owned by the authenticated user.
-    """
-    try:
-        # List only buckets owned by this main account
-        results = await db.fetch(get_query("list_user_buckets"), request.state.account.main_account)
-
-        root = ET.Element(
-            "ListAllMyBucketsResult",
-            xmlns="http://s3.amazonaws.com/doc/2006-03-01/",
-        )
-
-        owner = ET.SubElement(root, "Owner")
-        owner_id = ET.SubElement(owner, "ID")
-        owner_id.text = "hippius-s3-ipfs-gateway"
-        display_name = ET.SubElement(owner, "DisplayName")
-        display_name.text = "hippius-s3"
-
-        buckets = ET.SubElement(root, "Buckets")
-
-        for row in results:
-            bucket = ET.SubElement(buckets, "Bucket")
-            name = ET.SubElement(bucket, "Name")
-            name.text = row["bucket_name"]
-
-            creation_date = ET.SubElement(bucket, "CreationDate")
-            creation_date.text = format_s3_timestamp(row["created_at"])
-
-        xml_content = ET.tostring(
-            root,
-            encoding="UTF-8",
-            xml_declaration=True,
-            pretty_print=True,
-        )
-
-        return Response(
-            content=xml_content,
-            media_type="application/xml",
-        )
-
-    except Exception:
-        logger.exception("Error listing buckets via S3 protocol")
-        return create_xml_error_response(
-            "InternalError",
-            "We encountered an internal error. Please try again.",
-            status_code=500,
-        )
+    return await handle_list_buckets(ctx, db)
 
 
 @router.get("/{bucket_name}/", status_code=200, include_in_schema=True)
@@ -506,80 +461,7 @@ async def get_bucket(
     # If the tagging query parameter is present, this is a bucket tags request
     if "tagging" in request.query_params:
         logger.info(f"Handling tagging request for bucket {bucket_name}")
-
-        try:
-            # Get bucket for this main account
-            bucket = await db.fetchrow(
-                get_query("get_bucket_by_name_and_owner"), bucket_name, request.state.account.main_account
-            )
-
-            if not bucket:
-                # For S3 compatibility, return XML error for non-existent buckets
-                return errors.s3_error_response(
-                    code="NoSuchBucket",
-                    message=f"The specified bucket {bucket_name} does not exist",
-                    status_code=404,
-                    BucketName=bucket_name,
-                )
-
-            # Create Tagging XML response
-            root = ET.Element("Tagging", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
-            tag_set = ET.SubElement(root, "TagSet")
-
-            # Get tags from the bucket
-            tags = bucket.get("tags", {})
-            if isinstance(tags, str):
-                tags = json.loads(tags)
-
-            # If no tags present, S3 returns
-            if not tags:
-                return errors.s3_error_response(
-                    code="NoSuchTagSet",
-                    message="The TagSet does not exist",
-                    status_code=404,
-                    BucketName=bucket_name,
-                )
-
-            # Add tags to the XML response
-            for key, value in tags.items():
-                tag = ET.SubElement(tag_set, "Tag")
-                key_elem = ET.SubElement(tag, "Key")
-                key_elem.text = key
-                value_elem = ET.SubElement(tag, "Value")
-                value_elem.text = str(value)
-
-            # Generate XML with proper declaration
-            xml_content = ET.tostring(
-                root,
-                encoding="UTF-8",
-                xml_declaration=True,
-                pretty_print=True,
-            )
-
-            # Generate request ID for tracing
-            request_id = str(uuid.uuid4())
-
-            logger.debug(f"Bucket tags response content length: {len(xml_content)}")
-
-            # Return formatted response
-            return Response(
-                content=xml_content,
-                media_type="application/xml",
-                status_code=200,
-                headers={
-                    "Content-Type": "application/xml; charset=utf-8",
-                    "Content-Length": str(len(xml_content)),
-                    "x-amz-request-id": request_id,
-                },
-            )
-
-        except Exception as e:
-            logger.exception(f"Error getting bucket tags: {e}")
-            return errors.s3_error_response(
-                code="InternalError",
-                message="We encountered an internal error. Please try again.",
-                status_code=500,
-            )
+        return await tags_get_bucket_tags(bucket_name, db, request.state.account.main_account)
 
     # If the lifecycle query parameter is present, this is a bucket lifecycle request
     if "lifecycle" in request.query_params:
@@ -600,126 +482,11 @@ async def get_bucket(
 
     # If the policy query parameter is present, this is a bucket policy request
     if "policy" in request.query_params:
-        return await get_bucket_policy(bucket_name, db, request.state.account.main_account)
+        ctx = get_request_context(request)
+        return await policy_get_bucket_policy(bucket_name, db, ctx.main_account_id)
 
-    try:
-        # Get bucket for this main account
-        bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
-            bucket_name,
-            request.state.account.main_account,
-        )
-
-        if not bucket:
-            return create_xml_error_response(
-                "NoSuchBucket",
-                f"The specified bucket {bucket_name} does not exist",
-                status_code=404,
-                BucketName=bucket_name,
-            )
-
-        bucket_id = bucket["bucket_id"]
-        prefix = request.query_params.get(
-            "prefix",
-            None,
-        )
-
-        query = get_query("list_objects")
-        results = await db.fetch(
-            query,
-            bucket_id,
-            prefix,
-        )
-
-        # Create XML using lxml for better compatibility with MinIO client
-        root = ET.Element(
-            "ListBucketResult",
-            xmlns="http://s3.amazonaws.com/doc/2006-03-01/",
-        )
-
-        name = ET.SubElement(root, "Name")
-        name.text = bucket_name
-
-        prefix_elem = ET.SubElement(root, "Prefix")
-        prefix_elem.text = prefix or ""
-
-        marker = ET.SubElement(root, "Marker")
-        marker.text = ""
-
-        max_keys = ET.SubElement(root, "MaxKeys")
-        max_keys.text = "1000"
-
-        is_truncated = ET.SubElement(root, "IsTruncated")
-        is_truncated.text = "false"
-
-        # Add content objects
-        for obj in results:
-            content = ET.SubElement(root, "Contents")
-
-            key = ET.SubElement(content, "Key")
-            key.text = obj["object_key"]
-
-            last_modified = ET.SubElement(content, "LastModified")
-            last_modified.text = format_s3_timestamp(obj["created_at"])
-
-            etag = ET.SubElement(content, "ETag")
-            # Use MD5 hash as ETag for AWS CLI compatibility, fallback to CID if not available
-            etag.text = obj["md5_hash"]
-
-            size = ET.SubElement(content, "Size")
-            size.text = str(obj["size_bytes"])
-
-            # Use StorageClass based on whether object is multipart
-            storage_class = ET.SubElement(content, "StorageClass")
-            storage_class.text = "multipart" if obj.get("multipart") else "standard"
-
-            # Use Owner for IPFS CID and account ID
-            owner = ET.SubElement(content, "Owner")
-            owner_id = ET.SubElement(owner, "ID")
-            owner_display_name = ET.SubElement(owner, "DisplayName")
-
-            ipfs_cid = obj.get("ipfs_cid")
-            if ipfs_cid and ipfs_cid.strip():
-                owner_id.text = ipfs_cid
-            else:
-                owner_id.text = "pending"
-            owner_display_name.text = request.state.account.main_account  # Account ID of bucket owner
-
-        xml_content = ET.tostring(
-            root,
-            encoding="UTF-8",
-            xml_declaration=True,
-            pretty_print=True,
-        )
-
-        # Add custom headers with IPFS CID count and status summary
-        total_objects = len(results)
-        objects_with_cid = sum(1 for obj in results if obj.get("ipfs_cid"))
-        status_counts = {}
-        for obj in results:
-            status = obj.get("status", "unknown")
-            status_counts[status] = status_counts.get(status, 0) + 1
-
-        return Response(
-            content=xml_content,
-            media_type="application/xml",
-            headers={
-                "x-amz-bucket-objects-total": str(total_objects),
-                "x-amz-bucket-objects-with-cid": str(objects_with_cid),
-                "x-amz-bucket-objects-pending": str(total_objects - objects_with_cid),
-                "x-amz-bucket-status-publishing": str(status_counts.get("publishing", 0)),
-                "x-amz-bucket-status-pinning": str(status_counts.get("pinning", 0)),
-                "x-amz-bucket-status-uploaded": str(status_counts.get("uploaded", 0)),
-            },
-        )
-
-    except Exception:
-        logger.exception("Error listing bucket objects via S3 protocol")
-        return create_xml_error_response(
-            "InternalError",
-            "We encountered an internal error. Please try again.",
-            status_code=500,
-        )
+    ctx = get_request_context(request)
+    return await handle_list_objects(bucket_name, ctx, db, request.query_params.get("prefix"))
 
 
 async def delete_bucket_tags(
@@ -1642,7 +1409,7 @@ async def put_object(
 
     if "tagging" in request.query_params:
         # If tagging is in query params, handle object tagging
-        return await set_object_tags(
+        return await tags_set_object_tags(
             bucket_name,
             object_key,
             request,
@@ -1662,192 +1429,14 @@ async def put_object(
             redis_client=redis_client,
         )
 
-    try:
-        # Get or create user and bucket for this main account
-        main_account_id = request.state.account.main_account
-        await db.fetchrow(
-            get_query("get_or_create_user_by_main_account"),
-            main_account_id,
-            datetime.now(UTC),
-        )
-
-        bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
-            bucket_name,
-            main_account_id,
-        )
-
-        if not bucket:
-            return create_xml_error_response(
-                "NoSuchBucket",
-                f"The specified bucket {bucket_name} does not exist",
-                status_code=404,
-                BucketName=bucket_name,
-            )
-
-        bucket_id = bucket["bucket_id"]
-
-        # Read request body properly handling chunked encoding
-        incoming_bytes = await get_request_body(request)
-        content_type = request.headers.get("Content-Type", "application/octet-stream")
-
-        # Detect S4 append semantics via metadata
-        meta_append = request.headers.get("x-amz-meta-append", "").lower() == "true"
-        if meta_append:
-            return await handle_append(
-                request,
-                db,
-                ipfs_service,
-                redis_client,
-                bucket=bucket,
-                bucket_id=bucket_id,
-                bucket_name=bucket_name,
-                object_key=object_key,
-                incoming_bytes=incoming_bytes,
-            )
-
-        # Regular non-append PutObject path
-        file_data = incoming_bytes
-        file_size = len(file_data)
-        md5_hash = hashlib.md5(file_data).hexdigest()
-        logger.info(f"PUT {bucket_name}/{object_key}: size={len(file_data)}, md5={md5_hash}")
-        object_id = str(uuid.uuid4())
-        should_encrypt = not bucket["is_public"]
-        # Unified cache: write part 0 via repository
-        await RedisObjectPartsCache(redis_client).set(object_id, 0, file_data)
-        logger.info(f"PUT cache unified write object_id={object_id} part=0 bytes={len(file_data)}")
-
-        await enqueue_upload_request(
-            payload=SimpleUploadChainRequest(
-                substrate_url=config.substrate_url,
-                ipfs_node=config.ipfs_store_url,
-                address=request.state.account.main_account,
-                subaccount=request.state.account.main_account,
-                subaccount_seed_phrase=request.state.seed_phrase,
-                bucket_name=bucket_name,
-                object_key=object_key,
-                should_encrypt=should_encrypt,
-                object_id=object_id,
-                chunk=Chunk(
-                    id=0,
-                ),
-            ),
-            redis_client=redis_client,
-        )
-
-        created_at = datetime.now(UTC)
-
-        metadata = {}
-        for key, value in request.headers.items():
-            if key.lower().startswith("x-amz-meta-"):
-                meta_key = key[11:]
-                # Do not persist append control metadata as user metadata
-                if meta_key not in {"append", "append-id", "append-if-version"}:
-                    metadata[meta_key] = value
-
-        # Capture previous object (to clean up multipart parts if overwriting)
-        prev = await db.fetchrow(
-            get_query("get_object_by_path"),
-            bucket_id,
-            object_key,
-        )
-
-        async with db.transaction():
-            await db.fetchrow(
-                get_query("upsert_object_basic"),
-                object_id,
-                bucket_id,
-                object_key,
-                content_type,
-                json.dumps(metadata),
-                md5_hash,
-                file_size,
-                created_at,
-            )
-
-            # If overwriting a previous multipart object, remove stale parts
-            try:
-                if prev and (prev.get("multipart") or False):
-                    await db.execute("DELETE FROM parts WHERE object_id = $1", prev["object_id"])  # type: ignore[index]
-            except Exception:
-                logger.debug("Failed to cleanup previous parts on overwrite", exc_info=True)
-
-        # Mark as multipart and create a provisional manifest row for part 0 with placeholder CID
-        await db.execute(
-            "UPDATE objects SET multipart = TRUE WHERE object_id = $1",
-            object_id,
-        )
-        try:
-            upload_row = await db.fetchrow(
-                get_query("create_multipart_upload"),
-                uuid.UUID(object_id),
-                bucket_id,
-                object_key,
-                created_at,
-                content_type,
-                json.dumps(metadata),
-                created_at,
-            )
-            upload_id = upload_row["upload_id"] if upload_row else uuid.UUID(object_id)
-        except Exception:
-            # Best effort: if creation fails because exists, try to reuse existing row
-            upload_row = await db.fetchrow(
-                "SELECT upload_id FROM multipart_uploads WHERE bucket_id = $1 AND object_key = $2 ORDER BY initiated_at DESC LIMIT 1",
-                bucket_id,
-                object_key,
-            )
-            upload_id = upload_row["upload_id"] if upload_row else uuid.UUID(object_id)
-
-        try:
-            placeholder_cid = "pending"
-            placeholder_cid_id = await _upsert_cid(db, placeholder_cid)
-            await db.execute(
-                """
-                INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                ON CONFLICT (upload_id, part_number) DO NOTHING
-                """,
-                str(uuid.uuid4()),
-                upload_id,
-                0,
-                placeholder_cid,
-                int(file_size),
-                md5_hash,
-                created_at,
-                object_id,
-                placeholder_cid_id,
-            )
-        except Exception:
-            # Non-fatal; GET can still serve from cache, and append path will backfill if needed
-            pass
-
-        return Response(
-            status_code=200,
-            headers={
-                "ETag": f'"{md5_hash}"',
-            },
-        )
-
-    except Exception as e:
-        logger.exception("Error uploading object")
-        if isinstance(e, HippiusIPFSError):
-            return create_xml_error_response(
-                "InternalError",
-                f"IPFS upload failed: {str(e)}",
-                status_code=500,
-            )
-        if isinstance(e, HippiusSubstrateError):
-            return create_xml_error_response(
-                "InternalError",
-                f"Blockchain publishing failed: {str(e)}",
-                status_code=500,
-            )
-
-        return create_xml_error_response(
-            "InternalError",
-            "We encountered an internal error. Please try again.",
-            status_code=500,
-        )
+    return await handle_put_object(
+        bucket_name=bucket_name,
+        object_key=object_key,
+        request=request,
+        db=db,
+        ipfs_service=ipfs_service,
+        redis_client=redis_client,
+    )
 
 
 async def _get_object_with_permissions(
@@ -1967,7 +1556,7 @@ async def get_object(
     )
     # If tagging is in query params, handle object tags request
     if "tagging" in request.query_params:
-        return await get_object_tags(
+        return await tags_get_object_tags(
             bucket_name,
             object_key,
             db,
@@ -2486,7 +2075,7 @@ async def delete_object(
         )
     # If tagging is in query params, handle deleting object tags
     if "tagging" in request.query_params:
-        return await delete_object_tags(
+        return await tags_delete_object_tags(
             bucket_name,
             object_key,
             db,
@@ -2494,111 +2083,13 @@ async def delete_object(
             request.state.account.main_account,
         )
 
-    try:
-        # Get user for user-scoped bucket lookup
-        user = await db.fetchrow(
-            get_query("get_or_create_user_by_main_account"),
-            request.state.account.main_account,
-            datetime.now(UTC),
-        )
-
-        bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
-            bucket_name,
-            user["main_account_id"],
-        )
-
-        if not bucket:
-            # For S3 compatibility, return an XML error response
-            return create_xml_error_response(
-                "NoSuchBucket",
-                f"The specified bucket {bucket_name} does not exist",
-                status_code=404,
-                BucketName=bucket_name,
-            )
-
-        bucket_id = bucket["bucket_id"]
-        result = await db.fetchrow(
-            get_query("get_object_by_path"),
-            bucket_id,
-            object_key,
-        )
-
-        if not result:
-            # S3 returns 204 even if the object doesn't exist, so no error here
-            return Response(status_code=204)
-
-        # Use the user already retrieved above
-
-        if not user:
-            logger.warning(f"User not found when trying to delete object {object_key}")
-            return create_xml_error_response(
-                "AccessDenied",
-                f"You do not have permission to delete object {object_key}",
-                status_code=403,
-                Key=object_key,
-            )
-
-        # Delete the object and check if user has permission
-        deleted_object = await db.fetchrow(
-            get_query("delete_object"),
-            bucket_id,
-            object_key,
-            user["main_account_id"],  # Add user_id parameter for permission check
-        )
-
-        if not deleted_object:
-            logger.warning(f"User {user['user_id']} tried to delete object {object_key} without permission")
-            return create_xml_error_response(
-                "AccessDenied",
-                f"You do not have permission to delete object {object_key}",
-                status_code=403,
-                Key=object_key,
-            )
-
-        # Clean up any provisional multipart uploads for this object key to avoid bucket delete blocking
-        try:
-            await db.execute(
-                "DELETE FROM multipart_uploads WHERE bucket_id = $1 AND object_key = $2 AND is_completed = FALSE",
-                bucket_id,
-                object_key,
-            )
-        except Exception:
-            logger.debug("Failed to cleanup provisional multipart uploads on object delete", exc_info=True)
-
-        # Only enqueue unpin if object has a valid CID
-        cid = deleted_object.get("ipfs_cid") or ""
-        if cid and cid.strip():
-            await enqueue_unpin_request(
-                payload=UnpinChainRequest(
-                    substrate_url=config.substrate_url,
-                    ipfs_node=config.ipfs_store_url,
-                    address=request.state.account.main_account,
-                    subaccount=request.state.account.main_account,
-                    subaccount_seed_phrase=request.state.seed_phrase,
-                    bucket_name=bucket_name,
-                    object_key=object_key,
-                    should_encrypt=not bucket["is_public"],
-                    cid=cid,
-                    object_id=str(deleted_object["object_id"]),
-                ),
-                redis_client=redis_client,
-            )
-            logger.info(f"Enqueued unpin request for deleted object {object_key} with CID {cid}")
-        else:
-            logger.info(f"Skipped unpin for deleted object {object_key} - no CID available")
-
-        return Response(
-            status_code=204,
-        )
-
-    except Exception:
-        logger.exception("Error deleting object")
-        return create_xml_error_response(
-            "InternalError",
-            "We encountered an internal error. Please try again.",
-            status_code=500,
-        )
+    return await handle_delete_object(
+        bucket_name=bucket_name,
+        object_key=object_key,
+        request=request,
+        db=db,
+        redis_client=redis_client,
+    )
 
 
 async def set_bucket_policy(
@@ -2606,90 +2097,7 @@ async def set_bucket_policy(
     request: Request,
     db: dependencies.DBConnection,
 ) -> Response:
-    """
-    Set bucket policy to make bucket public (PUT /{bucket_name}?policy).
-
-    This allows transitioning a private bucket to public (one-way only).
-    Validates that bucket is empty and not already public.
-    """
-    try:
-        main_account_id = request.state.account.main_account
-
-        # Get bucket for this main account
-        bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
-            bucket_name,
-            main_account_id,
-        )
-
-        if not bucket:
-            return create_xml_error_response(
-                "NoSuchBucket",
-                f"The specified bucket {bucket_name} does not exist",
-                status_code=404,
-                BucketName=bucket_name,
-            )
-
-        # Check if bucket is already public
-        if bucket["is_public"]:
-            return create_xml_error_response(
-                "PolicyAlreadyExists",
-                "The bucket policy already exists and bucket is public",
-                status_code=409,
-                BucketName=bucket_name,
-            )
-
-        # Check if bucket has objects
-        if not await bucket_is_empty(bucket["bucket_id"], db):
-            return create_xml_error_response(
-                "BucketNotEmpty",
-                "Cannot make bucket public: bucket contains objects",
-                status_code=409,
-                BucketName=bucket_name,
-            )
-
-        # Parse and validate policy
-        policy_data = await get_request_body(request)
-        if not policy_data:
-            return create_xml_error_response(
-                "MalformedPolicy",
-                "Policy document is empty",
-                status_code=400,
-            )
-
-        try:
-            policy_json = json.loads(policy_data.decode("utf-8"))
-        except json.JSONDecodeError:
-            return create_xml_error_response(
-                "MalformedPolicy",
-                "Policy document is not valid JSON",
-                status_code=400,
-            )
-
-        # Validate it's a public read policy
-        if not await validate_public_policy(policy_json, bucket_name):
-            return create_xml_error_response(
-                "InvalidPolicyDocument",
-                "Policy document is invalid or not a public read policy",
-                status_code=400,
-            )
-
-        # Update bucket to public
-        await db.fetchrow(
-            "UPDATE buckets SET is_public = TRUE WHERE bucket_id = $1",
-            bucket["bucket_id"],
-        )
-
-        logger.info(f"Bucket '{bucket_name}' set to public via policy")
-        return Response(status_code=204)
-
-    except Exception as e:
-        logger.exception(f"Error setting bucket policy: {e}")
-        return create_xml_error_response(
-            "InternalError",
-            "We encountered an internal error. Please try again.",
-            status_code=500,
-        )
+    return await policy_set_bucket_policy(bucket_name, request, db)
 
 
 async def get_bucket_policy(
@@ -2697,62 +2105,7 @@ async def get_bucket_policy(
     db: dependencies.DBConnection,
     main_account_id: str,
 ) -> Response:
-    """
-    Get bucket policy (GET /{bucket_name}?policy).
-
-    Returns the policy for public buckets, or error for private buckets.
-    """
-    try:
-        # Get bucket for this main account
-        bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
-            bucket_name,
-            main_account_id,
-        )
-
-        if not bucket:
-            return create_xml_error_response(
-                "NoSuchBucket",
-                f"The specified bucket {bucket_name} does not exist",
-                status_code=404,
-                BucketName=bucket_name,
-            )
-
-        # If bucket is not public, no policy exists
-        if not bucket["is_public"]:
-            return create_xml_error_response(
-                "NoSuchBucketPolicy",
-                "The bucket policy does not exist",
-                status_code=404,
-                BucketName=bucket_name,
-            )
-
-        # Return standard public read policy
-        policy = {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Principal": "*",
-                    "Action": ["s3:GetObject"],
-                    "Resource": [f"arn:aws:s3:::{bucket_name}/*"],
-                }
-            ],
-        }
-
-        return Response(
-            content=json.dumps(policy, indent=2),
-            media_type="application/json",
-            status_code=200,
-        )
-
-    except Exception as e:
-        logger.exception(f"Error getting bucket policy: {e}")
-        return create_xml_error_response(
-            "InternalError",
-            "We encountered an internal error. Please try again.",
-            status_code=500,
-        )
+    return await policy_get_bucket_policy(bucket_name, db, main_account_id)
 
 
 async def validate_public_policy(policy: dict, bucket_name: str) -> bool:
