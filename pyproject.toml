@@ -117,10 +117,6 @@ module = "hippius_s3.api.s3.multipart"
 disallow_untyped_defs = false
 disable_error_code = ["attr-defined", "no-untyped-def", "misc", "return-value"]
 
-[[tool.mypy.overrides]]
-module = "hippius_s3.api.s3.endpoints"
-disallow_untyped_defs = false
-disable_error_code = ["attr-defined", "no-untyped-def", "var-annotated", "misc", "assignment", "return", "call-arg", "union-attr", "index", "no-any-return"]
 
 [[tool.mypy.overrides]]
 module = "hippius_s3.queue"

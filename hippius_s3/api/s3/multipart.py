@@ -419,23 +419,7 @@ async def upload_part(
         # Prefer unified cache via ObjectReader, fallback to IPFS through service
         source_bytes = None
         try:
-            from hippius_s3.services.object_reader import ObjectInfo
-
-            src_info = ObjectInfo(
-                object_id=str(source_obj["object_id"]),
-                bucket_name=source_bucket_name,
-                object_key=source_object_key,
-                size_bytes=int(source_obj["size_bytes"]),
-                content_type=source_obj["content_type"],
-                md5_hash=source_obj["md5_hash"],
-                created_at=source_obj["created_at"],
-                metadata=source_obj.get("metadata") or {},
-                multipart=bool(source_obj.get("multipart")),
-                should_decrypt=False,
-                simple_cid=source_obj.get("ipfs_cid"),
-                upload_id=source_obj.get("upload_id"),
-            )
-            source_bytes = await object_reader.read_base_bytes(db, request.app.state.redis_client, src_info)
+            source_bytes = await request.app.state.obj_cache.get(str(source_obj["object_id"]), 0)
         except Exception as e:
             logger.debug(f"ObjectReader cache base read miss: {e}")
             # Fallback: try unified object-parts cache directly (part 0)

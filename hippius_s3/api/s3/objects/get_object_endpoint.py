@@ -17,6 +17,7 @@ from hippius_s3.api.s3.common import parse_read_mode
 from hippius_s3.api.s3.range_utils import parse_range_header
 from hippius_s3.config import get_config
 from hippius_s3.services.manifest_service import ManifestService
+from hippius_s3.services.object_reader import DownloadNotReadyError
 from hippius_s3.services.object_reader import ObjectInfo as ORObjectInfo
 from hippius_s3.services.object_reader import ObjectReader
 from hippius_s3.services.object_reader import Range as ORRange
@@ -191,6 +192,15 @@ async def handle_get_object(
             code=e.code,
             message=e.message,
             status_code=e.status_code,
+        )
+
+    except DownloadNotReadyError:
+        # Map initial stream readiness timeout to 503 SlowDown-like response
+        return errors.s3_error_response(
+            code="SlowDown",
+            message="Object not ready for download yet. Please retry.",
+            status_code=503,
+            extra_headers={"Retry-After": "1"},
         )
 
     except Exception as e:

@@ -12,6 +12,8 @@ services:
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
       - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
+    volumes:
+      - .:/app
 
   pinner:
     env_file: []
@@ -42,6 +44,7 @@ services:
       - .:/app
 
   downloader:
+    command: ["python", "workers/run_downloader_in_loop.py"]
     env_file: []
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable

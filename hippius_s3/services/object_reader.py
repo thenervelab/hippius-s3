@@ -17,14 +17,16 @@ from hippius_s3.api.s3.common import build_headers
 from hippius_s3.api.s3.range_utils import calculate_chunks_for_range
 from hippius_s3.api.s3.range_utils import extract_range_from_chunks
 from hippius_s3.cache import ObjectPartsCache
-from hippius_s3.cache import RedisDownloadChunksCache
-from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.queue import ChunkToDownload
 from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import enqueue_download_request
 from hippius_s3.services.caching.cache_assembler import assemble_from_cache
 from hippius_s3.services.manifest_service import ManifestService
 from hippius_s3.utils import get_query
+
+
+class DownloadNotReadyError(Exception):
+    pass
 
 
 @dataclass
@@ -112,87 +114,75 @@ class ObjectReader:
         layout = [{"part_number": p.part_number, "size_bytes": p.size_bytes} for p in parts]
         return filtered, layout
 
-    async def read_base_bytes(self, db: Any, redis: Any, info: ObjectInfo, *, strict_pipeline: bool = False) -> bytes:
-        """Return base bytes for simple reads (append/copy), preferring cache, with pipeline fallback."""
-        # Try unified cache first
-        try:
-            data = await RedisObjectPartsCache(redis).get(info.object_id, 0)
-            if data:
-                return data
-        except Exception:
-            pass
-
-        if strict_pipeline:
-            # Require object-level CID
-            base_cid = await db.fetchval(
-                "SELECT c.cid FROM objects o JOIN cids c ON o.cid_id = c.id WHERE o.object_id = $1",
-                info.object_id,
-            )
-            if not base_cid:
-                base_cid = await db.fetchval("SELECT ipfs_cid FROM objects WHERE object_id = $1", info.object_id)
-            if not base_cid:
-                raise RuntimeError("object_not_ready")
-            # The caller (endpoint) should use IPFSService to fetch by CID if needed.
-            raise RuntimeError("pipeline_fetch_required")
-
-        # As a last resort, try object-level CID and expect the caller to fetch via IPFSService.
-        raise RuntimeError("pipeline_fetch_required")
-
-    async def enqueue_and_wait(
+    async def hydrate_object_cache(
         self,
         redis: Any,
+        obj_cache: ObjectPartsCache,
         info: ObjectInfo,
         parts: list[Part],
-        request_uuid: str,
         *,
         address: str,
-        subaccount: str,
         seed_phrase: str,
-        max_checks: int,
+    ) -> tuple[set[int], list[Part]]:
+        """Ensure required parts are present in obj: cache by copying existing bytes or queueing pipeline.
+
+        Returns (satisfied_from_cache_part_numbers, missing_for_pipeline_parts).
+        """
+        satisfied_from_cache: set[int] = set()
+        missing_for_pipeline: list[Part] = []
+
+        # Stage 1: check obj: presence; no per-request duplication
+        for p in parts:
+            try:
+                data = await obj_cache.get(info.object_id, int(p.part_number))
+                if data is not None:
+                    satisfied_from_cache.add(int(p.part_number))
+                else:
+                    missing_for_pipeline.append(p)
+            except Exception:
+                # On any error, fall back to pipeline for this part
+                missing_for_pipeline.append(p)
+
+        # Stage 2: enqueue only for missing parts (guard with a flag per part)
+        if missing_for_pipeline:
+            dl_parts = [ChunkToDownload(cid=p.cid, part_id=p.part_number) for p in missing_for_pipeline if p.cid]
+            req = DownloadChainRequest(
+                request_id=f"{info.object_id}::shared",
+                object_id=info.object_id,
+                object_key=info.object_key,
+                bucket_name=info.bucket_name,
+                address=address,
+                subaccount=address,
+                subaccount_seed_phrase=seed_phrase,
+                substrate_url=self.config.substrate_url,
+                ipfs_node=self.config.ipfs_get_url,
+                should_decrypt=info.should_decrypt,
+                size=info.size_bytes,
+                multipart=info.multipart,
+                chunks=dl_parts,
+            )
+            # Per-part guard to avoid duplicate enqueue storms
+            for chunk in dl_parts:
+                flag_key = f"download_in_progress:{info.object_id}:{int(chunk.part_id)}"
+                set_flag = await redis.set(flag_key, "1", nx=True, ex=300)
+                if set_flag:
+                    await enqueue_download_request(req, redis)
+
+        return satisfied_from_cache, missing_for_pipeline
+
+    async def verify_etags(
+        self, db: Any, info: ObjectInfo, parts: list[Part], obj_cache: ObjectPartsCache, redis: Any, request_uuid: str
     ) -> None:
-        dl_parts = [ChunkToDownload(cid=p.cid, part_id=p.part_number) for p in parts if p.cid]
-        req = DownloadChainRequest(
-            request_id=request_uuid,
-            object_id=info.object_id,
-            object_key=info.object_key,
-            bucket_name=info.bucket_name,
-            address=address,
-            subaccount=subaccount,
-            subaccount_seed_phrase=seed_phrase,
-            substrate_url=self.config.substrate_url,
-            ipfs_node=self.config.ipfs_get_url,
-            should_decrypt=info.should_decrypt,
-            size=info.size_bytes,
-            multipart=info.multipart,
-            chunks=dl_parts,
-        )
-        flag_key = f"download_in_progress:{request_uuid}"
-        set_flag = await redis.set(flag_key, "1", nx=True, ex=300)
-        if set_flag:
-            await enqueue_download_request(req, redis)
-
-        # Wait until all chunks are in Redis
-        dl_cache = RedisDownloadChunksCache(redis)
-        for p in dl_parts:
-            for _ in range(max_checks):
-                if await dl_cache.exists(info.object_id, request_uuid, int(p.part_id)):
-                    break
-                await asyncio.sleep(self.config.http_download_sleep_loop)
-            else:
-                raise RuntimeError(f"missing_chunk_{p.part_id}")
-
-    async def verify_etags(self, db: Any, info: ObjectInfo, parts: list[Part], redis: Any, request_uuid: str) -> None:
         if not info.upload_id:
             return
         rows = await db.fetch(get_query("get_parts_etags"), info.upload_id)
         if not rows:
             return
         expected = {int(r["part_number"]): r["etag"].split("-")[0] for r in rows}
-        dl_cache = RedisDownloadChunksCache(redis)
         for p in parts:
             if p.part_number not in expected:
                 continue
-            data = await dl_cache.get(info.object_id, request_uuid, int(p.part_number))
+            data = await obj_cache.get(info.object_id, int(p.part_number))
             if data is None:
                 raise RuntimeError("integrity_missing_chunk")
             md5 = hashlib.md5(data).hexdigest()
@@ -206,9 +196,11 @@ class ObjectReader:
         needed = calculate_chunks_for_range(rng.start, rng.end, layout)
         return [p for p in parts if p.part_number in needed]
 
-    async def _get_chunk_from_redis(self, redis: Any, object_id: str, request_id: str, chunk: ChunkToDownload) -> bytes:
+    async def _get_chunk_from_redis(
+        self, redis: Any, obj_cache: ObjectPartsCache, object_id: str, request_id: str, chunk: ChunkToDownload
+    ) -> bytes:
         for _ in range(self.config.http_redis_get_retries):
-            data = await RedisDownloadChunksCache(redis).get(object_id, request_id, int(chunk.part_id))
+            data = await obj_cache.get(object_id, int(chunk.part_id))
             if data:
                 return data
             await asyncio.sleep(self.config.http_download_sleep_loop)
@@ -226,10 +218,9 @@ class ObjectReader:
         address: str,
         seed_phrase: str,
     ) -> Response:
-        # Decide cache vs pipeline
+        # Probe whether any cache exists (for source header only)
         has_cache = False
         try:
-            # Consider either base(0) or bootstrap(1) as cache-present
             has_cache = bool((await obj_cache.exists(info.object_id, 0)) or (await obj_cache.exists(info.object_id, 1)))
         except Exception:
             has_cache = False
@@ -305,9 +296,6 @@ class ObjectReader:
 
         parts, layout = await self.plan_parts_for_range(db, info, rng)
         parts = [p for p in parts if p.cid and str(p.cid).strip().lower() not in {"", "none", "pending"}]
-        request_id = f"{info.object_id}_{address}"
-        if rng is not None:
-            request_id += f"_{rng.start}_{rng.end}"
 
         # Wait for required CIDs
         try:
@@ -335,31 +323,30 @@ class ObjectReader:
                 parts = [Part(part_number=0, cid=str(base_cid), size_bytes=info.size_bytes)]
 
         parts = sorted(parts, key=lambda p: p.part_number)
-
-        # Probe base bytes in cache to optionally prepend in pipeline streaming when base CID is missing
-        base_bytes: bytes | None = None
-        try:
-            base_bytes = await obj_cache.get(info.object_id, 0)
-        except Exception:
-            base_bytes = None
-
-        await self.enqueue_and_wait(
+        # Proactively enqueue missing parts; then we will wait per-part while streaming
+        satisfied_from_cache, missing_for_pipeline = await self.hydrate_object_cache(
             redis,
+            obj_cache,
             info,
             parts,
-            request_id,
             address=address,
-            subaccount=address,
             seed_phrase=seed_phrase,
-            max_checks=self.config.http_redis_get_retries,
         )
 
         # Range response
         if rng is not None:
 
             async def gen_range() -> AsyncGenerator[bytes, None]:
-                dl = [ChunkToDownload(cid=p.cid, part_id=p.part_number) for p in parts]
-                data_chunks = [await self._get_chunk_from_redis(redis, info.object_id, request_id, c) for c in dl]
+                # Wait per-part in order and collect then slice
+                data_chunks: list[bytes] = []
+                for _idx, p in enumerate(parts):
+                    # wait on obj: for this part
+                    while True:
+                        data = await obj_cache.get(info.object_id, int(p.part_number))
+                        if data is not None:
+                            data_chunks.append(data)
+                            break
+                        await asyncio.sleep(self.config.http_download_sleep_loop)
                 data = extract_range_from_chunks(
                     data_chunks, rng.start, rng.end, layout, [p.part_number for p in parts]
                 )
@@ -376,25 +363,53 @@ class ObjectReader:
 
         # Full response
         async def gen_full() -> AsyncGenerator[bytes, None]:
-            # If base part is not in planned parts but exists in cache, yield it first
-            planned_part_numbers = {p.part_number for p in parts}
-            if 0 not in planned_part_numbers and base_bytes is not None and rng is None:
-                yield base_bytes
-            dl = [ChunkToDownload(cid=p.cid, part_id=p.part_number) for p in parts]
-            for c in dl:
-                yield await self._get_chunk_from_redis(redis, info.object_id, request_id, c)
+            for p in parts:
+                while True:
+                    data = await obj_cache.get(info.object_id, int(p.part_number))
+                    if data is not None:
+                        yield data
+                        break
+                    await asyncio.sleep(self.config.http_download_sleep_loop)
 
-        # If we are augmenting with cache base, mark source as cache
-        source_header = (
-            "cache"
-            if (base_bytes is not None and (0 not in {p.part_number for p in parts}) and rng is None)
-            else ("cache" if has_cache else "pipeline")
-        )
+        all_satisfied_without_pipeline = len(missing_for_pipeline) == 0 and (has_cache or len(satisfied_from_cache) > 0)
+        source_header = "cache" if all_satisfied_without_pipeline else "pipeline"
         _md = info.metadata
         if isinstance(_md, str):
             try:
                 _md = json.loads(_md)
             except Exception:
                 _md = {}
+        # Preflight diagnostics and wait: first part must be ready within timeout
+        import time as _time
+
+        if parts:
+            try:
+                present_flags = []
+                for pp in parts:
+                    try:
+                        present_flags.append(
+                            (pp.part_number, bool(await obj_cache.exists(info.object_id, int(pp.part_number))))
+                        )
+                    except Exception:
+                        present_flags.append((pp.part_number, False))
+                with contextlib.suppress(Exception):
+                    self._logger.info(
+                        f"READ-PREFLIGHT object_id={info.object_id} parts={[p.part_number for p in parts]} exists={present_flags}"
+                    )
+            except Exception:
+                pass
+            first_part = parts[0]
+            deadline = _time.time() + float(self.config.http_stream_initial_timeout_seconds)
+            while True:
+                if (await obj_cache.get(info.object_id, int(first_part.part_number))) is not None:
+                    break
+                if _time.time() > deadline:
+                    with contextlib.suppress(Exception):
+                        self._logger.info(
+                            f"READ-PREFLIGHT-TIMEOUT object_id={info.object_id} first_part={first_part.part_number}"
+                        )
+                    raise DownloadNotReadyError("initial_stream_timeout")
+                await asyncio.sleep(self.config.http_download_sleep_loop)
+
         headers = build_headers(dataclasses.asdict(info), source=source_header, metadata=_md)
         return StreamingResponse(gen_full(), media_type=info.content_type, headers=headers)

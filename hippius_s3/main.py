@@ -22,6 +22,7 @@ from hippius_s3.api.middlewares.frontend_hmac import verify_frontend_hmac_middle
 from hippius_s3.api.middlewares.profiler import SpeedscopeProfilerMiddleware
 from hippius_s3.api.middlewares.rate_limit import RateLimitService
 from hippius_s3.api.middlewares.rate_limit import rate_limit_wrapper
+from hippius_s3.api.s3 import errors as s3_errors
 from hippius_s3.api.s3.multipart import router as multipart_router
 from hippius_s3.api.s3.router import router as s3_router_new
 from hippius_s3.api.user import router as user_router
@@ -172,6 +173,20 @@ app.middleware("http")(cors_middleware)
 if config.enable_request_profiling:
     # 9. Profiler (executes FIRST - outermost layer, profiles entire request including auth)
     app.add_middleware(SpeedscopeProfilerMiddleware)
+
+
+# Map streaming readiness failures to S3 503 error
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):  # type: ignore[no-untyped-def]
+    # Handle preflight stream readiness failures from ObjectReader
+    if exc.__class__.__name__ == "DownloadNotReadyError" or str(exc) in {"initial_stream_timeout"}:
+        return s3_errors.s3_error_response(
+            code="SlowDown",
+            message="Object not ready for download yet. Please retry.",
+            status_code=503,
+        )
+    # Let FastAPI default handler deal with others
+    raise exc
 
 
 @app.get("/robots.txt", include_in_schema=False)

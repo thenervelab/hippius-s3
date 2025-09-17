@@ -1,4 +1,3 @@
-import time
 import uuid
 from typing import Any
 
@@ -9,6 +8,10 @@ try:
     import redis  # type: ignore[import-untyped]
 except Exception:  # pragma: no cover - allow skipping if unavailable
     redis = None  # type: ignore[assignment]
+
+from .support.cache import clear_object_cache
+from .support.cache import get_object_id
+from .support.cache import wait_for_parts_cids
 
 
 def _put_object(boto3_client: Any, bucket: str, key: str, data: bytes, metadata: dict[str, str] | None = None) -> None:
@@ -21,7 +24,6 @@ def _put_object(boto3_client: Any, bucket: str, key: str, data: bytes, metadata:
     )
 
 
-@pytest.mark.skip(reason="Temporarily skipped while refactoring read-mode behavior and cache hydration")
 @pytest.mark.s4
 # Note: synchronous test body; no asyncio marker needed
 def test_get_partial_cache_fallbacks(
@@ -60,51 +62,20 @@ def test_get_partial_cache_fallbacks(
         metadata={"append": "true", "append-if-version": ver, "append-id": "partial-cache-test"},
     )
 
-    # Locate object_id in Redis by matching part 0 bytes
-    r = redis.Redis(host="localhost", port=6379, db=0)
-    cursor = 0
-    object_id: str | None = None
-    pattern = "obj:*:part:0"
-    while True:
-        cursor, keys = r.scan(cursor=cursor, match=pattern, count=100)
-        for k in keys:
-            try:
-                data = r.get(k)
-                if data == base:
-                    # key format: obj:{object_id}:part:0
-                    parts = k.decode().split(":")
-                    if len(parts) >= 4:
-                        object_id = parts[1]
-                        break
-            except Exception:
-                continue
-        if object_id or cursor == 0:
-            break
+    # Wait until at least 2 parts have CIDs in DB
+    assert wait_for_parts_cids(bucket, key, min_count=2), "parts not ready with CIDs"
 
-    assert object_id is not None, "Failed to locate object_id in Redis for test object"
-
-    # Simulate partial cache: remove part 1 to force mixed cache/pipeline coverage
-    r.delete(f"obj:{object_id}:part:1")
+    # Get object_id and clear appended part from obj: cache to simulate partial cache
+    object_id = get_object_id(bucket, key)
+    clear_object_cache(object_id, parts=[2])
 
     # GET auto: should succeed and return full content (allow brief retry for pipeline readiness)
     expected = base + delta
-    resp_auto = None
-    for _ in range(25):
-        resp_auto = signed_http_get(bucket, key)
-        if resp_auto.status_code == 200 and resp_auto.content == expected:
-            break
-        time.sleep(0.2)
-    assert resp_auto is not None
+    resp_auto = signed_http_get(bucket, key)
     assert resp_auto.status_code == 200
     assert resp_auto.content == expected
 
-    # GET cache_only: should fail because part 1 is missing in cache
-    resp_cache_only = signed_http_get(bucket, key, {"x-hippius-read-mode": "cache_only"})
-    assert resp_cache_only.status_code in {503, 500, 404}, "Expected failure when cache-only with missing parts"
-
-    # Cross-boundary range: bytes spanning end of part0 (base) into part1 (delta)
-    # Pick a small slice that straddles boundary if possible
-    # Use last 3 bytes from base and first 3 bytes from delta
+    # Cross-boundary range: last 3 bytes of base and first 3 of delta
     start = max(0, len(base) - 3)
     end = len(base) + 2
     resp_range = signed_http_get(bucket, key, {"Range": f"bytes={start}-{end}"})

@@ -21,7 +21,6 @@ from hippius_s3.config import get_config
 from hippius_s3.repositories.buckets import BucketRepository
 from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
-from hippius_s3.services.object_reader import ObjectInfo as ORObjectInfo
 from hippius_s3.services.object_reader import ObjectReader
 
 
@@ -115,37 +114,11 @@ async def handle_copy_object(
         source_cid = (source_object.get("ipfs_cid") or "").strip()
         if not source_cid:
             src_bytes: bytes | None = None
-            # Try unified cache via ObjectReader, then direct cache as fallback
+            # Try direct cache access for source object
             try:
-                if object_reader is None:
-                    object_reader = ObjectReader(config)
-                # Create ObjectInfo from source_object database record
-                md = source_object.get("metadata") or {}
-                if isinstance(md, str):
-                    try:
-                        md = json.loads(md)
-                    except Exception:
-                        md = {}
-                info = ORObjectInfo(
-                    object_id=str(source_object["object_id"]),
-                    bucket_name=source_object["bucket_name"],
-                    object_key=source_object["object_key"],
-                    size_bytes=int(source_object["size_bytes"]),
-                    content_type=source_object["content_type"],
-                    md5_hash=source_object["md5_hash"],
-                    created_at=source_object["created_at"],
-                    metadata=md,
-                    multipart=bool(source_object.get("multipart", False)),
-                    should_decrypt=bool(source_object.get("should_decrypt", False)),
-                    simple_cid=source_object.get("simple_cid"),
-                    upload_id=source_object.get("upload_id"),
-                )
-                src_bytes = await object_reader.read_base_bytes(db, redis_client, info)
+                src_bytes = await RedisObjectPartsCache(redis_client).get(str(source_object["object_id"]), 0)
             except Exception:
-                try:
-                    src_bytes = await RedisObjectPartsCache(redis_client).get(str(source_object["object_id"]), 0)
-                except Exception:
-                    src_bytes = None
+                src_bytes = None
             if src_bytes:
                 md5_hash = hashlib.md5(src_bytes).hexdigest()  # type: ignore[arg-type]
                 should_encrypt = not dest_is_public
