@@ -179,7 +179,7 @@ async def get_all_storage_requests(
         result = client.substrate.query_map(module="IpfsPallet", storage_function="UserStorageRequests")
 
         storage_requests = {}
-        for key, value in result:
+        for key, _value in result:
             try:
                 # Handle double map key (owner_account_id, file_hash)
                 if isinstance(key, (tuple, list)) and len(key) >= 2:
@@ -197,7 +197,7 @@ async def get_all_storage_requests(
                         try:
                             gateway_url = "https://get.hippius.network"
                             url = f"{gateway_url}/ipfs/{storage_request_cid}"
-                            response = await http_client.get(url, timeout=15.0)
+                            response = await http_client.get(url)
 
                             if response.status_code == 200:
                                 storage_data = response.json()

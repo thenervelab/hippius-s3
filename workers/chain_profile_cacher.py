@@ -41,12 +41,12 @@ async def get_all_unique_users(
     return [row["main_account_id"] for row in users]
 
 
-async def fetch_profile_content(http_client: httpx.AsyncClient, cid: str, timeout: float = 15.0) -> dict:
+async def fetch_profile_content(http_client: httpx.AsyncClient, cid: str) -> dict:
     """Fetch user profile JSON content from IPFS gateway with timeout."""
     try:
         gateway_url = "https://get.hippius.network"
         url = f"{gateway_url}/ipfs/{cid}"
-        response = await http_client.get(url, timeout=timeout)
+        response = await http_client.get(url)
 
         if response.status_code == 200:
             profile_data = response.json()
