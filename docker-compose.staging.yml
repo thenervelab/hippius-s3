@@ -1,0 +1,15 @@
+services:
+  api:
+    environment:
+      - HIPPIUS_ENVIRONMENT=staging
+      - DEBUG=false
+      - UVICORN_LOG_LEVEL=info
+
+  db:
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=hippius
+
+volumes:
+  postgres_data:
