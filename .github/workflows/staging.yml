@@ -1,0 +1,83 @@
+name: Deploy to Staging
+
+on:
+  push:
+    branches: [ staging ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up SSH
+      uses: webfactory/ssh-agent@v0.8.0
+      with:
+        ssh-private-key: ${{ secrets.STAGING_SSH_KEY }}
+
+    - name: Setup known hosts
+      run: |
+        mkdir -p ~/.ssh
+        ssh-keyscan -H ${{ secrets.STAGING_IP }} >> ~/.ssh/known_hosts
+        ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+
+    - name: Debug Repository URL
+      run: |
+        echo "Repository URL: ${{ github.server_url }}/${{ github.repository }}.git"
+        echo "SSH URL: git@github.com:${{ github.repository }}.git"
+
+    - name: Deploy to staging
+      env:
+        STAGING_IP: ${{ secrets.STAGING_IP }}
+        STAGING_USER: ${{ secrets.STAGING_USER }}
+        STAGING_PATH: ${{ secrets.STAGING_PATH }}
+        STAGING_DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
+        REPO_URL: "git@github.com:${{ github.repository }}.git"
+      run: |
+        # Deploy directly via SSH commands
+        ssh ${STAGING_USER}@${STAGING_IP} << EOF
+          set -e
+          echo "Deploying Hippius-S3 to staging server..."
+
+          # Debug info
+          echo "Using repo URL: ${REPO_URL}"
+
+          # Make sure the deployment path exists
+          mkdir -p ${STAGING_PATH}
+          cd ${STAGING_PATH} || { echo "Failed to change to deployment path"; exit 1; }
+
+          # Check if this is a git repository
+          if [ ! -d ".git" ]; then
+            echo "No git repository found. Initializing..."
+            # Clone the repository if it's not already there
+            git clone -b staging ${REPO_URL} .
+          else
+            echo "Updating git repository..."
+            # Try to pull latest changes
+            git fetch origin staging
+            git checkout staging || git checkout -b staging origin/staging
+            git pull origin staging
+          fi
+
+          echo "Building and starting Docker containers with staging config..."
+          docker compose -f docker-compose.yml -f docker-compose.staging.yml down || true
+          docker compose -f docker-compose.yml -f docker-compose.staging.yml build --no-cache
+          docker compose -f docker-compose.yml -f docker-compose.staging.yml up -d
+
+          echo "Waiting for database to be ready..."
+          sleep 10
+
+          echo "Running database migrations..."
+          docker compose -f docker-compose.yml -f docker-compose.staging.yml exec -T api dbmate up
+
+          echo "Staging deployment completed successfully!"
+
+    - name: Verify staging deployment
+      env:
+        STAGING_IP: ${{ secrets.STAGING_IP }}
+        STAGING_USER: ${{ secrets.STAGING_USER }}
+        STAGING_PATH: ${{ secrets.STAGING_PATH }}
+      run: |
+        ssh ${STAGING_USER}@${STAGING_IP} "cd ${STAGING_PATH} && docker compose -f docker-compose.yml -f docker-compose.staging.yml ps"
