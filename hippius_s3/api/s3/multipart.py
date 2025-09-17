@@ -705,8 +705,8 @@ async def abort_multipart_upload(
         )
 
 
-# Moving multipart uploads function to main endpoints.py for better routing
-# This avoids potential conflicts with other GET handlers
+# Multipart uploads function properly organized in dedicated multipart module
+# This maintains separation of concerns and avoids conflicts with other GET handlers
 
 
 async def list_multipart_uploads(

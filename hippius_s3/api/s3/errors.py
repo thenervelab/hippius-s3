@@ -51,8 +51,9 @@ def s3_error_response(
     if request_id == "":
         request_id = str(uuid.uuid4())
 
-    # Create XML using lxml for better compatibility with S3 clients
-    root = ET.Element("Error", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+    # Create XML using lxml. Avoid XML namespace for maximum boto3 compatibility
+    # (boto3 error parser expects <Error><Code>...</Code>...</Error> without a namespace)
+    root = ET.Element("Error")
 
     code_elem = ET.SubElement(root, "Code")
     code_elem.text = code

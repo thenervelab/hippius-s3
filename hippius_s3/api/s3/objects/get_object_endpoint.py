@@ -12,8 +12,8 @@ from fastapi import Request
 from fastapi import Response
 
 from hippius_s3.api.s3 import errors
-from hippius_s3.api.s3.get.req import parse_range
-from hippius_s3.api.s3.get.req import parse_read_mode
+from hippius_s3.api.s3.common import parse_range
+from hippius_s3.api.s3.common import parse_read_mode
 from hippius_s3.api.s3.range_utils import parse_range_header
 from hippius_s3.config import get_config
 from hippius_s3.services.manifest_service import ManifestService
@@ -39,7 +39,7 @@ async def handle_get_object(
     """Isolated GET object endpoint handler (extracted from endpoints.py)."""
     # If tagging is in query params, handle object tags request
     if "tagging" in request.query_params:
-        from hippius_s3.api.s3.endpoints import get_object_tags  # local import to avoid cycles
+        from hippius_s3.api.s3.objects.tagging_endpoint import get_object_tags  # local import to avoid cycles
 
         return await get_object_tags(
             bucket_name,

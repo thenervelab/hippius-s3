@@ -13,8 +13,7 @@ from typing import AsyncGenerator
 from fastapi import Response
 from fastapi.responses import StreamingResponse
 
-from hippius_s3.api.s3.get.cache_assembler import assemble_from_cache
-from hippius_s3.api.s3.get.headers import build_headers
+from hippius_s3.api.s3.common import build_headers
 from hippius_s3.api.s3.range_utils import calculate_chunks_for_range
 from hippius_s3.api.s3.range_utils import extract_range_from_chunks
 from hippius_s3.cache import ObjectPartsCache
@@ -23,6 +22,7 @@ from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.queue import ChunkToDownload
 from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import enqueue_download_request
+from hippius_s3.services.caching.cache_assembler import assemble_from_cache
 from hippius_s3.services.manifest_service import ManifestService
 from hippius_s3.utils import get_query
 

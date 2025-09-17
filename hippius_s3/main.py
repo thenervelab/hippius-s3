@@ -22,8 +22,8 @@ from hippius_s3.api.middlewares.frontend_hmac import verify_frontend_hmac_middle
 from hippius_s3.api.middlewares.profiler import SpeedscopeProfilerMiddleware
 from hippius_s3.api.middlewares.rate_limit import RateLimitService
 from hippius_s3.api.middlewares.rate_limit import rate_limit_wrapper
-from hippius_s3.api.s3.endpoints import router as s3_router
 from hippius_s3.api.s3.multipart import router as multipart_router
+from hippius_s3.api.s3.router import router as s3_router_new
 from hippius_s3.api.user import router as user_router
 from hippius_s3.cache import RedisDownloadChunksCache
 from hippius_s3.cache import RedisObjectPartsCache
@@ -211,5 +211,6 @@ Disallow: /"""
 
 
 app.include_router(user_router, prefix="/user")
-app.include_router(s3_router, prefix="")
+# Replace old s3 router with new composed router
+app.include_router(s3_router_new, prefix="")
 app.include_router(multipart_router, prefix="")
