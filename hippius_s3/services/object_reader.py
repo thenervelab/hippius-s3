@@ -233,10 +233,8 @@ class ObjectReader:
             has_cache = bool((await obj_cache.exists(info.object_id, 0)) or (await obj_cache.exists(info.object_id, 1)))
         except Exception:
             has_cache = False
-        force_pipeline = read_mode == "pipeline_only"
-        force_cache = read_mode == "cache_only"
         main_cid_missing = info.simple_cid is None
-        get_from_cache = (main_cid_missing or has_cache) and not force_pipeline or force_cache
+        get_from_cache = main_cid_missing or has_cache
 
         if get_from_cache:
             # Prefer structured assembly from cache (enriches contiguous parts beyond DB manifest)
@@ -353,9 +351,7 @@ class ObjectReader:
             address=address,
             subaccount=address,
             seed_phrase=seed_phrase,
-            max_checks=max(
-                self.config.http_redis_get_retries, 50 if force_pipeline else self.config.http_redis_get_retries
-            ),
+            max_checks=self.config.http_redis_get_retries,
         )
 
         # Range response
@@ -392,7 +388,7 @@ class ObjectReader:
         source_header = (
             "cache"
             if (base_bytes is not None and (0 not in {p.part_number for p in parts}) and rng is None)
-            else ("pipeline" if force_pipeline else ("cache" if has_cache else "pipeline"))
+            else ("cache" if has_cache else "pipeline")
         )
         _md = info.metadata
         if isinstance(_md, str):

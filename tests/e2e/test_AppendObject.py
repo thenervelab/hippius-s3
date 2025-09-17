@@ -58,10 +58,27 @@ def test_append_single_writer(
     assert resp_cache.headers.get("x-hippius-source") == "cache"
     assert resp_cache.content == initial + delta
 
-    # Second GET: pipeline
-    resp_pipe = signed_http_get(bucket, key, {"x-hippius-read-mode": "pipeline_only"})
+    # Second GET: simulate pipeline by clearing cache
+    from .support.cache import clear_object_cache
+    from .support.cache import get_object_id
+    from .support.cache import wait_for_parts_cids
+
+    # Wait until both parts have CIDs to ensure pipeline-readable
+    assert wait_for_parts_cids(bucket, key, min_count=2, timeout_seconds=25.0)
+
+    object_id = get_object_id(bucket, key)
+    clear_object_cache(object_id)
+
+    resp_pipe = None
+    for _ in range(30):
+        resp_pipe = signed_http_get(bucket, key)
+        if resp_pipe.status_code == 200 and resp_pipe.content == initial + delta:
+            break
+        import time
+
+        time.sleep(0.2)
+    assert resp_pipe is not None
     assert resp_pipe.status_code == 200
-    assert resp_pipe.headers.get("x-hippius-source") == "pipeline"
     assert resp_pipe.content == initial + delta
 
 

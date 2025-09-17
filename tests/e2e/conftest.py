@@ -186,7 +186,7 @@ def boto3_client(test_seed_phrase: str) -> Any:
 def signed_http_get(test_seed_phrase: str) -> Any:
     """Return a helper to perform SigV4-signed GET with custom headers.
 
-    Usage: signed_http_get(bucket, key, extra_headers={"x-hippius-read-mode": "pipeline_only"})
+    Usage: signed_http_get(bucket, key, extra_headers={})
     """
     import requests  # type: ignore[import-untyped]
 

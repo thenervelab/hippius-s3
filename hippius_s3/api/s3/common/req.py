@@ -6,16 +6,10 @@ from fastapi import Request
 
 
 def parse_read_mode(request: Request) -> str:
-    """Parse x-hippius-read-mode or legacy x-amz-meta-cache header.
+    """Return read mode.
 
-    Returns one of: "pipeline_only", "cache_only", or "auto".
+    For production, this is always 'auto'. Header-based modes are deprecated and ignored.
     """
-    hdr_mode = (request.headers.get("x-hippius-read-mode") or "").lower().strip()
-    if hdr_mode in {"pipeline_only", "cache_only", "auto"}:
-        return hdr_mode
-    # Back-compat: x-amz-meta-cache=true indicates cache_only
-    if (request.headers.get("x-amz-meta-cache") or "").lower().strip() == "true":
-        return "cache_only"
     return "auto"
 
 
