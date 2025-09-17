@@ -44,6 +44,7 @@ async def get_user_cids_from_db(
         AND o.multipart = FALSE
         AND o.cid_id IS NOT NULL
         AND o.status = 'uploaded'
+        AND o.created_at < NOW() - INTERVAL '1 hour'
     """,
         user,
     )
@@ -62,6 +63,7 @@ async def get_user_cids_from_db(
         AND o.multipart = TRUE
         AND o.cid_id IS NOT NULL
         AND o.status = 'uploaded'
+        AND o.created_at < NOW() - INTERVAL '1 hour'
     """,
         user,
     )
@@ -79,6 +81,7 @@ async def get_user_cids_from_db(
         WHERE b.main_account_id = $1
         AND p.cid_id IS NOT NULL
         AND o.status = 'uploaded'
+        AND o.created_at < NOW() - INTERVAL '1 hour'
     """,
         user,
     )

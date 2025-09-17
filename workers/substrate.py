@@ -205,9 +205,13 @@ async def get_all_storage_requests(
                                     for obj in storage_data:
                                         if isinstance(obj, dict) and "cid" in obj:
                                             storage_requests[account].append(obj["cid"])
-                                    logger.debug(f"Storage request {storage_request_cid}: extracted {len(storage_data)} CIDs for {account}")
+                                    logger.debug(
+                                        f"Storage request {storage_request_cid}: extracted {len(storage_data)} CIDs for {account}"
+                                    )
                             else:
-                                logger.warning(f"Failed to fetch storage request {storage_request_cid}: HTTP {response.status_code}")
+                                logger.warning(
+                                    f"Failed to fetch storage request {storage_request_cid}: HTTP {response.status_code}"
+                                )
                         except Exception as e:
                             logger.warning(f"Error fetching storage request {storage_request_cid}: {e}")
 
@@ -215,7 +219,9 @@ async def get_all_storage_requests(
                 logger.warning(f"Error processing storage request key {key}: {e}")
                 continue
 
-        logger.info(f"Fetched storage requests for {len(storage_requests)} users with total {sum(len(cids) for cids in storage_requests.values())} request CIDs")
+        logger.info(
+            f"Fetched storage requests for {len(storage_requests)} users with total {sum(len(cids) for cids in storage_requests.values())} request CIDs"
+        )
         return storage_requests
 
     except Exception as e:
@@ -255,7 +261,7 @@ async def submit_storage_request(
         raise ValueError("CID list cannot be empty")
 
     # Create FileInput objects from CIDs
-    files = [FileInput(file_hash=cid, file_name=f"s3_{cid}") for cid in cids]
+    files = [FileInput(file_hash=cid, file_name=f"s3-{cid}") for cid in cids]
 
     # Create substrate client for this request
     substrate_client = HippiusSubstrateClient(
@@ -295,7 +301,7 @@ async def submit_storage_request_for_user(
         raise ValueError("CID list cannot be empty")
 
     # Create FileInput objects from CIDs
-    files = [FileInput(file_hash=cid, file_name=f"s3_resubmission_{cid}") for cid in cids]
+    files = [FileInput(file_hash=cid, file_name=f"s3-{cid}") for cid in cids]
 
     # Create substrate client for this request
     substrate_client = HippiusSubstrateClient(
