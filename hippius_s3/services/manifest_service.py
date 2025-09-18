@@ -8,57 +8,42 @@ class ManifestService:
     @staticmethod
     async def build_initial_download_chunks(db: Any, object_info: dict) -> list[dict]:
         """
-        Build an initial manifest from the DB parts table (joined to cids), 0-based.
-        Falls back to object-level CID (via objects.cid_id then objects.ipfs_cid) to synthesize base(0) when needed.
+        Build manifest from parts table only.
+        All objects (simple, append, MPU) are represented by parts rows.
+        No object-level CID fallback used for streaming.
         """
-        # Prefer explicit parts when available; do not synthesize base(0) if any DB parts exist
         try:
-            part_rows = await db.fetch(
+            rows = await db.fetch(
                 """
-                SELECT p.part_number, COALESCE(c.cid, p.ipfs_cid) AS cid, p.size_bytes
+                SELECT p.part_number,
+                       COALESCE(c.cid, p.ipfs_cid) AS cid,
+                       p.size_bytes::bigint AS size_bytes
                 FROM parts p
                 LEFT JOIN cids c ON p.cid_id = c.id
                 WHERE p.object_id = $1
-                ORDER BY p.part_number
+                ORDER BY part_number
                 """,
                 object_info["object_id"],
             )
-            built: list[dict] = []
-            for r in part_rows:
+
+            manifest: list[dict] = []
+            for r in rows:
                 pn = int(r[0])
-                cid = (r[1] or "").strip() if isinstance(r[1], str) else str(r[1] or "").strip()
+                cid_raw = r[1]
+                cid: str | None = None
+                if cid_raw is not None:
+                    cid_str = cid_raw if isinstance(cid_raw, str) else str(cid_raw)
+                    cid_str = cid_str.strip()
+                    if cid_str and cid_str.lower() not in {"", "none", "pending"}:
+                        cid = cid_str
+
                 size = int(r[2] or 0)
-                if cid and cid.lower() not in {"none", "pending"}:
-                    built.append({"part_number": pn, "cid": cid, "size_bytes": size})
-            if built:
-                return built
-        except Exception:
-            # Fall through to object-level CID synthesis path
-            pass
+                manifest.append({"part_number": pn, "cid": cid, "size_bytes": size})
 
-        # Synthesize a single-part manifest if object-level CID exists
-        try:
-            base_cid = await db.fetchval(
-                "SELECT c.cid FROM objects o JOIN cids c ON o.cid_id = c.id WHERE o.object_id = $1",
-                object_info["object_id"],
-            )
-            if not base_cid:
-                base_cid = await db.fetchval(
-                    "SELECT ipfs_cid FROM objects WHERE object_id = $1",
-                    object_info["object_id"],
-                )
-            if base_cid and str(base_cid).strip().lower() not in {"", "none", "pending"}:
-                return [
-                    {
-                        "part_number": 0,
-                        "cid": str(base_cid),
-                        "size_bytes": int(object_info.get("size_bytes") or 0),
-                    }
-                ]
-        except Exception:
-            pass
+            return manifest
 
-        return []
+        except Exception:
+            return []
 
     @staticmethod
     async def wait_for_cids(

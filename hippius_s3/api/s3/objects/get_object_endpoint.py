@@ -207,8 +207,13 @@ async def handle_get_object(
             status_code=e.status_code,
         )
 
-    except DownloadNotReadyError:
-        # Map initial stream readiness timeout to 503 SlowDown-like response
+    except DownloadNotReadyError as e:
+        # Map download readiness issues to 503 SlowDown response
+        error_msg = str(e)
+        if "Parts not ready" in error_msg:
+            logger.warning(f"GET {bucket_name}/{object_key}: parts not ready for download: {error_msg}")
+        else:
+            logger.warning(f"GET {bucket_name}/{object_key}: download not ready: {error_msg}")
         return errors.s3_error_response(
             code="SlowDown",
             message="Object not ready for download yet. Please retry.",

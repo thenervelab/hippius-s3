@@ -215,6 +215,28 @@ docker compose -f docker-compose.yml -f docker-compose.e2e.yml down -v
 
 Note: The e2e override may enable `HIPPIUS_BYPASS_CREDIT_CHECK=true` and `HIPPIUS_PUBLISH_MODE=ipfs_only` for faster runs without chain publishing.
 
+### Benchmarking
+
+Compare AWS UploadPartCopy vs Hippius S4 Append performance:
+
+```bash
+# AWS S3 Multipart Upload with UploadPartCopy
+python hippius_s3/scripts/benchmark_copy_vs_append.py \
+    --mode aws --bucket test-bucket --size-mib 100 --part-mib 5
+
+# Hippius S4 Append operations
+python hippius_s3/scripts/benchmark_copy_vs_append.py \
+    --mode hippius --bucket test-bucket --size-mib 100 --part-mib 5 \
+    --endpoint-url http://localhost:8000
+
+# With CSV output and multiple runs
+python hippius_s3/scripts/benchmark_copy_vs_append.py \
+    --mode hippius --bucket test-bucket --size-mib 50 --part-mib 10 \
+    --repeats 5 --csv results.csv
+```
+
+The benchmark measures end-to-end latency and throughput for building objects via different copy/append mechanisms, with configurable concurrency and validation options.
+
 ## TODO Features
 
 - [ ] **Access Control Lists (ACLs)** - Fine-grained permissions

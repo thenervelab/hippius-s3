@@ -204,38 +204,7 @@ async def handle_append(
                 },
             )
 
-        # Readiness probe (only needed when converting simple->multipart)
-        str(current.get("status") or "").lower()
-        object_id_probe = str(current.get("object_id") or "")
-        has_simple_cid = bool((current.get("ipfs_cid") or "").strip())
-        has_unified_base = False
-        try:
-            if object_id_probe:
-                obj_cache = RedisObjectPartsCache(redis_client)
-                # Prefer deterministic check without scan: presence of part 0 or 1
-                has_unified_base = await obj_cache.exists(object_id_probe, 0) or await obj_cache.exists(
-                    object_id_probe, 1
-                )
-        except Exception:
-            has_unified_base = False
-
-        # Use object_id from preflight (already validated)
-
-        # If parts already exist, enforce multipart on the object row and skip base readiness
-        parts_count_existing = await db.fetchval(
-            "SELECT COUNT(*) FROM parts WHERE object_id = $1",
-            object_id,
-        )
-        is_multipart = bool(current.get("multipart")) or int(parts_count_existing or 0) > 0
-        if (not bool(current.get("multipart"))) and int(parts_count_existing or 0) > 0:
-            await db.execute("UPDATE objects SET multipart = TRUE WHERE object_id = $1", object_id)
-            with contextlib.suppress(Exception):
-                logger.info(
-                    f"APPEND enforced multipart due to existing parts object_id={object_id} parts_count={int(parts_count_existing)}"
-                )
-
-        # If object is not yet multipart, create an initial part from existing simple CID
-        # Ensure there is a backing multipart_uploads row to satisfy parts.upload_id NOT NULL
+        # Ensure multipart_uploads row exists for parts FK constraint
         upload_row = await db.fetchrow(
             "SELECT upload_id FROM multipart_uploads WHERE object_id = $1 ORDER BY initiated_at DESC LIMIT 1",
             object_id,
@@ -259,140 +228,8 @@ async def handle_append(
                 object_id,
             )
 
-        if not is_multipart:
-            with contextlib.suppress(Exception):
-                logger.info(
-                    f"APPEND readiness simple->multipart bucket={bucket_name} key={object_key} has_simple_cid={has_simple_cid} has_unified_base={has_unified_base}"
-                )
-            if not (has_simple_cid or has_unified_base):
-                return errors.s3_error_response(
-                    code="PreconditionFailed",
-                    message="Object base not ready for append.",
-                    status_code=412,
-                )
-            row = await db.fetchrow(get_query("get_object_by_path"), bucket_id, object_key)
-            simple_cid = (row.get("ipfs_cid") or "").strip() if row else ""
-            if not simple_cid:
-                # Provisional base: hydrate multipart part 1 from cache without waiting for CID
-                try:
-                    obj_cache = RedisObjectPartsCache(redis_client)
-                    base_bytes = await obj_cache.read_base_for_append(object_id)
-                    if base_bytes:
-                        logger.info(
-                            f"APPEND bootstrap multipart part=1 from unified cache object_id={object_id} bytes={len(base_bytes)}"
-                        )
-                        # Create a part 1 row referencing a provisional placeholder CID
-                        placeholder_cid = "pending"
-                        cid_id = await _upsert_cid(db, placeholder_cid)
-                        await db.execute(
-                            """
-                            INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
-                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                            ON CONFLICT (upload_id, part_number) DO NOTHING
-                            """,
-                            str(uuid.uuid4()),
-                            upload_id,
-                            1,
-                            placeholder_cid,
-                            int(current["size_bytes"] or len(base_bytes)),
-                            str(current.get("md5_hash") or ""),
-                            datetime.now(timezone.utc),
-                            object_id,
-                            cid_id,
-                        )
-                        # Mark object as multipart and cache part 1 bytes
-                        await db.execute("UPDATE objects SET multipart = TRUE WHERE object_id = $1", object_id)
-                        await RedisObjectPartsCache(redis_client).write_base_for_append(object_id, base_bytes, ttl=1800)
-                    else:
-                        return errors.s3_error_response(
-                            code="PreconditionFailed",
-                            message="Object base not in cache yet.",
-                            status_code=412,
-                        )
-                except Exception:
-                    return errors.s3_error_response(
-                        code="PreconditionFailed",
-                        message="Object base not ready.",
-                        status_code=412,
-                    )
-            # Upsert CID and create part 1 referencing existing content
-            cid_id = await _upsert_cid(db, simple_cid)
-            await db.execute(
-                """
-                INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                ON CONFLICT (upload_id, part_number) DO NOTHING
-                """,
-                str(uuid.uuid4()),
-                upload_id,
-                1,
-                simple_cid,
-                int(current["size_bytes"]),
-                str(current.get("md5_hash") or ""),
-                datetime.now(timezone.utc),
-                object_id,
-                cid_id,
-            )
-            # Mark object as multipart
-            await db.execute(
-                "UPDATE objects SET multipart = TRUE WHERE object_id = $1",
-                object_id,
-            )
-
-            # Hydrate multipart cache for part 1 from existing cache (best-effort)
-            try:
-                with contextlib.suppress(Exception):
-                    obj_cache = RedisObjectPartsCache(redis_client)
-                    base_bytes = await obj_cache.read_base_for_append(object_id)
-                    if base_bytes:
-                        logger.info(f"APPEND hydrate multipart part=1 object_id={object_id} bytes={len(base_bytes)}")
-                        await obj_cache.write_base_for_append(object_id, base_bytes, ttl=1800)
-            except Exception:
-                pass
-
-        # Ensure base part exists when object is already marked multipart but has no parts rows
-        parts_count = await db.fetchval(
-            "SELECT COUNT(*) FROM parts WHERE object_id = $1",
-            object_id,
-        )
-        if int(parts_count) == 0:
-            try:
-                obj_cache = RedisObjectPartsCache(redis_client)
-                # Debug: check cache presence for base part
-                exists_flag = await obj_cache.exists(object_id, 1)
-                logger.info(
-                    f"APPEND base-check object_id={object_id} exists={bool(exists_flag)} key={obj_cache.build_key(object_id, 1)}"
-                )
-                base_bytes = await obj_cache.read_base_for_append(object_id)
-                if base_bytes:
-                    # Create part 1 with placeholder or existing CID if available
-                    base_cid_raw = current.get("ipfs_cid")
-                    placeholder_cid = ""
-                    if isinstance(base_cid_raw, str):
-                        placeholder_cid = base_cid_raw.strip()
-                    if not placeholder_cid:
-                        placeholder_cid = "pending"
-                    cid_id = await _upsert_cid(db, placeholder_cid)
-                    base_md5 = hashlib.md5(base_bytes).hexdigest()
-                    await db.execute(
-                        """
-                        INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                        ON CONFLICT (upload_id, part_number) DO NOTHING
-                        """,
-                        str(uuid.uuid4()),
-                        upload_id,
-                        1,
-                        placeholder_cid,
-                        int(len(base_bytes)),
-                        base_md5,
-                        datetime.now(timezone.utc),
-                        object_id,
-                        cid_id,
-                    )
-                    logger.info(f"APPEND backfilled base part=1 object_id={object_id} bytes={len(base_bytes)}")
-            except Exception:
-                pass
+        # Mark object as multipart (part 0 exists from PUT, now adding more parts)
+        await db.execute("UPDATE objects SET multipart = TRUE WHERE object_id = $1", object_id)
 
         # Determine next part number
         next_part = await db.fetchval(
@@ -428,17 +265,30 @@ async def handle_append(
             placeholder_cid_id,
         )
 
-        # Recompute composite ETag from all part etags including the reserved part
+        # Recompute composite ETag from base object MD5 + all appended part etags
+        base_md5 = str(current.get("md5_hash") or "").strip()
+        if not base_md5 or len(base_md5) != 32:
+            # Fallback: compute MD5 from cache if available
+            try:
+                obj_cache = RedisObjectPartsCache(redis_client)
+                base_bytes = await obj_cache.get(object_id, 0)  # Base part is part 0
+                base_md5 = hashlib.md5(base_bytes).hexdigest() if base_bytes else "00000000000000000000000000000000"
+            except Exception:
+                base_md5 = "00000000000000000000000000000000"  # Placeholder
+
+        # Collect all part MD5s (base + appended parts)
+        md5s = [bytes.fromhex(base_md5)]
+
         parts = await db.fetch(
             "SELECT part_number, etag FROM parts WHERE object_id = $1 ORDER BY part_number",
             object_id,
         )
-        md5s = []
         for p in parts:
             e = str(p["etag"]).strip('"')  # type: ignore
             e = e.split("-")[0]  # type: ignore
             if len(e) == 32:  # type: ignore
                 md5s.append(bytes.fromhex(e))  # type: ignore
+
         combined_md5 = hashlib.md5(b"".join(md5s)).hexdigest()
         composite_etag = f"{combined_md5}-{len(md5s)}"
 

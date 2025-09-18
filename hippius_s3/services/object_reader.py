@@ -204,6 +204,81 @@ class ObjectReader:
             await asyncio.sleep(self.config.http_download_sleep_loop)
         raise RuntimeError(f"Chunk {chunk.part_id} not found in Redis")
 
+    async def _handle_pending_parts_with_cache_fallback(
+        self,
+        db: Any,
+        obj_cache: ObjectPartsCache,
+        info: ObjectInfo,
+        pending_parts: list[Part],
+        redis: Any,
+        address: str,
+        seed_phrase: str,
+    ) -> None:
+        """Handle parts with pending CIDs by falling back to cache with bounded polling."""
+        if not pending_parts:
+            return
+
+        # Check which pending parts are already available in cache (batch async)
+        existence = await asyncio.gather(*[obj_cache.exists(info.object_id, int(p.part_number)) for p in pending_parts])
+        still_pending = [p for p, exists in zip(pending_parts, existence, strict=True) if not exists]
+
+        if not still_pending:
+            # All pending parts are already in cache
+            return
+
+        # Do bounded polling for missing pending parts
+        poll_deadline = asyncio.get_event_loop().time() + 2.0  # 2 second timeout
+        poll_interval = self.config.http_download_sleep_loop
+
+        while asyncio.get_event_loop().time() < poll_deadline:
+            # Check if any missing parts have become available in cache
+            newly_available = []
+            for p in still_pending[:]:  # Copy to avoid modification during iteration
+                if await obj_cache.exists(info.object_id, int(p.part_number)):
+                    newly_available.append(p)
+                    still_pending.remove(p)
+
+            if newly_available:
+                self._logger.info(
+                    f"Pending parts became available in cache: {[(p.part_number, p.cid) for p in newly_available]}"
+                )
+
+            # Also check if any CIDs have become available (and enqueue downloads)
+            required_parts = {p.part_number for p in still_pending}
+            if required_parts:
+                # Check if CIDs have become available for any pending parts
+                cid_updates = await ManifestService.wait_for_cids(
+                    db, info.object_id, required_parts, attempts=1, interval_sec=0
+                )
+                if cid_updates:
+                    # Convert CID updates to parts and enqueue downloads
+                    cid_parts = [
+                        Part(
+                            part_number=int(c["part_number"]), cid=str(c["cid"]), size_bytes=int(c.get("size_bytes", 0))
+                        )
+                        for c in cid_updates
+                    ]
+                    await self.hydrate_object_cache(
+                        redis, obj_cache, info, cid_parts, address=address, seed_phrase=seed_phrase
+                    )
+                    # Remove from still_pending since they're now being hydrated
+                    for update in cid_updates:
+                        part_num = int(update["part_number"])
+                        still_pending = [p for p in still_pending if p.part_number != part_num]
+
+            if not still_pending:
+                # All parts are now available or being hydrated
+                break
+
+            await asyncio.sleep(poll_interval)
+
+        # If we still have pending parts after polling, they're not available
+        if still_pending:
+            self._logger.warning(
+                f"Parts still unavailable after polling: {[(p.part_number, p.cid) for p in still_pending]}"
+            )
+            raise DownloadNotReadyError(f"Parts not ready: {[p.part_number for p in still_pending]}")
+
     async def read_response(
         self,
         db: Any,
@@ -217,36 +292,8 @@ class ObjectReader:
         seed_phrase: str,
         range_was_invalid: bool = False,
     ) -> Response:
-        # Step 1: Build the full manifest of all parts
+        # Step 1: Build the full manifest of all parts (includes base 0 + appended parts)
         full_parts = await self.build_manifest(db, info)
-        full_parts = [p for p in full_parts if p.cid and str(p.cid).strip().lower() not in {"", "none", "pending"}]
-
-        # Wait for required CIDs to be available in the database if necessary
-        try:
-            rows_required = await db.fetch("SELECT part_number FROM parts WHERE object_id = $1", info.object_id)
-            required = {int(r[0]) for r in rows_required}
-        except Exception:
-            required = set()
-        available = {p.part_number for p in full_parts}
-        if required and not required.issubset(available):
-            waited = await ManifestService.wait_for_cids(db, info.object_id, required, attempts=10, interval_sec=0.5)
-            if waited:
-                full_parts = [
-                    Part(part_number=int(c["part_number"]), cid=str(c["cid"]), size_bytes=int(c.get("size_bytes", 0)))
-                    for c in waited
-                ]
-
-        # Fallback to the object-level CID if no parts are found
-        if not full_parts:
-            base_cid = await db.fetchval(
-                "SELECT c.cid FROM objects o JOIN cids c ON o.cid_id = c.id WHERE o.object_id = $1",
-                info.object_id,
-            )
-            if not base_cid:
-                base_cid = await db.fetchval("SELECT ipfs_cid FROM objects WHERE object_id = $1", info.object_id)
-            if base_cid and str(base_cid).strip().lower() not in {"", "none", "pending"}:
-                full_parts = [Part(part_number=0, cid=str(base_cid), size_bytes=info.size_bytes)]
-
         full_parts = sorted(full_parts, key=lambda p: p.part_number)
         layout = [{"part_number": p.part_number, "size_bytes": p.size_bytes} for p in full_parts]
 
@@ -259,26 +306,47 @@ class ObjectReader:
 
         parts = sorted(parts, key=lambda p: p.part_number)
 
-        # Step 3: Check cache and determine the source
-        all_parts_in_cache = True
-        if not parts:
-            all_parts_in_cache = False
-        else:
-            for p in parts:
-                if not await obj_cache.exists(info.object_id, int(p.part_number)):
-                    all_parts_in_cache = False
-                    break
-        source_header = "cache" if all_parts_in_cache else "pipeline"
+        # Step 3: Classify parts by availability and handle pending CIDs
+        cid_backed_parts = []  # Parts with concrete CIDs that can be hydrated
+        pending_only_parts = []  # Parts with pending/None CIDs that need cache fallback
 
-        # Step 4: Hydrate cache if necessary (enqueue downloads for missing parts)
-        if source_header == "pipeline":
+        for p in parts:
+            if p.cid:
+                cid_backed_parts.append(p)
+            else:
+                pending_only_parts.append(p)
+
+        # Check cache availability for all needed parts
+        all_parts_available = True
+        for p in parts:
+            if not await obj_cache.exists(info.object_id, int(p.part_number)):
+                all_parts_available = False
+                break
+
+        source_header = "cache" if all_parts_available else "pipeline"
+
+        # Step 4: Hydrate cache for CID-backed parts and handle pending-only parts
+        if cid_backed_parts:
+            # Only enqueue downloads for parts that have concrete CIDs
             await self.hydrate_object_cache(
                 redis,
                 obj_cache,
                 info,
-                parts,
+                cid_backed_parts,  # Only CID-backed parts
                 address=address,
                 seed_phrase=seed_phrase,
+            )
+
+        # Handle pending-only parts with bounded polling
+        if pending_only_parts:
+            await self._handle_pending_parts_with_cache_fallback(
+                db,
+                obj_cache,
+                info,
+                pending_only_parts,
+                redis,
+                address,
+                seed_phrase,
             )
 
         # Step 5: Pre-flight check to ensure the first part is available before sending headers

@@ -146,11 +146,7 @@ async def handle_put_object(
             except Exception:
                 logger.debug("Failed to cleanup previous parts on overwrite", exc_info=True)
 
-        # Mark as multipart and create a provisional manifest row for part 0 with placeholder CID
-        await db.execute(
-            "UPDATE objects SET multipart = TRUE WHERE object_id = $1",
-            object_id,
-        )
+        # Ensure a multipart_uploads row exists to satisfy parts.upload_id FK
         try:
             upload_row = await db.fetchrow(
                 get_query("create_multipart_upload"),
@@ -164,7 +160,7 @@ async def handle_put_object(
             )
             upload_id = upload_row["upload_id"] if upload_row else uuid.UUID(object_id)
         except Exception:
-            # Best effort: if creation fails because exists, try to reuse existing row
+            # Best effort: reuse existing upload row if it already exists
             upload_row = await db.fetchrow(
                 "SELECT upload_id FROM multipart_uploads WHERE bucket_id = $1 AND object_key = $2 ORDER BY initiated_at DESC LIMIT 1",
                 bucket_id,
@@ -172,28 +168,27 @@ async def handle_put_object(
             )
             upload_id = upload_row["upload_id"] if upload_row else uuid.UUID(object_id)
 
-        try:
-            placeholder_cid = "pending"
-            placeholder_cid_id = await _upsert_cid(db, placeholder_cid)
-            await db.execute(
-                """
-                INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                ON CONFLICT (upload_id, part_number) DO NOTHING
-                """,
-                str(uuid.uuid4()),
-                upload_id,
-                0,
-                placeholder_cid,
-                int(file_size),
-                md5_hash,
-                created_at,
-                object_id,
-                placeholder_cid_id,
-            )
-        except Exception:
-            # Non-fatal; GET can still serve from cache, and append path will backfill if needed
-            pass
+        # Insert parts(0) for simple objects - all objects are represented by parts
+        placeholder_cid = "pending"
+        placeholder_cid_id = await _upsert_cid(db, placeholder_cid)
+
+        # Insert part 0 representing the base object
+        await db.execute(
+            """
+            INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (upload_id, part_number) DO NOTHING
+            """,
+            str(uuid.uuid4()),
+            upload_id,
+            0,
+            placeholder_cid,
+            int(file_size),
+            md5_hash,
+            created_at,
+            object_id,
+            placeholder_cid_id,
+        )
 
         return Response(
             status_code=200,
