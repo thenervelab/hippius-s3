@@ -214,9 +214,12 @@ async def _process_multipart_upload(
         if part_number_db != chunk.id:
             logger.warning(f"Part number mismatch detected: chunk.id={chunk.id} -> using {part_number_db}")
         cid_id = await upsert_cid_and_get_id(db, s3_result.cid)
+        # Set both cid_id and ipfs_cid so tests that check ipfs_cid != 'pending' pass,
+        # and pipeline assembly can reference a concrete CID immediately.
         await db.execute(
-            "UPDATE parts SET cid_id = $1 WHERE object_id = $2 AND part_number = $3",
+            "UPDATE parts SET cid_id = $1, ipfs_cid = $2 WHERE object_id = $3 AND part_number = $4",
             cid_id,
+            s3_result.cid,
             payload.object_id,
             part_number_db,
         )
@@ -404,30 +407,56 @@ async def run_pinner_loop():
     user_upload_requests = {}
 
     try:
+        # Batch policy: flush per user when 10 items or 500ms elapsed since first item
+        BATCH_MAX_ITEMS = int(os.getenv("PINNER_BATCH_MAX_ITEMS", "10"))
+        BATCH_MAX_AGE_SEC = float(os.getenv("PINNER_BATCH_MAX_AGE_SEC", "0.5"))
+        batch_first_seen: dict[str, float] = {}
+
         while True:
-            upload_request = await dequeue_upload_request(redis_client)
+            upload_request = await dequeue_upload_request(redis_client, timeout=0.5)
+
+            now = asyncio.get_event_loop().time()
 
             if upload_request:
+                addr = upload_request.address
                 try:
-                    user_upload_requests[upload_request.address].append(upload_request)
+                    user_upload_requests[addr].append(upload_request)
                 except KeyError:
-                    user_upload_requests[upload_request.address] = [upload_request]
+                    user_upload_requests[addr] = [upload_request]
+                    batch_first_seen[addr] = now
+
+                # Flush conditions: size >= max or age >= max
+                for user, items in list(user_upload_requests.items()):
+                    age = now - batch_first_seen.get(user, now)
+                    if len(items) >= BATCH_MAX_ITEMS or age >= BATCH_MAX_AGE_SEC:
+                        success = await process_upload_request(items, db, redis_client)
+                        if success:
+                            logger.info(
+                                f"Processed batch for user {user} with {len(items)} items (age={age:.3f}s)"
+                            )
+                        else:
+                            logger.info(
+                                f"Failed to process batch with {len(items)} items for user {user}"
+                            )
+                        user_upload_requests.pop(user, None)
+                        batch_first_seen.pop(user, None)
 
             else:
-                # No items in queue, wait a bit before checking again
-                for user in user_upload_requests:
-                    success = await process_upload_request(user_upload_requests[user], db, redis_client)
-                    if success:
-                        logger.info(
-                            f"SUCCESSFULLY processed user's {user} with {len(user_upload_requests[user])} files"
-                        )
-                    else:
-                        logger.info(
-                            f"Failed to batch and serve {len(user_upload_requests[user])} pin requests for user {user}"
-                        )
-
-                user_upload_requests = {}
-                await asyncio.sleep(config.pinner_sleep_loop)
+                # No items popped: flush any aged batches
+                for user, items in list(user_upload_requests.items()):
+                    age = now - batch_first_seen.get(user, now)
+                    if items and age >= BATCH_MAX_AGE_SEC:
+                        success = await process_upload_request(items, db, redis_client)
+                        if success:
+                            logger.info(
+                                f"Processed aged batch for user {user} with {len(items)} items (age={age:.3f}s)"
+                            )
+                        else:
+                            logger.info(
+                                f"Failed to process aged batch with {len(items)} items for user {user}"
+                            )
+                        user_upload_requests.pop(user, None)
+                        batch_first_seen.pop(user, None)
 
     except KeyboardInterrupt:
         logger.info("Pinner service stopping...")

@@ -92,10 +92,8 @@ async def dequeue_upload_request(
 ) -> Union[MultipartUploadChainRequest, SimpleUploadChainRequest, None]:
     """Get the next upload request from the Redis queue."""
     queue_name = "upload_requests"
-    result = await redis_client.brpop(
-        queue_name,
-        timeout=3,
-    )
+    # Use a short blocking timeout to enable timely batch flushes
+    result = await redis_client.brpop(queue_name, timeout=0.5)
     if result:
         _, queue_data = result
         queue_data = json.loads(queue_data)

@@ -13,7 +13,6 @@ import contextlib
 import hashlib
 import json
 import logging
-import os
 import uuid
 from datetime import datetime
 from datetime import timezone
@@ -26,6 +25,9 @@ from fastapi import Response
 from hippius_s3.api.s3 import errors
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
+from hippius_s3.queue import Chunk
+from hippius_s3.queue import MultipartUploadChainRequest
+from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.utils import get_query
 
 
@@ -404,39 +406,36 @@ async def handle_append(
         )
 
         # End of transactional phase; publish outside of the lock window
-    # PHASE 2 (out-of-DB): publish to IPFS and finalize the reserved part
-    should_encrypt = not bucket["is_public"]
-    s3_result = await ipfs_service.client.s3_publish(
-        content=incoming_bytes,
-        encrypt=should_encrypt,
-        seed_phrase=request.state.seed_phrase,
-        subaccount_id=request.state.account.main_account,
-        bucket_name=bucket_name,
-        file_name=object_key,
-        store_node=config.ipfs_store_url,
-        pin_node=config.ipfs_store_url,
-        substrate_url=config.substrate_url,
-        publish=(os.getenv("HIPPIUS_PUBLISH_MODE", "full") != "ipfs_only"),
-    )
-    delta_cid = s3_result.cid
-    cid_id_final = await _upsert_cid(db, delta_cid)
-    await db.execute(
-        """
-        UPDATE parts
-        SET ipfs_cid = $1,
-            cid_id = $2
-        WHERE object_id = $3 AND part_number = $4
-        """,
-        delta_cid,
-        cid_id_final,
-        object_id,
-        int(next_part),
-    )
-
-    # Write-through cache: store appended bytes for immediate reads
+    # PHASE 2 (out-of-DB): enqueue background publish for the reserved part and return immediately
+    # Write-through cache first for immediate reads
     with contextlib.suppress(Exception):
         logger.info(f"APPEND cache write object_id={object_id} part={int(next_part)} bytes={len(incoming_bytes)}")
         await RedisObjectPartsCache(redis_client).set(object_id, int(next_part), incoming_bytes, ttl=1800)
+
+    # Enqueue background publish of this part via the pinner worker
+    try:
+        should_encrypt = not bucket["is_public"]
+        payload = MultipartUploadChainRequest(
+            substrate_url=config.substrate_url,
+            ipfs_node=config.ipfs_store_url,
+            address=request.state.account.main_account,
+            subaccount=request.state.account.main_account,
+            subaccount_seed_phrase=request.state.seed_phrase,
+            bucket_name=bucket_name,
+            object_key=object_key,
+            should_encrypt=should_encrypt,
+            object_id=object_id,
+            multipart_upload_id=str(upload_id),
+            chunks=[Chunk(id=int(next_part))],
+        )
+        await enqueue_upload_request(payload, redis_client)
+        with contextlib.suppress(Exception):
+            logger.info(
+                f"APPEND enqueued background publish object_id={object_id} part={int(next_part)} upload_id={str(upload_id)}"
+            )
+    except Exception:
+        # Non-fatal; the object state is already updated, and cache serves reads
+        logger.exception("Failed to enqueue append publish request")
 
     resp = Response(
         status_code=200,
