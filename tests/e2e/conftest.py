@@ -21,14 +21,40 @@ from botocore.config import Config  # type: ignore[import-untyped]
 
 
 def pytest_collection_modifyitems(config, items):  # type: ignore[no-untyped-def]
-    """Skip s4-marked tests when running against real AWS."""
+    """Skip s4/local/hippius_* tests when running against real AWS."""
     run_real = os.getenv("RUN_REAL_AWS") == "1" or os.getenv("AWS") == "1"
     if not run_real:
         return
     skip_s4 = pytest.mark.skip(reason="S4 extensions not supported on real AWS")
+    skip_local = pytest.mark.skip(reason="Local-only tests are skipped on real AWS")
+    skip_hippius = pytest.mark.skip(reason="Hippius-specific behavior not available on real AWS")
     for item in items:
         if item.get_closest_marker("s4"):
             item.add_marker(skip_s4)
+        if item.get_closest_marker("local"):
+            item.add_marker(skip_local)
+        if item.get_closest_marker("hippius_cache") or item.get_closest_marker("hippius_headers"):
+            item.add_marker(skip_hippius)
+
+
+def is_real_aws() -> bool:
+    """Return True when tests are running against real AWS."""
+    return os.getenv("RUN_REAL_AWS") == "1" or os.getenv("AWS") == "1"
+
+
+def assert_hippius_source(headers: dict[str, str] | dict[str, object], allowed: set[str] | None = None) -> None:
+    """Assert Hippius-specific source header when running locally; no-op on real AWS.
+
+    Parameters:
+    - headers: mapping of response headers
+    - allowed: allowed values for x-hippius-source (defaults to {"cache", "pipeline"})
+    """
+    if is_real_aws():
+        return
+    allowed_values = allowed or {"cache", "pipeline"}
+    # Some callers pass botocore ResponseMetadata HTTPHeaders (dict[str, str])
+    value = headers.get("x-hippius-source")  # type: ignore[arg-type]
+    assert value in allowed_values
 
 
 @pytest.fixture(scope="session")
@@ -148,6 +174,12 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
         )
 
 
+# Ensure docker services are started for all e2e tests without having to depend on the fixture explicitly
+@pytest.fixture(scope="session", autouse=True)
+def _ensure_services(docker_services: None) -> Iterator[None]:
+    yield
+
+
 @pytest.fixture
 def boto3_client(test_seed_phrase: str) -> Any:
     """Create a boto3 S3 client configured for testing.
@@ -177,6 +209,33 @@ def boto3_client(test_seed_phrase: str) -> Any:
             signature_version="s3v4",
         ),
     )
+
+
+@pytest.fixture
+def signed_http_get(boto3_client: Any) -> Any:
+    """Return a boto3-backed GET helper that mimics requests' response shape.
+
+    Usage: signed_http_get(bucket, key, extra_headers={})
+    Supports 'Range' in extra_headers.
+    """
+
+    class _Resp:
+        def __init__(self, status_code: int, headers: dict[str, str], content: bytes) -> None:
+            self.status_code = status_code
+            self.headers = headers
+            self.content = content
+
+    def _get(bucket: str, key: str, extra_headers: dict[str, str] | None = None) -> _Resp:
+        params: dict[str, Any] = {"Bucket": bucket, "Key": key}
+        if extra_headers and "Range" in extra_headers:
+            params["Range"] = extra_headers["Range"]
+        resp = boto3_client.get_object(**params)
+        status = int(resp.get("ResponseMetadata", {}).get("HTTPStatusCode", 200))
+        headers = resp.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+        body = resp["Body"].read()
+        return _Resp(status, headers, body)
+
+    return _get
 
 
 @pytest.fixture

@@ -24,9 +24,11 @@ from hippius_s3 import dependencies
 from hippius_s3 import utils
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.config import get_config
+from hippius_s3.dependencies import get_object_reader
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import MultipartUploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
+from hippius_s3.services.object_reader import ObjectReader
 from hippius_s3.utils import get_query
 
 
@@ -50,7 +52,7 @@ async def get_all_chunk_ids(
     for part in parts:
         chunk = Chunk(
             id=part["part_id"],
-            redis_key=f"multipart:{upload_id}:part:{part['part_number']}",
+            redis_key=f"obj:{upload_id}:part:{part['part_number']}",
         )
         chunks.append(chunk)
 
@@ -303,7 +305,7 @@ async def get_all_cached_chunks(
     redis_client: Redis,
 ):
     try:
-        keys_pattern = f"multipart:{upload_id}:part:*"
+        keys_pattern = f"obj:{upload_id}:part:*"
         return await redis_client.keys(keys_pattern)
     except Exception as e:
         logger.error(f"Failed to find any cached parts for {upload_id=}: {e}")
@@ -323,6 +325,7 @@ async def upload_part(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     ipfs_service=Depends(dependencies.get_ipfs_service),
+    object_reader: ObjectReader = Depends(get_object_reader),
 ) -> Response:
     """Upload a part for a multipart upload (PUT with partNumber & uploadId)."""
     # These two parameters are required for multipart upload parts
@@ -413,16 +416,21 @@ async def upload_part(
         if not source_obj:
             return s3_error_response("NoSuchKey", f"Key {source_object_key} not found", status_code=404)
 
-        # Prefer raw Redis bytes from simple upload cache to avoid decrypt/range issues
+        # Prefer unified cache via ObjectReader, fallback to IPFS through service
         source_bytes = None
-        redis_client = request.app.state.redis_client
         try:
-            redis_key = f"simple:{source_obj['object_id']}:part:0"
-            cached = await redis_client.get(redis_key)
-            if cached:
-                source_bytes = cached
+            source_bytes = await request.app.state.obj_cache.get(str(source_obj["object_id"]), 0)
         except Exception as e:
-            logger.debug(f"Redis read miss for source simple bytes: {e}")
+            logger.debug(f"ObjectReader cache base read miss: {e}")
+            # Fallback: try unified object-parts cache directly (part 0)
+            try:
+                source_bytes = await request.app.state.obj_cache.get(str(source_obj["object_id"]), 0)
+                if source_bytes:
+                    logger.info(
+                        f"UploadPartCopy fallback cache hit object_id={source_obj['object_id']} part=0 bytes={len(source_bytes)}"
+                    )
+            except Exception:
+                pass
 
         if source_bytes is None:
             source_cid = (source_obj.get("ipfs_cid") or "").strip()
@@ -521,7 +529,7 @@ async def upload_part(
 
     # Cache raw part data for concatenation at completion (no IPFS upload for parts)
     redis_client = request.app.state.redis_client
-    part_key = f"multipart:{upload_id}:part:{part_number}"
+    part_key = f"obj:{upload_id}:part:{part_number}"
 
     try:
         # Check if client is still connected before proceeding
@@ -655,7 +663,7 @@ async def abort_multipart_upload(
         )
         if parts:
             redis_client = request.app.state.redis_client
-            redis_keys_to_delete = [f"multipart:{upload_id}:part:{part['part_number']}" for part in parts]
+            redis_keys_to_delete = [f"obj:{upload_id}:part:{part['part_number']}" for part in parts]
             if redis_keys_to_delete:
                 await redis_client.delete(
                     *redis_keys_to_delete,
@@ -681,8 +689,8 @@ async def abort_multipart_upload(
         )
 
 
-# Moving multipart uploads function to main endpoints.py for better routing
-# This avoids potential conflicts with other GET handlers
+# Multipart uploads function properly organized in dedicated multipart module
+# This maintains separation of concerns and avoids conflicts with other GET handlers
 
 
 async def list_multipart_uploads(
@@ -999,7 +1007,7 @@ async def complete_multipart_upload(
                 chunks=[
                     Chunk(
                         id=part["part_number"],
-                        redis_key=f"multipart:{upload_id}:part:{part['part_number']}",
+                        redis_key=f"obj:{upload_id}:part:{part['part_number']}",
                     )
                     for part in parts
                 ],

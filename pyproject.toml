@@ -44,6 +44,7 @@ dev = [
     "types-boto3",
     "types-botocore",
     "requests>=2.31.0",
+    "psycopg[binary]>=3.1",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -117,10 +118,6 @@ module = "hippius_s3.api.s3.multipart"
 disallow_untyped_defs = false
 disable_error_code = ["attr-defined", "no-untyped-def", "misc", "return-value"]
 
-[[tool.mypy.overrides]]
-module = "hippius_s3.api.s3.endpoints"
-disallow_untyped_defs = false
-disable_error_code = ["attr-defined", "no-untyped-def", "var-annotated", "misc", "assignment", "return", "call-arg", "union-attr", "index", "no-any-return"]
 
 [[tool.mypy.overrides]]
 module = "hippius_s3.queue"
@@ -188,6 +185,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "mnemonic.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "psycopg.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

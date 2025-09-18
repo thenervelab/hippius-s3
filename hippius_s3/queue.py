@@ -11,13 +11,13 @@ logger = logging.getLogger(__name__)
 
 class Chunk(BaseModel):
     id: int
-    redis_key: str
 
 
 class ChunkToDownload(BaseModel):
     cid: str
     part_id: int
-    redis_key: str
+    # Temporary backward-compat: accept legacy payloads that include or expect a redis_key
+    redis_key: str | None = None
 
 
 class ChainRequest(BaseModel):
