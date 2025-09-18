@@ -62,6 +62,10 @@ services:
       - .:/app
 
   chain-pin-checker:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: ["python", "workers/chain_pin_checker.py"]
     env_file: []
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
@@ -73,8 +77,14 @@ services:
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
       - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
+    volumes:
+      - .:/app
 
   chain-profile-cacher:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: ["python", "workers/chain_profile_cacher.py"]
     env_file: []
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
@@ -86,3 +96,5 @@ services:
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
       - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
+    volumes:
+      - .:/app

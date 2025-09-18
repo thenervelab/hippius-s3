@@ -44,38 +44,6 @@ def clear_object_cache(
         r.delete(f"obj:{object_id}:part:{int(pn)}")
 
 
-def wait_for_object_cid(
-    bucket_name: str,
-    object_key: str,
-    *,
-    timeout_seconds: float = 15.0,
-    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
-) -> bool:
-    """Wait until objects.ipfs_cid (or cid_id) is set for the object.
-
-    Returns True if ready within timeout, False otherwise.
-    """
-    deadline = time.time() + timeout_seconds
-    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
-        while time.time() < deadline:
-            cur.execute(
-                """
-                    SELECT (o.ipfs_cid IS NOT NULL) OR (o.cid_id IS NOT NULL)
-                    FROM objects o
-                    JOIN buckets b ON b.bucket_id = o.bucket_id
-                    WHERE b.bucket_name = %s AND o.object_key = %s
-                    ORDER BY o.created_at DESC
-                    LIMIT 1
-                    """,
-                (bucket_name, object_key),
-            )
-            row = cur.fetchone()
-            if row and bool(row[0]):
-                return True
-            time.sleep(0.2)
-    return False
-
-
 def wait_for_parts_cids(
     bucket_name: str,
     object_key: str,
@@ -86,6 +54,8 @@ def wait_for_parts_cids(
 ) -> bool:
     """Wait until at least min_count parts for the object have non-pending ipfs_cid values.
 
+    This includes both the base part (from objects table) and appended parts (from parts table).
+
     Returns True if ready within timeout, False otherwise.
     """
     deadline = time.time() + timeout_seconds
@@ -94,13 +64,25 @@ def wait_for_parts_cids(
             cur.execute(
                 """
                     SELECT COUNT(*)
-                    FROM parts p
-                    JOIN objects o ON o.object_id = p.object_id
-                    JOIN buckets b ON b.bucket_id = o.bucket_id
-                    WHERE b.bucket_name = %s AND o.object_key = %s
-                      AND COALESCE(NULLIF(TRIM(p.ipfs_cid), ''), 'pending') <> 'pending'
+                    FROM (
+                        SELECT COALESCE(c.cid, o.ipfs_cid) as cid
+                        FROM objects o
+                        LEFT JOIN cids c ON o.cid_id = c.id
+                        JOIN buckets b ON b.bucket_id = o.bucket_id
+                        WHERE b.bucket_name = %s AND o.object_key = %s
+
+                        UNION ALL
+
+                        SELECT COALESCE(c.cid, p.ipfs_cid) as cid
+                        FROM parts p
+                        LEFT JOIN cids c ON p.cid_id = c.id
+                        JOIN objects o ON o.object_id = p.object_id
+                        JOIN buckets b ON b.bucket_id = o.bucket_id
+                        WHERE b.bucket_name = %s AND o.object_key = %s
+                    ) AS all_parts
+                    WHERE COALESCE(NULLIF(TRIM(cid), ''), 'pending') <> 'pending'
                     """,
-                (bucket_name, object_key),
+                (bucket_name, object_key, bucket_name, object_key),
             )
             row = cur.fetchone()
             count = int(row[0]) if row else 0
@@ -108,3 +90,54 @@ def wait_for_parts_cids(
                 return True
             time.sleep(0.3)
     return False
+
+
+def make_all_object_parts_pending(
+    bucket_name: str,
+    object_key: str,
+    *,
+    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+) -> str:
+    """Set all parts for an object to pending state (both base and appended parts).
+
+    Returns the object_id of the affected object.
+    """
+    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        # First get the object_id
+        cur.execute(
+            """
+            SELECT o.object_id
+            FROM objects o
+            JOIN buckets b ON b.bucket_id = o.bucket_id
+            WHERE b.bucket_name = %s AND o.object_key = %s
+            """,
+            (bucket_name, object_key),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise RuntimeError(f"Object {bucket_name}/{object_key} not found")
+        object_id = str(row[0])
+
+        # Set all parts to pending (both base and appended)
+        cur.execute(
+            """
+            UPDATE parts
+            SET cid_id = NULL, ipfs_cid = 'pending'
+            WHERE object_id = %s
+            """,
+            (object_id,),
+        )
+
+        # Also set object-level CID to pending
+        cur.execute(
+            """
+            UPDATE objects
+            SET cid_id = NULL, ipfs_cid = 'pending'
+            WHERE object_id = %s
+            """,
+            (object_id,),
+        )
+
+        conn.commit()
+
+        return object_id

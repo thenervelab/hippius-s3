@@ -431,13 +431,9 @@ async def run_pinner_loop():
                     if len(items) >= BATCH_MAX_ITEMS or age >= BATCH_MAX_AGE_SEC:
                         success = await process_upload_request(items, db, redis_client)
                         if success:
-                            logger.info(
-                                f"Processed batch for user {user} with {len(items)} items (age={age:.3f}s)"
-                            )
+                            logger.info(f"Processed batch for user {user} with {len(items)} items (age={age:.3f}s)")
                         else:
-                            logger.info(
-                                f"Failed to process batch with {len(items)} items for user {user}"
-                            )
+                            logger.info(f"Failed to process batch with {len(items)} items for user {user}")
                         user_upload_requests.pop(user, None)
                         batch_first_seen.pop(user, None)
 
@@ -452,9 +448,7 @@ async def run_pinner_loop():
                                 f"Processed aged batch for user {user} with {len(items)} items (age={age:.3f}s)"
                             )
                         else:
-                            logger.info(
-                                f"Failed to process aged batch with {len(items)} items for user {user}"
-                            )
+                            logger.info(f"Failed to process aged batch with {len(items)} items for user {user}")
                         user_upload_requests.pop(user, None)
                         batch_first_seen.pop(user, None)
 

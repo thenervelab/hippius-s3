@@ -7,7 +7,7 @@ from .conftest import assert_hippius_source
 from .conftest import is_real_aws
 from .support.cache import clear_object_cache
 from .support.cache import get_object_id
-from .support.cache import wait_for_object_cid
+from .support.cache import wait_for_parts_cids
 
 
 def test_put_object_returns_etag(
@@ -41,8 +41,8 @@ def test_put_object_returns_etag(
     assert resp_cache["Body"].read() == body
 
     if not is_real_aws():
-        # Wait until object CID is available before clearing cache
-        assert wait_for_object_cid(bucket_name, "hello.txt", timeout_seconds=20.0)
+        # Wait until object has at least 1 part with CID before clearing cache
+        assert wait_for_parts_cids(bucket_name, "hello.txt", min_count=1, timeout_seconds=20.0)
 
         # Clear cache and validate GET still returns content (now via pipeline)
         object_id = get_object_id(bucket_name, "hello.txt")

@@ -6,6 +6,8 @@ from typing import Callable
 import pytest
 from botocore.exceptions import ClientError
 
+from .support.cache import wait_for_parts_cids
+
 
 def test_get_object_range_valid(
     docker_services: Any,
@@ -549,6 +551,9 @@ def test_get_object_range_cache_invalidation_during_request(
     r1 = signed_http_get(bucket, key, {"Range": "bytes=0-10"})
     assert r1.status_code == 206
     assert r1.headers.get("x-hippius-source") == "cache"
+
+    # Wait for object to be processed and cached
+    assert wait_for_parts_cids(bucket, key, min_count=1, timeout_seconds=20.0)
 
     # Clear cache for part that contains our range
     object_id = get_object_id(bucket, key)
