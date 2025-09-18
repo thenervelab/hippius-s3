@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from dataclasses import dataclass
 from typing import Any
 from typing import AsyncGenerator
 
@@ -12,6 +13,10 @@ from starlette import status
 
 from hippius_s3.config import Config
 from hippius_s3.ipfs_service import IPFSService
+from hippius_s3.repositories import BucketRepository
+from hippius_s3.repositories import ObjectRepository
+from hippius_s3.repositories import UserRepository
+from hippius_s3.services.object_reader import ObjectReader
 
 
 logger = logging.getLogger(__name__)
@@ -78,6 +83,42 @@ def get_redis_accounts(request: Request) -> async_redis.Redis:
     """Extract the Redis accounts client from the request."""
     redis_accounts_client: async_redis.Redis = request.app.state.redis_accounts_client
     return redis_accounts_client
+
+
+def get_object_reader(request: Request) -> ObjectReader:
+    """Provide an ObjectReader service configured with app Config."""
+    return ObjectReader(request.app.state.config)
+
+
+@dataclass
+class RequestContext:
+    main_account_id: str
+    seed_phrase: str
+
+
+def get_request_context(request: Request) -> RequestContext:
+    """Lightweight context extracted from request.state for passing to services."""
+    main_account_id = getattr(request.state.account, "main_account", "") or ""
+    seed_phrase = getattr(request.state, "seed_phrase", "")
+    return RequestContext(main_account_id=main_account_id, seed_phrase=seed_phrase)
+
+
+def get_user_repo(db: Any = None):
+    if db is None:
+        raise RuntimeError("get_user_repo requires DB dependency injection")
+    return UserRepository(db)
+
+
+def get_bucket_repo(db: Any = None):
+    if db is None:
+        raise RuntimeError("get_bucket_repo requires DB dependency injection")
+    return BucketRepository(db)
+
+
+def get_object_repo(db: Any = None):
+    if db is None:
+        raise RuntimeError("get_object_repo requires DB dependency injection")
+    return ObjectRepository(db)
 
 
 async def extract_seed_phrase(request: Request) -> str:

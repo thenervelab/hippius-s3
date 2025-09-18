@@ -15,7 +15,6 @@ from mnemonic import Mnemonic
 from pydantic import BaseModel
 from starlette import status
 
-from hippius_s3.api.s3.endpoints import create_xml_error_response
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import get_redis_accounts
@@ -227,7 +226,7 @@ async def check_credit_for_all_operations(request: Request, call_next: Callable)
                 status_code=status.HTTP_403_FORBIDDEN,
             )
         except InvalidSeedPhraseError:
-            return create_xml_error_response(
+            return s3_error_response(
                 code="InvalidAccessKeyId",
                 message="The AWS Access Key Id you provided does not exist in our records.",
                 status_code=403,

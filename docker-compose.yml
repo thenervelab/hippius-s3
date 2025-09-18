@@ -127,6 +127,8 @@ services:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
+    volumes:
+      - .:/app
 
   unpinner:
     build:

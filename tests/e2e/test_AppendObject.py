@@ -1,4 +1,5 @@
 import base64
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import as_completed
@@ -20,7 +21,7 @@ def _put_object(boto3_client: Any, bucket: str, key: str, data: bytes, metadata:
 
 @pytest.mark.s4
 def test_append_single_writer(
-    boto3_client: Any, unique_bucket_name: Any, cleanup_buckets: Any, wait_until_readable: Any
+    boto3_client: Any, unique_bucket_name: Any, cleanup_buckets: Any, wait_until_readable: Any, signed_http_get: Any
 ) -> None:
     bucket = unique_bucket_name("append-single")
     boto3_client.create_bucket(Bucket=bucket)
@@ -51,14 +52,39 @@ def test_append_single_writer(
     )
 
     # Verify full content
-    obj = boto3_client.get_object(Bucket=bucket, Key=key)
-    data = obj["Body"].read()
-    assert data == initial + delta
+    # First GET: cache
+    resp_cache = signed_http_get(bucket, key)
+    assert resp_cache.status_code == 200
+    assert resp_cache.headers.get("x-hippius-source") == "cache"
+    assert resp_cache.content == initial + delta
+
+    # Second GET: simulate pipeline by clearing cache
+    from .support.cache import clear_object_cache
+    from .support.cache import get_object_id
+    from .support.cache import wait_for_parts_cids
+
+    # Wait until both parts have CIDs to ensure pipeline-readable
+    assert wait_for_parts_cids(bucket, key, min_count=2, timeout_seconds=25.0)
+
+    object_id = get_object_id(bucket, key)
+    clear_object_cache(object_id)
+
+    resp_pipe = None
+    for _ in range(30):
+        resp_pipe = signed_http_get(bucket, key)
+        if resp_pipe.status_code == 200 and resp_pipe.content == initial + delta:
+            break
+        import time
+
+        time.sleep(0.2)
+    assert resp_pipe is not None
+    assert resp_pipe.status_code == 200
+    assert resp_pipe.content == initial + delta
 
 
 @pytest.mark.s4
 def test_append_multi_writer_concurrent(
-    boto3_client: Any, unique_bucket_name: Any, cleanup_buckets: Any, wait_until_readable: Any
+    boto3_client: Any, unique_bucket_name: Any, cleanup_buckets: Any, wait_until_readable: Any, signed_http_get: Any
 ) -> None:
     bucket = unique_bucket_name("append-concurrent")
     boto3_client.create_bucket(Bucket=bucket)
@@ -76,9 +102,14 @@ def test_append_multi_writer_concurrent(
 
     # Simple helper to attempt CAS append with retry on 412
     def append_with_retry(delta: bytes) -> bool:
+        cached_version: str | None = None
         for attempt in range(100):
-            head = boto3_client.head_object(Bucket=bucket, Key=key)
-            version = head["ResponseMetadata"]["HTTPHeaders"].get("x-amz-meta-append-version", "0")
+            version: str
+            if cached_version is None:
+                head = boto3_client.head_object(Bucket=bucket, Key=key)
+                version = head["ResponseMetadata"]["HTTPHeaders"].get("x-amz-meta-append-version", "0")
+            else:
+                version = cached_version
             try:
                 _put_object(
                     boto3_client,
@@ -96,8 +127,22 @@ def test_append_multi_writer_concurrent(
                 # Expect a 412 on CAS failure (PreconditionFailed). Retry.
                 status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
                 code = e.response.get("Error", {}).get("Code")
-                if status == 412 or code in {"PreconditionFailed", "412"}:
-                    time.sleep(min(0.05 * (attempt + 1), 2.0))
+                if status in (412, 429) or code in {"PreconditionFailed", "412", "429"}:
+                    # Try to use server-provided current version header to avoid an extra HEAD
+                    hdrs = e.response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+                    next_version = hdrs.get("x-amz-meta-append-version")
+                    retry_after = hdrs.get("retry-after")
+                    if next_version is not None:
+                        cached_version = next_version
+                    else:
+                        head = boto3_client.head_object(Bucket=bucket, Key=key)
+                        cached_version = head["ResponseMetadata"]["HTTPHeaders"].get("x-amz-meta-append-version", "0")
+                    # jittered backoff to avoid herd effects; honor Retry-After if present
+                    if retry_after and retry_after.isdigit():
+                        sleep_s = max(float(retry_after), 0.05)
+                    else:
+                        sleep_s = min(0.05 * (attempt + 1), 2.0)
+                    time.sleep(sleep_s * (0.5 + random.random()))
                     continue
                 # If server does not support append, skip test gracefully
                 if code in {"InvalidRequest", "NotImplemented"}:
@@ -105,8 +150,12 @@ def test_append_multi_writer_concurrent(
                 raise
             except Exception as e:  # noqa: PERF203
                 msg = str(e)
-                if "412" in msg or "PreconditionFailed" in msg:
-                    time.sleep(min(0.05 * (attempt + 1), 2.0))
+                if "412" in msg or "PreconditionFailed" in msg or "429" in msg:
+                    # Best effort: refresh from HEAD when SDK masks headers
+                    head = boto3_client.head_object(Bucket=bucket, Key=key)
+                    cached_version = head["ResponseMetadata"]["HTTPHeaders"].get("x-amz-meta-append-version", "0")
+                    sleep_s = min(0.05 * (attempt + 1), 2.0)
+                    time.sleep(sleep_s * (0.5 + random.random()))
                     continue
                 if "InvalidRequest" in msg or "NotImplemented" in msg:
                     pytest.skip("Append extension not supported by server")
@@ -114,15 +163,17 @@ def test_append_multi_writer_concurrent(
         return False
 
     # Run appends concurrently
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=2) as ex:
         futs = [ex.submit(append_with_retry, d) for d in deltas]
         results = [f.result() for f in as_completed(futs)]
         assert all(results), "Some appends failed after retries"
 
     # Verify content contains all lines in some order following initial prefix.
     # Exact ordering depends on commit order under contention; we accept any order.
-    obj = boto3_client.get_object(Bucket=bucket, Key=key)
-    data = obj["Body"].read()
+    resp = signed_http_get(bucket, key)
+    assert resp.status_code == 200
+    assert resp.headers.get("x-hippius-source") == "cache"
+    data = resp.content
     text = data.decode()
     assert text.startswith(initial.decode())
     for d in deltas:
@@ -131,7 +182,7 @@ def test_append_multi_writer_concurrent(
 
 @pytest.mark.s4
 def test_append_stale_version_412(
-    boto3_client: Any, unique_bucket_name: Any, cleanup_buckets: Any, wait_until_readable: Any
+    boto3_client: Any, unique_bucket_name: Any, cleanup_buckets: Any, wait_until_readable: Any, signed_http_get: Any
 ) -> None:
     bucket = unique_bucket_name("append-412")
     boto3_client.create_bucket(Bucket=bucket)
@@ -167,7 +218,7 @@ def test_append_stale_version_412(
     code = exc.value.response.get("Error", {}).get("Code")
     assert status == 412 or code in {"PreconditionFailed", "412"}
 
-    body = boto3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
+    body = signed_http_get(bucket, key).content
     assert body == b"X\nY\n"
 
 

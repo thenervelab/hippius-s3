@@ -26,7 +26,15 @@ class S3Error(Exception):
         super().__init__(message)
 
 
-def s3_error_response(code: str, message: str, request_id: str = "", status_code: int = 400, **kwargs: str) -> Response:
+def s3_error_response(
+    code: str,
+    message: str,
+    request_id: str = "",
+    status_code: int = 400,
+    *,
+    extra_headers: dict[str, str] | None = None,
+    **kwargs: str,
+) -> Response:
     """Generate a standardized S3 error response in XML format.
 
     Args:
@@ -43,8 +51,9 @@ def s3_error_response(code: str, message: str, request_id: str = "", status_code
     if request_id == "":
         request_id = str(uuid.uuid4())
 
-    # Create XML using lxml for better compatibility with S3 clients
-    root = ET.Element("Error", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+    # Create XML using lxml. Avoid XML namespace for maximum boto3 compatibility
+    # (boto3 error parser expects <Error><Code>...</Code>...</Error> without a namespace)
+    root = ET.Element("Error")
 
     code_elem = ET.SubElement(root, "Code")
     code_elem.text = code
@@ -80,5 +89,8 @@ def s3_error_response(code: str, message: str, request_id: str = "", status_code
         "x-amz-error-code": code,
         "x-amz-error-message": message,
     }
+
+    if extra_headers:
+        headers.update({k: str(v) for k, v in extra_headers.items()})
 
     return Response(content=xml_content, media_type="application/xml", status_code=status_code, headers=headers)
