@@ -16,6 +16,7 @@ services:
       - .:/app
 
   pinner:
+    command: ["python", "workers/run_pinner_in_loop.py"]
     env_file: []
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
@@ -30,6 +31,7 @@ services:
       - .:/app
 
   unpinner:
+    command: ["python", "workers/run_unpinner_in_loop.py"]
     env_file: []
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
