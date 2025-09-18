@@ -6,6 +6,8 @@ from typing import Callable
 import pytest
 from botocore.exceptions import ClientError
 
+from .conftest import is_real_aws
+
 
 def test_upload_part_copy(
     docker_services: Any,
@@ -19,19 +21,20 @@ def test_upload_part_copy(
     cleanup_buckets(dst_bucket)
 
     boto3_client.create_bucket(Bucket=src_bucket)
-    # Make source bucket public so source objects are unencrypted
-    policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Principal": "*",
-                "Action": ["s3:GetObject"],
-                "Resource": [f"arn:aws:s3:::{src_bucket}/*"],
-            }
-        ],
-    }
-    boto3_client.put_bucket_policy(Bucket=src_bucket, Policy=_json.dumps(policy))
+    # Make source bucket public so source objects are unencrypted (skip on real AWS due to account BPA)
+    if not is_real_aws():
+        policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": ["s3:GetObject"],
+                    "Resource": [f"arn:aws:s3:::{src_bucket}/*"],
+                }
+            ],
+        }
+        boto3_client.put_bucket_policy(Bucket=src_bucket, Policy=_json.dumps(policy))
     boto3_client.create_bucket(Bucket=dst_bucket)
 
     key_src = "source.bin"

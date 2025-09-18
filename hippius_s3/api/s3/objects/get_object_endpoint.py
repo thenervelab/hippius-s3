@@ -87,9 +87,21 @@ async def handle_get_object(
 
         # Validate/resolve range with actual size
         start_byte = end_byte = None
+        range_was_invalid = False
         if range_header:
             try:
                 start_byte, end_byte = parse_range_header(range_header, object_info["size_bytes"])
+                # Check if this was originally an invalid range (start > end) that got converted to full range
+                original_parts = range_header.lower().strip()
+                if original_parts.startswith("bytes="):
+                    spec = original_parts[len("bytes=") :]
+                    range_parts = spec.split("-", 1)
+                    if len(range_parts) == 2 and range_parts[0].isdigit() and range_parts[1].isdigit():
+                        orig_start = int(range_parts[0])
+                        orig_end = int(range_parts[1])
+                        if orig_end < orig_start:
+                            # This was originally an invalid range (start > end) converted to full range
+                            range_was_invalid = True
             except ValueError:
                 return Response(
                     status_code=416,
@@ -183,6 +195,7 @@ async def handle_get_object(
                 else None,
                 address=request.state.account.main_account,
                 seed_phrase=request.state.seed_phrase,
+                range_was_invalid=range_was_invalid,
             ),
         )
 

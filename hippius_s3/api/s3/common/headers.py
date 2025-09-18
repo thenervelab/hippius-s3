@@ -4,7 +4,12 @@ import json
 
 
 def build_headers(
-    info: dict, *, source: str, metadata: dict | str | None = None, rng: tuple[int, int] | None = None
+    info: dict,
+    *,
+    source: str,
+    metadata: dict | str | None = None,
+    rng: tuple[int, int] | None = None,
+    range_was_invalid: bool = False,
 ) -> dict[str, str]:
     headers: dict[str, str] = {
         "Content-Type": info["content_type"],
@@ -13,7 +18,7 @@ def build_headers(
         "Last-Modified": info["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
         "x-hippius-source": source,
     }
-    if rng is not None:
+    if rng is not None and not range_was_invalid:
         start, end = rng
         headers["Content-Range"] = f"bytes {start}-{end}/{info['size_bytes']}"
     if metadata:

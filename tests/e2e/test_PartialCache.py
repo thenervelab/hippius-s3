@@ -67,17 +67,33 @@ def test_get_partial_cache_fallbacks(
 
     # Get object_id and clear appended part from obj: cache to simulate partial cache
     object_id = get_object_id(bucket, key)
-    clear_object_cache(object_id, parts=[2])
+    clear_object_cache(object_id, parts=[1])
 
-    # GET auto: should succeed and return full content (allow brief retry for pipeline readiness)
+    # Diagnostic: verify cache presence before first GET
+    try:
+        import redis as _redis  # type: ignore[import-untyped]
+
+        r = _redis.Redis.from_url("redis://localhost:6379/0")
+        has0 = bool(r.exists(f"obj:{object_id}:part:0"))
+        has1 = bool(r.exists(f"obj:{object_id}:part:1"))
+        print(f"DEBUG cache before GET: object_id={object_id} part0={has0} part1={has1}")
+    except Exception as _e:  # pragma: no cover
+        print(f"DEBUG cache probe failed: {_e}")
+
+    # GET auto: should succeed and return full content
     expected = base + delta
     resp_auto = signed_http_get(bucket, key)
     assert resp_auto.status_code == 200
     assert resp_auto.content == expected
+    # First request: since part 2 was cleared, this should use pipeline
+    assert resp_auto.headers.get("x-hippius-source") == "pipeline"
 
     # Cross-boundary range: last 3 bytes of base and first 3 of delta
+    # Second request should be served from cache (after first request populated it)
     start = max(0, len(base) - 3)
     end = len(base) + 2
     resp_range = signed_http_get(bucket, key, {"Range": f"bytes={start}-{end}"})
     assert resp_range.status_code == 206
     assert resp_range.content == expected[start : end + 1]
+    # Range request should be served from cache (after first request populated it)
+    assert resp_range.headers.get("x-hippius-source") == "cache"

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import dataclasses
 import hashlib
 import json
@@ -20,7 +19,6 @@ from hippius_s3.cache import ObjectPartsCache
 from hippius_s3.queue import ChunkToDownload
 from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import enqueue_download_request
-from hippius_s3.services.caching.cache_assembler import assemble_from_cache
 from hippius_s3.services.manifest_service import ManifestService
 from hippius_s3.utils import get_query
 
@@ -217,102 +215,29 @@ class ObjectReader:
         rng: Range | None,
         address: str,
         seed_phrase: str,
+        range_was_invalid: bool = False,
     ) -> Response:
-        # Probe whether any cache exists (for source header only)
-        has_cache = False
-        try:
-            has_cache = bool((await obj_cache.exists(info.object_id, 0)) or (await obj_cache.exists(info.object_id, 1)))
-        except Exception:
-            has_cache = False
-        main_cid_missing = info.simple_cid is None
-        get_from_cache = main_cid_missing or has_cache
+        # Step 1: Build the full manifest of all parts
+        full_parts = await self.build_manifest(db, info)
+        full_parts = [p for p in full_parts if p.cid and str(p.cid).strip().lower() not in {"", "none", "pending"}]
 
-        if get_from_cache:
-            # Prefer structured assembly from cache (enriches contiguous parts beyond DB manifest)
-            try:
-                # Debug probe: which parts are in cache right now
-                try:
-                    present = [_pn for _pn in range(0, 4) if await obj_cache.exists(info.object_id, _pn)]
-                    with contextlib.suppress(Exception):
-                        self._logger.info(
-                            f"OBJECT_READER cache-probe object_id={info.object_id} present_parts={present}"
-                        )
-                except Exception:
-                    pass
-                parts_for_cache = await self.build_manifest(db, info)
-                download_chunks = [{"part_number": p.part_number, "size_bytes": p.size_bytes} for p in parts_for_cache]
-                with contextlib.suppress(Exception):
-                    self._logger.info(
-                        f"OBJECT_READER cache-manifest object_id={info.object_id} manifest={[d['part_number'] for d in download_chunks]}"
-                    )
-                return await assemble_from_cache(
-                    obj_cache,
-                    {
-                        "object_id": info.object_id,
-                        "bucket_name": info.bucket_name,
-                        "object_key": info.object_key,
-                        "size_bytes": info.size_bytes,
-                        "content_type": info.content_type,
-                        "md5_hash": info.md5_hash,
-                        "created_at": info.created_at,
-                        "metadata": info.metadata,
-                        "multipart": True,
-                        "download_chunks": json.dumps(download_chunks),
-                    },
-                    range_header=None if rng is None else f"bytes={rng.start}-{rng.end}",
-                    start_byte=None if rng is None else rng.start,
-                    end_byte=None if rng is None else rng.end,
-                )
-            except Exception:
-                # Fallback: naive concatenation of any cached parts
-                try:
-                    collected: list[tuple[int, bytes]] = []
-                    for pn in range(0, 256):
-                        data = await obj_cache.get(info.object_id, pn)
-                        if data is not None:
-                            collected.append((pn, data))
-                    if collected:
-                        collected.sort(key=lambda x: x[0])
-                        blob = b"".join(b for _, b in collected)
-                        # Normalize metadata
-                        _md = info.metadata
-                        if isinstance(_md, str):
-                            try:
-                                _md = json.loads(_md)
-                            except Exception:
-                                _md = {}
-                        if rng is not None:
-                            slice_bytes = blob[rng.start : rng.end + 1]
-                            headers = build_headers(
-                                dataclasses.asdict(info), source="cache", metadata=_md, rng=(rng.start, rng.end)
-                            )
-                            return StreamingResponse(
-                                iter([slice_bytes]), status_code=206, media_type=info.content_type, headers=headers
-                            )
-                        headers = build_headers(dataclasses.asdict(info), source="cache", metadata=_md)
-                        return StreamingResponse(iter([blob]), media_type=info.content_type, headers=headers)
-                except Exception:
-                    pass
-
-        parts, layout = await self.plan_parts_for_range(db, info, rng)
-        parts = [p for p in parts if p.cid and str(p.cid).strip().lower() not in {"", "none", "pending"}]
-
-        # Wait for required CIDs
+        # Wait for required CIDs to be available in the database if necessary
         try:
             rows_required = await db.fetch("SELECT part_number FROM parts WHERE object_id = $1", info.object_id)
             required = {int(r[0]) for r in rows_required}
         except Exception:
             required = set()
-        available = {p.part_number for p in parts}
+        available = {p.part_number for p in full_parts}
         if required and not required.issubset(available):
             waited = await ManifestService.wait_for_cids(db, info.object_id, required, attempts=10, interval_sec=0.5)
             if waited:
-                parts = [
+                full_parts = [
                     Part(part_number=int(c["part_number"]), cid=str(c["cid"]), size_bytes=int(c.get("size_bytes", 0)))
                     for c in waited
                 ]
 
-        if not parts:
+        # Fallback to the object-level CID if no parts are found
+        if not full_parts:
             base_cid = await db.fetchval(
                 "SELECT c.cid FROM objects o JOIN cids c ON o.cid_id = c.id WHERE o.object_id = $1",
                 info.object_id,
@@ -320,27 +245,69 @@ class ObjectReader:
             if not base_cid:
                 base_cid = await db.fetchval("SELECT ipfs_cid FROM objects WHERE object_id = $1", info.object_id)
             if base_cid and str(base_cid).strip().lower() not in {"", "none", "pending"}:
-                parts = [Part(part_number=0, cid=str(base_cid), size_bytes=info.size_bytes)]
+                full_parts = [Part(part_number=0, cid=str(base_cid), size_bytes=info.size_bytes)]
+
+        full_parts = sorted(full_parts, key=lambda p: p.part_number)
+        layout = [{"part_number": p.part_number, "size_bytes": p.size_bytes} for p in full_parts]
+
+        # Step 2: Derive needed parts for the requested range
+        if rng is not None:
+            needed_part_numbers = calculate_chunks_for_range(rng.start, rng.end, layout)
+            parts = [p for p in full_parts if p.part_number in needed_part_numbers]
+        else:
+            parts = full_parts
 
         parts = sorted(parts, key=lambda p: p.part_number)
-        # Proactively enqueue missing parts; then we will wait per-part while streaming
-        satisfied_from_cache, missing_for_pipeline = await self.hydrate_object_cache(
-            redis,
-            obj_cache,
-            info,
-            parts,
-            address=address,
-            seed_phrase=seed_phrase,
-        )
 
-        # Range response
+        # Step 3: Check cache and determine the source
+        all_parts_in_cache = True
+        if not parts:
+            all_parts_in_cache = False
+        else:
+            for p in parts:
+                if not await obj_cache.exists(info.object_id, int(p.part_number)):
+                    all_parts_in_cache = False
+                    break
+        source_header = "cache" if all_parts_in_cache else "pipeline"
+
+        # Step 4: Hydrate cache if necessary (enqueue downloads for missing parts)
+        if source_header == "pipeline":
+            await self.hydrate_object_cache(
+                redis,
+                obj_cache,
+                info,
+                parts,
+                address=address,
+                seed_phrase=seed_phrase,
+            )
+
+        # Step 5: Pre-flight check to ensure the first part is available before sending headers
+        import time as _time
+
+        if parts:
+            first_part = parts[0]
+            deadline = _time.time() + float(self.config.http_stream_initial_timeout_seconds)
+            while True:
+                if (await obj_cache.get(info.object_id, int(first_part.part_number))) is not None:
+                    break
+                if _time.time() > deadline:
+                    raise DownloadNotReadyError("initial_stream_timeout")
+                await asyncio.sleep(self.config.http_download_sleep_loop)
+
+        # Step 6: Prepare and stream the response
+        _md = info.metadata
+        if isinstance(_md, str):
+            try:
+                _md = json.loads(_md)
+            except Exception:
+                _md = {}
+
+        # Handle Range Request
         if rng is not None:
 
             async def gen_range() -> AsyncGenerator[bytes, None]:
-                # Wait per-part in order and collect then slice
                 data_chunks: list[bytes] = []
-                for _idx, p in enumerate(parts):
-                    # wait on obj: for this part
+                for p in parts:
                     while True:
                         data = await obj_cache.get(info.object_id, int(p.part_number))
                         if data is not None:
@@ -352,16 +319,19 @@ class ObjectReader:
                 )
                 yield data
 
-            _md = info.metadata
-            if isinstance(_md, str):
-                try:
-                    _md = json.loads(_md)
-                except Exception:
-                    _md = {}
-            headers = build_headers(dataclasses.asdict(info), source="pipeline", metadata=_md, rng=(rng.start, rng.end))
-            return StreamingResponse(gen_range(), status_code=206, media_type=info.content_type, headers=headers)
+            headers = build_headers(
+                dataclasses.asdict(info),
+                source=source_header,
+                metadata=_md,
+                rng=(rng.start, rng.end),
+                range_was_invalid=range_was_invalid,
+            )
+            status_code = 200 if range_was_invalid else 206
+            return StreamingResponse(
+                gen_range(), status_code=status_code, media_type=info.content_type, headers=headers
+            )
 
-        # Full response
+        # Handle Full Request
         async def gen_full() -> AsyncGenerator[bytes, None]:
             for p in parts:
                 while True:
@@ -370,46 +340,6 @@ class ObjectReader:
                         yield data
                         break
                     await asyncio.sleep(self.config.http_download_sleep_loop)
-
-        all_satisfied_without_pipeline = len(missing_for_pipeline) == 0 and (has_cache or len(satisfied_from_cache) > 0)
-        source_header = "cache" if all_satisfied_without_pipeline else "pipeline"
-        _md = info.metadata
-        if isinstance(_md, str):
-            try:
-                _md = json.loads(_md)
-            except Exception:
-                _md = {}
-        # Preflight diagnostics and wait: first part must be ready within timeout
-        import time as _time
-
-        if parts:
-            try:
-                present_flags = []
-                for pp in parts:
-                    try:
-                        present_flags.append(
-                            (pp.part_number, bool(await obj_cache.exists(info.object_id, int(pp.part_number))))
-                        )
-                    except Exception:
-                        present_flags.append((pp.part_number, False))
-                with contextlib.suppress(Exception):
-                    self._logger.info(
-                        f"READ-PREFLIGHT object_id={info.object_id} parts={[p.part_number for p in parts]} exists={present_flags}"
-                    )
-            except Exception:
-                pass
-            first_part = parts[0]
-            deadline = _time.time() + float(self.config.http_stream_initial_timeout_seconds)
-            while True:
-                if (await obj_cache.get(info.object_id, int(first_part.part_number))) is not None:
-                    break
-                if _time.time() > deadline:
-                    with contextlib.suppress(Exception):
-                        self._logger.info(
-                            f"READ-PREFLIGHT-TIMEOUT object_id={info.object_id} first_part={first_part.part_number}"
-                        )
-                    raise DownloadNotReadyError("initial_stream_timeout")
-                await asyncio.sleep(self.config.http_download_sleep_loop)
 
         headers = build_headers(dataclasses.asdict(info), source=source_header, metadata=_md)
         return StreamingResponse(gen_full(), media_type=info.content_type, headers=headers)
