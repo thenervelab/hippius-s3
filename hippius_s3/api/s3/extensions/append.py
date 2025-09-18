@@ -92,15 +92,93 @@ async def handle_append(
             # On Redis issues, proceed without idempotency
             pass
 
-    # Atomic read-modify-write guarded by row lock
-    async with db.transaction():
-        current = await db.fetchrow(
-            "SELECT * FROM objects WHERE bucket_id = $1 AND object_key = $2 FOR UPDATE",
-            bucket_id,
-            object_key,
+    # Validate append-if-version header early
+    if expected_version_header is None:
+        return errors.s3_error_response(
+            code="InvalidRequest",
+            message="Missing append-if-version",
+            status_code=400,
+        )
+    try:
+        expected_version = int(expected_version_header)
+    except ValueError:
+        return errors.s3_error_response(
+            code="InvalidRequest",
+            message="append-if-version must be an integer",
+            status_code=400,
         )
 
+    # PHASE 0: Preflight CAS check (no lock) to reduce contention
+    # Check if object exists and get current version
+    current_row = await db.fetchrow(
+        "SELECT append_version, object_id FROM objects WHERE bucket_id = $1 AND object_key = $2 LIMIT 1",
+        bucket_id,
+        object_key,
+    )
+    if not current_row:
+        return errors.s3_error_response(
+            code="NoSuchKey",
+            message=f"The specified key {object_key} does not exist",
+            status_code=404,
+            Key=object_key,
+        )
+
+    current_version = int(current_row.get("append_version") or 0)
+    object_id = str(current_row["object_id"])
+
+    with contextlib.suppress(Exception):
+        logger.info(
+            f"APPEND preflight bucket={bucket_name} key={object_key} expected={expected_version} current={current_version}"
+        )
+    if expected_version != current_version:
+        with contextlib.suppress(Exception):
+            logger.info(
+                f"APPEND preflight-mismatch bucket={bucket_name} key={object_key} expected={expected_version} current={current_version} -> 412"
+            )
+        return errors.s3_error_response(
+            code="PreconditionFailed",
+            message="Version precondition failed",
+            status_code=412,
+            extra_headers={
+                "x-amz-meta-append-version": str(current_version),
+                "Retry-After": "0.1",  # Small jitter to spread retries
+            },
+        )
+
+    # PHASE 1: Transactional phase (with lock) - only reached if preflight passed
+    async with db.transaction():
+        try:
+            current = await db.fetchrow(
+                "SELECT * FROM objects WHERE bucket_id = $1 AND object_key = $2 FOR UPDATE NOWAIT",
+                bucket_id,
+                object_key,
+            )
+        except Exception as e:
+            # If lock is not available, convert to a fast 412 with refreshed version
+            # Postgres lock_not_available (55P03) is commonly surfaced as a generic Exception by drivers
+            with contextlib.suppress(Exception):
+                logger.info(f"APPEND lock not available for {bucket_name}/{object_key}: {e}")
+            try:
+                fresh = await db.fetchrow(
+                    "SELECT append_version FROM objects WHERE bucket_id = $1 AND object_key = $2",
+                    bucket_id,
+                    object_key,
+                )
+                fresh_version = int((fresh or {}).get("append_version") or current_version)
+            except Exception:
+                fresh_version = current_version
+            return errors.s3_error_response(
+                code="PreconditionFailed",
+                message="Concurrent append in progress",
+                status_code=412,
+                extra_headers={
+                    "x-amz-meta-append-version": str(fresh_version),
+                    "Retry-After": "0.1",
+                },
+            )
+
         if not current:
+            # Double-check in case of race (though preflight checked)
             return errors.s3_error_response(
                 code="NoSuchKey",
                 message=f"The specified key {object_key} does not exist",
@@ -108,37 +186,21 @@ async def handle_append(
                 Key=object_key,
             )
 
-        # Validate CAS version
-        if expected_version_header is None:
-            return errors.s3_error_response(
-                code="InvalidRequest",
-                message="Missing append-if-version",
-                status_code=400,
-            )
-        try:
-            expected_version = int(expected_version_header)
-        except ValueError:
-            return errors.s3_error_response(
-                code="InvalidRequest",
-                message="append-if-version must be an integer",
-                status_code=400,
-            )
-        current_version = int(current.get("append_version") or 0)
-        with contextlib.suppress(Exception):
-            logger.info(
-                f"APPEND version-check bucket={bucket_name} key={object_key} expected={expected_version} current={current_version}"
-            )
-        if expected_version != current_version:
+        # Double-check version (TOCTOU protection)
+        current_version_txn = int(current.get("append_version") or 0)
+        if expected_version != current_version_txn:
+            # This should be extremely rare since we checked preflight
             with contextlib.suppress(Exception):
-                logger.info(
-                    f"APPEND version-mismatch bucket={bucket_name} key={object_key} expected={expected_version} current={current_version} -> 412"
+                logger.warning(
+                    f"APPEND txn-version-mismatch bucket={bucket_name} key={object_key} expected={expected_version} current_txn={current_version_txn} -> 412"
                 )
             return errors.s3_error_response(
                 code="PreconditionFailed",
                 message="Version precondition failed",
                 status_code=412,
                 extra_headers={
-                    "x-amz-meta-append-version": str(current_version),
+                    "x-amz-meta-append-version": str(current_version_txn),
+                    "Retry-After": "0.1",
                 },
             )
 
@@ -157,18 +219,7 @@ async def handle_append(
         except Exception:
             has_unified_base = False
 
-        object_id = str(current["object_id"]) if current.get("object_id") else None
-        if object_id is None:
-            # Fallback: fetch object_id via get_object_by_path
-            row = await db.fetchrow(get_query("get_object_by_path"), bucket_id, object_key)
-            if row:
-                object_id = str(row["object_id"])  # type: ignore[index]
-        if object_id is None:
-            return errors.s3_error_response(
-                code="InternalError",
-                message="Could not resolve object id",
-                status_code=500,
-            )
+        # Use object_id from preflight (already validated)
 
         # If parts already exist, enforce multipart on the object row and skip base readiness
         parts_count_existing = await db.fetchval(
@@ -384,10 +435,10 @@ async def handle_append(
         )
         md5s = []
         for p in parts:
-            e = str(p["etag"]).strip('"')
-            e = e.split("-")[0]
-            if len(e) == 32:
-                md5s.append(bytes.fromhex(e))
+            e = str(p["etag"]).strip('"')  # type: ignore
+            e = e.split("-")[0]  # type: ignore
+            if len(e) == 32:  # type: ignore
+                md5s.append(bytes.fromhex(e))  # type: ignore
         combined_md5 = hashlib.md5(b"".join(md5s)).hexdigest()
         composite_etag = f"{combined_md5}-{len(md5s)}"
 

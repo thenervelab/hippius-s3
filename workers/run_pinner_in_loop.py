@@ -413,7 +413,7 @@ async def run_pinner_loop():
         batch_first_seen: dict[str, float] = {}
 
         while True:
-            upload_request = await dequeue_upload_request(redis_client, timeout=0.5)
+            upload_request = await dequeue_upload_request(redis_client)
 
             now = asyncio.get_event_loop().time()
 
