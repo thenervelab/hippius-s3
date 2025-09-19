@@ -23,8 +23,11 @@ WITH simple_objects AS (
 )
 INSERT INTO cids (id, cid)
 SELECT md5(random()::text || clock_timestamp()::text)::uuid, so.base_cid
-FROM simple_objects so
-WHERE NOT EXISTS (SELECT 1 FROM cids cc WHERE cc.cid = so.base_cid);
+FROM (
+    SELECT DISTINCT base_cid
+    FROM simple_objects
+) so
+ON CONFLICT (cid) DO NOTHING;
 
 -- Ensure a multipart_uploads row exists for each simple object (idempotent by object_id)
 WITH simple_objects AS (
