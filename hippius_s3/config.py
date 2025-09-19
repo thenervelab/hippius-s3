@@ -89,6 +89,9 @@ class Config:
     manifest_scan_interval_sec: int = env("MANIFEST_SCAN_INTERVAL_SEC:120", convert=int)
     manifest_builder_max_concurrency: int = env("MANIFEST_BUILDER_MAX_CONCURRENCY:5", convert=int)
 
+    # Publishing toggle (read directly from env; default true)
+    publish_to_chain: bool = env("PUBLISH_TO_CHAIN:true", convert=lambda x: x.lower() == "true")
+
 
 def get_config() -> Config:
     """Get application configuration."""
