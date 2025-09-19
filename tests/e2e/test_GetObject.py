@@ -5,7 +5,7 @@ import time
 from typing import Any
 from typing import Callable
 
-import redis  # type: ignore[import-untyped]
+import redis
 
 from .conftest import assert_hippius_source
 from .conftest import is_real_aws
