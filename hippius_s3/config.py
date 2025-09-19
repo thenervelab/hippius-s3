@@ -38,7 +38,7 @@ class Config:
     enable_audit_logging: bool = env("ENABLE_AUDIT_LOGGING", convert=lambda x: x.lower() == "true")
     enable_strict_validation: bool = env("ENABLE_STRICT_VALIDATION", convert=lambda x: x.lower() == "true")
     enable_api_docs: bool = env("ENABLE_API_DOCS", convert=lambda x: x.lower() == "true")
-    enable_request_profiling: bool = env("ENABLE_REQUEST_PROFILING", convert=lambda x: x.lower() == "true")
+    enable_request_profiling: bool = env("ENABLE_REQUEST_PROFILING:false", convert=lambda x: x.lower() == "true")
     enable_banhammer: bool = env("ENABLE_BANHAMMER:true", convert=lambda x: x.lower() == "true")
 
     # S3 Validation Limits
@@ -79,6 +79,15 @@ class Config:
     redis_read_chunk_timeout = 60
     http_download_sleep_loop = 0.1
     http_redis_get_retries = int(60 / http_download_sleep_loop)
+
+    # initial stream timeout (seconds) before sending first byte
+    http_stream_initial_timeout_seconds: float = env("HTTP_STREAM_INITIAL_TIMEOUT_SECONDS:5", convert=float)
+
+    # Manifest builder configuration
+    manifest_builder_enabled: bool = env("MANIFEST_BUILDER_ENABLED:false", convert=bool)
+    manifest_stabilization_window_sec: int = env("MANIFEST_STABILIZATION_WINDOW_SEC:600", convert=int)
+    manifest_scan_interval_sec: int = env("MANIFEST_SCAN_INTERVAL_SEC:120", convert=int)
+    manifest_builder_max_concurrency: int = env("MANIFEST_BUILDER_MAX_CONCURRENCY:5", convert=int)
 
 
 def get_config() -> Config:

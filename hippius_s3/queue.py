@@ -11,13 +11,13 @@ logger = logging.getLogger(__name__)
 
 class Chunk(BaseModel):
     id: int
-    redis_key: str
 
 
 class ChunkToDownload(BaseModel):
     cid: str
     part_id: int
-    redis_key: str
+    # Temporary backward-compat: accept legacy payloads that include or expect a redis_key
+    redis_key: str | None = None
 
 
 class ChainRequest(BaseModel):
@@ -92,10 +92,8 @@ async def dequeue_upload_request(
 ) -> Union[MultipartUploadChainRequest, SimpleUploadChainRequest, None]:
     """Get the next upload request from the Redis queue."""
     queue_name = "upload_requests"
-    result = await redis_client.brpop(
-        queue_name,
-        timeout=3,
-    )
+    # Use a short blocking timeout to enable timely batch flushes
+    result = await redis_client.brpop(queue_name, timeout=0.5)
     if result:
         _, queue_data = result
         queue_data = json.loads(queue_data)

@@ -1,0 +1,94 @@
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+
+class ManifestService:
+    @staticmethod
+    async def build_initial_download_chunks(db: Any, object_info: dict) -> list[dict]:
+        """
+        Build manifest from parts table only.
+        All objects (simple, append, MPU) are represented by parts rows.
+        No object-level CID fallback used for streaming.
+        """
+        try:
+            rows = await db.fetch(
+                """
+                SELECT p.part_number,
+                       COALESCE(c.cid, p.ipfs_cid) AS cid,
+                       p.size_bytes::bigint AS size_bytes
+                FROM parts p
+                LEFT JOIN cids c ON p.cid_id = c.id
+                WHERE p.object_id = $1
+                ORDER BY part_number
+                """,
+                object_info["object_id"],
+            )
+
+            manifest: list[dict] = []
+            for r in rows:
+                pn = int(r[0])
+                cid_raw = r[1]
+                cid: str | None = None
+                if cid_raw is not None:
+                    cid_str = cid_raw if isinstance(cid_raw, str) else str(cid_raw)
+                    cid_str = cid_str.strip()
+                    if cid_str and cid_str.lower() not in {"", "none", "pending"}:
+                        cid = cid_str
+
+                size = int(r[2] or 0)
+                manifest.append({"part_number": pn, "cid": cid, "size_bytes": size})
+
+            return manifest
+
+        except Exception:
+            return []
+
+    @staticmethod
+    async def wait_for_cids(
+        db: Any,
+        object_id: str,
+        required_parts: set[int],
+        *,
+        attempts: int = 10,
+        interval_sec: float = 0.5,
+    ) -> list[dict]:
+        """Wait briefly for parts to gain concrete CIDs; returns chunk dicts when ready or empty list."""
+        for _ in range(attempts):
+            try:
+                rows = await db.fetch(
+                    """
+                    SELECT p.part_number, COALESCE(c.cid, p.ipfs_cid) AS cid, p.size_bytes
+                    FROM parts p
+                    LEFT JOIN cids c ON p.cid_id = c.id
+                    WHERE p.object_id = $1
+                    ORDER BY p.part_number
+                    """,
+                    object_id,
+                )
+
+                def _valid(row: Any) -> bool:
+                    try:
+                        cid = row[1]
+                        cid_str = cid if isinstance(cid, str) else str(cid or "")
+                        return cid_str.strip().lower() not in {"", "none", "pending"}
+                    except Exception:
+                        return False
+
+                chunks = [
+                    {
+                        "part_number": int(r[0]),
+                        "cid": (r[1] if isinstance(r[1], str) else str(r[1] or "")),
+                        "size_bytes": int(r[2] or 0),
+                    }
+                    for r in rows
+                    if int(r[0]) in required_parts and _valid(r)
+                ]
+                avail = {c["part_number"] for c in chunks}
+                if required_parts.issubset(avail):
+                    return chunks
+            except Exception:
+                pass
+            await asyncio.sleep(interval_sec)
+        return []

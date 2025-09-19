@@ -34,7 +34,8 @@ def parse_range_header(range_header: str, total_size: int) -> Tuple[int, int]:
             raise ValueError(f"Invalid range end: {range_header}")
         end = int(parts[1])
         if end < start:
-            raise ValueError("Range end before start")
+            # AWS behavior: invalid range (start > end) is treated as no range (full object)
+            return 0, total_size - 1
         end = min(end, total_size - 1)
         return start, end
 

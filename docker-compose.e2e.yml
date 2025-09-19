@@ -12,8 +12,11 @@ services:
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
       - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
+    volumes:
+      - .:/app
 
   pinner:
+    command: ["python", "workers/run_pinner_in_loop.py"]
     env_file: []
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
@@ -24,7 +27,32 @@ services:
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
       - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
+    volumes:
+      - .:/app
+
+  manifest-builder:
+    command: ["python", "workers/run_manifest_builder_in_loop.py"]
+    env_file: []
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
+      - ENABLE_REQUEST_PROFILING=false
+      - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
+      - HIPPIUS_PUBLISH_MODE=ipfs_only
+      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
+      - REDIS_URL=redis://redis:6379/0
+      - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
+      - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
+      - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
+      - MANIFEST_BUILDER_ENABLED=true
+      - MANIFEST_STABILIZATION_WINDOW_SEC=1
+      - MANIFEST_SCAN_INTERVAL_SEC=1
+      - MANIFEST_BUILDER_MAX_CONCURRENCY=5
+      - HIPPIUS_E2E_IPFS_API_URL=http://localhost:5001
+    volumes:
+      - .:/app
+
   unpinner:
+    command: ["python", "workers/run_unpinner_in_loop.py"]
     env_file: []
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
@@ -35,8 +63,11 @@ services:
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
       - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
+    volumes:
+      - .:/app
 
   downloader:
+    command: ["python", "workers/run_downloader_in_loop.py"]
     env_file: []
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
@@ -48,8 +79,14 @@ services:
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
       - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
+    volumes:
+      - .:/app
 
   chain-pin-checker:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: ["python", "workers/chain_pin_checker.py"]
     env_file: []
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
@@ -60,8 +97,15 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
+      - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
+    volumes:
+      - .:/app
 
   chain-profile-cacher:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: ["python", "workers/chain_profile_cacher.py"]
     env_file: []
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
@@ -72,3 +116,6 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
+      - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
+    volumes:
+      - .:/app

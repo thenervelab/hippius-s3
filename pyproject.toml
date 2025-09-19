@@ -43,7 +43,10 @@ dev = [
     "boto3>=1.34.0",
     "types-boto3",
     "types-botocore",
+    "types-requests",
+    "types-redis",
     "requests>=2.31.0",
+    "psycopg[binary]>=3.1",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -101,6 +104,7 @@ max-complexity = 13 # TODO: get this down to 8
 "__init__.py" = ["F401"]
 "examples/*.py" = ["T201", "PTH"]
 "tests/**/*.py" = ["T201", "ERA001"]
+"hippius_s3/scripts/*.py" = ["T201", "PTH"]
 
 [tool.mypy]
 python_version = "3.10"
@@ -117,10 +121,6 @@ module = "hippius_s3.api.s3.multipart"
 disallow_untyped_defs = false
 disable_error_code = ["attr-defined", "no-untyped-def", "misc", "return-value"]
 
-[[tool.mypy.overrides]]
-module = "hippius_s3.api.s3.endpoints"
-disallow_untyped_defs = false
-disable_error_code = ["attr-defined", "no-untyped-def", "var-annotated", "misc", "assignment", "return", "call-arg", "union-attr", "index", "no-any-return"]
 
 [[tool.mypy.overrides]]
 module = "hippius_s3.queue"
@@ -188,6 +188,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "mnemonic.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "psycopg.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

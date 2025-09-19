@@ -1,0 +1,206 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import uuid
+from datetime import datetime
+from datetime import timezone
+from typing import Any
+
+from fastapi import Request
+from fastapi import Response
+
+from hippius_s3 import utils
+from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.extensions.append import _upsert_cid
+from hippius_s3.api.s3.extensions.append import handle_append
+from hippius_s3.cache import RedisObjectPartsCache
+from hippius_s3.config import get_config
+from hippius_s3.queue import Chunk
+from hippius_s3.queue import SimpleUploadChainRequest
+from hippius_s3.queue import enqueue_upload_request
+from hippius_s3.utils import get_query
+
+
+logger = logging.getLogger(__name__)
+config = get_config()
+
+
+async def handle_put_object(
+    bucket_name: str,
+    object_key: str,
+    request: Request,
+    db: Any,
+    ipfs_service: Any,
+    redis_client: Any,
+) -> Response:
+    try:
+        # Get or create user and bucket for this main account
+        main_account_id = request.state.account.main_account
+        await db.fetchrow(
+            get_query("get_or_create_user_by_main_account"),
+            main_account_id,
+            datetime.now(timezone.utc),
+        )
+
+        bucket = await db.fetchrow(
+            get_query("get_bucket_by_name_and_owner"),
+            bucket_name,
+            main_account_id,
+        )
+
+        if not bucket:
+            return errors.s3_error_response(
+                "NoSuchBucket",
+                f"The specified bucket {bucket_name} does not exist",
+                status_code=404,
+                BucketName=bucket_name,
+            )
+
+        bucket_id = bucket["bucket_id"]
+
+        # Read request body properly handling chunked encoding
+        incoming_bytes = await utils.get_request_body(request)
+        content_type = request.headers.get("Content-Type", "application/octet-stream")
+
+        # Detect S4 append semantics via metadata
+        meta_append = request.headers.get("x-amz-meta-append", "").lower() == "true"
+        if meta_append:
+            return await handle_append(
+                request,
+                db,
+                ipfs_service,
+                redis_client,
+                bucket=bucket,
+                bucket_id=bucket_id,
+                bucket_name=bucket_name,
+                object_key=object_key,
+                incoming_bytes=incoming_bytes,
+            )
+
+        # Regular non-append PutObject path
+        file_data = incoming_bytes
+        file_size = len(file_data)
+        md5_hash = hashlib.md5(file_data).hexdigest()
+        logger.info(f"PUT {bucket_name}/{object_key}: size={len(file_data)}, md5={md5_hash}")
+        object_id = str(uuid.uuid4())
+        should_encrypt = not bucket["is_public"]
+
+        # Unified cache: write part 0 via repository
+        await RedisObjectPartsCache(redis_client).set(object_id, 0, file_data)
+        logger.info(f"PUT cache unified write object_id={object_id} part=0 bytes={len(file_data)}")
+
+        await enqueue_upload_request(
+            payload=SimpleUploadChainRequest(
+                substrate_url=config.substrate_url,
+                ipfs_node=config.ipfs_store_url,
+                address=request.state.account.main_account,
+                subaccount=request.state.account.main_account,
+                subaccount_seed_phrase=request.state.seed_phrase,
+                bucket_name=bucket_name,
+                object_key=object_key,
+                should_encrypt=should_encrypt,
+                object_id=object_id,
+                chunk=Chunk(
+                    id=0,
+                ),
+            ),
+            redis_client=redis_client,
+        )
+
+        created_at = datetime.now(timezone.utc)
+
+        metadata = {}
+        for key, value in request.headers.items():
+            if key.lower().startswith("x-amz-meta-"):
+                meta_key = key[11:]
+                # Do not persist append control metadata as user metadata
+                if meta_key not in {"append", "append-id", "append-if-version"}:
+                    metadata[meta_key] = value
+
+        # Capture previous object (to clean up multipart parts if overwriting)
+        prev = await db.fetchrow(
+            get_query("get_object_by_path"),
+            bucket_id,
+            object_key,
+        )
+
+        async with db.transaction():
+            await db.fetchrow(
+                get_query("upsert_object_basic"),
+                object_id,
+                bucket_id,
+                object_key,
+                content_type,
+                json.dumps(metadata),
+                md5_hash,
+                file_size,
+                created_at,
+            )
+
+            # If overwriting a previous multipart object, remove stale parts
+            try:
+                if prev and (prev.get("multipart") or False):
+                    await db.execute("DELETE FROM parts WHERE object_id = $1", prev["object_id"])  # type: ignore[index]
+            except Exception:
+                logger.debug("Failed to cleanup previous parts on overwrite", exc_info=True)
+
+        # Ensure a multipart_uploads row exists to satisfy parts.upload_id FK
+        try:
+            upload_row = await db.fetchrow(
+                get_query("create_multipart_upload"),
+                uuid.UUID(object_id),
+                bucket_id,
+                object_key,
+                created_at,
+                content_type,
+                json.dumps(metadata),
+                created_at,
+            )
+            upload_id = upload_row["upload_id"] if upload_row else uuid.UUID(object_id)
+        except Exception:
+            # Best effort: reuse existing upload row if it already exists
+            upload_row = await db.fetchrow(
+                "SELECT upload_id FROM multipart_uploads WHERE bucket_id = $1 AND object_key = $2 ORDER BY initiated_at DESC LIMIT 1",
+                bucket_id,
+                object_key,
+            )
+            upload_id = upload_row["upload_id"] if upload_row else uuid.UUID(object_id)
+
+        # Insert parts(0) for simple objects - all objects are represented by parts
+        placeholder_cid = "pending"
+        placeholder_cid_id = await _upsert_cid(db, placeholder_cid)
+
+        # Insert part 0 representing the base object
+        await db.execute(
+            """
+            INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (upload_id, part_number) DO NOTHING
+            """,
+            str(uuid.uuid4()),
+            upload_id,
+            0,
+            placeholder_cid,
+            int(file_size),
+            md5_hash,
+            created_at,
+            object_id,
+            placeholder_cid_id,
+        )
+
+        return Response(
+            status_code=200,
+            headers={
+                "ETag": f'"{md5_hash}"',
+            },
+        )
+
+    except Exception:
+        logger.exception("Error uploading object")
+        return errors.s3_error_response(
+            "InternalError",
+            "We encountered an internal error. Please try again.",
+            status_code=500,
+        )
