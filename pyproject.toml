@@ -43,6 +43,8 @@ dev = [
     "boto3>=1.34.0",
     "types-boto3",
     "types-botocore",
+    "types-requests",
+    "types-redis",
     "requests>=2.31.0",
     "psycopg[binary]>=3.1",
 ]

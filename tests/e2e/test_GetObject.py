@@ -4,6 +4,7 @@ import os
 import time
 from typing import Any
 from typing import Callable
+from typing import cast
 
 import redis
 
@@ -119,7 +120,7 @@ def test_get_object_eventual_consistency(
 
     # Verify Redis has cached parts (obj:{object_id}:part:{n})
     redis_client = redis.Redis.from_url("redis://localhost:6379/0")
-    cache_keys = redis_client.keys(f"obj:{object_id}:part:*")
+    cache_keys = cast(list[bytes], redis_client.keys(f"obj:{object_id}:part:*"))
     assert len(cache_keys) >= 2, f"Expected at least 2 cached parts, found {len(cache_keys)}"
 
     # Step 4: Simulate eventual consistency issue - force all CIDs to 'pending'
