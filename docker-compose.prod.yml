@@ -8,6 +8,7 @@ services:
       - HIPPIUS_IPFS_STORE_URL=http://192.168.1.167:5001
 
   db:
+    shm_size: 2g
     command: [
       "postgres",
       "-c", "max_connections=1000",
