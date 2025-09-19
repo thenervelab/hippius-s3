@@ -22,6 +22,7 @@ from hippius_s3.api.middlewares.frontend_hmac import verify_frontend_hmac_middle
 from hippius_s3.api.middlewares.profiler import SpeedscopeProfilerMiddleware
 from hippius_s3.api.middlewares.rate_limit import RateLimitService
 from hippius_s3.api.middlewares.rate_limit import rate_limit_wrapper
+from hippius_s3.api.middlewares.trailing_slash import trailing_slash_normalizer
 from hippius_s3.api.s3 import errors as s3_errors
 from hippius_s3.api.s3.multipart import router as multipart_router
 from hippius_s3.api.s3.router import router as s3_router_new
@@ -168,10 +169,12 @@ app.middleware("http")(verify_hmac_middleware)
 # 7. Banhammer (IP-based protection - executes THIRD)
 if config.enable_banhammer:
     app.middleware("http")(banhammer_wrapper)
-# 8. CORS (executes SECOND)
+# 8. Trailing slash normalization (executes SECOND)
+app.middleware("http")(trailing_slash_normalizer)
+# 9. CORS (executes THIRD)
 app.middleware("http")(cors_middleware)
 if config.enable_request_profiling:
-    # 9. Profiler (executes FIRST - outermost layer, profiles entire request including auth)
+    # 10. Profiler (executes FIRST - outermost layer, profiles entire request including auth)
     app.add_middleware(SpeedscopeProfilerMiddleware)
 
 
