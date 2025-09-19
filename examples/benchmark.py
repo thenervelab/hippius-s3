@@ -1,3 +1,4 @@
+import argparse
 import base64
 import csv
 import json
@@ -38,18 +39,21 @@ AWS_CLI_CONFIG = {
 }
 
 # Test files
+DATA_PATH_PREFIX = ""
 files = [
-    "test_data/5mb.bin",
-    "test_data/100mb.bin",
-    "test_data/250mb.bin",
-    "test_data/500mb.bin",
-    "test_data/2.5gb.bin",
-    "test_data/5gb.bin",
+    f"{DATA_PATH_PREFIX}test_data/5mb.bin",
+    f"{DATA_PATH_PREFIX}test_data/100mb.bin",
+    f"{DATA_PATH_PREFIX}test_data/250mb.bin",
+    f"{DATA_PATH_PREFIX}test_data/500mb.bin",
+    f"{DATA_PATH_PREFIX}test_data/2.5gb.bin",
+    f"{DATA_PATH_PREFIX}test_data/5gb.bin",
 ]
 
-on_production = True
-endpoint_url = "https://s3.hippius.com" if on_production else "http://localhost:8000"
-use_ssl = on_production
+staging = "https://s3-staging.hippius.com"
+production = "https://s3.hippius.com"
+localhost = "http://localhost:8000"
+endpoint_url = production
+use_ssl = not (endpoint_url == localhost)
 
 
 def get_file_size(file_path):
@@ -136,11 +140,12 @@ def upload_file_aws_cli(file_path, bucket, endpoint_url, env):
         return None, None, None, None
 
     file_size = get_file_size(file_path)
+    file_name = Path(file_path).name
     logger.info(f"Starting upload of {file_path} ({format_size(file_size)}) to bucket {bucket}")
 
     start_time = time.time()
 
-    cmd = ["aws", "s3", "cp", file_path, f"s3://{bucket}/{file_path}", "--endpoint-url", endpoint_url]
+    cmd = ["aws", "s3", "cp", file_path, f"s3://{bucket}/{file_name}", "--endpoint-url", endpoint_url]
 
     try:
         # Use Popen to capture stderr in real-time (where progress is shown)
@@ -198,6 +203,9 @@ def download_file_aws_cli(file_name, bucket, endpoint_url, env, download_dir):
             if download_path.exists():
                 downloaded_size = get_file_size(download_path)
                 avg_download_speed = downloaded_size / download_time if download_time > 0 else 0
+                logger.debug(
+                    f"Download debug: path={download_path}, size={downloaded_size}, time={download_time}, speed_calc={avg_download_speed}"
+                )
 
                 # Parse speeds from stderr (where AWS CLI shows progress)
                 speeds = parse_aws_cli_speeds(stderr)
@@ -209,9 +217,11 @@ def download_file_aws_cli(file_name, bucket, endpoint_url, env, download_dir):
                 )
                 if min_speed and max_speed:
                     logger.info(f"  Speed range: {format_speed(min_speed)} - {format_speed(max_speed)}")
+                else:
+                    logger.warning(f"No speed data parsed from AWS CLI stderr: {stderr[:200]}")
 
                 return download_time, avg_download_speed, downloaded_size, min_speed, max_speed
-            logger.error(f"Downloaded file {file_name} not found after AWS CLI command")
+            logger.error(f"Downloaded file {file_name} not found at {download_path} after AWS CLI command")
             return None, None, None, None, None
         logger.error(f"AWS CLI download failed for {file_name}: {stderr}")
         return None, None, None, None, None
@@ -364,10 +374,10 @@ def wait_for_cid_aws_cli(file_name, bucket, endpoint_url, env, max_attempts=100,
     return False
 
 
-def benchmark_s3_endpoint(results):
+def benchmark_s3_endpoint(results, skip_ipfs=False):
     """Test S3 endpoint performance using AWS CLI."""
     s3_bucket = f"s3-{bucket_name}"
-    download_dir = Path("downloaded/s3")
+    download_dir = Path(f"{DATA_PATH_PREFIX}test_data/downloads/s3")
     download_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Starting S3 endpoint benchmark with bucket {s3_bucket}")
@@ -410,6 +420,7 @@ def benchmark_s3_endpoint(results):
         results[file_name]["file_size"] = file_size
 
         # Upload test
+        file_basename = Path(file_name).name
         logger.info(f"Starting S3 upload test for {file_name}")
         upload_time, upload_speed_avg, upload_speed_min, upload_speed_max = upload_file_aws_cli(
             file_name, s3_bucket, endpoint_url, env
@@ -418,22 +429,26 @@ def benchmark_s3_endpoint(results):
         if upload_time is not None:
             logger.info(f"S3 upload successful for {file_name}")
 
-            # Wait for CID to be available after upload
-            logger.info(f"Waiting for CID to be available for {file_name}...")
-            cid_available = wait_for_cid_aws_cli(file_name, s3_bucket, endpoint_url, env)
-            if cid_available:
-                logger.info(f"CID is now available for {file_name}")
+            # Wait for CID to be available after upload (unless skipping IPFS)
+            cid_available = True
+            if not skip_ipfs:
+                logger.info(f"Waiting for CID to be available for {file_name}...")
+                cid_available = wait_for_cid_aws_cli(file_basename, s3_bucket, endpoint_url, env)
+                if cid_available:
+                    logger.info(f"CID is now available for {file_name}")
+                else:
+                    logger.warning(f"CID not available after polling timeout for {file_name}")
             else:
-                logger.warning(f"CID not available after polling timeout for {file_name}")
+                logger.info(f"Skipping CID wait for {file_name} (--skip-ipfs enabled)")
         else:
             logger.error(f"S3 upload failed for {file_name}")
 
-        # Download test (only after CID is available)
+        # Download test
         download_time = download_speed_avg = downloaded_size = download_speed_min = download_speed_max = None
         if upload_time is not None and cid_available:
             logger.info(f"Starting S3 download test for {file_name}")
             download_time, download_speed_avg, downloaded_size, download_speed_min, download_speed_max = (
-                download_file_aws_cli(file_name, s3_bucket, endpoint_url, env, download_dir)
+                download_file_aws_cli(file_basename, s3_bucket, endpoint_url, env, download_dir)
             )
 
         if download_time is not None:
@@ -460,7 +475,7 @@ def benchmark_s3_endpoint(results):
 def benchmark_r2_endpoint(results):
     """Test R2 endpoint performance using AWS CLI."""
     r2_bucket = f"r2-{bucket_name}"
-    download_dir = Path("downloaded/r2")
+    download_dir = Path(f"{DATA_PATH_PREFIX}test_data/downloads/r2")
     download_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Starting R2 endpoint benchmark with bucket {r2_bucket}")
@@ -499,6 +514,7 @@ def benchmark_r2_endpoint(results):
             results[file_name]["file_size"] = file_size
 
         # Upload test
+        file_basename = Path(file_name).name
         logger.info(f"Starting R2 upload test for {file_name}")
         upload_time, upload_speed_avg, upload_speed_min, upload_speed_max = upload_file_aws_cli(
             file_name, r2_bucket, r2_endpoint, env
@@ -512,7 +528,7 @@ def benchmark_r2_endpoint(results):
         # Download test
         logger.info(f"Starting R2 download test for {file_name}")
         download_time, download_speed_avg, downloaded_size, download_speed_min, download_speed_max = (
-            download_file_aws_cli(file_name, r2_bucket, r2_endpoint, env, download_dir)
+            download_file_aws_cli(file_basename, r2_bucket, r2_endpoint, env, download_dir)
         )
 
         if download_time is not None:
@@ -692,7 +708,13 @@ def print_summary(results):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="S3 vs R2 speed benchmark using AWS CLI")
+    parser.add_argument("--skip-ipfs", action="store_true", help="Skip waiting for CIDs to become available")
+    args = parser.parse_args()
+
     logger.info("Starting S3 vs R2 speed benchmark using AWS CLI")
+    if args.skip_ipfs:
+        logger.info("IPFS CID waiting disabled - files will be downloaded immediately from cache")
 
     # Check for required environment variables
     required_vars = ["HIPPIUS_ACC_1_SUBACCOUNT_UPLOAD", "R2_ACCESS_KEY", "R2_SECRET_KEY", "R2_ENDPOINT"]
@@ -710,7 +732,7 @@ def main():
 
     # Test S3 endpoint
     logger.info("Starting S3 endpoint tests")
-    benchmark_s3_endpoint(results)
+    benchmark_s3_endpoint(results, skip_ipfs=args.skip_ipfs)
 
     # Test R2 endpoint
     logger.info("Starting R2 endpoint tests")
