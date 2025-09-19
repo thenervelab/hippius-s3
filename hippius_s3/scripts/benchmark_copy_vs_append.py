@@ -22,6 +22,7 @@ Usage examples:
 """
 
 import argparse
+import contextlib
 import csv
 import json
 import os
@@ -431,18 +432,13 @@ class HippiusBenchmarkRunner(BenchmarkRunner):
         base_data = self._get_part_data(0)
         t0 = time.time()
         self._log(1, f"[{self._ts()}] [hippius] PUT base: key={target_key} bytes={len(base_data)}")
-        self.client.put_object(Bucket=self.bucket, Key=target_key, Body=base_data)
+        put_resp = self.client.put_object(Bucket=self.bucket, Key=target_key, Body=base_data)
         self._log(1, f"[{self._ts()}] [hippius] PUT base done in {int((time.time() - t0) * 1000)} ms")
 
-        # Get initial version
-        th0 = time.time()
-        self._log(2, f"[{self._ts()}] [hippius] HEAD after base: key={target_key}")
-        head = self.client.head_object(Bucket=self.bucket, Key=target_key)
-        self._log(
-            2,
-            f"[{self._ts()}] [hippius] HEAD after base done in {int((time.time() - th0) * 1000)} ms headers={head.get('ResponseMetadata', {}).get('HTTPHeaders', {})}",
+        # Read initial version directly from PUT response headers
+        current_version = (
+            put_resp.get("ResponseMetadata", {}).get("HTTPHeaders", {}).get("x-amz-meta-append-version", "0")
         )
-        current_version = head.get("Metadata", {}).get("append-version", "0")
         self._log(1, f"[{self._ts()}] [hippius] current append-version={current_version}")
 
         t_init_ms = (time.time() - t_init_start) * 1000
@@ -467,7 +463,7 @@ class HippiusBenchmarkRunner(BenchmarkRunner):
                 attempt += 1
                 try:
                     pa0 = time.time()
-                    self.client.put_object(
+                    resp = self.client.put_object(
                         Bucket=self.bucket,
                         Key=target_key,
                         Body=part_data,
@@ -476,6 +472,11 @@ class HippiusBenchmarkRunner(BenchmarkRunner):
                     self._log(
                         1, f"[{self._ts()}] [hippius] PUT append part={i} ok in {int((time.time() - pa0) * 1000)} ms"
                     )
+                    # Update version from server response header to avoid HEAD
+                    next_version = (
+                        resp.get("ResponseMetadata", {}).get("HTTPHeaders", {}).get("x-amz-meta-append-version")
+                    )
+                    current_version = str(next_version) if next_version is not None else str(int(current_version) + 1)
                     break
                 except ClientError as e:
                     code = str(e.response.get("Error", {}).get("Code"))
@@ -487,55 +488,27 @@ class HippiusBenchmarkRunner(BenchmarkRunner):
                     if self._v() >= 3:
                         traceback.print_exc()
 
-                    # On version mismatch, check if append actually succeeded despite 412
+                    # On version mismatch, use server-provided current version and optional Retry-After; avoid HEAD
                     if code in {"PreconditionFailed", "412"}:
-                        try:
-                            hr0 = time.time()
-                            self._log(2, f"[{self._ts()}] [hippius] HEAD refresh after 412: key={target_key}")
-                            hh = self.client.head_object(Bucket=self.bucket, Key=target_key)
+                        hdrs = e.response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+                        next_version = hdrs.get("x-amz-meta-append-version")
+                        retry_after = hdrs.get("retry-after")
+                        if next_version is not None:
+                            current_version = str(next_version)
+                            metadata["append-if-version"] = str(current_version)
                             self._log(
-                                2,
-                                f"[{self._ts()}] [hippius] HEAD refresh done in {int((time.time() - hr0) * 1000)} ms headers={hh.get('ResponseMetadata', {}).get('HTTPHeaders', {})}",
+                                1, f"[{self._ts()}] [hippius] updated append-version from server: {current_version}"
                             )
-                            new_size = hh.get("ContentLength", 0)
-                            new_version = hh.get("Metadata", {}).get("append-version", current_version)
-
-                            # If object grew by exactly our part size, treat as success
-                            expected_size = sum(len(self._get_part_data(j)) for j in range(i + 1))
-                            if new_size == expected_size:
-                                self._log(
-                                    1,
-                                    f"[{self._ts()}] [hippius] detected successful append despite 412 (size grew from {len(self._get_part_data(0))} to {new_size})",
-                                )
-                                break  # Success, exit retry loop
-
-                            # Otherwise, refresh version and retry if attempts remain
-                            if attempt < max_retries:
-                                current_version = int(new_version)
-                                metadata["append-if-version"] = str(current_version)
-                                self._log(
-                                    1,
-                                    f"[{self._ts()}] [hippius] refreshed append-version={current_version} and retrying",
-                                )
-                                time.sleep(retry_wait)
-                                continue
-                        except Exception as he:
-                            self._log(1, f"[{self._ts()}] [hippius] HEAD refresh failed: {he}")
-                            if attempt < max_retries:
-                                time.sleep(retry_wait)
-                                continue
+                        if attempt < max_retries:
+                            sleep_s = retry_wait
+                            if retry_after and str(retry_after).replace(".", "", 1).isdigit():
+                                with contextlib.suppress(Exception):
+                                    sleep_s = float(retry_after)
+                            time.sleep(sleep_s)
+                            continue
 
                     raise
-
-            # Get new version for next append
-            hv0 = time.time()
-            self._log(2, f"[{self._ts()}] [hippius] HEAD after append: key={target_key}")
-            head = self.client.head_object(Bucket=self.bucket, Key=target_key)
-            self._log(
-                2,
-                f"[{self._ts()}] [hippius] HEAD after append done in {int((time.time() - hv0) * 1000)} ms headers={head.get('ResponseMetadata', {}).get('HTTPHeaders', {})}",
-            )
-            current_version = head.get("Metadata", {}).get("append-version", current_version)
+            # Version already updated from PUT response; no HEAD needed
             self._log(1, f"[{self._ts()}] [hippius] new append-version={current_version}")
 
             part_ms = (time.time() - part_start) * 1000
