@@ -1,10 +1,13 @@
 -- migrate:up
 
+-- Ensure UUID generator is available
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- Backfill part 0 for simple objects so that all objects are represented by parts
 -- Criteria:
 --  - Object has no parts rows yet
 --  - Object has a concrete CID (cid_id or ipfs_cid not pending/empty)
-
+-- Ensure a multipart_uploads row exists for each simple object (idempotent by object_id)
 WITH simple_objects AS (
     SELECT o.object_id,
            o.bucket_id,
@@ -14,30 +17,33 @@ WITH simple_objects AS (
            COALESCE(c.cid, o.ipfs_cid) AS base_cid
     FROM objects o
     LEFT JOIN cids c ON o.cid_id = c.id
-    WHERE NOT EXISTS (
-        SELECT 1 FROM parts p WHERE p.object_id = o.object_id
-    )
+    WHERE NOT EXISTS (SELECT 1 FROM parts p WHERE p.object_id = o.object_id)
+      AND COALESCE(NULLIF(TRIM(COALESCE(c.cid, o.ipfs_cid)), ''), 'pending') <> 'pending'
+)
+INSERT INTO multipart_uploads (upload_id, bucket_id, object_key, initiated_at, is_completed, content_type, metadata, object_id)
+SELECT gen_random_uuid(), so.bucket_id, so.object_key, NOW() AT TIME ZONE 'UTC', TRUE, NULL, '{}'::jsonb, so.object_id
+FROM simple_objects so
+WHERE NOT EXISTS (SELECT 1 FROM multipart_uploads mu WHERE mu.object_id = so.object_id);
+
+-- Now insert part 0 for each simple object using the upload row
+WITH simple_objects AS (
+    SELECT o.object_id,
+           o.bucket_id,
+           o.object_key,
+           o.size_bytes,
+           o.md5_hash,
+           COALESCE(c.cid, o.ipfs_cid) AS base_cid
+    FROM objects o
+    LEFT JOIN cids c ON o.cid_id = c.id
+    WHERE NOT EXISTS (SELECT 1 FROM parts p WHERE p.object_id = o.object_id)
       AND COALESCE(NULLIF(TRIM(COALESCE(c.cid, o.ipfs_cid)), ''), 'pending') <> 'pending'
 )
 INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
-SELECT gen_random_uuid() AS part_id,
-       mu.upload_id,
-       0 AS part_number,
-       so.base_cid AS ipfs_cid,
-        so.size_bytes::bigint AS size_bytes,
-       so.md5_hash AS etag,
-       NOW() AT TIME ZONE 'UTC' AS uploaded_at,
-       so.object_id,
-       c.id AS cid_id
+SELECT gen_random_uuid(), mu.upload_id, 0, so.base_cid, so.size_bytes::bigint, so.md5_hash, NOW() AT TIME ZONE 'UTC', so.object_id, c.id
 FROM simple_objects so
-JOIN LATERAL (
-    -- Ensure a multipart_uploads row exists per object (idempotent)
-    INSERT INTO multipart_uploads (upload_id, bucket_id, object_key, initiated_at, is_completed, content_type, metadata)
-    VALUES (gen_random_uuid(), so.bucket_id, so.object_key, NOW() AT TIME ZONE 'UTC', TRUE, NULL, '{}'::jsonb)
-    ON CONFLICT DO NOTHING
-    RETURNING upload_id
-) mu ON TRUE
-JOIN cids c ON c.cid = so.base_cid;
+JOIN multipart_uploads mu ON mu.object_id = so.object_id
+JOIN cids c ON c.cid = so.base_cid
+ON CONFLICT (upload_id, part_number) DO NOTHING;
 
 -- migrate:down
 -- This down migration deletes only part 0 rows for objects that still have no other parts
