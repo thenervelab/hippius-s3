@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import uuid
 from datetime import datetime
 from datetime import timezone
@@ -132,7 +131,7 @@ async def handle_copy_object(
                     store_node=config.ipfs_store_url,
                     pin_node=config.ipfs_store_url,
                     substrate_url=config.substrate_url,
-                    publish=(os.getenv("HIPPIUS_PUBLISH_MODE", "full") != "ipfs_only"),
+                    publish=config.publish_to_chain,
                 )
                 ipfs_cid = s3_result.cid
                 file_size = len(src_bytes)  # type: ignore[arg-type]
@@ -164,7 +163,7 @@ async def handle_copy_object(
                 store_node=config.ipfs_store_url,
                 pin_node=config.ipfs_store_url,
                 substrate_url=config.substrate_url,
-                publish=(os.getenv("HIPPIUS_PUBLISH_MODE", "full") != "ipfs_only"),
+                publish=config.publish_to_chain,
             )
             ipfs_cid = s3_result.cid
             file_size = len(src_bytes)  # type: ignore[arg-type]
