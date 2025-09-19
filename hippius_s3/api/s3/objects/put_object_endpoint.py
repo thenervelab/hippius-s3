@@ -190,10 +190,12 @@ async def handle_put_object(
             placeholder_cid_id,
         )
 
+        # New or overwrite base object: expose append-version so clients can start append flow without HEAD
         return Response(
             status_code=200,
             headers={
                 "ETag": f'"{md5_hash}"',
+                "x-amz-meta-append-version": "0",
             },
         )
 
