@@ -338,10 +338,12 @@ async def handle_append(
         # Non-fatal; the object state is already updated, and cache serves reads
         logger.exception("Failed to enqueue append publish request")
 
+    # Successful append: return the new append version so clients can avoid a HEAD
     resp = Response(
         status_code=200,
         headers={
             "ETag": f'"{composite_etag}"',
+            "x-amz-meta-append-version": str(current_version + 1),
         },
     )
     with contextlib.suppress(Exception):
