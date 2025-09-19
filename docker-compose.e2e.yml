@@ -11,6 +11,7 @@ services:
       - ENABLE_REQUEST_PROFILING=false
       - ENABLE_BANHAMMER=false
       - RATE_LIMIT_PER_MINUTE=100000
+<<<<<<< HEAD
       - HIPPIUS_IPFS_GET_URL=http://toxiproxy:18080
       - HIPPIUS_IPFS_STORE_URL=http://toxiproxy:15001
       - REDIS_URL=redis://redis:6379/0

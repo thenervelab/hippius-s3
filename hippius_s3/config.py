@@ -134,6 +134,9 @@ class Config:
     # Substrate worker configuration
     substrate_queue_name: str = env("HIPPIUS_SUBSTRATE_QUEUE_NAME:substrate_requests", convert=str)
 
+    # Publishing toggle (read directly from env; default true)
+    publish_to_chain: bool = env("PUBLISH_TO_CHAIN:true", convert=lambda x: x.lower() == "true")
+
 
 def get_config() -> Config:
     """Get application configuration."""
