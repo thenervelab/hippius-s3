@@ -223,6 +223,11 @@ async def _process_multipart_upload(
             payload.object_id,
             part_number_db,
         )
+        # Update last_append_at timestamp for manifest builder scheduling
+        await db.execute(
+            "UPDATE objects SET last_append_at = NOW() WHERE object_id = $1",
+            payload.object_id,
+        )
         logger.debug(
             f"Updated parts mapping: object_id={payload.object_id} part_number={part_number_db} cid={s3_result.cid}"
         )
