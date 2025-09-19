@@ -626,7 +626,6 @@ async def upload_part(
         raise
 
 
-@router.delete("/{bucket_name}/{object_key:path}/", status_code=204)
 @router.delete("/{bucket_name}/{object_key:path}", status_code=204)
 async def abort_multipart_upload(
     _: str,

@@ -26,7 +26,6 @@ from hippius_s3.services.object_reader import ObjectReader
 router = APIRouter()
 
 
-@router.head("/{bucket_name}/{object_key:path}/", status_code=200)
 @router.head("/{bucket_name}/{object_key:path}", status_code=200)
 async def head_object(
     bucket_name: str,
@@ -37,7 +36,6 @@ async def head_object(
     return await handle_head_object(bucket_name, object_key, request, db)
 
 
-@router.get("/{bucket_name}/{object_key:path}/", status_code=200)
 @router.get("/{bucket_name}/{object_key:path}", status_code=200)
 async def get_object(
     bucket_name: str,
@@ -58,7 +56,6 @@ async def get_object(
     return await handle_get_object(bucket_name, object_key, request, db, ipfs_service, redis_client, object_reader)
 
 
-@router.put("/{bucket_name}/{object_key:path}/", status_code=200)
 @router.put("/{bucket_name}/{object_key:path}", status_code=200)
 async def put_object(
     bucket_name: str,
@@ -81,7 +78,6 @@ async def put_object(
     return await handle_put_object(bucket_name, object_key, request, db, ipfs_service, redis_client)
 
 
-@router.delete("/{bucket_name}/{object_key:path}/", status_code=204)
 @router.delete("/{bucket_name}/{object_key:path}", status_code=204)
 async def delete_object(
     bucket_name: str,

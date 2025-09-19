@@ -33,8 +33,7 @@ async def list_buckets(
     return await handle_list_buckets(ctx, db)
 
 
-@router.get("/{bucket_name}/", status_code=200, include_in_schema=True)
-@router.get("/{bucket_name}", status_code=200, include_in_schema=True)
+@router.get("/{bucket_name}", status_code=200)
 async def get_bucket(
     bucket_name: str,
     request: Request,
@@ -79,7 +78,6 @@ async def delete_bucket_tags_route(
     return await handle_delete_bucket(bucket_name, request, db, redis_client)
 
 
-@router.head("/{bucket_name}/", status_code=200)
 @router.head("/{bucket_name}", status_code=200)
 async def head_bucket(
     bucket_name: str,
