@@ -10,7 +10,6 @@ import asyncio
 import dataclasses
 import json
 import logging
-import os
 from typing import Any
 
 import asyncpg
@@ -18,7 +17,6 @@ import redis.asyncio as redis
 
 from hippius_s3.config import get_config
 from hippius_s3.ipfs_service import IPFSService
-from workers.substrate import submit_storage_request
 
 
 logger = logging.getLogger(__name__)
@@ -108,6 +106,10 @@ async def build_and_publish_manifest(
             )
 
         # Verify all parts have non-pending CIDs
+        if not parts_rows:
+            logger.info(f"Object {request.object_id} has no parts yet, requeueing after stabilization window")
+            return False
+
         incomplete_parts = [p for p in parts_rows if not p["ipfs_cid"] or p["ipfs_cid"] == "pending"]
         if incomplete_parts:
             logger.info(f"Object {request.object_id} has {len(incomplete_parts)} incomplete parts, requeueing")
@@ -153,37 +155,21 @@ async def build_and_publish_manifest(
 
         manifest_data = json.dumps(manifest, separators=(",", ":")).encode()
 
-        # Publish manifest to IPFS (respect e2e IPFS-only mode; skip chain publish when requested)
-        publish_full = os.getenv("HIPPIUS_PUBLISH_MODE", "full") != "ipfs_only"
-        if not publish_full:
-            # Store-only path (no chain): use raw IPFS upload + pin
-            up = await ipfs_service.upload_file(
-                file_data=manifest_data,
-                file_name=f"{object_row['object_key']}_manifest_v{request.append_version}.json",
-                content_type="application/json",
-                encrypt=False,
-                seed_phrase=config.resubmission_seed_phrase,
-            )
-            manifest_cid = up["cid"]
-        else:
-            # Full publish: upload via s3_publish then submit storage request on chain
-            result = await ipfs_service.client.s3_publish(
-                content=manifest_data,
-                encrypt=False,
-                seed_phrase=config.resubmission_seed_phrase,
-                subaccount_id=config.resubmission_seed_phrase,
-                bucket_name=str(object_row["bucket_name"]),
-                object_key=f"{object_row['object_key']}_manifest_v{request.append_version}.json",
-            )
-            manifest_cid = result["cid"]
-            try:
-                await submit_storage_request(
-                    cids=[manifest_cid],
-                    seed_phrase=config.resubmission_seed_phrase,
-                    substrate_url=config.substrate_url,
-                )
-            except Exception:
-                logger.exception("Failed to submit storage request for manifest; proceeding with DB update")
+        # Publish manifest to IPFS; toggle chain publish based on config (env-backed)
+
+        result = await ipfs_service.client.s3_publish(
+            content=manifest_data,
+            encrypt=False,
+            seed_phrase=config.resubmission_seed_phrase,
+            subaccount_id=config.resubmission_seed_phrase,
+            bucket_name=str(object_row["bucket_name"]),
+            file_name=f"{object_row['object_key']}_manifest_v{request.append_version}.json",
+            store_node=config.ipfs_store_url,
+            pin_node=config.ipfs_store_url,
+            substrate_url=config.substrate_url,
+            publish=config.publish_to_chain,
+        )
+        manifest_cid = result.cid
 
         # Update object with manifest info
         async with pool.acquire() as db:

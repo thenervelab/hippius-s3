@@ -5,7 +5,8 @@ services:
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - HIPPIUS_BYPASS_CREDIT_CHECK=true
-      - HIPPIUS_PUBLISH_MODE=ipfs_only
+      - ENVIRONMENT=dev
+      - PUBLISH_TO_CHAIN=false
       - ENABLE_REQUEST_PROFILING=false
       - ENABLE_BANHAMMER=false
       - RATE_LIMIT_PER_MINUTE=100000
@@ -22,7 +23,8 @@ services:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - ENABLE_REQUEST_PROFILING=false
       - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - HIPPIUS_PUBLISH_MODE=ipfs_only
+      - ENVIRONMENT=dev
+      - PUBLISH_TO_CHAIN=false
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
@@ -37,7 +39,8 @@ services:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - ENABLE_REQUEST_PROFILING=false
       - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - HIPPIUS_PUBLISH_MODE=ipfs_only
+      - ENVIRONMENT=dev
+      - PUBLISH_TO_CHAIN=false
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - REDIS_URL=redis://redis:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
@@ -58,7 +61,8 @@ services:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - ENABLE_REQUEST_PROFILING=false
       - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - HIPPIUS_PUBLISH_MODE=ipfs_only
+      - ENVIRONMENT=dev
+      - PUBLISH_TO_CHAIN=false
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
@@ -73,7 +77,8 @@ services:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - ENABLE_REQUEST_PROFILING=false
       - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - HIPPIUS_PUBLISH_MODE=ipfs_only
+      - ENVIRONMENT=dev
+      - PUBLISH_TO_CHAIN=false
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - REDIS_URL=redis://redis:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
@@ -92,7 +97,8 @@ services:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - ENABLE_REQUEST_PROFILING=false
       - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - HIPPIUS_PUBLISH_MODE=ipfs_only
+      - ENVIRONMENT=dev
+      - PUBLISH_TO_CHAIN=false
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - REDIS_URL=redis://redis:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
@@ -111,7 +117,8 @@ services:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - ENABLE_REQUEST_PROFILING=false
       - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - HIPPIUS_PUBLISH_MODE=ipfs_only
+      - ENVIRONMENT=dev
+      - PUBLISH_TO_CHAIN=false
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - REDIS_URL=redis://redis:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
