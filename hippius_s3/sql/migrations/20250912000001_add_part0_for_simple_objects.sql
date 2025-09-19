@@ -18,6 +18,8 @@ WITH simple_objects AS (
     LEFT JOIN cids c ON o.cid_id = c.id
     WHERE NOT EXISTS (SELECT 1 FROM parts p WHERE p.object_id = o.object_id)
       AND COALESCE(NULLIF(TRIM(COALESCE(c.cid, o.ipfs_cid)), ''), 'pending') <> 'pending'
+      AND o.md5_hash IS NOT NULL
+      AND o.size_bytes IS NOT NULL
 )
 INSERT INTO cids (id, cid)
 SELECT md5(random()::text || clock_timestamp()::text)::uuid, so.base_cid
