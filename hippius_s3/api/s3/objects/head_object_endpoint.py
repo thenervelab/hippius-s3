@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
+from typing import Optional
 
 from fastapi import Request
 from fastapi import Response
@@ -20,11 +21,13 @@ async def _get_object_with_permissions_min(
     bucket_name: str,
     object_key: str,
     db: Any,
-    main_account_id: str,
+    main_account_id: Optional[str],
 ) -> Any:
     """Lightweight existence and metadata check with permissions (HEAD)."""
-    # Ensure user exists (align with GET behavior)
-    await UserRepository(db).ensure_by_main_account(main_account_id)
+    # For anonymous access (empty account), skip user creation
+    if main_account_id:
+        # Ensure user exists (align with GET behavior)
+        await UserRepository(db).ensure_by_main_account(main_account_id)
     # Prefer the same query used by GET with permissions baked in
     row = await ObjectRepository(db).get_for_download_with_permissions(bucket_name, object_key, main_account_id)
     if not row:

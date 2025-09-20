@@ -25,6 +25,7 @@ from hippius_s3.api.middlewares.rate_limit import rate_limit_wrapper
 from hippius_s3.api.middlewares.trailing_slash import trailing_slash_normalizer
 from hippius_s3.api.s3 import errors as s3_errors
 from hippius_s3.api.s3.multipart import router as multipart_router
+from hippius_s3.api.s3.public_router import router as public_router
 from hippius_s3.api.s3.router import router as s3_router_new
 from hippius_s3.api.user import router as user_router
 from hippius_s3.cache import RedisDownloadChunksCache
@@ -229,6 +230,8 @@ Disallow: /"""
 
 
 app.include_router(user_router, prefix="/user")
+# Public router handles rewritten anonymous requests (more specific routes first)
+app.include_router(public_router, prefix="")
 # Replace old s3 router with new composed router
 app.include_router(s3_router_new, prefix="")
 app.include_router(multipart_router, prefix="")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from typing import Optional
 
 from hippius_s3.utils import get_query
 
@@ -9,7 +10,9 @@ class ObjectRepository:
     def __init__(self, db: Any) -> None:
         self._db = db
 
-    async def get_for_download_with_permissions(self, bucket_name: str, object_key: str, main_account_id: str) -> Any:
+    async def get_for_download_with_permissions(
+        self, bucket_name: str, object_key: str, main_account_id: Optional[str]
+    ) -> Any:
         return await self._db.fetchrow(
             get_query("get_object_for_download_with_permissions"),
             bucket_name,
