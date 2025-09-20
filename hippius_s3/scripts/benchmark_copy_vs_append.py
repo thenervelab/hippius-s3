@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Benchmark script comparing AWS UploadPartCopy vs Hippius S4 Append performance.
+"""Benchmark script comparing AWS Multipart Upload vs Hippius S4 Append performance.
 
 This script measures end-to-end latency and throughput for building objects via:
-- AWS S3 Multipart Upload with UploadPartCopy operations
+- AWS S3 Multipart Upload with upload_part operations (client sends each part)
 - Hippius S4 Append operations (via S3-compatible API with append metadata)
+
+Both modes send all data from client to server, providing fair client-upload parity.
 
 Usage examples:
     # Basic AWS benchmark (50 MiB total, 5 MiB parts)
@@ -62,6 +64,8 @@ class BenchmarkResult:
     throughput_mib_s: float
     download_throughput_mib_s: float
     per_part_ms: List[float]
+    client_bytes_sent: int = 0
+    server_bytes_copied: int = 0
 
     def to_csv_row(self) -> Dict[str, Any]:
         """Convert to CSV row dictionary."""
@@ -79,15 +83,18 @@ class BenchmarkResult:
             "throughput_mib_s": round(self.throughput_mib_s, 2),
             "download_throughput_mib_s": round(self.download_throughput_mib_s, 2),
             "per_part_ms_json": json.dumps([round(t, 1) for t in self.per_part_ms]),
+            "client_bytes_sent": self.client_bytes_sent,
+            "server_bytes_copied": self.server_bytes_copied,
         }
 
     def __str__(self) -> str:
         """Human-readable summary."""
         total_mib = self.total_bytes / (1024 * 1024)
         part_mib = self.part_bytes / (1024 * 1024)
+        client_mib = self.client_bytes_sent / (1024 * 1024)
         return (
             f"{self.mode} | {total_mib:.0f} MiB | {part_mib:.0f} MiB parts | "
-            f"conc={self.concurrency} | total={self.t_total_ms / 1000:.1f}s | "
+            f"client_sent={client_mib:.0f} MiB | conc={self.concurrency} | total={self.t_total_ms / 1000:.1f}s | "
             f"{self.throughput_mib_s:.1f} MiB/s "
             f"(init={self.t_init_ms / 1000:.1f}s, parts={sum(self.per_part_ms) / 1000:.1f}s, "
             f"complete={self.t_complete_ms / 1000:.1f}s, dl={self.t_download_ms / 1000:.1f}s @ {self.download_throughput_mib_s:.1f} MiB/s)"
@@ -311,73 +318,38 @@ class BenchmarkRunner:
 
 
 class AWSBenchmarkRunner(BenchmarkRunner):
-    """Benchmark runner for AWS UploadPartCopy."""
-
-    def __init__(self, args: argparse.Namespace):
-        super().__init__(args)
-
-        # AWS requires parts >= 5 MiB except the last part
-        if self.part_bytes < 5 * 1024 * 1024 and self.parts > 1:
-            raise ValueError("AWS requires parts >= 5 MiB for multipart upload (except last part)")
-
-        self.source_bucket = args.source_bucket or self.bucket
-        self.source_key = args.source_key or f"{self.object_prefix}-source"
+    """Benchmark runner for AWS Multipart Upload using upload_part (client sends parts)."""
 
     def run_benchmark(self) -> BenchmarkResult:
-        """Run AWS UploadPartCopy benchmark."""
         target_key = f"{self.object_prefix}-target"
 
-        # Create source object
         t_init_start = time.time()
-        self._log(1, f"[{self._ts()}] [aws] PUT source: key={self.source_key} bytes={len(self.test_data)}")
-        self.client.put_object(Bucket=self.source_bucket, Key=self.source_key, Body=self.test_data)
-
-        # Start multipart upload
+        # Start MPU
         mpu = self.client.create_multipart_upload(Bucket=self.bucket, Key=target_key)
         upload_id = mpu["UploadId"]
         parts_info = []
-
         t_init_ms = (time.time() - t_init_start) * 1000
 
-        # Upload parts
         per_part_ms = []
+        client_sent = 0
 
         for i in range(self.parts):
             part_start = time.time()
             part_number = i + 1
-            start_byte = i * self.part_bytes
-            end_byte = min(start_byte + self.part_bytes, self.total_bytes) - 1
-
-            copy_source = {
-                "Bucket": self.source_bucket,
-                "Key": self.source_key,
-            }
-
-            # Build params and pass CopySourceRange at the top level (not inside CopySource)
-            params = {
-                "Bucket": self.bucket,
-                "Key": target_key,
-                "PartNumber": part_number,
-                "UploadId": upload_id,
-                "CopySource": copy_source,
-            }
-
-            if start_byte != 0 or end_byte != self.total_bytes - 1:
-                params["CopySourceRange"] = f"bytes={start_byte}-{end_byte}"
-
-            self._log(3, f"[{self._ts()}] [aws] UploadPartCopy part={part_number} range={start_byte}-{end_byte}")
-            response = self.client.upload_part_copy(**params)
-
-            part_ms = (time.time() - part_start) * 1000
-            per_part_ms.append(part_ms)
-            parts_info.append(
-                {
-                    "ETag": response["CopyPartResult"]["ETag"],
-                    "PartNumber": part_number,
-                }
+            body = self._get_part_data(i)
+            self._log(2, f"[{self._ts()}] [aws-mpu] upload_part {part_number} bytes={len(body)}")
+            resp = self.client.upload_part(
+                Bucket=self.bucket,
+                Key=target_key,
+                UploadId=upload_id,
+                PartNumber=part_number,
+                Body=body,
             )
+            client_sent += len(body)
+            per_part_ms.append((time.time() - part_start) * 1000)
+            parts_info.append({"ETag": resp["ETag"], "PartNumber": part_number})
 
-        # Complete multipart upload
+        # Complete
         t_complete_start = time.time()
         self.client.complete_multipart_upload(
             Bucket=self.bucket, Key=target_key, UploadId=upload_id, MultipartUpload={"Parts": parts_info}
@@ -387,29 +359,22 @@ class AWSBenchmarkRunner(BenchmarkRunner):
         t_total_ms = (time.time() - t_init_start) * 1000
         throughput_mib_s = (self.total_bytes / (1024 * 1024)) / (t_total_ms / 1000)
 
-        # Download and validate content (and time it)
         if getattr(self.args, "skip_download", False):
             t_download_ms = 0.0
             download_throughput_mib_s = 0.0
         else:
             t_download_ms, download_throughput_mib_s = self._time_and_download(target_key)
 
-        # Validate
         self._validate_object(target_key)
-
-        # Cleanup
-        cleanup_keys = [target_key]
-        if self.source_bucket == self.bucket and self.source_key != target_key:
-            cleanup_keys.append(self.source_key)
-        self._cleanup(cleanup_keys)
+        self._cleanup([target_key])
 
         return BenchmarkResult(
             mode="aws",
             total_bytes=self.total_bytes,
             part_bytes=self.part_bytes,
             parts=self.parts,
-            concurrency=1,  # AWS MPU is sequential
-            repeat_idx=0,  # Set by caller
+            concurrency=1,
+            repeat_idx=0,
             t_init_ms=t_init_ms,
             t_complete_ms=t_complete_ms,
             t_total_ms=t_total_ms,
@@ -417,6 +382,8 @@ class AWSBenchmarkRunner(BenchmarkRunner):
             t_download_ms=t_download_ms,
             download_throughput_mib_s=download_throughput_mib_s,
             per_part_ms=per_part_ms,
+            client_bytes_sent=client_sent,
+            server_bytes_copied=0,
         )
 
 
@@ -445,6 +412,7 @@ class HippiusBenchmarkRunner(BenchmarkRunner):
 
         # Append remaining parts
         per_part_ms = []
+        client_sent = len(base_data)
 
         for i in range(1, self.parts):
             part_start = time.time()
@@ -511,6 +479,7 @@ class HippiusBenchmarkRunner(BenchmarkRunner):
             # Version already updated from PUT response; no HEAD needed
             self._log(1, f"[{self._ts()}] [hippius] new append-version={current_version}")
 
+            client_sent += len(part_data)
             part_ms = (time.time() - part_start) * 1000
             per_part_ms.append(part_ms)
 
@@ -521,7 +490,8 @@ class HippiusBenchmarkRunner(BenchmarkRunner):
         throughput_mib_s = (self.total_bytes / (1024 * 1024)) / (t_total_ms / 1000)
 
         # Validate (with small delay for eventual consistency)
-        time.sleep(2)  # Give Hippius S4 time to fully propagate changes
+        if self.args.post_append_sleep > 0:
+            time.sleep(self.args.post_append_sleep)
         self._validate_object(target_key)
 
         # Download and validate content (and time it)
@@ -548,6 +518,8 @@ class HippiusBenchmarkRunner(BenchmarkRunner):
             t_download_ms=t_download_ms,
             download_throughput_mib_s=download_throughput_mib_s,
             per_part_ms=per_part_ms,
+            client_bytes_sent=client_sent,
+            server_bytes_copied=0,
         )
 
 
@@ -577,10 +549,6 @@ def main() -> None:
     parser.add_argument("--bucket", required=True, help="Target bucket name")
     parser.add_argument("--size-mib", type=int, default=50, help="Total object size in MiB (default: 50)")
     parser.add_argument("--part-mib", type=int, default=5, help="Part size in MiB (default: 5)")
-
-    # AWS-specific options
-    parser.add_argument("--source-bucket", help="Source bucket for AWS copy (default: same as target)")
-    parser.add_argument("--source-key", help="Source key for AWS copy (default: auto-generated)")
 
     # Connection options
     parser.add_argument("--endpoint-url", help="S3 endpoint URL (for local/Hippius)")
@@ -621,12 +589,18 @@ def main() -> None:
     parser.add_argument(
         "--skip-download", action="store_true", help="Skip timed GET/download and content verification step"
     )
+    parser.add_argument(
+        "--post-append-sleep",
+        type=float,
+        default=0,
+        help="Sleep seconds before Hippius validation (set 0 for symmetry with AWS)",
+    )
 
     args = parser.parse_args()
 
     # Validate arguments
-    if args.mode == "aws" and args.endpoint_url:
-        print("Warning: --endpoint-url ignored for AWS mode")
+    if args.mode == "aws" and args.size_mib > args.part_mib and args.part_mib < 5:
+        raise ValueError("AWS requires parts >= 5 MiB (except last).")
     if args.mode == "hippius" and not args.endpoint_url:
         print("Warning: --endpoint-url recommended for Hippius mode")
 
