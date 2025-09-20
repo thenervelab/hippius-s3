@@ -62,19 +62,24 @@ async def handle_get_object(
     logger.info(f"GET start {bucket_name}/{object_key} read_mode={hdr_mode or 'auto'} range={bool(range_header)}")
 
     try:
-        # Get user for user-scoped bucket lookup (creates user if not exists)
-        await db.fetchrow(
-            get_query("get_or_create_user_by_main_account"),
-            request.state.account.main_account,
-            datetime.now(timezone.utc),
-        )
+        # For anonymous access, skip user creation and pass NULL account for permission check
+        is_anonymous = getattr(request.state, "access_mode", None) == "anon"
+        account_id = None if is_anonymous else request.state.account.main_account
+
+        if not is_anonymous:
+            # Get user for user-scoped bucket lookup (creates user if not exists)
+            await db.fetchrow(
+                get_query("get_or_create_user_by_main_account"),
+                request.state.account.main_account,
+                datetime.now(timezone.utc),
+            )
 
         # Get object info for download with permission checks
         object_info = await db.fetchrow(
             get_query("get_object_for_download_with_permissions"),
             bucket_name,
             object_key,
-            request.state.account.main_account,
+            account_id,
         )
 
         if not object_info:
@@ -194,7 +199,7 @@ async def handle_get_object(
                 if start_byte is not None and end_byte is not None
                 else None,
                 address=request.state.account.main_account,
-                seed_phrase=request.state.seed_phrase,
+                seed_phrase=getattr(request.state, "seed_phrase", ""),  # Empty for anonymous
                 range_was_invalid=range_was_invalid,
             ),
         )
