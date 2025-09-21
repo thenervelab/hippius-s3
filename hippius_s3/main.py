@@ -230,8 +230,6 @@ Disallow: /"""
 
 
 app.include_router(user_router, prefix="/user")
-# Public router handles rewritten anonymous requests (more specific routes first)
-app.include_router(public_router, prefix="")
-# Replace old s3 router with new composed router
+app.include_router(public_router, prefix="")  # before the generic S3 routes
 app.include_router(s3_router_new, prefix="")
 app.include_router(multipart_router, prefix="")

@@ -10,9 +10,10 @@ services:
       - ENABLE_REQUEST_PROFILING=false
       - ENABLE_BANHAMMER=false
       - RATE_LIMIT_PER_MINUTE=100000
+      - REDIS_URL=redis://redis:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
-      - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
+      - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
     volumes:
       - .:/app
 
@@ -25,10 +26,11 @@ services:
       - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - ENVIRONMENT=dev
       - PUBLISH_TO_CHAIN=false
+      - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
-      - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
+      - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
     volumes:
       - .:/app
 
@@ -45,7 +47,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
-      - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
+      - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
       - MANIFEST_BUILDER_ENABLED=true
       - MANIFEST_STABILIZATION_WINDOW_SEC=1
       - MANIFEST_SCAN_INTERVAL_SEC=1
@@ -66,7 +68,7 @@ services:
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
-      - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
+      - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
     volumes:
       - .:/app
 
@@ -83,7 +85,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
-      - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
+      - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
     volumes:
       - .:/app
 
@@ -103,7 +105,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
-      - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
+      - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
     volumes:
       - .:/app
 
@@ -123,6 +125,6 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
-      - RESUBMISSION_SEED_PHRASE=test twelve word seed phrase for e2e testing purposes only
+      - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
     volumes:
       - .:/app

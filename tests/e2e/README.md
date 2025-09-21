@@ -7,7 +7,7 @@ This directory contains end-to-end tests that verify the full Hippius S3 pipelin
 The tests currently use environment variable bypasses to skip credit checks and blockchain publishing:
 
 - `HIPPIUS_BYPASS_CREDIT_CHECK=true` - Skips credit verification for write operations
-- `HIPPIUS_PUBLISH_MODE=ipfs_only` - Uses IPFS-only mode instead of full blockchain publishing for single file uploads
+- `PUBLISH_TO_CHAIN=false` - Disables blockchain publishing for faster e2e runs
 
 These bypasses allow tests to run without:
 
@@ -59,15 +59,15 @@ services:
     environment:
       # delete these lines
       - HIPPIUS_BYPASS_CREDIT_CHECK=true
-      - HIPPIUS_PUBLISH_MODE=ipfs_only
+      - PUBLISH_TO_CHAIN=false
   pinner:
     environment:
       # delete this line
-      - HIPPIUS_PUBLISH_MODE=ipfs_only
+      - PUBLISH_TO_CHAIN=false
   unpinner:
     environment:
       # delete this line
-      - HIPPIUS_PUBLISH_MODE=ipfs_only
+      - PUBLISH_TO_CHAIN=false
 ```
 
 ### 2. Remove Bypass Code from Source

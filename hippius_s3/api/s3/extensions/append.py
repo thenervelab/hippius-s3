@@ -307,8 +307,12 @@ async def handle_append(
         )
 
         # End of transactional phase; publish outside of the lock window
+
     # PHASE 2 (out-of-DB): enqueue background publish for the reserved part and return immediately
     # Write-through cache first for immediate reads
+
+    # Write-through cache: store appended bytes for immediate reads
+
     with contextlib.suppress(Exception):
         logger.info(f"APPEND cache write object_id={object_id} part={int(next_part)} bytes={len(incoming_bytes)}")
         await RedisObjectPartsCache(redis_client).set(object_id, int(next_part), incoming_bytes, ttl=1800)

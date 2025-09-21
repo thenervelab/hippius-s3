@@ -67,7 +67,7 @@ def test_run_id() -> str:
 def test_seed_phrase() -> str:
     """Generate a unique seed phrase for this test run."""
     # For now, use a fixed test seed. In production, generate or load from secure source.
-    return "test twelve word seed phrase for e2e testing purposes only"
+    return "about acid actor absent action able actual abandon abstract above ability achieve"
 
 
 @pytest.fixture(scope="session")

@@ -28,8 +28,18 @@ async def _get_object_with_permissions_min(
     if main_account_id:
         # Ensure user exists (align with GET behavior)
         await UserRepository(db).ensure_by_main_account(main_account_id)
+
+    # Check if this is an anonymous request to a public bucket
+    account_id_for_query = main_account_id
+    if not main_account_id:
+        # Check if bucket is public
+        from hippius_s3.repositories.buckets import BucketRepository
+
+        bucket = await BucketRepository(db).get_by_name(bucket_name)
+        account_id_for_query = None if bucket and bucket.get("is_public") else main_account_id
+
     # Prefer the same query used by GET with permissions baked in
-    row = await ObjectRepository(db).get_for_download_with_permissions(bucket_name, object_key, main_account_id)
+    row = await ObjectRepository(db).get_for_download_with_permissions(bucket_name, object_key, account_id_for_query)
     if not row:
         raise errors.S3Error(
             code="NoSuchKey",
@@ -47,10 +57,31 @@ async def handle_head_object(
     *,
     object_reader: ObjectReader | None = None,
 ) -> Response:
+    # Compute anonymity before accessing request.state.account
+    is_anonymous = getattr(request.state, "access_mode", None) == "anon"
+    account = getattr(request.state, "account", None)
+
+    if (not is_anonymous) and (account is None):
+        # Check bucket publicity and switch to anon if public
+        from hippius_s3.repositories.buckets import BucketRepository
+
+        bucket = await BucketRepository(db).get_by_name(bucket_name)
+        if bucket and bucket.get("is_public"):
+            from hippius_s3.api.middlewares.credit_check import HippiusAccount
+
+            request.state.access_mode = "anon"
+            request.state.account = HippiusAccount(
+                seed="", id="anon", main_account="public", has_credits=True, upload=False, delete=False
+            )
+            is_anonymous = True
+            account = request.state.account
+
+    main_account_id = None if is_anonymous else (account.main_account if account else None)
+
     # Tagging HEAD: only verify existence
     if "tagging" in request.query_params:
         try:
-            await _get_object_with_permissions_min(bucket_name, object_key, db, request.state.account.main_account)
+            await _get_object_with_permissions_min(bucket_name, object_key, db, main_account_id)
             return Response(status_code=200)
         except errors.S3Error as e:
             return Response(status_code=e.status_code)
@@ -59,7 +90,7 @@ async def handle_head_object(
             return Response(status_code=500)
 
     try:
-        row = await _get_object_with_permissions_min(bucket_name, object_key, db, request.state.account.main_account)
+        row = await _get_object_with_permissions_min(bucket_name, object_key, db, main_account_id)
         # Build headers
         created_at = row["created_at"]
         size_bytes = int(row["size_bytes"]) if row.get("size_bytes") is not None else 0
