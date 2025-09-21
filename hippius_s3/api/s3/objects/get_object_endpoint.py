@@ -42,12 +42,13 @@ async def handle_get_object(
     if "tagging" in request.query_params:
         from hippius_s3.api.s3.objects.tagging_endpoint import get_object_tags  # local import to avoid cycles
 
+        account = getattr(request.state, "account", None)
         return await get_object_tags(
             bucket_name,
             object_key,
             db,
-            request.state.seed_phrase,
-            request.state.account.main_account,
+            getattr(request.state, "seed_phrase", ""),
+            account.main_account if account else "",
         )
 
     # List parts for an ongoing multipart upload
@@ -64,13 +65,14 @@ async def handle_get_object(
     try:
         # For anonymous access, skip user creation and pass NULL account for permission check
         is_anonymous = getattr(request.state, "access_mode", None) == "anon"
-        account_id = None if is_anonymous else request.state.account.main_account
+        account = getattr(request.state, "account", None)
+        account_id = None if is_anonymous else (account.main_account if account else None)
 
-        if not is_anonymous:
+        if not is_anonymous and account:
             # Get user for user-scoped bucket lookup (creates user if not exists)
             await db.fetchrow(
                 get_query("get_or_create_user_by_main_account"),
-                request.state.account.main_account,
+                account.main_account,
                 datetime.now(timezone.utc),
             )
 
@@ -198,7 +200,7 @@ async def handle_get_object(
                 else ORRange(start=start_byte, end=end_byte)
                 if start_byte is not None and end_byte is not None
                 else None,
-                address=request.state.account.main_account,
+                address=account.main_account if account else "",
                 seed_phrase=getattr(request.state, "seed_phrase", ""),  # Empty for anonymous
                 range_was_invalid=range_was_invalid,
             ),

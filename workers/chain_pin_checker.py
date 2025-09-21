@@ -2,7 +2,6 @@
 import asyncio
 import json
 import logging
-import os
 import sys
 import time
 from pathlib import Path
@@ -171,7 +170,7 @@ async def run_chain_pin_checker_loop():
     db = await asyncpg.connect(config.database_url)
 
     # Connect to redis-chain (identical to redis-accounts)
-    redis_chain_url = os.getenv("REDIS_CHAIN_URL", "redis://127.0.0.1:6381/0")
+    redis_chain_url = config.redis_chain_url
     redis_chain = async_redis.from_url(redis_chain_url)
 
     logger.info("Starting chain pin checker service...")

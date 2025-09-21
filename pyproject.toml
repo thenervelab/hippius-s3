@@ -47,6 +47,7 @@ dev = [
     "types-redis",
     "requests>=2.31.0",
     "psycopg[binary]>=3.1",
+    "fakeredis>=2.23.0",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -192,6 +193,14 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "psycopg.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "fakeredis.aioredis"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "aiohttp.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

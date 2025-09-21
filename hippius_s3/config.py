@@ -42,6 +42,7 @@ class Config:
     enable_banhammer: bool = env("ENABLE_BANHAMMER:true", convert=lambda x: x.lower() == "true")
     enable_public_read: bool = env("HIPPIUS_ENABLE_PUBLIC_READ:true", convert=lambda x: x.lower() == "true")
     public_bucket_cache_ttl_seconds: int = env("PUBLIC_BUCKET_CACHE_TTL_SECONDS:60", convert=int)
+    enable_bypass_credit_check: bool = env("HIPPIUS_BYPASS_CREDIT_CHECK:false", convert=lambda x: x.lower() == "true")
 
     # S3 Validation Limits
     min_bucket_name_length: int = env("MIN_BUCKET_NAME_LENGTH", convert=int)
@@ -58,6 +59,9 @@ class Config:
 
     # Redis for account caching (persistent)
     redis_accounts_url: str = env("REDIS_ACCOUNTS_URL")
+
+    # Redis for chain operations
+    redis_chain_url: str = env("REDIS_CHAIN_URL:redis://127.0.0.1:6381/0")
 
     # API signing key for pre-signed URLs
     # Generated on first run if not provided
@@ -77,6 +81,20 @@ class Config:
     # Resubmission settings
     resubmission_seed_phrase: str = env("RESUBMISSION_SEED_PHRASE")
 
+    # Publishing toggle (read directly from env; default true)
+    publish_to_chain: bool = env("PUBLISH_TO_CHAIN:true", convert=lambda x: x.lower() == "true")
+
+    # Pinner configuration
+    pinner_max_attempts: int = env("HIPPIUS_PINNER_MAX_ATTEMPTS:5", convert=int)
+    pinner_backoff_base_ms: int = env("HIPPIUS_PINNER_BACKOFF_BASE_MS:500", convert=int)
+    pinner_backoff_max_ms: int = env("HIPPIUS_PINNER_BACKOFF_MAX_MS:60000", convert=int)
+    pinner_batch_max_age_sec: int = env("HIPPIUS_PINNER_BATCH_MAX_AGE_SEC:10", convert=int)
+    pinner_batch_max_items: int = env("HIPPIUS_PINNER_BATCH_MAX_ITEMS:16", convert=int)
+    pinner_multipart_max_concurrency: int = env("HIPPIUS_PINNER_MULTIPART_MAX_CONCURRENCY:5", convert=int)
+
+    # Cache TTL (shared across components)
+    cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:259200", convert=int)
+
     # endpoint chunk download settings, quite aggressive
     redis_read_chunk_timeout = 60
     http_download_sleep_loop = 0.1
@@ -90,9 +108,6 @@ class Config:
     manifest_stabilization_window_sec: int = env("MANIFEST_STABILIZATION_WINDOW_SEC:600", convert=int)
     manifest_scan_interval_sec: int = env("MANIFEST_SCAN_INTERVAL_SEC:120", convert=int)
     manifest_builder_max_concurrency: int = env("MANIFEST_BUILDER_MAX_CONCURRENCY:5", convert=int)
-
-    # Publishing toggle (read directly from env; default true)
-    publish_to_chain: bool = env("PUBLISH_TO_CHAIN:true", convert=lambda x: x.lower() == "true")
 
 
 def get_config() -> Config:
