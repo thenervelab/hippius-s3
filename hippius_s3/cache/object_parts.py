@@ -4,8 +4,10 @@ from typing import Any
 from typing import Optional
 from typing import Protocol
 
+from hippius_s3.config import get_config
 
-DEFAULT_OBJ_PART_TTL_SECONDS = 1800
+
+DEFAULT_OBJ_PART_TTL_SECONDS = get_config().cache_ttl_seconds
 
 
 class ObjectPartsCache(Protocol):

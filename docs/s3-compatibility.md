@@ -35,7 +35,7 @@ Notes:
 | DeleteBucketTagging                             | ✔         | Deletes all tags                                           | DELETE /{bucket}?tagging                      | test_BucketTagging.py                                                |
 | DeleteBucketWebsite                             |           |                                                            |                                               |                                                                      |
 | DeleteObject                                    | ✔         | Idempotent 204                                             | DELETE /{bucket}/{key}                        | test_DeleteObject.py                                                 |
-| DeleteObjects                                   |           | Batch delete not supported                                 |                                               |                                                                      |
+| DeleteObjects                                   | ✔         | Batch delete via XML; idempotent; supports Quiet           | POST /{bucket}?delete                         | test_DeleteObjects.py                                                |
 | DeleteObjectTagging                             | ✔         | Deletes all tags                                           | DELETE /{bucket}/{key}?tagging                | test_ObjectTagging.py                                                |
 | DeletePublicAccessBlock                         |           |                                                            |                                               |                                                                      |
 | GetBucketAccelerateConfiguration                |           |                                                            |                                               |                                                                      |
@@ -161,12 +161,13 @@ Notes:
   - `PUT /{bucket}/{key}` — Upload object (stores metadata, content type, MD5 as ETag)
   - `GET /{bucket}/{key}` — Download object (supports Range requests; returns S3-like headers)
   - `HEAD /{bucket}/{key}` — Object metadata (size, content type, ETag, Last-Modified)
-  - `x-amz-object-status` on HEAD:
-    - `pending` — object accepted, not yet published to IPFS
+  - `x-amz-object-status` on HEAD (if present):
+    - `uploaded` — object uploaded and available
     - `pinning` — publishing/pinning in progress
-    - `available` — content published and retrievable
-    - `unknown` — status not determined (header omitted)
+    - `publishing` — being published to IPFS
+    - `pending` — accepted, status not finalized yet
   - `DELETE /{bucket}/{key}` — Delete object (idempotent 204)
+  - `POST /{bucket}?delete` — Delete multiple objects (XML body). Idempotent; supports `Quiet`. Response includes `Deleted` and optional `Errors`.
   - User metadata: `x-amz-meta-*` stored and returned on HEAD/GET
   - ETag: MD5 of content for simple uploads (quoted in responses)
 
@@ -189,6 +190,21 @@ Notes:
   - `GET /{bucket}/{key}` with `Range: bytes=...` — 206 Partial Content with `Content-Range`, `Accept-Ranges: bytes`
   - Validates and returns 416 with `Content-Range: bytes */{size}` for invalid ranges
 
+### Hippius extensions
+
+- **Append semantics (non-S3 extension)**
+
+  - `PUT /{bucket}/{key}` with metadata controls:
+    - `x-amz-meta-append: true` — enable append mode
+    - `x-amz-meta-append-if-version: <N>` — CAS guard; current version obtained from `HEAD` response header `x-amz-meta-append-version`
+    - `x-amz-meta-append-id: <id>` — optional idempotency key to deduplicate retries
+  - Responses and errors:
+    - Success appends return 200 and advance `x-amz-meta-append-version`
+    - Stale version returns 412 `PreconditionFailed`
+    - Missing key returns 404 `NoSuchKey`
+  - Works with Range GETs across append boundaries
+  - Tests: `test_AppendObject.py`
+
 - **Object listing (within bucket)**
 
   - `GET /{bucket}` — List objects (optional `prefix` filtering)
@@ -210,4 +226,5 @@ Notes:
 - **Headers returned**
   - `Content-Type`, `Content-Length`, `ETag` (quoted), `Last-Modified`
   - `x-amz-ipfs-cid` with CID or `pending`
+  - `x-hippius-source`: `cache` or `pipeline` (diagnostic; indicates serving source and cache fallback)
   - `Accept-Ranges: bytes` on GETs

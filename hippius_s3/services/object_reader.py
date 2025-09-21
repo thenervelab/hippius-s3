@@ -247,8 +247,9 @@ class ObjectReader:
             required_parts = {p.part_number for p in still_pending}
             if required_parts:
                 # Check if CIDs have become available for any pending parts
+                # Allow brief polling to account for pinner committing CIDs shortly after PUT
                 cid_updates = await ManifestService.wait_for_cids(
-                    db, info.object_id, required_parts, attempts=1, interval_sec=0
+                    db, info.object_id, required_parts, attempts=10, interval_sec=0.2
                 )
                 if cid_updates:
                     # Convert CID updates to parts and enqueue downloads

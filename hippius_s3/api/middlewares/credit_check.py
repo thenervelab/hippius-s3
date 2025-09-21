@@ -4,7 +4,6 @@ import asyncio
 import base64
 import json
 import logging
-import os
 import re
 from typing import Callable
 
@@ -166,7 +165,7 @@ async def check_credit_for_all_operations(request: Request, call_next: Callable)
     path = request.url.path
 
     # Test bypass: short-circuit credit and substrate/redis access entirely
-    if os.getenv("HIPPIUS_BYPASS_CREDIT_CHECK", "false").lower() == "true":
+    if config.enable_bypass_credit_check:
         # Ensure downstream code has an account object
         from contextlib import suppress
 
@@ -203,7 +202,7 @@ async def check_credit_for_all_operations(request: Request, call_next: Callable)
                     raise BadAccount("This account does not have DELETE permissions")
 
                 # Bypass for testing if enabled
-                if os.getenv("HIPPIUS_BYPASS_CREDIT_CHECK", "false").lower() == "true":
+                if config.enable_bypass_credit_check:
                     logger.info("Credit check bypassed for testing")
                 elif not request.state.account.has_credits:
                     logger.warning(f"Account does not have credit for {request.method} operation: {path}")

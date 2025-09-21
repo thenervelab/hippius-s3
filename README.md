@@ -213,7 +213,7 @@ pytest tests/e2e -v
 docker compose -f docker-compose.yml -f docker-compose.e2e.yml down -v
 ```
 
-Note: The e2e override may enable `HIPPIUS_BYPASS_CREDIT_CHECK=true` and `HIPPIUS_PUBLISH_MODE=ipfs_only` for faster runs without chain publishing.
+Note: The e2e override may enable `HIPPIUS_BYPASS_CREDIT_CHECK=true` and `PUBLISH_TO_CHAIN=false` for faster runs without chain publishing.
 
 ### Benchmarking
 
