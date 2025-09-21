@@ -8,6 +8,7 @@ from fastapi import Request
 from fastapi import Response
 
 from hippius_s3 import dependencies
+from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.buckets.bucket_create_endpoint import handle_create_bucket
 from hippius_s3.api.s3.buckets.bucket_delete_endpoint import handle_delete_bucket
 from hippius_s3.api.s3.buckets.bucket_head_endpoint import handle_head_bucket
@@ -16,6 +17,7 @@ from hippius_s3.api.s3.buckets.bucket_location_endpoint import handle_get_bucket
 from hippius_s3.api.s3.buckets.bucket_policy_endpoint import get_bucket_policy as policy_get_bucket_policy
 from hippius_s3.api.s3.buckets.bucket_tagging_endpoint import delete_bucket_tags as tags_delete_bucket_tags
 from hippius_s3.api.s3.buckets.bucket_tagging_endpoint import get_bucket_tags as tags_get_bucket_tags
+from hippius_s3.api.s3.buckets.delete_objects_endpoint import handle_delete_objects
 from hippius_s3.api.s3.buckets.list_buckets_endpoint import handle_list_buckets
 from hippius_s3.api.s3.buckets.list_objects_endpoint import handle_list_objects
 from hippius_s3.dependencies import RequestContext
@@ -76,6 +78,23 @@ async def delete_bucket_tags_route(
     if "tagging" in request.query_params:
         return await tags_delete_bucket_tags(bucket_name, db, request.state.account.main_account)
     return await handle_delete_bucket(bucket_name, request, db, redis_client)
+
+
+@router.post("/{bucket_name}")
+async def post_bucket_subresources(
+    bucket_name: str,
+    request: Request,
+    db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    redis_client: Any = Depends(dependencies.get_redis),
+) -> Response:
+    # Only subresource supported here is ?delete
+    if "delete" in request.query_params:
+        return await handle_delete_objects(bucket_name, request, db, redis_client)
+    return errors.s3_error_response(
+        "NotImplemented",
+        "The specified operation is not supported.",
+        status_code=501,
+    )
 
 
 @router.head("/{bucket_name}", status_code=200)

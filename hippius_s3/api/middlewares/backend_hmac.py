@@ -257,13 +257,11 @@ async def _check_public_read_bypass(request: Request) -> bool:
         return False
 
     bucket_name = path_parts[0]
-    object_key = "/".join(path_parts[1:])
 
     # Query param policy is enforced in public_router (whitelist). Middleware does not block by params.
 
     # Use helper to check public flag (cached)
     if not await is_public_bucket(request, bucket_name):
-        logger.debug(f"Anonymous read blocked: bucket {bucket_name} not found or not public")
         return False
 
     # Set up anonymous access state
@@ -285,7 +283,6 @@ async def _check_public_read_bypass(request: Request) -> bool:
     with contextlib.suppress(Exception):
         request.scope["raw_path"] = new_path.encode("utf-8")
 
-    logger.debug(f"Anonymous public read bypass: {bucket_name}/{object_key} -> {new_path}")
     return True
 
 
