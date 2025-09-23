@@ -320,6 +320,9 @@ async def handle_append(
     # Enqueue background publish of this part via the pinner worker
     try:
         should_encrypt = not bucket["is_public"]
+        logger.debug(
+            f"APPEND about to enqueue MultipartUploadChainRequest for object_id={object_id}, part={int(next_part)}, upload_id={str(upload_id)}"
+        )
         payload = MultipartUploadChainRequest(
             substrate_url=config.substrate_url,
             ipfs_node=config.ipfs_store_url,
@@ -333,7 +336,9 @@ async def handle_append(
             multipart_upload_id=str(upload_id),
             chunks=[Chunk(id=int(next_part))],
         )
+        logger.debug(f"APPEND MultipartUploadChainRequest payload created: {payload}")
         await enqueue_upload_request(payload, redis_client)
+        logger.debug("APPEND MultipartUploadChainRequest successfully enqueued")
         with contextlib.suppress(Exception):
             logger.info(
                 f"APPEND enqueued background publish object_id={object_id} part={int(next_part)} upload_id={str(upload_id)}"

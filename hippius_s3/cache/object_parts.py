@@ -66,6 +66,28 @@ class RedisObjectPartsCache:
         await self.set(object_id, 1, data, ttl=ttl)
 
 
+class RedisUploadPartsCache:
+    """Cache for in-flight multipart uploads keyed by upload_id."""
+
+    def __init__(self, redis_client: Any) -> None:
+        self.redis = redis_client
+
+    def build_key(self, upload_id: str, part_number: int) -> str:
+        return f"obj:{upload_id}:part:{int(part_number)}"
+
+    async def get(self, upload_id: str, part_number: int) -> Optional[bytes]:
+        result = await self.redis.get(self.build_key(upload_id, part_number))
+        return result if isinstance(result, bytes) else None
+
+    async def set(
+        self, upload_id: str, part_number: int, data: bytes, *, ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS
+    ) -> None:
+        await self.redis.setex(self.build_key(upload_id, part_number), ttl, data)
+
+    async def delete(self, upload_id: str, part_number: int) -> None:
+        await self.redis.delete(self.build_key(upload_id, part_number))
+
+
 class NullObjectPartsCache:
     def build_key(self, object_id: str, part_number: int) -> str:  # type: ignore[override]
         return f"obj:{object_id}:part:{int(part_number)}"

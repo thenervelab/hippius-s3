@@ -21,7 +21,9 @@ from workers.substrate import resubmit_substrate_pinning_request
 load_dotenv()
 config = get_config()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+# Set logging level based on config
+log_level = getattr(logging, config.log_level.upper(), logging.INFO)
+logging.basicConfig(level=log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 

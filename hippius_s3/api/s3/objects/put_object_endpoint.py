@@ -91,24 +91,6 @@ async def handle_put_object(
         await RedisObjectPartsCache(redis_client).set(object_id, 0, file_data)
         logger.info(f"PUT cache unified write object_id={object_id} part=0 bytes={len(file_data)}")
 
-        await enqueue_upload_request(
-            payload=SimpleUploadChainRequest(
-                substrate_url=config.substrate_url,
-                ipfs_node=config.ipfs_store_url,
-                address=request.state.account.main_account,
-                subaccount=request.state.account.main_account,
-                subaccount_seed_phrase=request.state.seed_phrase,
-                bucket_name=bucket_name,
-                object_key=object_key,
-                should_encrypt=should_encrypt,
-                object_id=object_id,
-                chunk=Chunk(
-                    id=0,
-                ),
-            ),
-            redis_client=redis_client,
-        )
-
         created_at = datetime.now(timezone.utc)
 
         metadata = {}
@@ -172,7 +154,7 @@ async def handle_put_object(
         placeholder_cid = "pending"
         placeholder_cid_id = await _upsert_cid(db, placeholder_cid)
 
-        # Insert part 0 representing the base object
+        # Insert part 0 representing the base object (placeholder)
         await db.execute(
             """
             INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
@@ -188,6 +170,25 @@ async def handle_put_object(
             created_at,
             object_id,
             placeholder_cid_id,
+        )
+
+        # Only enqueue after DB state (object, upload row, and part 0) is persisted to avoid race with pinner
+        await enqueue_upload_request(
+            payload=SimpleUploadChainRequest(
+                substrate_url=config.substrate_url,
+                ipfs_node=config.ipfs_store_url,
+                address=request.state.account.main_account,
+                subaccount=request.state.account.main_account,
+                subaccount_seed_phrase=request.state.seed_phrase,
+                bucket_name=bucket_name,
+                object_key=object_key,
+                should_encrypt=should_encrypt,
+                object_id=object_id,
+                chunk=Chunk(
+                    id=0,
+                ),
+            ),
+            redis_client=redis_client,
         )
 
         # New or overwrite base object: expose append-version so clients can start append flow without HEAD

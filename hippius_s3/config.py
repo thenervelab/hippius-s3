@@ -103,12 +103,6 @@ class Config:
     # initial stream timeout (seconds) before sending first byte
     http_stream_initial_timeout_seconds: float = env("HTTP_STREAM_INITIAL_TIMEOUT_SECONDS:5", convert=float)
 
-    # Manifest builder configuration
-    manifest_builder_enabled: bool = env("MANIFEST_BUILDER_ENABLED:false", convert=bool)
-    manifest_stabilization_window_sec: int = env("MANIFEST_STABILIZATION_WINDOW_SEC:600", convert=int)
-    manifest_scan_interval_sec: int = env("MANIFEST_SCAN_INTERVAL_SEC:120", convert=int)
-    manifest_builder_max_concurrency: int = env("MANIFEST_BUILDER_MAX_CONCURRENCY:5", convert=int)
-
 
 def get_config() -> Config:
     """Get application configuration."""

@@ -1,11 +1,14 @@
 import hashlib
+import json
 import logging
 import tempfile
 from pathlib import Path
 from typing import Dict
+from typing import NamedTuple
 from typing import Optional
 from typing import Union
 
+import httpx
 import redis.asyncio as async_redis
 from hippius_sdk.client import HippiusClient
 
@@ -31,6 +34,106 @@ class IPFSService:
         logger.info(
             f"IPFS service initialized: IPFS={config.ipfs_get_url} {config.ipfs_store_url}, Substrate={config.substrate_url}"
         )
+
+    class PinnedFile(NamedTuple):
+        file_hash: str
+        cid: str
+
+    async def pin_file_with_encryption(
+        self,
+        *,
+        file_data: bytes,
+        file_name: str,
+        should_encrypt: bool,
+        seed_phrase: Optional[str] = None,
+        subaccount_id: Optional[str] = None,
+        bucket_name: Optional[str] = None,
+        wrap_with_directory: bool = False,
+    ) -> "IPFSService.PinnedFile":
+        """
+        Publish bytes to HIPPIUS via SDK when enabled; fallback to upload+pin otherwise.
+
+        This method matches the expectations of the Pinner, which requires an object exposing a .cid attribute
+        and, when publishing to chain, a .file_hash attribute (aliasing to the cid).
+        """
+        # Prefer SDK s3_publish when we have account context to preserve filename (wrapped directory)
+        try:
+            if self.config.publish_to_chain and seed_phrase and subaccount_id and bucket_name:
+                with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                    temp_path = temp_file.name
+                    temp_file.write(file_data)
+                try:
+                    logger.info(
+                        f"IPFS publish start via s3_publish file={file_name} size={len(file_data)} subaccount={subaccount_id} bucket={bucket_name}"
+                    )
+                    pub = await self.client.s3_publish(
+                        temp_path,
+                        seed_phrase=seed_phrase,
+                        encrypt=should_encrypt,
+                        subaccount_id=subaccount_id,
+                        bucket_name=bucket_name,
+                    )
+                    cid = str(pub["cid"]) if isinstance(pub, dict) and "cid" in pub else str(pub)
+                    logger.info(f"IPFS publish complete cid={cid}")
+                    return IPFSService.PinnedFile(file_hash=cid, cid=cid)
+                finally:
+                    if Path(temp_path).exists():
+                        Path(temp_path).unlink()
+
+            # If asked to wrap filename into a directory (for ls to show name) without publish
+            if wrap_with_directory:
+                # Build a temporary real file named exactly file_name and add with wrap-with-directory
+                # We use IPFS HTTP API directly to control wrapping semantics
+                tmp_dir = tempfile.mkdtemp(prefix="hippius-manifest-")
+                real_path = Path(tmp_dir) / file_name
+                real_path.write_bytes(file_data)
+                try:
+                    url = f"{self.config.ipfs_store_url.rstrip('/')}/api/v0/add"
+                    params = {
+                        "wrap-with-directory": "true",
+                        "recursive": "true",
+                        "cid-version": "1",
+                    }
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        with real_path.open("rb") as f:
+                            files = {"file": (file_name, f)}
+                            resp = await client.post(url, params=params, files=files)
+                            resp.raise_for_status()
+                            # Response is NDJSON; root dir entry is last
+                            lines = [ln for ln in resp.text.splitlines() if ln.strip()]
+                            root = json.loads(lines[-1]) if lines else {}
+                            cid = str(root.get("Hash"))
+                            if not cid:
+                                raise RuntimeError("ipfs_add_missing_cid")
+                    # Pin the root CID
+                    await self.client.pin(cid, seed_phrase=seed_phrase)
+                    return IPFSService.PinnedFile(file_hash=cid, cid=cid)
+                finally:
+                    try:
+                        real_path_obj = Path(real_path)
+                        tmp_dir_obj = Path(tmp_dir)
+                        if real_path_obj.exists():
+                            real_path_obj.unlink()
+                        if tmp_dir_obj.is_dir():
+                            tmp_dir_obj.rmdir()
+                    except Exception:
+                        pass
+
+            # Otherwise, use upload + pin
+            logger.info(f"IPFS upload+pin start file={file_name} size={len(file_data)}")
+            result = await self.upload_file(
+                file_data=file_data,
+                file_name=file_name,
+                content_type="application/octet-stream",
+                encrypt=should_encrypt,
+                seed_phrase=seed_phrase,
+            )
+            cid = str(result["cid"])
+            logger.info(f"IPFS upload+pin complete cid={cid}")
+            return IPFSService.PinnedFile(file_hash=cid, cid=cid)
+        except Exception as e:
+            logger.exception(f"pin_file_with_encryption failed: {e}")
+            raise
 
     async def upload_file(
         self,
@@ -64,11 +167,28 @@ class IPFSService:
             temp_file.write(file_data)
 
         try:
-            result = await self.client.upload_file(
-                temp_path,
-                encrypt=encrypt,
-                seed_phrase=seed_phrase,
-            )
+            # If encryption is requested and seed phrase is provided, use a client with derived encryption key
+            if encrypt and seed_phrase:
+                key_material = hashlib.sha256(seed_phrase.encode("utf-8")).digest()
+                client = HippiusClient(
+                    ipfs_gateway=self.config.ipfs_get_url,
+                    ipfs_api_url=self.config.ipfs_store_url,
+                    substrate_url=self.config.substrate_url,
+                    encrypt_by_default=False,
+                    encryption_key=key_material,
+                )
+                result = await client.upload_file(
+                    temp_path,
+                    encrypt=encrypt,
+                    seed_phrase=seed_phrase,
+                )
+            else:
+                result = await self.client.upload_file(
+                    temp_path,
+                    encrypt=encrypt,
+                    seed_phrase=seed_phrase,
+                )
+
             pinning_status = await self.client.pin(
                 result["cid"],
                 seed_phrase=seed_phrase,

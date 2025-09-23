@@ -150,30 +150,6 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
 
-  manifest-builder:
-    build:
-      context: .
-      dockerfile: workers/Dockerfile
-    command: ["python", "workers/run_manifest_builder_in_loop.py"]
-    env_file:
-      - .env
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    deploy:
-      replicas: 1
-    restart: unless-stopped
-    environment:
-      - PYTHONUNBUFFERED=1
-      - REDIS_URL=redis://redis:6379/0
-      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
-      - MANIFEST_BUILDER_ENABLED=true
-      - MANIFEST_STABILIZATION_WINDOW_SEC=600
-      - MANIFEST_SCAN_INTERVAL_SEC=120
-      - MANIFEST_BUILDER_MAX_CONCURRENCY=5
-
   downloader:
     build:
       context: .
