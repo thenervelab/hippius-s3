@@ -146,6 +146,7 @@ async def handle_put_object(
                 content_type,
                 json.dumps(metadata),
                 created_at,
+                uuid.UUID(object_id),
             )
             upload_id = upload_row["upload_id"] if upload_row else uuid.UUID(object_id)
         except Exception:
@@ -166,7 +167,7 @@ async def handle_put_object(
             """
             INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            ON CONFLICT (upload_id, part_number) DO NOTHING
+            ON CONFLICT (object_id, part_number) DO NOTHING
             """,
             str(uuid.uuid4()),
             upload_id,

@@ -132,6 +132,9 @@ async def list_parts_internal(
     if mpu["is_completed"]:
         return s3_error_response("InvalidRequest", "Upload already completed", status_code=400)
 
+    # Get object_id from multipart upload
+    object_id = mpu["object_id"]
+
     # Check bucket and key
     if mpu["object_key"] != object_key:
         return s3_error_response("InvalidRequest", "Object key does not match upload", status_code=400)
@@ -156,7 +159,7 @@ async def list_parts_internal(
         part_marker = 0
 
     # Fetch all parts and then apply simple pagination (DB already orders)
-    all_parts = await db.fetch(get_query("list_parts"), upload_id)
+    all_parts = await db.fetch(get_query("list_parts"), object_id)
     visible_parts = [p for p in all_parts if p["part_number"] > part_marker][:max_parts]
 
     is_truncated = len(visible_parts) < len([p for p in all_parts if p["part_number"] > part_marker])
@@ -224,6 +227,7 @@ async def initiate_multipart_upload(
 
         # Create a new multipart upload
         upload_id = str(uuid.uuid4())
+        object_id = str(uuid.uuid4())  # Create object_id immediately
         initiated_at = datetime.now(UTC)
         content_type = request.headers.get(
             "Content-Type",
@@ -259,7 +263,20 @@ async def initiate_multipart_upload(
                 status_code=400,
             )
 
-        # Create the multipart upload in the database
+        # Create initial objects row for this multipart upload
+        await db.execute(
+            get_query("upsert_object_multipart"),
+            object_id,
+            bucket["bucket_id"],
+            object_key,
+            content_type,
+            json.dumps(metadata),
+            "",  # initial md5_hash (will be updated on completion)
+            0,  # initial size_bytes (will be updated on completion)
+            initiated_at,  # created_at
+        )
+
+        # Create the multipart upload in the database with object_id
         await db.fetchrow(
             get_query("create_multipart_upload"),
             upload_id,
@@ -269,6 +286,7 @@ async def initiate_multipart_upload(
             content_type,
             json.dumps(metadata),
             datetime.fromtimestamp(file_mtime, UTC) if file_mtime is not None else None,
+            uuid.UUID(object_id),
         )
 
         # Create XML response using a hardcoded template
@@ -301,14 +319,14 @@ async def initiate_multipart_upload(
 
 
 async def get_all_cached_chunks(
-    upload_id: str,
+    object_id: str,
     redis_client: Redis,
 ):
     try:
-        keys_pattern = f"obj:{upload_id}:part:*"
+        keys_pattern = f"obj:{object_id}:part:*"
         return await redis_client.keys(keys_pattern)
     except Exception as e:
-        logger.error(f"Failed to find any cached parts for {upload_id=}: {e}")
+        logger.error(f"Failed to find any cached parts for {object_id=}: {e}")
 
 
 @router.put(
@@ -375,8 +393,11 @@ async def upload_part(
             status_code=400,
         )
 
+    # Get object_id from multipart upload
+    object_id = ongoing_multipart_upload["object_id"]
+
     start_time = time.time()
-    logger.info(f"Starting part {part_number} upload for upload {upload_id}")
+    logger.info(f"Starting part {part_number} upload for upload {upload_id} (object_id={object_id})")
 
     # Support UploadPartCopy via x-amz-copy-source
     copy_source = request.headers.get("x-amz-copy-source")
@@ -529,7 +550,7 @@ async def upload_part(
 
     # Cache raw part data for concatenation at completion (no IPFS upload for parts)
     redis_client = request.app.state.redis_client
-    part_key = f"obj:{upload_id}:part:{part_number}"
+    part_key = f"obj:{object_id}:part:{part_number}"
 
     try:
         # Check if client is still connected before proceeding
@@ -655,14 +676,17 @@ async def abort_multipart_upload(
                 status_code=404,
             )
 
+        # Get object_id from multipart upload
+        object_id = multipart_upload["object_id"]
+
         # Clean up Redis keys for cached parts
         parts = await db.fetch(
             get_query("list_parts"),
-            upload_id,
+            object_id,
         )
         if parts:
             redis_client = request.app.state.redis_client
-            redis_keys_to_delete = [f"obj:{upload_id}:part:{part['part_number']}" for part in parts]
+            redis_keys_to_delete = [f"obj:{object_id}:part:{part['part_number']}" for part in parts]
             if redis_keys_to_delete:
                 await redis_client.delete(
                     *redis_keys_to_delete,
@@ -788,12 +812,12 @@ async def list_multipart_uploads(
 
 
 async def hash_all_etags(
-    upload_id: str,
+    object_id: str,
     db: dependencies.DBConnection,
 ) -> str:
     parts = await db.fetch(
         get_query("get_parts_etags"),
-        upload_id,
+        object_id,
     )
 
     etags = [part["etag"].split("-")[0] for part in parts]
@@ -822,15 +846,42 @@ async def complete_multipart_upload(
                 status_code=404,
             )
 
+        # Get object_id from multipart upload
+        object_id = multipart_upload["object_id"]
+
+        # Get bucket info
+        bucket = await db.fetchrow(
+            get_query("get_bucket_by_name_and_owner"),
+            bucket_name,
+            request.state.account.main_account,
+        )
+        if not bucket:
+            return s3_error_response("NoSuchBucket", f"Bucket {bucket_name} does not exist", status_code=404)
+
         if multipart_upload["is_completed"]:
             # Return success response for already completed uploads (idempotent)
             # This prevents AWS CLI retries from failing
+            # Get the final ETag from the objects table
+            completed_object = await db.fetchrow(
+                get_query("get_object_by_path"),
+                bucket["bucket_id"],
+                object_key,
+            )
+            final_etag = None
+            if completed_object and completed_object.get("md5_hash"):
+                final_etag = completed_object["md5_hash"]
+            else:
+                # Fallback: recompute combined ETag from parts by object_id
+                try:
+                    final_etag = await hash_all_etags(object_id, db)
+                except Exception:
+                    final_etag = "completed"
             xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
     <Location>http://localhost:8000/{bucket_name}/{object_key}</Location>
     <Bucket>{bucket_name}</Bucket>
     <Key>{object_key}</Key>
-    <ETag>"{multipart_upload.get("final_etag", "completed")}"</ETag>
+    <ETag>"{final_etag}"</ETag>
 </CompleteMultipartUploadResult>"""
             return Response(
                 content=xml_content,
@@ -874,9 +925,9 @@ async def complete_multipart_upload(
         # Get the parts from the database
         db_parts = await db.fetch(
             get_query("list_parts"),
-            upload_id,
+            object_id,
         )
-        logger.info(f"Found {len(db_parts)} parts for upload {upload_id}")
+        logger.info(f"Found {len(db_parts)} parts for upload {upload_id} (object_id={object_id})")
         db_parts_dict = {p["part_number"]: p for p in db_parts}
 
         if not db_parts_dict:
@@ -896,18 +947,8 @@ async def complete_multipart_upload(
                 status_code=400,
             )
 
-        # Get content type
-        content_type = multipart_upload["content_type"] or "application/octet-stream"
-
-        # Get bucket info to check if it's public
-        bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
-            bucket_name,
-            request.state.account.main_account,
-        )
-
         final_md5_hash = await hash_all_etags(
-            upload_id,
+            object_id,
             db,
         )
         logger.info(f"MPU complete: upload_id={upload_id} key={object_key} final_etag={final_md5_hash}")
@@ -917,8 +958,6 @@ async def complete_multipart_upload(
         should_encrypt = not bucket["is_public"]
 
         # Prepare metadata
-        bucket_id = multipart_upload["bucket_id"]
-
         metadata = multipart_upload["metadata"] if multipart_upload["metadata"] else {}
         if isinstance(metadata, str):
             metadata = json.loads(metadata)
@@ -940,17 +979,12 @@ async def complete_multipart_upload(
             upload_id,
         )
 
-        # Delete any existing object with same key
-        await db.execute(
-            "DELETE FROM objects WHERE bucket_id = $1 AND object_key = $2",
-            bucket_id,
-            object_key,
-        )
+        # Do not delete the object row; it was created at initiation. Update it below.
 
         # Calculate total size from all parts
         parts = await db.fetch(
             get_query("list_parts"),
-            upload_id,
+            object_id,
         )
         total_size = sum(part["size_bytes"] for part in parts)
         logger.info(
@@ -958,7 +992,7 @@ async def complete_multipart_upload(
         )
         # Also log each part's ETag and size for debugging
         try:
-            part_rows = await db.fetch(get_query("list_parts"), upload_id)
+            part_rows = await db.fetch(get_query("list_parts"), object_id)
             dbg = [
                 {
                     "part": r["part_number"],
@@ -971,30 +1005,25 @@ async def complete_multipart_upload(
         except Exception:
             logger.debug("Failed to log parts detail after MPU", exc_info=True)
 
-        # Create the object in database (without CID initially for multipart uploads)
-        object_result = await db.fetchrow(
-            get_query("upsert_object_multipart"),
-            upload_id,
-            bucket_id,
-            object_key,
-            content_type,
-            json.dumps(metadata),
+        # Update the existing object with final metadata
+        await db.execute(
+            """
+            UPDATE objects
+            SET md5_hash = $1,
+                size_bytes = $2,
+                last_modified = $3,
+                status = 'publishing'
+            WHERE object_id = $4
+            """,
             final_md5_hash,
             total_size,
             file_created_at,
+            object_id,
         )
 
-        # Update multipart_uploads table with the object_id
+        # Mark multipart upload as completed
         await db.execute(
-            "UPDATE multipart_uploads SET object_id = $1 WHERE upload_id = $2",
-            object_result["object_id"],
-            upload_id,
-        )
-
-        # Update all parts for this upload to have the correct object_id
-        await db.execute(
-            "UPDATE parts SET object_id = $1 WHERE upload_id = $2",
-            object_result["object_id"],
+            "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
             upload_id,
         )
 
@@ -1017,7 +1046,7 @@ async def complete_multipart_upload(
                 subaccount=request.state.account.main_account,
                 subaccount_seed_phrase=request.state.seed_phrase,
                 should_encrypt=should_encrypt,
-                object_id=str(object_result["object_id"]),
+                object_id=str(object_id),
             ),
             request.app.state.redis_client,
         )

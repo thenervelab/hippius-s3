@@ -1,6 +1,6 @@
 -- Get parts etags for multipart upload hashing
--- Parameters: $1: upload_id
+-- Parameters: $1: object_id
 SELECT etag, part_number
 FROM parts
-WHERE upload_id = $1
+WHERE object_id = $1
 ORDER BY part_number ASC

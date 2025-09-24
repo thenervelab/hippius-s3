@@ -12,6 +12,7 @@ from hippius_s3.api.s3 import errors
 from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
 from hippius_s3.services.object_reader import ObjectReader
+from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,18 @@ async def handle_head_object(
         created_at = row["created_at"]
         size_bytes = int(row["size_bytes"]) if row.get("size_bytes") is not None else 0
         md5_hash = row["md5_hash"]
+        # Fallback: if md5_hash is missing/empty for multipart object, compute combined ETag from parts
+        if (not md5_hash) and bool(row.get("multipart")):
+            try:
+                parts = await db.fetch(get_query("get_parts_etags"), row["object_id"])
+                etags = [p["etag"].split("-")[0] for p in parts]
+                import hashlib as _hashlib
+
+                if etags:
+                    binary = b"".join(bytes.fromhex(e) for e in etags)
+                    md5_hash = f"{_hashlib.md5(binary).hexdigest()}-{len(etags)}"
+            except Exception:
+                md5_hash = md5_hash or ""
         content_type = row["content_type"]
         headers: dict[str, str] = {
             "Content-Type": content_type,

@@ -247,7 +247,7 @@ async def handle_append(
             """
             INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            ON CONFLICT (upload_id, part_number) DO UPDATE SET
+            ON CONFLICT (object_id, part_number) DO UPDATE SET
                 ipfs_cid = EXCLUDED.ipfs_cid,
                 cid_id = EXCLUDED.cid_id,
                 size_bytes = EXCLUDED.size_bytes,

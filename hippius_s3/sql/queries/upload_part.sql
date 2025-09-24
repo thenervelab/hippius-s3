@@ -13,7 +13,7 @@ VALUES (
     $7,
     (SELECT object_id FROM multipart_uploads WHERE upload_id = $2)
 )
-ON CONFLICT (upload_id, part_number) DO UPDATE SET
+ON CONFLICT (object_id, part_number) DO UPDATE SET
     ipfs_cid = EXCLUDED.ipfs_cid,
     size_bytes = EXCLUDED.size_bytes,
     etag = EXCLUDED.etag,

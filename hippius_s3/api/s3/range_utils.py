@@ -70,9 +70,13 @@ def extract_range_from_chunks(
         part_start = current_offset
         if part["part_number"] in needed_parts:
             chunk_data = chunks_data[chunk_idx]
+            # Compute slice within this chunk (end is exclusive)
             slice_start = max(0, start_byte - part_start)
-            slice_end = min(part["size_bytes"], end_byte - part_start + 1)
-            range_data += chunk_data[slice_start:slice_end]
+            # Desired absolute end within this part (exclusive)
+            desired_end_exclusive = (end_byte - part_start) + 1
+            # Cap by part size and ensure not before slice_start
+            capped_end_exclusive = min(part["size_bytes"], max(slice_start, desired_end_exclusive))
+            range_data += chunk_data[slice_start:capped_end_exclusive]
             chunk_idx += 1
         current_offset += part["size_bytes"]
         if current_offset > end_byte:
