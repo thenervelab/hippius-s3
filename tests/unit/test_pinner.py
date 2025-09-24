@@ -50,16 +50,16 @@ def test_classify_error_permanent() -> None:
 
 def test_compute_backoff_ms() -> None:
     """Test backoff computation with jitter."""
-    # First attempt (attempts=1 means first retry after initial failure)
-    delay1 = compute_backoff_ms(attempts=1, base_ms=100, max_ms=10000)
+    # First attempt (attempt=1 means first retry after initial failure)
+    delay1 = compute_backoff_ms(attempt=1, base_ms=100, max_ms=10000)
     assert 80 <= delay1 <= 120  # 100ms ±20%
 
     # Second attempt
-    delay2 = compute_backoff_ms(attempts=2, base_ms=100, max_ms=10000)
+    delay2 = compute_backoff_ms(attempt=2, base_ms=100, max_ms=10000)
     assert 160 <= delay2 <= 240  # 200ms ±20%
 
     # Test max cap
-    delay_max = compute_backoff_ms(attempts=10, base_ms=100, max_ms=500)
+    delay_max = compute_backoff_ms(attempt=10, base_ms=100, max_ms=500)
     assert delay_max <= 500
 
 

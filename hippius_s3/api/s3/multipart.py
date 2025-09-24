@@ -970,9 +970,6 @@ async def complete_multipart_upload(
             }
         )
 
-        # Set file creation time to current timestamp
-        file_created_at = datetime.now(UTC)
-
         # Mark the upload as completed
         await db.fetchrow(
             get_query("complete_multipart_upload"),
@@ -1005,19 +1002,18 @@ async def complete_multipart_upload(
         except Exception:
             logger.debug("Failed to log parts detail after MPU", exc_info=True)
 
-        # Update the existing object with final metadata
+        # Update the existing object with final metadata and touch last_modified
         await db.execute(
             """
             UPDATE objects
             SET md5_hash = $1,
                 size_bytes = $2,
-                last_modified = $3,
+                last_modified = NOW(),
                 status = 'publishing'
-            WHERE object_id = $4
+            WHERE object_id = $3
             """,
             final_md5_hash,
             total_size,
-            file_created_at,
             object_id,
         )
 

@@ -13,6 +13,7 @@ from typing import Tuple
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.cache import RedisUploadPartsCache
 from hippius_s3.config import get_config
+from hippius_s3.dlq.storage import DLQStorage
 from hippius_s3.ipfs_service import IPFSService
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
@@ -28,6 +29,48 @@ class FileInput(NamedTuple):
 logger = logging.getLogger(__name__)
 
 
+def classify_error(error: Exception) -> str:
+    """Classify error as transient, permanent, or unknown."""
+    err_str = str(error).lower()
+    err_type = type(error).__name__.lower()
+
+    # Permanent errors
+    if any(
+        keyword in err_str
+        for keyword in ["malformed", "invalid", "negative size", "missing part", "validation error", "integrity"]
+    ):
+        return "permanent"
+
+    # Transient errors (retryable)
+    if any(
+        keyword in err_str
+        for keyword in [
+            "timeout",
+            "connection",
+            "network",
+            "5xx",
+            "503",
+            "502",
+            "504",
+            "unavailable",
+            "throttled",
+            "rate limit",
+        ]
+    ) or any(keyword in err_type for keyword in ["connectionerror", "timeouterror", "httperror"]):
+        return "transient"
+
+    # Default to transient for unknown errors
+    return "transient"
+
+
+def compute_backoff_ms(attempt: int, base_ms: int = 1000, max_ms: int = 30000) -> float:
+    """Compute exponential backoff with jitter."""
+    # Exponential backoff: base * 2^(attempt-1) + jitter
+    exp_backoff = base_ms * (2 ** (attempt - 1))
+    jitter = random.uniform(0, exp_backoff * 0.1)  # 10% jitter
+    return float(min(exp_backoff + jitter, max_ms))
+
+
 # Import heavy dependencies only when needed to avoid test import issues
 def _get_redis_cache() -> type:  # type: ignore[no-any-return]
     return RedisObjectPartsCache
@@ -41,23 +84,6 @@ def _get_ipfs_service() -> type:  # type: ignore[no-any-return]
     return IPFSService
 
 
-def classify_error(exc: Exception) -> bool:
-    """Classify exception as transient (retryable) or permanent (fail immediately)."""
-    err_str = str(exc).lower()
-    transient_patterns = ["timeout", "temporarily", "connection", "reset", "503", "502", "504", "connect"]
-    return any(p in err_str for p in transient_patterns)
-
-
-def compute_backoff_ms(attempts: int, base_ms: int, max_ms: int) -> int:
-    """Compute exponential backoff with jitter."""
-    n = attempts
-    raw_delay = base_ms * (2 ** (n - 1))
-    jitter = int(0.2 * raw_delay)
-    jitter_offset = random.randint(-jitter, jitter)
-    result = min(max_ms, max(0, raw_delay + jitter_offset))
-    return int(result)
-
-
 class Pinner:
     """Handles per-item upload processing with retry logic."""
 
@@ -66,6 +92,7 @@ class Pinner:
         self.ipfs_service = ipfs_service
         self.redis_client = redis_client
         self.config = config
+        self.dlq_storage = DLQStorage()
 
     async def process_item(self, payload: UploadChainRequest) -> Tuple[List[FileInput], bool]:
         try:
@@ -101,9 +128,10 @@ class Pinner:
         except Exception as e:
             logger.debug(f"process_item EXCEPTION object_id={getattr(payload, 'object_id', 'unknown')} err={e}")
             err_str = str(e)
-            transient = classify_error(e)
+            error_type = classify_error(e)
             attempts_next = (payload.attempts or 0) + 1
-            if transient and attempts_next <= self.config.pinner_max_attempts:
+
+            if error_type == "transient" and attempts_next <= self.config.pinner_max_attempts:
                 delay_ms = compute_backoff_ms(
                     attempts_next, self.config.pinner_backoff_base_ms, self.config.pinner_backoff_max_ms
                 )
@@ -111,6 +139,8 @@ class Pinner:
                     payload, self.redis_client, delay_seconds=delay_ms / 1000.0, last_error=err_str
                 )
                 return [], False
+            # Permanent error or max attempts reached - push to DLQ
+            await self._push_to_dlq(payload, err_str, error_type)
             await self.db.execute("UPDATE objects SET status = 'failed' WHERE object_id = $1", payload.object_id)
             return [], False
 
@@ -396,6 +426,67 @@ class Pinner:
 
         logger.debug(f"_build_and_publish_manifest COMPLETE object_id={object_id}, manifest_cid={manifest_result.cid}")
         return FileInput(file_hash=manifest_result.cid)
+
+    async def _push_to_dlq(self, payload: UploadChainRequest, last_error: str, error_type: str) -> None:
+        """Push a failed request to the Dead-Letter Queue and persist chunks to disk."""
+        import time
+
+        # First, persist chunks from cache to disk
+        await self._persist_chunks_to_dlq(payload)
+
+        # Normalize error_type to string for DLQ entries
+        etype = error_type
+        if isinstance(etype, bool):
+            etype = "transient" if etype else "permanent"
+
+        dlq_entry = {
+            "payload": payload.model_dump(),
+            "object_id": payload.object_id,
+            "upload_id": payload.upload_id,
+            "bucket_name": payload.bucket_name,
+            "object_key": payload.object_key,
+            "attempts": payload.attempts or 0,
+            "first_enqueued_at": getattr(payload, "first_enqueued_at", time.time()),
+            "last_attempt_at": time.time(),
+            "last_error": last_error,
+            "error_type": etype,
+        }
+
+        try:
+            await self.redis_client.lpush("upload_requests:dlq", json.dumps(dlq_entry))
+            logger.warning(f"Pushed to DLQ: object_id={payload.object_id}, error_type={error_type}, error={last_error}")
+        except Exception as e:
+            logger.error(f"Failed to push to DLQ: {e}")
+
+    async def _persist_chunks_to_dlq(self, payload: UploadChainRequest) -> None:
+        """Persist all available chunks from cache to DLQ filesystem."""
+        object_id = payload.object_id
+        RedisCache = _get_redis_cache()
+        obj_cache = RedisCache(self.redis_client)
+
+        try:
+            # Get all chunks for this object from cache
+            for chunk in payload.chunks:
+                part_number = int(chunk.id)
+
+                # Try to get chunk data from cache
+                chunk_data = await obj_cache.get(object_id, part_number)
+                if chunk_data is None:
+                    logger.warning(
+                        f"No cached data for object {object_id} part {part_number}, skipping DLQ persistence"
+                    )
+                    continue
+
+                # Save to DLQ filesystem
+                try:
+                    self.dlq_storage.save_chunk(object_id, part_number, chunk_data)
+                    logger.debug(f"Persisted chunk {part_number} for object {object_id} to DLQ")
+                except Exception as e:
+                    logger.error(f"Failed to persist chunk {part_number} for object {object_id} to DLQ: {e}")
+
+        except Exception as e:
+            logger.error(f"Failed to persist chunks for object {object_id} to DLQ: {e}")
+            # Don't fail the DLQ push if persistence fails
 
     async def _process_upload_common(
         self,
