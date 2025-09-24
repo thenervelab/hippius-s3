@@ -171,9 +171,7 @@ class ObjectReader:
     async def verify_etags(
         self, db: Any, info: ObjectInfo, parts: list[Part], obj_cache: ObjectPartsCache, redis: Any, request_uuid: str
     ) -> None:
-        if not info.upload_id:
-            return
-        rows = await db.fetch(get_query("get_parts_etags"), info.upload_id)
+        rows = await db.fetch(get_query("get_parts_etags"), info.object_id)
         if not rows:
             return
         expected = {int(r["part_number"]): r["etag"].split("-")[0] for r in rows}
