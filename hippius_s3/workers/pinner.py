@@ -124,19 +124,30 @@ class Pinner:
                 f"process_item START object_id={unified_payload.object_id} chunks={len(unified_payload.chunks)} upload_id={unified_payload.upload_id} attempts={unified_payload.attempts}"
             )
 
-            # Process all chunks using unified logic
-            chunk_results, manifest_result = await self._process_upload_common(
+            # Step 2: Process chunks only (upload to IPFS, upsert parts table)
+            chunk_results = await self._process_chunks_only(
                 object_id=unified_payload.object_id,
                 object_key=unified_payload.object_key,
                 should_encrypt=unified_payload.should_encrypt,
                 chunks=unified_payload.chunks,
-                appendable=True,
                 upload_id=unified_payload.upload_id,
+                seed_phrase=unified_payload.subaccount_seed_phrase,
+            )
+
+            # Step 3: Build and publish manifest (only if all parts have CIDs)
+            manifest_result = await self._build_and_publish_manifest(
+                object_id=unified_payload.object_id,
+                object_key=unified_payload.object_key,
+                should_encrypt=unified_payload.should_encrypt,
                 seed_phrase=unified_payload.subaccount_seed_phrase,
                 subaccount=unified_payload.subaccount,
                 bucket_name=unified_payload.bucket_name,
             )
-            files = [result[0] for result in chunk_results] + [manifest_result]
+
+            # Return chunk FileInputs, and manifest FileInput only if it was actually built
+            files = [result[0] for result in chunk_results]
+            if manifest_result.file_hash != "pending":
+                files.append(manifest_result)
             return files, True
         except Exception as e:
             logger.debug(f"process_item EXCEPTION object_id={getattr(payload, 'object_id', 'unknown')} err={e}")
@@ -289,22 +300,19 @@ class Pinner:
         )
         return FileInput(file_hash=chunk_cid), chunk
 
-    async def _process_upload_common(
+    async def _process_chunks_only(
         self,
         *,
         object_id: str,
         object_key: str,
         should_encrypt: bool,
         chunks: List[Chunk],
-        appendable: bool,
         upload_id: Optional[str] = None,
         seed_phrase: Optional[str] = None,
-        subaccount: Optional[str] = None,
-        bucket_name: Optional[str] = None,
-    ) -> Tuple[List[Tuple[FileInput, Chunk]], FileInput]:
-        """Pin chunks, upsert parts, build/pin manifest, set object ipfs_cid."""
+    ) -> List[Tuple[FileInput, Chunk]]:
+        """Process chunks only: read from Redis, upload to IPFS, upsert parts table with CIDs."""
         logger.debug(
-            f"_process_upload_common START object_id={object_id}, object_key={object_key}, chunks={[c.id for c in chunks]}, upload_id={upload_id}"
+            f"_process_chunks_only START object_id={object_id}, object_key={object_key}, chunks={[c.id for c in chunks]}, upload_id={upload_id}"
         )
         cfg = get_config()
         concurrency = int(getattr(cfg, "pinner_multipart_max_concurrency", 5) or 5)
@@ -331,37 +339,99 @@ class Pinner:
         else:
             chunk_results = [first_result]
 
-        # Build manifest from current parts
-        RedisObjectPartsCache = _get_redis_cache()
+        # Touch caches for present parts
+        RedisCacheCls = _get_redis_cache()
+        obj_cache = RedisCacheCls(self.redis_client)  # type: ignore[call-arg]
+        for _, chunk in chunk_results:
+            await obj_cache.expire(object_id, int(chunk.id), ttl=self.config.cache_ttl_seconds)
+
+        logger.debug(f"_process_chunks_only COMPLETE object_id={object_id}, processed {len(chunk_results)} chunks")
+        return chunk_results
+
+    async def _build_and_publish_manifest(
+        self,
+        *,
+        object_id: str,
+        object_key: str,
+        should_encrypt: bool,
+        seed_phrase: Optional[str] = None,
+        subaccount: Optional[str] = None,
+        bucket_name: Optional[str] = None,
+    ) -> FileInput:
+        """Build manifest from parts table and publish/pin it. Only builds if all parts have CIDs."""
+        logger.debug(f"_build_and_publish_manifest START object_id={object_id}, object_key={object_key}")
+
+        # Build manifest JSON from DB parts
+        rows = await self.db.fetch(
+            """
+            SELECT p.part_number,
+                   COALESCE(c.cid, p.ipfs_cid) AS cid,
+                   p.size_bytes::bigint AS size_bytes
+            FROM parts p
+            LEFT JOIN cids c ON p.cid_id = c.id
+            WHERE p.object_id = $1
+            ORDER BY part_number
+            """,
+            object_id,
+        )
+
+        # Check if all parts have concrete CIDs
+        parts_data = []
+        all_parts_have_cids = True
+        for r in rows:
+            pn = int(r[0])
+            cid_raw = r[1]
+            cid: str | None = None
+            if cid_raw is not None:
+                cid_str = cid_raw if isinstance(cid_raw, str) else str(cid_raw)
+                cid_str = cid_str.strip()
+                if cid_str and cid_str.lower() not in {"", "none", "pending"}:
+                    cid = cid_str
+                else:
+                    all_parts_have_cids = False
+
+            size = int(r[2] or 0)
+            parts_data.append({"part_number": pn, "cid": cid, "size_bytes": size})
+
+        # Only build manifest if all parts have concrete CIDs
+        if not all_parts_have_cids:
+            logger.debug(
+                f"_build_and_publish_manifest SKIP - not all parts have CIDs yet (found {len(parts_data)} parts)"
+            )
+            return FileInput(file_hash="pending")
+
+        # Get object info for manifest metadata
+        obj_row = await self.db.fetchrow("SELECT content_type FROM objects WHERE object_id = $1", object_id)
+        content_type = obj_row["content_type"] if obj_row else "application/octet-stream"
+
         manifest_data = {
             "object_id": object_id,
             "object_key": object_key,
-            "appendable": appendable,
-            "parts": [
-                {
-                    "part_number": int(result[1].id),
-                    "cid": result[0].file_hash,
-                    "size_bytes": len(
-                        await RedisObjectPartsCache(self.redis_client).get(object_id, int(result[1].id)) or b""
-                    ),  # type: ignore[call-arg]
-                }
-                for result in chunk_results
-            ],
+            "appendable": True,  # All objects are appendable in this system
+            "content_type": content_type,
+            "parts": parts_data,
         }
+
+        manifest_json = json.dumps(manifest_data)
+        logger.debug(f"_build_and_publish_manifest built manifest with {len(parts_data)} parts")
+
+        # Publish/pin the manifest
         manifest_result = await self.ipfs_service.pin_file_with_encryption(
-            file_data=json.dumps(manifest_data).encode(),
+            file_data=manifest_json.encode(),
             file_name=f"{object_key}.manifest",
             should_encrypt=should_encrypt,
             seed_phrase=seed_phrase,
             subaccount_id=subaccount,
             bucket_name=bucket_name,
         )
-        # Persist object-level CID via cids table for HEAD/readers
+
+        # Update object with manifest CID and set status to uploaded
         try:
             cid_row = await self.db.fetchrow(get_query("upsert_cid"), manifest_result.cid)
             cid_id = cid_row["id"] if cid_row else None
         except Exception:
             cid_id = None
+
         await self.db.execute(
             """
             UPDATE objects
@@ -374,11 +444,43 @@ class Pinner:
             manifest_result.cid,
             cid_id,
         )
-        # Touch caches for present parts
-        RedisCacheCls = _get_redis_cache()
-        obj_cache = RedisCacheCls(self.redis_client)  # type: ignore[call-arg]
-        for _, chunk in chunk_results:
-            await obj_cache.expire(object_id, int(chunk.id), ttl=self.config.cache_ttl_seconds)
 
-        logger.debug(f"_process_upload_common COMPLETE object_id={object_id}, manifest_cid={manifest_result.cid}")
+        logger.debug(f"_build_and_publish_manifest COMPLETE object_id={object_id}, manifest_cid={manifest_result.cid}")
+        return FileInput(file_hash=manifest_result.cid)
+
+    async def _process_upload_common(
+        self,
+        *,
+        object_id: str,
+        object_key: str,
+        should_encrypt: bool,
+        chunks: List[Chunk],
+        appendable: bool,
+        upload_id: Optional[str] = None,
+        seed_phrase: Optional[str] = None,
+        subaccount: Optional[str] = None,
+        bucket_name: Optional[str] = None,
+    ) -> Tuple[List[Tuple[FileInput, Chunk]], FileInput]:
+        """Pin chunks, upsert parts, build/pin manifest, set object ipfs_cid."""
+        logger.debug(
+            f"_process_upload_common START object_id={object_id}, object_key={object_key}, chunks={[c.id for c in chunks]}, upload_id={upload_id}"
+        )
+
+        # Process chunks only (Step 2)
+        chunk_results = await self._process_chunks_only(
+            object_id=object_id,
+            object_key=object_key,
+            should_encrypt=should_encrypt,
+            chunks=chunks,
+            upload_id=upload_id,
+            seed_phrase=seed_phrase,
+        )
+
+        # TODO: Step 3 - Build manifest from current parts
+        # For now, return a placeholder manifest result
+        manifest_result = FileInput(file_hash="pending")  # Placeholder for step 3
+
+        logger.debug(
+            f"_process_upload_common COMPLETE object_id={object_id}, chunks processed (manifest deferred to step 3)"
+        )
         return chunk_results, manifest_result
