@@ -10,7 +10,6 @@ from typing import NamedTuple
 from typing import Optional
 from typing import Tuple
 from typing import Union
-from typing import cast
 
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.cache import RedisUploadPartsCache
@@ -19,6 +18,7 @@ from hippius_s3.ipfs_service import IPFSService
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import MultipartUploadChainRequest
 from hippius_s3.queue import SimpleUploadChainRequest
+from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.utils import get_query
 
@@ -70,22 +70,73 @@ class Pinner:
         self.redis_client = redis_client
         self.config = config
 
+    def _normalize_payload(
+        self, payload: Union[SimpleUploadChainRequest, MultipartUploadChainRequest, UploadChainRequest]
+    ) -> UploadChainRequest:
+        """Normalize any payload type to the unified UploadChainRequest format."""
+        if isinstance(payload, UploadChainRequest):
+            return payload
+        if isinstance(payload, SimpleUploadChainRequest):
+            return UploadChainRequest(
+                substrate_url=payload.substrate_url,
+                ipfs_node=payload.ipfs_node,
+                address=payload.address,
+                subaccount=payload.subaccount,
+                subaccount_seed_phrase=payload.subaccount_seed_phrase,
+                bucket_name=payload.bucket_name,
+                object_key=payload.object_key,
+                should_encrypt=payload.should_encrypt,
+                object_id=payload.object_id,
+                chunks=[payload.chunk],
+                request_id=payload.request_id,
+                attempts=payload.attempts,
+                first_enqueued_at=payload.first_enqueued_at,
+                last_error=payload.last_error,
+            )
+        if isinstance(payload, MultipartUploadChainRequest):
+            return UploadChainRequest(
+                substrate_url=payload.substrate_url,
+                ipfs_node=payload.ipfs_node,
+                address=payload.address,
+                subaccount=payload.subaccount,
+                subaccount_seed_phrase=payload.subaccount_seed_phrase,
+                bucket_name=payload.bucket_name,
+                object_key=payload.object_key,
+                should_encrypt=payload.should_encrypt,
+                object_id=payload.object_id,
+                chunks=payload.chunks,
+                upload_id=payload.multipart_upload_id,
+                request_id=payload.request_id,
+                attempts=payload.attempts,
+                first_enqueued_at=payload.first_enqueued_at,
+                last_error=payload.last_error,
+            )
+        raise ValueError(f"Unknown payload type: {type(payload)}")
+
     async def process_item(
-        self, payload: Union[SimpleUploadChainRequest, MultipartUploadChainRequest]
+        self, payload: Union[SimpleUploadChainRequest, MultipartUploadChainRequest, UploadChainRequest]
     ) -> Tuple[List[FileInput], bool]:
         try:
+            # Normalize payload to unified type
+            unified_payload = self._normalize_payload(payload)
+
             logger.debug(
-                f"process_item START object_id={payload.object_id} type={'multipart' if hasattr(payload, 'chunks') else 'simple'} attempts={payload.attempts}"
+                f"process_item START object_id={unified_payload.object_id} chunks={len(unified_payload.chunks)} upload_id={unified_payload.upload_id} attempts={unified_payload.attempts}"
             )
-            if hasattr(payload, "chunks"):  # Multipart
-                # Type cast: we know this is MultipartUploadChainRequest due to hasattr check
-                multipart_payload = cast(MultipartUploadChainRequest, payload)
-                chunk_results, manifest_result = await self._process_multipart_upload(multipart_payload)
-                files = [result[0] for result in chunk_results] + [manifest_result]
-            else:  # Simple
-                logger.debug(f"process_item SIMPLE path object_id={payload.object_id}")
-                result = await self._process_simple_upload(payload)
-                files = [result]
+
+            # Process all chunks using unified logic
+            chunk_results, manifest_result = await self._process_upload_common(
+                object_id=unified_payload.object_id,
+                object_key=unified_payload.object_key,
+                should_encrypt=unified_payload.should_encrypt,
+                chunks=unified_payload.chunks,
+                appendable=True,
+                upload_id=unified_payload.upload_id,
+                seed_phrase=unified_payload.subaccount_seed_phrase,
+                subaccount=unified_payload.subaccount,
+                bucket_name=unified_payload.bucket_name,
+            )
+            files = [result[0] for result in chunk_results] + [manifest_result]
             return files, True
         except Exception as e:
             logger.debug(f"process_item EXCEPTION object_id={getattr(payload, 'object_id', 'unknown')} err={e}")
@@ -104,8 +155,8 @@ class Pinner:
             return [], False
 
     async def process_batch(
-        self, payloads: List[Union[SimpleUploadChainRequest, MultipartUploadChainRequest]]
-    ) -> Tuple[List[FileInput], List[Union[SimpleUploadChainRequest, MultipartUploadChainRequest]]]:
+        self, payloads: List[Union[SimpleUploadChainRequest, MultipartUploadChainRequest, UploadChainRequest]]
+    ) -> Tuple[List[FileInput], List[Union[SimpleUploadChainRequest, MultipartUploadChainRequest, UploadChainRequest]]]:
         all_files = []
         succeeded_payloads = []
         for payload in payloads:
@@ -331,39 +382,3 @@ class Pinner:
 
         logger.debug(f"_process_upload_common COMPLETE object_id={object_id}, manifest_cid={manifest_result.cid}")
         return chunk_results, manifest_result
-
-    async def _process_simple_upload(self, payload: SimpleUploadChainRequest) -> FileInput:
-        """Treat simple as single-chunk multipart via common path, return manifest.
-
-        For append flows that still enqueue SimpleUploadChainRequest, we want to upsert
-        per-part CIDs. We therefore call the common upload path with appendable=True so
-        that the chunk is processed via _process_multipart_chunk and parts are updated.
-        """
-        chunk = payload.chunk
-        chunks = [chunk]
-        _, manifest_result = await self._process_upload_common(
-            object_id=payload.object_id,
-            object_key=payload.object_key,
-            should_encrypt=payload.should_encrypt,
-            chunks=chunks,
-            appendable=True,
-            seed_phrase=payload.subaccount_seed_phrase,
-            subaccount=payload.subaccount,
-            bucket_name=payload.bucket_name,
-        )
-        return manifest_result
-
-    async def _process_multipart_upload(
-        self, payload: MultipartUploadChainRequest
-    ) -> Tuple[List[Tuple[FileInput, Chunk]], FileInput]:
-        return await self._process_upload_common(
-            object_id=payload.object_id,
-            object_key=payload.object_key,
-            should_encrypt=payload.should_encrypt,
-            chunks=payload.chunks,
-            appendable=True,
-            upload_id=payload.multipart_upload_id,
-            seed_phrase=payload.subaccount_seed_phrase,
-            subaccount=payload.subaccount,
-            bucket_name=payload.bucket_name,
-        )

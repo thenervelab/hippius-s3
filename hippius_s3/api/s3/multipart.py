@@ -26,7 +26,7 @@ from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import get_object_reader
 from hippius_s3.queue import Chunk
-from hippius_s3.queue import MultipartUploadChainRequest
+from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.services.object_reader import ObjectReader
 from hippius_s3.utils import get_query
@@ -999,14 +999,13 @@ async def complete_multipart_upload(
         )
 
         await enqueue_upload_request(
-            MultipartUploadChainRequest(
+            UploadChainRequest(
                 object_key=object_key,
                 bucket_name=bucket_name,
-                multipart_upload_id=upload_id,
+                upload_id=upload_id,
                 chunks=[
                     Chunk(
                         id=part["part_number"],
-                        redis_key=f"obj:{upload_id}:part:{part['part_number']}",
                     )
                     for part in parts
                 ],

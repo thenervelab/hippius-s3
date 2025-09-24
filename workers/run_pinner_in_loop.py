@@ -17,6 +17,7 @@ from hippius_s3.config import get_config
 from hippius_s3.ipfs_service import IPFSService
 from hippius_s3.queue import MultipartUploadChainRequest
 from hippius_s3.queue import SimpleUploadChainRequest
+from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import dequeue_upload_request
 from hippius_s3.queue import move_due_retries_to_primary
 from hippius_s3.workers.pinner import Pinner
@@ -52,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 
 async def process_upload_request(
-    upload_requests: list[Union[SimpleUploadChainRequest, MultipartUploadChainRequest]],
+    upload_requests: list[Union[SimpleUploadChainRequest, MultipartUploadChainRequest, UploadChainRequest]],
     db: asyncpg.Connection,
     redis_client: async_redis.Redis,
 ) -> bool:

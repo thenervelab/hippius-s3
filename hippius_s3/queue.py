@@ -41,9 +41,11 @@ class ChainRequest(BaseModel):
 
     @property
     def name(self):
-        if hasattr(self, "upload_id"):
+        # Unified request uses upload_id; legacy multipart uses multipart_upload_id
+        if hasattr(self, "upload_id") and self.upload_id is not None:
+            return f"multipart::{self.object_id}::{self.upload_id}::{self.address}"
+        if hasattr(self, "multipart_upload_id") and self.multipart_upload_id is not None:
             return f"multipart::{self.object_id}::{self.multipart_upload_id}::{self.address}"
-
         return f"simple::{self.object_id}::{self.address}"
 
 
@@ -54,6 +56,13 @@ class MultipartUploadChainRequest(ChainRequest):
 
 class SimpleUploadChainRequest(ChainRequest):
     chunk: Chunk
+
+
+class UploadChainRequest(ChainRequest):
+    """Unified upload request type that combines simple and multipart uploads."""
+
+    chunks: list[Chunk]
+    upload_id: str | None = None
 
 
 class UnpinChainRequest(ChainRequest):
@@ -84,6 +93,7 @@ async def enqueue_upload_request(
     payload: Union[
         MultipartUploadChainRequest,
         SimpleUploadChainRequest,
+        UploadChainRequest,
     ],
     redis_client: async_redis.Redis,
 ) -> None:
@@ -102,7 +112,7 @@ async def enqueue_upload_request(
 
 async def dequeue_upload_request(
     redis_client: async_redis.Redis,
-) -> Union[MultipartUploadChainRequest, SimpleUploadChainRequest, None]:
+) -> Union[MultipartUploadChainRequest, SimpleUploadChainRequest, UploadChainRequest, None]:
     """Get the next upload request from the Redis queue."""
     queue_name = "upload_requests"
     # Use a short blocking timeout to enable timely batch flushes
@@ -111,6 +121,9 @@ async def dequeue_upload_request(
         _, queue_data = result
         queue_data = json.loads(queue_data)
 
+        if "chunks" in queue_data and "upload_id" in queue_data:
+            # Unified UploadChainRequest has chunks and optional upload_id
+            return UploadChainRequest.model_validate(queue_data)
         if "chunk" in queue_data:
             return SimpleUploadChainRequest.model_validate(queue_data)
 
@@ -127,6 +140,7 @@ async def enqueue_retry_request(
     payload: Union[
         MultipartUploadChainRequest,
         SimpleUploadChainRequest,
+        UploadChainRequest,
     ],
     redis_client: async_redis.Redis,
     *,

@@ -26,7 +26,7 @@ from hippius_s3.api.s3 import errors
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.queue import Chunk
-from hippius_s3.queue import MultipartUploadChainRequest
+from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.utils import get_query
 
@@ -321,9 +321,9 @@ async def handle_append(
     try:
         should_encrypt = not bucket["is_public"]
         logger.debug(
-            f"APPEND about to enqueue MultipartUploadChainRequest for object_id={object_id}, part={int(next_part)}, upload_id={str(upload_id)}"
+            f"APPEND about to enqueue UploadChainRequest for object_id={object_id}, part={int(next_part)}, upload_id={str(upload_id)}"
         )
-        payload = MultipartUploadChainRequest(
+        payload = UploadChainRequest(
             substrate_url=config.substrate_url,
             ipfs_node=config.ipfs_store_url,
             address=request.state.account.main_account,
@@ -333,12 +333,12 @@ async def handle_append(
             object_key=object_key,
             should_encrypt=should_encrypt,
             object_id=object_id,
-            multipart_upload_id=str(upload_id),
+            upload_id=str(upload_id),
             chunks=[Chunk(id=int(next_part))],
         )
-        logger.debug(f"APPEND MultipartUploadChainRequest payload created: {payload}")
+        logger.debug(f"APPEND UploadChainRequest payload created: {payload}")
         await enqueue_upload_request(payload, redis_client)
-        logger.debug("APPEND MultipartUploadChainRequest successfully enqueued")
+        logger.debug("APPEND UploadChainRequest successfully enqueued")
         with contextlib.suppress(Exception):
             logger.info(
                 f"APPEND enqueued background publish object_id={object_id} part={int(next_part)} upload_id={str(upload_id)}"

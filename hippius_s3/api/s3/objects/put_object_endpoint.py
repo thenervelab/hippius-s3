@@ -18,7 +18,7 @@ from hippius_s3.api.s3.extensions.append import handle_append
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.queue import Chunk
-from hippius_s3.queue import SimpleUploadChainRequest
+from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.utils import get_query
 
@@ -84,12 +84,6 @@ async def handle_put_object(
         file_size = len(file_data)
         md5_hash = hashlib.md5(file_data).hexdigest()
         logger.info(f"PUT {bucket_name}/{object_key}: size={len(file_data)}, md5={md5_hash}")
-        object_id = str(uuid.uuid4())
-        should_encrypt = not bucket["is_public"]
-
-        # Unified cache: write part 0 via repository
-        await RedisObjectPartsCache(redis_client).set(object_id, 0, file_data)
-        logger.info(f"PUT cache unified write object_id={object_id} part=0 bytes={len(file_data)}")
 
         created_at = datetime.now(timezone.utc)
 
@@ -108,6 +102,19 @@ async def handle_put_object(
             object_key,
         )
 
+        # Generate object_id or reuse existing one
+        if prev:
+            object_id = str(prev["object_id"])  # ensure string for model validation and cache keys
+            logger.debug(f"Reusing existing object_id {object_id} for overwrite")
+        else:
+            object_id = str(uuid.uuid4())
+
+        should_encrypt = not bucket["is_public"]
+
+        # Unified cache: write part 0 via repository
+        await RedisObjectPartsCache(redis_client).set(object_id, 0, file_data)
+        logger.info(f"PUT cache unified write object_id={object_id} part=0 bytes={len(file_data)}")
+
         async with db.transaction():
             await db.fetchrow(
                 get_query("upsert_object_basic"),
@@ -121,9 +128,9 @@ async def handle_put_object(
                 created_at,
             )
 
-            # If overwriting a previous multipart object, remove stale parts
+            # If overwriting a previous object, remove its parts since we're replacing it
             try:
-                if prev and (prev.get("multipart") or False):
+                if prev:
                     await db.execute("DELETE FROM parts WHERE object_id = $1", prev["object_id"])  # type: ignore[index]
             except Exception:
                 logger.debug("Failed to cleanup previous parts on overwrite", exc_info=True)
@@ -174,7 +181,7 @@ async def handle_put_object(
 
         # Only enqueue after DB state (object, upload row, and part 0) is persisted to avoid race with pinner
         await enqueue_upload_request(
-            payload=SimpleUploadChainRequest(
+            payload=UploadChainRequest(
                 substrate_url=config.substrate_url,
                 ipfs_node=config.ipfs_store_url,
                 address=request.state.account.main_account,
@@ -184,9 +191,7 @@ async def handle_put_object(
                 object_key=object_key,
                 should_encrypt=should_encrypt,
                 object_id=object_id,
-                chunk=Chunk(
-                    id=0,
-                ),
+                chunks=[Chunk(id=0)],
             ),
             redis_client=redis_client,
         )
@@ -200,8 +205,8 @@ async def handle_put_object(
             },
         )
 
-    except Exception:
-        logger.exception("Error uploading object")
+    except Exception as e:
+        logger.exception(f"Error uploading object: {e}")
         return errors.s3_error_response(
             "InternalError",
             "We encountered an internal error. Please try again.",

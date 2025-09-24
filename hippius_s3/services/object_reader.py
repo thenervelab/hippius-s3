@@ -226,8 +226,8 @@ class ObjectReader:
             # All pending parts are already in cache
             return
 
-        # Do bounded polling for missing pending parts
-        poll_deadline = asyncio.get_event_loop().time() + 2.0  # 2 second timeout
+        # Do bounded polling for missing pending parts (align with HTTP stream initial timeout)
+        poll_deadline = asyncio.get_event_loop().time() + float(self.config.http_stream_initial_timeout_seconds)
         poll_interval = self.config.http_download_sleep_loop
 
         while asyncio.get_event_loop().time() < poll_deadline:
