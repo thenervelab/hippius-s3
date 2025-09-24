@@ -8,7 +8,7 @@ import pytest
 
 from hippius_s3.config import Config
 from hippius_s3.queue import Chunk
-from hippius_s3.queue import SimpleUploadChainRequest
+from hippius_s3.queue import UploadChainRequest
 from hippius_s3.workers.pinner import Pinner
 from hippius_s3.workers.pinner import classify_error
 from hippius_s3.workers.pinner import compute_backoff_ms
@@ -66,7 +66,7 @@ def test_compute_backoff_ms() -> None:
 @pytest.mark.asyncio
 async def test_process_item_success_simple(pinner: Pinner) -> None:
     """Test successful processing of simple upload."""
-    payload = SimpleUploadChainRequest(
+    payload = UploadChainRequest(
         substrate_url="http://test",
         ipfs_node="http://test",
         address="user1",
@@ -76,7 +76,8 @@ async def test_process_item_success_simple(pinner: Pinner) -> None:
         object_key="test-key",
         should_encrypt=False,
         object_id="obj-123",
-        chunk=Chunk(id=0),
+        chunks=[Chunk(id=0)],
+        upload_id=None,
         attempts=0,
         request_id="req-456",
     )
@@ -101,7 +102,7 @@ async def test_process_item_success_simple(pinner: Pinner) -> None:
 @pytest.mark.asyncio
 async def test_process_item_transient_error_retry(pinner: Pinner) -> None:
     """Test transient error triggers retry."""
-    payload = SimpleUploadChainRequest(
+    payload = UploadChainRequest(
         substrate_url="http://test",
         ipfs_node="http://test",
         address="user1",
@@ -111,12 +112,13 @@ async def test_process_item_transient_error_retry(pinner: Pinner) -> None:
         object_key="test-key",
         should_encrypt=False,
         object_id="obj-123",
-        chunk=Chunk(id=0),
+        chunks=[Chunk(id=0)],
+        upload_id=None,
         attempts=1,  # Already tried once
         request_id="req-456",
     )
 
-    with patch.object(pinner, "_process_simple_upload", side_effect=ConnectionError("timeout")):
+    with patch.object(pinner, "_process_chunks_only", side_effect=ConnectionError("timeout")):
         files, success = await pinner.process_item(payload)
 
     assert not success
@@ -131,7 +133,7 @@ async def test_process_item_transient_error_retry(pinner: Pinner) -> None:
 @pytest.mark.asyncio
 async def test_process_item_permanent_error_fail(pinner: Pinner) -> None:
     """Test permanent error marks object as failed."""
-    payload = SimpleUploadChainRequest(
+    payload = UploadChainRequest(
         substrate_url="http://test",
         ipfs_node="http://test",
         address="user1",
@@ -141,12 +143,13 @@ async def test_process_item_permanent_error_fail(pinner: Pinner) -> None:
         object_key="test-key",
         should_encrypt=False,
         object_id="obj-123",
-        chunk=Chunk(id=0),
+        chunks=[Chunk(id=0)],
+        upload_id=None,
         attempts=5,  # Max attempts exceeded
         request_id="req-456",
     )
 
-    with patch.object(pinner, "_process_simple_upload", side_effect=ValueError("invalid data")):
+    with patch.object(pinner, "_process_chunks_only", side_effect=ValueError("invalid data")):
         files, success = await pinner.process_item(payload)
 
     assert not success
@@ -161,7 +164,7 @@ async def test_process_item_permanent_error_fail(pinner: Pinner) -> None:
 @pytest.mark.asyncio
 async def test_process_batch_mixed_results(pinner: Pinner) -> None:
     """Test batch processing isolates failures."""
-    payload1 = SimpleUploadChainRequest(
+    payload1 = UploadChainRequest(
         substrate_url="http://test",
         ipfs_node="http://test",
         address="user1",
@@ -171,12 +174,13 @@ async def test_process_batch_mixed_results(pinner: Pinner) -> None:
         object_key="test-key-1",
         should_encrypt=False,
         object_id="obj-1",
-        chunk=Chunk(id=0),
+        chunks=[Chunk(id=0)],
+        upload_id=None,
         attempts=0,
         request_id="req-1",
     )
 
-    payload2 = SimpleUploadChainRequest(
+    payload2 = UploadChainRequest(
         substrate_url="http://test",
         ipfs_node="http://test",
         address="user1",
@@ -186,7 +190,8 @@ async def test_process_batch_mixed_results(pinner: Pinner) -> None:
         object_key="test-key-2",
         should_encrypt=False,
         object_id="obj-2",
-        chunk=Chunk(id=0),
+        chunks=[Chunk(id=0)],
+        upload_id=None,
         attempts=0,
         request_id="req-2",
     )
@@ -196,7 +201,7 @@ async def test_process_batch_mixed_results(pinner: Pinner) -> None:
     mock_result1.file_hash = "bafkreid1"
     mock_result1.cid = "bafkreid1"
 
-    with patch.object(pinner, "_process_simple_upload", side_effect=[mock_result1, ConnectionError("timeout")]):
+    with patch.object(pinner, "_process_chunks_only", side_effect=[mock_result1, ConnectionError("timeout")]):
         files, succeeded_payloads = await pinner.process_batch([payload1, payload2])
 
     # Only successful file returned

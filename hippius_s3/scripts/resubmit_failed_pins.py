@@ -13,7 +13,7 @@ import redis.asyncio as async_redis
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.queue import Chunk
-from hippius_s3.queue import SimpleUploadChainRequest
+from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
 
 
@@ -92,7 +92,7 @@ async def main() -> None:
                 skipped_private_no_seed += 1
                 continue
 
-            payload = SimpleUploadChainRequest(
+            payload = UploadChainRequest(
                 substrate_url=config.substrate_url,
                 ipfs_node=config.ipfs_store_url,
                 address=address,
@@ -102,7 +102,8 @@ async def main() -> None:
                 object_key=object_key,
                 should_encrypt=should_encrypt,
                 object_id=object_id,
-                chunk=Chunk(id=0),
+                chunks=[Chunk(id=0)],
+                upload_id=None,
             )
 
             if args.dry_run:

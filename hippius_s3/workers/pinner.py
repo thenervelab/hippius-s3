@@ -9,15 +9,12 @@ from typing import List
 from typing import NamedTuple
 from typing import Optional
 from typing import Tuple
-from typing import Union
 
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.cache import RedisUploadPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.ipfs_service import IPFSService
 from hippius_s3.queue import Chunk
-from hippius_s3.queue import MultipartUploadChainRequest
-from hippius_s3.queue import SimpleUploadChainRequest
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.utils import get_query
@@ -70,78 +67,30 @@ class Pinner:
         self.redis_client = redis_client
         self.config = config
 
-    def _normalize_payload(
-        self, payload: Union[SimpleUploadChainRequest, MultipartUploadChainRequest, UploadChainRequest]
-    ) -> UploadChainRequest:
-        """Normalize any payload type to the unified UploadChainRequest format."""
-        if isinstance(payload, UploadChainRequest):
-            return payload
-        if isinstance(payload, SimpleUploadChainRequest):
-            return UploadChainRequest(
-                substrate_url=payload.substrate_url,
-                ipfs_node=payload.ipfs_node,
-                address=payload.address,
-                subaccount=payload.subaccount,
-                subaccount_seed_phrase=payload.subaccount_seed_phrase,
-                bucket_name=payload.bucket_name,
-                object_key=payload.object_key,
-                should_encrypt=payload.should_encrypt,
-                object_id=payload.object_id,
-                chunks=[payload.chunk],
-                request_id=payload.request_id,
-                attempts=payload.attempts,
-                first_enqueued_at=payload.first_enqueued_at,
-                last_error=payload.last_error,
-            )
-        if isinstance(payload, MultipartUploadChainRequest):
-            return UploadChainRequest(
-                substrate_url=payload.substrate_url,
-                ipfs_node=payload.ipfs_node,
-                address=payload.address,
-                subaccount=payload.subaccount,
-                subaccount_seed_phrase=payload.subaccount_seed_phrase,
-                bucket_name=payload.bucket_name,
-                object_key=payload.object_key,
-                should_encrypt=payload.should_encrypt,
-                object_id=payload.object_id,
-                chunks=payload.chunks,
-                upload_id=payload.multipart_upload_id,
-                request_id=payload.request_id,
-                attempts=payload.attempts,
-                first_enqueued_at=payload.first_enqueued_at,
-                last_error=payload.last_error,
-            )
-        raise ValueError(f"Unknown payload type: {type(payload)}")
-
-    async def process_item(
-        self, payload: Union[SimpleUploadChainRequest, MultipartUploadChainRequest, UploadChainRequest]
-    ) -> Tuple[List[FileInput], bool]:
+    async def process_item(self, payload: UploadChainRequest) -> Tuple[List[FileInput], bool]:
         try:
-            # Normalize payload to unified type
-            unified_payload = self._normalize_payload(payload)
-
             logger.debug(
-                f"process_item START object_id={unified_payload.object_id} chunks={len(unified_payload.chunks)} upload_id={unified_payload.upload_id} attempts={unified_payload.attempts}"
+                f"process_item START object_id={payload.object_id} chunks={len(payload.chunks)} upload_id={payload.upload_id} attempts={payload.attempts}"
             )
 
             # Step 2: Process chunks only (upload to IPFS, upsert parts table)
             chunk_results = await self._process_chunks_only(
-                object_id=unified_payload.object_id,
-                object_key=unified_payload.object_key,
-                should_encrypt=unified_payload.should_encrypt,
-                chunks=unified_payload.chunks,
-                upload_id=unified_payload.upload_id,
-                seed_phrase=unified_payload.subaccount_seed_phrase,
+                object_id=payload.object_id,
+                object_key=payload.object_key,
+                should_encrypt=payload.should_encrypt,
+                chunks=payload.chunks,
+                upload_id=payload.upload_id,
+                seed_phrase=payload.subaccount_seed_phrase,
             )
 
             # Step 3: Build and publish manifest (only if all parts have CIDs)
             manifest_result = await self._build_and_publish_manifest(
-                object_id=unified_payload.object_id,
-                object_key=unified_payload.object_key,
-                should_encrypt=unified_payload.should_encrypt,
-                seed_phrase=unified_payload.subaccount_seed_phrase,
-                subaccount=unified_payload.subaccount,
-                bucket_name=unified_payload.bucket_name,
+                object_id=payload.object_id,
+                object_key=payload.object_key,
+                should_encrypt=payload.should_encrypt,
+                seed_phrase=payload.subaccount_seed_phrase,
+                subaccount=payload.subaccount,
+                bucket_name=payload.bucket_name,
             )
 
             # Return chunk FileInputs, and manifest FileInput only if it was actually built
@@ -166,8 +115,8 @@ class Pinner:
             return [], False
 
     async def process_batch(
-        self, payloads: List[Union[SimpleUploadChainRequest, MultipartUploadChainRequest, UploadChainRequest]]
-    ) -> Tuple[List[FileInput], List[Union[SimpleUploadChainRequest, MultipartUploadChainRequest, UploadChainRequest]]]:
+        self, payloads: List[UploadChainRequest]
+    ) -> Tuple[List[FileInput], List[UploadChainRequest]]:
         all_files = []
         succeeded_payloads = []
         for payload in payloads:

@@ -49,15 +49,6 @@ class ChainRequest(BaseModel):
         return f"simple::{self.object_id}::{self.address}"
 
 
-class MultipartUploadChainRequest(ChainRequest):
-    multipart_upload_id: str
-    chunks: list[Chunk]
-
-
-class SimpleUploadChainRequest(ChainRequest):
-    chunk: Chunk
-
-
 class UploadChainRequest(ChainRequest):
     """Unified upload request type that combines simple and multipart uploads."""
 
@@ -90,11 +81,7 @@ class DownloadChainRequest(BaseModel):
 
 
 async def enqueue_upload_request(
-    payload: Union[
-        MultipartUploadChainRequest,
-        SimpleUploadChainRequest,
-        UploadChainRequest,
-    ],
+    payload: UploadChainRequest,
     redis_client: async_redis.Redis,
 ) -> None:
     """Add an upload request to the Redis queue for processing by workers."""
@@ -112,7 +99,7 @@ async def enqueue_upload_request(
 
 async def dequeue_upload_request(
     redis_client: async_redis.Redis,
-) -> Union[MultipartUploadChainRequest, SimpleUploadChainRequest, UploadChainRequest, None]:
+) -> UploadChainRequest | None:
     """Get the next upload request from the Redis queue."""
     queue_name = "upload_requests"
     # Use a short blocking timeout to enable timely batch flushes
@@ -121,13 +108,7 @@ async def dequeue_upload_request(
         _, queue_data = result
         queue_data = json.loads(queue_data)
 
-        if "chunks" in queue_data and "upload_id" in queue_data:
-            # Unified UploadChainRequest has chunks and optional upload_id
-            return UploadChainRequest.model_validate(queue_data)
-        if "chunk" in queue_data:
-            return SimpleUploadChainRequest.model_validate(queue_data)
-
-        return MultipartUploadChainRequest.model_validate(queue_data)
+        return UploadChainRequest.model_validate(queue_data)
 
     return None
 
@@ -137,11 +118,7 @@ RETRY_ZSET = "upload_retries"
 
 
 async def enqueue_retry_request(
-    payload: Union[
-        MultipartUploadChainRequest,
-        SimpleUploadChainRequest,
-        UploadChainRequest,
-    ],
+    payload: UploadChainRequest,
     redis_client: async_redis.Redis,
     *,
     delay_seconds: float,
