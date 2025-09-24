@@ -6,6 +6,7 @@ import sys
 import time
 from pathlib import Path
 from typing import List
+from typing import Optional
 
 import asyncpg
 import redis.asyncio as async_redis
@@ -114,7 +115,11 @@ async def get_cached_chain_cids(
         logger.info(f"User {user} cached chain profile is too old (age: {int(current_time - timestamp)}s), ignoring")
         return []
 
-    cids = data.get("cids", [])
+    raw_cids = data.get("cids", [])
+    if not isinstance(raw_cids, list):
+        logger.debug("Cached cids is not a list; ignoring")
+        return []
+    cids: List[str] = [str(c) for c in raw_cids]
     logger.debug(f"Retrieved {len(cids)} CIDs from cache for user {user}")
     return cids
 
@@ -162,11 +167,31 @@ async def get_all_users(
     db: asyncpg.Connection,
 ) -> List[str]:
     """Get all users from the database."""
-    users = await db.fetch("SELECT DISTINCT main_account_id FROM buckets WHERE main_account_id IS NOT NULL")
-    return [row["main_account_id"] for row in users]
+    rows: List[asyncpg.Record] = await db.fetch(
+        "SELECT DISTINCT main_account_id FROM buckets WHERE main_account_id IS NOT NULL"
+    )
+    user_ids: List[str] = [str(row["main_account_id"]) for row in rows]
+    return user_ids
 
 
-async def run_chain_pin_checker_loop():
+async def _wait_for_table(
+    db: asyncpg.Connection, table: str, timeout_seconds: int = 120, poll_interval_seconds: float = 1.0
+) -> None:
+    """Wait until a given table exists. Raises after timeout."""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            exists: Optional[str] = await db.fetchval("SELECT to_regclass($1)", f"public.{table}")
+            if exists:
+                logger.info(f"Schema ready: found table '{table}'")
+                return
+        except Exception as e:
+            logger.debug(f"Error while checking for table {table}: {e}")
+        await asyncio.sleep(poll_interval_seconds)
+    raise TimeoutError(f"Timed out waiting for table '{table}' to exist")
+
+
+async def run_chain_pin_checker_loop() -> None:
     """Main loop that checks user CIDs against chain data."""
     # Connect to database
     db = await asyncpg.connect(config.database_url)
@@ -178,6 +203,15 @@ async def run_chain_pin_checker_loop():
     logger.info("Starting chain pin checker service...")
     logger.info(f"Database: {config.database_url}")
     logger.info(f"Redis Chain: {redis_chain_url}")
+
+    # Wait for schema readiness (buckets is required; others are joined later)
+    try:
+        await _wait_for_table(db, "buckets", timeout_seconds=180)
+    except Exception as e:
+        logger.error(f"Schema not ready: {e}")
+        # Give up this run cycle to avoid tight crash loops
+        await asyncio.sleep(config.pin_checker_loop_sleep)
+        return
 
     while True:
         # Get all users

@@ -16,8 +16,6 @@ class ObjectPartsCache(Protocol):
     async def exists(self, object_id: str, part_number: int) -> bool: ...
     async def expire(self, object_id: str, part_number: int, seconds: int) -> None: ...
     async def strlen(self, object_id: str, part_number: int) -> int: ...
-    async def read_base_for_append(self, object_id: str) -> bytes | None: ...
-    async def write_base_for_append(self, object_id: str, data: bytes, ttl: int | None = None) -> None: ...
 
 
 @runtime_checkable
@@ -60,15 +58,6 @@ class RedisObjectPartsCacheAdapter(ObjectPartsCache):
 
     async def strlen(self, object_id: str, part_number: int) -> int:
         return await self._delegate.strlen(object_id, part_number)
-
-    async def read_base_for_append(self, object_id: str) -> bytes | None:
-        return await self._delegate.read_base_for_append(object_id)
-
-    async def write_base_for_append(self, object_id: str, data: bytes, ttl: int | None = None) -> None:
-        if ttl is not None:
-            await self._delegate.write_base_for_append(object_id, data, ttl=ttl)
-        else:
-            await self._delegate.write_base_for_append(object_id, data)
 
 
 class RedisDownloadChunksCacheAdapter(DownloadChunksCache):

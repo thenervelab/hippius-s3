@@ -111,9 +111,9 @@ async def handle_put_object(
 
         should_encrypt = not bucket["is_public"]
 
-        # Unified cache: write part 0 via repository
-        await RedisObjectPartsCache(redis_client).set(object_id, 0, file_data)
-        logger.info(f"PUT cache unified write object_id={object_id} part=0 bytes={len(file_data)}")
+        # Unified cache: write base part as part 1 (1-based indexing)
+        await RedisObjectPartsCache(redis_client).set(object_id, 1, file_data)
+        logger.info(f"PUT cache unified write object_id={object_id} part=1 bytes={len(file_data)}")
 
         async with db.transaction():
             await db.fetchrow(
@@ -158,11 +158,11 @@ async def handle_put_object(
             )
             upload_id = upload_row["upload_id"] if upload_row else uuid.UUID(object_id)
 
-        # Insert parts(0) for simple objects - all objects are represented by parts
+        # Insert parts(1) for simple objects - all objects are represented by parts (1-based)
         placeholder_cid = "pending"
         placeholder_cid_id = await _upsert_cid(db, placeholder_cid)
 
-        # Insert part 0 representing the base object (placeholder)
+        # Insert part 1 representing the base object (placeholder)
         await db.execute(
             """
             INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
@@ -171,7 +171,7 @@ async def handle_put_object(
             """,
             str(uuid.uuid4()),
             upload_id,
-            0,
+            1,
             placeholder_cid,
             int(file_size),
             md5_hash,
@@ -180,7 +180,7 @@ async def handle_put_object(
             placeholder_cid_id,
         )
 
-        # Only enqueue after DB state (object, upload row, and part 0) is persisted to avoid race with pinner
+        # Only enqueue after DB state (object, upload row, and part 1) is persisted to avoid race with pinner
         await enqueue_upload_request(
             payload=UploadChainRequest(
                 substrate_url=config.substrate_url,
@@ -192,7 +192,7 @@ async def handle_put_object(
                 object_key=object_key,
                 should_encrypt=should_encrypt,
                 object_id=object_id,
-                chunks=[Chunk(id=0)],
+                chunks=[Chunk(id=1)],
             ),
             redis_client=redis_client,
         )

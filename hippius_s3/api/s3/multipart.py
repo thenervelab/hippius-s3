@@ -440,12 +440,12 @@ async def upload_part(
         # Prefer unified cache via ObjectReader, fallback to IPFS through service
         source_bytes = None
         try:
-            source_bytes = await request.app.state.obj_cache.get(str(source_obj["object_id"]), 0)
+            source_bytes = await request.app.state.obj_cache.get(str(source_obj["object_id"]), 1)
         except Exception as e:
             logger.debug(f"ObjectReader cache base read miss: {e}")
             # Fallback: try unified object-parts cache directly (part 0)
             try:
-                source_bytes = await request.app.state.obj_cache.get(str(source_obj["object_id"]), 0)
+                source_bytes = await request.app.state.obj_cache.get(str(source_obj["object_id"]), 1)
                 if source_bytes:
                     logger.info(
                         f"UploadPartCopy fallback cache hit object_id={source_obj['object_id']} part=0 bytes={len(source_bytes)}"

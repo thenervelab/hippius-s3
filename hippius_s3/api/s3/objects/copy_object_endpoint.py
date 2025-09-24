@@ -20,7 +20,9 @@ from hippius_s3.config import get_config
 from hippius_s3.repositories.buckets import BucketRepository
 from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
+from hippius_s3.services.object_reader import DownloadNotReadyError
 from hippius_s3.services.object_reader import ObjectReader
+from hippius_s3.services.object_reader import Part
 
 
 logger = logging.getLogger(__name__)
@@ -46,14 +48,14 @@ async def handle_copy_object(
     copy_source_path = unquote(copy_source_path)
     if copy_source_path.startswith("/"):
         copy_source_path = copy_source_path[1:]
-    parts = copy_source_path.split("/", 1)
-    if len(parts) != 2:
+    path_parts = copy_source_path.split("/", 1)
+    if len(path_parts) != 2:
         return errors.s3_error_response(
             "InvalidArgument",
             "x-amz-copy-source must be in format /source-bucket/source-key",
             status_code=400,
         )
-    source_bucket_name, source_object_key = parts
+    source_bucket_name, source_object_key = path_parts
 
     # Resolve user and buckets (same owner for src/dst)
     user = await UserRepository(db).ensure_by_main_account(request.state.account.main_account)
@@ -94,64 +96,87 @@ async def handle_copy_object(
     object_id = str(uuid.uuid4())
     created_at = datetime.now(timezone.utc)
 
-    if same_encryption_context:
-        # Fast path: reuse CID & metadata
-        logger.info(f"CopyObject fast path: same encryption (same_bucket={same_bucket}, public={source_is_public})")
-        ipfs_cid = source_object["ipfs_cid"]
-        file_size = source_object["size_bytes"]
-        content_type = source_object["content_type"]
-        md5_hash = source_object["md5_hash"]
+    # Prefer ObjectReader to manage readiness and cache hydration
+    obj_reader = object_reader or ObjectReader(config)
+    try:
+        src_info = await obj_reader.fetch_object_info(
+            db, source_bucket_name, source_object_key, request.state.account.main_account
+        )
+    except Exception:
+        return errors.s3_error_response(
+            "NoSuchKey", f"The specified key {source_object_key} does not exist", status_code=404
+        )
+
+    # Fast path reuse if contexts match and a CID exists (allow during publishing too)
+    if same_encryption_context and (str(source_object.get("ipfs_cid") or "").strip()):
+        logger.info(f"CopyObject fast path: reuse CID (same_bucket={same_bucket}, public={source_is_public})")
+        ipfs_cid = str(source_object["ipfs_cid"])  # type: ignore[index]
+        file_size = int(source_object["size_bytes"])  # type: ignore[index]
+        content_type = str(source_object["content_type"])  # type: ignore[index]
+        md5_hash = str(source_object["md5_hash"])  # type: ignore[index]
         metadata: dict[str, Any] = {
             "ipfs": source_metadata.get("ipfs", {}),
             "hippius": source_metadata.get("hippius", {}),
             **{k: v for k, v in source_metadata.items() if k not in ["ipfs", "hippius"]},
         }
     else:
-        # Slow path: fetch bytes and republish for destination bucket context
-        logger.info(f"CopyObject slow path: source public={source_is_public}, dest public={dest_is_public}")
-        # If CID missing, try cache/ObjectReader before 503
-        source_cid = (source_object.get("ipfs_cid") or "").strip()
-        if not source_cid:
-            src_bytes: bytes | None = None
-            # Try direct cache access for source object
+        # Assemble bytes via ObjectReader (hydrate cache and read parts in order)
+        logger.info("CopyObject assembling bytes via ObjectReader")
+        obj_cache = RedisObjectPartsCache(redis_client)
+        # Build full manifest and split by cid presence
+        parts: list[Part] = await obj_reader.build_manifest(db, src_info)
+        parts = sorted(parts, key=lambda p: p.part_number)
+        cid_backed: list[Part] = [p for p in parts if p.cid]
+        pending_only: list[Part] = [p for p in parts if not p.cid]
+
+        # Hydrate CID-backed parts
+        if cid_backed:
+            await obj_reader.hydrate_object_cache(
+                redis_client,
+                obj_cache,
+                src_info,
+                cid_backed,
+                address=request.state.account.main_account,
+                seed_phrase=request.state.seed_phrase,
+            )
+
+        # Handle pending parts with bounded polling
+        if pending_only:
             try:
-                src_bytes = await RedisObjectPartsCache(redis_client).get(str(source_object["object_id"]), 0)
-            except Exception:
-                src_bytes = None
-            if src_bytes:
-                md5_hash = hashlib.md5(src_bytes).hexdigest()  # type: ignore[arg-type]
-                should_encrypt = not dest_is_public
-                s3_result = await ipfs_service.client.s3_publish(
-                    content=src_bytes,  # type: ignore[arg-type]
-                    encrypt=should_encrypt,
-                    seed_phrase=request.state.seed_phrase,
-                    subaccount_id=request.state.account.main_account,
-                    bucket_name=dest_bucket["bucket_name"],
-                    file_name=source_object_key,
-                    store_node=config.ipfs_store_url,
-                    pin_node=config.ipfs_store_url,
-                    substrate_url=config.substrate_url,
-                    publish=config.publish_to_chain,
+                await obj_reader._handle_pending_parts_with_cache_fallback(  # type: ignore[attr-defined]
+                    db,
+                    obj_cache,
+                    src_info,
+                    pending_only,
+                    redis_client,
+                    request.state.account.main_account,
+                    request.state.seed_phrase,
                 )
-                ipfs_cid = s3_result.cid
-                file_size = len(src_bytes)  # type: ignore[arg-type]
-                content_type = source_object["content_type"]
-                metadata = {}
-            else:
+            except DownloadNotReadyError:
                 return errors.s3_error_response(
-                    "ServiceUnavailable",
+                    "SlowDown",
                     "Source object is not yet available for copying. Please retry shortly.",
                     status_code=503,
                 )
+
+        # Read all parts from cache in order
+        data_chunks: list[bytes] = []
+        for p in parts:
+            chunk = await obj_cache.get(src_info.object_id, int(p.part_number))
+            if chunk is None:
+                return errors.s3_error_response(
+                    "SlowDown",
+                    "Source object is not yet available for copying. Please retry shortly.",
+                    status_code=503,
+                )
+            data_chunks.append(chunk)
+        src_bytes = b"".join(data_chunks)
+
+        # Publish with destination encryption context (or reuse CID if contexts match and CID exists)
+        md5_hash = hashlib.md5(src_bytes).hexdigest()
+        if same_encryption_context and (str(source_object.get("ipfs_cid") or "").strip()):
+            ipfs_cid = str(source_object["ipfs_cid"])  # type: ignore[index]
         else:
-            # Download by CID and re-publish with destination encryption
-            src_bytes = await ipfs_service.download_file(
-                cid=source_cid,
-                subaccount_id=request.state.account.main_account,
-                bucket_name=source_bucket_name,
-                decrypt=not source_is_public,
-            )
-            md5_hash = hashlib.md5(src_bytes).hexdigest()  # type: ignore[arg-type]
             should_encrypt = not dest_is_public
             s3_result = await ipfs_service.client.s3_publish(
                 content=src_bytes,
@@ -166,9 +191,9 @@ async def handle_copy_object(
                 publish=config.publish_to_chain,
             )
             ipfs_cid = s3_result.cid
-            file_size = len(src_bytes)  # type: ignore[arg-type]
-            content_type = source_object["content_type"]
-            metadata = {}
+        file_size = len(src_bytes)
+        content_type = str(source_object["content_type"])  # type: ignore[index]
+        metadata = {}
 
     # Upsert destination object (CID table)
     cid_id = await utils.upsert_cid_and_get_id(db, ipfs_cid)

@@ -9,6 +9,7 @@ and the current value exposed on HEAD as ``x-amz-meta-append-version``. ETag is
 maintained for clients, but is not used for CAS.
 """
 
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -147,35 +148,42 @@ async def handle_append(
 
     # PHASE 1: Transactional phase (with lock) - only reached if preflight passed
     async with db.transaction():
-        try:
-            current = await db.fetchrow(
-                "SELECT * FROM objects WHERE bucket_id = $1 AND object_key = $2 FOR UPDATE NOWAIT",
-                bucket_id,
-                object_key,
-            )
-        except Exception as e:
-            # If lock is not available, convert to a fast 412 with refreshed version
-            # Postgres lock_not_available (55P03) is commonly surfaced as a generic Exception by drivers
-            with contextlib.suppress(Exception):
-                logger.info(f"APPEND lock not available for {bucket_name}/{object_key}: {e}")
+        # Try to acquire row lock with brief retries to avoid spurious 412s in serial clients
+        lock_attempts = 3
+        current = None
+        for attempt in range(lock_attempts):
             try:
-                fresh = await db.fetchrow(
-                    "SELECT append_version FROM objects WHERE bucket_id = $1 AND object_key = $2",
+                current = await db.fetchrow(
+                    "SELECT * FROM objects WHERE bucket_id = $1 AND object_key = $2 FOR UPDATE NOWAIT",
                     bucket_id,
                     object_key,
                 )
-                fresh_version = int((fresh or {}).get("append_version") or current_version)
-            except Exception:
-                fresh_version = current_version
-            return errors.s3_error_response(
-                code="PreconditionFailed",
-                message="Concurrent append in progress",
-                status_code=412,
-                extra_headers={
-                    "x-amz-meta-append-version": str(fresh_version),
-                    "Retry-After": "0.1",
-                },
-            )
+                break
+            except Exception as e:
+                if attempt == lock_attempts - 1:
+                    # If still not available, convert to a fast 412 with refreshed version
+                    with contextlib.suppress(Exception):
+                        logger.info(f"APPEND lock not available for {bucket_name}/{object_key}: {e}")
+                    try:
+                        fresh = await db.fetchrow(
+                            "SELECT append_version FROM objects WHERE bucket_id = $1 AND object_key = $2",
+                            bucket_id,
+                            object_key,
+                        )
+                        fresh_version = int((fresh or {}).get("append_version") or current_version)
+                    except Exception:
+                        fresh_version = current_version
+                    return errors.s3_error_response(
+                        code="PreconditionFailed",
+                        message="Concurrent append in progress",
+                        status_code=412,
+                        extra_headers={
+                            "x-amz-meta-append-version": str(fresh_version),
+                            "Retry-After": "0.1",
+                        },
+                    )
+                # brief backoff before retrying lock acquisition
+                await asyncio.sleep(0.03 * (attempt + 1))
 
         if not current:
             # Double-check in case of race (though preflight checked)
@@ -268,10 +276,10 @@ async def handle_append(
         # Recompute composite ETag from base object MD5 + all appended part etags
         base_md5 = str(current.get("md5_hash") or "").strip()
         if not base_md5 or len(base_md5) != 32:
-            # Fallback: compute MD5 from cache if available
+            # Fallback: compute MD5 from cache if available (1-based base part)
             try:
                 obj_cache = RedisObjectPartsCache(redis_client)
-                base_bytes = await obj_cache.get(object_id, 0)  # Base part is part 0
+                base_bytes = await obj_cache.get(object_id, 1)
                 base_md5 = hashlib.md5(base_bytes).hexdigest() if base_bytes else "00000000000000000000000000000000"
             except Exception:
                 base_md5 = "00000000000000000000000000000000"  # Placeholder

@@ -122,7 +122,3 @@ services:
       - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
     volumes:
       - .:/app
-
-  redis:
-    ports:
-      - "6379:6379"

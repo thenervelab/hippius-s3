@@ -21,11 +21,6 @@ class ObjectPartsCache(Protocol):
     async def strlen(self, object_id: str, part_number: int) -> int: ...
     async def expire(self, object_id: str, part_number: int, *, ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS) -> None: ...
 
-    async def read_base_for_append(self, object_id: str) -> Optional[bytes]: ...
-    async def write_base_for_append(
-        self, object_id: str, data: bytes, *, ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS
-    ) -> None: ...
-
 
 class RedisObjectPartsCache:
     def __init__(self, redis_client: Any) -> None:
@@ -52,18 +47,7 @@ class RedisObjectPartsCache:
     async def expire(self, object_id: str, part_number: int, *, ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS) -> None:
         await self.redis.expire(self.build_key(object_id, part_number), ttl)
 
-    async def read_base_for_append(self, object_id: str) -> Optional[bytes]:
-        # Prefer part 0, then 1. Do not scan.
-        data = await self.get(object_id, 0)
-        if data:
-            return data
-        return await self.get(object_id, 1)
-
-    async def write_base_for_append(
-        self, object_id: str, data: bytes, *, ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS
-    ) -> None:
-        # Write to part 1 for compatibility with current append flow
-        await self.set(object_id, 1, data, ttl=ttl)
+    # Note: base part policy is 1-based; callers should use get/set directly with part_number=1
 
 
 class RedisUploadPartsCache:
@@ -109,10 +93,4 @@ class NullObjectPartsCache:
     async def expire(self, object_id: str, part_number: int, *, ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS) -> None:  # type: ignore[override]
         return None
 
-    async def read_base_for_append(self, object_id: str) -> Optional[bytes]:  # type: ignore[override]
-        return None
-
-    async def write_base_for_append(
-        self, object_id: str, data: bytes, *, ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS
-    ) -> None:  # type: ignore[override]
-        return None
+    # Base helpers removed; use get/set directly

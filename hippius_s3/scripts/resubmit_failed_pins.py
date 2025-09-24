@@ -82,7 +82,7 @@ async def main() -> None:
                 continue
 
             # Ensure part 0 is still in cache
-            if not await obj_cache.exists(object_id, 0):
+            if not await obj_cache.exists(object_id, 1):
                 skipped_no_cache += 1
                 continue
 
@@ -102,7 +102,7 @@ async def main() -> None:
                 object_key=object_key,
                 should_encrypt=should_encrypt,
                 object_id=object_id,
-                chunks=[Chunk(id=0)],
+                chunks=[Chunk(id=1)],
                 upload_id=None,
             )
 

@@ -119,9 +119,8 @@ async def handle_head_object(
         try:
             obj_id_str = str(row["object_id"])  # type: ignore[index]
             oc = request.app.state.obj_cache
-            has0 = await oc.exists(obj_id_str, 0)
             has1 = await oc.exists(obj_id_str, 1)
-            headers["x-hippius-source"] = "cache" if (has0 or has1) else "pipeline"
+            headers["x-hippius-source"] = "cache" if has1 else "pipeline"
         except Exception:
             headers["x-hippius-source"] = "pipeline"
         # Append version header if present
