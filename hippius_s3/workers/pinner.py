@@ -1,76 +1,87 @@
 """Pinner logic with retry handling and batch processing."""
 
 import asyncio
-import hashlib
+import json
 import logging
 import random
 from typing import Any
 from typing import List
+from typing import NamedTuple
+from typing import Optional
+from typing import Tuple
+
+from hippius_s3.cache import RedisObjectPartsCache
+from hippius_s3.cache import RedisUploadPartsCache
+from hippius_s3.config import get_config
+from hippius_s3.dlq.storage import DLQStorage
+from hippius_s3.ipfs_service import IPFSService
+from hippius_s3.queue import Chunk
+from hippius_s3.queue import UploadChainRequest
+from hippius_s3.queue import enqueue_retry_request
+from hippius_s3.utils import get_query
+
 
 # FileInput is from hippius_sdk.substrate.FileInput but we define a simple alias for testing
-from typing import NamedTuple
-from typing import Tuple
-from typing import Union
-
-from hippius_s3.queue import Chunk
-from hippius_s3.queue import MultipartUploadChainRequest
-from hippius_s3.queue import SimpleUploadChainRequest
-from hippius_s3.queue import enqueue_retry_request
-from hippius_s3.utils import upsert_cid_and_get_id
-
-
 class FileInput(NamedTuple):
     file_hash: str
-    file_name: str
-
-
-# Import heavy dependencies only when needed to avoid test import issues
-def _get_redis_cache() -> Any:
-    from hippius_s3.cache import RedisObjectPartsCache
-
-    return RedisObjectPartsCache
 
 
 logger = logging.getLogger(__name__)
 
 
-def classify_error(exc: Exception) -> bool:
-    """Classify exception as transient (retryable) or permanent (fail immediately).
+def classify_error(error: Exception) -> str:
+    """Classify error as transient, permanent, or unknown."""
+    err_str = str(error).lower()
+    err_type = type(error).__name__.lower()
 
-    Transient: timeouts, connection errors, 5xx HTTP, reset.
-    Permanent: 4xx validation errors, auth failures, etc.
-    """
-    # Type-based checks for common transient exceptions
-    if isinstance(exc, (asyncio.TimeoutError, asyncio.CancelledError, ConnectionError, OSError, BrokenPipeError)):
-        return True
+    # Permanent errors
+    if any(
+        keyword in err_str
+        for keyword in ["malformed", "invalid", "negative size", "missing part", "validation error", "integrity"]
+    ):
+        return "permanent"
 
-    # Try aiohttp-specific checks if available
-    try:
-        import aiohttp
+    # Transient errors (retryable)
+    if any(
+        keyword in err_str
+        for keyword in [
+            "timeout",
+            "connection",
+            "network",
+            "5xx",
+            "503",
+            "502",
+            "504",
+            "unavailable",
+            "throttled",
+            "rate limit",
+        ]
+    ) or any(keyword in err_type for keyword in ["connectionerror", "timeouterror", "httperror"]):
+        return "transient"
 
-        if isinstance(exc, (aiohttp.ClientConnectorError, aiohttp.ServerTimeoutError, aiohttp.ClientError)):
-            return True
-    except ImportError:
-        pass
-
-    # String-based pattern matching for other cases
-    err_str = str(exc).lower()
-    transient_patterns = ["timeout", "temporarily", "connection", "reset", "503", "502", "504", "connect"]
-    return any(p in err_str for p in transient_patterns)
+    # Default to transient for unknown errors
+    return "transient"
 
 
-def compute_backoff_ms(attempts: int, base_ms: int, max_ms: int) -> int:
-    """Compute exponential backoff with jitter.
+def compute_backoff_ms(attempt: int, base_ms: int = 1000, max_ms: int = 30000) -> float:
+    """Compute exponential backoff with jitter."""
+    # Exponential backoff: base * 2^(attempt-1) + jitter
+    exp_backoff = base_ms * (2 ** (attempt - 1))
+    jitter = random.uniform(0, exp_backoff * 0.1)  # 10% jitter
+    return float(min(exp_backoff + jitter, max_ms))
 
-    Formula: min(max_ms, base_ms * 2^(attempts-1)) with ±20% jitter.
-    """
-    n = attempts
-    raw_delay = base_ms * (2 ** (n - 1))
-    jitter = int(0.2 * raw_delay)
-    jitter_offset = random.randint(-jitter, jitter)
-    delay_ms = max(0, raw_delay + jitter_offset)
-    delay_ms = min(max_ms, delay_ms)
-    return int(delay_ms)
+
+# Import heavy dependencies only when needed to avoid test import issues
+def _get_redis_cache() -> type:  # type: ignore[no-any-return]
+    return RedisObjectPartsCache
+
+
+def _get_redis_upload_cache() -> type:  # type: ignore[no-any-return]
+    return RedisUploadPartsCache
+
+
+def _get_ipfs_service() -> type:  # type: ignore[no-any-return]
+    return IPFSService
 
 
 class Pinner:
@@ -81,56 +92,61 @@ class Pinner:
         self.ipfs_service = ipfs_service
         self.redis_client = redis_client
         self.config = config
+        self.dlq_storage = DLQStorage()
 
-    async def process_item(
-        self, payload: Union[SimpleUploadChainRequest, MultipartUploadChainRequest]
-    ) -> Tuple[List[FileInput], bool]:
-        """Process a single upload item.
-
-        Returns (files_to_publish, success).
-        On transient error: schedules retry and returns ([], False).
-        On permanent error: marks failed and returns ([], False).
-        On success: returns (files, True).
-        """
+    async def process_item(self, payload: UploadChainRequest) -> Tuple[List[FileInput], bool]:
         try:
-            if isinstance(payload, MultipartUploadChainRequest):  # Multipart
-                chunk_results = await self._process_multipart_upload(payload)
-                files = [result[0] for result in chunk_results]
-            else:  # Simple
-                result = await self._process_simple_upload(payload)
-                files = [result]
-            logger.info(
-                f"Pinner success: {payload.name} request_id={payload.request_id} attempts={payload.attempts} files={len(files)}"
+            logger.debug(
+                f"process_item START object_id={payload.object_id} chunks={len(payload.chunks)} upload_id={payload.upload_id} attempts={payload.attempts}"
             )
+
+            # Step 2: Process chunks only (upload to IPFS, upsert parts table)
+            chunk_results = await self._process_chunks_only(
+                object_id=payload.object_id,
+                object_key=payload.object_key,
+                should_encrypt=payload.should_encrypt,
+                chunks=payload.chunks,
+                upload_id=payload.upload_id,
+                seed_phrase=payload.subaccount_seed_phrase,
+            )
+
+            # Step 3: Build and publish manifest (only if all parts have CIDs)
+            manifest_result = await self._build_and_publish_manifest(
+                object_id=payload.object_id,
+                object_key=payload.object_key,
+                should_encrypt=payload.should_encrypt,
+                seed_phrase=payload.subaccount_seed_phrase,
+                subaccount=payload.subaccount,
+                bucket_name=payload.bucket_name,
+            )
+
+            # Return chunk FileInputs, and manifest FileInput only if it was actually built
+            files = [result[0] for result in chunk_results]
+            if manifest_result.file_hash != "pending":
+                files.append(manifest_result)
             return files, True
         except Exception as e:
+            logger.debug(f"process_item EXCEPTION object_id={getattr(payload, 'object_id', 'unknown')} err={e}")
             err_str = str(e)
-            transient = classify_error(e)
+            error_type = classify_error(e)
             attempts_next = (payload.attempts or 0) + 1
-            if transient and attempts_next <= self.config.pinner_max_attempts:
+
+            if error_type == "transient" and attempts_next <= self.config.pinner_max_attempts:
                 delay_ms = compute_backoff_ms(
                     attempts_next, self.config.pinner_backoff_base_ms, self.config.pinner_backoff_max_ms
                 )
                 await enqueue_retry_request(
                     payload, self.redis_client, delay_seconds=delay_ms / 1000.0, last_error=err_str
                 )
-                logger.warning(
-                    f"Pinner transient failure (retry scheduled): {payload.name} request_id={payload.request_id} attempts={payload.attempts} error={err_str[:200]}"
-                )
                 return [], False
+            # Permanent error or max attempts reached - push to DLQ
+            await self._push_to_dlq(payload, err_str, error_type)
             await self.db.execute("UPDATE objects SET status = 'failed' WHERE object_id = $1", payload.object_id)
-            logger.error(
-                f"Pinner permanent failure: {payload.name} request_id={payload.request_id} attempts={payload.attempts} error={err_str[:200]}"
-            )
             return [], False
 
     async def process_batch(
-        self, payloads: List[Union[SimpleUploadChainRequest, MultipartUploadChainRequest]]
-    ) -> Tuple[List[FileInput], List[Union[SimpleUploadChainRequest, MultipartUploadChainRequest]]]:
-        """Process a batch of items, isolating failures.
-
-        Returns (successful_files, succeeded_payloads) for substrate publish.
-        """
+        self, payloads: List[UploadChainRequest]
+    ) -> Tuple[List[FileInput], List[UploadChainRequest]]:
         all_files = []
         succeeded_payloads = []
         for payload in payloads:
@@ -138,231 +154,373 @@ class Pinner:
             if success:
                 all_files.extend(files)
                 succeeded_payloads.append(payload)
+            else:
+                logger.debug(f"process_batch item FAILED object_id={payload.object_id}")
         return all_files, succeeded_payloads
 
-    async def _process_simple_upload(self, payload: SimpleUploadChainRequest) -> FileInput:
-        """Process a simple upload."""
-        logger.info(f"Processing simple upload for object {payload.object_id}")
+    async def _process_multipart_chunk(
+        self,
+        *,
+        object_id: str,
+        object_key: str,
+        should_encrypt: bool,
+        chunk: Chunk,
+        upload_id: Optional[str] = None,
+        seed_phrase: Optional[str] = None,
+    ) -> Tuple[FileInput, Chunk]:
+        """Process a single multipart chunk (upsert into parts) with fallback to upload_id cache."""
+        logger.debug(
+            f"_process_multipart_chunk START object_id={object_id}, part_number={chunk.id}, upload_id={upload_id}"
+        )
         RedisObjectPartsCache = _get_redis_cache()
-        obj_cache = RedisObjectPartsCache(self.redis_client)
-        # For simple upload, the chunk id should be 0
-        chunk_data = await obj_cache.get(payload.object_id, int(payload.chunk.id))
-        logger.info(
-            f"Retrieved chunk data for object {payload.object_id}, size: {len(chunk_data) if chunk_data else 0}"
-        )
-
-        # Generate IPFS CID using s3_publish (pin, no chain publish)
-        # Keep filename as-is for unencrypted; hash for encrypted to avoid leaking names
-        file_name = payload.object_key
-        if payload.should_encrypt:
-            filename_hash = hashlib.md5(f"{payload.object_key}_md5".encode()).hexdigest()
-            file_name = f"{filename_hash}.chunk"
-
-        s3_result = await self.ipfs_service.client.s3_publish(
-            content=chunk_data,
-            encrypt=payload.should_encrypt,
-            seed_phrase=payload.subaccount_seed_phrase,
-            subaccount_id=payload.subaccount,
-            bucket_name=payload.bucket_name,
-            file_name=file_name,
-            store_node=payload.ipfs_node,
-            pin_node=payload.ipfs_node,
-            substrate_url=payload.substrate_url,
-            publish=False,
-        )
-        logger.info(
-            f"s3_publish result for object {payload.object_id}: cid={getattr(s3_result, 'cid', 'MISSING')}, type={type(s3_result)}"
-        )
-
-        # Backfill the base part CID for unified multipart reads
-        logger.info(f"Storing CID {s3_result.cid} for object {payload.object_id} in objects table")
-        await self.db.execute(
-            """
-            UPDATE objects
-            SET ipfs_cid = $2
-            WHERE object_id = $1 AND ipfs_cid IS NULL
-            """,
-            payload.object_id,
-            s3_result.cid,
-        )
-
-        # Ensure base (part 0) exists/updated with concrete ipfs_cid and cid_id for manifest/reads
-        try:
-            base_md5 = hashlib.md5(chunk_data).hexdigest()
-            cid_id = await upsert_cid_and_get_id(self.db, s3_result.cid)
-            logger.info(
-                f"Storing CID {s3_result.cid} (cid_id={cid_id}) for object {payload.object_id} part 0 in parts table"
+        obj_cache = RedisObjectPartsCache(self.redis_client)  # type: ignore[call-arg]
+        part_number_db = int(chunk.id)
+        # Try object_id-based cache first
+        chunk_data = await obj_cache.get(object_id, part_number_db)
+        # Fallback to upload_id-based key if not found
+        if chunk_data is None:
+            logger.debug(
+                f"_process_multipart_chunk cache miss for object_id={object_id} part={part_number_db} key=obj:{object_id}:part:{part_number_db}"
             )
-            # Try update-first; if no row was updated, insert a new one.
-            status = await self.db.execute(
+        if chunk_data is None:
+            raise ValueError(f"Chunk data missing for object_id={object_id} part={part_number_db}")
+
+        logger.debug(f"_process_multipart_chunk fetched chunk_data bytes={len(chunk_data)}")
+        # For chunks, upload+pin only (no publish) for immediate CID
+        upload_result = await self.ipfs_service.upload_file(
+            file_data=chunk_data,
+            file_name=f"{object_key}.part{part_number_db}",
+            content_type="application/octet-stream",
+            encrypt=False,
+            seed_phrase=seed_phrase,
+        )
+        chunk_cid = str(upload_result.get("cid"))
+        logger.debug(f"_process_multipart_chunk obtained cid={chunk_cid}")
+        # Resolve or create cid_id for parts row to override any 'pending' linkage
+        cid_id_for_part = None
+        try:
+            cid_row = await self.db.fetchrow(get_query("upsert_cid"), chunk_cid)
+            cid_id_for_part = cid_row["id"] if cid_row else None
+        except Exception:
+            cid_id_for_part = None
+        # Update existing placeholder row, insert if missing
+        logger.debug(
+            f"_process_multipart_chunk upserting part object_id={object_id}, part_number={part_number_db}, cid={chunk_cid}, size={len(chunk_data)}"
+        )
+        try:
+            updated = await self.db.execute(
                 """
                 UPDATE parts
-                SET ipfs_cid = $1, cid_id = $2, size_bytes = $3, etag = $4
-                WHERE object_id = $5 AND part_number = 0
+                SET ipfs_cid = $3, size_bytes = $4,
+                    cid_id = COALESCE($5, cid_id)
+                WHERE object_id = $1 AND part_number = $2
                 """,
-                s3_result.cid,
-                cid_id,
+                object_id,
+                part_number_db,
+                chunk_cid,
                 len(chunk_data),
-                base_md5,
-                payload.object_id,
+                cid_id_for_part,
             )
-            updated = False
+            # Some drivers return a string like "UPDATE 1"; normalize to int check
+            updated_str = str(updated or "")
+            rows_affected = 0
             try:
-                updated = isinstance(status, str) and status.split()[-1].isdigit() and int(status.split()[-1]) > 0
+                # asyncpg returns number of rows as string prefix
+                if updated_str.upper().startswith("UPDATE"):
+                    rows_affected = int(updated_str.split(" ")[-1])
+                else:
+                    rows_affected = int(updated_str)  # best effort if driver returns int
             except Exception:
-                updated = False
-            if not updated:
+                rows_affected = 0
+
+            logger.debug(f"_process_multipart_chunk update rows_affected={rows_affected}")
+            if rows_affected == 0:
                 await self.db.execute(
                     """
-                    INSERT INTO parts (object_id, part_number, ipfs_cid, cid_id, size_bytes, etag)
-                    VALUES ($1, 0, $2, $3, $4, $5)
+                    INSERT INTO parts (part_id, object_id, part_number, ipfs_cid, size_bytes, cid_id, uploaded_at)
+                    VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, NOW())
+                    ON CONFLICT (object_id, part_number) DO UPDATE SET
+                        ipfs_cid = EXCLUDED.ipfs_cid,
+                        size_bytes = EXCLUDED.size_bytes,
+                        cid_id = COALESCE(EXCLUDED.cid_id, parts.cid_id)
                     """,
-                    payload.object_id,
-                    s3_result.cid,
-                    cid_id,
+                    object_id,
+                    part_number_db,
+                    chunk_cid,
                     len(chunk_data),
-                    base_md5,
+                    cid_id_for_part,
                 )
-            logger.info(f"Successfully stored/updated part 0 in parts table for object {payload.object_id}")
+                logger.debug(
+                    f"_process_multipart_chunk inserted/upserted part object_id={object_id} part_number={part_number_db}"
+                )
         except Exception:
-            logger.exception("Failed to write base part 0 into parts table")
-
-        # Keep cache for a while to ensure immediate consistency on reads (unified multipart)
-        RedisObjectPartsCache = _get_redis_cache()
-        await RedisObjectPartsCache(self.redis_client).expire(payload.object_id, 0, ttl=self.config.cache_ttl_seconds)
-
-        return FileInput(file_hash=s3_result.cid, file_name=file_name)
-
-    async def _process_multipart_chunk(
-        self, payload: MultipartUploadChainRequest, chunk: Chunk
-    ) -> Tuple[FileInput, Chunk]:
-        """Process a single multipart chunk."""
-        RedisObjectPartsCache = _get_redis_cache()
-        obj_cache = RedisObjectPartsCache(self.redis_client)
-        # Derive part_number from key to drive both read and DB updates
-
-        part_number_db = int(chunk.id)
-
-        # Get chunk data from cache
-        chunk_data = await obj_cache.get(payload.object_id, part_number_db)
-
-        # Generate IPFS CID for this chunk using s3_publish (no chain publish)
-        file_name = payload.object_key
-        if payload.should_encrypt:
-            filename_hash = hashlib.md5(f"{payload.object_key}_{chunk.id}".encode()).hexdigest()
-            file_name = f"{filename_hash}.chunk"
-
-        s3_result = await self.ipfs_service.client.s3_publish(
-            content=chunk_data,
-            encrypt=payload.should_encrypt,
-            seed_phrase=payload.subaccount_seed_phrase,
-            subaccount_id=payload.subaccount,
-            bucket_name=payload.bucket_name,
-            file_name=file_name,
-            store_node=payload.ipfs_node,
-            pin_node=payload.ipfs_node,
-            substrate_url=payload.substrate_url,
-            publish=False,
-        )
-
-        # Store part CID in database (update reserved placeholder row)
-        cid_id = await upsert_cid_and_get_id(self.db, s3_result.cid)
-        await self.db.execute(
-            """
-            UPDATE parts
-            SET ipfs_cid = $1, cid_id = $2, size_bytes = $3
-            WHERE object_id = $4 AND part_number = $5
-            """,
-            s3_result.cid,
-            cid_id,
-            len(chunk_data),
-            payload.object_id,
-            part_number_db,
-        )
-
-        return FileInput(file_hash=s3_result.cid, file_name=file_name), chunk
-
-    async def _process_multipart_upload(self, payload: MultipartUploadChainRequest) -> List[Tuple[FileInput, Chunk]]:
-        """Process multipart upload with concurrent chunk processing."""
-        # Concurrency for multipart processing is configurable
-        concurrency = int(getattr(self.config, "pinner_multipart_max_concurrency", 5) or 5)
-        semaphore = asyncio.Semaphore(concurrency)
-
-        # Ensure base part 0 has a concrete CID (simple PUT may still be pending)
-        try:
-            row = await self.db.fetchrow(
-                "SELECT ipfs_cid FROM parts WHERE object_id = $1 AND part_number = 0",
-                payload.object_id,
+            # Fallback to upsert if update failed for any reason
+            logger.debug("PINNER _process_multipart_chunk update failed; falling back to upsert", exc_info=True)
+            await self.db.execute(
+                """
+                INSERT INTO parts (part_id, object_id, part_number, ipfs_cid, size_bytes, cid_id, uploaded_at)
+                VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, NOW())
+                ON CONFLICT (object_id, part_number) DO UPDATE SET
+                    ipfs_cid = EXCLUDED.ipfs_cid,
+                    size_bytes = EXCLUDED.size_bytes,
+                    cid_id = COALESCE(EXCLUDED.cid_id, parts.cid_id)
+                """,
+                object_id,
+                part_number_db,
+                chunk_cid,
+                len(chunk_data),
+                cid_id_for_part,
             )
-            needs_base = True
-            if row is not None:
-                cid_raw = row[0]
-                if cid_raw is not None:
-                    cid_str = cid_raw if isinstance(cid_raw, str) else str(cid_raw)
-                    needs_base = cid_str.strip().lower() in {"", "none", "pending"}
+            logger.debug(
+                f"_process_multipart_chunk upserted part after exception object_id={object_id} part_number={part_number_db}"
+            )
+        logger.debug(
+            f"_process_multipart_chunk COMPLETE object_id={object_id}, part_number={part_number_db}, cid={chunk_cid}"
+        )
+        return FileInput(file_hash=chunk_cid), chunk
 
-            if needs_base:
-                RedisObjectPartsCache = _get_redis_cache()
-                obj_cache = RedisObjectPartsCache(self.redis_client)
-                base_bytes = await obj_cache.get(payload.object_id, 0)
-                if base_bytes:
-                    file_name = payload.object_key
-                    if payload.should_encrypt:
-                        filename_hash = hashlib.md5(f"{payload.object_key}_md5".encode()).hexdigest()
-                        file_name = f"{filename_hash}.chunk"
-                    base_result = await self.ipfs_service.client.s3_publish(
-                        content=base_bytes,
-                        encrypt=payload.should_encrypt,
-                        seed_phrase=payload.subaccount_seed_phrase,
-                        subaccount_id=payload.subaccount,
-                        bucket_name=payload.bucket_name,
-                        file_name=file_name,
-                        store_node=payload.ipfs_node,
-                        pin_node=payload.ipfs_node,
-                        substrate_url=payload.substrate_url,
-                        publish=False,
-                    )
-                    cid_id = await upsert_cid_and_get_id(self.db, base_result.cid)
-                    base_md5 = hashlib.md5(base_bytes).hexdigest()
-                    await self.db.execute(
-                        """
-                        UPDATE parts
-                        SET ipfs_cid = $2, cid_id = $3, size_bytes = COALESCE(size_bytes, $4), etag = COALESCE(etag, $5)
-                        WHERE object_id = $1 AND part_number = 0
-                        """,
-                        payload.object_id,
-                        base_result.cid,
-                        cid_id,
-                        len(base_bytes),
-                        base_md5,
-                    )
-                    await obj_cache.expire(payload.object_id, 0, ttl=self.config.cache_ttl_seconds)
-        except Exception:
-            logger.debug("Failed ensuring base part(0) CID before multipart processing", exc_info=True)
+    async def _process_chunks_only(
+        self,
+        *,
+        object_id: str,
+        object_key: str,
+        should_encrypt: bool,
+        chunks: List[Chunk],
+        upload_id: Optional[str] = None,
+        seed_phrase: Optional[str] = None,
+    ) -> List[Tuple[FileInput, Chunk]]:
+        """Process chunks only: read from Redis, upload to IPFS, upsert parts table with CIDs."""
+        logger.debug(
+            f"_process_chunks_only START object_id={object_id}, object_key={object_key}, chunks={[c.id for c in chunks]}, upload_id={upload_id}"
+        )
+        cfg = get_config()
+        concurrency = int(getattr(cfg, "pinner_multipart_max_concurrency", 5) or 5)
+        semaphore = asyncio.Semaphore(concurrency)
 
         async def process_chunk_with_semaphore(chunk: Chunk) -> Tuple[FileInput, Chunk]:
             async with semaphore:
-                return await self._process_multipart_chunk(payload, chunk)
+                return await self._process_multipart_chunk(
+                    object_id=object_id,
+                    object_key=object_key,
+                    should_encrypt=should_encrypt,
+                    chunk=chunk,
+                    upload_id=upload_id,
+                    seed_phrase=seed_phrase,
+                )
 
-        # Process first part synchronously to ensure encryption key is generated once,
-        # then parallelize the remaining parts to avoid key-generation races.
-        chunks_sorted = sorted(payload.chunks, key=lambda c: c.id)
+        chunks_sorted = sorted(chunks, key=lambda c: c.id)
+        # Process first chunk synchronously
         first_result = await process_chunk_with_semaphore(chunks_sorted[0])
-
-        # Process remaining parts concurrently
+        # Process remaining concurrently
         if len(chunks_sorted) > 1:
-            remaining_results = await asyncio.gather(
-                *[process_chunk_with_semaphore(chunk) for chunk in chunks_sorted[1:]]
-            )
+            remaining_results = await asyncio.gather(*[process_chunk_with_semaphore(c) for c in chunks_sorted[1:]])
             chunk_results = [first_result] + list(remaining_results)
         else:
             chunk_results = [first_result]
 
-        # Keep per-chunk caches for a while; GETs may still be assembling from cache
-        RedisObjectPartsCache = _get_redis_cache()
-        obj_cache = RedisObjectPartsCache(self.redis_client)
+        # Touch caches for present parts
+        RedisCacheCls = _get_redis_cache()
+        obj_cache = RedisCacheCls(self.redis_client)  # type: ignore[call-arg]
         for _, chunk in chunk_results:
-            part_number_db = int(chunk.id)
-            await obj_cache.expire(payload.object_id, part_number_db, ttl=self.config.cache_ttl_seconds)
+            await obj_cache.expire(object_id, int(chunk.id), ttl=self.config.cache_ttl_seconds)
 
+        logger.debug(f"_process_chunks_only COMPLETE object_id={object_id}, processed {len(chunk_results)} chunks")
         return chunk_results
+
+    async def _build_and_publish_manifest(
+        self,
+        *,
+        object_id: str,
+        object_key: str,
+        should_encrypt: bool,
+        seed_phrase: Optional[str] = None,
+        subaccount: Optional[str] = None,
+        bucket_name: Optional[str] = None,
+    ) -> FileInput:
+        """Build manifest from parts table and publish/pin it. Only builds if all parts have CIDs."""
+        logger.debug(f"_build_and_publish_manifest START object_id={object_id}, object_key={object_key}")
+
+        # Build manifest JSON from DB parts
+        rows = await self.db.fetch(
+            """
+            SELECT p.part_number,
+                   COALESCE(c.cid, p.ipfs_cid) AS cid,
+                   p.size_bytes::bigint AS size_bytes
+            FROM parts p
+            LEFT JOIN cids c ON p.cid_id = c.id
+            WHERE p.object_id = $1
+            ORDER BY part_number
+            """,
+            object_id,
+        )
+
+        # Check if all parts have concrete CIDs
+        parts_data = []
+        all_parts_have_cids = True
+        for r in rows:
+            pn = int(r[0])
+            cid_raw = r[1]
+            cid: str | None = None
+            if cid_raw is not None:
+                cid_str = cid_raw if isinstance(cid_raw, str) else str(cid_raw)
+                cid_str = cid_str.strip()
+                if cid_str and cid_str.lower() not in {"", "none", "pending"}:
+                    cid = cid_str
+                else:
+                    all_parts_have_cids = False
+
+            size = int(r[2] or 0)
+            parts_data.append({"part_number": pn, "cid": cid, "size_bytes": size})
+
+        # Only build manifest if all parts have concrete CIDs
+        if not all_parts_have_cids:
+            logger.debug(
+                f"_build_and_publish_manifest SKIP - not all parts have CIDs yet (found {len(parts_data)} parts)"
+            )
+            return FileInput(file_hash="pending")
+
+        # Get object info for manifest metadata
+        obj_row = await self.db.fetchrow("SELECT content_type FROM objects WHERE object_id = $1", object_id)
+        content_type = obj_row["content_type"] if obj_row else "application/octet-stream"
+
+        manifest_data = {
+            "object_id": object_id,
+            "object_key": object_key,
+            "appendable": True,  # All objects are appendable in this system
+            "content_type": content_type,
+            "parts": parts_data,
+        }
+
+        manifest_json = json.dumps(manifest_data)
+        logger.debug(f"_build_and_publish_manifest built manifest with {len(parts_data)} parts")
+
+        # Publish/pin the manifest
+        manifest_result = await self.ipfs_service.pin_file_with_encryption(
+            file_data=manifest_json.encode(),
+            file_name=f"{object_key}.manifest",
+            should_encrypt=should_encrypt,
+            seed_phrase=seed_phrase,
+            subaccount_id=subaccount,
+            bucket_name=bucket_name,
+        )
+
+        # Update object with manifest CID and set status to uploaded
+        try:
+            cid_row = await self.db.fetchrow(get_query("upsert_cid"), manifest_result.cid)
+            cid_id = cid_row["id"] if cid_row else None
+        except Exception:
+            cid_id = None
+
+        await self.db.execute(
+            """
+            UPDATE objects
+            SET ipfs_cid = $2,
+                cid_id = COALESCE($3, cid_id),
+                status = 'uploaded'
+            WHERE object_id = $1
+            """,
+            object_id,
+            manifest_result.cid,
+            cid_id,
+        )
+
+        logger.debug(f"_build_and_publish_manifest COMPLETE object_id={object_id}, manifest_cid={manifest_result.cid}")
+        return FileInput(file_hash=manifest_result.cid)
+
+    async def _push_to_dlq(self, payload: UploadChainRequest, last_error: str, error_type: str) -> None:
+        """Push a failed request to the Dead-Letter Queue and persist chunks to disk."""
+        import time
+
+        # First, persist chunks from cache to disk
+        await self._persist_chunks_to_dlq(payload)
+
+        # Normalize error_type to string for DLQ entries
+        etype = error_type
+        if isinstance(etype, bool):
+            etype = "transient" if etype else "permanent"
+
+        dlq_entry = {
+            "payload": payload.model_dump(),
+            "object_id": payload.object_id,
+            "upload_id": payload.upload_id,
+            "bucket_name": payload.bucket_name,
+            "object_key": payload.object_key,
+            "attempts": payload.attempts or 0,
+            "first_enqueued_at": getattr(payload, "first_enqueued_at", time.time()),
+            "last_attempt_at": time.time(),
+            "last_error": last_error,
+            "error_type": etype,
+        }
+
+        try:
+            await self.redis_client.lpush("upload_requests:dlq", json.dumps(dlq_entry))
+            logger.warning(f"Pushed to DLQ: object_id={payload.object_id}, error_type={error_type}, error={last_error}")
+        except Exception as e:
+            logger.error(f"Failed to push to DLQ: {e}")
+
+    async def _persist_chunks_to_dlq(self, payload: UploadChainRequest) -> None:
+        """Persist all available chunks from cache to DLQ filesystem."""
+        object_id = payload.object_id
+        RedisCache = _get_redis_cache()
+        obj_cache = RedisCache(self.redis_client)
+
+        try:
+            # Get all chunks for this object from cache
+            for chunk in payload.chunks:
+                part_number = int(chunk.id)
+
+                # Try to get chunk data from cache
+                chunk_data = await obj_cache.get(object_id, part_number)
+                if chunk_data is None:
+                    logger.warning(
+                        f"No cached data for object {object_id} part {part_number}, skipping DLQ persistence"
+                    )
+                    continue
+
+                # Save to DLQ filesystem
+                try:
+                    self.dlq_storage.save_chunk(object_id, part_number, chunk_data)
+                    logger.debug(f"Persisted chunk {part_number} for object {object_id} to DLQ")
+                except Exception as e:
+                    logger.error(f"Failed to persist chunk {part_number} for object {object_id} to DLQ: {e}")
+
+        except Exception as e:
+            logger.error(f"Failed to persist chunks for object {object_id} to DLQ: {e}")
+            # Don't fail the DLQ push if persistence fails
+
+    async def _process_upload_common(
+        self,
+        *,
+        object_id: str,
+        object_key: str,
+        should_encrypt: bool,
+        chunks: List[Chunk],
+        appendable: bool,
+        upload_id: Optional[str] = None,
+        seed_phrase: Optional[str] = None,
+        subaccount: Optional[str] = None,
+        bucket_name: Optional[str] = None,
+    ) -> Tuple[List[Tuple[FileInput, Chunk]], FileInput]:
+        """Pin chunks, upsert parts, build/pin manifest, set object ipfs_cid."""
+        logger.debug(
+            f"_process_upload_common START object_id={object_id}, object_key={object_key}, chunks={[c.id for c in chunks]}, upload_id={upload_id}"
+        )
+
+        # Process chunks only (Step 2)
+        chunk_results = await self._process_chunks_only(
+            object_id=object_id,
+            object_key=object_key,
+            should_encrypt=should_encrypt,
+            chunks=chunks,
+            upload_id=upload_id,
+            seed_phrase=seed_phrase,
+        )
+
+        # TODO: Step 3 - Build manifest from current parts
+        # For now, return a placeholder manifest result
+        manifest_result = FileInput(file_hash="pending")  # Placeholder for step 3
+
+        logger.debug(
+            f"_process_upload_common COMPLETE object_id={object_id}, chunks processed (manifest deferred to step 3)"
+        )
+        return chunk_results, manifest_result

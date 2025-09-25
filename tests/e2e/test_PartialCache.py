@@ -74,9 +74,9 @@ def test_get_partial_cache_fallbacks(
         import redis as _redis  # type: ignore[import-untyped]
 
         r = _redis.Redis.from_url("redis://localhost:6379/0")
-        has0 = bool(r.exists(f"obj:{object_id}:part:0"))
         has1 = bool(r.exists(f"obj:{object_id}:part:1"))
-        print(f"DEBUG cache before GET: object_id={object_id} part0={has0} part1={has1}")
+        has2 = bool(r.exists(f"obj:{object_id}:part:2"))
+        print(f"DEBUG cache before GET: object_id={object_id} part1={has1} part2={has2}")
     except Exception as _e:  # pragma: no cover
         print(f"DEBUG cache probe failed: {_e}")
 

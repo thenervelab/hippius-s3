@@ -177,11 +177,11 @@ def test_range_cache_source_when_irrelevant_part_missing(
     data = b"abcdefghijklmnop"  # 16 bytes
     boto3_client.put_object(Bucket=bucket, Key=key, Body=data)
 
-    # Ensure object is processed; then clear a non-needed part (e.g., part 1) for a range entirely in base part 0
+    # Ensure object is processed; then clear a non-needed part (e.g., part 2) for a range entirely in base part 1
     object_id = get_object_id(bucket, key)
-    clear_object_cache(object_id, parts=[1])
+    clear_object_cache(object_id, parts=[2])
 
-    # bytes=0-4 doesn't require part 1; should still be served from cache
+    # bytes=0-4 doesn't require part 2; should still be served from cache
     r = signed_http_get(bucket, key, {"Range": "bytes=0-4"})
     assert r.status_code == 206
     assert r.content == data[0:5]
@@ -555,9 +555,9 @@ def test_get_object_range_cache_invalidation_during_request(
     # Wait for object to be processed and cached
     assert wait_for_parts_cids(bucket, key, min_count=1, timeout_seconds=20.0)
 
-    # Clear cache for part that contains our range
+    # Clear cache for the part that contains our range (base is part 1 under 1-based indexing)
     object_id = get_object_id(bucket, key)
-    clear_object_cache(object_id, parts=[0])
+    clear_object_cache(object_id, parts=[1])
 
     # Subsequent request should be from pipeline
     r2 = signed_http_get(bucket, key, {"Range": "bytes=5-15"})

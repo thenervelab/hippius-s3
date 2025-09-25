@@ -58,9 +58,40 @@ def wait_for_parts_cids(
 
     Returns True if ready within timeout, False otherwise.
     """
+    print(f"DEBUG: wait_for_parts_cids called for {bucket_name}/{object_key}, expecting min_count={min_count}")
     deadline = time.time() + timeout_seconds
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
         while time.time() < deadline:
+            # First, get object_id for debugging
+            cur.execute(
+                """
+                SELECT o.object_id, o.ipfs_cid, c.cid as object_cid
+                FROM objects o
+                LEFT JOIN cids c ON o.cid_id = c.id
+                JOIN buckets b ON b.bucket_id = o.bucket_id
+                WHERE b.bucket_name = %s AND o.object_key = %s
+                """,
+                (bucket_name, object_key),
+            )
+            obj_row = cur.fetchone()
+            print(f"DEBUG: Object row: {obj_row}")
+
+            # Get parts for debugging
+            cur.execute(
+                """
+                SELECT p.part_number, p.ipfs_cid, p.size_bytes, p.etag, c.cid as part_cid
+                FROM parts p
+                LEFT JOIN cids c ON p.cid_id = c.id
+                JOIN objects o ON o.object_id = p.object_id
+                JOIN buckets b ON b.bucket_id = o.bucket_id
+                WHERE b.bucket_name = %s AND o.object_key = %s
+                ORDER BY p.part_number
+                """,
+                (bucket_name, object_key),
+            )
+            parts_rows = cur.fetchall()
+            print(f"DEBUG: Parts rows: {parts_rows}")
+
             cur.execute(
                 """
                     SELECT COUNT(*)
@@ -86,9 +117,13 @@ def wait_for_parts_cids(
             )
             row = cur.fetchone()
             count = int(row[0]) if row else 0
+            print(f"DEBUG: Non-pending parts count: {count} (need {min_count})")
             if count >= min_count:
+                print(f"DEBUG: wait_for_parts_cids SUCCESS - found {count} non-pending parts")
                 return True
+            print(f"DEBUG: wait_for_parts_cids still waiting... ({count}/{min_count})")
             time.sleep(0.3)
+    print(f"DEBUG: wait_for_parts_cids TIMEOUT - only found {count} non-pending parts after {timeout_seconds}s")
     return False
 
 

@@ -2,10 +2,13 @@ import json
 import logging
 import time
 import uuid
+from typing import List
 from typing import Union
 
 import redis.asyncio as async_redis
 from pydantic import BaseModel
+
+from hippius_s3.config import get_config
 
 
 logger = logging.getLogger(__name__)
@@ -41,19 +44,19 @@ class ChainRequest(BaseModel):
 
     @property
     def name(self):
-        if hasattr(self, "upload_id"):
+        # Unified request uses upload_id; legacy multipart uses multipart_upload_id
+        if hasattr(self, "upload_id") and self.upload_id is not None:
+            return f"multipart::{self.object_id}::{self.upload_id}::{self.address}"
+        if hasattr(self, "multipart_upload_id") and self.multipart_upload_id is not None:
             return f"multipart::{self.object_id}::{self.multipart_upload_id}::{self.address}"
-
         return f"simple::{self.object_id}::{self.address}"
 
 
-class MultipartUploadChainRequest(ChainRequest):
-    multipart_upload_id: str
+class UploadChainRequest(ChainRequest):
+    """Unified upload request type that combines simple and multipart uploads."""
+
     chunks: list[Chunk]
-
-
-class SimpleUploadChainRequest(ChainRequest):
-    chunk: Chunk
+    upload_id: str | None = None
 
 
 class UnpinChainRequest(ChainRequest):
@@ -81,10 +84,7 @@ class DownloadChainRequest(BaseModel):
 
 
 async def enqueue_upload_request(
-    payload: Union[
-        MultipartUploadChainRequest,
-        SimpleUploadChainRequest,
-    ],
+    payload: UploadChainRequest,
     redis_client: async_redis.Redis,
 ) -> None:
     """Add an upload request to the Redis queue for processing by workers."""
@@ -96,25 +96,29 @@ async def enqueue_upload_request(
     if payload.attempts is None:
         payload.attempts = 0
 
-    await redis_client.lpush("upload_requests", payload.model_dump_json())
-    logger.info(f"Enqueued upload request {payload.name=}")
+    # Fan-out to one or more queues per configuration
+    config = get_config()
+    raw = payload.model_dump_json()
+    queue_names_str: str = getattr(config, "upload_queue_names", "upload_requests")
+    queue_names: List[str] = [q.strip() for q in queue_names_str.split(",") if q.strip()]
+    for qname in queue_names:
+        await redis_client.lpush(qname, raw)
+    logger.info(f"Enqueued upload request {payload.name=} queues={queue_names}")
 
 
 async def dequeue_upload_request(
     redis_client: async_redis.Redis,
-) -> Union[MultipartUploadChainRequest, SimpleUploadChainRequest, None]:
+) -> UploadChainRequest | None:
     """Get the next upload request from the Redis queue."""
-    queue_name = "upload_requests"
+    config = get_config()
+    queue_name: str = getattr(config, "pinner_consume_queue", "upload_requests")
     # Use a short blocking timeout to enable timely batch flushes
     result = await redis_client.brpop(queue_name, timeout=0.5)
     if result:
         _, queue_data = result
         queue_data = json.loads(queue_data)
 
-        if "chunk" in queue_data:
-            return SimpleUploadChainRequest.model_validate(queue_data)
-
-        return MultipartUploadChainRequest.model_validate(queue_data)
+        return UploadChainRequest.model_validate(queue_data)
 
     return None
 
@@ -124,10 +128,7 @@ RETRY_ZSET = "upload_retries"
 
 
 async def enqueue_retry_request(
-    payload: Union[
-        MultipartUploadChainRequest,
-        SimpleUploadChainRequest,
-    ],
+    payload: UploadChainRequest,
     redis_client: async_redis.Redis,
     *,
     delay_seconds: float,

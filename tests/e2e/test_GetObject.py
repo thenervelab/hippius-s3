@@ -14,6 +14,7 @@ from .support.cache import clear_object_cache
 from .support.cache import get_object_id
 from .support.cache import make_all_object_parts_pending
 from .support.cache import wait_for_parts_cids
+from .support.manifest import wait_for_object_cid_via_head
 
 
 def test_get_object_downloads_and_matches_headers(
@@ -49,8 +50,13 @@ def test_get_object_downloads_and_matches_headers(
     assert headers.get("x-amz-meta-test-meta") == "test-value"
 
     if not is_real_aws():
-        # Wait until object has at least 1 part with CID before clearing cache (pipeline readiness)
+        # Wait until object has at least 1 part with CID (pipeline readiness) and object-level CID materializes
         assert wait_for_parts_cids(bucket_name, key, min_count=1, timeout_seconds=20.0)
+        cid = wait_for_object_cid_via_head(boto3_client, bucket_name, key, timeout_sec=30.0)
+        assert cid is not None
+
+        # Validate IPFS object contains expected filename (removed; flaky against IPFS gateway)
+        # assert_ipfs_contains_filename(cid, key)
 
         # Simulate pipeline path by clearing obj: cache, then GET should still succeed
         object_id = get_object_id(bucket_name, key)

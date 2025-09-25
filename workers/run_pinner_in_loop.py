@@ -4,7 +4,6 @@ import contextlib
 import logging
 import sys
 from pathlib import Path
-from typing import Union
 import time
 
 import asyncpg
@@ -15,8 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hippius_s3.config import get_config
 from hippius_s3.ipfs_service import IPFSService
-from hippius_s3.queue import MultipartUploadChainRequest
-from hippius_s3.queue import SimpleUploadChainRequest
+from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import dequeue_upload_request
 from hippius_s3.queue import move_due_retries_to_primary
 from hippius_s3.workers.pinner import Pinner
@@ -37,7 +35,9 @@ def _get_batch_context(upload_requests):
 
 config = get_config()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+# Set logging level based on config
+log_level = getattr(logging, config.log_level.upper(), logging.INFO)
+logging.basicConfig(level=log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # Config is loaded globally, no module-level constants needed
@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 async def process_upload_request(
-    upload_requests: list[Union[SimpleUploadChainRequest, MultipartUploadChainRequest]],
+    upload_requests: list[UploadChainRequest],
     db: asyncpg.Connection,
     redis_client: async_redis.Redis,
 ) -> bool:
@@ -72,7 +72,7 @@ async def process_upload_request(
 
     # Optionally skip substrate publish if disabled
     if not config.publish_to_chain:
-        logger.info("Skipping substrate publish because publish_to_chain=false; marking objects as uploaded")
+        logger.info("Skipping substrate publish (publish_to_chain=false); marking successful objects as uploaded")
         for payload in succeeded_payloads:
             await db.execute(
                 "UPDATE objects SET status = 'uploaded' WHERE object_id = $1",
@@ -156,11 +156,11 @@ async def run_pinner_loop():
                         success = await process_upload_request(batch, db, redis_client)
                         if success:
                             logger.info(
-                                f"Processed user's {upload_request.address} with {len(batch)} files (flush reason: {'size' if size_ok else 'age'})"
+                                f"Flushed batch for user {upload_request.address} (count={len(batch)}, reason={'size' if size_ok else 'age'})"
                             )
                         else:
                             logger.info(
-                                f"Failed to process {len(batch)} pin requests for user {upload_request.address} (flush reason: {'size' if size_ok else 'age'})"
+                                f"Batch flush had failures for user {upload_request.address} (count={len(batch)}, reason={'size' if size_ok else 'age'})"
                             )
                         # Reset entry for user
                         user_upload_requests.pop(upload_request.address, None)
@@ -176,9 +176,9 @@ async def run_pinner_loop():
                             continue
                         success = await process_upload_request(batch, db, redis_client)
                         if success:
-                            logger.info(f"SUCCESSFULLY processed user's {user} with {len(batch)} files")
+                            logger.info(f"Flushed batch for user {user} (count={len(batch)})")
                         else:
-                            logger.info(f"Failed to batch and serve {len(batch)} pin requests for user {user}")
+                            logger.info(f"Batch flush had failures for user {user} (count={len(batch)})")
                         user_upload_requests.pop(user, None)
                 await asyncio.sleep(0.1)
 
