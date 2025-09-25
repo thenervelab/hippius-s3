@@ -1,6 +1,8 @@
+import asyncio
 import hashlib
 import json
 import logging
+import random
 import tempfile
 from pathlib import Path
 from typing import Dict
@@ -12,6 +14,7 @@ import httpx
 import redis.asyncio as async_redis
 from hippius_sdk.client import HippiusClient
 
+from hippius_s3.adapters.publish import ResilientPublishAdapter
 from hippius_s3.config import Config
 
 
@@ -31,6 +34,7 @@ class IPFSService:
             encrypt_by_default=False,
         )
         self.redis_client = redis_client
+        self.publish_adapter = ResilientPublishAdapter(config, self.client)
         logger.info(
             f"IPFS service initialized: IPFS={config.ipfs_get_url} {config.ipfs_store_url}, Substrate={config.substrate_url}"
         )
@@ -59,26 +63,17 @@ class IPFSService:
         # Prefer SDK s3_publish when we have account context to preserve filename (wrapped directory)
         try:
             if self.config.publish_to_chain and seed_phrase and subaccount_id and bucket_name:
-                with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-                    temp_path = temp_file.name
-                    temp_file.write(file_data)
-                try:
-                    logger.info(
-                        f"IPFS publish start via s3_publish file={file_name} size={len(file_data)} subaccount={subaccount_id} bucket={bucket_name}"
-                    )
-                    pub = await self.client.s3_publish(
-                        temp_path,
-                        seed_phrase=seed_phrase,
-                        encrypt=should_encrypt,
-                        subaccount_id=subaccount_id,
-                        bucket_name=bucket_name,
-                    )
-                    cid = str(pub["cid"]) if isinstance(pub, dict) and "cid" in pub else str(pub)
-                    logger.info(f"IPFS publish complete cid={cid}")
-                    return IPFSService.PinnedFile(file_hash=cid, cid=cid)
-                finally:
-                    if Path(temp_path).exists():
-                        Path(temp_path).unlink()
+                # Use resilient adapter (retries + fallback) for manifest publish
+                resolved = await self.publish_adapter.publish_manifest(
+                    file_data=file_data,
+                    file_name=file_name,
+                    should_encrypt=should_encrypt,
+                    seed_phrase=seed_phrase,
+                    subaccount_id=subaccount_id,
+                    bucket_name=bucket_name,
+                )
+                logger.info(f"Publish path={resolved.path} cid={resolved.cid} tx={resolved.tx_hash}")
+                return IPFSService.PinnedFile(file_hash=resolved.cid, cid=resolved.cid)
 
             # If asked to wrap filename into a directory (for ls to show name) without publish
             if wrap_with_directory:
@@ -167,32 +162,62 @@ class IPFSService:
             temp_file.write(file_data)
 
         try:
-            # If encryption is requested and seed phrase is provided, use a client with derived encryption key
-            if encrypt and seed_phrase:
-                key_material = hashlib.sha256(seed_phrase.encode("utf-8")).digest()
-                client = HippiusClient(
-                    ipfs_gateway=self.config.ipfs_get_url,
-                    ipfs_api_url=self.config.ipfs_store_url,
-                    substrate_url=self.config.substrate_url,
-                    encrypt_by_default=False,
-                    encryption_key=key_material,
-                )
-                result = await client.upload_file(
-                    temp_path,
-                    encrypt=encrypt,
-                    seed_phrase=seed_phrase,
-                )
-            else:
-                result = await self.client.upload_file(
-                    temp_path,
-                    encrypt=encrypt,
-                    seed_phrase=seed_phrase,
-                )
+            # Helper for retry with jitter
+            def _compute_backoff_ms(attempt: int) -> float:
+                base = getattr(self.config, "ipfs_retry_base_ms", 500)
+                max_ms = getattr(self.config, "ipfs_retry_max_ms", 5000)
+                exp = base * (2 ** max(0, attempt - 1))
+                jitter = random.uniform(0, exp * 0.1)
+                return float(min(exp + jitter, max_ms))
 
-            pinning_status = await self.client.pin(
-                result["cid"],
-                seed_phrase=seed_phrase,
-            )
+            # Upload with retries
+            for attempt in range(1, int(getattr(self.config, "ipfs_max_retries", 3)) + 1):
+                try:
+                    # If encryption is requested and seed phrase is provided, use a client with derived encryption key
+                    if encrypt and seed_phrase:
+                        key_material = hashlib.sha256(seed_phrase.encode("utf-8")).digest()
+                        client = HippiusClient(
+                            ipfs_gateway=self.config.ipfs_get_url,
+                            ipfs_api_url=self.config.ipfs_store_url,
+                            substrate_url=self.config.substrate_url,
+                            encrypt_by_default=False,
+                            encryption_key=key_material,
+                        )
+                        result = await client.upload_file(
+                            temp_path,
+                            encrypt=encrypt,
+                            seed_phrase=seed_phrase,
+                        )
+                    else:
+                        result = await self.client.upload_file(
+                            temp_path,
+                            encrypt=encrypt,
+                            seed_phrase=seed_phrase,
+                        )
+                    break
+                except Exception as e:
+                    if attempt >= int(getattr(self.config, "ipfs_max_retries", 3)):
+                        logger.exception(f"IPFS upload failed after {attempt} attempts: {e}")
+                        raise
+                    backoff_ms = _compute_backoff_ms(attempt)
+                    logger.warning(f"IPFS upload failed (attempt {attempt}), retrying in {backoff_ms:.0f}ms: {e}")
+                    await asyncio.sleep(backoff_ms / 1000.0)
+
+            # Pin with retries
+            for attempt in range(1, int(getattr(self.config, "ipfs_max_retries", 3)) + 1):
+                try:
+                    pinning_status = await self.client.pin(
+                        result["cid"],
+                        seed_phrase=seed_phrase,
+                    )
+                    break
+                except Exception as e:
+                    if attempt >= int(getattr(self.config, "ipfs_max_retries", 3)):
+                        logger.exception(f"IPFS pin failed after {attempt} attempts: {e}")
+                        raise
+                    backoff_ms = _compute_backoff_ms(attempt)
+                    logger.warning(f"IPFS pin failed (attempt {attempt}), retrying in {backoff_ms:.0f}ms: {e}")
+                    await asyncio.sleep(backoff_ms / 1000.0)
 
             return {
                 "cid": result["cid"],
@@ -362,40 +387,74 @@ class IPFSService:
             temp_file.write(file_data)
 
         try:
-            # If encryption is requested, create a new client with encryption key
-            if encrypt and seed_phrase:
-                # Derive encryption key from seed phrase
-                key_material = hashlib.sha256(seed_phrase.encode("utf-8")).digest()
-                client = HippiusClient(
-                    ipfs_gateway=self.config.ipfs_get_url,
-                    ipfs_api_url=self.config.ipfs_store_url,
-                    substrate_url=self.config.substrate_url,
-                    encrypt_by_default=False,
-                    encryption_key=key_material,
-                )
-                # Upload the part to IPFS with encryption
-                result = await client.upload_file(
-                    temp_path,
-                    encrypt=encrypt,
-                    seed_phrase=seed_phrase,
-                )
-            else:
-                # Upload the part to IPFS without encryption
-                result = await self.client.upload_file(
-                    temp_path,
-                    encrypt=encrypt,
-                    seed_phrase=seed_phrase,
-                )
+            # Helper for retry with jitter (reuse upload helper above)
+            def _compute_backoff_ms(attempt: int) -> float:
+                base = getattr(self.config, "ipfs_retry_base_ms", 500)
+                max_ms = getattr(self.config, "ipfs_retry_max_ms", 5000)
+                exp = base * (2 ** max(0, attempt - 1))
+                jitter = random.uniform(0, exp * 0.1)
+                return float(min(exp + jitter, max_ms))
+
+            # Upload with retries
+            for attempt in range(1, int(getattr(self.config, "ipfs_max_retries", 3)) + 1):
+                try:
+                    # If encryption is requested, create a new client with encryption key
+                    if encrypt and seed_phrase:
+                        # Derive encryption key from seed phrase
+                        key_material = hashlib.sha256(seed_phrase.encode("utf-8")).digest()
+                        client = HippiusClient(
+                            ipfs_gateway=self.config.ipfs_get_url,
+                            ipfs_api_url=self.config.ipfs_store_url,
+                            substrate_url=self.config.substrate_url,
+                            encrypt_by_default=False,
+                            encryption_key=key_material,
+                        )
+                        # Upload the part to IPFS with encryption
+                        result = await client.upload_file(
+                            temp_path,
+                            encrypt=encrypt,
+                            seed_phrase=seed_phrase,
+                        )
+                    else:
+                        # Upload the part to IPFS without encryption
+                        result = await self.client.upload_file(
+                            temp_path,
+                            encrypt=encrypt,
+                            seed_phrase=seed_phrase,
+                        )
+                    break
+                except Exception as e:
+                    if attempt >= int(getattr(self.config, "ipfs_max_retries", 3)):
+                        logger.exception(f"IPFS part upload failed after {attempt} attempts: {e}")
+                        raise
+                    backoff_ms = _compute_backoff_ms(attempt)
+                    logger.warning(
+                        f"IPFS part upload failed (attempt {attempt}), retrying in {backoff_ms:.0f}ms: {e}"
+                    )
+                    await asyncio.sleep(backoff_ms / 1000.0)
 
             # Calculate ETag (MD5 hash) for the part, similar to S3
             md5_hash = hashlib.md5(file_data).hexdigest()
             etag = f"{md5_hash}-{part_number}"
 
-            # Pin the CID to ensure it stays available
-            await self.client.pin(
-                result["cid"],
-                seed_phrase=seed_phrase,
-            )
+            # Pin with retries
+            for attempt in range(1, int(getattr(self.config, "ipfs_max_retries", 3)) + 1):
+                try:
+                    # Pin the CID to ensure it stays available
+                    await self.client.pin(
+                        result["cid"],
+                        seed_phrase=seed_phrase,
+                    )
+                    break
+                except Exception as e:
+                    if attempt >= int(getattr(self.config, "ipfs_max_retries", 3)):
+                        logger.exception(f"IPFS part pin failed after {attempt} attempts: {e}")
+                        raise
+                    backoff_ms = _compute_backoff_ms(attempt)
+                    logger.warning(
+                        f"IPFS part pin failed (attempt {attempt}), retrying in {backoff_ms:.0f}ms: {e}"
+                    )
+                    await asyncio.sleep(backoff_ms / 1000.0)
 
             return {
                 "cid": result["cid"],

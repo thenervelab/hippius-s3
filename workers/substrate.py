@@ -9,6 +9,12 @@ import logging
 from typing import Dict
 from typing import List
 
+import asyncio
+import random
+from contextlib import suppress
+from typing import Optional
+
+from hippius_s3.config import get_config
 from hippius_sdk.errors import HippiusSubstrateError
 from hippius_sdk.substrate import FileInput
 from hippius_sdk.substrate import SubstrateClient as HippiusSubstrateClient
@@ -256,38 +262,63 @@ async def submit_storage_request(
     seed_phrase: str,
     substrate_url: str,
 ) -> str:
-    """Submit a storage request to substrate for a list of CIDs."""
+    """Submit a storage request to substrate for a list of CIDs with retry and timeouts."""
     if not cids:
         raise ValueError("CID list cannot be empty")
 
     # Create FileInput objects from CIDs
     files = [FileInput(file_hash=cid, file_name=f"s3-{cid}") for cid in cids]
 
-    # Create substrate client for this request
-    substrate_client = HippiusSubstrateClient(
-        url=substrate_url,
-        seed_phrase=seed_phrase,
-    )
+    config = get_config()
 
-    # Submit storage request
-    tx_hash = await substrate_client.storage_request(
-        files=files,
-        miner_ids=[],
-        seed_phrase=seed_phrase,
-    )
+    def _backoff_ms(attempt: int) -> float:
+        base = getattr(config, "substrate_retry_base_ms", 500)
+        max_ms = getattr(config, "substrate_retry_max_ms", 5000)
+        exp = base * (2 ** max(0, attempt - 1))
+        jitter = random.uniform(0, exp * 0.1)
+        return float(min(exp + jitter, max_ms))
 
-    logger.info(f"Submitted storage request for {len(cids)} CIDs")
-    logger.debug(f"Substrate call result: {tx_hash}")
-
-    if not tx_hash or tx_hash == "0x" or len(tx_hash) < 10:
-        logger.error(f"Invalid transaction hash received: {tx_hash}")
-        raise HippiusSubstrateError(
-            f"Invalid transaction hash received: {tx_hash}. "
-            "This might indicate insufficient credits or transaction failure."
+    # Use Optional for broad Python compatibility (avoid PEP604 union here)
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, int(getattr(config, "substrate_max_retries", 3)) + 1):
+        # Fresh client per attempt to avoid hung WS
+        substrate_client = HippiusSubstrateClient(
+            url=substrate_url,
+            seed_phrase=seed_phrase,
         )
+        try:
+            # Enforce call timeout
+            tx_hash = await asyncio.wait_for(
+                substrate_client.storage_request(
+                    files=files,
+                    miner_ids=[],
+                    seed_phrase=seed_phrase,
+                ),
+                timeout=float(getattr(config, "substrate_call_timeout_seconds", 20.0)),
+            )
+            if not tx_hash or tx_hash == "0x" or len(tx_hash) < 10:
+                raise HippiusSubstrateError(
+                    f"Invalid transaction hash received: {tx_hash}. This might indicate insufficient credits or transaction failure."
+                )
+            logger.info(f"Successfully submitted storage request with transaction: {tx_hash} (attempt {attempt})")
+            return tx_hash
+        except (asyncio.TimeoutError, Exception) as e:  # treat all errors as retryable up to max
+            last_exc = e
+            # Best-effort close to avoid hung websockets; SDK lacks public close()
+            with suppress(Exception):
+                if hasattr(substrate_client, "_substrate") and substrate_client._substrate:
+                    substrate_client._substrate.close()
+            if attempt >= int(getattr(config, "substrate_max_retries", 3)):
+                logger.error(f"Substrate submit failed after {attempt} attempts: {e}")
+                raise
+            backoff = _backoff_ms(attempt)
+            logger.warning(f"Substrate submit failed (attempt {attempt}), retrying in {backoff:.0f}ms: {e}")
+            await asyncio.sleep(backoff / 1000.0)
 
-    logger.info(f"Successfully submitted storage request with transaction: {tx_hash}")
-    return tx_hash
+    # Should not reach here, but raise last exception defensively
+    if last_exc:
+        raise last_exc
+    raise HippiusSubstrateError("Unknown substrate submission failure")
 
 
 async def submit_storage_request_for_user(

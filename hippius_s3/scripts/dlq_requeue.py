@@ -14,9 +14,11 @@ Usage:
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 from typing import Dict
@@ -43,6 +45,22 @@ class DLQManager:
     def __init__(self, redis_client: Any):
         self.redis_client = redis_client
         self.dlq_key = "upload_requests:dlq"
+        self.lock_prefix = "dlq:requeue:lock:"
+
+    def _lock_key(self, object_id: str) -> str:
+        return f"{self.lock_prefix}{object_id}"
+
+    async def _acquire_lock(self, object_id: str, ttl_ms: int = 60000) -> Optional[str]:
+        """Acquire a per-object lock using Redis SET NX PX. Returns token or None."""
+        token = uuid.uuid4().hex
+        ok = await self.redis_client.set(self._lock_key(object_id), token, nx=True, px=ttl_ms)
+        return token if ok else None
+
+    async def _release_lock(self, object_id: str, token: str) -> None:
+        """Release lock only if token matches (atomic compare-and-delete)."""
+        script = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
+        with contextlib.suppress(Exception):
+            await self.redis_client.eval(script, 1, self._lock_key(object_id), token)
 
     async def peek(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Peek at DLQ entries without removing them."""
@@ -94,19 +112,27 @@ class DLQManager:
 
     async def requeue(self, object_id: str, force: bool = False) -> bool:
         """Requeue a specific entry by object_id with DLQ hydration."""
-        entry = await self._find_and_remove_entry(object_id)
-        if not entry:
-            logger.error(f"No DLQ entry found for object_id: {object_id}")
-            return False
-
-        # Check if it's a permanent error and force is not set
-        if entry.get("error_type") == "permanent" and not force:
-            logger.error(f"Refusing to requeue permanent error for object_id: {object_id}. Use --force to override.")
-            # Put it back
-            await self.redis_client.lpush(self.dlq_key, json.dumps(entry))
+        # Acquire per-object lock to serialize requeues
+        token = await self._acquire_lock(object_id)
+        if not token:
+            logger.error(f"Requeue already in progress for object_id: {object_id}")
             return False
 
         try:
+            entry = await self._find_and_remove_entry(object_id)
+            if not entry:
+                logger.error(f"No DLQ entry found for object_id: {object_id}")
+                return False
+
+            # Check if it's a permanent error and force is not set
+            if entry.get("error_type") == "permanent" and not force:
+                logger.error(
+                    f"Refusing to requeue permanent error for object_id: {object_id}. Use --force to override."
+                )
+                # Put it back
+                await self.redis_client.lpush(self.dlq_key, json.dumps(entry))
+                return False
+
             # Reconstruct the payload
             payload_data = entry["payload"]
             payload = UploadChainRequest.model_validate(payload_data)
@@ -129,9 +155,15 @@ class DLQManager:
 
         except Exception as e:
             logger.error(f"Failed to requeue object_id: {object_id}, error: {e}")
-            # Put it back on failure
-            await self.redis_client.lpush(self.dlq_key, json.dumps(entry))
+            # Put it back on failure (best-effort)
+            with contextlib.suppress(Exception):
+                if "entry" in locals() and entry:
+                    await self.redis_client.lpush(self.dlq_key, json.dumps(entry))
             return False
+        finally:
+            # Always release the lock
+            with contextlib.suppress(Exception):
+                await self._release_lock(object_id, token)
 
     async def purge(self, object_id: Optional[str] = None) -> int:
         """Purge entries from DLQ. If object_id is specified, only that entry."""

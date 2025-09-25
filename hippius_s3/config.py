@@ -53,6 +53,10 @@ class Config:
     # Blockchain
     substrate_url: str = env("HIPPIUS_SUBSTRATE_URL")
     validator_region: str = env("HIPPIUS_VALIDATOR_REGION")
+    substrate_max_retries: int = env("HIPPIUS_SUBSTRATE_MAX_RETRIES:3", convert=int)
+    substrate_retry_base_ms: int = env("HIPPIUS_SUBSTRATE_RETRY_BASE_MS:500", convert=int)
+    substrate_retry_max_ms: int = env("HIPPIUS_SUBSTRATE_RETRY_MAX_MS:5000", convert=int)
+    substrate_call_timeout_seconds: float = env("HIPPIUS_SUBSTRATE_CALL_TIMEOUT_SECONDS:20", convert=float)
 
     # Redis for caching/rate limiting
     redis_url: str = env("REDIS_URL")
@@ -106,6 +110,11 @@ class Config:
     # DLQ configuration
     dlq_dir: str = env("HIPPIUS_DLQ_DIR:/tmp/hippius_dlq")
     dlq_archive_dir: str = env("HIPPIUS_DLQ_ARCHIVE_DIR:/tmp/hippius_dlq_archive")
+
+    # IPFS upload/pin retry settings
+    ipfs_max_retries: int = env("HIPPIUS_IPFS_MAX_RETRIES:3", convert=int)
+    ipfs_retry_base_ms: int = env("HIPPIUS_IPFS_RETRY_BASE_MS:500", convert=int)
+    ipfs_retry_max_ms: int = env("HIPPIUS_IPFS_RETRY_MAX_MS:5000", convert=int)
 
 
 def get_config() -> Config:
