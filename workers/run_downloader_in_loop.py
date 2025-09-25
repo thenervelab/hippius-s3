@@ -52,6 +52,13 @@ async def process_download_request(
             cid_str = str(chunk.cid or "").strip().lower()
             if cid_str in {"", "none", "pending"}:
                 chunk_logger.error(f"Skipping download for chunk {chunk.part_id}: invalid CID '{chunk.cid}'")
+                # Clear in-progress flag so future attempts aren't blocked by TTL
+                try:
+                    await redis_client.delete(
+                        f"download_in_progress:{download_request.object_id}:{int(chunk.part_id)}"
+                    )
+                except Exception:
+                    chunk_logger.debug("Failed to delete in-progress flag for invalid CID", exc_info=True)
                 return False
 
             max_attempts = getattr(config, "downloader_chunk_retries", 5)
@@ -93,7 +100,13 @@ async def process_download_request(
                     chunk_logger.info(
                         f"OBJ-CACHE stored object_id={download_request.object_id} part={int(chunk.part_id)}"
                     )
-
+                    # Clear in-progress flag on success
+                    try:
+                        await redis_client.delete(
+                            f"download_in_progress:{download_request.object_id}:{int(chunk.part_id)}"
+                        )
+                    except Exception:
+                        chunk_logger.debug("Failed to delete in-progress flag after success", exc_info=True)
                     return True
 
                 except Exception as e:
@@ -101,6 +114,13 @@ async def process_download_request(
                         chunk_logger.error(
                             f"Failed to download chunk {chunk.part_id} (CID: {chunk.cid}) after {max_attempts} attempts: {e}"
                         )
+                        # Clear in-progress flag after final failure
+                        try:
+                            await redis_client.delete(
+                                f"download_in_progress:{download_request.object_id}:{int(chunk.part_id)}"
+                            )
+                        except Exception:
+                            chunk_logger.debug("Failed to delete in-progress flag after failure", exc_info=True)
                         return False
                     sleep_for = base_sleep * attempt + _random.uniform(0, jitter)
                     chunk_logger.warning(
