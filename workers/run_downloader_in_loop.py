@@ -75,22 +75,22 @@ async def process_download_request(
                 except Exception:
                     cid_plan = []
 
-            # Fallback to single CID if no part_chunks in DB
-            if not cid_plan:
-                cid_str = str(chunk.cid or "").strip().lower()
-                if cid_str in {"", "none", "pending"}:
-                    chunk_logger.error(
-                        f"Skipping download for part {chunk.part_id}: invalid CID '{chunk.cid}' and no part_chunks"
-                    )
-                    # Clear in-progress flag so future attempts aren't blocked by TTL
-                    try:
-                        await redis_client.delete(
-                            f"download_in_progress:{download_request.object_id}:{int(chunk.part_id)}"
+                # Fallback to single CID if no part_chunks in DB
+                if not cid_plan:
+                    cid_str = str(chunk.cid or "").strip().lower()
+                    if cid_str in {"", "none", "pending"}:
+                        chunk_logger.error(
+                            f"Skipping download for part {chunk.part_id}: invalid CID '{chunk.cid}' and no part_chunks"
                         )
-                    except Exception:
-                        chunk_logger.debug("Failed to delete in-progress flag for invalid CID", exc_info=True)
-                    return False
-                cid_plan = [(0, str(chunk.cid), None)]
+                        # Clear in-progress flag so future attempts aren't blocked by TTL
+                        try:
+                            await redis_client.delete(
+                                f"download_in_progress:{download_request.object_id}:{int(chunk.part_id)}"
+                            )
+                        except Exception:
+                            chunk_logger.debug("Failed to delete in-progress flag for invalid CID", exc_info=True)
+                        return False
+                    cid_plan = [(0, str(chunk.cid), None)]
 
             max_attempts = getattr(config, "downloader_chunk_retries", 5)
             base_sleep = getattr(config, "downloader_retry_base_seconds", 0.25)
