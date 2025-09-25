@@ -2,82 +2,84 @@ name: Deploy to Production
 
 on:
   push:
-    branches: [ production ]
+    branches: [production]
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up SSH
-      uses: webfactory/ssh-agent@v0.8.0
-      with:
-        ssh-private-key: ${{ secrets.DEPLOYMENT_SSH_KEY }}
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.8.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOYMENT_SSH_KEY }}
 
-    - name: Setup known hosts
-      run: |
-        mkdir -p ~/.ssh
-        ssh-keyscan -H ${{ secrets.DEPLOYMENT_IP }} >> ~/.ssh/known_hosts
-        ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+      - name: Setup known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.DEPLOYMENT_IP }} >> ~/.ssh/known_hosts
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
 
-    - name: Debug Repository URL
-      run: |
-        echo "Repository URL: ${{ github.server_url }}/${{ github.repository }}.git"
-        echo "SSH URL: git@github.com:${{ github.repository }}.git"
+      - name: Debug Repository URL
+        run: |
+          echo "Repository URL: ${{ github.server_url }}/${{ github.repository }}.git"
+          echo "SSH URL: git@github.com:${{ github.repository }}.git"
 
-    - name: Deploy to production
-      env:
-        DEPLOYMENT_IP: ${{ secrets.DEPLOYMENT_IP }}
-        DEPLOYMENT_USER: ${{ secrets.DEPLOYMENT_USER }}
-        DEPLOYMENT_PATH: ${{ secrets.DEPLOYMENT_PATH }}
-        DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        REPO_URL: "git@github.com:${{ github.repository }}.git"
-      run: |
-        # Deploy directly via SSH commands
-        ssh ${DEPLOYMENT_USER}@${DEPLOYMENT_IP} << EOF
-          set -e
-          echo "Deploying Hippius-S3 to production server..."
+      - name: Deploy to production
+        env:
+          DEPLOYMENT_IP: ${{ secrets.DEPLOYMENT_IP }}
+          DEPLOYMENT_USER: ${{ secrets.DEPLOYMENT_USER }}
+          DEPLOYMENT_PATH: ${{ secrets.DEPLOYMENT_PATH }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REPO_URL: "git@github.com:${{ github.repository }}.git"
+        run: |
+          # Deploy directly via SSH commands
+          ssh ${DEPLOYMENT_USER}@${DEPLOYMENT_IP} << EOF
+            set -e
+            echo "Deploying Hippius-S3 to production server..."
 
-          # Debug info
-          echo "Using repo URL: ${REPO_URL}"
+            # Debug info
+            echo "Using repo URL: ${REPO_URL}"
 
-          # Make sure the deployment path exists
-          mkdir -p ${DEPLOYMENT_PATH}
-          cd ${DEPLOYMENT_PATH} || { echo "Failed to change to deployment path"; exit 1; }
+            # Make sure the deployment path exists
+            mkdir -p ${DEPLOYMENT_PATH}
+            cd ${DEPLOYMENT_PATH} || { echo "Failed to change to deployment path"; exit 1; }
 
-          # Check if this is a git repository
-          if [ ! -d ".git" ]; then
-            echo "No git repository found. Initializing..."
-            # Clone the repository if it's not already there
-            git clone -b production ${REPO_URL} .
-          else
-            echo "Updating git repository..."
-            # Try to pull latest changes
-            git fetch origin production
-            git checkout production || git checkout -b production origin/production
-            git pull origin production
-          fi
+            # Check if this is a git repository
+            if [ ! -d ".git" ]; then
+              echo "No git repository found. Initializing..."
+              # Clone the repository if it's not already there
+              git clone -b production ${REPO_URL} .
+            else
+              echo "Updating git repository..."
+              # Try to pull latest changes
+              git fetch origin production
+              git checkout production || git checkout -b production origin/production
+              git pull origin production
+            fi
 
-          echo "Building and starting Docker containers with production config..."
-          docker compose -f docker-compose.yml -f docker-compose.prod.yml down || true
-          docker compose -f docker-compose.yml -f docker-compose.prod.yml build --no-cache
-          docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+            # Ensure external Docker network exists
+            docker network inspect hippius_net >/dev/null 2>&1 || docker network create hippius_net
+            echo "Building and starting Docker containers with production config..."
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml down || true
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml build --no-cache
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 
-          echo "Waiting for database to be ready..."
-          sleep 10
+            echo "Waiting for database to be ready..."
+            sleep 10
 
-          echo "Running database migrations..."
-          docker compose -f docker-compose.yml -f docker-compose.prod.yml exec -T api dbmate up
+            echo "Running database migrations..."
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml exec -T api dbmate up
 
-          echo "Deployment completed successfully!"
+            echo "Deployment completed successfully!"
 
-    - name: Verify deployment
-      env:
-        DEPLOYMENT_IP: ${{ secrets.DEPLOYMENT_IP }}
-        DEPLOYMENT_USER: ${{ secrets.DEPLOYMENT_USER }}
-        DEPLOYMENT_PATH: ${{ secrets.DEPLOYMENT_PATH }}
-      run: |
-        ssh ${DEPLOYMENT_USER}@${DEPLOYMENT_IP} "cd ${DEPLOYMENT_PATH} && docker compose -f docker-compose.yml -f docker-compose.prod.yml ps"
+      - name: Verify deployment
+        env:
+          DEPLOYMENT_IP: ${{ secrets.DEPLOYMENT_IP }}
+          DEPLOYMENT_USER: ${{ secrets.DEPLOYMENT_USER }}
+          DEPLOYMENT_PATH: ${{ secrets.DEPLOYMENT_PATH }}
+        run: |
+          ssh ${DEPLOYMENT_USER}@${DEPLOYMENT_IP} "cd ${DEPLOYMENT_PATH} && docker compose -f docker-compose.yml -f docker-compose.prod.yml ps"
