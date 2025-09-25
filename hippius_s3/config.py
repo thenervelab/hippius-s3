@@ -96,6 +96,12 @@ class Config:
     pinner_batch_max_items: int = env("HIPPIUS_PINNER_BATCH_MAX_ITEMS:16", convert=int)
     pinner_multipart_max_concurrency: int = env("HIPPIUS_PINNER_MULTIPART_MAX_CONCURRENCY:5", convert=int)
 
+    # Upload queue configuration
+    # Fan-out (producer): push to one or more queues (CSV)
+    upload_queue_names: str = env("HIPPIUS_UPLOAD_QUEUE_NAMES:upload_requests", convert=str)
+    # Consumer (pinner): single primary queue to consume from (singular)
+    pinner_consume_queue: str = env("HIPPIUS_PINNER_CONSUME_QUEUE:upload_requests", convert=str)
+
     # Cache TTL (shared across components)
     cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:259200", convert=int)
 

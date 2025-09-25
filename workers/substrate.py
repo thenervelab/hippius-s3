@@ -4,21 +4,21 @@ Substrate blockchain interaction module for fetching user profiles and storage r
 Extracted from example.py and adapted for the chain pin checker system.
 """
 
+import asyncio
 import binascii
 import logging
-from typing import Dict
-from typing import List
-
-import asyncio
 import random
 from contextlib import suppress
+from typing import Dict
+from typing import List
 from typing import Optional
 
-from hippius_s3.config import get_config
 from hippius_sdk.errors import HippiusSubstrateError
 from hippius_sdk.substrate import FileInput
 from hippius_sdk.substrate import SubstrateClient as HippiusSubstrateClient
 from substrateinterface import SubstrateInterface
+
+from hippius_s3.config import get_config
 
 
 logger = logging.getLogger(__name__)

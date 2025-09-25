@@ -2,10 +2,13 @@ import json
 import logging
 import time
 import uuid
+from typing import List
 from typing import Union
 
 import redis.asyncio as async_redis
 from pydantic import BaseModel
+
+from hippius_s3.config import get_config
 
 
 logger = logging.getLogger(__name__)
@@ -93,15 +96,22 @@ async def enqueue_upload_request(
     if payload.attempts is None:
         payload.attempts = 0
 
-    await redis_client.lpush("upload_requests", payload.model_dump_json())
-    logger.info(f"Enqueued upload request {payload.name=}")
+    # Fan-out to one or more queues per configuration
+    config = get_config()
+    raw = payload.model_dump_json()
+    queue_names_str: str = getattr(config, "upload_queue_names", "upload_requests")
+    queue_names: List[str] = [q.strip() for q in queue_names_str.split(",") if q.strip()]
+    for qname in queue_names:
+        await redis_client.lpush(qname, raw)
+    logger.info(f"Enqueued upload request {payload.name=} queues={queue_names}")
 
 
 async def dequeue_upload_request(
     redis_client: async_redis.Redis,
 ) -> UploadChainRequest | None:
     """Get the next upload request from the Redis queue."""
-    queue_name = "upload_requests"
+    config = get_config()
+    queue_name: str = getattr(config, "pinner_consume_queue", "upload_requests")
     # Use a short blocking timeout to enable timely batch flushes
     result = await redis_client.brpop(queue_name, timeout=0.5)
     if result:

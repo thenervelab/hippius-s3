@@ -428,9 +428,7 @@ class IPFSService:
                         logger.exception(f"IPFS part upload failed after {attempt} attempts: {e}")
                         raise
                     backoff_ms = _compute_backoff_ms(attempt)
-                    logger.warning(
-                        f"IPFS part upload failed (attempt {attempt}), retrying in {backoff_ms:.0f}ms: {e}"
-                    )
+                    logger.warning(f"IPFS part upload failed (attempt {attempt}), retrying in {backoff_ms:.0f}ms: {e}")
                     await asyncio.sleep(backoff_ms / 1000.0)
 
             # Calculate ETag (MD5 hash) for the part, similar to S3
@@ -451,9 +449,7 @@ class IPFSService:
                         logger.exception(f"IPFS part pin failed after {attempt} attempts: {e}")
                         raise
                     backoff_ms = _compute_backoff_ms(attempt)
-                    logger.warning(
-                        f"IPFS part pin failed (attempt {attempt}), retrying in {backoff_ms:.0f}ms: {e}"
-                    )
+                    logger.warning(f"IPFS part pin failed (attempt {attempt}), retrying in {backoff_ms:.0f}ms: {e}")
                     await asyncio.sleep(backoff_ms / 1000.0)
 
             return {

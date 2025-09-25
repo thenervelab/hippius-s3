@@ -102,6 +102,8 @@ services:
       - "8474:8474" # control API (for host-driven tests if needed)
     depends_on:
       - ipfs
+    networks:
+      - hippius_net
 
   chain-profile-cacher:
     build:
@@ -122,3 +124,8 @@ services:
       - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
     volumes:
       - .:/app
+
+networks:
+  hippius_net:
+    external: true
+    name: hippius_net

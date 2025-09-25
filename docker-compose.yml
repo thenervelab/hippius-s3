@@ -28,6 +28,8 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - REDIS_CHAIN_URL=redis://redis-chain:6379/0
+    networks:
+      - hippius_net
 
   db:
     image: postgres:15
@@ -45,6 +47,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - hippius_net
 
   ipfs:
     image: ipfs/kubo:latest
@@ -62,6 +66,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+    networks:
+      - hippius_net
 
   redis:
     image: redis:7-alpine
@@ -77,6 +83,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - hippius_net
 
   redis-accounts:
     image: redis:7-alpine
@@ -92,6 +100,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - hippius_net
 
   redis-chain:
     image: redis:7-alpine
@@ -107,6 +117,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - hippius_net
 
   pinner:
     build:
@@ -129,6 +141,8 @@ services:
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
     volumes:
       - .:/app
+    networks:
+      - hippius_net
 
   unpinner:
     build:
@@ -149,6 +163,8 @@ services:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
+    networks:
+      - hippius_net
 
   downloader:
     build:
@@ -168,6 +184,8 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
+    networks:
+      - hippius_net
 
   chain-pin-checker:
     build:
@@ -187,6 +205,8 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_CHAIN_URL=redis://redis-chain:6379/0
+    networks:
+      - hippius_net
 
   chain-profile-cacher:
     build:
@@ -206,6 +226,8 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_CHAIN_URL=redis://redis-chain:6379/0
+    networks:
+      - hippius_net
 
 volumes:
   postgres_data:
@@ -213,3 +235,8 @@ volumes:
   redis_data:
   redis_accounts_data:
   redis_chain_data:
+
+networks:
+  hippius_net:
+    external: true
+    name: hippius_net

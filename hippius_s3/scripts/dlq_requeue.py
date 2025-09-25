@@ -33,6 +33,7 @@ import redis.asyncio as async_redis
 
 from hippius_s3.config import get_config
 from hippius_s3.dlq.logic import DLQLogic
+from hippius_s3.dlq.storage import DLQStorage
 from hippius_s3.queue import UploadChainRequest
 
 
@@ -246,6 +247,21 @@ async def main() -> None:
     cleanup_parser = subparsers.add_parser("cleanup", help="Clean up archived DLQ data")
     cleanup_parser.add_argument("--object-id", help="Specific object ID to cleanup (omit to cleanup all archived)")
 
+    # dlq-parts: list available DLQ part numbers for an object (for testing)
+    dlq_parts_parser = subparsers.add_parser("dlq-parts", help="List DLQ parts for an object")
+    dlq_parts_parser.add_argument("--object-id", required=True, help="Object ID to inspect")
+
+    # dlq-part-size: get size of a DLQ part (for testing)
+    dlq_part_size_parser = subparsers.add_parser("dlq-part-size", help="Get DLQ part size for an object")
+    dlq_part_size_parser.add_argument("--object-id", required=True, help="Object ID")
+    dlq_part_size_parser.add_argument("--part", type=int, required=True, help="Part number")
+
+    # archived-exists: check if archived directory exists for object (for testing)
+    archived_exists_parser = subparsers.add_parser(
+        "archived-exists", help="Check if archived directory exists for object"
+    )
+    archived_exists_parser.add_argument("--object-id", required=True, help="Object ID")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -318,8 +334,6 @@ async def main() -> None:
                 sys.exit(1)
 
         elif args.command == "cleanup":
-            from hippius_s3.dlq.storage import DLQStorage
-
             storage = DLQStorage()
 
             if args.object_id:
@@ -334,6 +348,28 @@ async def main() -> None:
                 print("Cleanup of all archived data requires manual intervention.")
                 print("Please specify --object-id or delete manually from DLQ_ARCHIVE_DIR.")
                 sys.exit(1)
+
+        elif args.command == "dlq-parts":
+            storage = DLQStorage()
+            parts = storage.list_chunks(args.object_id)
+            print(json.dumps(parts))
+
+        elif args.command == "dlq-part-size":
+            storage = DLQStorage()
+            data = storage.load_chunk(args.object_id, args.part)
+            if data is None:
+                print("-1")
+                sys.exit(1)
+            print(str(len(data)))
+
+        elif args.command == "archived-exists":
+            storage = DLQStorage()
+            target = storage.archive_dir / args.object_id
+            if target.exists():
+                print("FOUND")
+                return
+            print("MISSING")
+            sys.exit(1)
 
     finally:
         if redis_client:
