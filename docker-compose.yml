@@ -23,8 +23,6 @@ services:
       - PYTHONUNBUFFERED=1
       - UVICORN_LOG_LEVEL=debug
       - DEBUG=true
-      - HIPPIUS_IPFS_GET_URL=https://get.hippius.network
-      - HIPPIUS_IPFS_STORE_URL=https://store.hippius.network
       - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - REDIS_CHAIN_URL=redis://redis-chain:6379/0
