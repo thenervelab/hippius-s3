@@ -60,4 +60,5 @@ coverage.xml
 
 # pytest
 .pytest_cache/
+.e2e
 **/.claude/settings.local.json

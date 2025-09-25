@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 class ManifestService:
@@ -13,6 +17,7 @@ class ManifestService:
         No object-level CID fallback used for streaming.
         """
         try:
+            logger.debug(f"MANIFEST build_initial_download_chunks called for object_id={object_info['object_id']}")
             rows = await db.fetch(
                 """
                 SELECT p.part_number,
@@ -25,6 +30,7 @@ class ManifestService:
                 """,
                 object_info["object_id"],
             )
+            logger.debug(f"MANIFEST found {len(rows)} parts rows: {[(r[0], r[1], r[2]) for r in rows]}")
 
             manifest: list[dict] = []
             for r in rows:
@@ -40,6 +46,7 @@ class ManifestService:
                 size = int(r[2] or 0)
                 manifest.append({"part_number": pn, "cid": cid, "size_bytes": size})
 
+            logger.debug(f"MANIFEST built manifest: {manifest}")
             return manifest
 
         except Exception:

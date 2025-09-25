@@ -171,9 +171,7 @@ class ObjectReader:
     async def verify_etags(
         self, db: Any, info: ObjectInfo, parts: list[Part], obj_cache: ObjectPartsCache, redis: Any, request_uuid: str
     ) -> None:
-        if not info.upload_id:
-            return
-        rows = await db.fetch(get_query("get_parts_etags"), info.upload_id)
+        rows = await db.fetch(get_query("get_parts_etags"), info.object_id)
         if not rows:
             return
         expected = {int(r["part_number"]): r["etag"].split("-")[0] for r in rows}
@@ -226,8 +224,8 @@ class ObjectReader:
             # All pending parts are already in cache
             return
 
-        # Do bounded polling for missing pending parts
-        poll_deadline = asyncio.get_event_loop().time() + 2.0  # 2 second timeout
+        # Do bounded polling for missing pending parts (align with HTTP stream initial timeout)
+        poll_deadline = asyncio.get_event_loop().time() + float(self.config.http_stream_initial_timeout_seconds)
         poll_interval = self.config.http_download_sleep_loop
 
         while asyncio.get_event_loop().time() < poll_deadline:
