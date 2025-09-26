@@ -54,9 +54,7 @@ async def process_download_request(
                 chunk_logger.error(f"Skipping download for chunk {chunk.part_id}: invalid CID '{chunk.cid}'")
                 # Clear in-progress flag so future attempts aren't blocked by TTL
                 try:
-                    await redis_client.delete(
-                        f"download_in_progress:{download_request.object_id}:{int(chunk.part_id)}"
-                    )
+                    await redis_client.delete(f"download_in_progress:{download_request.object_id}:{int(chunk.part_id)}")
                 except Exception:
                     chunk_logger.debug("Failed to delete in-progress flag for invalid CID", exc_info=True)
                 return False
