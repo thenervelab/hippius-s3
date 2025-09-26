@@ -28,6 +28,15 @@ dependencies = [
     "cachetools",
     "redis",
     "pyinstrument>=4.0.0",
+    # OpenTelemetry and monitoring dependencies
+    "opentelemetry-api>=1.37.0",
+    "opentelemetry-sdk>=1.37.0",
+    "opentelemetry-instrumentation>=0.58b0",
+    "opentelemetry-instrumentation-fastapi>=0.58b0",
+    "opentelemetry-instrumentation-redis>=0.58b0",
+    "opentelemetry-instrumentation-asyncpg>=0.58b0",
+    "opentelemetry-exporter-prometheus>=0.58b0",
+    "prometheus-client>=0.23.1",
     "PyNaCl>=1.5.0",
 ]
 
@@ -201,6 +210,14 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "aiohttp.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "opentelemetry.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "prometheus_client.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

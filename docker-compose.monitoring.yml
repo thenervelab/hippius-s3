@@ -1,0 +1,125 @@
+services:
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: hippius-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    restart: unless-stopped
+    depends_on:
+      - otel-collector
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: hippius-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+  # OpenTelemetry Collector for metrics collection
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: hippius-otel-collector
+    command: ["--config=/etc/otelcol-contrib/otel-config.yml"]
+    ports:
+      - "1888:1888"   # pprof extension
+      - "8888:8888"   # Prometheus metrics exposed by the collector
+      - "8889:8889"   # Prometheus exporter metrics
+      - "13133:13133" # health_check extension
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+      - "55679:55679" # zpages extension
+    volumes:
+      - ./monitoring/otel/otel-config.yml:/etc/otelcol-contrib/otel-config.yml:ro
+    restart: unless-stopped
+    depends_on:
+      - redis
+
+  # Redis exporter for main Redis metrics
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.76.0
+    container_name: hippius-redis-exporter
+    ports:
+      - "9121:9121"
+    environment:
+      - REDIS_ADDR=redis://redis:6379
+    command: [
+      "/redis_exporter",
+      "-redis.addr=redis://redis:6379",
+      "-count-keys=db0=obj:*",
+      "-log-format=txt",
+      "-debug"
+    ]
+    restart: unless-stopped
+    depends_on:
+      - redis
+
+  # Redis exporter for accounts cache
+  redis-accounts-exporter:
+    image: oliver006/redis_exporter:v1.76.0
+    container_name: hippius-redis-accounts-exporter
+    ports:
+      - "9122:9121"
+    environment:
+      - REDIS_ADDR=redis://redis-accounts:6379
+    command: [
+      "/redis_exporter",
+      "-count-keys=db0=hippius_subaccount_cache:*,db0=hippius_main_account_credits:*,db0=hippius_seed_to_subaccount:*"
+    ]
+    restart: unless-stopped
+    depends_on:
+      - redis-accounts
+
+  # Redis exporter for chain cache
+  redis-chain-exporter:
+    image: oliver006/redis_exporter:v1.76.0
+    container_name: hippius-redis-chain-exporter
+    ports:
+      - "9123:9121"
+    environment:
+      - REDIS_ADDR=redis://redis-chain:6379
+    command: [
+      "/redis_exporter",
+      "-count-keys=db0=pinned_cids:*"
+    ]
+    restart: unless-stopped
+    depends_on:
+      - redis-chain
+
+  # Postgres exporter for database metrics
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    container_name: hippius-postgres-exporter
+    ports:
+      - "9187:9187"
+    environment:
+      - DATA_SOURCE_NAME=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
+    restart: unless-stopped
+    depends_on:
+      - db
+
+volumes:
+  prometheus_data:
+  grafana_data:

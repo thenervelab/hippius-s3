@@ -9,8 +9,11 @@ import asyncpg
 import redis.asyncio as async_redis
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi import Request
 from fastapi import Response
 from fastapi.openapi.utils import get_openapi
+from prometheus_client import CONTENT_TYPE_LATEST
+from prometheus_client import generate_latest
 
 from hippius_s3.api.middlewares.audit_log import audit_log_middleware
 from hippius_s3.api.middlewares.backend_hmac import verify_hmac_middleware
@@ -32,6 +35,8 @@ from hippius_s3.cache import RedisDownloadChunksCache
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.ipfs_service import IPFSService
+from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
+from hippius_s3.monitoring import get_metrics_collector
 
 
 load_dotenv()
@@ -46,6 +51,53 @@ logging.basicConfig(
 
 # Set up this module's logger
 logger = logging.getLogger(__name__)
+
+
+async def metrics_middleware(request: Request, call_next):
+    """Middleware for recording HTTP metrics."""
+    import time
+
+    start_time = time.time()
+    response = await call_next(request)
+    duration = time.time() - start_time
+
+    # Extract account info from request state if available
+    main_account = None
+    subaccount_id = None
+
+    if hasattr(request.state, "account"):
+        main_account = getattr(request.state.account, "main_account", None)
+        subaccount_id = getattr(request.state.account, "id", None)
+
+    # Get endpoint function name from request scope
+    endpoint_name = "unknown"
+    try:
+        if "route" in request.scope:
+            route = request.scope["route"]
+            if hasattr(route, "endpoint") and hasattr(route.endpoint, "__name__"):
+                endpoint_name = route.endpoint.__name__
+    except Exception:
+        pass
+
+    # Record metrics
+    metrics_collector = get_metrics_collector()
+    if metrics_collector:
+        # Create a custom attributes dict to override the handler
+        attributes = {
+            "method": request.method,
+            "handler": endpoint_name,  # Use function name instead of path
+            "status_code": str(response.status_code),
+        }
+
+        if main_account:
+            attributes["main_account"] = main_account
+        if subaccount_id:
+            attributes["subaccount_id"] = subaccount_id
+
+        metrics_collector.http_requests_total.add(1, attributes=attributes)
+        metrics_collector.http_request_duration.record(duration, attributes=attributes)
+
+    return response
 
 
 async def postgres_create_pool(database_url: str) -> asyncpg.Pool:
@@ -96,9 +148,49 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.dl_cache = RedisDownloadChunksCache(app.state.redis_client)
         logger.info("Cache repositories initialized")
 
+        # Initialize metrics collector and set global instance
+        from opentelemetry.exporter.prometheus import PrometheusMetricReader
+        from opentelemetry.sdk.metrics import MeterProvider
+        from opentelemetry.sdk.resources import Resource
+
+        from hippius_s3.monitoring import MetricsCollector
+        from hippius_s3.monitoring import metrics
+
+        # Set up OpenTelemetry
+        resource = Resource.create({"service.name": "hippius-s3-api", "service.version": "1.0.0"})
+        prometheus_reader = PrometheusMetricReader()
+        provider = MeterProvider(resource=resource, metric_readers=[prometheus_reader])
+        metrics.set_meter_provider(provider)
+
+        # Prometheus metrics are served via /metrics route, no separate server needed
+
+        app.state.metrics_collector = MetricsCollector(app.state.redis_client)
+
+        # Set global metrics collector instance
+        import hippius_s3.monitoring
+
+        hippius_s3.monitoring.metrics_collector = app.state.metrics_collector
+
+        logger.info("Metrics collector and Prometheus server initialized")
+
+        # Start background metrics collection
+        app.state.background_metrics_collector = BackgroundMetricsCollector(
+            app.state.metrics_collector, app.state.redis_client
+        )
+        await app.state.background_metrics_collector.start()
+        logger.info("Background metrics collection started")
+
         yield
 
     finally:
+        try:
+            # Stop background metrics collection
+            if hasattr(app.state, "background_metrics_collector"):
+                await app.state.background_metrics_collector.stop()
+                logger.info("Background metrics collection stopped")
+        except Exception:
+            logger.exception("Error shutting down background metrics collector")
+
         try:
             await app.state.redis_client.close()
             logger.info("Redis client closed")
@@ -129,6 +221,12 @@ app = FastAPI(
 )
 
 
+@app.get("/metrics")
+async def metrics_endpoint():
+    """Prometheus metrics endpoint."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 def custom_openapi() -> dict:
     if app.openapi_schema:
         return app.openapi_schema
@@ -157,7 +255,9 @@ app.openapi = custom_openapi  # type: ignore[method-assign]
 # Custom middlewares - middleware("http") executes in REVERSE order
 # 1. Rate limiting (executes LAST, needs account from credit check)
 app.middleware("http")(rate_limit_wrapper)
-# 2. Audit logging (executes EIGHTH, logs all operations after auth)
+# 2. Metrics collection (executes NINTH, records after all processing)
+app.middleware("http")(metrics_middleware)
+# 3. Audit logging (executes EIGHTH, logs all operations after auth)
 app.middleware("http")(audit_log_middleware)
 # 3. Credit verification (executes SEVENTH, sets account info, needs seed phrase)
 app.middleware("http")(check_credit_for_all_operations)
