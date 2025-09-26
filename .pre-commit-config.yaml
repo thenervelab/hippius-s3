@@ -3,7 +3,7 @@ repos:
     rev: v0.13.0
     hooks:
       - id: ruff
-        args: []
+        args: [--fix]
         stages: [pre-commit]
         files: ^(hippius_s3/|tests/)
       - id: ruff-format
@@ -28,7 +28,7 @@ repos:
         stages: [pre-commit]
 
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.11.2
+    rev: v1.10.0
     hooks:
       - id: mypy
         name: mypy (src)
@@ -46,6 +46,7 @@ repos:
           - types-requests
           - types-boto3
           - types-botocore
+          - httpx
         args:
           - --config-file=pyproject.toml
           - --show-error-codes

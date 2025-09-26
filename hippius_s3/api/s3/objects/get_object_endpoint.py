@@ -92,33 +92,6 @@ async def handle_get_object(
                 Key=object_key,
             )
 
-        # Validate/resolve range with actual size
-        start_byte = end_byte = None
-        range_was_invalid = False
-        if range_header:
-            try:
-                start_byte, end_byte = parse_range_header(range_header, object_info["size_bytes"])
-                # Check if this was originally an invalid range (start > end) that got converted to full range
-                original_parts = range_header.lower().strip()
-                if original_parts.startswith("bytes="):
-                    spec = original_parts[len("bytes=") :]
-                    range_parts = spec.split("-", 1)
-                    if len(range_parts) == 2 and range_parts[0].isdigit() and range_parts[1].isdigit():
-                        orig_start = int(range_parts[0])
-                        orig_end = int(range_parts[1])
-                        if orig_end < orig_start:
-                            # This was originally an invalid range (start > end) converted to full range
-                            range_was_invalid = True
-            except ValueError:
-                return Response(
-                    status_code=416,
-                    headers={
-                        "Content-Range": f"bytes */{object_info['size_bytes']}",
-                        "Accept-Ranges": "bytes",
-                        "Content-Length": "0",
-                    },
-                )
-
         # Build manifest purely from DB parts, 0-based; prefer ObjectReader if provided
         download_chunks = json.loads(object_info["download_chunks"]) if object_info.get("download_chunks") else []
         if object_reader is not None:
@@ -163,6 +136,38 @@ async def handle_get_object(
             object_info["download_chunks"] = json.dumps(download_chunks)
         except Exception:
             pass
+        # Validate/resolve range with effective size (objects.size_bytes or sum of chunks)
+        start_byte = end_byte = None
+        range_was_invalid = False
+        if range_header:
+            try:
+                effective_size = int(object_info.get("size_bytes") or 0)
+                if (not effective_size) and download_chunks:
+                    try:
+                        effective_size = sum(int(c.get("size_bytes", 0)) for c in download_chunks)
+                    except Exception:
+                        effective_size = 0
+                start_byte, end_byte = parse_range_header(range_header, effective_size)
+                # Check if this was originally an invalid range (start > end) that got converted to full range
+                original_parts = range_header.lower().strip()
+                if original_parts.startswith("bytes="):
+                    spec = original_parts[len("bytes=") :]
+                    range_parts = spec.split("-", 1)
+                    if len(range_parts) == 2 and range_parts[0].isdigit() and range_parts[1].isdigit():
+                        orig_start = int(range_parts[0])
+                        orig_end = int(range_parts[1])
+                        if orig_end < orig_start:
+                            # This was originally an invalid range (start > end) converted to full range
+                            range_was_invalid = True
+            except ValueError:
+                return Response(
+                    status_code=416,
+                    headers={
+                        "Content-Range": f"bytes */{effective_size}",
+                        "Accept-Ranges": "bytes",
+                        "Content-Length": "0",
+                    },
+                )
 
         with contextlib.suppress(Exception):
             logger.info(

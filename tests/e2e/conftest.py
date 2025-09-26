@@ -15,6 +15,9 @@ import boto3  # type: ignore[import-untyped]
 import pytest
 from botocore.config import Config  # type: ignore[import-untyped]
 
+from .support.compose import enable_ipfs_proxy
+from .support.compose import wait_for_toxiproxy
+
 
 # type: ignore[import-untyped]
 # Note: event_loop fixture removed as it's not needed for synchronous tests
@@ -102,6 +105,26 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
     env["COMPOSE_PROJECT_NAME"] = compose_project_name
     project_root = str(Path(__file__).resolve().parents[2])
 
+    # Ensure .e2e directories exist for volume mounts
+    e2e_dir = Path(project_root) / ".e2e"
+    e2e_dir.mkdir(exist_ok=True)
+    dlq_dir = e2e_dir / "dlq"
+    dlq_dir.mkdir(exist_ok=True)
+    dlq_archive_dir = e2e_dir / "dlq_archive"
+    dlq_archive_dir.mkdir(exist_ok=True)
+
+    # Ensure external network exists in CI runners
+    def _ensure_network(name: str) -> None:
+        try:
+            probe = subprocess.run(["docker", "network", "inspect", name], check=False, capture_output=True)
+            if probe.returncode != 0:
+                subprocess.run(["docker", "network", "create", name], check=True)
+        except Exception as e:  # noqa: PERF203
+            # Do not hard-fail on network creation; compose may still succeed locally
+            print(f"Warning: failed ensuring docker network '{name}': {e}")
+
+    _ensure_network("hippius_net")
+
     def compose_cmd(args: list[str]) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
             ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.e2e.yml", *args],
@@ -117,12 +140,30 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
 
     if not already_running:
         # Start services with e2e override
-        subprocess.run(
-            ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.e2e.yml", "up", "-d", "--wait"],
-            env=env,
-            check=True,
-            cwd=project_root,
-        )
+        up_cmd = [
+            "docker",
+            "compose",
+            "-f",
+            "docker-compose.yml",
+            "-f",
+            "docker-compose.e2e.yml",
+            "up",
+            "-d",
+            "--wait",
+        ]
+        result = subprocess.run(up_cmd, env=env, cwd=project_root, capture_output=True, text=True)
+        if result.returncode != 0:
+            # Capture diagnostics to artifacts for CI visibility
+            try:
+                artifacts_dir = Path(project_root) / "artifacts"
+                artifacts_dir.mkdir(parents=True, exist_ok=True)
+                (artifacts_dir / "compose_up.stdout.txt").write_text(result.stdout or "")
+                (artifacts_dir / "compose_up.stderr.txt").write_text(result.stderr or "")
+                ps_out = compose_cmd(["ps"]).stdout
+                (artifacts_dir / "ps.txt").write_bytes(ps_out or b"")
+            except Exception as e:  # noqa: PERF203
+                print(f"Warning: failed to write compose diagnostics: {e}")
+            raise RuntimeError("docker compose up failed; see artifacts/compose_up.stderr.txt for details")
         print("Waiting for services to be ready...")
         time.sleep(10)
 
@@ -159,8 +200,8 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
 
             # service logs (best-effort)
             for svc in ["api", "downloader", "pinner", "unpinner"]:
-                result = compose_cmd(["logs", svc])
-                (artifacts_dir / f"{svc}.log").write_bytes(result.stdout or b"")
+                log_result = compose_cmd(["logs", svc])
+                (artifacts_dir / f"{svc}.log").write_bytes(log_result.stdout or b"")
     except Exception as e:  # noqa: PERF203
         print(f"Warning: failed to dump logs: {e}")
 
@@ -177,6 +218,21 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
 # Ensure docker services are started for all e2e tests without having to depend on the fixture explicitly
 @pytest.fixture(scope="session", autouse=True)
 def _ensure_services(docker_services: None) -> Iterator[None]:
+    yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _init_ipfs_proxies(docker_services: None) -> Iterator[None]:
+    """Ensure Toxiproxy IPFS proxies exist and are enabled before any tests run.
+
+    Depends on docker_services so the compose stack (including toxiproxy) is up.
+    No-op when running against real AWS.
+    """
+    if os.getenv("RUN_REAL_AWS") == "1" or os.getenv("AWS") == "1":
+        yield
+        return
+    assert wait_for_toxiproxy(), "Toxiproxy API not available"
+    enable_ipfs_proxy()
     yield
 
 

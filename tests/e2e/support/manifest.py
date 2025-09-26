@@ -49,3 +49,20 @@ def fetch_ipfs_json(cid: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"Expected JSON object, got {type(data)}")
     return data
+
+
+def wait_for_object_cid_via_head(
+    boto3_client: Any, bucket: str, key: str, *, timeout_sec: float = 30.0, interval: float = 0.5
+) -> Optional[str]:
+    """Poll HEAD until x-amz-ipfs-cid is set (not 'pending'), return the CID or None on timeout."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            head = boto3_client.head_object(Bucket=bucket, Key=key)
+            cid = head["ResponseMetadata"]["HTTPHeaders"].get("x-amz-ipfs-cid")
+            if cid and str(cid).strip().lower() != "pending":
+                return str(cid)
+        except Exception:
+            pass
+        time.sleep(interval)
+    return None
