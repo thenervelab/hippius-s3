@@ -76,6 +76,9 @@ class ResilientPublishAdapter:
                     encrypt=should_encrypt,
                     subaccount_id=subaccount_id,
                     bucket_name=bucket_name,
+                    store_node=self.config.ipfs_store_url,
+                    pin_node=self.config.ipfs_store_url,
+                    substrate_url=self.config.substrate_url,
                 )
                 cid = str(pub["cid"]) if isinstance(pub, dict) and "cid" in pub else str(pub)
                 tx_hash = pub.get("tx_hash") if isinstance(pub, dict) else None  # type: ignore[assignment]
