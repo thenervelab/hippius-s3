@@ -18,6 +18,8 @@ services:
         condition: service_healthy
     volumes:
       - .:/app
+      - /var/lib/hippius/dlq:/tmp/hippius_dlq
+      - /var/lib/hippius/dlq_archive:/tmp/hippius_dlq_archive
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
@@ -26,6 +28,8 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - REDIS_CHAIN_URL=redis://redis-chain:6379/0
+      - HIPPIUS_DLQ_DIR=/tmp/hippius_dlq
+      - HIPPIUS_DLQ_ARCHIVE_DIR=/tmp/hippius_dlq_archive
     networks:
       - hippius_net
 
@@ -137,8 +141,12 @@ services:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
+      - HIPPIUS_DLQ_DIR=/tmp/hippius_dlq
+      - HIPPIUS_DLQ_ARCHIVE_DIR=/tmp/hippius_dlq_archive
     volumes:
       - .:/app
+      - /var/lib/hippius/dlq:/tmp/hippius_dlq
+      - /var/lib/hippius/dlq_archive:/tmp/hippius_dlq_archive
     networks:
       - hippius_net
 
