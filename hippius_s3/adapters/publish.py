@@ -78,10 +78,9 @@ class ResilientPublishAdapter:
                     bucket_name=bucket_name,
                     store_node=self.config.ipfs_store_url,
                 )
-                cid = str(pub["cid"]) if isinstance(pub, dict) and "cid" in pub else str(pub)
-                tx_hash = pub.get("tx_hash") if isinstance(pub, dict) else None  # type: ignore[assignment]
-                logger.info(f"SDK publish complete cid={cid} tx={tx_hash}")
-                return ResolvedPublish(cid=cid, path="sdk", tx_hash=tx_hash)
+                tx_hash = getattr(pub, "tx_hash", None)
+                logger.info(f"SDK publish complete cid={pub.cid} tx={tx_hash}")
+                return ResolvedPublish(cid=pub.cid, path="sdk", tx_hash=tx_hash)
             except Exception as e:
                 last_exc = e
                 if attempt >= max_retries:
@@ -125,7 +124,7 @@ class ResilientPublishAdapter:
                 encrypt=should_encrypt,
                 seed_phrase=seed_phrase,
             )
-            cid = str(result["cid"]) if isinstance(result, dict) else str(result)
+            cid = str(result["cid"])
             # Pin
             await self.client.pin(cid, seed_phrase=seed_phrase)
             return ResolvedPublish(cid=cid, path="fallback", tx_hash=None)
