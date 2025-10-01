@@ -32,63 +32,43 @@ async def get_user_cids_from_db(
     db: asyncpg.Connection,
     user: str,
 ) -> List[str]:
-    """Get all CIDs for a user from the database (both simple and multipart)."""
+    """Get all CIDs for a user from the database (manifest CIDs and chunk CIDs)."""
     user_cids = []
 
-    # Get simple object CIDs for this user
-    simple_objects = await db.fetch(
+    # Get manifest CIDs from objects.ipfs_cid (all objects now use manifest structure)
+    manifest_cids = await db.fetch(
         """
-        SELECT DISTINCT c.cid
+        SELECT DISTINCT o.ipfs_cid as cid
         FROM objects o
         JOIN buckets b ON o.bucket_id = b.bucket_id
-        JOIN cids c ON o.cid_id = c.id
         WHERE b.main_account_id = $1
-        AND o.multipart = FALSE
-        AND o.cid_id IS NOT NULL
+        AND o.ipfs_cid IS NOT NULL
+        AND o.ipfs_cid != ''
         AND o.status = 'uploaded'
         AND o.created_at < NOW() - INTERVAL '1 hour'
-    """,
+        """,
         user,
     )
 
-    for row in simple_objects:
-        user_cids.append(row["cid"])  # noqa: PERF401
+    user_cids.extend(row["cid"] for row in manifest_cids if row["cid"])
 
-    # Get multipart object CIDs (main CID + parts CIDs) for this user
-    multipart_objects = await db.fetch(
-        """
-        SELECT DISTINCT c.cid
-        FROM objects o
-        JOIN buckets b ON o.bucket_id = b.bucket_id
-        JOIN cids c ON o.cid_id = c.id
-        WHERE b.main_account_id = $1
-        AND o.multipart = TRUE
-        AND o.cid_id IS NOT NULL
-        AND o.status = 'uploaded'
-        AND o.created_at < NOW() - INTERVAL '1 hour'
-    """,
-        user,
-    )
-
-    user_cids.extend(row["cid"] for row in multipart_objects)
-
-    # Get all parts CIDs for multipart uploads of this user
+    # Get chunk CIDs from parts.ipfs_cid
     parts_cids = await db.fetch(
         """
-        SELECT DISTINCT c.cid
+        SELECT DISTINCT p.ipfs_cid as cid
         FROM parts p
         JOIN objects o ON p.object_id = o.object_id
         JOIN buckets b ON o.bucket_id = b.bucket_id
-        JOIN cids c ON p.cid_id = c.id
         WHERE b.main_account_id = $1
-        AND p.cid_id IS NOT NULL
+        AND p.ipfs_cid IS NOT NULL
+        AND p.ipfs_cid != ''
         AND o.status = 'uploaded'
         AND o.created_at < NOW() - INTERVAL '1 hour'
-    """,
+        """,
         user,
     )
 
-    user_cids.extend(row["cid"] for row in parts_cids)
+    user_cids.extend(row["cid"] for row in parts_cids if row["cid"])
 
     return list(set(user_cids))  # Remove duplicates
 

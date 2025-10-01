@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hippius_s3.config import get_config
-from workers.substrate import get_all_pinned_cids
+from workers.substrate import SubstrateClient
 from workers.substrate import get_all_storage_requests
 
 
@@ -97,14 +97,15 @@ def extract_file_cids_from_profile(profile_data: dict) -> List[str]:
 async def cache_user_chain_profile(
     redis_chain: async_redis.Redis,
     user: str,
+    all_profiles: dict,
     storage_requests_dict: dict,
     http_client: httpx.AsyncClient,
 ) -> None:
     """Download and cache chain profile data for a single user."""
     logger.debug(f"Caching chain profile for user {user}")
 
-    # Get profile CIDs from chain for this specific user
-    profile_cids = get_all_pinned_cids(user, config.substrate_url)
+    # Get profile CIDs from pre-fetched profiles dict
+    profile_cids = all_profiles.get(user, [])
 
     # Download and parse each profile to extract file CIDs
     profile_file_cids = []
@@ -151,11 +152,8 @@ async def run_chain_profile_cacher_loop():
     # Connect to database
     db = await asyncpg.connect(config.database_url)
 
-    # Connect to redis-chain
     redis_chain_url = config.redis_chain_url
     redis_chain = async_redis.from_url(redis_chain_url)
-
-    # Create HTTP client for profile downloads
     http_client = httpx.AsyncClient(timeout=30.0)
 
     logger.info("Starting chain profile cacher service...")
@@ -168,14 +166,33 @@ async def run_chain_profile_cacher_loop():
             users = await get_all_unique_users(db)
             logger.info(f"Caching chain profiles for {len(users)} users")
 
+            # Pre-fetch all user profiles once (more efficient than per-user calls)
+            logger.info("Fetching all user profiles from chain...")
+            substrate_client = SubstrateClient(config.substrate_url)
+            try:
+                substrate_client.connect()
+                all_profiles = substrate_client.fetch_user_profiles()
+                logger.info(f"Fetched profiles for {len(all_profiles)} users")
+            finally:
+                substrate_client.close()
+
             # Pre-fetch all storage requests once (more efficient than per-user calls)
             logger.info("Fetching all storage requests from chain...")
-            storage_requests_dict = await get_all_storage_requests(config.substrate_url, http_client)
+            storage_requests_dict = await get_all_storage_requests(
+                config.substrate_url,
+                http_client,
+            )
             logger.info(f"Fetched storage requests for {len(storage_requests_dict)} users")
 
             # Process each user
             for user in users:
-                await cache_user_chain_profile(redis_chain, user, storage_requests_dict, http_client)
+                await cache_user_chain_profile(
+                    redis_chain,
+                    user,
+                    all_profiles,
+                    storage_requests_dict,
+                    http_client,
+                )
 
             logger.info(f"Completed caching chain profiles for all {len(users)} users")
 
