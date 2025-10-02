@@ -17,13 +17,16 @@ from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import dequeue_download_request
 
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+
 async def process_download_request(
     download_request: DownloadChainRequest,
     redis_client: async_redis.Redis,
 ) -> bool:
     """Process a download request by downloading each chunk and storing in Redis."""
 
-    logger = logging.getLogger(__name__)
     obj_cache = RedisObjectPartsCache(redis_client)
     hippius_client = HippiusClient(
         ipfs_gateway=config.ipfs_get_url,
