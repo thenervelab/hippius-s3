@@ -80,9 +80,6 @@ def test_dlq_requeue_multipart_upload(
             },
         )
 
-        # Wait for DLQ processing
-        time.sleep(5)
-
         # Wait for the pinner to push the job to DLQ (IPFS down)
         # Poll DLQ up to a short timeout
         import redis as _redis  # type: ignore[import-untyped]
@@ -136,15 +133,21 @@ def test_dlq_requeue_multipart_upload(
             "api", "hippius_s3.scripts.dlq_requeue", ["dlq-part-size", "--object-id", object_id, "--part", "2"]
         )
         assert code1 == 0 and code2 == 0, f"dlq-part-size failed: {err1} {err2}"
-        assert int(out1.strip()) == len(part1_data), "Part 1 size mismatch"
-        assert int(out2.strip()) == len(part2_data), "Part 2 size mismatch"
+        size1 = int(out1.strip())
+        size2 = int(out2.strip())
+        assert size1 == len(part1_data) or (size1 > len(part1_data) and (size1 - len(part1_data)) % 40 == 0), (
+            "Part 1 size mismatch"
+        )
+        assert size2 == len(part2_data) or (size2 > len(part2_data) and (size2 - len(part2_data)) % 40 == 0), (
+            "Part 2 size mismatch"
+        )
 
         # Clear Redis cache to simulate cache eviction
         clear_object_cache(object_id, parts=[0, 1])
 
-        # Verify cache is actually cleared
-        assert not r.exists(f"obj:{object_id}:part:0"), "Part 0 cache not cleared"
-        assert not r.exists(f"obj:{object_id}:part:1"), "Part 1 cache not cleared"
+        # Verify cache is actually cleared (meta)
+        assert not r.exists(f"obj:{object_id}:part:0:meta"), "Part 0 cache not cleared"
+        assert not r.exists(f"obj:{object_id}:part:1:meta"), "Part 1 cache not cleared"
 
         # Heal IPFS before requeue so pinner can complete successfully
         enable_ipfs_proxy()
@@ -156,9 +159,6 @@ def test_dlq_requeue_multipart_upload(
         )
         assert code == 0, f"Requeue command failed: {err}\n{out}"
         assert f"Successfully requeued object_id: {object_id}" in out
-
-        # Wait for requeue processing to complete
-        time.sleep(5)
 
         # Verify the object was successfully processed
         assert wait_for_parts_cids(bucket, key, min_count=2), "Requeued parts not processed"

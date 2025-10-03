@@ -751,7 +751,7 @@ wheels = [
 
 [[package]]
 name = "hippius"
-version = "0.2.59"
+version = "0.2.63"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "base58" },
@@ -766,9 +766,9 @@ dependencies = [
     { name = "substrate-interface" },
     { name = "zfec" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/08/18/9f3c82fd8b3f39e6f4995837aa8595b0b3fd38cfe35a90d3fc8710d06c01/hippius-0.2.59.tar.gz", hash = "sha256:ce500a3cfce0b382a3e668f07b899330e79aa02209e47c972b086e6e52457bd3", size = 108531, upload-time = "2025-09-16T18:23:53.28Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/df/cb/039a4f880135f1f0c4861081eb2b581ba5d3aa494b3453201a12250006be/hippius-0.2.63.tar.gz", hash = "sha256:efd3830524d42d84013c31ae2ea95791776201e3c9c9c564a2a27eff3f562afe", size = 108681, upload-time = "2025-10-02T06:53:24.627Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/92/43/bc31912882ae8a1fdb34b5fcda2b6b313cbb3264291bb4c259e4256153a5/hippius-0.2.59-py3-none-any.whl", hash = "sha256:66626083e8784931638f650359c70b612591c4cea4c2defcf0dfdd1ff52fb0b3", size = 110559, upload-time = "2025-09-16T18:23:52.226Z" },
+    { url = "https://files.pythonhosted.org/packages/e4/cd/cc3a3caf0a37a803d6c9ab216370c4aa0114c56f6962d5378abdfed06310/hippius-0.2.63-py3-none-any.whl", hash = "sha256:84a0bee9221725cfe4baab21c64cac93425522ac53c41ad6dc1a02aa4767e828", size = 110764, upload-time = "2025-10-02T06:53:22.988Z" },
 ]
 
 [package.optional-dependencies]
@@ -828,7 +828,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115.12" },
     { name = "gunicorn", specifier = ">=21.2.0" },
     { name = "hippius" },
-    { name = "hippius", extras = ["key-storage"], specifier = ">=0.2.59" },
+    { name = "hippius", extras = ["key-storage"], specifier = ">=0.2.61" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "lxml", specifier = ">=4.9.3" },
     { name = "minio", marker = "extra == 'dev'", specifier = ">=7.1.15" },

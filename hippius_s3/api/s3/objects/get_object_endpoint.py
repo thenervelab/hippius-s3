@@ -170,7 +170,7 @@ async def handle_get_object(
                 )
 
         with contextlib.suppress(Exception):
-            logger.info(
+            logger.debug(
                 f"GET manifest-built multipart={object_info.get('multipart')} parts={[c if isinstance(c, dict) else c for c in download_chunks]}"
             )
 

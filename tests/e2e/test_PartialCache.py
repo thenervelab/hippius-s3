@@ -61,6 +61,10 @@ def test_get_partial_cache_fallbacks(
         delta,
         metadata={"append": "true", "append-if-version": ver, "append-id": "partial-cache-test"},
     )
+    # Wait a bit for append to complete
+    import time
+
+    time.sleep(0.1)
 
     # Wait until at least 2 parts have CIDs in DB
     assert wait_for_parts_cids(bucket, key, min_count=2), "parts not ready with CIDs"
@@ -69,14 +73,14 @@ def test_get_partial_cache_fallbacks(
     object_id = get_object_id(bucket, key)
     clear_object_cache(object_id, parts=[1])
 
-    # Diagnostic: verify cache presence before first GET
+    # Diagnostic: verify chunked cache presence before first GET
     try:
         import redis as _redis  # type: ignore[import-untyped]
 
         r = _redis.Redis.from_url("redis://localhost:6379/0")
-        has1 = bool(r.exists(f"obj:{object_id}:part:1"))
-        has2 = bool(r.exists(f"obj:{object_id}:part:2"))
-        print(f"DEBUG cache before GET: object_id={object_id} part1={has1} part2={has2}")
+        has1 = bool(r.exists(f"obj:{object_id}:part:1:meta"))
+        has2 = bool(r.exists(f"obj:{object_id}:part:2:meta"))
+        print(f"DEBUG cache before GET: object_id={object_id} part1meta={has1} part2meta={has2}")
     except Exception as _e:  # pragma: no cover
         print(f"DEBUG cache probe failed: {_e}")
 
@@ -92,8 +96,12 @@ def test_get_partial_cache_fallbacks(
     # Second request should be served from cache (after first request populated it)
     start = max(0, len(base) - 3)
     end = len(base) + 2
+    print(f"DEBUG range: base_len={len(base)} delta_len={len(delta)} start={start} end={end}")
+    print(f"DEBUG expected content: {expected!r}")
+    print(f"DEBUG expected range: {expected[start : end + 1]!r}")
     resp_range = signed_http_get(bucket, key, {"Range": f"bytes={start}-{end}"})
     assert resp_range.status_code == 206
+    print(f"DEBUG actual range content: {resp_range.content}")
     assert resp_range.content == expected[start : end + 1]
     # Range request should be served from cache (after first request populated it)
     assert resp_range.headers.get("x-hippius-source") == "cache"

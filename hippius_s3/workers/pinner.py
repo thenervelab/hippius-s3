@@ -19,6 +19,7 @@ from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.utils import get_query
+from hippius_s3.utils.timing import log_timing
 
 
 # FileInput is from hippius_sdk.substrate.FileInput but we define a simple alias for testing
@@ -175,24 +176,74 @@ class Pinner:
         RedisObjectPartsCache = _get_redis_cache()
         obj_cache = RedisObjectPartsCache(self.redis_client)  # type: ignore[call-arg]
         part_number_db = int(chunk.id)
-        # Try object_id-based cache first
-        chunk_data = await obj_cache.get(object_id, part_number_db)
-        # Fallback to upload_id-based key if not found
-        if chunk_data is None:
+        # Ensure we have a non-null upload_id (required by parts table)
+        if not upload_id:
+            # Resolve upload_id from DB; if missing, fail fast (no silent fallback)
+            row = None
+            try:
+                row = await self.db.fetchrow(
+                    "SELECT upload_id FROM multipart_uploads WHERE object_id = $1 ORDER BY initiated_at DESC LIMIT 1",
+                    object_id,
+                )
+            except Exception:
+                row = None
+            if row and row[0] is not None:
+                upload_id = str(row[0])
+            else:
+                raise ValueError(f"missing_upload_id for object_id={object_id} part={part_number_db}")
+        # Final defensive guard: never proceed with NULL upload_id (parts.upload_id is NOT NULL)
+        try:
+            if upload_id is None or (isinstance(upload_id, str) and upload_id.strip() == ""):
+                logger.warning(
+                    f"_process_multipart_chunk empty upload_id detected; using object_id as fallback. "
+                    f"This may indicate a DB constraint issue if parts.upload_id has FK. "
+                    f"object_id={object_id} part={part_number_db}",
+                    extra={"object_id": object_id, "part_number": part_number_db, "fallback": "upload_id_missing"},
+                )
+                upload_id = object_id
+        except Exception as e:
+            logger.warning(
+                f"_process_multipart_chunk exception checking upload_id; using object_id as fallback. "
+                f"error={e} object_id={object_id} part={part_number_db}",
+                extra={"object_id": object_id, "part_number": part_number_db, "fallback": "upload_id_exception"},
+            )
+            upload_id = object_id
+        # Read chunk data from chunked cache; do not treat ':meta' as payload
+        chunk_data = None
+        assembled = await obj_cache.get(object_id, part_number_db)
+        if isinstance(assembled, (bytes, bytearray)) and len(assembled) > 0:
+            chunk_data = bytes(assembled)
+            logger.debug(
+                f"_process_multipart_chunk using CHUNKED obj:{object_id}:part:{part_number_db} len={len(chunk_data)}"
+            )
+        else:
             logger.debug(
                 f"_process_multipart_chunk cache miss for object_id={object_id} part={part_number_db} key=obj:{object_id}:part:{part_number_db}"
             )
+
+        if chunk_data is None and upload_id:
+            try:
+                from hippius_s3.cache import RedisUploadPartsCache as _UploadCache  # local import
+
+                up_cache = _UploadCache(self.redis_client)
+                tmp = await up_cache.get(upload_id, part_number_db)
+                if isinstance(tmp, (bytes, bytearray)) and len(tmp) > 0:
+                    chunk_data = bytes(tmp)
+                    logger.debug(
+                        f"_process_multipart_chunk using UPLOAD-CACHE upload_id={upload_id} part={part_number_db} len={len(chunk_data)}"
+                    )
+            except Exception:
+                logger.debug("_process_multipart_chunk upload cache fallback failed", exc_info=True)
         if chunk_data is None:
             raise ValueError(f"Chunk data missing for object_id={object_id} part={part_number_db}")
 
         logger.debug(f"_process_multipart_chunk fetched chunk_data bytes={len(chunk_data)}")
-        # For chunks, upload+pin only (no publish) for immediate CID
+        # For backward compatibility, upload assembled part bytes to IPFS to retain part-level CID
         upload_result = await self.ipfs_service.upload_file(
             file_data=chunk_data,
             file_name=f"{object_key}.part{part_number_db}",
             content_type="application/octet-stream",
             encrypt=False,
-            seed_phrase=seed_phrase,
         )
         chunk_cid = str(upload_result.get("cid"))
         logger.debug(f"_process_multipart_chunk obtained cid={chunk_cid}")
@@ -205,7 +256,7 @@ class Pinner:
             cid_id_for_part = None
         # Update existing placeholder row, insert if missing
         logger.debug(
-            f"_process_multipart_chunk upserting part object_id={object_id}, part_number={part_number_db}, cid={chunk_cid}, size={len(chunk_data)}"
+            f"_process_multipart_chunk upserting part object_id={object_id}, upload_id={upload_id}, part_number={part_number_db}, cid={chunk_cid}, size={len(chunk_data)}"
         )
         try:
             updated = await self.db.execute(
@@ -237,14 +288,16 @@ class Pinner:
             if rows_affected == 0:
                 await self.db.execute(
                     """
-                    INSERT INTO parts (part_id, object_id, part_number, ipfs_cid, size_bytes, cid_id, uploaded_at)
-                    VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, NOW())
+                    INSERT INTO parts (part_id, object_id, upload_id, part_number, ipfs_cid, size_bytes, cid_id, uploaded_at)
+                    VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW())
                     ON CONFLICT (object_id, part_number) DO UPDATE SET
                         ipfs_cid = EXCLUDED.ipfs_cid,
                         size_bytes = EXCLUDED.size_bytes,
-                        cid_id = COALESCE(EXCLUDED.cid_id, parts.cid_id)
+                        cid_id = COALESCE(EXCLUDED.cid_id, parts.cid_id),
+                        upload_id = COALESCE(parts.upload_id, EXCLUDED.upload_id)
                     """,
                     object_id,
+                    upload_id,
                     part_number_db,
                     chunk_cid,
                     len(chunk_data),
@@ -258,14 +311,16 @@ class Pinner:
             logger.debug("PINNER _process_multipart_chunk update failed; falling back to upsert", exc_info=True)
             await self.db.execute(
                 """
-                INSERT INTO parts (part_id, object_id, part_number, ipfs_cid, size_bytes, cid_id, uploaded_at)
-                VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, NOW())
+                INSERT INTO parts (part_id, object_id, upload_id, part_number, ipfs_cid, size_bytes, cid_id, uploaded_at)
+                VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW())
                 ON CONFLICT (object_id, part_number) DO UPDATE SET
                     ipfs_cid = EXCLUDED.ipfs_cid,
                     size_bytes = EXCLUDED.size_bytes,
-                    cid_id = COALESCE(EXCLUDED.cid_id, parts.cid_id)
+                    cid_id = COALESCE(EXCLUDED.cid_id, parts.cid_id),
+                    upload_id = COALESCE(parts.upload_id, EXCLUDED.upload_id)
                 """,
                 object_id,
+                upload_id,
                 part_number_db,
                 chunk_cid,
                 len(chunk_data),
@@ -277,6 +332,66 @@ class Pinner:
         logger.debug(
             f"_process_multipart_chunk COMPLETE object_id={object_id}, part_number={part_number_db}, cid={chunk_cid}"
         )
+
+        # Additionally, upload each Redis-stored chunk individually and upsert per-chunk CID records
+        try:
+            meta = await obj_cache.get_meta(object_id, part_number_db)
+        except Exception:
+            meta = None
+        if isinstance(meta, dict):
+            num_chunks = int(meta.get("num_chunks", 0) or 0)
+            if num_chunks > 0:
+                # Resolve part_id once
+                try:
+                    row = await self.db.fetchrow(
+                        get_query("get_part_id_by_object_and_number"), object_id, part_number_db
+                    )
+                    part_id = row[0] if row else None
+                except Exception:
+                    part_id = None
+                if part_id:
+                    uploaded = 0
+                    for ci in range(num_chunks):
+                        try:
+                            import time as _ptime
+
+                            chunk_pin_start = _ptime.perf_counter()
+                            cbytes = await obj_cache.get_chunk(object_id, part_number_db, ci)
+                            if not isinstance(cbytes, (bytes, bytearray)) or len(cbytes) == 0:
+                                continue
+                            up_res = await self.ipfs_service.upload_file(
+                                file_data=bytes(cbytes),
+                                file_name=f"{object_key}.part{part_number_db}.chunk{ci}",
+                                content_type="application/octet-stream",
+                                encrypt=False,
+                            )
+                            ccid = str(up_res.get("cid"))
+                            await self.db.execute(
+                                get_query("upsert_part_chunk"),
+                                part_id,
+                                ci,
+                                ccid,
+                                len(cbytes),
+                                None,
+                                None,
+                            )
+                            uploaded += 1
+                            chunk_pin_ms = (_ptime.perf_counter() - chunk_pin_start) * 1000.0
+                            log_timing(
+                                "pinner.chunk_pin_and_upsert",
+                                chunk_pin_ms,
+                                extra={
+                                    "object_id": object_id,
+                                    "part_number": part_number_db,
+                                    "chunk_index": ci,
+                                    "size_bytes": len(cbytes),
+                                },
+                            )
+                        except Exception:
+                            logger.debug("Failed uploading or upserting per-chunk CID", exc_info=True)
+                    logger.debug(
+                        f"_process_multipart_chunk per-chunk upload complete object_id={object_id} part={part_number_db} count={uploaded}/{num_chunks}"
+                    )
         return FileInput(file_hash=chunk_cid), chunk
 
     async def _process_chunks_only(
@@ -459,7 +574,7 @@ class Pinner:
             logger.error(f"Failed to push to DLQ: {e}")
 
     async def _persist_chunks_to_dlq(self, payload: UploadChainRequest) -> None:
-        """Persist all available chunks from cache to DLQ filesystem."""
+        """Persist all available chunks + metadata from cache to DLQ filesystem (no whole-part files)."""
         object_id = payload.object_id
         RedisCache = _get_redis_cache()
         obj_cache = RedisCache(self.redis_client)
@@ -469,20 +584,45 @@ class Pinner:
             for chunk in payload.chunks:
                 part_number = int(chunk.id)
 
-                # Try to get chunk data from cache
-                chunk_data = await obj_cache.get(object_id, part_number)
-                if chunk_data is None:
+                # Ensure we have meta (build fallback if needed)
+                meta = await obj_cache.get_meta(object_id, part_number)
+                if not meta:
                     logger.warning(
-                        f"No cached data for object {object_id} part {part_number}, skipping DLQ persistence"
+                        f"No cached meta for object {object_id} part {part_number}, skipping DLQ persistence"
                     )
                     continue
 
-                # Save to DLQ filesystem
+                # Save metadata sidecar first
                 try:
-                    self.dlq_storage.save_chunk(object_id, part_number, chunk_data)
-                    logger.debug(f"Persisted chunk {part_number} for object {object_id} to DLQ")
+                    self.dlq_storage.save_meta(object_id, part_number, meta)
+                    logger.debug(f"Persisted meta for part {part_number} of object {object_id} to DLQ")
                 except Exception as e:
-                    logger.error(f"Failed to persist chunk {part_number} for object {object_id} to DLQ: {e}")
+                    logger.error(f"Failed to persist meta for part {part_number} of object {object_id} to DLQ: {e}")
+                    continue
+
+                # Persist each piece exactly as it exists in Redis (no whole-part file)
+                num_chunks = int(meta.get("num_chunks", 0))
+                if num_chunks == 0:
+                    logger.warning(f"Meta has num_chunks=0 for object {object_id} part {part_number}")
+                    continue
+
+                pieces_saved = 0
+                for ci in range(num_chunks):
+                    piece = await obj_cache.get_chunk(object_id, part_number, ci)
+                    if isinstance(piece, (bytes, bytearray)) and len(piece) > 0:
+                        try:
+                            self.dlq_storage.save_chunk_piece(object_id, part_number, ci, bytes(piece))
+                            pieces_saved += 1
+                        except Exception as e:
+                            logger.error(
+                                f"Failed to persist chunk piece {ci} for object {object_id} part {part_number}: {e}"
+                            )
+                    else:
+                        logger.warning(f"Missing chunk piece {ci} for object {object_id} part {part_number} in Redis")
+
+                logger.debug(
+                    f"Persisted {pieces_saved}/{num_chunks} pieces for part {part_number} of object {object_id} to DLQ"
+                )
 
         except Exception as e:
             logger.error(f"Failed to persist chunks for object {object_id} to DLQ: {e}")

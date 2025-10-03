@@ -104,6 +104,14 @@ class Config:
 
     # Cache TTL (shared across components)
     cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:259200", convert=int)
+    # Unified object part chunk size (bytes) for cache and range math
+    object_chunk_size_bytes: int = env("HIPPIUS_CHUNK_SIZE_BYTES:4194304", convert=int)
+
+    # Crypto configuration
+    # Default encryption suite for new objects
+    # hip-enc/1: XSalsa20-Poly1305 with random nonces (current)
+    # hip-enc/legacy: Legacy whole-part encryption (SDK compatibility)
+    crypto_suite_id: str = env("HIPPIUS_CRYPTO_SUITE_ID:hip-enc/1")
 
     # endpoint chunk download settings, quite aggressive
     redis_read_chunk_timeout = 60
