@@ -104,7 +104,6 @@ class Pinner:
             chunk_results = await self._process_chunks_only(
                 object_id=payload.object_id,
                 object_key=payload.object_key,
-                should_encrypt=payload.should_encrypt,
                 chunks=payload.chunks,
                 upload_id=payload.upload_id,
                 seed_phrase=payload.subaccount_seed_phrase,
@@ -116,7 +115,7 @@ class Pinner:
                 object_key=payload.object_key,
                 should_encrypt=payload.should_encrypt,
                 seed_phrase=payload.subaccount_seed_phrase,
-                subaccount=payload.subaccount,
+                account_address=payload.address,
                 bucket_name=payload.bucket_name,
             )
 
@@ -163,7 +162,6 @@ class Pinner:
         *,
         object_id: str,
         object_key: str,
-        should_encrypt: bool,
         chunk: Chunk,
         upload_id: Optional[str] = None,
         seed_phrase: Optional[str] = None,
@@ -284,7 +282,6 @@ class Pinner:
         *,
         object_id: str,
         object_key: str,
-        should_encrypt: bool,
         chunks: List[Chunk],
         upload_id: Optional[str] = None,
         seed_phrase: Optional[str] = None,
@@ -302,7 +299,6 @@ class Pinner:
                 return await self._process_multipart_chunk(
                     object_id=object_id,
                     object_key=object_key,
-                    should_encrypt=should_encrypt,
                     chunk=chunk,
                     upload_id=upload_id,
                     seed_phrase=seed_phrase,
@@ -334,7 +330,7 @@ class Pinner:
         object_key: str,
         should_encrypt: bool,
         seed_phrase: Optional[str] = None,
-        subaccount: Optional[str] = None,
+        account_address: Optional[str] = None,
         bucket_name: Optional[str] = None,
     ) -> FileInput:
         """Build manifest from parts table and publish/pin it. Only builds if all parts have CIDs."""
@@ -400,7 +396,7 @@ class Pinner:
             file_name=f"{object_key}.manifest",
             should_encrypt=should_encrypt,
             seed_phrase=seed_phrase,
-            subaccount_id=subaccount,
+            account_address=account_address,
             bucket_name=bucket_name,
         )
 
@@ -487,40 +483,3 @@ class Pinner:
         except Exception as e:
             logger.error(f"Failed to persist chunks for object {object_id} to DLQ: {e}")
             # Don't fail the DLQ push if persistence fails
-
-    async def _process_upload_common(
-        self,
-        *,
-        object_id: str,
-        object_key: str,
-        should_encrypt: bool,
-        chunks: List[Chunk],
-        appendable: bool,
-        upload_id: Optional[str] = None,
-        seed_phrase: Optional[str] = None,
-        subaccount: Optional[str] = None,
-        bucket_name: Optional[str] = None,
-    ) -> Tuple[List[Tuple[FileInput, Chunk]], FileInput]:
-        """Pin chunks, upsert parts, build/pin manifest, set object ipfs_cid."""
-        logger.debug(
-            f"_process_upload_common START object_id={object_id}, object_key={object_key}, chunks={[c.id for c in chunks]}, upload_id={upload_id}"
-        )
-
-        # Process chunks only (Step 2)
-        chunk_results = await self._process_chunks_only(
-            object_id=object_id,
-            object_key=object_key,
-            should_encrypt=should_encrypt,
-            chunks=chunks,
-            upload_id=upload_id,
-            seed_phrase=seed_phrase,
-        )
-
-        # TODO: Step 3 - Build manifest from current parts
-        # For now, return a placeholder manifest result
-        manifest_result = FileInput(file_hash="pending")  # Placeholder for step 3
-
-        logger.debug(
-            f"_process_upload_common COMPLETE object_id={object_id}, chunks processed (manifest deferred to step 3)"
-        )
-        return chunk_results, manifest_result

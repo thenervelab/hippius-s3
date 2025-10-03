@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import redis.asyncio as async_redis
+from dotenv import load_dotenv
 from hippius_sdk.client import HippiusClient
 
 
@@ -13,12 +14,17 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
+from hippius_s3.ipfs_service import s3_download
 from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import dequeue_download_request
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+
+load_dotenv()
+config = get_config()
 
 
 async def process_download_request(
@@ -76,28 +82,27 @@ async def process_download_request(
                     )
 
                     # Download the chunk using hippius_sdk
-                    chunk_data = await hippius_client.s3_download(
+                    downloaded_chunk = await s3_download(
                         cid=chunk.cid,
-                        subaccount_id=download_request.subaccount,
+                        account_address=download_request.subaccount,
                         bucket_name=download_request.bucket_name,
-                        auto_decrypt=download_request.should_decrypt,
-                        download_node=download_request.ipfs_node,
-                        return_bytes=True,
+                        decrypt=download_request.should_decrypt,
                     )
+                    downloaded_data = downloaded_chunk.data
 
-                    md5 = _hashlib.md5(chunk_data).hexdigest()
-                    head_hex = chunk_data[:8].hex() if chunk_data else ""
-                    tail_hex = chunk_data[-8:].hex() if len(chunk_data) >= 8 else head_hex
+                    md5 = _hashlib.md5(downloaded_data).hexdigest()
+                    head_hex = downloaded_data[:8].hex()
+                    tail_hex = downloaded_data[-8:].hex() if len(downloaded_data) >= 8 else head_hex
                     chunk_logger.debug(
-                        f"Downloaded chunk {chunk.part_id} cid={str(chunk.cid)[:10]}... len={len(chunk_data)} md5={md5} "
+                        f"Downloaded chunk {chunk.part_id} cid={str(chunk.cid)}... len={len(downloaded_data)} md5={md5} "
                         f"head8={head_hex} tail8={tail_hex}"
                     )
 
                     # Store the chunk data in Redis object parts cache
                     chunk_logger.info(
-                        f"OBJ-CACHE write object_id={download_request.object_id} part={int(chunk.part_id)} bytes={len(chunk_data)}"
+                        f"OBJ-CACHE write object_id={download_request.object_id} part={int(chunk.part_id)} bytes={len(downloaded_data)}"
                     )
-                    await obj_cache.set(download_request.object_id, int(chunk.part_id), chunk_data)
+                    await obj_cache.set(download_request.object_id, int(chunk.part_id), downloaded_data)
                     chunk_logger.info(
                         f"OBJ-CACHE stored object_id={download_request.object_id} part={int(chunk.part_id)}"
                     )

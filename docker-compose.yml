@@ -179,7 +179,8 @@ services:
       redis:
         condition: service_healthy
     deploy:
-      replicas: 3
+      # for dev/staging easier to debug
+      replicas: 1
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1

@@ -1,30 +1,123 @@
 import asyncio
+import base64
 import hashlib
 import json
 import logging
 import random
 import tempfile
+import time
 from pathlib import Path
+from typing import AsyncIterator
 from typing import Dict
 from typing import NamedTuple
 from typing import Optional
 from typing import Union
 
+import asyncpg
 import httpx
+import nacl.secret
 import redis.asyncio as async_redis
 from hippius_sdk.client import HippiusClient
+from pydantic import BaseModel
 
 from hippius_s3.adapters.publish import ResilientPublishAdapter
 from hippius_s3.config import Config
+from hippius_s3.config import get_config
 
 
 logger = logging.getLogger(__name__)
+config = get_config()
+
+
+class S3Download(BaseModel):
+    """Result model for s3_download method."""
+
+    cid: str
+    elapsed: float
+    decrypted: bool
+    data: bytes
+    size_bytes: int
+
+
+async def get_encryption_key(identifier: str) -> str:
+    hashed_identifier = hashlib.sha256(identifier.encode("utf-8")).hexdigest()
+    conn = await asyncpg.connect(config.encryption_database_url)
+    try:
+        result = await conn.fetchrow(
+            """
+            SELECT encryption_key_b64
+            FROM encryption_keys
+            WHERE subaccount_id = $1
+            ORDER BY created_at DESC
+            LIMIT 1
+        """,
+            hashed_identifier,
+        )
+        return str(result["encryption_key_b64"])
+    finally:
+        await conn.close()
+
+
+async def stream_from_ipfs(cid: str) -> AsyncIterator[bytes]:
+    download_url = f"{config.ipfs_store_url.rstrip('/')}/api/v0/cat?arg={cid}"
+
+    async with httpx.AsyncClient(timeout=config.httpx_ipfs_api_timeout) as client:  # noqa: SIM117
+        async with client.stream(
+            "POST",
+            download_url,
+        ) as response:
+            response.raise_for_status()
+
+            async for chunk in response.aiter_bytes(chunk_size=8192):
+                yield chunk
+
+
+async def s3_download(
+    cid: str,
+    account_address: str,
+    bucket_name: str,
+    decrypt: bool,
+) -> S3Download:
+    start_time = time.time()
+
+    raw_data = bytearray()
+    async for chunk in stream_from_ipfs(cid):
+        raw_data.extend(chunk)
+    raw_data_bytes = bytes(raw_data)
+
+    if decrypt:
+        identifier = f"{account_address}:{bucket_name}"
+        encryption_key_b64 = await get_encryption_key(identifier)
+        encryption_key = base64.b64decode(encryption_key_b64)
+
+        box = nacl.secret.SecretBox(encryption_key)
+        data = box.decrypt(raw_data_bytes)
+
+        logger.info(f"Decrypted {len(data)} bytes for {cid=} {bucket_name=} {account_address=}")
+    else:
+        data = raw_data_bytes
+        logger.info(f"Public chunk, no encryption {len(data)} bytes {cid=} {bucket_name=} {account_address=}")
+
+    size_bytes = len(data)
+    elapsed_time = time.time() - start_time
+
+    return S3Download(
+        cid=cid,
+        data=data,
+        decrypted=decrypt,
+        elapsed=elapsed_time,
+        size_bytes=size_bytes,
+    )
 
 
 class IPFSService:
     """Service for interacting with IPFS through Hippius SDK."""
 
-    def __init__(self, config: Config, redis_client: Optional[async_redis.Redis] = None):
+    def __init__(
+        self,
+        config: Config,
+        redis_client: Optional[async_redis.Redis] = None,
+    ):
         """Initialize the IPFS service."""
         self.config = config
         self.client = HippiusClient(
@@ -50,7 +143,7 @@ class IPFSService:
         file_name: str,
         should_encrypt: bool,
         seed_phrase: Optional[str] = None,
-        subaccount_id: Optional[str] = None,
+        account_address: Optional[str] = None,
         bucket_name: Optional[str] = None,
         wrap_with_directory: bool = False,
     ) -> "IPFSService.PinnedFile":
@@ -62,14 +155,14 @@ class IPFSService:
         """
         # Prefer SDK s3_publish when we have account context to preserve filename (wrapped directory)
         try:
-            if self.config.publish_to_chain and seed_phrase and subaccount_id and bucket_name:
+            if self.config.publish_to_chain and seed_phrase and account_address and bucket_name:
                 # Use resilient adapter (retries + fallback) for manifest publish
                 resolved = await self.publish_adapter.publish_manifest(
                     file_data=file_data,
                     file_name=file_name,
                     should_encrypt=should_encrypt,
                     seed_phrase=seed_phrase,
-                    subaccount_id=subaccount_id,
+                    account_address=account_address,
                     bucket_name=bucket_name,
                 )
                 logger.info(f"Publish path={resolved.path} cid={resolved.cid} tx={resolved.tx_hash}")
@@ -254,26 +347,15 @@ class IPFSService:
         Returns:
             Binary file data (if streaming=False) or streaming HTTP response (if streaming=True)
         """
-        if streaming:
-            # Return streaming HTTP response directly from s3_download
-            return await self.client.s3_download(
-                cid=cid,
-                subaccount_id=subaccount_id,
-                bucket_name=bucket_name,
-                auto_decrypt=decrypt,
-                download_node=self.config.ipfs_get_url,
-                streaming=True,
-            )
-        # Use return_bytes mode instead of temp file to avoid file I/O issues
         try:
-            return await self.client.s3_download(
-                cid=cid,
-                subaccount_id=subaccount_id,
-                bucket_name=bucket_name,
-                auto_decrypt=decrypt,
-                download_node=self.config.ipfs_get_url,
-                return_bytes=True,
-            )
+            return (
+                await s3_download(
+                    cid=cid,
+                    account_address=subaccount_id,
+                    bucket_name=bucket_name,
+                    decrypt=decrypt,
+                )
+            ).data
 
         except Exception as e:
             logger.exception(f"Failed to download file with CID {cid}: {e}")
@@ -369,7 +451,11 @@ class IPFSService:
         return "file"
 
     async def upload_part(
-        self, file_data: bytes, part_number: int, encrypt: bool = True, seed_phrase: Optional[str] = None
+        self,
+        file_data: bytes,
+        part_number: int,
+        encrypt: bool = True,
+        seed_phrase: Optional[str] = None,
     ) -> Dict[str, Union[str, int]]:
         """
         Upload a part of a multipart upload to IPFS.

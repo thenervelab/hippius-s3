@@ -2,6 +2,7 @@ import dataclasses
 import uuid
 
 import dotenv
+import httpx
 
 from hippius_s3.utils import env
 
@@ -15,6 +16,7 @@ class Config:
 
     # Database Configuration
     database_url: str = env("DATABASE_URL")
+    encryption_database_url: str = env("HIPPIUS_KEYSTORE_DATABASE_URL")
 
     # IPFS Configuration
     ipfs_get_url: str = env("HIPPIUS_IPFS_GET_URL")
@@ -112,6 +114,7 @@ class Config:
 
     # initial stream timeout (seconds) before sending first byte
     http_stream_initial_timeout_seconds: float = env("HTTP_STREAM_INITIAL_TIMEOUT_SECONDS:5", convert=float)
+    httpx_ipfs_api_timeout = httpx.Timeout(10.0, read=300.0)
 
     # DLQ configuration
     dlq_dir: str = env("HIPPIUS_DLQ_DIR:/tmp/hippius_dlq")

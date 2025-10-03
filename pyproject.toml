@@ -24,7 +24,7 @@ dependencies = [
     "aiofiles>=23.1.0",
     "lxml>=4.9.3",
     "botocore>=1.38.25",
-    "hippius[key_storage]>=0.2.61",
+    "hippius[key_storage]>=0.2.63",
     "cachetools",
     "redis",
     "pyinstrument>=4.0.0",
@@ -137,6 +137,10 @@ disable_error_code = ["var-annotated", "no-untyped-def", "no-any-return"]
 module = "hippius_s3.ipfs_service"
 disallow_untyped_defs = false
 disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "nacl.*"
+ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "hippius_s3.api.middlewares.profiler"
