@@ -1,0 +1,24 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    make \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy only dependency files first
+COPY pyproject.toml LICENSE README.md ./
+RUN mkdir -p hippius_s3 && touch hippius_s3/__init__.py
+
+# Install Python dependencies (this layer will be cached)
+RUN pip install -e . \
+    && apt-get remove -y gcc g++ make \
+    && apt-get autoremove -y
+
+# Set Python path
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
