@@ -4,6 +4,7 @@ services:
     env_file: []
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
+      - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - HIPPIUS_BYPASS_CREDIT_CHECK=true
       - ENVIRONMENT=dev
       - PUBLISH_TO_CHAIN=false
@@ -16,6 +17,11 @@ services:
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
       - LOG_LEVEL=DEBUG
+      - FRONTEND_HMAC_SECRET=e2e_test_secret
+      - HOST=0.0.0.0
+      - PORT=8000
+      - HIPPIUS_SUBSTRATE_URL=wss://rpc.hippius.network
+      - HIPPIUS_VALIDATOR_REGION=decentralized
     volumes:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
