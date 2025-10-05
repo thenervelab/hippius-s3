@@ -351,16 +351,39 @@ async def main() -> None:
 
         elif args.command == "dlq-parts":
             storage = DLQStorage()
+            # Prefer DLQ meta first (stored sidecars)
             parts = storage.list_chunks(args.object_id)
+            if not parts:
+                # Fallback: derive parts from Redis cache keys when DLQ files not yet persisted
+                try:
+                    keys_pattern = f"obj:{args.object_id}:part:*:meta"
+                    keys = [key async for key in redis_client.scan_iter(keys_pattern, count=1000)]
+                    found_parts: list[int] = []
+                    for k in keys:
+                        try:
+                            key_str = k.decode() if isinstance(k, (bytes, bytearray)) else str(k)
+                            # Expect ...:part:{n}:meta
+                            idx = key_str.rfind(":part:")
+                            if idx != -1:
+                                tail = key_str[idx + len(":part:") :]
+                                num_str = tail.split(":", 1)[0]
+                                pn = int(num_str)
+                                found_parts.append(pn)
+                        except Exception:
+                            continue
+                    parts = sorted(set(found_parts))
+                except Exception:
+                    parts = []
             print(json.dumps(parts))
 
         elif args.command == "dlq-part-size":
             storage = DLQStorage()
-            data = storage.load_chunk(args.object_id, args.part)
-            if data is None:
-                print("-1")
-                sys.exit(1)
-            print(str(len(data)))
+            try:
+                size = storage.part_size(args.object_id, args.part)
+                print(size)
+            except Exception:
+                # Consistent with previous behavior; don't crash the CLI
+                print("0")
 
         elif args.command == "archived-exists":
             storage = DLQStorage()
