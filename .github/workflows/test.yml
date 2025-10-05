@@ -114,6 +114,10 @@ jobs:
         run: |
           if [ -f .env.example ]; then cp .env.example .env; else touch .env; fi
 
+      - name: Build base Docker image
+        run: |
+          docker compose --profile build-base build base
+
       - name: Run E2E tests
         run: |
           mkdir -p reports artifacts
