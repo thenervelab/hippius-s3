@@ -55,10 +55,6 @@ class Config:
     # Blockchain
     substrate_url: str = env("HIPPIUS_SUBSTRATE_URL")
     validator_region: str = env("HIPPIUS_VALIDATOR_REGION")
-    substrate_max_retries: int = env("HIPPIUS_SUBSTRATE_MAX_RETRIES:3", convert=int)
-    substrate_retry_base_ms: int = env("HIPPIUS_SUBSTRATE_RETRY_BASE_MS:500", convert=int)
-    substrate_retry_max_ms: int = env("HIPPIUS_SUBSTRATE_RETRY_MAX_MS:5000", convert=int)
-    substrate_call_timeout_seconds: float = env("HIPPIUS_SUBSTRATE_CALL_TIMEOUT_SECONDS:20", convert=float)
 
     # Redis for caching/rate limiting
     redis_url: str = env("REDIS_URL")
@@ -124,6 +120,20 @@ class Config:
     ipfs_max_retries: int = env("HIPPIUS_IPFS_MAX_RETRIES:3", convert=int)
     ipfs_retry_base_ms: int = env("HIPPIUS_IPFS_RETRY_BASE_MS:500", convert=int)
     ipfs_retry_max_ms: int = env("HIPPIUS_IPFS_RETRY_MAX_MS:5000", convert=int)
+
+    # Substrate worker configuration
+    substrate_queue_name: str = env("HIPPIUS_SUBSTRATE_QUEUE_NAME:substrate_requests", convert=str)
+    substrate_batch_size: int = env("HIPPIUS_SUBSTRATE_BATCH_SIZE:100", convert=int)
+    substrate_batch_max_age_sec: int = env("HIPPIUS_SUBSTRATE_BATCH_MAX_AGE_SEC:10", convert=int)
+    substrate_max_retries: int = env("HIPPIUS_SUBSTRATE_MAX_RETRIES:3", convert=int)
+    substrate_retry_base_ms: int = env("HIPPIUS_SUBSTRATE_RETRY_BASE_MS:500", convert=int)
+    substrate_retry_max_ms: int = env("HIPPIUS_SUBSTRATE_RETRY_MAX_MS:5000", convert=int)
+    substrate_call_timeout_seconds: float = env("HIPPIUS_SUBSTRATE_CALL_TIMEOUT_SECONDS:20.0", convert=float)
+
+    # Uploader worker retry configuration
+    uploader_max_attempts: int = env("HIPPIUS_UPLOADER_MAX_ATTEMPTS:3", convert=int)
+    uploader_backoff_base_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_BASE_MS:1000", convert=int)
+    uploader_backoff_max_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_MAX_MS:30000", convert=int)
 
 
 def get_config() -> Config:

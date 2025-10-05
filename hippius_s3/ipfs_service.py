@@ -146,6 +146,7 @@ class IPFSService:
         account_address: Optional[str] = None,
         bucket_name: Optional[str] = None,
         wrap_with_directory: bool = False,
+        publish_to_chain: Optional[bool] = None,
     ) -> "IPFSService.PinnedFile":
         """
         Publish bytes to HIPPIUS via SDK when enabled; fallback to upload+pin otherwise.
@@ -153,9 +154,10 @@ class IPFSService:
         This method matches the expectations of the Pinner, which requires an object exposing a .cid attribute
         and, when publishing to chain, a .file_hash attribute (aliasing to the cid).
         """
-        # Prefer SDK s3_publish when we have account context to preserve filename (wrapped directory)
+        should_publish = publish_to_chain if publish_to_chain is not None else self.config.publish_to_chain
+
         try:
-            if self.config.publish_to_chain and seed_phrase and account_address and bucket_name:
+            if should_publish and seed_phrase and account_address and bucket_name:
                 # Use resilient adapter (retries + fallback) for manifest publish
                 resolved = await self.publish_adapter.publish_manifest(
                     file_data=file_data,
