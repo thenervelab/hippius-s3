@@ -44,15 +44,29 @@ services:
     env_file: []
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - ENABLE_REQUEST_PROFILING=false
+      - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
+      - HIPPIUS_IPFS_GET_URL=http://toxiproxy:18080
+      - HIPPIUS_IPFS_STORE_URL=http://toxiproxy:15001
+      - FRONTEND_HMAC_SECRET=unused
+      - RATE_LIMIT_PER_MINUTE=1
+      - MAX_REQUEST_SIZE_MB=1
+      - LOG_LEVEL=DEBUG
+      - HOST=0.0.0.0
+      - PORT=8000
       - ENVIRONMENT=dev
-      - PUBLISH_TO_CHAIN=false
+      - MIN_BUCKET_NAME_LENGTH=1
+      - MAX_BUCKET_NAME_LENGTH=1
+      - MAX_OBJECT_KEY_LENGTH=1
+      - MAX_METADATA_SIZE=1
+      - HIPPIUS_VALIDATOR_REGION=unused
       - REDIS_URL=redis://redis:6379/0
+      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
+      - ENABLE_REQUEST_PROFILING=false
+      - PUBLISH_TO_CHAIN=false
       - HIPPIUS_SUBSTRATE_URL=wss://rpc.hippius.network
       - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
       - HIPPIUS_SUBSTRATE_BATCH_SIZE=1
       - HIPPIUS_SUBSTRATE_BATCH_MAX_AGE_SEC=1
-      - LOG_LEVEL=DEBUG
     volumes:
       - .:/app
 
