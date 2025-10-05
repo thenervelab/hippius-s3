@@ -6,7 +6,6 @@ from pathlib import Path
 
 import redis.asyncio as async_redis
 from dotenv import load_dotenv
-from hippius_sdk.client import HippiusClient
 
 
 # Add parent directory to path to import hippius_s3 modules
