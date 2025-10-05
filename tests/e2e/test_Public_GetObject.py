@@ -61,6 +61,8 @@ def test_public_get_object_anonymous(
     url = f"{s3_base_url}/{bucket_name}/{key}"
     response = requests.get(url, timeout=10)
 
+    print(f"response: {response.content!r}, {url}")
+
     assert response.status_code == 200
     assert response.content == body
     assert response.headers.get("content-type") == "text/plain"

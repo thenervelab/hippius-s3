@@ -20,6 +20,7 @@ from hippius_s3.config import get_config
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
+from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.utils import get_query
 
 
@@ -112,8 +113,31 @@ async def handle_put_object(
         should_encrypt = not bucket["is_public"]
 
         # Unified cache: write base part as part 1 (1-based indexing)
-        await RedisObjectPartsCache(redis_client).set(object_id, 1, file_data)
-        logger.info(f"PUT cache unified write object_id={object_id} part=1 bytes={len(file_data)}")
+        obj_cache = RedisObjectPartsCache(redis_client)
+        if not bucket["is_public"]:
+            # Encrypt-before-Redis: store ciphertext meta first (readiness signal), then chunks
+            chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+            ct_chunks = CryptoService.encrypt_part_to_chunks(
+                file_data,
+                object_id=object_id,
+                part_number=1,
+                seed_phrase=request.state.seed_phrase,
+                chunk_size=chunk_size,
+            )
+            total_ct = sum(len(ct) for ct in ct_chunks)
+            # Write meta first to provide cheap readiness check
+            await obj_cache.set_meta(
+                object_id, 1, chunk_size=chunk_size, num_chunks=len(ct_chunks), size_bytes=total_ct
+            )
+            # Then write chunk data
+            for i, ct in enumerate(ct_chunks):
+                await obj_cache.set_chunk(object_id, 1, i, ct)
+            logger.info(
+                f"PUT cache encrypted write object_id={object_id} part=1 chunks={len(ct_chunks)} bytes={total_ct}"
+            )
+        else:
+            await obj_cache.set(object_id, 1, file_data)
+            logger.info(f"PUT cache unified write object_id={object_id} part=1 bytes={len(file_data)}")
 
         async with db.transaction():
             await db.fetchrow(
@@ -192,6 +216,7 @@ async def handle_put_object(
                 object_key=object_key,
                 should_encrypt=should_encrypt,
                 object_id=object_id,
+                upload_id=str(upload_id),
                 chunks=[Chunk(id=1)],
             ),
             redis_client=redis_client,

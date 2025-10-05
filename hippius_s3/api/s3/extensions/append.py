@@ -29,6 +29,7 @@ from hippius_s3.config import get_config
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
+from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.utils import get_query
 
 
@@ -322,8 +323,34 @@ async def handle_append(
     # Write-through cache: store appended bytes for immediate reads
 
     with contextlib.suppress(Exception):
-        logger.info(f"APPEND cache write object_id={object_id} part={int(next_part)} bytes={len(incoming_bytes)}")
-        await RedisObjectPartsCache(redis_client).set(object_id, int(next_part), incoming_bytes, ttl=1800)
+        logger.info(
+            f"APPEND cache write object_id={object_id} part={int(next_part)} bytes={len(incoming_bytes)} public={bucket['is_public']}"
+        )
+        obj_cache = RedisObjectPartsCache(redis_client)
+        if not bucket["is_public"]:
+            chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+            ct_chunks = CryptoService.encrypt_part_to_chunks(
+                incoming_bytes,
+                object_id=object_id,
+                part_number=int(next_part),
+                seed_phrase=request.state.seed_phrase,
+                chunk_size=chunk_size,
+            )
+            total_ct = sum(len(ct) for ct in ct_chunks)
+            # Write meta first for cheap readiness check
+            await obj_cache.set_meta(
+                object_id,
+                int(next_part),
+                chunk_size=chunk_size,
+                num_chunks=len(ct_chunks),
+                size_bytes=total_ct,
+                ttl=1800,
+            )
+            # Then write chunk data
+            for i, ct in enumerate(ct_chunks):
+                await obj_cache.set_chunk(object_id, int(next_part), i, ct, ttl=1800)
+        else:
+            await obj_cache.set(object_id, int(next_part), incoming_bytes, ttl=1800)
 
     # Enqueue background publish of this part via the pinner worker
     try:

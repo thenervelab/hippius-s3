@@ -219,7 +219,9 @@ async def get_all_storage_requests(
                                     f"Failed to fetch storage request {storage_request_cid} for {account} from {url}: HTTP {response.status_code}"
                                 )
                         except Exception as e:
-                            logger.warning(f"Error fetching storage request {storage_request_cid} for {account} from {url}: {e}")
+                            logger.warning(
+                                f"Error fetching storage request {storage_request_cid} for {account} from {url}: {e}"
+                            )
 
             except Exception as e:
                 logger.warning(f"Error processing storage request key {key}: {e}")

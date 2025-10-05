@@ -1,5 +1,6 @@
 """E2E tests for GetObject with Range requests."""
 
+import time
 from typing import Any
 from typing import Callable
 
@@ -216,6 +217,7 @@ def test_get_object_range_large_spanning_many_parts(
         boto3_client.put_object(
             Bucket=bucket, Key=key, Body=part_data, Metadata={"append": "true", "append-if-version": ver}
         )
+
         ver = boto3_client.head_object(Bucket=bucket, Key=key)["ResponseMetadata"]["HTTPHeaders"].get(
             "x-amz-meta-append-version", "0"
         )
@@ -474,7 +476,6 @@ def test_get_object_range_concurrent_appends(
 ) -> None:
     """Test range requests when object is being appended to concurrently."""
     import threading
-    import time
 
     bucket = unique_bucket_name("range-concurrent")
     cleanup_buckets(bucket)

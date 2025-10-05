@@ -20,6 +20,7 @@ from hippius_s3.config import get_config
 from hippius_s3.repositories.buckets import BucketRepository
 from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
+from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.object_reader import DownloadNotReadyError
 from hippius_s3.services.object_reader import ObjectReader
 from hippius_s3.services.object_reader import Part
@@ -159,17 +160,69 @@ async def handle_copy_object(
                     status_code=503,
                 )
 
-        # Read all parts from cache in order
+        # Read all parts from cache in order (assemble plaintext for private buckets)
         data_chunks: list[bytes] = []
         for p in parts:
-            chunk = await obj_cache.get(src_info.object_id, int(p.part_number))
-            if chunk is None:
-                return errors.s3_error_response(
-                    "SlowDown",
-                    "Source object is not yet available for copying. Please retry shortly.",
-                    status_code=503,
-                )
-            data_chunks.append(chunk)
+            # Prefer chunked meta
+            meta = None
+            try:
+                meta = await obj_cache.get_meta(src_info.object_id, int(p.part_number))  # type: ignore[attr-defined]
+            except Exception:
+                meta = None
+            if meta:
+                num_chunks = int(meta.get("num_chunks", 0))
+                if num_chunks <= 0:
+                    data_chunks.append(b"")
+                    continue
+                chunks: list[bytes] = []
+                for ci in range(num_chunks):
+                    c = await obj_cache.get_chunk(src_info.object_id, int(p.part_number), ci)  # type: ignore[attr-defined]
+                    if c is None:
+                        return errors.s3_error_response(
+                            "SlowDown",
+                            "Source object is not yet available for copying. Please retry shortly.",
+                            status_code=503,
+                        )
+                    chunks.append(c)
+                if not source_is_public:
+                    # Decrypt assembled ciphertext
+                    ct_all = b"".join(chunks)
+                    try:
+                        pt = CryptoService.decrypt_part_auto(
+                            ct_all,
+                            seed_phrase=request.state.seed_phrase,
+                            object_id=src_info.object_id,
+                            part_number=int(p.part_number),
+                            chunk_count=len(chunks),
+                            chunk_loader=lambda i, arr=chunks: arr[i],  # type: ignore[misc]
+                        )
+                    except Exception:
+                        # fallback per-chunk
+                        parts_pt: list[bytes] = []
+                        for ci, c in enumerate(chunks):
+                            parts_pt.append(
+                                CryptoService.decrypt_chunk(
+                                    c,
+                                    seed_phrase=request.state.seed_phrase,
+                                    object_id=src_info.object_id,
+                                    part_number=int(p.part_number),
+                                    chunk_index=ci,
+                                )
+                            )
+                        pt = b"".join(parts_pt)
+                    data_chunks.append(pt)
+                else:
+                    data_chunks.append(b"".join(chunks))
+            else:
+                # Fallback to whole-part key (may be plaintext for public only)
+                chunk = await obj_cache.get(src_info.object_id, int(p.part_number))
+                if chunk is None:
+                    return errors.s3_error_response(
+                        "SlowDown",
+                        "Source object is not yet available for copying. Please retry shortly.",
+                        status_code=503,
+                    )
+                data_chunks.append(chunk)
         src_bytes = b"".join(data_chunks)
 
         # Publish with destination encryption context (or reuse CID if contexts match and CID exists)
