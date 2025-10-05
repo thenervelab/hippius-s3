@@ -64,19 +64,6 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
     )
 
     # Upload manifest to IPFS
-    # Ensure we use HTTPS for API URL to avoid redirect issues
-    api_url = config.ipfs_store_url
-    if api_url.startswith("http://"):
-        api_url = api_url.replace("http://", "https://")
-
-    ipfs_client = HippiusClient(
-        ipfs_gateway=config.ipfs_store_url,
-        ipfs_api_url=api_url,
-        substrate_url=config.substrate_url,
-        encrypt_by_default=False,
-        # Manifest doesn't need encryption
-    )
-
     try:
         # Create temporary file with manifest
         with tempfile.NamedTemporaryFile(

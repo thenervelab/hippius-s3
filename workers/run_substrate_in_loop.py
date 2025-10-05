@@ -8,6 +8,7 @@ from pathlib import Path
 import asyncpg
 import redis.asyncio as async_redis
 
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hippius_s3.config import get_config

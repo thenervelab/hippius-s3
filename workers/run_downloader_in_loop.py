@@ -34,12 +34,6 @@ async def process_download_request(
     """Process a download request by downloading each chunk and storing in Redis."""
 
     obj_cache = RedisObjectPartsCache(redis_client)
-    hippius_client = HippiusClient(
-        ipfs_gateway=config.ipfs_get_url,
-        ipfs_api_url=config.ipfs_store_url,
-        substrate_url=config.substrate_url,
-        encrypt_by_default=False,
-    )
 
     # Use shorter identifier for logging
     short_id = f"{download_request.bucket_name}/{download_request.object_key}"
