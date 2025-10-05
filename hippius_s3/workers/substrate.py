@@ -46,7 +46,7 @@ class SubstrateWorker:
         files_json = json.dumps(file_list, indent=2)
         logger.debug(f"Uploading file list with {len(file_list)} entries to IPFS")
 
-        url = "http://ipfs:5001/api/v0/add"
+        url = f"{self.config.ipfs_store_url.rstrip('/')}/api/v0/add"
         params = {"wrap-with-directory": "false", "cid-version": "1"}
 
         async with httpx.AsyncClient(timeout=30.0) as client:
