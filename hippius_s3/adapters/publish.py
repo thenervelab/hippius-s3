@@ -77,6 +77,8 @@ class ResilientPublishAdapter:
                     subaccount_id=account_address,
                     bucket_name=bucket_name,
                     store_node=self.config.ipfs_store_url,
+                    pin_node=self.config.ipfs_store_url,
+                    substrate_url=self.config.substrate_url,
                 )
                 tx_hash = getattr(pub, "tx_hash", None)
                 logger.info(f"SDK publish complete cid={pub.cid} tx={tx_hash}")
