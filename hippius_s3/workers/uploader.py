@@ -165,7 +165,6 @@ class Uploader:
             file_name=f"{object_key}.part{part_number}",
             content_type="application/octet-stream",
             encrypt=False,
-            seed_phrase=seed_phrase,
         )
 
         chunk_cid = str(upload_result["cid"])

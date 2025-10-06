@@ -16,6 +16,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
+      - HTTP_STREAM_INITIAL_TIMEOUT_SECONDS=0.5
       - LOG_LEVEL=DEBUG
       - FRONTEND_HMAC_SECRET=e2e_test_secret
       - HOST=0.0.0.0

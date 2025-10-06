@@ -124,9 +124,9 @@ def test_get_object_eventual_consistency(
     # Step 3: Get object_id and verify cache exists
     object_id = get_object_id(bucket_name, key)
 
-    # Verify Redis has cached parts (obj:{object_id}:part:{n})
+    # Verify Redis has cached part chunk meta
     redis_client = redis.Redis.from_url("redis://localhost:6379/0")
-    cache_keys = cast(list[bytes], redis_client.keys(f"obj:{object_id}:part:*"))
+    cache_keys = cast(list[bytes], redis_client.keys(f"obj:{object_id}:part:*:meta"))
     assert len(cache_keys) >= 2, f"Expected at least 2 cached parts, found {len(cache_keys)}"
 
     # Step 4: Simulate eventual consistency issue - force all CIDs to 'pending'
