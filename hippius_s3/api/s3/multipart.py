@@ -31,6 +31,7 @@ from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.object_reader import ObjectReader
+from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.utils import get_query
 
 
@@ -647,16 +648,16 @@ async def upload_part(
 
         # Save the part information in the database
         db_start = time.time()
-        await db.fetchrow(
-            get_query("upload_part"),
-            str(uuid.uuid4()),
-            upload_id,
-            part_number,
-            "",
-            # cid not yet available
-            part_result["size_bytes"],
-            part_result["etag"],
-            datetime.now(UTC),
+        await upsert_part_placeholder(
+            db,
+            object_id=str(object_id),
+            upload_id=str(upload_id),
+            part_number=int(part_number),
+            size_bytes=int(file_size),
+            etag=str(etag),
+            chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+            if should_encrypt
+            else None,
         )
         db_time = time.time() - db_start
         logger.debug(f"Part {part_number}: Database insert took {db_time:.3f}s")

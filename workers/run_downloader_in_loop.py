@@ -110,8 +110,7 @@ async def process_download_request(
                 except Exception:
                     cid_plan = []
 
-<<<<<<< HEAD
-                # Fallback to single CID if no part_chunks in DB
+                # Fallback if no part_chunks rows in DB: honor requested indices if provided, else default to index 0
                 if not cid_plan:
                     cid_str = str(chunk.cid or "").strip().lower()
                     if cid_str in {"", "none", "pending"}:
@@ -126,28 +125,11 @@ async def process_download_request(
                         except Exception:
                             chunk_logger.debug("Failed to delete in-progress flag for invalid CID", exc_info=True)
                         return False
-=======
-            # Fallback if no part_chunks rows in DB: honor requested indices if provided, else default to index 0
-            if not cid_plan:
-                cid_str = str(chunk.cid or "").strip().lower()
-                if cid_str in {"", "none", "pending"}:
-                    chunk_logger.error(
-                        f"Skipping download for part {chunk.part_id}: invalid CID '{chunk.cid}' and no part_chunks"
-                    )
-                    # Clear in-progress flag so future attempts aren't blocked by TTL
-                    try:
-                        await redis_client.delete(
-                            f"download_in_progress:{download_request.object_id}:{int(chunk.part_id)}"
-                        )
-                    except Exception:
-                        chunk_logger.debug("Failed to delete in-progress flag for invalid CID", exc_info=True)
-                    return False
-                requested = list(getattr(chunk, "chunk_indices", []) or [])
-                if requested:
-                    cid_plan = [(int(i), str(chunk.cid), None) for i in requested]
-                else:
->>>>>>> d4dc9f7 (fixes)
-                    cid_plan = [(0, str(chunk.cid), None)]
+                    requested = list(getattr(chunk, "chunk_indices", []) or [])
+                    if requested:
+                        cid_plan = [(int(i), str(chunk.cid), None) for i in requested]
+                    else:
+                        cid_plan = [(0, str(chunk.cid), None)]
 
             max_attempts = getattr(config, "downloader_chunk_retries", 5)
             base_sleep = getattr(config, "downloader_retry_base_seconds", 0.25)
@@ -237,14 +219,34 @@ async def process_download_request(
                         )
                     else:
                         # Single-chunk case: write meta first, then chunk at the requested index (default 0)
+                        # Ensure meta reflects at least the requested index (e.g., idx=1 => num_chunks >= 2)
+                        target_index = int(cid_plan[0][0]) if cid_plan else 0
+
+                        # If chunk_size not known from DB plan, try to read authoritative value from DB meta
+                        eff_chunk_size = auth_chunk_size
+                        if eff_chunk_size <= 0:
+                            try:
+                                from hippius_s3.metadata.meta_reader import read_db_meta  # local import to avoid cycles
+
+                                db_meta = await read_db_meta(db, download_request.object_id, int(chunk.part_id))
+                                eff_chunk_size = (
+                                    int(db_meta["chunk_size_bytes"])
+                                    if db_meta and db_meta.get("chunk_size_bytes")
+                                    else 0
+                                )
+                            except Exception:
+                                eff_chunk_size = 0
+                        if eff_chunk_size <= 0:
+                            # Final fallback to configured chunk size to avoid stalling range math
+                            eff_chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+
                         await obj_cache.set_meta(
                             download_request.object_id,
                             part_num,
-                            chunk_size=auth_chunk_size,  # authoritative from DB if available
-                            num_chunks=1,
+                            chunk_size=eff_chunk_size,
+                            num_chunks=max(1, target_index + 1),
                             size_bytes=len(chunk_data),
                         )
-                        target_index = int(cid_plan[0][0]) if cid_plan else 0
                         data_i = by_index.get(target_index, chunk_data)
                         await obj_cache.set_chunk(download_request.object_id, part_num, target_index, data_i)
                         chunk_logger.info(

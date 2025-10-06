@@ -1,7 +1,17 @@
 services:
+  base:
+    image: hippius-s3-base:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.base
+    profiles:
+      - build-base
   api:
+    build: .
     # Ensure CI does not depend on a local .env file
     env_file: []
+    ports:
+      - "8000:8000"
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
@@ -11,7 +21,6 @@ services:
       - ENABLE_REQUEST_PROFILING=false
       - ENABLE_BANHAMMER=false
       - RATE_LIMIT_PER_MINUTE=100000
-<<<<<<< HEAD
       - HIPPIUS_IPFS_GET_URL=http://toxiproxy:18080
       - HIPPIUS_IPFS_STORE_URL=http://toxiproxy:15001
       - REDIS_URL=redis://redis:6379/0
@@ -24,12 +33,26 @@ services:
       - PORT=8000
       - HIPPIUS_SUBSTRATE_URL=wss://rpc.hippius.network
       - HIPPIUS_VALIDATOR_REGION=decentralized
+    depends_on:
+      db:
+        condition: service_healthy
+      ipfs:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      redis-accounts:
+        condition: service_healthy
     volumes:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
       - ./.e2e/dlq_archive:/tmp/hippius_dlq_archive
+    networks:
+      - hippius_net
 
   uploader:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
     command: ["python", "workers/run_uploader_in_loop.py"]
     env_file: []
     environment:
@@ -48,12 +71,22 @@ services:
       - HIPPIUS_UPLOADER_MAX_ATTEMPTS=2
       - HIPPIUS_UPLOADER_BACKOFF_BASE_MS=100
       - HIPPIUS_UPLOADER_BACKOFF_MAX_MS=500
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
       - ./.e2e/dlq_archive:/tmp/hippius_dlq_archive
+    networks:
+      - hippius_net
 
   substrate:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
     command: ["python", "workers/run_substrate_in_loop.py"]
     env_file: []
     environment:
@@ -81,10 +114,20 @@ services:
       - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
       - HIPPIUS_SUBSTRATE_BATCH_SIZE=1
       - HIPPIUS_SUBSTRATE_BATCH_MAX_AGE_SEC=1
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - .:/app
+    networks:
+      - hippius_net
 
   unpinner:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
     command: ["python", "workers/run_unpinner_in_loop.py"]
     env_file: []
     environment:
@@ -97,10 +140,20 @@ services:
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
       - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - .:/app
+    networks:
+      - hippius_net
 
   downloader:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
     command: ["python", "workers/run_downloader_in_loop.py"]
     env_file: []
     environment:
@@ -114,8 +167,15 @@ services:
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
       - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - .:/app
+    networks:
+      - hippius_net
 
   chain-pin-checker:
     build:
@@ -134,13 +194,20 @@ services:
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
       - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - .:/app
+    networks:
+      - hippius_net
 
   toxiproxy:
     image: shopify/toxiproxy:latest
     ports:
-      - "8474:8474" # control API (for host-driven tests if needed)
+      - "8474:8474"
     depends_on:
       - ipfs
     networks:
@@ -163,8 +230,58 @@ services:
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
       - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - .:/app
+
+  db:
+    image: postgres:15
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=hippius
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hippius_net
+
+  ipfs:
+    image: ipfs/kubo:latest
+    # No host port bindings needed for CI; services use internal DNS
+    environment:
+      - IPFS_PROFILE=server
+    healthcheck:
+      test: ["CMD-SHELL", "ipfs id"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - hippius_net
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+    networks:
+      - hippius_net
+
+  redis-accounts:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+    networks:
+      - hippius_net
 
 networks:
   hippius_net:

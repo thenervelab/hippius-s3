@@ -16,7 +16,8 @@ class Config:
 
     # Database Configuration
     database_url: str = env("DATABASE_URL")
-    encryption_database_url: str = env("HIPPIUS_KEYSTORE_DATABASE_URL")
+    # Inline default prevents KeyError during class init; runtime fallback to DATABASE_URL is applied in get_config()
+    encryption_database_url: str = env("HIPPIUS_KEYSTORE_DATABASE_URL:", convert=str)
 
     # IPFS Configuration
     ipfs_get_url: str = env("HIPPIUS_IPFS_GET_URL")
@@ -82,9 +83,6 @@ class Config:
     # Resubmission settings
     resubmission_seed_phrase: str = env("RESUBMISSION_SEED_PHRASE")
 
-    # Publishing toggle (read directly from env; default true)
-    publish_to_chain: bool = env("PUBLISH_TO_CHAIN:true", convert=lambda x: x.lower() == "true")
-
     # Uploader configuration (supersedes legacy pinner config)
     uploader_max_attempts: int = env("HIPPIUS_UPLOADER_MAX_ATTEMPTS:5", convert=int)
     uploader_backoff_base_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_BASE_MS:500", convert=int)
@@ -146,4 +144,11 @@ class Config:
 
 def get_config() -> Config:
     """Get application configuration."""
-    return Config()
+    cfg = Config()
+    try:
+        if not getattr(cfg, "encryption_database_url", None):
+            object.__setattr__(cfg, "encryption_database_url", cfg.database_url)
+    except Exception:
+        # Last resort: ensure a usable value
+        object.__setattr__(cfg, "encryption_database_url", cfg.database_url)
+    return cfg
