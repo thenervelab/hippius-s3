@@ -68,20 +68,19 @@ class Uploader:
         self.dlq_storage = DLQStorage()
 
     async def process_upload(self, payload: UploadChainRequest) -> List[str]:
+        start_time = time.time()
         logger.info(f"Processing upload object_id={payload.object_id} chunks={len(payload.chunks)}")
 
-        await self.db.execute(
-            "UPDATE objects SET status = 'processing' WHERE object_id = $1",
-            payload.object_id,
-        )
-
+        chunk_start = time.time()
         chunk_cids = await self._upload_chunks(
             object_id=payload.object_id,
             object_key=payload.object_key,
             chunks=payload.chunks,
             seed_phrase=payload.subaccount_seed_phrase,
         )
+        chunk_duration = time.time() - chunk_start
 
+        manifest_start = time.time()
         manifest_cid = await self._build_and_upload_manifest(
             object_id=payload.object_id,
             object_key=payload.object_key,
@@ -90,13 +89,9 @@ class Uploader:
             account_address=payload.address,
             bucket_name=payload.bucket_name,
         )
+        manifest_duration = time.time() - manifest_start
 
         all_cids = chunk_cids + [manifest_cid]
-
-        await self.db.execute(
-            "UPDATE objects SET status = 'publishing' WHERE object_id = $1",
-            payload.object_id,
-        )
 
         await enqueue_substrate_request(
             SubstratePinningRequest(
@@ -107,7 +102,11 @@ class Uploader:
             self.redis_client,
         )
 
-        logger.info(f"Upload complete object_id={payload.object_id} cids={len(all_cids)}")
+        total_duration = time.time() - start_time
+        logger.info(
+            f"Upload complete object_id={payload.object_id} cids={len(all_cids)} "
+            f"chunks={chunk_duration:.2f}s manifest={manifest_duration:.2f}s total={total_duration:.2f}s"
+        )
         return all_cids
 
     async def _upload_chunks(
@@ -119,7 +118,7 @@ class Uploader:
     ) -> List[str]:
         logger.debug(f"Uploading {len(chunks)} chunks for object_id={object_id}")
 
-        concurrency = self.config.pinner_multipart_max_concurrency
+        concurrency = self.config.uploader_multipart_max_concurrency
         semaphore = asyncio.Semaphore(concurrency)
 
         async def upload_chunk(chunk: Chunk) -> Tuple[str, int]:
@@ -170,21 +169,66 @@ class Uploader:
         chunk_cid = str(upload_result["cid"])
         logger.debug(f"Chunk uploaded object_id={object_id} part={part_number} cid={chunk_cid}")
 
-        cid_row = await self.db.fetchrow(get_query("upsert_cid"), chunk_cid)
-        cid_id = cid_row["id"] if cid_row else None
+        cid_id = None
+        try:
+            cid_row = await self.db.fetchrow(get_query("upsert_cid"), chunk_cid)
+            cid_id = cid_row["id"] if cid_row else None
+        except Exception:
+            cid_id = None
 
-        await self.db.execute(
-            """
-            UPDATE parts
-            SET ipfs_cid = $3, size_bytes = $4, cid_id = COALESCE($5, cid_id), uploaded_at = NOW()
-            WHERE object_id = $1 AND part_number = $2
-            """,
-            object_id,
-            part_number,
-            chunk_cid,
-            len(chunk_data),
-            cid_id,
-        )
+        try:
+            updated = await self.db.execute(
+                """
+                UPDATE parts
+                SET ipfs_cid = $3, size_bytes = $4, cid_id = COALESCE($5, cid_id)
+                WHERE object_id = $1 AND part_number = $2
+                """,
+                object_id,
+                part_number,
+                chunk_cid,
+                len(chunk_data),
+                cid_id,
+            )
+            updated_str = str(updated or "")
+            rows_affected = 0
+            if updated_str.upper().startswith("UPDATE"):
+                rows_affected = int(updated_str.split(" ")[-1])
+            else:
+                rows_affected = int(updated_str) if updated_str else 0
+
+            if rows_affected == 0:
+                await self.db.execute(
+                    """
+                    INSERT INTO parts (part_id, object_id, part_number, ipfs_cid, size_bytes, cid_id, uploaded_at)
+                    VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, NOW())
+                    ON CONFLICT (object_id, part_number) DO UPDATE SET
+                        ipfs_cid = EXCLUDED.ipfs_cid,
+                        size_bytes = EXCLUDED.size_bytes,
+                        cid_id = COALESCE(EXCLUDED.cid_id, parts.cid_id)
+                    """,
+                    object_id,
+                    part_number,
+                    chunk_cid,
+                    len(chunk_data),
+                    cid_id,
+                )
+        except Exception:
+            logger.debug("Uploader update failed; falling back to upsert", exc_info=True)
+            await self.db.execute(
+                """
+                INSERT INTO parts (part_id, object_id, part_number, ipfs_cid, size_bytes, cid_id, uploaded_at)
+                VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, NOW())
+                ON CONFLICT (object_id, part_number) DO UPDATE SET
+                    ipfs_cid = EXCLUDED.ipfs_cid,
+                    size_bytes = EXCLUDED.size_bytes,
+                    cid_id = COALESCE(EXCLUDED.cid_id, parts.cid_id)
+                """,
+                object_id,
+                part_number,
+                chunk_cid,
+                len(chunk_data),
+                cid_id,
+            )
 
         return chunk_cid, part_number
 
@@ -250,13 +294,16 @@ class Uploader:
 
         manifest_cid = manifest_result.cid
 
+        cid_id = None
         cid_row = await self.db.fetchrow(get_query("upsert_cid"), manifest_cid)
         cid_id = cid_row["id"] if cid_row else None
 
         await self.db.execute(
             """
             UPDATE objects
-            SET ipfs_cid = $2, cid_id = COALESCE($3, cid_id)
+            SET ipfs_cid = $2,
+                cid_id = COALESCE($3, cid_id),
+                status = 'pinning'
             WHERE object_id = $1
             """,
             object_id,

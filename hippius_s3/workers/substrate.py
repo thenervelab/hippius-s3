@@ -4,6 +4,7 @@ import json
 import logging
 import pprint
 import random
+import time
 import uuid
 from typing import Any
 from typing import Dict
@@ -59,7 +60,7 @@ class SubstrateWorker:
             resp.raise_for_status()
             result = resp.json()
             cid: str = result["Hash"]
-            logger.debug(f"File list uploaded to IPFS cid={cid}")
+            logger.debug(f"File list uploaded and pinned to IPFS cid={cid}")
             return cid
 
     async def _submit_extrinsic_with_retry(
@@ -100,6 +101,7 @@ class SubstrateWorker:
         raise SubstrateRequestException("Unknown substrate submission failure")
 
     async def process_batch(self, requests: List[SubstratePinningRequest]) -> bool:
+        start_time = time.time()
         logger.info(f"Processing substrate batch requests={len(requests)}")
 
         self.connect()
@@ -113,6 +115,7 @@ class SubstrateWorker:
             user_cid_map[req.address].extend(req.cids)
             user_request_map[req.address].append(req)
 
+        file_list_start = time.time()
         calls = []
         for user_address, cids in user_cid_map.items():
             file_list = [{"file_hash": cid, "file_name": f"s3-{cid}"} for cid in cids]
@@ -135,6 +138,7 @@ class SubstrateWorker:
                 call_params=call_params,
             )
             calls.append(call)
+        file_list_duration = time.time() - file_list_start
 
         batch_call = self.substrate.compose_call(
             call_module="Utility",
@@ -149,21 +153,40 @@ class SubstrateWorker:
             keypair=self.keypair,
         )
 
+        submit_start = time.time()
         logger.info(f"Submitting batched transaction users={len(user_cid_map)} total_calls={len(calls)}")
         receipt = await self._submit_extrinsic_with_retry(
             extrinsic,
             max_retries=self.config.substrate_max_retries,
             timeout_seconds=self.config.substrate_call_timeout_seconds,
         )
+        submit_duration = time.time() - submit_start
+        error_msg = None
 
-        if receipt.is_success:
+        try:
+            is_success = receipt.is_success
             tx_hash = receipt.extrinsic_hash
-            logger.info(f"Batched transaction successful tx_hash={tx_hash}")
+            if not is_success:
+                error_msg = receipt.error_message
+        except Exception as e:
+            logger.error(f"Failed to check receipt status: {e}")
+            raise SubstrateRequestException(f"Failed to verify transaction receipt: {e}") from None
+
+        if is_success:
+            total_duration = time.time() - start_time
+            logger.info(
+                f"Batched transaction successful tx_hash={tx_hash} "
+                f"file_list={file_list_duration:.2f}s submit={submit_duration:.2f}s total={total_duration:.2f}s"
+            )
 
             for req in requests:
-                await self.db.execute("UPDATE objects SET status = 'published' WHERE object_id = $1", req.object_id)
+                await self.db.execute(
+                    "UPDATE objects SET status = 'uploaded' WHERE object_id = $1 AND status != 'uploaded'",
+                    req.object_id,
+                )
+                logger.info(f"Updated object status to 'uploaded' object_id={req.object_id}")
 
             return True
 
-        logger.error(f"Batched transaction failed: {receipt.error_message}")
-        raise SubstrateRequestException(f"Transaction failed: {receipt.error_message}")
+        logger.error(f"Batched transaction failed: {error_msg}")
+        raise SubstrateRequestException(f"Transaction failed: {error_msg}")

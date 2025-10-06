@@ -140,8 +140,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    deploy:
-      replicas: 3
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
