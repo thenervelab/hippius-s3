@@ -49,6 +49,8 @@ services:
       - HIPPIUS_UPLOADER_BACKOFF_MAX_MS=500
     volumes:
       - .:/app
+      - ./.e2e/dlq:/tmp/hippius_dlq
+      - ./.e2e/dlq_archive:/tmp/hippius_dlq_archive
 
   substrate:
     command: ["python", "workers/run_substrate_in_loop.py"]
