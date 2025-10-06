@@ -87,8 +87,13 @@ async def process_download_request(
                                     )
                                     try:
                                         from hippius_s3.metadata.meta_reader import read_db_meta
+
                                         db_meta = await read_db_meta(db, download_request.object_id, int(chunk.part_id))
-                                        chunk_size = int(db_meta["chunk_size_bytes"]) if db_meta and db_meta["chunk_size_bytes"] else 0
+                                        chunk_size = (
+                                            int(db_meta["chunk_size_bytes"])
+                                            if db_meta and db_meta["chunk_size_bytes"]
+                                            else 0
+                                        )
                                     except Exception:
                                         chunk_size = 0
                                     if chunk_size <= 0:
