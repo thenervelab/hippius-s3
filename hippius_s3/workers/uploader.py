@@ -339,16 +339,49 @@ class Uploader:
         logger.warning(f"Pushed to DLQ: object_id={payload.object_id}, error_type={error_type}, error={last_error}")
 
     async def _persist_chunks_to_dlq(self, payload: UploadChainRequest) -> None:
-        """Persist all available chunks from cache to DLQ filesystem."""
+        """Persist all available chunks + metadata from cache to DLQ filesystem."""
         object_id = payload.object_id
 
-        for chunk in payload.chunks:
-            part_number = int(chunk.id)
+        try:
+            for chunk in payload.chunks:
+                part_number = int(chunk.id)
 
-            chunk_data = await self.obj_cache.get(object_id, part_number)
-            if chunk_data is None:
-                logger.warning(f"No cached data for object {object_id} part {part_number}, skipping DLQ persistence")
-                continue
+                meta = await self.obj_cache.get_meta(object_id, part_number)
+                if not meta:
+                    logger.warning(
+                        f"No cached meta for object {object_id} part {part_number}, skipping DLQ persistence"
+                    )
+                    continue
 
-            self.dlq_storage.save_chunk(object_id, part_number, chunk_data)
-            logger.debug(f"Persisted chunk {part_number} for object {object_id} to DLQ")
+                try:
+                    self.dlq_storage.save_meta(object_id, part_number, meta)
+                    logger.debug(f"Persisted meta for part {part_number} of object {object_id} to DLQ")
+                except Exception as e:
+                    logger.error(f"Failed to persist meta for part {part_number} of object {object_id} to DLQ: {e}")
+                    continue
+
+                num_chunks = int(meta.get("num_chunks", 0))
+                if num_chunks == 0:
+                    logger.warning(f"Meta has num_chunks=0 for object {object_id} part {part_number}")
+                    continue
+
+                pieces_saved = 0
+                for ci in range(num_chunks):
+                    piece = await self.obj_cache.get_chunk(object_id, part_number, ci)
+                    if isinstance(piece, (bytes, bytearray)) and len(piece) > 0:
+                        try:
+                            self.dlq_storage.save_chunk_piece(object_id, part_number, ci, bytes(piece))
+                            pieces_saved += 1
+                        except Exception as e:
+                            logger.error(
+                                f"Failed to persist chunk piece {ci} for object {object_id} part {part_number}: {e}"
+                            )
+                    else:
+                        logger.warning(f"Missing chunk piece {ci} for object {object_id} part {part_number} in Redis")
+
+                logger.debug(
+                    f"Persisted {pieces_saved}/{num_chunks} pieces for part {part_number} of object {object_id} to DLQ"
+                )
+
+        except Exception as e:
+            logger.error(f"Failed to persist chunks for object {object_id} to DLQ: {e}")
