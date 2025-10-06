@@ -9,7 +9,6 @@ from pathlib import Path
 import aiofiles
 import httpx
 import redis.asyncio as async_redis
-from hippius_sdk import HippiusClient
 from hippius_sdk.substrate import SubstrateClient
 
 from hippius_s3.queue import UnpinChainRequest
@@ -64,19 +63,6 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
     )
 
     # Upload manifest to IPFS
-    # Ensure we use HTTPS for API URL to avoid redirect issues
-    api_url = config.ipfs_store_url
-    if api_url.startswith("http://"):
-        api_url = api_url.replace("http://", "https://")
-
-    ipfs_client = HippiusClient(
-        ipfs_gateway=config.ipfs_store_url,
-        ipfs_api_url=api_url,
-        substrate_url=config.substrate_url,
-        encrypt_by_default=False,
-        # Manifest doesn't need encryption
-    )
-
     try:
         # Create temporary file with manifest
         with tempfile.NamedTemporaryFile(
@@ -95,8 +81,6 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
 
             # Ensure we're using HTTPS and the correct endpoint
             base_url = config.ipfs_store_url.rstrip("/")
-            if not base_url.startswith("https://"):
-                base_url = base_url.replace("http://", "https://")
 
             upload_url = f"{base_url}/api/v0/add?wrap-with-directory=false&cid-version=1"
             logger.info(f"Uploading manifest to: {upload_url}")
@@ -126,10 +110,13 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
 
         logger.info(f"Uploaded manifest directly to IPFS with CID: {manifest_cid}")
 
-        # Pin the manifest
-        pinning_result = await ipfs_client.pin(manifest_cid, seed_phrase)
-        if not pinning_result["success"]:
-            raise Exception(pinning_result["message"])
+        # Pin the manifest to local IPFS node
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            pin_url = f"{base_url}/api/v0/pin/add?arg={manifest_cid}"
+            logger.debug(f"Pinning manifest to local IPFS: {pin_url}")
+            pin_response = await client.post(pin_url)
+            pin_response.raise_for_status()
+            logger.info(f"Pinned manifest to local IPFS node: {manifest_cid}")
 
         manifest = {"cid": manifest_cid}
 

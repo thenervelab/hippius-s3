@@ -63,11 +63,11 @@ def test_dlq_requeue_multipart_upload(
         print(f"DEBUG: Proxy status confirmed disabled: {proxy_data['enabled']}")
     else:
         assert resp.status_code == 404, f"Unexpected status from toxiproxy: {resp.status_code} {resp.text}"
-    # Verify IPFS is truly down from inside the pinner container before proceeding
-    assert wait_for_ipfs_state(False, service="pinner"), "IPFS still reachable after break"
+    # Verify IPFS is truly down from inside the uploader container before proceeding
+    assert wait_for_ipfs_state(False, service="uploader"), "IPFS still reachable after break"
 
     try:
-        # Attempt to complete multipart upload - API should return 200 even if pinner later fails
+        # Attempt to complete multipart upload - API should return 200 even if uploader later fails
         boto3_client.complete_multipart_upload(
             Bucket=bucket,
             Key=key,
@@ -80,7 +80,7 @@ def test_dlq_requeue_multipart_upload(
             },
         )
 
-        # Wait for the pinner to push the job to DLQ (IPFS down)
+        # Wait for the uploader to push the job to DLQ (IPFS down)
         # Poll DLQ up to a short timeout
         import redis as _redis  # type: ignore[import-untyped]
 
@@ -98,7 +98,7 @@ def test_dlq_requeue_multipart_upload(
             if found:
                 break
             time.sleep(0.2)
-        assert found, "DLQ entry not found after waiting for pinner to fail"
+        assert found, "DLQ entry not found after waiting for uploader to fail"
 
         # Verify DLQ entry exists
         r = redis.Redis.from_url("redis://localhost:6379/0")
@@ -149,9 +149,9 @@ def test_dlq_requeue_multipart_upload(
         assert not r.exists(f"obj:{object_id}:part:0:meta"), "Part 0 cache not cleared"
         assert not r.exists(f"obj:{object_id}:part:1:meta"), "Part 1 cache not cleared"
 
-        # Heal IPFS before requeue so pinner can complete successfully
+        # Heal IPFS before requeue so uploader can complete successfully
         enable_ipfs_proxy()
-        assert wait_for_ipfs_state(True, service="pinner"), "IPFS did not come back after heal"
+        assert wait_for_ipfs_state(True, service="uploader"), "IPFS did not come back after heal"
 
         # Run the requeue CLI command inside the api container (mounted /app)
         code, out, err = exec_python_module(

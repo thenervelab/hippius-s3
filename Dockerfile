@@ -1,14 +1,9 @@
-FROM python:3.11-slim
+FROM hippius-s3-base:latest
 
-WORKDIR /app
-
-# Install dependencies including dbmate, gcc, and build tools
+# Install dbmate for migrations
 RUN apt-get update && apt-get install -y \
     curl \
     ca-certificates \
-    gcc \
-    g++ \
-    make \
     && curl -fsSL -o /usr/local/bin/dbmate https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-amd64 \
     && chmod +x /usr/local/bin/dbmate \
     && apt-get clean \
@@ -16,12 +11,6 @@ RUN apt-get update && apt-get install -y \
 
 # Copy the entire project
 COPY . .
-
-# Install Python dependencies
-RUN pip install --no-cache-dir -e .
-
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
 
 # Run migrations and then start the application
 CMD ["sh", "-c", "python -m hippius_s3.scripts.migrate && uvicorn hippius_s3.main:app --host 0.0.0.0 --port 8000 --reload --log-level debug --access-log"]

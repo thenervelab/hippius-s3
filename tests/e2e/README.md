@@ -50,7 +50,7 @@ To make the tests truly end-to-end, you need to:
 
 ### 1. Remove Environment Bypasses
 
-Remove these from `docker-compose.e2e.yml` (they are set under the `api`, `pinner`, and `unpinner` services):
+Remove these from `docker-compose.e2e.yml` (they are set under the `api`, `uploader`, `substrate`, and `unpinner` services):
 
 ```yaml
 # In docker-compose.e2e.yml
@@ -60,7 +60,11 @@ services:
       # delete these lines
       - HIPPIUS_BYPASS_CREDIT_CHECK=true
       - PUBLISH_TO_CHAIN=false
-  pinner:
+  uploader:
+    environment:
+      # delete this line
+      - PUBLISH_TO_CHAIN=false
+  substrate:
     environment:
       # delete this line
       - PUBLISH_TO_CHAIN=false
