@@ -1072,12 +1072,14 @@ async def complete_multipart_upload(
             object_id,
         )
 
-        # Mark multipart upload as completed
-        await db.execute(
-            "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
-            upload_id,
-        )
+        # Mark multipart upload as completed and only enqueue after DB commit
+        async with db.transaction():
+            await db.execute(
+                "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
+                upload_id,
+            )
 
+        # After commit, enqueue background publish
         await enqueue_upload_request(
             UploadChainRequest(
                 object_key=object_key,

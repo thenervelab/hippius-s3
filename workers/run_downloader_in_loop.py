@@ -63,7 +63,7 @@ async def process_download_request(
         async def download_chunk(chunk):
             chunk_logger = logging.getLogger(__name__)
             async with semaphore:
-                # Build per-part download plan from DB
+                # Build per-part download plan from DB; optionally restrict to in-range chunk indices
                 cid_plan: list[tuple[int, str, int | None]] = []
                 try:
                     rows = await db.fetch(
@@ -71,10 +71,50 @@ async def process_download_request(
                         download_request.object_id,
                         int(chunk.part_id),
                     )
-                    cid_plan.extend((int(r[0]), str(r[1]), int(r[2]) if r[2] is not None else None) for r in rows or [])
+                    all_entries = [(int(r[0]), str(r[1]), int(r[2]) if r[2] is not None else None) for r in rows or []]
+                    # Restrict to requested indices if provided
+                    if getattr(chunk, "chunk_indices", None):
+                        idx_set = set(int(i) for i in chunk.chunk_indices or [])
+                        cid_plan.extend([e for e in all_entries if e[0] in idx_set])
+                        # Check for missing indices and slice part CID for them if needed
+                        if idx_set:
+                            found_indices = {e[0] for e in cid_plan}
+                            missing_indices = idx_set - found_indices
+                            if missing_indices and chunk.cid:
+                                # Slice part-level CID for missing chunk indices
+                                chunk_logger.info(
+                                    f"Backfilling missing chunk indices {sorted(missing_indices)} from part CID for part {chunk.part_id}"
+                                )
+                                # Fetch chunk size from DB meta or use config default
+                                try:
+                                    from hippius_s3.metadata.meta_reader import read_db_meta
+
+                                    db_meta = await read_db_meta(db, download_request.object_id, int(chunk.part_id))
+                                    chunk_size = (
+                                        db_meta["chunk_size_bytes"]
+                                        if db_meta and db_meta["chunk_size_bytes"]
+                                        else config.object_chunk_size_bytes
+                                    )
+                                except Exception:
+                                    chunk_size = config.object_chunk_size_bytes
+
+                                # For each missing index, create a plan entry to fetch via range
+                                for mi in sorted(missing_indices):
+                                    start_byte = mi * chunk_size
+                                    end_byte = start_byte + chunk_size - 1
+                                    # Create synthetic entry; hippius_client.s3_download doesn't support range yet,
+                                    # so we'll fetch the full part CID and slice locally for now
+                                    # TODO: Implement IPFS range fetch for efficiency
+                                    cid_plan.append((mi, str(chunk.cid), None))
+                                chunk_logger.warning(
+                                    f"Part {chunk.part_id}: backfilled {len(missing_indices)} missing indices; will fetch full part and slice"
+                                )
+                    else:
+                        cid_plan.extend(all_entries)
                 except Exception:
                     cid_plan = []
 
+<<<<<<< HEAD
                 # Fallback to single CID if no part_chunks in DB
                 if not cid_plan:
                     cid_str = str(chunk.cid or "").strip().lower()
@@ -90,6 +130,27 @@ async def process_download_request(
                         except Exception:
                             chunk_logger.debug("Failed to delete in-progress flag for invalid CID", exc_info=True)
                         return False
+=======
+            # Fallback if no part_chunks rows in DB: honor requested indices if provided, else default to index 0
+            if not cid_plan:
+                cid_str = str(chunk.cid or "").strip().lower()
+                if cid_str in {"", "none", "pending"}:
+                    chunk_logger.error(
+                        f"Skipping download for part {chunk.part_id}: invalid CID '{chunk.cid}' and no part_chunks"
+                    )
+                    # Clear in-progress flag so future attempts aren't blocked by TTL
+                    try:
+                        await redis_client.delete(
+                            f"download_in_progress:{download_request.object_id}:{int(chunk.part_id)}"
+                        )
+                    except Exception:
+                        chunk_logger.debug("Failed to delete in-progress flag for invalid CID", exc_info=True)
+                    return False
+                requested = list(getattr(chunk, "chunk_indices", []) or [])
+                if requested:
+                    cid_plan = [(int(i), str(chunk.cid), None) for i in requested]
+                else:
+>>>>>>> d4dc9f7 (fixes)
                     cid_plan = [(0, str(chunk.cid), None)]
 
             max_attempts = getattr(config, "downloader_chunk_retries", 5)
@@ -109,25 +170,39 @@ async def process_download_request(
                     )
 
                     # Download per plan entry (DB-driven chunk layout if available)
-                    assembled: list[bytes] = []
+                    # Deduplicate CID fetches to avoid redundant IPFS downloads
+                    cid_cache: dict[str, bytes] = {}
+                    assembled: list[tuple[int, bytes]] = []  # (chunk_index, data)
+
                     for ci, cid_val, expected_len in cid_plan:
                         chunk_logger.debug(
                             f"Downloading part {chunk.part_id} ci={ci} CID={cid_val[:10]}... expected={expected_len}"
                         )
-                        data_i = await hippius_client.s3_download(
-                            cid=cid_val,
-                            subaccount_id=download_request.subaccount,
-                            bucket_name=download_request.bucket_name,
-                            auto_decrypt=False,
-                            download_node=download_request.ipfs_node,
-                            return_bytes=True,
-                        )
+                        # Check if we already fetched this CID
+                        if cid_val in cid_cache:
+                            data_i = cid_cache[cid_val]
+                            chunk_logger.debug(f"Using cached CID data for ci={ci}")
+                        else:
+                            data_i = await hippius_client.s3_download(
+                                cid=cid_val,
+                                subaccount_id=download_request.subaccount,
+                                bucket_name=download_request.bucket_name,
+                                auto_decrypt=False,
+                                download_node=download_request.ipfs_node,
+                                return_bytes=True,
+                            )
+                            cid_cache[cid_val] = data_i
+
                         if expected_len is not None and len(data_i) != int(expected_len):
                             chunk_logger.warning(
                                 f"Cipher len mismatch for part {chunk.part_id} ci={ci}: got={len(data_i)} expected={expected_len}"
                             )
-                        assembled.append(data_i)
-                    chunk_data = b"".join(assembled)
+                        assembled.append((ci, data_i))
+
+                    # Sort by chunk index and concatenate; also map by index for targeted writes
+                    assembled.sort(key=lambda x: x[0])
+                    by_index: dict[int, bytes] = {int(i): bytes(d) for i, d in assembled}
+                    chunk_data = b"".join([data for _, data in assembled])
 
                     md5 = _hashlib.md5(chunk_data).hexdigest()
                     head_hex = chunk_data[:8].hex()
@@ -148,14 +223,14 @@ async def process_download_request(
                             num_chunks=len(cid_plan),
                             size_bytes=len(chunk_data),
                         )
-                        for idx, (ci, _cid, _exp) in enumerate(cid_plan):
-                            data_i = assembled[idx] if idx < len(assembled) else b""
+                        for ci, _cid, _exp in cid_plan:
+                            data_i = by_index.get(int(ci), b"")
                             await obj_cache.set_chunk(download_request.object_id, part_num, int(ci), data_i)
                         chunk_logger.info(
                             f"OBJ-CACHE stored (DB layout) object_id={download_request.object_id} part={part_num} ct_chunks={len(cid_plan)} total_bytes={len(chunk_data)}"
                         )
                     else:
-                        # Single-chunk case: write meta first, then chunk at index 0
+                        # Single-chunk case: write meta first, then chunk at the requested index (default 0)
                         await obj_cache.set_meta(
                             download_request.object_id,
                             part_num,
@@ -163,9 +238,11 @@ async def process_download_request(
                             num_chunks=1,
                             size_bytes=len(chunk_data),
                         )
-                        await obj_cache.set_chunk(download_request.object_id, part_num, 0, chunk_data)
+                        target_index = int(cid_plan[0][0]) if cid_plan else 0
+                        data_i = by_index.get(target_index, chunk_data)
+                        await obj_cache.set_chunk(download_request.object_id, part_num, target_index, data_i)
                         chunk_logger.info(
-                            f"OBJ-CACHE stored (single) object_id={download_request.object_id} part={part_num} bytes={len(chunk_data)}"
+                            f"OBJ-CACHE stored (single) object_id={download_request.object_id} part={part_num} idx={target_index} bytes={len(data_i)}"
                         )
                     # Log download timing
                     chunk_ms = (_dtime.perf_counter() - chunk_start) * 1000.0

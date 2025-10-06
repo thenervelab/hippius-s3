@@ -828,7 +828,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115.12" },
     { name = "gunicorn", specifier = ">=21.2.0" },
     { name = "hippius" },
-    { name = "hippius", extras = ["key-storage"], specifier = ">=0.2.61" },
+    { name = "hippius", extras = ["key-storage"], specifier = ">=0.2.62" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "lxml", specifier = ">=4.9.3" },
     { name = "minio", marker = "extra == 'dev'", specifier = ">=7.1.15" },

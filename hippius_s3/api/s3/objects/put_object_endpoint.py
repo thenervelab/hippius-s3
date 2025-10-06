@@ -159,50 +159,52 @@ async def handle_put_object(
             except Exception:
                 logger.debug("Failed to cleanup previous parts on overwrite", exc_info=True)
 
-        # Ensure a multipart_uploads row exists to satisfy parts.upload_id FK
-        try:
-            upload_row = await db.fetchrow(
-                get_query("create_multipart_upload"),
-                uuid.UUID(object_id),
-                bucket_id,
-                object_key,
-                created_at,
-                content_type,
-                json.dumps(metadata),
-                created_at,
-                uuid.UUID(object_id),
-            )
-            upload_id = upload_row["upload_id"] if upload_row else uuid.UUID(object_id)
-        except Exception:
-            # Best effort: reuse existing upload row if it already exists
-            upload_row = await db.fetchrow(
-                "SELECT upload_id FROM multipart_uploads WHERE bucket_id = $1 AND object_key = $2 ORDER BY initiated_at DESC LIMIT 1",
-                bucket_id,
-                object_key,
-            )
-            upload_id = upload_row["upload_id"] if upload_row else uuid.UUID(object_id)
+        # Ensure upload row and parts(1) placeholder exist atomically before enqueueing
+        async with db.transaction():
+            # Ensure a multipart_uploads row exists to satisfy parts.upload_id FK
+            try:
+                upload_row = await db.fetchrow(
+                    get_query("create_multipart_upload"),
+                    uuid.UUID(object_id),
+                    bucket_id,
+                    object_key,
+                    created_at,
+                    content_type,
+                    json.dumps(metadata),
+                    created_at,
+                    uuid.UUID(object_id),
+                )
+                upload_id = upload_row["upload_id"] if upload_row else uuid.UUID(object_id)
+            except Exception:
+                # Best effort: reuse existing upload row if it already exists
+                upload_row = await db.fetchrow(
+                    "SELECT upload_id FROM multipart_uploads WHERE bucket_id = $1 AND object_key = $2 ORDER BY initiated_at DESC LIMIT 1",
+                    bucket_id,
+                    object_key,
+                )
+                upload_id = upload_row["upload_id"] if upload_row else uuid.UUID(object_id)
 
-        # Insert parts(1) for simple objects - all objects are represented by parts (1-based)
-        placeholder_cid = "pending"
-        placeholder_cid_id = await _upsert_cid(db, placeholder_cid)
+            # Insert parts(1) for simple objects - all objects are represented by parts (1-based)
+            placeholder_cid = "pending"
+            placeholder_cid_id = await _upsert_cid(db, placeholder_cid)
 
-        # Insert part 1 representing the base object (placeholder)
-        await db.execute(
-            """
-            INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            ON CONFLICT (object_id, part_number) DO NOTHING
-            """,
-            str(uuid.uuid4()),
-            upload_id,
-            1,
-            placeholder_cid,
-            int(file_size),
-            md5_hash,
-            created_at,
-            object_id,
-            placeholder_cid_id,
-        )
+            # Insert part 1 representing the base object (placeholder)
+            await db.execute(
+                """
+                INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (object_id, part_number) DO NOTHING
+                """,
+                str(uuid.uuid4()),
+                upload_id,
+                1,
+                placeholder_cid,
+                int(file_size),
+                md5_hash,
+                created_at,
+                object_id,
+                placeholder_cid_id,
+            )
 
         # Only enqueue after DB state (object, upload row, and part 1) is persisted to avoid race with pinner
         await enqueue_upload_request(

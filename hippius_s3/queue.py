@@ -23,6 +23,8 @@ class ChunkToDownload(BaseModel):
     part_id: int
     # Temporary backward-compat: accept legacy payloads that include or expect a redis_key
     redis_key: str | None = None
+    # Optional subset of chunk indices to hydrate for this part (minimal range fetch)
+    chunk_indices: list[int] | None = None
 
 
 class ChainRequest(BaseModel):
