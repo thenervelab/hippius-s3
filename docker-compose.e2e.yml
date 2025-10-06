@@ -43,6 +43,10 @@ services:
       - HIPPIUS_IPFS_STORE_URL=http://toxiproxy:15001
       - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
       - LOG_LEVEL=DEBUG
+      - HIPPIUS_IPFS_MAX_RETRIES=1
+      - HIPPIUS_UPLOADER_MAX_ATTEMPTS=2
+      - HIPPIUS_UPLOADER_BACKOFF_BASE_MS=100
+      - HIPPIUS_UPLOADER_BACKOFF_MAX_MS=500
     volumes:
       - .:/app
 
