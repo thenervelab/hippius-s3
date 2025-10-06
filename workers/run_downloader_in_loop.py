@@ -76,39 +76,30 @@ async def process_download_request(
                     if getattr(chunk, "chunk_indices", None):
                         idx_set = set(int(i) for i in chunk.chunk_indices or [])
                         cid_plan.extend([e for e in all_entries if e[0] in idx_set])
-                        # Check for missing indices and slice part CID for them if needed
+                        # Check for missing indices; do NOT backfill unless flag allows
                         if idx_set:
                             found_indices = {e[0] for e in cid_plan}
                             missing_indices = idx_set - found_indices
                             if missing_indices and chunk.cid:
-                                # Slice part-level CID for missing chunk indices
-                                chunk_logger.info(
-                                    f"Backfilling missing chunk indices {sorted(missing_indices)} from part CID for part {chunk.part_id}"
-                                )
-                                # Fetch chunk size from DB meta or use config default
-                                try:
-                                    from hippius_s3.metadata.meta_reader import read_db_meta
-
-                                    db_meta = await read_db_meta(db, download_request.object_id, int(chunk.part_id))
-                                    chunk_size = (
-                                        db_meta["chunk_size_bytes"]
-                                        if db_meta and db_meta["chunk_size_bytes"]
-                                        else config.object_chunk_size_bytes
+                                if getattr(config, "downloader_allow_part_backfill", False):
+                                    chunk_logger.warning(
+                                        f"ALLOW_BACKFILL enabled: attempting to backfill missing indices {sorted(missing_indices)} from part CID for part {chunk.part_id}"
                                     )
-                                except Exception:
-                                    chunk_size = config.object_chunk_size_bytes
-
-                                # For each missing index, create a plan entry to fetch via range
-                                for mi in sorted(missing_indices):
-                                    start_byte = mi * chunk_size
-                                    end_byte = start_byte + chunk_size - 1
-                                    # Create synthetic entry; hippius_client.s3_download doesn't support range yet,
-                                    # so we'll fetch the full part CID and slice locally for now
-                                    # TODO: Implement IPFS range fetch for efficiency
-                                    cid_plan.append((mi, str(chunk.cid), None))
-                                chunk_logger.warning(
-                                    f"Part {chunk.part_id}: backfilled {len(missing_indices)} missing indices; will fetch full part and slice"
-                                )
+                                    try:
+                                        from hippius_s3.metadata.meta_reader import read_db_meta
+                                        db_meta = await read_db_meta(db, download_request.object_id, int(chunk.part_id))
+                                        chunk_size = int(db_meta["chunk_size_bytes"]) if db_meta and db_meta["chunk_size_bytes"] else 0
+                                    except Exception:
+                                        chunk_size = 0
+                                    if chunk_size <= 0:
+                                        # Cannot backfill without authoritative chunk size
+                                        raise RuntimeError("chunk_size_bytes_missing")
+                                    for mi in sorted(missing_indices):
+                                        # Plan entries will be fetched as full CID; client lacks range
+                                        cid_plan.append((mi, str(chunk.cid), None))
+                                else:
+                                    # Strict mode: don't guess/backfill; let caller retry later
+                                    raise RuntimeError("missing_requested_chunk_indices")
                     else:
                         cid_plan.extend(all_entries)
                 except Exception:
@@ -174,6 +165,16 @@ async def process_download_request(
                     cid_cache: dict[str, bytes] = {}
                     assembled: list[tuple[int, bytes]] = []  # (chunk_index, data)
 
+                    # Derive authoritative chunk_size from DB plan if provided (third column)
+                    auth_chunk_size = 0
+                    try:
+                        for _ci, _cidv, _exp in cid_plan:
+                            if _exp is not None and int(_exp) > 0:
+                                auth_chunk_size = int(_exp)
+                                break
+                    except Exception:
+                        auth_chunk_size = 0
+
                     for ci, cid_val, expected_len in cid_plan:
                         chunk_logger.debug(
                             f"Downloading part {chunk.part_id} ci={ci} CID={cid_val[:10]}... expected={expected_len}"
@@ -219,7 +220,7 @@ async def process_download_request(
                         await obj_cache.set_meta(
                             download_request.object_id,
                             part_num,
-                            chunk_size=getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024),
+                            chunk_size=auth_chunk_size,  # authoritative from DB rows; 0 if unknown
                             num_chunks=len(cid_plan),
                             size_bytes=len(chunk_data),
                         )
@@ -234,7 +235,7 @@ async def process_download_request(
                         await obj_cache.set_meta(
                             download_request.object_id,
                             part_num,
-                            chunk_size=getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024),
+                            chunk_size=auth_chunk_size,  # authoritative from DB if available
                             num_chunks=1,
                             size_bytes=len(chunk_data),
                         )

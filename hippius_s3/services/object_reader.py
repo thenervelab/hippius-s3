@@ -409,16 +409,21 @@ class ObjectReader:
                 part_offsets = build_part_offsets(part_inputs)
                 offset_map = {int(po["part_number"]): (int(po["offset"]), int(po["plain_size"])) for po in part_offsets}
 
-                # Determine chunk_size for each part from DB or fallback to config
+                # Determine chunk_size for each part from DB only; if missing -> 503/SlowDown
                 per_part_chunk_size: dict[int, int] = {}
+                missing_chunk_size_parts: list[int] = []
                 for p in cid_backed_parts:
                     pn = int(p.part_number)
                     db_meta = await read_db_meta(db, info.object_id, pn)
                     if db_meta and db_meta["chunk_size_bytes"]:
                         per_part_chunk_size[pn] = int(db_meta["chunk_size_bytes"])  # type: ignore[index]
                     else:
-                        # Fallback to config for parts without persisted chunk_size (pre-migration)
-                        per_part_chunk_size[pn] = int(self.config.object_chunk_size_bytes)
+                        missing_chunk_size_parts.append(pn)
+                if missing_chunk_size_parts:
+                    self._logger.warning(
+                        f"chunk_size_bytes_missing object_id={info.object_id} parts={sorted(missing_chunk_size_parts)}"
+                    )
+                    raise DownloadNotReadyError("chunk_size_bytes_missing")
 
                 # Plan minimal indices per part (pure math, per-part chunk_size)
                 per_part_indices: dict[int, list[int]] = {}
@@ -796,34 +801,28 @@ class ObjectReader:
                     local_start = max(0, cursor - part_start)
                     local_end_inclusive = min(size_bytes - 1, end_inclusive - part_start)
 
-                    # If no meta, fallback to whole-part assembly and slice
+                    # Prefer meta; if missing but part bytes exist, slice whole-part for this request only
                     meta = await obj_cache.get_meta(info.object_id, target_pn)  # type: ignore[attr-defined]
                     if not isinstance(meta, dict):
                         data = await _read_part_bytes(target_pn)
                         if not data:
-                            if _t.time() <= wait_deadline:
-                                await asyncio.sleep(self.config.http_download_sleep_loop)
-                                continue
-                            break
+                            raise DownloadNotReadyError("chunk_size_bytes_missing")
                         yield data[local_start : local_end_inclusive + 1]
                         cursor = part_start + local_end_inclusive + 1
                         continue
 
                     try:
-                        chunk_size = int(meta.get("chunk_size", 4 * 1024 * 1024))
+                        chunk_size = int(meta.get("chunk_size", 0))
                         num_chunks = int(meta.get("num_chunks", 0))
                     except Exception:
-                        chunk_size = 4 * 1024 * 1024
+                        chunk_size = 0
                         num_chunks = 0
 
-                    if num_chunks <= 0:
-                        # Fallback
+                    if num_chunks <= 0 or chunk_size <= 0:
+                        # Fallback to whole-part slice if available in cache for this request
                         data = await _read_part_bytes(target_pn)
                         if not data:
-                            if _t.time() <= wait_deadline:
-                                await asyncio.sleep(self.config.http_download_sleep_loop)
-                                continue
-                            break
+                            raise DownloadNotReadyError("chunk_size_bytes_missing")
                         yield data[local_start : local_end_inclusive + 1]
                         cursor = part_start + local_end_inclusive + 1
                         continue

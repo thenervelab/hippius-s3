@@ -85,11 +85,13 @@ class Config:
     # Publishing toggle (read directly from env; default true)
     publish_to_chain: bool = env("PUBLISH_TO_CHAIN:true", convert=lambda x: x.lower() == "true")
 
-    # Uploader configuration
+    # Uploader configuration (supersedes legacy pinner config)
     uploader_max_attempts: int = env("HIPPIUS_UPLOADER_MAX_ATTEMPTS:5", convert=int)
     uploader_backoff_base_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_BASE_MS:500", convert=int)
     uploader_backoff_max_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_MAX_MS:60000", convert=int)
     uploader_multipart_max_concurrency: int = env("HIPPIUS_UPLOADER_MULTIPART_MAX_CONCURRENCY:5", convert=int)
+    # Heavy validation gating (legacy PINNER_VALIDATE_COVERAGE supported for compat)
+    uploader_validate_coverage: bool = env("UPLOADER_VALIDATE_COVERAGE:false", convert=lambda x: x.lower() == "true")
 
     # Substrate worker configuration
     substrate_batch_size: int = env("HIPPIUS_SUBSTRATE_BATCH_SIZE:16", convert=int)
@@ -106,6 +108,10 @@ class Config:
     cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:259200", convert=int)
     # Unified object part chunk size (bytes) for cache and range math
     object_chunk_size_bytes: int = env("HIPPIUS_CHUNK_SIZE_BYTES:4194304", convert=int)
+    # Downloader behavior (default: no whole-part backfill)
+    downloader_allow_part_backfill: bool = env(
+        "DOWNLOADER_ALLOW_PART_BACKFILL:false", convert=lambda x: x.lower() == "true"
+    )
 
     # Crypto configuration
     # Default encryption suite for new objects
