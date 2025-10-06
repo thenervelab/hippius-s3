@@ -285,5 +285,4 @@ services:
 
 networks:
   hippius_net:
-    external: true
     name: hippius_net
