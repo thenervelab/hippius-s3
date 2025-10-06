@@ -26,6 +26,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 
+config = get_config()
+
+
 async def process_download_request(
     download_request: DownloadChainRequest,
     redis_client: async_redis.Redis,
@@ -127,10 +130,10 @@ async def process_download_request(
                     chunk_data = b"".join(assembled)
 
                     md5 = _hashlib.md5(chunk_data).hexdigest()
-                    head_hex = chunk_data[:8].hex() if chunk_data else ""
+                    head_hex = chunk_data[:8].hex()
                     tail_hex = chunk_data[-8:].hex() if len(chunk_data) >= 8 else head_hex
                     chunk_logger.debug(
-                        f"Downloaded chunk {chunk.part_id} cid={str(chunk.cid)[:10]}... len={len(chunk_data)} md5={md5} "
+                        f"Downloaded chunk {chunk.part_id} cid={str(chunk.cid)}... len={len(chunk_data)} md5={md5} "
                         f"head8={head_hex} tail8={tail_hex}"
                     )
 

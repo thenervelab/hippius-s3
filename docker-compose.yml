@@ -1,4 +1,12 @@
 services:
+  base:
+    image: hippius-s3-base:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.base
+    profiles:
+      - build-base
+
   api:
     build: .
     ports:
@@ -122,11 +130,11 @@ services:
     networks:
       - hippius_net
 
-  pinner:
+  uploader:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["python", "workers/run_pinner_in_loop.py"]
+    command: ["watchfiles", "--filter", "python", "python workers/run_uploader_in_loop.py"]
     env_file:
       - .env
     depends_on:
@@ -134,8 +142,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    deploy:
-      replicas: 1 # can't scale up otherwise we get transaction conflicts for the same user
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
@@ -150,11 +156,34 @@ services:
     networks:
       - hippius_net
 
+  substrate:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: ["watchfiles", "--filter", "python", "python workers/run_substrate_in_loop.py"]
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - .:/app
+    networks:
+      - hippius_net
+
   unpinner:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["python", "workers/run_unpinner_in_loop.py"]
+    command: ["watchfiles", "--filter", "python", "python workers/run_unpinner_in_loop.py"]
     env_file:
       - .env
     depends_on:
@@ -176,7 +205,7 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["python", "workers/run_downloader_in_loop.py"]
+    command: ["watchfiles", "--filter", "python", "python workers/run_downloader_in_loop.py"]
     env_file:
       - .env
     depends_on:
@@ -185,7 +214,7 @@ services:
       redis:
         condition: service_healthy
     deploy:
-      replicas: 3
+      replicas: 1
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
@@ -197,7 +226,7 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["python", "workers/chain_pin_checker.py"]
+    command: ["watchfiles", "--filter", "python", "python workers/chain_pin_checker.py"]
     env_file:
       - .env
     depends_on:
@@ -218,7 +247,7 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["python", "workers/chain_profile_cacher.py"]
+    command: ["watchfiles", "--filter", "python", "python workers/chain_profile_cacher.py"]
     env_file:
       - .env
     depends_on:
