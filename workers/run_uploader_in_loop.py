@@ -40,9 +40,18 @@ async def run_uploader_loop():
     uploader = Uploader(db, ipfs_service, redis_client, config)
 
     while True:
-        moved = await move_due_retries_to_primary(redis_client, now_ts=time.time(), max_items=64)
-        if moved:
-            logger.info(f"Moved {moved} due retry requests back to primary queue")
+        try:
+            moved = await move_due_retries_to_primary(redis_client, now_ts=time.time(), max_items=64)
+            if moved:
+                logger.info(f"Moved {moved} due retry requests back to primary queue")
+        except async_redis.exceptions.BusyLoadingError:
+            logger.warning("Redis is still loading dataset, waiting 2 seconds...")
+            await asyncio.sleep(2)
+            continue
+        except Exception as e:
+            logger.error(f"Error moving retry requests: {e}")
+            await asyncio.sleep(1)
+            continue
 
         upload_request = await dequeue_upload_request(redis_client)
 
