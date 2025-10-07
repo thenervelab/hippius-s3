@@ -23,6 +23,7 @@ from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import dequeue_download_request
 from hippius_s3.utils import get_query
 from hippius_s3.utils.timing import log_timing
+from hippius_s3.metadata.meta_reader import read_db_meta
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -164,35 +165,6 @@ async def process_download_request(
                     except Exception:
                         auth_chunk_size = 0
 
-                    # EARLY readiness signal: write meta before downloading all chunks so API can unblock
-                    if cid_plan and len(cid_plan) > 1:
-                        eff_chunk_size_early = auth_chunk_size
-                        db_chunks_early = 0
-                        if eff_chunk_size_early <= 0:
-                            try:
-                                from hippius_s3.metadata.meta_reader import read_db_meta  # local import
-
-                                db_meta_early = await read_db_meta(db, download_request.object_id, part_num)
-                                if db_meta_early:
-                                    eff_chunk_size_early = int(db_meta_early.get("chunk_size_bytes") or 0)
-                                    db_chunks_early = int(db_meta_early.get("num_chunks_db") or 0)
-                            except Exception:
-                                eff_chunk_size_early = 0
-                        if eff_chunk_size_early <= 0:
-                            eff_chunk_size_early = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-
-                        try:
-                            await obj_cache.set_meta(
-                                download_request.object_id,
-                                part_num,
-                                chunk_size=eff_chunk_size_early,
-                                num_chunks=max(1, max(db_chunks_early, len(cid_plan))),
-                                size_bytes=0,
-                            )
-                        except Exception:
-                            # Non-fatal; downloader will attempt a final meta write after download
-                            chunk_logger.debug("Early meta write failed", exc_info=True)
-
                     # Order plan to prioritize the lowest chunk index for faster first byte
                     ordered_plan = sorted(cid_plan, key=lambda x: int(x[0]))
                     total_size_bytes = 0
@@ -236,71 +208,14 @@ async def process_download_request(
                         results = await asyncio.gather(*[fetch_and_store(e) for e in tail])
                         total_size_bytes += sum(int(x or 0) for x in results)
 
-                    # Optional debug: we no longer hold the whole part; skip part-level md5 to save memory
-
-                    # Store bytes in Redis cache with meta-first write order (readiness signal before chunks)
+                    # Store bytes in Redis cache
                     if cid_plan and len(cid_plan) > 1:
-                        # Multiple chunks in DB: ensure non-zero chunk_size and prefer DB count
-                        eff_chunk_size = auth_chunk_size
-                        db_chunks = 0
-                        if eff_chunk_size <= 0:
-                            try:
-                                from hippius_s3.metadata.meta_reader import read_db_meta  # local import
-
-                                db_meta = await read_db_meta(db, download_request.object_id, part_num)
-                                if db_meta:
-                                    eff_chunk_size = int(db_meta.get("chunk_size_bytes") or 0)
-                                    db_chunks = int(db_meta.get("num_chunks_db") or 0)
-                            except Exception:
-                                eff_chunk_size = 0
-                        if eff_chunk_size <= 0:
-                            eff_chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-
-                        # Update meta one more time with final size_bytes (non-critical for readiness)
-                        try:
-                            await obj_cache.set_meta(
-                                download_request.object_id,
-                                part_num,
-                                chunk_size=eff_chunk_size,
-                                num_chunks=max(1, max(db_chunks, len(cid_plan))),
-                                size_bytes=int(total_size_bytes),
-                            )
-                        except Exception:
-                            chunk_logger.debug("Final meta write failed", exc_info=True)
                         chunk_logger.info(
                             f"OBJ-CACHE stored (DB layout) object_id={download_request.object_id} part={part_num} ct_chunks={len(cid_plan)} total_bytes={int(total_size_bytes)}"
                         )
                     else:
-                        # Single-chunk case: write meta first, then chunk at the requested index (default 0)
-                        # Ensure meta reflects at least the requested index (e.g., idx=1 => num_chunks >= 2)
+                        # Single-chunk case: fetch and write target chunk directly (no whole-part assembly)
                         target_index = int(cid_plan[0][0]) if cid_plan else 0
-
-                        # If chunk_size not known from DB plan, try to read authoritative value from DB meta
-                        eff_chunk_size = auth_chunk_size
-                        if eff_chunk_size <= 0:
-                            try:
-                                from hippius_s3.metadata.meta_reader import read_db_meta  # local import to avoid cycles
-
-                                db_meta = await read_db_meta(db, download_request.object_id, int(chunk.part_id))
-                                eff_chunk_size = (
-                                    int(db_meta["chunk_size_bytes"])
-                                    if db_meta and db_meta.get("chunk_size_bytes")
-                                    else 0
-                                )
-                            except Exception:
-                                eff_chunk_size = 0
-                        if eff_chunk_size <= 0:
-                            # Final fallback to configured chunk size to avoid stalling range math
-                            eff_chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-
-                        await obj_cache.set_meta(
-                            download_request.object_id,
-                            part_num,
-                            chunk_size=eff_chunk_size,
-                            num_chunks=max(1, target_index + 1),
-                            size_bytes=0,
-                        )
-                        # Fetch and write target chunk directly (no whole-part assembly)
                         entry = ordered_plan[0] if ordered_plan else (target_index, str(chunk.cid), None)
                         _ = await fetch_and_store(entry)
                         chunk_logger.info(
@@ -380,9 +295,7 @@ async def run_downloader_loop():
             try:
                 download_request = await dequeue_download_request(redis_client)
             except (BusyLoadingError, RedisConnectionError, RedisTimeoutError) as e:
-                logger.warning(
-                    f"Redis error while dequeuing download request: {e}. Reconnecting in 2s..."
-                )
+                logger.warning(f"Redis error while dequeuing download request: {e}. Reconnecting in 2s...")
                 with contextlib.suppress(Exception):
                     await redis_client.aclose()
                 await asyncio.sleep(2)

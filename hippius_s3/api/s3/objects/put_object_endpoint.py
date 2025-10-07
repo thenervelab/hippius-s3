@@ -16,6 +16,7 @@ from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.extensions.append import handle_append
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
+from hippius_s3.metadata.meta_writer import write_cache_meta
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
@@ -125,9 +126,14 @@ async def handle_put_object(
                 chunk_size=chunk_size,
             )
             total_ct = sum(len(ct) for ct in ct_chunks)
-            # Write meta first to provide cheap readiness check
-            await obj_cache.set_meta(
-                object_id, 1, chunk_size=chunk_size, num_chunks=len(ct_chunks), size_bytes=total_ct
+            # Write meta first using unified writer; store plaintext size for readers
+            await write_cache_meta(
+                obj_cache,
+                object_id,
+                1,
+                chunk_size=chunk_size,
+                num_chunks=len(ct_chunks),
+                plain_size=len(file_data),
             )
             # Then write chunk data
             for i, ct in enumerate(ct_chunks):

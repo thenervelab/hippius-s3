@@ -26,6 +26,7 @@ from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import get_object_reader
+from hippius_s3.metadata.meta_writer import write_cache_meta
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
@@ -614,14 +615,14 @@ async def upload_part(
             # Plaintext is chunked identically to ciphertext (no encryption)
             chunks_bytes = [file_data[i : i + chunk_size] for i in range(0, len(file_data), chunk_size)]
 
-        total_size_bytes = sum(len(c) for c in chunks_bytes)
-        # Write meta first for readiness
-        await obj_cache.set_meta(
+        # Write meta first for readiness (store plaintext size)
+        await write_cache_meta(
+            obj_cache,
             str(object_id),
             int(part_number),
             chunk_size=chunk_size,
             num_chunks=len(chunks_bytes),
-            size_bytes=total_size_bytes,
+            plain_size=len(file_data),
             ttl=1800,
         )
         # Then write chunk data

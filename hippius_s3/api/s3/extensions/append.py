@@ -26,6 +26,7 @@ from fastapi import Response
 from hippius_s3.api.s3 import errors
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
+from hippius_s3.metadata.meta_writer import write_cache_meta
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
@@ -323,14 +324,14 @@ async def handle_append(
                 seed_phrase=request.state.seed_phrase,
                 chunk_size=chunk_size,
             )
-            total_ct = sum(len(ct) for ct in ct_chunks)
-            # Write meta first for cheap readiness check
-            await obj_cache.set_meta(
+            # Write meta first using unified writer with plaintext size
+            await write_cache_meta(
+                obj_cache,
                 object_id,
                 int(next_part),
                 chunk_size=chunk_size,
                 num_chunks=len(ct_chunks),
-                size_bytes=total_ct,
+                plain_size=len(incoming_bytes),
                 ttl=1800,
             )
             # Then write chunk data

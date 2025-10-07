@@ -195,13 +195,12 @@ class Uploader:
             updated = await self.db.execute(
                 """
                 UPDATE parts
-                SET ipfs_cid = $3, size_bytes = $4, cid_id = COALESCE($5, cid_id)
+                SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
                 WHERE object_id = $1 AND part_number = $2
                 """,
                 object_id,
                 part_number,
                 chunk_cid,
-                len(chunk_data),
                 cid_id,
             )
             updated_str = str(updated or "")
@@ -216,13 +215,12 @@ class Uploader:
                 updated2 = await self.db.execute(
                     """
                     UPDATE parts
-                    SET ipfs_cid = $3, size_bytes = $4, cid_id = COALESCE($5, cid_id)
+                    SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
                     WHERE upload_id = $1 AND part_number = $2
                     """,
                     resolved_upload_id,
                     part_number,
                     chunk_cid,
-                    len(chunk_data),
                     cid_id,
                 )
                 updated2_str = str(updated2 or "")
