@@ -1,4 +1,33 @@
 services:
+  # Loki for log aggregation
+  loki:
+    image: grafana/loki:latest
+    container_name: hippius-loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./monitoring/loki/loki-config.yml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    restart: unless-stopped
+    networks:
+      - hippius_net
+
+  # Promtail for log collection
+  promtail:
+    image: grafana/promtail:latest
+    container_name: hippius-promtail
+    volumes:
+      - ./monitoring/promtail/promtail-config.yml:/etc/promtail/config.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: -config.file=/etc/promtail/config.yml
+    restart: unless-stopped
+    networks:
+      - hippius_net
+    depends_on:
+      - loki
+
   # Prometheus for metrics collection
   prometheus:
     image: prom/prometheus:latest
@@ -127,6 +156,7 @@ services:
 volumes:
   prometheus_data:
   grafana_data:
+  loki_data:
 
 networks:
   hippius_net:
