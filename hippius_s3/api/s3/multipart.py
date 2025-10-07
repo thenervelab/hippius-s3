@@ -601,30 +601,32 @@ async def upload_part(
 
         # Store in Redis via chunked cache API (encrypt for private, meta-first for readiness)
         redis_start = time.time()
+        chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
         if should_encrypt:
-            chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-            ct_chunks = CryptoService.encrypt_part_to_chunks(
+            chunks_bytes = CryptoService.encrypt_part_to_chunks(
                 file_data,
                 object_id=str(object_id),
                 part_number=int(part_number),
                 seed_phrase=request.state.seed_phrase,
                 chunk_size=chunk_size,
             )
-            total_ct = sum(len(ct) for ct in ct_chunks)
-            # Write meta first for cheap readiness check
-            await obj_cache.set_meta(
-                str(object_id),
-                int(part_number),
-                chunk_size=chunk_size,
-                num_chunks=len(ct_chunks),
-                size_bytes=total_ct,
-                ttl=1800,
-            )
-            # Then write chunk data
-            for i, ct in enumerate(ct_chunks):
-                await obj_cache.set_chunk(str(object_id), int(part_number), i, ct, ttl=1800)
         else:
-            await obj_cache.set(str(object_id), int(part_number), file_data, ttl=1800)
+            # Plaintext is chunked identically to ciphertext (no encryption)
+            chunks_bytes = [file_data[i : i + chunk_size] for i in range(0, len(file_data), chunk_size)]
+
+        total_size_bytes = sum(len(c) for c in chunks_bytes)
+        # Write meta first for readiness
+        await obj_cache.set_meta(
+            str(object_id),
+            int(part_number),
+            chunk_size=chunk_size,
+            num_chunks=len(chunks_bytes),
+            size_bytes=total_size_bytes,
+            ttl=1800,
+        )
+        # Then write chunk data
+        for i, piece in enumerate(chunks_bytes):
+            await obj_cache.set_chunk(str(object_id), int(part_number), i, piece, ttl=1800)
         redis_time = time.time() - redis_start
         logger.debug(
             f"Part {part_number}: Cached via RedisObjectPartsCache in {redis_time:.3f}s (object_id={object_id}, encrypted={should_encrypt})"
@@ -655,9 +657,8 @@ async def upload_part(
             part_number=int(part_number),
             size_bytes=int(file_size),
             etag=str(etag),
-            chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-            if should_encrypt
-            else None,
+            # Treat plaintext and ciphertext identically for chunking
+            chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
         )
         db_time = time.time() - db_start
         logger.debug(f"Part {part_number}: Database insert took {db_time:.3f}s")

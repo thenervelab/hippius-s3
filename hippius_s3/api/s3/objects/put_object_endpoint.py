@@ -191,9 +191,7 @@ async def handle_put_object(
                 part_number=1,
                 size_bytes=int(file_size),
                 etag=md5_hash,
-                chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-                if should_encrypt
-                else None,
+                chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
             )
 
         # Only enqueue after DB state (object, upload row, and part 1) is persisted to avoid race with pinner

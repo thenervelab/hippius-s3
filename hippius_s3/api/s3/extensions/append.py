@@ -258,9 +258,7 @@ async def handle_append(
             part_number=int(next_part),
             size_bytes=int(delta_size),
             etag=delta_md5,
-            chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-            if not bucket["is_public"]
-            else None,
+            chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
         )
 
         # Recompute composite ETag from base object MD5 + all appended part etags
