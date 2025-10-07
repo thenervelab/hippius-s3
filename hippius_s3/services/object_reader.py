@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse
 from hippius_s3.api.s3.common import build_headers
 from hippius_s3.api.s3.range_utils import calculate_chunks_for_range
 from hippius_s3.cache import ObjectPartsCache
+from hippius_s3.metadata.meta_reader import read_cache_meta
 from hippius_s3.metadata.meta_reader import read_db_meta
 from hippius_s3.planning.range_planner import PartInput
 from hippius_s3.planning.range_planner import build_part_offsets
@@ -488,29 +489,7 @@ class ObjectReader:
                 seed_phrase,
             )
 
-        # Step 5: Pre-flight check to ensure the first part is available before sending headers
-        # Use meta-based check (cheap) instead of whole-part get (expensive assembly)
-        import time as _time
-
-        if parts:
-            pre_header_start = _time.perf_counter()
-            first_part = parts[0]
-            deadline = _time.time() + float(self.config.http_stream_initial_timeout_seconds)
-            while True:
-                meta = await obj_cache.get_meta(info.object_id, int(first_part.part_number))
-                if meta and int(meta.get("num_chunks", 0)) > 0:
-                    break
-                if _time.time() > deadline:
-                    raise DownloadNotReadyError("initial_stream_timeout")
-                await asyncio.sleep(self.config.http_download_sleep_loop)
-            pre_header_ms = (_time.perf_counter() - pre_header_start) * 1000.0
-            log_timing(
-                "object_reader.pre_header_wait",
-                pre_header_ms,
-                extra={"object_id": info.object_id, "part_number": first_part.part_number},
-            )
-
-        # No additional wait; caching/hydration handled earlier and falls back to pipeline
+        # Step 5 removed: no pre-header readiness wait; generator will handle bounded waits per chunk
 
         # Step 6: Prepare and stream the response
         _md = info.metadata
@@ -879,11 +858,86 @@ class ObjectReader:
                 gen_range(), status_code=status_code, media_type=info.content_type, headers=headers
             )
 
-        # Handle Full Request
+        # Handle Full Request (per-chunk streaming)
         async def gen_full() -> AsyncGenerator[bytes, None]:
+            import time as _ft
+
             for p in parts:
-                data = await _read_part_bytes(int(p.part_number))
-                yield data
+                pn = int(p.part_number)
+
+                # Determine chunk plan: prefer cache meta; fallback to DB meta
+                chunk_size: int = 0
+                num_chunks: int = 0
+
+                try:
+                    cmeta = await read_cache_meta(obj_cache, info.object_id, pn)
+                    if cmeta:
+                        chunk_size = int(cmeta.get("chunk_size", 0))
+                        num_chunks = int(cmeta.get("num_chunks", 0))
+                except Exception:
+                    chunk_size = 0
+                    num_chunks = 0
+
+                if num_chunks <= 0 or chunk_size <= 0:
+                    try:
+                        dbm = await read_db_meta(db, info.object_id, pn)
+                    except Exception:
+                        dbm = None
+                    if dbm:
+                        try:
+                            chunk_size = int(dbm.get("chunk_size_bytes") or 0)  # type: ignore[arg-type]
+                        except Exception:
+                            chunk_size = 0
+                        try:
+                            num_chunks = int(dbm.get("num_chunks_db") or 0)  # type: ignore[arg-type]
+                        except Exception:
+                            num_chunks = 0
+
+                # If still unknown, do a bounded wait for cache meta to appear
+                if num_chunks <= 0 or chunk_size <= 0:
+                    deadline = _ft.time() + float(self.config.http_stream_initial_timeout_seconds)
+                    while _ft.time() < deadline:
+                        try:
+                            cmeta2 = await read_cache_meta(obj_cache, info.object_id, pn)
+                        except Exception:
+                            cmeta2 = None
+                        if cmeta2 and int(cmeta2.get("num_chunks", 0)) > 0 and int(cmeta2.get("chunk_size", 0)) > 0:
+                            chunk_size = int(cmeta2.get("chunk_size", 0))
+                            num_chunks = int(cmeta2.get("num_chunks", 0))
+                            break
+                        await asyncio.sleep(self.config.http_download_sleep_loop)
+
+                if num_chunks <= 0 or chunk_size <= 0:
+                    # Unable to determine chunking; signal client to retry later
+                    raise DownloadNotReadyError("chunk_size_bytes_missing")
+
+                # Stream each chunk with bounded polling and per-chunk decrypt if needed
+                for ci in range(int(num_chunks)):
+                    chunk_deadline = _ft.time() + float(self.config.http_stream_initial_timeout_seconds)
+                    cbytes = None
+                    while _ft.time() < chunk_deadline:
+                        cbytes = await obj_cache.get_chunk(info.object_id, pn, int(ci))  # type: ignore[attr-defined]
+                        if cbytes is not None:
+                            break
+                        await asyncio.sleep(self.config.http_download_sleep_loop)
+                    if cbytes is None:
+                        # Chunk not ready within deadline
+                        raise DownloadNotReadyError("range_chunk_missing")
+
+                    if info.should_decrypt:
+                        try:
+                            pt = CryptoService.decrypt_chunk(
+                                cbytes,
+                                seed_phrase=seed_phrase,
+                                object_id=info.object_id,
+                                part_number=pn,
+                                chunk_index=int(ci),
+                            )
+                        except Exception as err:
+                            raise DownloadNotReadyError("range_decrypt_failed") from err
+                        yield pt
+                    else:
+                        yield cbytes
 
         # Log total read_response time
         total_read_ms = (_timing_time.perf_counter() - read_start) * 1000.0

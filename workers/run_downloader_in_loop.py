@@ -7,6 +7,9 @@ from pathlib import Path
 
 import redis.asyncio as async_redis
 from hippius_sdk.client import HippiusClient
+from redis.exceptions import BusyLoadingError
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 
 # Add parent directory to path to import hippius_s3 modules
@@ -374,18 +377,39 @@ async def run_downloader_loop():
 
     try:
         while True:
-            download_request = await dequeue_download_request(redis_client)
+            try:
+                download_request = await dequeue_download_request(redis_client)
+            except (BusyLoadingError, RedisConnectionError, RedisTimeoutError) as e:
+                logger.warning(
+                    f"Redis error while dequeuing download request: {e}. Reconnecting in 2s..."
+                )
+                with contextlib.suppress(Exception):
+                    await redis_client.aclose()
+                await asyncio.sleep(2)
+                redis_client = async_redis.from_url(config.redis_url)
+                continue
 
             if download_request:
-                success = await process_download_request(download_request, redis_client)
-                if success:
-                    logger.info(
-                        f"Successfully processed download request {download_request.bucket_name}/{download_request.object_key}"
+                try:
+                    success = await process_download_request(download_request, redis_client)
+                    if success:
+                        logger.info(
+                            f"Successfully processed download request {download_request.bucket_name}/{download_request.object_key}"
+                        )
+                    else:
+                        logger.error(
+                            f"Failed to process download request {download_request.bucket_name}/{download_request.object_key}"
+                        )
+                except (RedisConnectionError, RedisTimeoutError, BusyLoadingError) as e:
+                    logger.warning(
+                        f"Redis connection issue during processing: {e}. Reconnecting in 2s and continuing..."
                     )
-                else:
-                    logger.error(
-                        f"Failed to process download request {download_request.bucket_name}/{download_request.object_key}"
-                    )
+                    with contextlib.suppress(Exception):
+                        await redis_client.aclose()
+                    await asyncio.sleep(2)
+                    redis_client = async_redis.from_url(config.redis_url)
+                    # Continue main loop; item-specific retry/backoff is handled by callers
+                    continue
             else:
                 # Wait a bit before checking again
                 await asyncio.sleep(config.downloader_sleep_loop)
