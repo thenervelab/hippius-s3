@@ -35,6 +35,8 @@ jobs:
           STAGING_PATH: ${{ secrets.STAGING_PATH }}
           STAGING_DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
           REPO_URL: "git@github.com:${{ github.repository }}.git"
+          GRAFANA_ADMIN_USER: ${{ secrets.GRAFANA_ADMIN_USER }}
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
         run: |
           # Deploy directly via SSH commands
           ssh ${STAGING_USER}@${STAGING_IP} << EOF
@@ -64,6 +66,8 @@ jobs:
             # Ensure external Docker network exists
             docker network inspect hippius_net >/dev/null 2>&1 || docker network create hippius_net
             echo "Building and starting Docker containers with staging config..."
+            export GRAFANA_ADMIN_USER="${GRAFANA_ADMIN_USER}"
+            export GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD}"
             docker compose -f docker-compose.yml -f docker-compose.staging.yml -f docker-compose.monitoring.yml down || true
             docker compose -f docker-compose.yml -f docker-compose.staging.yml -f docker-compose.monitoring.yml build --no-cache
             docker compose -f docker-compose.yml -f docker-compose.staging.yml -f docker-compose.monitoring.yml up -d
