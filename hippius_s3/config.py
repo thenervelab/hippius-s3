@@ -141,6 +141,9 @@ class Config:
     # Publishing toggle (read directly from env; default true)
     publish_to_chain: bool = env("PUBLISH_TO_CHAIN:true", convert=lambda x: x.lower() == "true")
 
+    # Legacy SDK compatibility (temporary; set LEGACY_SDK_COMPAT=true to enable)
+    enable_legacy_sdk_compat: bool = env("LEGACY_SDK_COMPAT:false", convert=lambda x: x.lower() == "true")
+
 
 def get_config() -> Config:
     """Get application configuration."""

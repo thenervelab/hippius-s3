@@ -172,6 +172,85 @@ async def read_response(
         except Exception:
             pass
 
+    # Whole-object legacy SDK fallback (multipart, private): decrypt once then slice
+    from hippius_s3.config import get_config as _get_cfg  # local to avoid circulars
+
+    if (
+        bool(info.get("should_decrypt"))
+        and isinstance(parts, list)
+        and len(parts) > 1
+        and _get_cfg().enable_legacy_sdk_compat
+    ):
+        try:
+            # Assemble full ciphertext across parts
+            from hippius_s3.reader.fetcher import fetch_chunk_blocking  # local import to avoid cycles
+
+            ct_all: list[bytes] = []
+            # Sort parts by part_number
+            ordered_parts = sorted(parts, key=lambda p: int(p.get("part_number", 0)))
+            for p in ordered_parts:
+                pn = int(p.get("part_number", 0))
+                # Determine chunk count from cache meta if present
+                num_chunks = 0
+                try:
+                    meta = await obj_cache.get_meta(info["object_id"], pn)  # type: ignore[attr-defined]
+                except Exception:
+                    meta = None
+                if isinstance(meta, dict):
+                    try:
+                        num_chunks = int(meta.get("num_chunks", 0))
+                    except Exception:
+                        num_chunks = 0
+                idx = 0
+                while True:
+                    if num_chunks and idx >= num_chunks:
+                        break
+                    c = await fetch_chunk_blocking(
+                        obj_cache, info["object_id"], pn, idx, sleep_seconds=float(cfg.http_download_sleep_loop)
+                    )
+                    if not c:
+                        break
+                    ct_all.append(c)
+                    idx += 1
+
+            # Decrypt once using SDK key
+            from hippius_s3.legacy.sdk_compat import decrypt_whole_ciphertext  # local import
+
+            pt_all = await decrypt_whole_ciphertext(
+                ciphertext=b"".join(ct_all), address=address, bucket_name=str(info.get("bucket_name", ""))
+            )
+
+            # If range present, slice once here; otherwise stream whole
+            async def _gen_whole() -> AsyncIterator[bytes]:
+                yield pt_all
+
+            async def _gen_range(start: int, end: int) -> AsyncIterator[bytes]:
+                yield pt_all[int(start) : int(end) + 1]
+
+            headers = build_headers(
+                info,
+                source=source,
+                metadata=info.get("metadata") or {},
+                rng=(rng.start, rng.end) if rng is not None else None,
+                range_was_invalid=range_was_invalid,
+            )
+            if rng is None:
+                return StreamingResponse(
+                    _gen_whole(),
+                    status_code=200,
+                    media_type=info.get("content_type", "application/octet-stream"),
+                    headers=headers,
+                )
+            return StreamingResponse(
+                _gen_range(int(rng.start), int(rng.end)),
+                status_code=206 if not range_was_invalid else 200,
+                media_type=info.get("content_type", "application/octet-stream"),
+                headers=headers,
+            )
+        except Exception:
+            # Fall through to normal streaming
+            pass
+
     gen = stream_plan(
         obj_cache=obj_cache,
         object_id=info["object_id"],

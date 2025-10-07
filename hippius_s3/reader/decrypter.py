@@ -28,24 +28,16 @@ async def decrypt_chunk_if_needed(
         )
     except Exception:
         # Fallback to SDK legacy key (account+bucket scoped) for single-chunk legacy ciphertext
-        try:
-            import base64 as _b64
+        from hippius_s3.config import get_config
 
-            import nacl.secret as _secret
-
-            from hippius_s3.ipfs_service import get_encryption_key  # local import to avoid cycles
-
-            key_b64 = None
-            if address and bucket_name:
-                key_b64 = await get_encryption_key(f"{address}:{bucket_name}")
-            if not key_b64:
-                raise RuntimeError("legacy_key_missing")
-            key = _b64.b64decode(key_b64)
-            box = _secret.SecretBox(key)
-            return bytes(box.decrypt(cbytes))
-        except Exception as _:
-            # Re-raise original
+        cfg = get_config()
+        if not cfg.enable_legacy_sdk_compat:
             raise
+        from hippius_s3.legacy.sdk_compat import decrypt_part_ciphertext  # local import
+
+        if not address or not bucket_name:
+            raise
+        return await decrypt_part_ciphertext(ciphertext=cbytes, address=address, bucket_name=bucket_name)
 
 
 def maybe_slice(pt: bytes, start: Optional[int], end_excl: Optional[int]) -> bytes:
