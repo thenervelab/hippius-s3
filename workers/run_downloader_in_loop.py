@@ -149,7 +149,7 @@ async def process_download_request(
                     # Download per plan entry (DB-driven chunk layout if available)
                     # Deduplicate CID fetches to avoid redundant IPFS downloads
                     cid_cache: dict[str, bytes] = {}
-                    assembled: list[tuple[int, bytes]] = []  # (chunk_index, data)
+                    # Switch to write-on-arrival: persist each chunk as soon as it's fetched
 
                     # Derive authoritative chunk_size from DB plan if provided (third column)
                     auth_chunk_size = 0
@@ -190,11 +190,15 @@ async def process_download_request(
                             # Non-fatal; downloader will attempt a final meta write after download
                             chunk_logger.debug("Early meta write failed", exc_info=True)
 
-                    for ci, cid_val, expected_len in cid_plan:
+                    # Order plan to prioritize the lowest chunk index for faster first byte
+                    ordered_plan = sorted(cid_plan, key=lambda x: int(x[0]))
+                    total_size_bytes = 0
+
+                    async def fetch_and_store(entry: tuple[int, str, int | None]) -> int:
+                        ci, cid_val, expected_len = entry
                         chunk_logger.debug(
                             f"Downloading part {chunk.part_id} ci={ci} CID={cid_val[:10]}... expected={expected_len}"
                         )
-                        # Check if we already fetched this CID
                         if cid_val in cid_cache:
                             data_i = cid_cache[cid_val]
                             chunk_logger.debug(f"Using cached CID data for ci={ci}")
@@ -208,25 +212,28 @@ async def process_download_request(
                                 return_bytes=True,
                             )
                             cid_cache[cid_val] = data_i
-
                         if expected_len is not None and len(data_i) != int(expected_len):
                             chunk_logger.warning(
                                 f"Cipher len mismatch for part {chunk.part_id} ci={ci}: got={len(data_i)} expected={expected_len}"
                             )
-                        assembled.append((ci, data_i))
+                        await obj_cache.set_chunk(download_request.object_id, part_num, int(ci), data_i)
+                        return len(data_i)
 
-                    # Sort by chunk index and concatenate; also map by index for targeted writes
-                    assembled.sort(key=lambda x: x[0])
-                    by_index: dict[int, bytes] = {int(i): bytes(d) for i, d in assembled}
-                    chunk_data = b"".join([data for _, data in assembled])
+                    # Fetch the first (lowest) chunk synchronously and write immediately
+                    head_len = 0
+                    if ordered_plan:
+                        head_len = await fetch_and_store(ordered_plan[0])
+                        total_size_bytes += head_len
 
-                    md5 = _hashlib.md5(chunk_data).hexdigest()
-                    head_hex = chunk_data[:8].hex()
-                    tail_hex = chunk_data[-8:].hex() if len(chunk_data) >= 8 else head_hex
-                    chunk_logger.debug(
-                        f"Downloaded chunk {chunk.part_id} cid={str(chunk.cid)}... len={len(chunk_data)} md5={md5} "
-                        f"head8={head_hex} tail8={tail_hex}"
-                    )
+                    # Fetch and store the remaining chunks concurrently
+                    if len(ordered_plan) > 1:
+                        tail = ordered_plan[1:]
+                        # Limit intra-part concurrency by the same semaphore already held
+                        # Note: semaphore guards outer part processing; this inner gather is fine
+                        results = await asyncio.gather(*[fetch_and_store(e) for e in tail])
+                        total_size_bytes += sum(int(x or 0) for x in results)
+
+                    # Optional debug: we no longer hold the whole part; skip part-level md5 to save memory
 
                     # Store bytes in Redis cache with meta-first write order (readiness signal before chunks)
                     if cid_plan and len(cid_plan) > 1:
@@ -246,19 +253,19 @@ async def process_download_request(
                         if eff_chunk_size <= 0:
                             eff_chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
 
-                        await obj_cache.set_meta(
-                            download_request.object_id,
-                            part_num,
-                            chunk_size=eff_chunk_size,
-                            # Prefer DB total; if unknown, fall back to plan length so reader can proceed
-                            num_chunks=max(1, max(db_chunks, len(cid_plan))),
-                            size_bytes=len(chunk_data),
-                        )
-                        for ci, _cid, _exp in cid_plan:
-                            data_i = by_index.get(int(ci), b"")
-                            await obj_cache.set_chunk(download_request.object_id, part_num, int(ci), data_i)
+                        # Update meta one more time with final size_bytes (non-critical for readiness)
+                        try:
+                            await obj_cache.set_meta(
+                                download_request.object_id,
+                                part_num,
+                                chunk_size=eff_chunk_size,
+                                num_chunks=max(1, max(db_chunks, len(cid_plan))),
+                                size_bytes=int(total_size_bytes),
+                            )
+                        except Exception:
+                            chunk_logger.debug("Final meta write failed", exc_info=True)
                         chunk_logger.info(
-                            f"OBJ-CACHE stored (DB layout) object_id={download_request.object_id} part={part_num} ct_chunks={len(cid_plan)} total_bytes={len(chunk_data)}"
+                            f"OBJ-CACHE stored (DB layout) object_id={download_request.object_id} part={part_num} ct_chunks={len(cid_plan)} total_bytes={int(total_size_bytes)}"
                         )
                     else:
                         # Single-chunk case: write meta first, then chunk at the requested index (default 0)
@@ -288,12 +295,13 @@ async def process_download_request(
                             part_num,
                             chunk_size=eff_chunk_size,
                             num_chunks=max(1, target_index + 1),
-                            size_bytes=len(chunk_data),
+                            size_bytes=0,
                         )
-                        data_i = by_index.get(target_index, chunk_data)
-                        await obj_cache.set_chunk(download_request.object_id, part_num, target_index, data_i)
+                        # Fetch and write target chunk directly (no whole-part assembly)
+                        entry = ordered_plan[0] if ordered_plan else (target_index, str(chunk.cid), None)
+                        _ = await fetch_and_store(entry)
                         chunk_logger.info(
-                            f"OBJ-CACHE stored (single) object_id={download_request.object_id} part={part_num} idx={target_index} bytes={len(data_i)}"
+                            f"OBJ-CACHE stored (single) object_id={download_request.object_id} part={part_num} idx={target_index}"
                         )
                     # Log download timing
                     chunk_ms = (_dtime.perf_counter() - chunk_start) * 1000.0
@@ -303,7 +311,7 @@ async def process_download_request(
                         extra={
                             "object_id": download_request.object_id,
                             "part_id": chunk.part_id,
-                            "size_bytes": len(chunk_data),
+                            "size_bytes": int(total_size_bytes) if (cid_plan and len(cid_plan) > 1) else None,
                             "num_cids": len(cid_plan),
                         },
                     )
