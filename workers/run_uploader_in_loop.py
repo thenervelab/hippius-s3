@@ -7,6 +7,8 @@ from pathlib import Path
 
 import asyncpg
 import redis.asyncio as async_redis
+from pydantic import ValidationError
+from redis.exceptions import BusyLoadingError
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -44,7 +46,7 @@ async def run_uploader_loop():
             moved = await move_due_retries_to_primary(redis_client, now_ts=time.time(), max_items=64)
             if moved:
                 logger.info(f"Moved {moved} due retry requests back to primary queue")
-        except async_redis.exceptions.BusyLoadingError:
+        except BusyLoadingError:
             logger.warning("Redis is still loading dataset, waiting 2 seconds...")
             await asyncio.sleep(2)
             continue
@@ -53,7 +55,16 @@ async def run_uploader_loop():
             await asyncio.sleep(1)
             continue
 
-        upload_request = await dequeue_upload_request(redis_client)
+        try:
+            upload_request = await dequeue_upload_request(redis_client)
+        except ValidationError as e:
+            logger.error(f"Invalid queue data, skipping: {e}")
+            await asyncio.sleep(0.1)
+            continue
+        except BusyLoadingError:
+            logger.warning("Redis is still loading dataset, waiting 2 seconds...")
+            await asyncio.sleep(2)
+            continue
 
         if upload_request:
             logger.info(
