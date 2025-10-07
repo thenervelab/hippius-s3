@@ -40,11 +40,25 @@ async def run_substrate_loop():
     first_request_time = None
 
     while True:
-        moved = await move_substrate_due_retries_to_primary(redis_client, now_ts=time.time(), max_items=64)
-        if moved:
-            logger.info(f"Moved {moved} due substrate retry requests back to primary queue")
+        try:
+            moved = await move_substrate_due_retries_to_primary(redis_client, now_ts=time.time(), max_items=64)
+            if moved:
+                logger.info(f"Moved {moved} due substrate retry requests back to primary queue")
+        except async_redis.exceptions.BusyLoadingError:
+            logger.warning("Redis is still loading dataset, waiting 2 seconds...")
+            await asyncio.sleep(2)
+            continue
+        except Exception as e:
+            logger.error(f"Error moving substrate retry requests: {e}")
+            await asyncio.sleep(1)
+            continue
 
-        substrate_request = await dequeue_substrate_request(redis_client)
+        try:
+            substrate_request = await dequeue_substrate_request(redis_client)
+        except async_redis.exceptions.BusyLoadingError:
+            logger.warning("Redis is still loading dataset, waiting 2 seconds...")
+            await asyncio.sleep(2)
+            continue
 
         now = time.time()
 
