@@ -20,6 +20,7 @@ async def stream_plan(
     sleep_seconds: float,
     address: str = "",
     bucket_name: str = "",
+    storage_version: int = 2,
 ) -> AsyncGenerator[bytes, None]:
     for item in plan:
         c = await fetch_chunk_blocking(
@@ -34,5 +35,6 @@ async def stream_plan(
             chunk_index=int(item.chunk_index),
             address=address,
             bucket_name=bucket_name,
+            storage_version=int(storage_version),
         )
         yield maybe_slice(pt, item.slice_start, item.slice_end_excl)

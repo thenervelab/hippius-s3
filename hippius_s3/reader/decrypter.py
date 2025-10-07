@@ -15,29 +15,30 @@ async def decrypt_chunk_if_needed(
     chunk_index: int,
     address: str,
     bucket_name: str,
+    storage_version: int,
 ) -> bytes:
     if not should_decrypt:
         return cbytes
-    try:
-        return CryptoService.decrypt_chunk(
-            cbytes,
-            seed_phrase=seed_phrase,
-            object_id=object_id,
-            part_number=int(part_number),
-            chunk_index=int(chunk_index),
-        )
-    except Exception:
-        # Fallback to SDK legacy key (account+bucket scoped) for single-chunk legacy ciphertext
+    if int(storage_version) == 1:
+        # Legacy: decrypt per chunk/part using SDK key
         from hippius_s3.config import get_config
 
         cfg = get_config()
         if not cfg.enable_legacy_sdk_compat:
-            raise
+            raise RuntimeError("legacy_disabled")
         from hippius_s3.legacy.sdk_compat import decrypt_part_ciphertext  # local import
 
         if not address or not bucket_name:
-            raise
+            raise RuntimeError("legacy_key_missing")
         return await decrypt_part_ciphertext(ciphertext=cbytes, address=address, bucket_name=bucket_name)
+    # Modern v2 decrypt
+    return CryptoService.decrypt_chunk(
+        cbytes,
+        seed_phrase=seed_phrase,
+        object_id=object_id,
+        part_number=int(part_number),
+        chunk_index=int(chunk_index),
+    )
 
 
 def maybe_slice(pt: bytes, start: Optional[int], end_excl: Optional[int]) -> bytes:

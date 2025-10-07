@@ -163,6 +163,7 @@ async def handle_get_object(
             "metadata": object_info.get("metadata") or {},
             "multipart": bool(object_info["multipart"]),
             "should_decrypt": bool(object_info["should_decrypt"]),
+            "storage_version": int(object_info.get("storage_version") or 2),
         }
 
         return await read_response(
