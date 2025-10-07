@@ -63,13 +63,14 @@ async def process_download_request(
         async def download_chunk(chunk):
             chunk_logger = logging.getLogger(__name__)
             async with semaphore:
+                part_num = int(chunk.part_id)
                 # Build per-part download plan from DB; optionally restrict to in-range chunk indices
                 cid_plan: list[tuple[int, str, int | None]] = []
                 try:
                     rows = await db.fetch(
                         get_query("get_part_chunks_by_object_and_number"),
                         download_request.object_id,
-                        int(chunk.part_id),
+                        part_num,
                     )
                     all_entries = [(int(r[0]), str(r[1]), int(r[2]) if r[2] is not None else None) for r in rows or []]
                     # Restrict to requested indices if provided
@@ -160,6 +161,35 @@ async def process_download_request(
                     except Exception:
                         auth_chunk_size = 0
 
+                    # EARLY readiness signal: write meta before downloading all chunks so API can unblock
+                    if cid_plan and len(cid_plan) > 1:
+                        eff_chunk_size_early = auth_chunk_size
+                        db_chunks_early = 0
+                        if eff_chunk_size_early <= 0:
+                            try:
+                                from hippius_s3.metadata.meta_reader import read_db_meta  # local import
+
+                                db_meta_early = await read_db_meta(db, download_request.object_id, part_num)
+                                if db_meta_early:
+                                    eff_chunk_size_early = int(db_meta_early.get("chunk_size_bytes") or 0)
+                                    db_chunks_early = int(db_meta_early.get("num_chunks_db") or 0)
+                            except Exception:
+                                eff_chunk_size_early = 0
+                        if eff_chunk_size_early <= 0:
+                            eff_chunk_size_early = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+
+                        try:
+                            await obj_cache.set_meta(
+                                download_request.object_id,
+                                part_num,
+                                chunk_size=eff_chunk_size_early,
+                                num_chunks=max(1, max(db_chunks_early, len(cid_plan))),
+                                size_bytes=0,
+                            )
+                        except Exception:
+                            # Non-fatal; downloader will attempt a final meta write after download
+                            chunk_logger.debug("Early meta write failed", exc_info=True)
+
                     for ci, cid_val, expected_len in cid_plan:
                         chunk_logger.debug(
                             f"Downloading part {chunk.part_id} ci={ci} CID={cid_val[:10]}... expected={expected_len}"
@@ -199,7 +229,6 @@ async def process_download_request(
                     )
 
                     # Store bytes in Redis cache with meta-first write order (readiness signal before chunks)
-                    part_num = int(chunk.part_id)
                     if cid_plan and len(cid_plan) > 1:
                         # Multiple chunks in DB: ensure non-zero chunk_size and prefer DB count
                         eff_chunk_size = auth_chunk_size
@@ -221,8 +250,8 @@ async def process_download_request(
                             download_request.object_id,
                             part_num,
                             chunk_size=eff_chunk_size,
-                            # Prefer DB total; if unknown, keep 0 (reader polls per-chunk)
-                            num_chunks=db_chunks,
+                            # Prefer DB total; if unknown, fall back to plan length so reader can proceed
+                            num_chunks=max(1, max(db_chunks, len(cid_plan))),
                             size_bytes=len(chunk_data),
                         )
                         for ci, _cid, _exp in cid_plan:
