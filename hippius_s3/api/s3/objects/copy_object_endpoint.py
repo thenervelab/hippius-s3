@@ -190,6 +190,7 @@ async def handle_copy_object(
             sleep_seconds=float(config.http_download_sleep_loop),
             address=request.state.account.main_account,
             bucket_name=source_bucket_name,
+            storage_version=int(src_obj_row.get("storage_version") or 2),
         )
         # Accumulate bytes (TODO: switch to streaming publish if supported)
         src_bytes = b"".join([piece async for piece in chunks_iter])
