@@ -5,6 +5,7 @@ import random
 import time
 from typing import Any
 from typing import List
+from typing import Optional
 from typing import Tuple
 
 from hippius_s3.cache import RedisObjectPartsCache
@@ -76,7 +77,7 @@ class Uploader:
             object_id=payload.object_id,
             object_key=payload.object_key,
             chunks=payload.chunks,
-            seed_phrase=payload.subaccount_seed_phrase,
+            upload_id=payload.upload_id,
         )
         chunk_duration = time.time() - chunk_start
 
@@ -84,10 +85,6 @@ class Uploader:
         manifest_cid = await self._build_and_upload_manifest(
             object_id=payload.object_id,
             object_key=payload.object_key,
-            should_encrypt=payload.should_encrypt,
-            seed_phrase=payload.subaccount_seed_phrase,
-            account_address=payload.address,
-            bucket_name=payload.bucket_name,
         )
         manifest_duration = time.time() - manifest_start
 
@@ -114,7 +111,7 @@ class Uploader:
         object_id: str,
         object_key: str,
         chunks: List[Chunk],
-        seed_phrase: str,
+        upload_id: Optional[str],
     ) -> List[str]:
         logger.debug(f"Uploading {len(chunks)} chunks for object_id={object_id}")
 
@@ -127,7 +124,7 @@ class Uploader:
                     object_id=object_id,
                     object_key=object_key,
                     chunk=chunk,
-                    seed_phrase=seed_phrase,
+                    upload_id=upload_id,
                 )
 
         chunks_sorted = sorted(chunks, key=lambda c: c.id)
@@ -150,7 +147,7 @@ class Uploader:
         object_id: str,
         object_key: str,
         chunk: Chunk,
-        seed_phrase: str,
+        upload_id: Optional[str],
     ) -> Tuple[str, int]:
         part_number = int(chunk.id)
         logger.debug(f"Uploading chunk object_id={object_id} part={part_number}")
@@ -158,6 +155,24 @@ class Uploader:
         chunk_data = await self.obj_cache.get(object_id, part_number)
         if chunk_data is None:
             raise ValueError(f"Chunk data missing for object_id={object_id} part={part_number}")
+
+        # Ensure we have a non-null upload_id for parts table operations
+        resolved_upload_id: Optional[str] = upload_id
+        if not resolved_upload_id:
+            try:
+                row = await self.db.fetchrow(
+                    "SELECT upload_id FROM multipart_uploads WHERE object_id = $1 ORDER BY initiated_at DESC LIMIT 1",
+                    object_id,
+                )
+                if row and row[0] is not None:
+                    resolved_upload_id = str(row[0])
+            except Exception:
+                resolved_upload_id = None
+        if not resolved_upload_id or (isinstance(resolved_upload_id, str) and resolved_upload_id.strip() == ""):
+            logger.warning(
+                f"uploader: missing upload_id; using object_id as fallback (object_id={object_id} part={part_number})"
+            )
+            resolved_upload_id = object_id
 
         upload_result = await self.ipfs_service.upload_file(
             file_data=chunk_data,
@@ -197,38 +212,31 @@ class Uploader:
                 rows_affected = int(updated_str) if updated_str else 0
 
             if rows_affected == 0:
-                await self.db.execute(
+                # Fallback: try update by upload_id
+                updated2 = await self.db.execute(
                     """
-                    INSERT INTO parts (part_id, object_id, part_number, ipfs_cid, size_bytes, cid_id, uploaded_at)
-                    VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, NOW())
-                    ON CONFLICT (object_id, part_number) DO UPDATE SET
-                        ipfs_cid = EXCLUDED.ipfs_cid,
-                        size_bytes = EXCLUDED.size_bytes,
-                        cid_id = COALESCE(EXCLUDED.cid_id, parts.cid_id)
+                    UPDATE parts
+                    SET ipfs_cid = $3, size_bytes = $4, cid_id = COALESCE($5, cid_id)
+                    WHERE upload_id = $1 AND part_number = $2
                     """,
-                    object_id,
+                    resolved_upload_id,
                     part_number,
                     chunk_cid,
                     len(chunk_data),
                     cid_id,
                 )
+                updated2_str = str(updated2 or "")
+                rows_affected2 = 0
+                if updated2_str.upper().startswith("UPDATE"):
+                    rows_affected2 = int(updated2_str.split(" ")[-1])
+                else:
+                    rows_affected2 = int(updated2_str) if updated2_str else 0
+                if rows_affected2 == 0:
+                    # No existing parts row yet; treat as transient and let caller requeue
+                    raise RuntimeError("parts_row_missing_for_update")
         except Exception:
-            logger.debug("Uploader update failed; falling back to upsert", exc_info=True)
-            await self.db.execute(
-                """
-                INSERT INTO parts (part_id, object_id, part_number, ipfs_cid, size_bytes, cid_id, uploaded_at)
-                VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, NOW())
-                ON CONFLICT (object_id, part_number) DO UPDATE SET
-                    ipfs_cid = EXCLUDED.ipfs_cid,
-                    size_bytes = EXCLUDED.size_bytes,
-                    cid_id = COALESCE(EXCLUDED.cid_id, parts.cid_id)
-                """,
-                object_id,
-                part_number,
-                chunk_cid,
-                len(chunk_data),
-                cid_id,
-            )
+            logger.debug("Uploader update failed; will requeue (no synthesize)", exc_info=True)
+            raise
 
         return chunk_cid, part_number
 
@@ -236,10 +244,6 @@ class Uploader:
         self,
         object_id: str,
         object_key: str,
-        should_encrypt: bool,
-        seed_phrase: str,
-        account_address: str,
-        bucket_name: str,
     ) -> str:
         logger.debug(f"Building manifest for object_id={object_id}")
 
@@ -255,17 +259,16 @@ class Uploader:
             """,
             object_id,
         )
-
+        # If any part is missing a concrete CID, skip manifest build for now
         parts_data = []
         for r in rows:
             part_number = int(r[0])
             cid_raw = r[1]
             cid = str(cid_raw).strip() if cid_raw else None
             size = int(r[2] or 0)
-
             if not cid or cid.lower() in {"", "none", "pending"}:
-                raise ValueError(f"Part {part_number} missing CID for object_id={object_id}")
-
+                logger.debug(f"Manifest deferred: missing CID for part {part_number} (object_id={object_id})")
+                return "pending"
             parts_data.append({"part_number": part_number, "cid": cid, "size_bytes": size})
 
         obj_row = await self.db.fetchrow("SELECT content_type FROM objects WHERE object_id = $1", object_id)
@@ -282,17 +285,17 @@ class Uploader:
         manifest_json = json.dumps(manifest_data)
         logger.debug(f"Manifest built with {len(parts_data)} parts for object_id={object_id}")
 
-        manifest_result = await self.ipfs_service.pin_file_with_encryption(
+        manifest_result = await self.ipfs_service.upload_file(
             file_data=manifest_json.encode(),
             file_name=f"{object_key}.manifest",
-            should_encrypt=should_encrypt,
-            seed_phrase=seed_phrase,
-            account_address=account_address,
-            bucket_name=bucket_name,
-            publish_to_chain=False,
+            content_type="application/json",
+            encrypt=False,
         )
-
-        manifest_cid = manifest_result.cid
+        manifest_cid = str(
+            manifest_result.get("cid") if isinstance(manifest_result, dict) else getattr(manifest_result, "cid", None)
+        )
+        if not manifest_cid:
+            raise ValueError("manifest_publish_missing_cid")
 
         cid_id = None
         cid_row = await self.db.fetchrow(get_query("upsert_cid"), manifest_cid)

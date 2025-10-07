@@ -3,8 +3,6 @@
 
 -- migrate:up
 
-BEGIN;
-
 CREATE TABLE IF NOT EXISTS part_chunks (
   id BIGSERIAL PRIMARY KEY,
   part_id UUID NOT NULL REFERENCES parts(part_id) ON DELETE CASCADE,
@@ -29,11 +27,7 @@ LEFT JOIN cids c ON p.cid_id = c.id
 WHERE (p.ipfs_cid IS NOT NULL AND p.ipfs_cid <> '') OR p.cid_id IS NOT NULL
 ON CONFLICT (part_id, chunk_index) DO NOTHING;
 
-COMMIT;
-
 -- migrate:down
 
-BEGIN;
 DROP INDEX IF EXISTS part_chunks_part_idx;
 DROP TABLE IF EXISTS part_chunks;
-COMMIT;

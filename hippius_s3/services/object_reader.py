@@ -9,6 +9,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 from typing import AsyncGenerator
+from typing import cast
 
 from fastapi import Response
 from fastapi.responses import StreamingResponse
@@ -16,6 +17,9 @@ from fastapi.responses import StreamingResponse
 from hippius_s3.api.s3.common import build_headers
 from hippius_s3.api.s3.range_utils import calculate_chunks_for_range
 from hippius_s3.cache import ObjectPartsCache
+from hippius_s3.metadata.meta_reader import read_db_meta
+from hippius_s3.planning.range_planner import PartInput
+from hippius_s3.planning.range_planner import build_part_offsets
 from hippius_s3.queue import ChunkToDownload
 from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import enqueue_download_request
@@ -126,6 +130,7 @@ class ObjectReader:
         *,
         address: str,
         seed_phrase: str,
+        rng: Range | None = None,
     ) -> tuple[set[int], list[Part]]:
         """Ensure required parts are present in obj: cache by copying existing bytes or queueing pipeline.
 
@@ -147,7 +152,8 @@ class ObjectReader:
                 missing_for_pipeline.append(p)
 
         # Stage 2: enqueue only for missing parts (guard with a flag per part)
-        if missing_for_pipeline:
+        # Skip generic enqueue for range requests; a minimal per-range enqueue happens below
+        if missing_for_pipeline and rng is None:
             dl_parts = [ChunkToDownload(cid=p.cid, part_id=p.part_number) for p in missing_for_pipeline if p.cid]
             req = DownloadChainRequest(
                 request_id=f"{info.object_id}::shared",
@@ -263,7 +269,7 @@ class ObjectReader:
                         for c in cid_updates
                     ]
                     await self.hydrate_object_cache(
-                        redis, obj_cache, info, cid_parts, address=address, seed_phrase=seed_phrase
+                        redis, obj_cache, info, cid_parts, address=address, seed_phrase=seed_phrase, rng=None
                     )
                     # Remove from still_pending since they're now being hydrated
                     for update in cid_updates:
@@ -387,14 +393,88 @@ class ObjectReader:
         # Step 4: Hydrate cache for CID-backed parts and handle pending-only parts
         if cid_backed_parts:
             # Only enqueue downloads for parts that have concrete CIDs
-            await self.hydrate_object_cache(
-                redis,
-                obj_cache,
-                info,
-                cid_backed_parts,  # Only CID-backed parts
-                address=address,
-                seed_phrase=seed_phrase,
-            )
+            # If a range is provided, pass minimal chunk indices per part
+            if rng is not None:
+                # Build offsets from DB plain sizes (no cache dependency)
+                part_inputs = cast(
+                    list[PartInput],
+                    [
+                        {
+                            "part_number": fp.part_number,
+                            "plain_size": plaintext_sizes.get(fp.part_number, fp.size_bytes),
+                        }
+                        for fp in full_parts
+                    ],
+                )
+                part_offsets = build_part_offsets(part_inputs)
+                offset_map = {int(po["part_number"]): (int(po["offset"]), int(po["plain_size"])) for po in part_offsets}
+
+                # Determine chunk_size for each part from DB only; if missing -> 503/SlowDown
+                per_part_chunk_size: dict[int, int] = {}
+                missing_chunk_size_parts: list[int] = []
+                for p in cid_backed_parts:
+                    pn = int(p.part_number)
+                    db_meta = await read_db_meta(db, info.object_id, pn)
+                    if db_meta and db_meta["chunk_size_bytes"]:
+                        per_part_chunk_size[pn] = int(db_meta["chunk_size_bytes"])  # type: ignore[index]
+                    else:
+                        missing_chunk_size_parts.append(pn)
+                if missing_chunk_size_parts:
+                    self._logger.warning(
+                        f"chunk_size_bytes_missing object_id={info.object_id} parts={sorted(missing_chunk_size_parts)}"
+                    )
+                    raise DownloadNotReadyError("chunk_size_bytes_missing")
+
+                # Plan minimal indices per part (pure math, per-part chunk_size)
+                per_part_indices: dict[int, list[int]] = {}
+                for p in cid_backed_parts:
+                    pn = int(p.part_number)
+                    if pn not in per_part_chunk_size or pn not in offset_map:
+                        continue
+                    chunk_size = int(per_part_chunk_size[pn])
+                    part_start, part_plain_size = offset_map[pn]
+                    # Compute local range within this part
+                    local_start = max(0, int(rng.start) - part_start)
+                    local_end = min(max(0, part_plain_size - 1), int(rng.end) - part_start)
+                    if local_start > local_end or part_plain_size <= 0 or chunk_size <= 0:
+                        continue
+                    s_chunk = local_start // chunk_size
+                    e_chunk = local_end // chunk_size
+                    per_part_indices[pn] = list(range(int(s_chunk), int(e_chunk) + 1))
+
+                # Enqueue with minimal indices
+                dl_parts = []
+                for p in cid_backed_parts:
+                    indices = per_part_indices.get(int(p.part_number))
+                    if p.cid:
+                        dl = ChunkToDownload(cid=p.cid, part_id=p.part_number, redis_key=None, chunk_indices=indices)
+                        dl_parts.append(dl)
+                req = DownloadChainRequest(
+                    request_id=f"{info.object_id}::shared",
+                    object_id=info.object_id,
+                    object_key=info.object_key,
+                    bucket_name=info.bucket_name,
+                    address=address,
+                    subaccount=address,
+                    subaccount_seed_phrase=seed_phrase,
+                    substrate_url=self.config.substrate_url,
+                    ipfs_node=self.config.ipfs_get_url,
+                    should_decrypt=info.should_decrypt,
+                    size=info.size_bytes,
+                    multipart=info.multipart,
+                    chunks=dl_parts,
+                )
+                await enqueue_download_request(req, redis)
+            else:
+                await self.hydrate_object_cache(
+                    redis,
+                    obj_cache,
+                    info,
+                    cid_backed_parts,  # Only CID-backed parts
+                    address=address,
+                    seed_phrase=seed_phrase,
+                    rng=None,
+                )
 
         # Handle pending-only parts with bounded polling
         if pending_only_parts:
@@ -643,8 +723,7 @@ class ObjectReader:
         if rng is not None:
 
             async def gen_range() -> AsyncGenerator[bytes, None]:
-                # Stream parts needed for range: use full_parts (already refreshed above for range requests)
-                # and compute offsets using PLAINTEXT sizes (not ciphertext DB sizes)
+                # Stream parts needed for range: compute offsets using PLAINTEXT sizes
                 import time as _t
 
                 cursor = int(rng.start)
@@ -676,6 +755,8 @@ class ObjectReader:
                 total_plain = acc
                 with contextlib.suppress(Exception):
                     self._logger.info(f"RANGE gen_range: total_plain={total_plain} offsets={offsets}")
+
+                # Preflight removed: we will poll per-chunk with a bounded timeout while streaming
 
                 while cursor <= end_inclusive:
                     # Identify part covering current cursor
@@ -715,33 +796,82 @@ class ObjectReader:
                             break
                         await asyncio.sleep(self.config.http_download_sleep_loop)
 
-                    # Read this part and yield the required slice
-                    data = await _read_part_bytes(target_pn)
-                    with contextlib.suppress(Exception):
-                        self._logger.debug(
-                            f"RANGE read pn={target_pn} part_start={part_start} size={len(data) if data else 0} cursor={cursor}"
-                        )
-                    if not data:
-                        # Part not ready yet despite readiness check; retry within the same deadline
-                        if _t.time() <= wait_deadline:
-                            await asyncio.sleep(self.config.http_download_sleep_loop)
-                            continue
-                        break
-                    slice_start = max(0, cursor - part_start)
-                    desired_end_exclusive = (end_inclusive - part_start) + 1
-                    capped_end_exclusive = min(size_bytes, max(slice_start, desired_end_exclusive))
-                    if capped_end_exclusive > slice_start:
-                        yield data[slice_start:capped_end_exclusive]
-                        cursor = part_start + capped_end_exclusive
-                    else:
-                        # Nothing to yield for this part; advance to next
-                        cursor = part_start + size_bytes
+                    # Yield only the plaintext needed within this part using per-chunk decrypt
+                    # Compute local range within part
+                    local_start = max(0, cursor - part_start)
+                    local_end_inclusive = min(size_bytes - 1, end_inclusive - part_start)
 
+                    # Prefer meta; if missing but part bytes exist, slice whole-part for this request only
+                    meta = await obj_cache.get_meta(info.object_id, target_pn)  # type: ignore[attr-defined]
+                    if not isinstance(meta, dict):
+                        data = await _read_part_bytes(target_pn)
+                        if not data:
+                            raise DownloadNotReadyError("chunk_size_bytes_missing")
+                        yield data[local_start : local_end_inclusive + 1]
+                        cursor = part_start + local_end_inclusive + 1
+                        continue
+
+                    try:
+                        chunk_size = int(meta.get("chunk_size", 0))
+                        num_chunks = int(meta.get("num_chunks", 0))
+                    except Exception:
+                        chunk_size = 0
+                        num_chunks = 0
+
+                    if num_chunks <= 0 or chunk_size <= 0:
+                        # Fallback to whole-part slice if available in cache for this request
+                        data = await _read_part_bytes(target_pn)
+                        if not data:
+                            raise DownloadNotReadyError("chunk_size_bytes_missing")
+                        yield data[local_start : local_end_inclusive + 1]
+                        cursor = part_start + local_end_inclusive + 1
+                        continue
+
+                    start_chunk = int(local_start // chunk_size)
+                    end_chunk = int(local_end_inclusive // chunk_size)
+                    for ci in range(start_chunk, min(end_chunk, num_chunks - 1) + 1):
+                        # Fetch single ciphertext chunk with bounded polling per chunk
+                        cbytes = None
+                        chunk_deadline = _t.time() + float(self.config.http_stream_initial_timeout_seconds)
+                        while _t.time() < chunk_deadline:
+                            cbytes = await obj_cache.get_chunk(info.object_id, int(target_pn), int(ci))  # type: ignore[attr-defined]
+                            if cbytes is not None:
+                                break
+                            await asyncio.sleep(self.config.http_download_sleep_loop)
+                        if cbytes is None:
+                            raise DownloadNotReadyError("range_chunk_missing")
+
+                        # Decrypt if needed
+                        if info.should_decrypt:
+                            try:
+                                pt = CryptoService.decrypt_chunk(
+                                    cbytes,
+                                    seed_phrase=seed_phrase,
+                                    object_id=info.object_id,
+                                    part_number=int(target_pn),
+                                    chunk_index=int(ci),
+                                )
+                            except Exception as err:
+                                # Surface as SlowDown rather than stalling/assembling whole part
+                                raise DownloadNotReadyError("range_decrypt_failed") from err
+                        else:
+                            pt = cbytes
+
+                        # Slice within this plaintext chunk
+                        chunk_pt_start = ci * chunk_size
+                        s_local = max(0, local_start - chunk_pt_start)
+                        e_local_excl = min(len(pt), (local_end_inclusive - chunk_pt_start) + 1)
+                        if e_local_excl > s_local:
+                            yield pt[s_local:e_local_excl]
+
+                    cursor = part_start + local_end_inclusive + 1
+
+            # Build range-aware headers safely
             headers = build_headers(
                 dataclasses.asdict(info),
                 source=source_header,
                 metadata=_md,
-                rng=(rng.start, rng.end),
+                rng=(rng.start, rng.end) if rng is not None else None,
                 range_was_invalid=range_was_invalid,
             )
             status_code = 200 if range_was_invalid else 206
