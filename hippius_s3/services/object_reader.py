@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from typing import AsyncIterator
 
 from fastapi import Response
 from fastapi.responses import StreamingResponse
@@ -130,6 +131,47 @@ async def read_response(
             )
             await enqueue_download_request(req, redis)
 
+    # Legacy SDK whole-part decrypt fallback: only for full GET on private objects
+    if bool(info.get("should_decrypt")) and rng is None:
+        try:
+            # Attempt to assemble all chunks in-order; if any missing, skip fallback
+            buf: list[bytes] = []
+            for item in plan:
+                c = await obj_cache.get_chunk(info["object_id"], int(item.part_number), int(item.chunk_index))  # type: ignore[attr-defined]
+                if c is None:
+                    buf = []
+                    break
+                buf.append(c)
+            if buf:
+                ct = b"".join(buf)
+                # Try decrypt using legacy SDK key (account+bucket scoped)
+                import base64 as _b64
+
+                import nacl.secret as _secret
+
+                from hippius_s3.ipfs_service import get_encryption_key  # local import
+
+                account_bucket = f"{address}:{info.get('bucket_name', '')}"
+                key_b64 = await get_encryption_key(account_bucket)
+                key = _b64.b64decode(key_b64)
+                box = _secret.SecretBox(key)
+                pt = bytes(box.decrypt(ct))
+
+                async def _once() -> AsyncIterator[bytes]:
+                    yield pt
+
+                headers = build_headers(
+                    info, source=source, metadata=info.get("metadata") or {}, rng=None, range_was_invalid=False
+                )
+                return StreamingResponse(
+                    _once(),
+                    status_code=200,
+                    media_type=info.get("content_type", "application/octet-stream"),
+                    headers=headers,
+                )
+        except Exception:
+            pass
+
     gen = stream_plan(
         obj_cache=obj_cache,
         object_id=info["object_id"],
@@ -137,6 +179,8 @@ async def read_response(
         should_decrypt=bool(info.get("should_decrypt")),
         seed_phrase=seed_phrase,
         sleep_seconds=float(cfg.http_download_sleep_loop),
+        address=address,
+        bucket_name=str(info.get("bucket_name", "")),
     )
     headers = build_headers(
         info,

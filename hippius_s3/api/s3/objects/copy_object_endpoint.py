@@ -188,6 +188,8 @@ async def handle_copy_object(
             should_decrypt=not source_is_public,
             seed_phrase=request.state.seed_phrase,
             sleep_seconds=float(config.http_download_sleep_loop),
+            address=request.state.account.main_account,
+            bucket_name=source_bucket_name,
         )
         # Accumulate bytes (TODO: switch to streaming publish if supported)
         src_bytes = b"".join([piece async for piece in chunks_iter])
