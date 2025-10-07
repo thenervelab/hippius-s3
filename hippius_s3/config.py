@@ -16,7 +16,8 @@ class Config:
 
     # Database Configuration
     database_url: str = env("DATABASE_URL")
-    encryption_database_url: str = env("HIPPIUS_KEYSTORE_DATABASE_URL")
+    # Inline default prevents KeyError during class init; runtime fallback to DATABASE_URL is applied in get_config()
+    encryption_database_url: str = env("HIPPIUS_KEYSTORE_DATABASE_URL:", convert=str)
 
     # IPFS Configuration
     ipfs_get_url: str = env("HIPPIUS_IPFS_GET_URL")
@@ -82,14 +83,13 @@ class Config:
     # Resubmission settings
     resubmission_seed_phrase: str = env("RESUBMISSION_SEED_PHRASE")
 
-    # Publishing toggle (read directly from env; default true)
-    publish_to_chain: bool = env("PUBLISH_TO_CHAIN:true", convert=lambda x: x.lower() == "true")
-
-    # Uploader configuration
+    # Uploader configuration (supersedes legacy pinner config)
     uploader_max_attempts: int = env("HIPPIUS_UPLOADER_MAX_ATTEMPTS:5", convert=int)
     uploader_backoff_base_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_BASE_MS:500", convert=int)
     uploader_backoff_max_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_MAX_MS:60000", convert=int)
     uploader_multipart_max_concurrency: int = env("HIPPIUS_UPLOADER_MULTIPART_MAX_CONCURRENCY:5", convert=int)
+    # Heavy validation gating (legacy PINNER_VALIDATE_COVERAGE supported for compat)
+    uploader_validate_coverage: bool = env("UPLOADER_VALIDATE_COVERAGE:false", convert=lambda x: x.lower() == "true")
 
     # Substrate worker configuration
     substrate_batch_size: int = env("HIPPIUS_SUBSTRATE_BATCH_SIZE:16", convert=int)
@@ -106,6 +106,10 @@ class Config:
     cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:259200", convert=int)
     # Unified object part chunk size (bytes) for cache and range math
     object_chunk_size_bytes: int = env("HIPPIUS_CHUNK_SIZE_BYTES:4194304", convert=int)
+    # Downloader behavior (default: no whole-part backfill)
+    downloader_allow_part_backfill: bool = env(
+        "DOWNLOADER_ALLOW_PART_BACKFILL:false", convert=lambda x: x.lower() == "true"
+    )
 
     # Crypto configuration
     # Default encryption suite for new objects
@@ -134,7 +138,17 @@ class Config:
     # Substrate worker configuration
     substrate_queue_name: str = env("HIPPIUS_SUBSTRATE_QUEUE_NAME:substrate_requests", convert=str)
 
+    # Publishing toggle (read directly from env; default true)
+    publish_to_chain: bool = env("PUBLISH_TO_CHAIN:true", convert=lambda x: x.lower() == "true")
+
 
 def get_config() -> Config:
     """Get application configuration."""
-    return Config()
+    cfg = Config()
+    try:
+        if not getattr(cfg, "encryption_database_url", None):
+            object.__setattr__(cfg, "encryption_database_url", cfg.database_url)
+    except Exception:
+        # Last resort: ensure a usable value
+        object.__setattr__(cfg, "encryption_database_url", cfg.database_url)
+    return cfg
