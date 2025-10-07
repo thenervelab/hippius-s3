@@ -7,6 +7,7 @@ from pathlib import Path
 
 import asyncpg
 import redis.asyncio as async_redis
+from redis.exceptions import BusyLoadingError
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -44,7 +45,7 @@ async def run_uploader_loop():
             moved = await move_due_retries_to_primary(redis_client, now_ts=time.time(), max_items=64)
             if moved:
                 logger.info(f"Moved {moved} due retry requests back to primary queue")
-        except async_redis.exceptions.BusyLoadingError:
+        except BusyLoadingError:
             logger.warning("Redis is still loading dataset, waiting 2 seconds...")
             await asyncio.sleep(2)
             continue
