@@ -29,6 +29,8 @@ from hippius_s3.config import get_config
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
+from hippius_s3.services.crypto_service import CryptoService
+from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.utils import get_query
 
 
@@ -249,28 +251,14 @@ async def handle_append(
         # PHASE 1 (in-DB reservation): insert placeholder part and update object metadata atomically
         delta_md5 = hashlib.md5(incoming_bytes).hexdigest()
         delta_size = len(incoming_bytes)
-        placeholder_cid = "pending"
-        placeholder_cid_id = await _upsert_cid(db, placeholder_cid)
-        await db.execute(
-            """
-            INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            ON CONFLICT (object_id, part_number) DO UPDATE SET
-                ipfs_cid = EXCLUDED.ipfs_cid,
-                cid_id = EXCLUDED.cid_id,
-                size_bytes = EXCLUDED.size_bytes,
-                etag = EXCLUDED.etag,
-                uploaded_at = EXCLUDED.uploaded_at
-            """,
-            str(uuid.uuid4()),
-            upload_id,
-            int(next_part),
-            placeholder_cid,
-            int(delta_size),
-            delta_md5,
-            datetime.now(timezone.utc),
-            object_id,
-            placeholder_cid_id,
+        await upsert_part_placeholder(
+            db,
+            object_id=object_id,
+            upload_id=str(upload_id),
+            part_number=int(next_part),
+            size_bytes=int(delta_size),
+            etag=delta_md5,
+            chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
         )
 
         # Recompute composite ETag from base object MD5 + all appended part etags
@@ -322,8 +310,34 @@ async def handle_append(
     # Write-through cache: store appended bytes for immediate reads
 
     with contextlib.suppress(Exception):
-        logger.info(f"APPEND cache write object_id={object_id} part={int(next_part)} bytes={len(incoming_bytes)}")
-        await RedisObjectPartsCache(redis_client).set(object_id, int(next_part), incoming_bytes, ttl=1800)
+        logger.info(
+            f"APPEND cache write object_id={object_id} part={int(next_part)} bytes={len(incoming_bytes)} public={bucket['is_public']}"
+        )
+        obj_cache = RedisObjectPartsCache(redis_client)
+        if not bucket["is_public"]:
+            chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+            ct_chunks = CryptoService.encrypt_part_to_chunks(
+                incoming_bytes,
+                object_id=object_id,
+                part_number=int(next_part),
+                seed_phrase=request.state.seed_phrase,
+                chunk_size=chunk_size,
+            )
+            total_ct = sum(len(ct) for ct in ct_chunks)
+            # Write meta first for cheap readiness check
+            await obj_cache.set_meta(
+                object_id,
+                int(next_part),
+                chunk_size=chunk_size,
+                num_chunks=len(ct_chunks),
+                size_bytes=total_ct,
+                ttl=1800,
+            )
+            # Then write chunk data
+            for i, ct in enumerate(ct_chunks):
+                await obj_cache.set_chunk(object_id, int(next_part), i, ct, ttl=1800)
+        else:
+            await obj_cache.set(object_id, int(next_part), incoming_bytes, ttl=1800)
 
     # Enqueue background publish of this part via the pinner worker
     try:

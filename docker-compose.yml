@@ -1,4 +1,12 @@
 services:
+  base:
+    image: hippius-s3-base:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.base
+    profiles:
+      - build-base
+
   api:
     build: .
     ports:
@@ -18,16 +26,20 @@ services:
         condition: service_healthy
     volumes:
       - .:/app
+      - /var/lib/hippius/dlq:/tmp/hippius_dlq
+      - /var/lib/hippius/dlq_archive:/tmp/hippius_dlq_archive
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
       - UVICORN_LOG_LEVEL=debug
       - DEBUG=true
-      - HIPPIUS_IPFS_GET_URL=https://get.hippius.network
-      - HIPPIUS_IPFS_STORE_URL=https://store.hippius.network
       - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - REDIS_CHAIN_URL=redis://redis-chain:6379/0
+      - HIPPIUS_DLQ_DIR=/tmp/hippius_dlq
+      - HIPPIUS_DLQ_ARCHIVE_DIR=/tmp/hippius_dlq_archive
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     networks:
       - hippius_net
 
@@ -120,11 +132,39 @@ services:
     networks:
       - hippius_net
 
-  pinner:
+  uploader:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["python", "workers/run_pinner_in_loop.py"]
+    command: ["watchfiles", "--filter", "python", "python workers/run_uploader_in_loop.py"]
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
+      - HIPPIUS_DLQ_DIR=/tmp/hippius_dlq
+      - HIPPIUS_DLQ_ARCHIVE_DIR=/tmp/hippius_dlq_archive
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
+    volumes:
+      - .:/app
+      - /var/lib/hippius/dlq:/tmp/hippius_dlq
+      - /var/lib/hippius/dlq_archive:/tmp/hippius_dlq_archive
+    networks:
+      - hippius_net
+
+  substrate:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: ["watchfiles", "--filter", "python", "python workers/run_substrate_in_loop.py"]
     env_file:
       - .env
     depends_on:
@@ -133,12 +173,13 @@ services:
       redis:
         condition: service_healthy
     deploy:
-      replicas: 1 # can't scale up otherwise we get transaction conflicts for the same user
+      replicas: 1
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
-      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     volumes:
       - .:/app
     networks:
@@ -148,7 +189,7 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["python", "workers/run_unpinner_in_loop.py"]
+    command: ["watchfiles", "--filter", "python", "python workers/run_unpinner_in_loop.py"]
     env_file:
       - .env
     depends_on:
@@ -163,6 +204,8 @@ services:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     networks:
       - hippius_net
 
@@ -170,7 +213,7 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["python", "workers/run_downloader_in_loop.py"]
+    command: ["watchfiles", "--filter", "python", "python workers/run_downloader_in_loop.py"]
     env_file:
       - .env
     depends_on:
@@ -179,11 +222,13 @@ services:
       redis:
         condition: service_healthy
     deploy:
-      replicas: 3
+      replicas: 1
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     networks:
       - hippius_net
 
@@ -191,7 +236,7 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["python", "workers/chain_pin_checker.py"]
+    command: ["watchfiles", "--filter", "python", "python workers/chain_pin_checker.py"]
     env_file:
       - .env
     depends_on:
@@ -205,6 +250,8 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_CHAIN_URL=redis://redis-chain:6379/0
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     networks:
       - hippius_net
 
@@ -212,7 +259,7 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["python", "workers/chain_profile_cacher.py"]
+    command: ["watchfiles", "--filter", "python", "python workers/chain_profile_cacher.py"]
     env_file:
       - .env
     depends_on:
@@ -226,6 +273,8 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_CHAIN_URL=redis://redis-chain:6379/0
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     networks:
       - hippius_net
 

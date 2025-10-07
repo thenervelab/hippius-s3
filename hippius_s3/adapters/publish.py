@@ -44,11 +44,11 @@ class ResilientPublishAdapter:
         file_name: str,
         should_encrypt: bool,
         seed_phrase: Optional[str],
-        subaccount_id: Optional[str],
+        account_address: Optional[str],
         bucket_name: Optional[str],
     ) -> ResolvedPublish:
         # If account context missing or publish disabled, go straight to fallback
-        if not getattr(self.config, "publish_to_chain", True) or not (seed_phrase and subaccount_id and bucket_name):
+        if not getattr(self.config, "publish_to_chain", True) or not (seed_phrase and account_address and bucket_name):
             logger.info("Publish disabled or missing account context; using upload+pin fallback")
             return await self._fallback_upload_pin(
                 file_data=file_data,
@@ -68,19 +68,21 @@ class ResilientPublishAdapter:
                     temp_file.write(file_data)
 
                 logger.info(
-                    f"SDK s3_publish attempt {attempt}/{max_retries} file={file_name} size={len(file_data)} subaccount={subaccount_id} bucket={bucket_name}"
+                    f"SDK s3_publish attempt {attempt}/{max_retries} file={file_name} size={len(file_data)} subaccount={account_address} bucket={bucket_name}"
                 )
                 pub = await self.client.s3_publish(
                     tmp_path,
                     seed_phrase=seed_phrase,
                     encrypt=should_encrypt,
-                    subaccount_id=subaccount_id,
+                    subaccount_id=account_address,
                     bucket_name=bucket_name,
+                    store_node=self.config.ipfs_store_url,
+                    pin_node=self.config.ipfs_store_url,
+                    substrate_url=self.config.substrate_url,
                 )
-                cid = str(pub["cid"]) if isinstance(pub, dict) and "cid" in pub else str(pub)
-                tx_hash = pub.get("tx_hash") if isinstance(pub, dict) else None  # type: ignore[assignment]
-                logger.info(f"SDK publish complete cid={cid} tx={tx_hash}")
-                return ResolvedPublish(cid=cid, path="sdk", tx_hash=tx_hash)
+                tx_hash = getattr(pub, "tx_hash", None)
+                logger.info(f"SDK publish complete cid={pub.cid} tx={tx_hash}")
+                return ResolvedPublish(cid=pub.cid, path="sdk", tx_hash=tx_hash)
             except Exception as e:
                 last_exc = e
                 if attempt >= max_retries:
@@ -124,7 +126,7 @@ class ResilientPublishAdapter:
                 encrypt=should_encrypt,
                 seed_phrase=seed_phrase,
             )
-            cid = str(result["cid"]) if isinstance(result, dict) else str(result)
+            cid = str(result["cid"])
             # Pin
             await self.client.pin(cid, seed_phrase=seed_phrase)
             return ResolvedPublish(cid=cid, path="fallback", tx_hash=None)

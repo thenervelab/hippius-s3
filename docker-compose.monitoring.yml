@@ -17,6 +17,8 @@ services:
       - '--web.enable-lifecycle'
       - '--web.enable-admin-api'
     restart: unless-stopped
+    networks:
+      - hippius_net
     depends_on:
       - otel-collector
 
@@ -35,6 +37,8 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
       - GF_USERS_ALLOW_SIGN_UP=false
     restart: unless-stopped
+    networks:
+      - hippius_net
     depends_on:
       - prometheus
 
@@ -54,8 +58,8 @@ services:
     volumes:
       - ./monitoring/otel/otel-config.yml:/etc/otelcol-contrib/otel-config.yml:ro
     restart: unless-stopped
-    depends_on:
-      - redis
+    networks:
+      - hippius_net
 
   # Redis exporter for main Redis metrics
   redis-exporter:
@@ -73,8 +77,8 @@ services:
       "-debug"
     ]
     restart: unless-stopped
-    depends_on:
-      - redis
+    networks:
+      - hippius_net
 
   # Redis exporter for accounts cache
   redis-accounts-exporter:
@@ -89,8 +93,8 @@ services:
       "-count-keys=db0=hippius_subaccount_cache:*,db0=hippius_main_account_credits:*,db0=hippius_seed_to_subaccount:*"
     ]
     restart: unless-stopped
-    depends_on:
-      - redis-accounts
+    networks:
+      - hippius_net
 
   # Redis exporter for chain cache
   redis-chain-exporter:
@@ -105,8 +109,8 @@ services:
       "-count-keys=db0=pinned_cids:*"
     ]
     restart: unless-stopped
-    depends_on:
-      - redis-chain
+    networks:
+      - hippius_net
 
   # Postgres exporter for database metrics
   postgres-exporter:
@@ -117,9 +121,14 @@ services:
     environment:
       - DATA_SOURCE_NAME=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
     restart: unless-stopped
-    depends_on:
-      - db
+    networks:
+      - hippius_net
 
 volumes:
   prometheus_data:
   grafana_data:
+
+networks:
+  hippius_net:
+    external: true
+    name: hippius_net

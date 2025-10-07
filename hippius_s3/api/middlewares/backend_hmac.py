@@ -61,7 +61,6 @@ class SigV4Verifier:
             raise AuthParsingError("Credentials not found")
 
         logger.debug("SUCCESS: Authorization header format valid")
-        logger.debug(f"Full authorization header: '{self.auth_header}'")
 
         credential_match = re.search(
             r"Credential=([^/]+)/([^/]+)/([^/]+)/([^/]+)/([^,]+)",

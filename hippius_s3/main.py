@@ -1,7 +1,6 @@
 """Main application module for Hippius S3 service."""
 
 import logging
-import sys
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -35,6 +34,7 @@ from hippius_s3.cache import RedisDownloadChunksCache
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.ipfs_service import IPFSService
+from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
 from hippius_s3.monitoring import get_metrics_collector
 
@@ -42,12 +42,7 @@ from hippius_s3.monitoring import get_metrics_collector
 load_dotenv()
 config = get_config()
 
-# Configure the root logger
-logging.basicConfig(
-    level=config.log_level,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
+setup_loki_logging(config, "api")
 
 # Set up this module's logger
 logger = logging.getLogger(__name__)

@@ -13,13 +13,15 @@ from fastapi import Response
 
 from hippius_s3 import utils
 from hippius_s3.api.s3 import errors
-from hippius_s3.api.s3.extensions.append import _upsert_cid
 from hippius_s3.api.s3.extensions.append import handle_append
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
+from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
+from hippius_s3.services.crypto_service import CryptoService
+from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.utils import get_query
 
 
@@ -112,8 +114,31 @@ async def handle_put_object(
         should_encrypt = not bucket["is_public"]
 
         # Unified cache: write base part as part 1 (1-based indexing)
-        await RedisObjectPartsCache(redis_client).set(object_id, 1, file_data)
-        logger.info(f"PUT cache unified write object_id={object_id} part=1 bytes={len(file_data)}")
+        obj_cache = RedisObjectPartsCache(redis_client)
+        if not bucket["is_public"]:
+            # Encrypt-before-Redis: store ciphertext meta first (readiness signal), then chunks
+            chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+            ct_chunks = CryptoService.encrypt_part_to_chunks(
+                file_data,
+                object_id=object_id,
+                part_number=1,
+                seed_phrase=request.state.seed_phrase,
+                chunk_size=chunk_size,
+            )
+            total_ct = sum(len(ct) for ct in ct_chunks)
+            # Write meta first to provide cheap readiness check
+            await obj_cache.set_meta(
+                object_id, 1, chunk_size=chunk_size, num_chunks=len(ct_chunks), size_bytes=total_ct
+            )
+            # Then write chunk data
+            for i, ct in enumerate(ct_chunks):
+                await obj_cache.set_chunk(object_id, 1, i, ct)
+            logger.info(
+                f"PUT cache encrypted write object_id={object_id} part=1 chunks={len(ct_chunks)} bytes={total_ct}"
+            )
+        else:
+            await obj_cache.set(object_id, 1, file_data)
+            logger.info(f"PUT cache unified write object_id={object_id} part=1 bytes={len(file_data)}")
 
         async with db.transaction():
             await db.fetchrow(
@@ -135,50 +160,40 @@ async def handle_put_object(
             except Exception:
                 logger.debug("Failed to cleanup previous parts on overwrite", exc_info=True)
 
-        # Ensure a multipart_uploads row exists to satisfy parts.upload_id FK
-        try:
-            upload_row = await db.fetchrow(
-                get_query("create_multipart_upload"),
-                uuid.UUID(object_id),
-                bucket_id,
-                object_key,
-                created_at,
-                content_type,
-                json.dumps(metadata),
-                created_at,
-                uuid.UUID(object_id),
-            )
-            upload_id = upload_row["upload_id"] if upload_row else uuid.UUID(object_id)
-        except Exception:
-            # Best effort: reuse existing upload row if it already exists
-            upload_row = await db.fetchrow(
-                "SELECT upload_id FROM multipart_uploads WHERE bucket_id = $1 AND object_key = $2 ORDER BY initiated_at DESC LIMIT 1",
-                bucket_id,
-                object_key,
-            )
-            upload_id = upload_row["upload_id"] if upload_row else uuid.UUID(object_id)
+        # Ensure upload row and parts(1) placeholder exist atomically before enqueueing
+        async with db.transaction():
+            # Ensure a multipart_uploads row exists to satisfy parts.upload_id FK
+            try:
+                upload_row = await db.fetchrow(
+                    get_query("create_multipart_upload"),
+                    uuid.UUID(object_id),
+                    bucket_id,
+                    object_key,
+                    created_at,
+                    content_type,
+                    json.dumps(metadata),
+                    created_at,
+                    uuid.UUID(object_id),
+                )
+                upload_id = upload_row["upload_id"] if upload_row else uuid.UUID(object_id)
+            except Exception:
+                upload_row = await db.fetchrow(
+                    "SELECT upload_id FROM multipart_uploads WHERE bucket_id = $1 AND object_key = $2 ORDER BY initiated_at DESC LIMIT 1",
+                    bucket_id,
+                    object_key,
+                )
+                upload_id = upload_row["upload_id"] if upload_row else uuid.UUID(object_id)
 
-        # Insert parts(1) for simple objects - all objects are represented by parts (1-based)
-        placeholder_cid = "pending"
-        placeholder_cid_id = await _upsert_cid(db, placeholder_cid)
-
-        # Insert part 1 representing the base object (placeholder)
-        await db.execute(
-            """
-            INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            ON CONFLICT (object_id, part_number) DO NOTHING
-            """,
-            str(uuid.uuid4()),
-            upload_id,
-            1,
-            placeholder_cid,
-            int(file_size),
-            md5_hash,
-            created_at,
-            object_id,
-            placeholder_cid_id,
-        )
+            # Insert parts(1) placeholder for simple objects (1-based indexing)
+            await upsert_part_placeholder(
+                db,
+                object_id=object_id,
+                upload_id=str(upload_id),
+                part_number=1,
+                size_bytes=int(file_size),
+                etag=md5_hash,
+                chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
+            )
 
         # Only enqueue after DB state (object, upload row, and part 1) is persisted to avoid race with pinner
         await enqueue_upload_request(
@@ -192,10 +207,31 @@ async def handle_put_object(
                 object_key=object_key,
                 should_encrypt=should_encrypt,
                 object_id=object_id,
+                upload_id=str(upload_id),
                 chunks=[Chunk(id=1)],
             ),
             redis_client=redis_client,
         )
+
+        # Record metrics
+        metrics = get_metrics_collector()
+        if metrics:
+            metrics.record_s3_operation(
+                operation="put_object",
+                bucket_name=bucket_name,
+                object_key=object_key,
+                main_account=main_account_id,
+                subaccount_id=request.state.account.id,
+                success=True,
+            )
+            metrics.record_data_transfer(
+                operation="put_object",
+                bytes_transferred=file_size,
+                bucket_name=bucket_name,
+                object_key=object_key,
+                main_account=main_account_id,
+                subaccount_id=request.state.account.id,
+            )
 
         # New or overwrite base object: expose append-version so clients can start append flow without HEAD
         return Response(
@@ -208,6 +244,14 @@ async def handle_put_object(
 
     except Exception as e:
         logger.exception(f"Error uploading object: {e}")
+        metrics = get_metrics_collector()
+        if metrics:
+            metrics.record_error(
+                error_type="internal_error",
+                operation="put_object",
+                bucket_name=bucket_name,
+                main_account=getattr(request.state, "account", None) and request.state.account.main_account,
+            )
         return errors.s3_error_response(
             "InternalError",
             "We encountered an internal error. Please try again.",

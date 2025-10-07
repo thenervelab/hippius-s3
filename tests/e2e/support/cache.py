@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from typing import Iterable
+from typing import Optional
 
 import psycopg  # type: ignore[import-untyped]
 import redis  # type: ignore[import-untyped]
@@ -33,15 +34,73 @@ essentially_all_parts = range(0, 256)
 
 
 def clear_object_cache(
-    object_id: str, parts: Iterable[int] | None = None, *, redis_url: str = "redis://localhost:6379/0"
+    object_id: str,
+    parts: Iterable[int] | None = None,
+    *,
+    redis_url: str = "redis://localhost:6379/0",
+    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
 ) -> None:
-    """Delete obj:{object_id}:part:{n} keys in Redis for the given parts.
+    """Delete chunked obj:{object_id}:part:{n}:chunk:* and meta keys in Redis for the given parts.
 
-    If parts is None, clears a reasonable range (0..255) by default.
+    If parts is None, queries DB to find actual parts for this object (much faster than scanning 256).
     """
+    import psycopg
+
     r = redis.Redis.from_url(redis_url)
-    for pn in parts or essentially_all_parts:
-        r.delete(f"obj:{object_id}:part:{int(pn)}")
+
+    # If no parts specified, query DB for actual part numbers to avoid scanning 256 empty parts
+    if parts is None:
+        with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT part_number
+                FROM parts
+                WHERE object_id = %s
+                ORDER BY part_number
+                """,
+                (object_id,),
+            )
+            parts_list = [row[0] for row in cur.fetchall()]
+            # Always include part 1 (the base object part)
+            if 1 not in parts_list:
+                parts_list.insert(0, 1)
+            parts = parts_list
+
+    for pn in parts:
+        # Delete meta first, then all chunk keys
+        r.delete(f"obj:{object_id}:part:{int(pn)}:meta")
+        # Scan and delete chunk keys
+        for k in r.scan_iter(match=f"obj:{object_id}:part:{int(pn)}:chunk:*"):
+            r.delete(k)
+
+
+def read_part_from_cache(
+    object_id: str,
+    part_number: int,
+    *,
+    redis_url: str = "redis://localhost:6379/0",
+) -> Optional[bytes]:
+    """Assemble part bytes from chunked cache if present; returns None if missing."""
+    r = redis.Redis.from_url(redis_url)
+    meta = r.get(f"obj:{object_id}:part:{int(part_number)}:meta")
+    if not meta:
+        return None
+    import json as _json
+
+    try:
+        m = _json.loads(meta)
+    except Exception:
+        return None
+    num_chunks = int(m.get("num_chunks", 0))
+    if num_chunks <= 0:
+        return b""
+    chunks: list[bytes] = []
+    for i in range(num_chunks):
+        c = r.get(f"obj:{object_id}:part:{int(part_number)}:chunk:{i}")
+        if not isinstance(c, (bytes, bytearray)):
+            return None
+        chunks.append(bytes(c))
+    return b"".join(chunks)
 
 
 def wait_for_parts_cids(

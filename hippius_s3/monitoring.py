@@ -106,6 +106,46 @@ class MetricsCollector:
             name="cache_downloads_total", description="Total downloads served from Redis cache", unit="1"
         )
 
+        # Data transfer metrics
+        self.s3_bytes_uploaded = self.meter.create_counter(
+            name="s3_bytes_uploaded_total", description="Total bytes uploaded to S3", unit="bytes"
+        )
+
+        self.s3_bytes_downloaded = self.meter.create_counter(
+            name="s3_bytes_downloaded_total", description="Total bytes downloaded from S3", unit="bytes"
+        )
+
+        # S3 operations counter by type
+        self.s3_operations_total = self.meter.create_counter(
+            name="s3_operations_total", description="Total S3 operations by type", unit="1"
+        )
+
+        # Multipart operation metrics
+        self.multipart_parts_uploaded = self.meter.create_counter(
+            name="multipart_parts_uploaded_total", description="Total multipart parts uploaded", unit="1"
+        )
+
+        self.multipart_uploads_completed = self.meter.create_counter(
+            name="multipart_uploads_completed_total", description="Total completed multipart uploads", unit="1"
+        )
+
+        # Error tracking
+        self.s3_errors_total = self.meter.create_counter(
+            name="s3_errors_total", description="Total S3 errors by type", unit="1"
+        )
+
+        # Cache performance
+        self.cache_hits = self.meter.create_counter(name="cache_hits_total", description="Total cache hits", unit="1")
+
+        self.cache_misses = self.meter.create_counter(
+            name="cache_misses_total", description="Total cache misses", unit="1"
+        )
+
+        # Object size distribution
+        self.object_size_bytes = self.meter.create_histogram(
+            name="object_size_bytes", description="Distribution of object sizes", unit="bytes"
+        )
+
     async def update_queue_metrics(self) -> None:
         """Update queue length metrics from Redis"""
         try:
@@ -186,6 +226,8 @@ class MetricsCollector:
         if subaccount_id:
             attributes["subaccount_id"] = subaccount_id
 
+        self.s3_operations_total.add(1, attributes=attributes)
+
         if operation in ["put_object", "post_object"]:
             self.s3_objects_total.add(1, attributes=attributes)
         elif operation in ["put_bucket"]:
@@ -226,6 +268,109 @@ class MetricsCollector:
             attributes["main_account"] = main_account
 
         self.cache_downloads_total.add(1, attributes=attributes)
+
+    def record_data_transfer(
+        self,
+        operation: str,
+        bytes_transferred: int,
+        bucket_name: str,
+        object_key: Optional[str] = None,
+        main_account: Optional[str] = None,
+        subaccount_id: Optional[str] = None,
+    ) -> None:
+        """Record data transfer metrics"""
+        attributes = {
+            "operation": operation,
+            "bucket_name": bucket_name,
+        }
+
+        if object_key:
+            attributes["object_key"] = object_key
+        if main_account:
+            attributes["main_account"] = main_account
+        if subaccount_id:
+            attributes["subaccount_id"] = subaccount_id
+
+        if operation in ["upload", "put_object", "post_object", "upload_part"]:
+            self.s3_bytes_uploaded.add(bytes_transferred, attributes=attributes)
+        elif operation in ["download", "get_object"]:
+            self.s3_bytes_downloaded.add(bytes_transferred, attributes=attributes)
+
+        self.s3_operations_total.add(1, attributes=attributes)
+
+        if bytes_transferred > 0:
+            self.object_size_bytes.record(bytes_transferred, attributes=attributes)
+
+    def record_multipart_operation(
+        self,
+        operation: str,
+        upload_id: Optional[str] = None,
+        part_number: Optional[int] = None,
+        main_account: Optional[str] = None,
+        subaccount_id: Optional[str] = None,
+    ) -> None:
+        """Record multipart operation metrics"""
+        attributes = {
+            "operation": operation,
+        }
+
+        if upload_id:
+            attributes["upload_id"] = upload_id
+        if part_number:
+            attributes["part_number"] = str(part_number)
+        if main_account:
+            attributes["main_account"] = main_account
+        if subaccount_id:
+            attributes["subaccount_id"] = subaccount_id
+
+        if operation == "upload_part":
+            self.multipart_parts_uploaded.add(1, attributes=attributes)
+        elif operation == "complete_upload":
+            self.multipart_uploads_completed.add(1, attributes=attributes)
+            self.multipart_uploads_active.add(-1, attributes=attributes)
+        elif operation == "initiate_upload":
+            self.multipart_uploads_active.add(1, attributes=attributes)
+        elif operation == "abort_upload":
+            self.multipart_uploads_active.add(-1, attributes=attributes)
+
+    def record_error(
+        self,
+        error_type: str,
+        operation: str,
+        bucket_name: Optional[str] = None,
+        main_account: Optional[str] = None,
+    ) -> None:
+        """Record error metrics"""
+        attributes = {
+            "error_type": error_type,
+            "operation": operation,
+        }
+
+        if bucket_name:
+            attributes["bucket_name"] = bucket_name
+        if main_account:
+            attributes["main_account"] = main_account
+
+        self.s3_errors_total.add(1, attributes=attributes)
+
+    def record_cache_operation(
+        self,
+        hit: bool,
+        operation: str,
+        main_account: Optional[str] = None,
+    ) -> None:
+        """Record cache hit/miss metrics"""
+        attributes = {
+            "operation": operation,
+        }
+
+        if main_account:
+            attributes["main_account"] = main_account
+
+        if hit:
+            self.cache_hits.add(1, attributes=attributes)
+        else:
+            self.cache_misses.add(1, attributes=attributes)
 
 
 # Global metrics collector instance

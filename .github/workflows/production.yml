@@ -64,15 +64,15 @@ jobs:
             # Ensure external Docker network exists
             docker network inspect hippius_net >/dev/null 2>&1 || docker network create hippius_net
             echo "Building and starting Docker containers with production config..."
-            docker compose -f docker-compose.yml -f docker-compose.prod.yml down || true
-            docker compose -f docker-compose.yml -f docker-compose.prod.yml build --no-cache
-            docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.monitoring.yml down || true
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.monitoring.yml build --no-cache
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.monitoring.yml up -d
 
             echo "Waiting for database to be ready..."
             sleep 10
 
             echo "Running database migrations..."
-            docker compose -f docker-compose.yml -f docker-compose.prod.yml exec -T api dbmate up
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.monitoring.yml exec -T api dbmate up
 
             echo "Deployment completed successfully!"
 
@@ -82,4 +82,4 @@ jobs:
           DEPLOYMENT_USER: ${{ secrets.DEPLOYMENT_USER }}
           DEPLOYMENT_PATH: ${{ secrets.DEPLOYMENT_PATH }}
         run: |
-          ssh ${DEPLOYMENT_USER}@${DEPLOYMENT_IP} "cd ${DEPLOYMENT_PATH} && docker compose -f docker-compose.yml -f docker-compose.prod.yml ps"
+          ssh ${DEPLOYMENT_USER}@${DEPLOYMENT_IP} "cd ${DEPLOYMENT_PATH} && docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.monitoring.yml ps"

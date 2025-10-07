@@ -14,6 +14,7 @@ from lxml import etree as ET
 
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.buckets.bucket_policy_endpoint import set_bucket_policy
+from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.utils import get_query
 from hippius_s3.utils import get_request_body
 
@@ -211,9 +212,28 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
                 main_account_id,
             )
 
+            # Record metrics
+            metrics = get_metrics_collector()
+            if metrics:
+                metrics.record_s3_operation(
+                    operation="put_bucket",
+                    bucket_name=bucket_name,
+                    main_account=main_account_id,
+                    subaccount_id=request.state.account.id,
+                    success=True,
+                )
+
             return Response(status_code=200)
 
         except asyncpg.UniqueViolationError:
+            metrics = get_metrics_collector()
+            if metrics:
+                metrics.record_error(
+                    error_type="BucketAlreadyExists",
+                    operation="put_bucket",
+                    bucket_name=bucket_name,
+                    main_account=request.state.account.main_account,
+                )
             return errors.s3_error_response(
                 "BucketAlreadyExists",
                 f"The requested bucket {bucket_name} already exists",
@@ -222,6 +242,14 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
             )
         except Exception:
             logger.exception("Error creating bucket via S3 protocol")
+            metrics = get_metrics_collector()
+            if metrics:
+                metrics.record_error(
+                    error_type="internal_error",
+                    operation="put_bucket",
+                    bucket_name=bucket_name,
+                    main_account=request.state.account.main_account,
+                )
             return errors.s3_error_response(
                 "InternalError",
                 "We encountered an internal error. Please try again.",

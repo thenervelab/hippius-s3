@@ -24,11 +24,14 @@ dependencies = [
     "aiofiles>=23.1.0",
     "lxml>=4.9.3",
     "botocore>=1.38.25",
-    "hippius[key_storage]>=0.2.59",
+    "hippius[key_storage]>=0.2.63",
     "cachetools",
     "redis",
     "pyinstrument>=4.0.0",
-    # OpenTelemetry and monitoring dependencies
+    "PyNaCl>=1.6.0",
+    "substrate-interface>=1.7.11",
+    "watchfiles>=1.1.0",
+    "pandas>=2.3.3",
     "opentelemetry-api>=1.37.0",
     "opentelemetry-sdk>=1.37.0",
     "opentelemetry-instrumentation>=0.58b0",
@@ -36,8 +39,9 @@ dependencies = [
     "opentelemetry-instrumentation-redis>=0.58b0",
     "opentelemetry-instrumentation-asyncpg>=0.58b0",
     "opentelemetry-exporter-prometheus>=0.58b0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.37.0",
     "prometheus-client>=0.23.1",
-    "PyNaCl>=1.5.0",
+    "loki-logger-handler>=1.1.2",
 ]
 
 [project.optional-dependencies]
@@ -148,6 +152,14 @@ disallow_untyped_defs = false
 disable_error_code = ["no-untyped-def"]
 
 [[tool.mypy.overrides]]
+module = "loki_logger_handler.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "nacl.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "hippius_s3.api.middlewares.profiler"
 disallow_untyped_defs = false
 disable_error_code = ["attr-defined", "no-untyped-def"]
@@ -213,14 +225,18 @@ module = "aiohttp.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = "opentelemetry.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "prometheus_client.*"
+module = "substrateinterface.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = "test_*.py"
 addopts = "--cov=hippius_s3"
+
+[[tool.mypy.overrides]]
+module = "opentelemetry.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "prometheus_client.*"
+ignore_missing_imports = true
