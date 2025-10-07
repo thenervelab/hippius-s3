@@ -74,7 +74,7 @@ async def process_download_request(
                     all_entries = [(int(r[0]), str(r[1]), int(r[2]) if r[2] is not None else None) for r in rows or []]
                     # Restrict to requested indices if provided
                     if getattr(chunk, "chunk_indices", None):
-                        idx_set = set(int(i) for i in chunk.chunk_indices or [])
+                        idx_set = {int(i) for i in chunk.chunk_indices or []}
                         cid_plan.extend([e for e in all_entries if e[0] in idx_set])
                         # Check for missing indices; do NOT backfill unless flag allows
                         if idx_set:
@@ -99,9 +99,7 @@ async def process_download_request(
                                     if chunk_size <= 0:
                                         # Cannot backfill without authoritative chunk size
                                         raise RuntimeError("chunk_size_bytes_missing")
-                                    for mi in sorted(missing_indices):
-                                        # Plan entries will be fetched as full CID; client lacks range
-                                        cid_plan.append((mi, str(chunk.cid), None))
+                                    cid_plan.extend((mi, str(chunk.cid), None) for mi in sorted(missing_indices))
                                 else:
                                     # Strict mode: don't guess/backfill; let caller retry later
                                     raise RuntimeError("missing_requested_chunk_indices")
