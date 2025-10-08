@@ -40,6 +40,11 @@ class S3Download(BaseModel):
 
 
 async def get_encryption_key(identifier: str) -> str:
+    """Get the most recent encryption key for an identifier.
+
+    Returns the newest key first for the fast path.
+    Use get_all_encryption_keys() if you need to try multiple keys.
+    """
     hashed_identifier = hashlib.sha256(identifier.encode("utf-8")).hexdigest()
     conn = await asyncpg.connect(config.encryption_database_url)
     try:
@@ -54,6 +59,28 @@ async def get_encryption_key(identifier: str) -> str:
             hashed_identifier,
         )
         return str(result["encryption_key_b64"])
+    finally:
+        await conn.close()
+
+
+async def get_all_encryption_keys(identifier: str) -> list[str]:
+    """Get all encryption keys for an identifier, ordered by newest first.
+
+    Use this when decryption fails with the primary key and you need to try fallbacks.
+    """
+    hashed_identifier = hashlib.sha256(identifier.encode("utf-8")).hexdigest()
+    conn = await asyncpg.connect(config.encryption_database_url)
+    try:
+        results = await conn.fetch(
+            """
+            SELECT encryption_key_b64
+            FROM encryption_keys
+            WHERE subaccount_id = $1
+            ORDER BY created_at DESC
+        """,
+            hashed_identifier,
+        )
+        return [str(row["encryption_key_b64"]) for row in results]
     finally:
         await conn.close()
 
