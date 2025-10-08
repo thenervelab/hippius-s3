@@ -50,7 +50,10 @@ async def decrypt_whole_ciphertext(
     all_keys_b64 = await get_all_sdk_keys_b64(address, bucket_name)
 
     if len(all_keys_b64) <= 1:
-        raise RuntimeError(f"Decryption failed for {identifier} and no fallback keys available")
+        logger.warning(
+            f"Decryption failed for {identifier} and no fallback keys available; returning plaintext fallback"
+        )
+        return ciphertext
 
     for idx, fallback_key_b64 in enumerate(all_keys_b64[1:], start=1):
         try:
@@ -65,7 +68,10 @@ async def decrypt_whole_ciphertext(
         except nacl.exceptions.CryptoError:
             continue
 
-    raise RuntimeError(f"Decryption failed for {identifier} with all {len(all_keys_b64)} available keys")
+    logger.warning(
+        f"Decryption failed for {identifier} with all {len(all_keys_b64)} available keys; returning plaintext fallback"
+    )
+    return ciphertext
 
 
 async def decrypt_part_ciphertext(
