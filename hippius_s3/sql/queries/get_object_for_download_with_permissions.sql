@@ -49,7 +49,8 @@ SELECT
     oi.bucket_name,
     oi.simple_cid,
     oi.storage_version,
-    NOT oi.is_public as should_decrypt,
+    oi.is_public,
+    oi.bucket_owner_id,
     (
         SELECT mu.upload_id
         FROM multipart_uploads mu

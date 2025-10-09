@@ -111,56 +111,48 @@ async def handle_put_object(
         else:
             object_id = str(uuid.uuid4())
 
-        should_encrypt = not bucket["is_public"]
-
         # Unified cache: write base part as part 1 (1-based indexing)
         obj_cache = RedisObjectPartsCache(redis_client)
-        if not bucket["is_public"]:
-            # Encrypt-before-Redis: store ciphertext meta first (readiness signal), then chunks
-            chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+        # Encrypt-before-Redis: store ciphertext meta first (readiness signal), then chunks
+        chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
 
-            from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
+        from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
 
-            try:
-                key_bytes = await get_or_create_encryption_key_bytes(
-                    subaccount_id=request.state.account.main_account,
-                    bucket_name=bucket_name,
-                )
-                ct_chunks = CryptoService.encrypt_part_to_chunks(
-                    file_data,
-                    object_id=object_id,
-                    part_number=1,
-                    seed_phrase=request.state.seed_phrase,
-                    chunk_size=chunk_size,
-                    key=key_bytes,
-                )
-            except Exception:
-                from hippius_s3.api.s3.errors import s3_error_response
-
-                return s3_error_response(
-                    "InternalError",
-                    "Failed to resolve encryption key for private bucket",
-                    status_code=500,
-                )
-            total_ct = sum(len(ct) for ct in ct_chunks)
-            # Write meta first using unified writer; store plaintext size for readers
-            await write_cache_meta(
-                obj_cache,
-                object_id,
-                1,
+        try:
+            key_bytes = await get_or_create_encryption_key_bytes(
+                subaccount_id=request.state.account.main_account,
+                bucket_name=bucket_name,
+            )
+            ct_chunks = CryptoService.encrypt_part_to_chunks(
+                file_data,
+                object_id=object_id,
+                part_number=1,
+                seed_phrase=request.state.seed_phrase,
                 chunk_size=chunk_size,
-                num_chunks=len(ct_chunks),
-                plain_size=len(file_data),
+                key=key_bytes,
             )
-            # Then write chunk data
-            for i, ct in enumerate(ct_chunks):
-                await obj_cache.set_chunk(object_id, 1, i, ct)
-            logger.info(
-                f"PUT cache encrypted write object_id={object_id} part=1 chunks={len(ct_chunks)} bytes={total_ct}"
+        except Exception:
+            from hippius_s3.api.s3.errors import s3_error_response
+
+            return s3_error_response(
+                "InternalError",
+                "Failed to resolve encryption key",
+                status_code=500,
             )
-        else:
-            await obj_cache.set(object_id, 1, file_data)
-            logger.info(f"PUT cache unified write object_id={object_id} part=1 bytes={len(file_data)}")
+        total_ct = sum(len(ct) for ct in ct_chunks)
+        # Write meta first using unified writer; store plaintext size for readers
+        await write_cache_meta(
+            obj_cache,
+            object_id,
+            1,
+            chunk_size=chunk_size,
+            num_chunks=len(ct_chunks),
+            plain_size=len(file_data),
+        )
+        # Then write chunk data
+        for i, ct in enumerate(ct_chunks):
+            await obj_cache.set_chunk(object_id, 1, i, ct)
+        logger.info(f"PUT cache encrypted write object_id={object_id} part=1 chunks={len(ct_chunks)} bytes={total_ct}")
 
         async with db.transaction():
             await db.fetchrow(
@@ -220,7 +212,6 @@ async def handle_put_object(
                 subaccount_seed_phrase=request.state.seed_phrase,
                 bucket_name=bucket_name,
                 object_key=object_key,
-                should_encrypt=should_encrypt,
                 object_id=object_id,
                 upload_id=str(upload_id),
                 chunks=[Chunk(id=1)],

@@ -152,6 +152,14 @@ async def handle_get_object(
         if range_header and start_byte is not None and end_byte is not None:
             v2_rng = V2Range(start=int(start_byte), end=int(end_byte))
 
+        # Decide decryption internally based on storage_version (v3+: always decrypt)
+        storage_version = int(object_info.get("storage_version") or 2)
+        is_public_bucket = bool(object_info.get("is_public"))
+        bucket_owner_id = str(object_info.get("bucket_owner_id") or "")
+
+        # Use owner main account id for anonymous public reads to resolve keys
+        resolved_address = (account.main_account if account else "") if not is_anonymous else bucket_owner_id
+
         info_dict = {
             "object_id": str(object_info["object_id"]),
             "bucket_name": object_info["bucket_name"],
@@ -162,8 +170,9 @@ async def handle_get_object(
             "created_at": object_info["created_at"],
             "metadata": object_info.get("metadata") or {},
             "multipart": bool(object_info["multipart"]),
-            "should_decrypt": bool(object_info["should_decrypt"]),
-            "storage_version": int(object_info.get("storage_version") or 2),
+            # should_decrypt derived in reader from storage_version; keep for now to avoid breaking
+            "should_decrypt": storage_version >= 3 or (not is_public_bucket),
+            "storage_version": storage_version,
         }
 
         return await read_response(
@@ -173,7 +182,7 @@ async def handle_get_object(
             info=info_dict,
             read_mode=hdr_mode or "auto",
             rng=v2_rng,
-            address=account.main_account if account else "",
+            address=resolved_address,
             seed_phrase=getattr(request.state, "seed_phrase", ""),
             range_was_invalid=range_was_invalid,
         )

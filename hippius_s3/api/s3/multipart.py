@@ -443,50 +443,76 @@ async def upload_part(
         if not source_obj:
             return s3_error_response("NoSuchKey", f"Key {source_object_key} not found", status_code=404)
 
-        # Prefer unified cache via ObjectReader, fallback to IPFS through service
+        # Always read source from IPFS service to obtain plaintext when needed
         source_bytes = None
-        try:
-            source_bytes = await request.app.state.obj_cache.get(str(source_obj["object_id"]), 1)
-        except Exception as e:
-            logger.debug(f"ObjectReader cache base read miss: {e}")
-            # Fallback: try unified object-parts cache directly (part 0)
-            try:
-                source_bytes = await request.app.state.obj_cache.get(str(source_obj["object_id"]), 1)
-                if source_bytes:
-                    logger.info(
-                        f"UploadPartCopy fallback cache hit object_id={source_obj['object_id']} part=0 bytes={len(source_bytes)}"
-                    )
-            except Exception:
-                pass
 
         if source_bytes is None:
-            source_cid = (source_obj.get("ipfs_cid") or "").strip()
-            if not source_cid:
-                return s3_error_response(
-                    "ServiceUnavailable",
-                    "Source object not yet available for copy",
-                    status_code=503,
-                )
-
-            # Download full bytes then slice per range if provided
-            # Do not support UploadPartCopy from encrypted sources yet
-            if not source_bucket.get("is_public"):
-                return s3_error_response(
-                    "NotImplemented",
-                    "UploadPartCopy is not supported for encrypted source objects yet",
-                    status_code=501,
-                )
-            decrypt = False
+            # Read plaintext via reader pipeline (manifest → plan → stream decrypt)
             try:
-                source_bytes = await ipfs_service.download_file(
-                    cid=source_cid,
-                    subaccount_id=request.state.account.main_account,
+                from hippius_s3.queue import ChunkToDownload  # local import
+                from hippius_s3.queue import DownloadChainRequest  # local import
+                from hippius_s3.queue import enqueue_download_request  # local import
+                from hippius_s3.reader.db_meta import read_parts_manifest  # local import to avoid cycles
+                from hippius_s3.reader.planner import build_chunk_plan  # local import
+                from hippius_s3.reader.streamer import stream_plan  # local import
+            except Exception:
+                return s3_error_response("InternalError", "Reader pipeline unavailable", status_code=500)
+
+            object_id_str = str(source_obj["object_id"])  # type: ignore[index]
+            manifest = await read_parts_manifest(db, object_id_str)
+            plan = await build_chunk_plan(db, object_id_str, manifest, None)
+
+            # Enqueue downloader for any missing chunk indices in cache
+            obj_cache = RedisObjectPartsCache(request.app.state.redis_client)
+            indices_by_part: dict[int, list[int]] = {}
+            for it in plan:
+                exists = await obj_cache.chunk_exists(object_id_str, int(it.part_number), int(it.chunk_index))  # type: ignore[attr-defined]
+                if not exists:
+                    arr = indices_by_part.setdefault(int(it.part_number), [])
+                    arr.append(int(it.chunk_index))
+            if indices_by_part:
+                dl_parts = [
+                    ChunkToDownload(
+                        cid=str(next((c["cid"] for c in manifest if int(c.get("part_number", 0)) == pn), "")),
+                        part_id=int(pn),
+                        redis_key=None,
+                        chunk_indices=sorted(set(idxs)),
+                    )
+                    for pn, idxs in indices_by_part.items()
+                ]
+                req = DownloadChainRequest(
+                    request_id=f"{object_id_str}::upload_part_copy",
+                    object_id=object_id_str,
+                    object_key=source_object_key,
                     bucket_name=source_bucket_name,
-                    decrypt=decrypt,
-                    seed_phrase=request.state.seed_phrase,
+                    address=request.state.account.main_account,
+                    subaccount=request.state.account.main_account,
+                    subaccount_seed_phrase=request.state.seed_phrase,
+                    substrate_url=config.substrate_url,
+                    ipfs_node=config.ipfs_get_url,
+                    should_decrypt=True,  # v3 path will decrypt; legacy parts unaffected
+                    size=int(source_obj.get("size_bytes") or 0),
+                    multipart=bool((json.loads(source_obj.get("metadata") or "{}") or {}).get("multipart", False)),
+                    chunks=dl_parts,
                 )
+                await enqueue_download_request(req, request.app.state.redis_client)
+
+            # Stream plaintext bytes
+            chunks_iter = stream_plan(
+                obj_cache=obj_cache,
+                object_id=object_id_str,
+                plan=plan,
+                should_decrypt=True,
+                seed_phrase=request.state.seed_phrase,
+                sleep_seconds=float(config.http_download_sleep_loop),
+                address=request.state.account.main_account,
+                bucket_name=source_bucket_name,
+                storage_version=int(source_obj.get("storage_version") or 2),
+            )
+            try:
+                source_bytes = b"".join([piece async for piece in chunks_iter])
             except Exception as e:
-                logger.warning(f"UploadPartCopy failed to download source: {e}")
+                logger.warning(f"UploadPartCopy failed to stream source via reader: {e}")
                 return s3_error_response("ServiceUnavailable", "Failed to read source", status_code=503)
 
         if range_start is not None and range_end is not None:
@@ -583,12 +609,11 @@ async def upload_part(
             )
         except Exception:
             logger.debug("Failed to compute md5 for pre-cache log", exc_info=True)
-        # Decide encryption policy (private buckets encrypt before Redis)
-        should_encrypt = False
+        # Resolve destination bucket name for key lookup
         try:
             row = await db.fetchrow(
                 """
-                SELECT b.is_public, b.bucket_name
+                SELECT b.bucket_name
                 FROM multipart_uploads mu
                 JOIN buckets b ON b.bucket_id = mu.bucket_id
                 WHERE mu.upload_id = $1
@@ -598,47 +623,32 @@ async def upload_part(
             )
         except Exception:
             row = None
-
         if not row:
             logger.error(f"Upload row not found for upload_id={upload_id}; refusing to cache part")
-            return s3_error_response(
-                "NoSuchUpload",
-                "The specified upload does not exist.",
-                status_code=404,
-            )
-
-        should_encrypt = not bool(row.get("is_public"))
+            return s3_error_response("NoSuchUpload", "The specified upload does not exist.", status_code=404)
         dest_bucket_name = row.get("bucket_name")
 
         # Store in Redis via chunked cache API (encrypt for private, meta-first for readiness)
         redis_start = time.time()
         chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-        if should_encrypt:
-            # Resolve per-account+bucket encryption key (no fallback)
-            from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
+        # Always encrypt chunks before caching
+        from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
 
-            try:
-                key_bytes = await get_or_create_encryption_key_bytes(
-                    subaccount_id=request.state.account.main_account,
-                    bucket_name=str(dest_bucket_name or ""),
-                )
-            except Exception:
-                return s3_error_response(
-                    "InternalError",
-                    "Failed to resolve encryption key for private bucket",
-                    status_code=500,
-                )
-            chunks_bytes = CryptoService.encrypt_part_to_chunks(
-                file_data,
-                object_id=str(object_id),
-                part_number=int(part_number),
-                seed_phrase=request.state.seed_phrase,
-                chunk_size=chunk_size,
-                key=key_bytes,
+        try:
+            key_bytes = await get_or_create_encryption_key_bytes(
+                subaccount_id=request.state.account.main_account,
+                bucket_name=str(dest_bucket_name or ""),
             )
-        else:
-            # Plaintext is chunked identically to ciphertext (no encryption)
-            chunks_bytes = [file_data[i : i + chunk_size] for i in range(0, len(file_data), chunk_size)]
+        except Exception:
+            return s3_error_response("InternalError", "Failed to resolve encryption key", status_code=500)
+        chunks_bytes = CryptoService.encrypt_part_to_chunks(
+            file_data,
+            object_id=str(object_id),
+            part_number=int(part_number),
+            seed_phrase=request.state.seed_phrase,
+            chunk_size=chunk_size,
+            key=key_bytes,
+        )
 
         # Write meta first for readiness (store plaintext size)
         await write_cache_meta(
@@ -655,7 +665,7 @@ async def upload_part(
             await obj_cache.set_chunk(str(object_id), int(part_number), i, piece, ttl=1800)
         redis_time = time.time() - redis_start
         logger.debug(
-            f"Part {part_number}: Cached via RedisObjectPartsCache in {redis_time:.3f}s (object_id={object_id}, encrypted={should_encrypt})"
+            f"Part {part_number}: Cached via RedisObjectPartsCache in {redis_time:.3f}s (object_id={object_id}, encrypted=True)"
         )
 
         # Create mock part result (no IPFS upload needed for individual parts)
@@ -1126,7 +1136,6 @@ async def complete_multipart_upload(
                 # be based on main account not only readable by subaccounts
                 subaccount=request.state.account.main_account,
                 subaccount_seed_phrase=request.state.seed_phrase,
-                should_encrypt=should_encrypt,
                 object_id=str(object_id),
             ),
             request.app.state.redis_client,
