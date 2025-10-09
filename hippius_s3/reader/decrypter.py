@@ -19,47 +19,31 @@ async def decrypt_chunk_if_needed(
 ) -> bytes:
     if not should_decrypt:
         return cbytes
-    # Prefer indicated storage_version but fall back to alternate on failure when allowed
+    # v2: decrypt using per-bucket key from SDK key storage. No seed fallback.
     if int(storage_version) == 2:
-        try:
-            return CryptoService.decrypt_chunk(
-                cbytes,
-                seed_phrase=seed_phrase,
-                object_id=object_id,
-                part_number=int(part_number),
-                chunk_index=int(chunk_index),
-            )
-        except Exception:
-            from hippius_s3.config import get_config as _get_cfg
+        from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
 
-            cfg = _get_cfg()
-            if not cfg.enable_legacy_sdk_compat:
-                raise
-            from hippius_s3.legacy.sdk_compat import decrypt_part_ciphertext  # local import
+        if not address or not bucket_name:
+            raise RuntimeError("missing_address_or_bucket")
+        key_bytes = await get_or_create_encryption_key_bytes(
+            subaccount_id=address,
+            bucket_name=bucket_name,
+        )
+        return CryptoService.decrypt_chunk(
+            cbytes,
+            seed_phrase=seed_phrase,
+            object_id=object_id,
+            part_number=int(part_number),
+            chunk_index=int(chunk_index),
+            key=key_bytes,
+        )
 
-            if not address or not bucket_name:
-                raise
-            return await decrypt_part_ciphertext(ciphertext=cbytes, address=address, bucket_name=bucket_name)
-    else:
-        from hippius_s3.config import get_config as _get_cfg
+    # v1: legacy SDK compatibility decrypt (whole-part compatibility helper)
+    from hippius_s3.legacy.sdk_compat import decrypt_part_ciphertext  # local import
 
-        cfg = _get_cfg()
-        try:
-            if not cfg.enable_legacy_sdk_compat:
-                raise RuntimeError("legacy_disabled")
-            from hippius_s3.legacy.sdk_compat import decrypt_part_ciphertext  # local import
-
-            if not address or not bucket_name:
-                raise RuntimeError("legacy_key_missing")
-            return await decrypt_part_ciphertext(ciphertext=cbytes, address=address, bucket_name=bucket_name)
-        except Exception:
-            return CryptoService.decrypt_chunk(
-                cbytes,
-                seed_phrase=seed_phrase,
-                object_id=object_id,
-                part_number=int(part_number),
-                chunk_index=int(chunk_index),
-            )
+    if not address or not bucket_name:
+        raise RuntimeError("legacy_key_missing")
+    return await decrypt_part_ciphertext(ciphertext=cbytes, address=address, bucket_name=bucket_name)
 
 
 def maybe_slice(pt: bytes, start: Optional[int], end_excl: Optional[int]) -> bytes:

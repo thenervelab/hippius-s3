@@ -16,7 +16,7 @@ async def write_cache_meta(
     """Write normalized cache meta for a part.
 
     Schema normalization:
-    - chunk_size: bytes per chunk (plaintext-chunk size for public; ciphertext chunk size for private, but readers use plain_size for range math)
+    - chunk_size: plaintext bytes per chunk (used for range math for both public and private)
     - num_chunks: number of chunks in cache for this part
     - plain_size: authoritative plaintext size of this part
 

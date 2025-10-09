@@ -317,13 +317,29 @@ async def handle_append(
         obj_cache = RedisObjectPartsCache(redis_client)
         if not bucket["is_public"]:
             chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-            ct_chunks = CryptoService.encrypt_part_to_chunks(
-                incoming_bytes,
-                object_id=object_id,
-                part_number=int(next_part),
-                seed_phrase=request.state.seed_phrase,
-                chunk_size=chunk_size,
+            from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
+
+            key_bytes = await get_or_create_encryption_key_bytes(
+                subaccount_id=request.state.account.main_account,
+                bucket_name=bucket_name,
             )
+            try:
+                ct_chunks = CryptoService.encrypt_part_to_chunks(
+                    incoming_bytes,
+                    object_id=object_id,
+                    part_number=int(next_part),
+                    seed_phrase=request.state.seed_phrase,
+                    chunk_size=chunk_size,
+                    key=key_bytes,
+                )
+            except Exception:
+                from hippius_s3.api.s3.errors import s3_error_response
+
+                return s3_error_response(
+                    "InternalError",
+                    "Failed to resolve encryption key for private bucket",
+                    status_code=500,
+                )
             # Write meta first using unified writer with plaintext size
             await write_cache_meta(
                 obj_cache,

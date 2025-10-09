@@ -23,7 +23,6 @@ from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import dequeue_download_request
 from hippius_s3.utils import get_query
 from hippius_s3.utils.timing import log_timing
-from hippius_s3.metadata.meta_reader import read_db_meta
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -138,7 +137,6 @@ async def process_download_request(
             base_sleep = getattr(config, "downloader_retry_base_seconds", 0.25)
             jitter = getattr(config, "downloader_retry_jitter_seconds", 0.2)
 
-            import hashlib as _hashlib
             import random as _random
 
             for attempt in range(1, max_attempts + 1):
