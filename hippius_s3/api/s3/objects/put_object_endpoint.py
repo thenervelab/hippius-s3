@@ -167,27 +167,20 @@ async def handle_put_object(
 
         # Ensure upload row and parts(1) placeholder exist atomically before enqueueing
         async with db.transaction():
-            # Ensure a multipart_uploads row exists to satisfy parts.upload_id FK
-            try:
-                upload_row = await db.fetchrow(
-                    get_query("create_multipart_upload"),
-                    uuid.UUID(object_id),
-                    bucket_id,
-                    object_key,
-                    created_at,
-                    content_type,
-                    json.dumps(metadata),
-                    created_at,
-                    uuid.UUID(object_id),
-                )
-                upload_id = upload_row["upload_id"] if upload_row else uuid.UUID(object_id)
-            except Exception:
-                upload_row = await db.fetchrow(
-                    "SELECT upload_id FROM multipart_uploads WHERE bucket_id = $1 AND object_key = $2 ORDER BY initiated_at DESC LIMIT 1",
-                    bucket_id,
-                    object_key,
-                )
-                upload_id = upload_row["upload_id"] if upload_row else uuid.UUID(object_id)
+            # Generate a fresh upload_id per simple PUT to avoid conflicts with previous sessions
+            new_upload_id = uuid.uuid4()
+            upload_row = await db.fetchrow(
+                get_query("create_multipart_upload"),
+                new_upload_id,
+                bucket_id,
+                object_key,
+                created_at,
+                content_type,
+                json.dumps(metadata),
+                created_at,
+                uuid.UUID(object_id),
+            )
+            upload_id = upload_row["upload_id"] if upload_row else new_upload_id
 
             # Insert parts(1) placeholder for simple objects (1-based indexing)
             await upsert_part_placeholder(
