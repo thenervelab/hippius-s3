@@ -40,7 +40,7 @@ services:
 
   downloader:
     deploy:
-      replicas: 20
+      replicas: 1
 
   ipfs:
     volumes:
