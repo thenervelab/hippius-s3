@@ -138,7 +138,6 @@ async def process_download_request(
             base_sleep = getattr(config, "downloader_retry_base_seconds", 0.25)
             jitter = getattr(config, "downloader_retry_jitter_seconds", 0.2)
 
-            import hashlib as _hashlib
             import random as _random
 
             for attempt in range(1, max_attempts + 1):

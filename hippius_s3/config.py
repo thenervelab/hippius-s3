@@ -113,9 +113,9 @@ class Config:
 
     # Crypto configuration
     # Default encryption suite for new objects
-    # hip-enc/1: XSalsa20-Poly1305 with random nonces (current)
-    # hip-enc/legacy: Legacy whole-part encryption (SDK compatibility)
-    crypto_suite_id: str = env("HIPPIUS_CRYPTO_SUITE_ID:hip-enc/1")
+    # hip-enc/legacy: SecretBox per-chunk (current default)
+    # hip-enc/1: Reserved for future adapter variants
+    crypto_suite_id: str = env("HIPPIUS_CRYPTO_SUITE_ID:hip-enc/legacy")
 
     # endpoint chunk download settings, quite aggressive
     redis_read_chunk_timeout = 60

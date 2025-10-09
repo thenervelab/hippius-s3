@@ -211,8 +211,6 @@ class LegacySecretBoxAdapter(CryptoAdapter):
     """Legacy whole-part SecretBox adapter.
 
     Suite ID: hip-enc/legacy
-    - Used for objects encrypted before chunked AEAD
-    - No chunk-level granularity
     """
 
     @property
@@ -230,8 +228,9 @@ class LegacySecretBoxAdapter(CryptoAdapter):
         chunk_index: int,
         upload_id: str,
     ) -> bytes:
-        # Not used for legacy (whole-part only)
-        raise NotImplementedError("Legacy adapter does not support chunked encrypt")
+        box = SecretBox(key)
+        ct = box.encrypt(plaintext)
+        return bytes(ct)
 
     def decrypt_chunk(
         self,
@@ -280,11 +279,10 @@ class CryptoService:
     # Adapter registry
     _ADAPTERS: Dict[str, CryptoAdapter] = {
         "hip-enc/legacy": LegacySecretBoxAdapter(),
-        "hip-enc/1": SecretBoxChunkedAdapter(),  # Legacy chunked (HMAC nonces)
     }
 
     # Default suite for new writes
-    DEFAULT_SUITE_ID = "hip-enc/1"
+    DEFAULT_SUITE_ID = "hip-enc/legacy"
 
     # Backward compat: exposed for existing code
     OVERHEAD_PER_CHUNK = SecretBox.NONCE_SIZE + SecretBox.MACBYTES  # 40 bytes
@@ -322,6 +320,7 @@ class CryptoService:
         bucket_id: str = "",
         upload_id: str = "",
         suite_id: Optional[str] = None,
+        key: Optional[bytes] = None,
     ) -> List[bytes]:
         """Encrypt plaintext into fixed-size chunks.
 
@@ -329,16 +328,17 @@ class CryptoService:
             plaintext: Data to encrypt
             object_id: Object UUID
             part_number: Part number (1-based)
-            seed_phrase: Seed phrase for key derivation
+            seed_phrase: Seed phrase for key derivation (ignored if key provided)
             chunk_size: Plaintext bytes per chunk
             bucket_id: Bucket UUID (for AAD)
             upload_id: Upload UUID (for AAD)
-            suite_id: Encryption suite (defaults to hip-enc/1)
+            suite_id: Encryption suite (defaults to configured/legacy)
+            key: Optional raw 32-byte key to use instead of seed derivation
 
         Returns:
             List of ciphertext chunks (each chunk_size + overhead)
         """
-        key = cls.derive_key_from_seed(seed_phrase)
+        key_bytes = key if key is not None else cls.derive_key_from_seed(seed_phrase)
         adapter = cls.get_adapter(suite_id)
 
         chunks: List[bytes] = []
@@ -352,7 +352,7 @@ class CryptoService:
             end = min(start + chunk_size, total)
             ct = adapter.encrypt_chunk(
                 plaintext[start:end],
-                key=key,
+                key=key_bytes,
                 bucket_id=bucket_id,
                 object_id=object_id,
                 part_number=part_number,
@@ -374,19 +374,17 @@ class CryptoService:
         bucket_id: str = "",
         upload_id: str = "",
         suite_id: Optional[str] = None,
+        key: Optional[bytes] = None,
     ) -> bytes:
-        """Decrypt a single chunk.
-
-        Tries new HKDF path first, falls back to legacy if needed.
-        """
-        key = cls.derive_key_from_seed(seed_phrase)
+        """Decrypt a single chunk."""
+        key_bytes = key if key is not None else cls.derive_key_from_seed(seed_phrase)
         adapter = cls.get_adapter(suite_id)
 
         # Try new path first
         try:
             return adapter.decrypt_chunk(
                 ciphertext_chunk,
-                key=key,
+                key=key_bytes,
                 bucket_id=bucket_id,
                 object_id=object_id,
                 part_number=part_number,
@@ -398,7 +396,7 @@ class CryptoService:
             try:
                 return adapter.decrypt_chunk_legacy(
                     ciphertext_chunk,
-                    key=key,
+                    key=key_bytes,
                     object_id=object_id,
                     part_number=part_number,
                     chunk_index=chunk_index,
