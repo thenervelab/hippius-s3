@@ -1,6 +1,6 @@
 -- migrate:up
 
-ALTER TABLE parts ADD COLUMN chunk_size_bytes INTEGER;
+ALTER TABLE parts ADD COLUMN IF NOT EXISTS chunk_size_bytes INTEGER;
 
 -- Backfill chunk_size_bytes for existing parts
 -- For parts with exactly 1 chunk, set chunk_size_bytes = size_bytes (migrated single-chunk parts)
