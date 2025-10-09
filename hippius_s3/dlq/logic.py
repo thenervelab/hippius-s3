@@ -30,39 +30,75 @@ class DLQLogic:
         return RedisObjectPartsCache
 
     async def hydrate_cache_from_dlq(self, object_id: str) -> bool:
-        """Hydrate Redis cache with chunks from DLQ filesystem."""
+        """Hydrate Redis cache with exactly the meta + per-chunk pieces from DLQ.
+
+        Never infer chunk boundaries or slice concatenated files. Only restore from
+        per-chunk piece files that were persisted directly from Redis.
+        """
         if not self.storage.has_object(object_id):
             logger.warning(f"No DLQ data found for object {object_id}")
             return False
 
-        # Get available chunks from filesystem
         available_parts = self.storage.list_chunks(object_id)
         if not available_parts:
-            logger.warning(f"No chunks found in DLQ for object {object_id}")
+            logger.warning(f"No DLQ parts found for object {object_id}")
             return False
 
-        logger.info(f"Hydrating cache for object {object_id} with parts: {available_parts}")
+        cache = self._get_redis_cache()(self.redis_client)
+        ok = True
 
-        # Load and cache each chunk
-        success = True
-        RedisCache = self._get_redis_cache()
-        cache = RedisCache(self.redis_client)
         for part_number in available_parts:
-            chunk_data = self.storage.load_chunk(object_id, part_number)
-            if chunk_data is None:
-                logger.error(f"Failed to load chunk {part_number} for object {object_id}")
-                success = False
+            meta = self.storage.load_meta(object_id, part_number)
+            indices = self.storage.list_chunk_piece_indices(object_id, part_number)
+
+            if not meta or not indices:
+                logger.error(
+                    f"Cannot hydrate object {object_id} part {part_number}: "
+                    f"{'missing meta' if not meta else 'no chunk pieces'}"
+                )
+                ok = False
                 continue
 
-            try:
-                # Store in Redis cache
-                await cache.set(object_id, part_number, chunk_data)
-                logger.debug(f"Cached chunk {part_number} for object {object_id}, size={len(chunk_data)}")
-            except Exception as e:
-                logger.error(f"Failed to cache chunk {part_number} for object {object_id}: {e}")
-                success = False
+            # Load all pieces
+            pieces: list[tuple[int, bytes]] = []
+            total_bytes = 0
+            for ci in indices:
+                data = self.storage.load_chunk_piece(object_id, part_number, ci)
+                if not isinstance(data, (bytes, bytearray)):
+                    logger.error(f"Missing piece {ci} for object {object_id} part {part_number}")
+                    ok = False
+                    pieces = []
+                    break
+                b = bytes(data)
+                pieces.append((ci, b))
+                total_bytes += len(b)
 
-        return success
+            if not pieces:
+                continue
+
+            # Write meta first (use observed counts/size for correctness)
+            try:
+                chunk_size = int(meta.get("chunk_size", 4 * 1024 * 1024))
+            except Exception:
+                chunk_size = 4 * 1024 * 1024
+
+            await cache.set_meta(
+                object_id,
+                part_number,
+                chunk_size=chunk_size,
+                num_chunks=len(pieces),
+                size_bytes=total_bytes,
+            )
+
+            # Then write each chunk piece
+            for ci, b in pieces:
+                await cache.set_chunk(object_id, part_number, ci, b)
+
+            logger.debug(
+                f"Hydrated object {object_id} part {part_number} with {len(pieces)} pieces (bytes={total_bytes})"
+            )
+
+        return ok
 
     async def requeue_with_hydration(
         self, payload: UploadChainRequest, force: bool = False, redis_client: Any = None

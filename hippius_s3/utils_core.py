@@ -14,6 +14,7 @@ from typing import Dict
 from typing import Tuple
 from typing import TypeVar
 
+import asyncpg
 from fastapi import Request
 
 
@@ -84,7 +85,7 @@ def _decode_aws_chunked_body(chunked_data: bytes) -> Tuple[bytes, Dict[str, str]
 
     result = bytearray()
     offset = 0
-    trailers = {}
+    trailers: Dict[str, str] = {}
 
     while offset < len(chunked_data):
         # Find the end of the chunk size line
@@ -165,20 +166,21 @@ def env(key: str, convert: Callable[[str], T] = typing.cast(Callable[[str], T], 
 def get_query(name: str) -> str:
     """Load SQL query from disk once and cache it in memory."""
     file_name = f"{name}.sql"
+    # Use pathlib to get parent directory (hippius_s3/) from utils_core.py location
     path = pathlib.Path(__file__).parent.joinpath("sql").joinpath("queries").joinpath(file_name)
 
-    logger.info(f"Loading/caching query: {file_name}")
+    logger.debug(f"Loading query from disk: {file_name}")
     with path.open("r") as fp:
         return fp.read().strip()
 
 
-async def upsert_cid_and_get_id(db, cid: str) -> str:
+async def upsert_cid_and_get_id(db: asyncpg.Pool, cid: str) -> str:
     """Insert or get existing CID and return the cid_id (UUID)."""
     result = await db.fetchrow(get_query("upsert_cid"), cid)
-    return result["id"]
+    return str(result["id"])
 
 
-async def get_object_download_info(db, object_id: str) -> dict:
+async def get_object_download_info(db: asyncpg.Pool, object_id: str) -> dict:
     """Get complete download information for an object (simple or multipart)."""
     result = await db.fetchrow(get_query("get_object_download_info_by_id"), object_id)
 
@@ -213,6 +215,7 @@ async def is_public_bucket(request: Request, bucket_name: str) -> bool:
         db = request.app.state.postgres_pool
         row = await db.fetchrow(get_query("get_bucket_by_name"), bucket_name)
         is_public = bool(row and row.get("is_public"))
+
         await redis.set(cache_key, "1" if is_public else "0", ex=config.public_bucket_cache_ttl_seconds)
         return is_public
     except Exception:

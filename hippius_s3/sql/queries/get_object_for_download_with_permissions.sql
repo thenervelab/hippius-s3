@@ -15,7 +15,8 @@ WITH object_info AS (
         b.bucket_name,
         b.is_public,
         b.main_account_id as bucket_owner_id,
-        c.cid as simple_cid
+        c.cid as simple_cid,
+        o.storage_version
     FROM objects o
     JOIN buckets b ON o.bucket_id = b.bucket_id
     LEFT JOIN cids c ON o.cid_id = c.id
@@ -47,6 +48,7 @@ SELECT
     oi.md5_hash,
     oi.bucket_name,
     oi.simple_cid,
+    oi.storage_version,
     NOT oi.is_public as should_decrypt,
     (
         SELECT mu.upload_id

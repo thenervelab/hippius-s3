@@ -1,11 +1,14 @@
 """E2E tests for GetObject with Range requests."""
 
+import time
 from typing import Any
 from typing import Callable
 
 import pytest
 from botocore.exceptions import ClientError
 
+from .support.cache import clear_object_cache
+from .support.cache import get_object_id
 from .support.cache import wait_for_parts_cids
 
 
@@ -45,6 +48,71 @@ def test_get_object_range_valid(
     resp3 = boto3_client.get_object(Bucket=bucket, Key=key, Range="bytes=-5")
     assert resp3["ResponseMetadata"]["HTTPStatusCode"] == 206
     assert resp3["Body"].read() == data[-5:]
+
+
+@pytest.mark.local
+def test_range_downloads_only_needed_chunks(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+    signed_http_get: Any,
+) -> None:
+    """After clearing cache, a small range should only materialize the in-range chunk(s)."""
+    try:
+        import redis  # type: ignore[import-untyped]
+    except Exception:
+        pytest.skip("redis client unavailable")
+
+    bucket = unique_bucket_name("range-chunk-only")
+    cleanup_buckets(bucket)
+    boto3_client.create_bucket(Bucket=bucket)
+
+    # Create a single large part (>= 2 chunks with default 4MiB chunk_size)
+    part_size = 4 * 1024 * 1024
+    key = "large/single-part.bin"
+    body = b"A" * (part_size * 2 + 123)  # a bit over 2 chunks
+    boto3_client.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/octet-stream")
+
+    # Ensure server processed it
+    assert wait_for_parts_cids(bucket, key, min_count=1, timeout_seconds=20.0)
+
+    # Clear all cache for this object
+    object_id = get_object_id(bucket, key)
+    clear_object_cache(object_id)
+
+    # Request a small range within the first chunk
+    r = signed_http_get(bucket, key, {"Range": "bytes=0-1048575"})
+    assert r.status_code == 206
+    assert r.headers.get("x-hippius-source") in {"pipeline", "cache"}
+
+    # Inspect Redis for which chunk keys were created
+    rcli = redis.Redis.from_url("redis://localhost:6379/0")
+    keys = sorted(
+        [
+            k.decode()
+            for k in rcli.scan_iter(match=f"obj:{object_id}:part:1:chunk:*", count=1000)  # 1-based part number
+        ]
+    )
+    # Expect at minimum chunk:0 exists for the first-range request
+    # (downloader may prefetch additional chunks, but the in-range chunk must be present)
+    expected_chunk = f"obj:{object_id}:part:1:chunk:0"
+    assert expected_chunk in keys, f"expected chunk {expected_chunk} not found in {keys}"
+    # Verify minimal hydration: should not have fetched chunks far outside the range
+    # (allow adjacent chunks due to prefetch, but not all chunks)
+    assert len(keys) <= 3, f"too many chunks hydrated: {keys}"
+
+    # Clear cache again and request middle of the second chunk
+    clear_object_cache(object_id)
+    start = part_size + 256 * 1024
+    end = start + 128 * 1024 - 1
+    r2 = signed_http_get(bucket, key, {"Range": f"bytes={start}-{end}"})
+    assert r2.status_code == 206
+    keys2 = sorted([k.decode() for k in rcli.scan_iter(match=f"obj:{object_id}:part:1:chunk:*", count=1000)])
+    expected_chunk2 = f"obj:{object_id}:part:1:chunk:1"
+    assert expected_chunk2 in keys2, f"expected chunk {expected_chunk2} not found in {keys2}"
+    # Verify minimal hydration: should not have fetched all chunks
+    assert len(keys2) <= 3, f"too many chunks hydrated: {keys2}"
 
 
 def test_get_object_range_invalid(
@@ -216,6 +284,7 @@ def test_get_object_range_large_spanning_many_parts(
         boto3_client.put_object(
             Bucket=bucket, Key=key, Body=part_data, Metadata={"append": "true", "append-if-version": ver}
         )
+
         ver = boto3_client.head_object(Bucket=bucket, Key=key)["ResponseMetadata"]["HTTPHeaders"].get(
             "x-amz-meta-append-version", "0"
         )
@@ -474,7 +543,6 @@ def test_get_object_range_concurrent_appends(
 ) -> None:
     """Test range requests when object is being appended to concurrently."""
     import threading
-    import time
 
     bucket = unique_bucket_name("range-concurrent")
     cleanup_buckets(bucket)

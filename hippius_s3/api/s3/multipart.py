@@ -23,12 +23,16 @@ from starlette.requests import ClientDisconnect
 from hippius_s3 import dependencies
 from hippius_s3 import utils
 from hippius_s3.api.s3.errors import s3_error_response
+from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import get_object_reader
+from hippius_s3.metadata.meta_writer import write_cache_meta
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
+from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.object_reader import ObjectReader
+from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.utils import get_query
 
 
@@ -322,11 +326,13 @@ async def get_all_cached_chunks(
     object_id: str,
     redis_client: Redis,
 ):
+    """Find all cached part meta keys for an object using non-blocking SCAN."""
     try:
-        keys_pattern = f"obj:{object_id}:part:*"
-        return await redis_client.keys(keys_pattern)
+        keys_pattern = f"obj:{object_id}:part:*:meta"
+        return [key async for key in redis_client.scan_iter(keys_pattern, count=1000)]
     except Exception as e:
         logger.error(f"Failed to find any cached parts for {object_id=}: {e}")
+        return []
 
 
 @router.put(
@@ -548,9 +554,9 @@ async def upload_part(
             status_code=400,
         )
 
-    # Cache raw part data for concatenation at completion (no IPFS upload for parts)
+    # Cache part data in chunked layout (no IPFS upload for parts)
     redis_client = request.app.state.redis_client
-    part_key = f"obj:{object_id}:part:{part_number}"
+    obj_cache = RedisObjectPartsCache(redis_client)
 
     try:
         # Check if client is still connected before proceeding
@@ -577,15 +583,55 @@ async def upload_part(
             )
         except Exception:
             logger.debug("Failed to compute md5 for pre-cache log", exc_info=True)
-        # Store in Redis
+        # Decide encryption policy (private buckets encrypt before Redis)
+        should_encrypt = False
+        try:
+            row = await db.fetchrow(
+                """
+                SELECT b.is_public
+                FROM multipart_uploads mu
+                JOIN buckets b ON b.bucket_id = mu.bucket_id
+                WHERE mu.upload_id = $1
+                LIMIT 1
+                """,
+                upload_id,
+            )
+            should_encrypt = not bool(row and row.get("is_public"))
+        except Exception:
+            should_encrypt = False
+
+        # Store in Redis via chunked cache API (encrypt for private, meta-first for readiness)
         redis_start = time.time()
-        await redis_client.setex(
-            part_key,
-            1800,
-            file_data,
-        )  # 30 minute TTL
+        chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+        if should_encrypt:
+            chunks_bytes = CryptoService.encrypt_part_to_chunks(
+                file_data,
+                object_id=str(object_id),
+                part_number=int(part_number),
+                seed_phrase=request.state.seed_phrase,
+                chunk_size=chunk_size,
+            )
+        else:
+            # Plaintext is chunked identically to ciphertext (no encryption)
+            chunks_bytes = [file_data[i : i + chunk_size] for i in range(0, len(file_data), chunk_size)]
+
+        # Write meta first for readiness (store plaintext size)
+        await write_cache_meta(
+            obj_cache,
+            str(object_id),
+            int(part_number),
+            chunk_size=chunk_size,
+            num_chunks=len(chunks_bytes),
+            plain_size=len(file_data),
+            ttl=1800,
+        )
+        # Then write chunk data
+        for i, piece in enumerate(chunks_bytes):
+            await obj_cache.set_chunk(str(object_id), int(part_number), i, piece, ttl=1800)
         redis_time = time.time() - redis_start
-        logger.debug(f"Part {part_number}: Redis setex took {redis_time:.3f}s (key={part_key})")
+        logger.debug(
+            f"Part {part_number}: Cached via RedisObjectPartsCache in {redis_time:.3f}s (object_id={object_id}, encrypted={should_encrypt})"
+        )
 
         # Create mock part result (no IPFS upload needed for individual parts)
         md5_start = time.time()
@@ -605,16 +651,15 @@ async def upload_part(
 
         # Save the part information in the database
         db_start = time.time()
-        await db.fetchrow(
-            get_query("upload_part"),
-            str(uuid.uuid4()),
-            upload_id,
-            part_number,
-            "",
-            # cid not yet available
-            part_result["size_bytes"],
-            part_result["etag"],
-            datetime.now(UTC),
+        await upsert_part_placeholder(
+            db,
+            object_id=str(object_id),
+            upload_id=str(upload_id),
+            part_number=int(part_number),
+            size_bytes=int(file_size),
+            etag=str(etag),
+            # Treat plaintext and ciphertext identically for chunking
+            chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
         )
         db_time = time.time() - db_start
         logger.debug(f"Part {part_number}: Database insert took {db_time:.3f}s")
@@ -638,9 +683,20 @@ async def upload_part(
         )
 
     except Exception:
-        # If any error occurs, clean up the Redis key
+        # If any error occurs, clean up the Redis keys for this part
         try:
-            await redis_client.delete(part_key)
+            # Delete meta and any chunk keys
+            try:
+                meta_key = f"obj:{object_id}:part:{part_number}:meta"
+                await redis_client.delete(meta_key)
+            except Exception:
+                pass
+            try:
+                # Best-effort wildcard delete for chunk keys (non-blocking SCAN)
+                async for k in redis_client.scan_iter(f"obj:{object_id}:part:{part_number}:chunk:*", count=1000):
+                    await redis_client.delete(k)
+            except Exception:
+                pass
         except Exception as cleanup_error:
             logger.error(f"Failed to cleanup Redis key after error: {cleanup_error}")
 
@@ -679,18 +735,20 @@ async def abort_multipart_upload(
         # Get object_id from multipart upload
         object_id = multipart_upload["object_id"]
 
-        # Clean up Redis keys for cached parts
+        # Clean up Redis keys for cached parts (meta + chunks)
         parts = await db.fetch(
             get_query("list_parts"),
             object_id,
         )
         if parts:
             redis_client = request.app.state.redis_client
-            redis_keys_to_delete = [f"obj:{object_id}:part:{part['part_number']}" for part in parts]
-            if redis_keys_to_delete:
-                await redis_client.delete(
-                    *redis_keys_to_delete,
-                )
+            for part in parts:
+                part_num = int(part["part_number"])
+                # Delete meta key
+                await redis_client.delete(f"obj:{object_id}:part:{part_num}:meta")
+                # Delete all chunk keys for this part using SCAN (non-blocking)
+                async for key in redis_client.scan_iter(f"obj:{object_id}:part:{part_num}:chunk:*"):
+                    await redis_client.delete(key)
 
         # Fully remove the multipart upload (and cascade parts) so it disappears from listings immediately
         async with db.transaction():
@@ -1017,12 +1075,14 @@ async def complete_multipart_upload(
             object_id,
         )
 
-        # Mark multipart upload as completed
-        await db.execute(
-            "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
-            upload_id,
-        )
+        # Mark multipart upload as completed and only enqueue after DB commit
+        async with db.transaction():
+            await db.execute(
+                "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
+                upload_id,
+            )
 
+        # After commit, enqueue background publish
         await enqueue_upload_request(
             UploadChainRequest(
                 object_key=object_key,

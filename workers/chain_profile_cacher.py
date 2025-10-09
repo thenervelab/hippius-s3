@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+import io
 import json
 import logging
 import sys
@@ -9,6 +10,7 @@ from typing import List
 
 import asyncpg
 import httpx
+import pandas as pd
 import redis.asyncio as async_redis
 from dotenv import load_dotenv
 
@@ -42,56 +44,34 @@ async def get_all_unique_users(
     return [row["main_account_id"] for row in users]
 
 
-async def fetch_profile_content(http_client: httpx.AsyncClient, cid: str) -> dict:
-    """Fetch user profile JSON content from IPFS gateway with timeout."""
-    try:
-        gateway_url = "https://get.hippius.network"
-        url = f"{gateway_url}/ipfs/{cid}"
-        response = await http_client.get(url)
+async def fetch_profile_content(http_client: httpx.AsyncClient, cid: str, gateway_url: str) -> dict:
+    """Fetch user profile parquet content from IPFS gateway with timeout."""
+    url = f"{gateway_url}/ipfs/{cid}"
+    response = await http_client.get(url)
 
-        if response.status_code == 200:
-            profile_data = response.json()
-            logger.debug(f"Successfully fetched profile content for CID {cid}")
-            return profile_data
-        logger.warning(f"Failed to fetch profile {cid}: HTTP {response.status_code}")
-        return {}
-
-    except Exception as e:
-        logger.error(f"Error fetching profile content for CID {cid}: {e}")
-        return {}
+    if response.status_code == 200:
+        df = pd.read_parquet(io.BytesIO(response.content))
+        profile_data = df.to_dict(orient="records")
+        logger.debug(f"Successfully fetched profile content for CID {cid}")
+        return profile_data
+    logger.warning(f"Failed to fetch profile {cid}: HTTP {response.status_code}")
+    return {}
 
 
 def extract_file_cids_from_profile(profile_data: dict) -> List[str]:
-    """Extract individual file CIDs from user profile JSON."""
+    """Extract individual file CIDs from user profile parquet data."""
     file_cids = []
 
-    try:
-        if isinstance(profile_data, list):
-            for file_entry in profile_data:
-                if isinstance(file_entry, dict):
-                    file_hash = file_entry.get("file_hash", [])
+    if isinstance(profile_data, list):
+        for file_entry in profile_data:
+            if isinstance(file_entry, dict):
+                cid = file_entry.get("cid")
+                if cid and isinstance(cid, str):
+                    file_cids.append(cid)
+                    logger.debug(f"Extracted file CID: {cid}")
 
-                    if isinstance(file_hash, list) and file_hash:
-                        try:
-                            cid_bytes = bytes(file_hash)
-                            cid_string = cid_bytes.decode("utf-8", errors="ignore")
-
-                            if cid_string and (cid_string.startswith("Qm") or cid_string.startswith("b")):
-                                file_cids.append(cid_string)
-                                logger.debug(f"Extracted file CID: {cid_string}")
-                        except Exception as e:
-                            logger.warning(f"Error converting file_hash to CID: {file_hash}, error: {e}")
-
-                    elif isinstance(file_hash, str) and file_hash:
-                        file_cids.append(file_hash)
-                        logger.debug(f"Extracted file CID: {file_hash}")
-
-        logger.debug(f"Extracted {len(file_cids)} file CIDs from profile")
-        return file_cids
-
-    except Exception as e:
-        logger.error(f"Error extracting file CIDs from profile: {e}")
-        return []
+    logger.debug(f"Extracted {len(file_cids)} file CIDs from profile")
+    return file_cids
 
 
 async def cache_user_chain_profile(
@@ -100,6 +80,7 @@ async def cache_user_chain_profile(
     all_profiles: dict,
     storage_requests_dict: dict,
     http_client: httpx.AsyncClient,
+    gateway_url: str,
 ) -> None:
     """Download and cache chain profile data for a single user."""
     logger.debug(f"Caching chain profile for user {user}")
@@ -110,7 +91,7 @@ async def cache_user_chain_profile(
     # Download and parse each profile to extract file CIDs
     profile_file_cids = []
     for profile_cid in profile_cids:
-        profile_data = await fetch_profile_content(http_client, profile_cid)
+        profile_data = await fetch_profile_content(http_client, profile_cid, gateway_url)
         if profile_data:
             file_cids = extract_file_cids_from_profile(profile_data)
             profile_file_cids.extend(file_cids)
@@ -192,6 +173,7 @@ async def run_chain_profile_cacher_loop():
                     all_profiles,
                     storage_requests_dict,
                     http_client,
+                    config.ipfs_get_url,
                 )
 
             logger.info(f"Completed caching chain profiles for all {len(users)} users")
