@@ -28,9 +28,10 @@ def test_get_object_downloads_and_matches_headers(
 
     boto3_client.create_bucket(Bucket=bucket_name)
 
-    key = "file.txt"
-    content = b"hello get object"
-    content_type = "text/plain"
+    key = "file.bin"
+    # ~9MB to ensure multi-chunk with default 4MB chunk size
+    content = os.urandom(9 * 1024 * 1024)
+    content_type = "application/octet-stream"
 
     boto3_client.put_object(
         Bucket=bucket_name,

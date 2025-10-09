@@ -23,6 +23,7 @@ from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import dequeue_download_request
 from hippius_s3.utils import get_query
 from hippius_s3.utils.timing import log_timing
+from hippius_s3.metadata.meta_reader import read_db_meta
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
