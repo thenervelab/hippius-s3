@@ -55,6 +55,8 @@ jobs:
               git clone -b production ${REPO_URL} .
             else
               echo "Updating git repository..."
+              # Stash any local changes before pulling
+              git stash
               # Try to pull latest changes
               git fetch origin production
               git checkout production || git checkout -b production origin/production
@@ -63,6 +65,8 @@ jobs:
 
             # Ensure external Docker network exists
             docker network inspect hippius_net >/dev/null 2>&1 || docker network create hippius_net
+            echo "Building base image..."
+            COMPOSE_PROFILES=build-base docker compose build --no-cache base
             echo "Building and starting Docker containers with production config..."
             docker compose -f docker-compose.yml -f docker-compose.prod.yml down || true
             docker compose -f docker-compose.yml -f docker-compose.prod.yml build --no-cache
