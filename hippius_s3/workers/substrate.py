@@ -76,7 +76,7 @@ class SubstrateWorker:
                 return await asyncio.wait_for(
                     asyncio.get_event_loop().run_in_executor(
                         None,
-                        lambda: self.substrate.submit_extrinsic(extrinsic, wait_for_inclusion=True),
+                        lambda: self.substrate.submit_extrinsic(extrinsic, wait_for_finalization=True),
                     ),
                     timeout=timeout_seconds,
                 )
