@@ -4,8 +4,8 @@ services:
     environment:
       - UVICORN_LOG_LEVEL=info
       - DEBUG=false
-      - HIPPIUS_IPFS_GET_URL=http://192.168.1.167:8080
-      - HIPPIUS_IPFS_STORE_URL=http://192.168.1.167:5001
+      - HIPPIUS_IPFS_GET_URL=http://192.168.1.173:8080
+      - HIPPIUS_IPFS_STORE_URL=http://192.168.1.173:5001
 
   db:
     shm_size: 2g
