@@ -34,8 +34,9 @@ Example:
 from __future__ import annotations
 
 import argparse
-import csv
 import contextlib
+import csv
+import hashlib
 import io
 import json
 import os
@@ -43,8 +44,8 @@ import random
 import string
 import sys
 import time
-from dataclasses import dataclass, asdict
-import hashlib
+from dataclasses import asdict
+from dataclasses import dataclass
 from typing import Dict
 from typing import List
 from typing import Optional
@@ -53,7 +54,6 @@ from typing import Tuple
 import boto3  # type: ignore[import-not-found]
 import requests  # type: ignore[import-not-found]
 from botocore.config import Config as BotoConfig  # type: ignore[import-not-found]
-from botocore.exceptions import ClientError  # type: ignore[import-not-found]
 
 
 def _rand_suffix(n: int = 6) -> str:
