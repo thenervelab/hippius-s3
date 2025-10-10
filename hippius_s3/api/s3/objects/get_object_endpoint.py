@@ -157,8 +157,9 @@ async def handle_get_object(
         is_public_bucket = bool(object_info.get("is_public"))
         bucket_owner_id = str(object_info.get("bucket_owner_id") or "")
 
-        # Use owner main account id for anonymous public reads to resolve keys
-        resolved_address = (account.main_account if account else "") if not is_anonymous else bucket_owner_id
+        # Resolve key address: for public buckets always use bucket owner id (works for anon and authenticated)
+        # Otherwise, use the caller's main account when authenticated
+        resolved_address = bucket_owner_id if is_public_bucket else (account.main_account if account else "")
 
         info_dict = {
             "object_id": str(object_info["object_id"]),
