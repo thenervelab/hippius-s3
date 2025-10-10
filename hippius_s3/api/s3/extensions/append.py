@@ -26,6 +26,7 @@ from fastapi import Response
 from hippius_s3.api.s3 import errors
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
+from hippius_s3.metadata.meta_writer import write_cache_meta
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
@@ -316,21 +317,37 @@ async def handle_append(
         obj_cache = RedisObjectPartsCache(redis_client)
         if not bucket["is_public"]:
             chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-            ct_chunks = CryptoService.encrypt_part_to_chunks(
-                incoming_bytes,
-                object_id=object_id,
-                part_number=int(next_part),
-                seed_phrase=request.state.seed_phrase,
-                chunk_size=chunk_size,
+            from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
+
+            key_bytes = await get_or_create_encryption_key_bytes(
+                subaccount_id=request.state.account.main_account,
+                bucket_name=bucket_name,
             )
-            total_ct = sum(len(ct) for ct in ct_chunks)
-            # Write meta first for cheap readiness check
-            await obj_cache.set_meta(
+            try:
+                ct_chunks = CryptoService.encrypt_part_to_chunks(
+                    incoming_bytes,
+                    object_id=object_id,
+                    part_number=int(next_part),
+                    seed_phrase=request.state.seed_phrase,
+                    chunk_size=chunk_size,
+                    key=key_bytes,
+                )
+            except Exception:
+                from hippius_s3.api.s3.errors import s3_error_response
+
+                return s3_error_response(
+                    "InternalError",
+                    "Failed to resolve encryption key for private bucket",
+                    status_code=500,
+                )
+            # Write meta first using unified writer with plaintext size
+            await write_cache_meta(
+                obj_cache,
                 object_id,
                 int(next_part),
                 chunk_size=chunk_size,
                 num_chunks=len(ct_chunks),
-                size_bytes=total_ct,
+                plain_size=len(incoming_bytes),
                 ttl=1800,
             )
             # Then write chunk data

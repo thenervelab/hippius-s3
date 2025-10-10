@@ -26,6 +26,7 @@ from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import get_object_reader
+from hippius_s3.metadata.meta_writer import write_cache_meta
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
@@ -606,7 +607,7 @@ async def upload_part(
         try:
             row = await db.fetchrow(
                 """
-                SELECT b.is_public
+                SELECT b.is_public, b.bucket_name
                 FROM multipart_uploads mu
                 JOIN buckets b ON b.bucket_id = mu.bucket_id
                 WHERE mu.upload_id = $1
@@ -614,33 +615,58 @@ async def upload_part(
                 """,
                 upload_id,
             )
-            should_encrypt = not bool(row and row.get("is_public"))
         except Exception:
-            should_encrypt = False
+            row = None
+
+        if not row:
+            logger.error(f"Upload row not found for upload_id={upload_id}; refusing to cache part")
+            return s3_error_response(
+                "NoSuchUpload",
+                "The specified upload does not exist.",
+                status_code=404,
+            )
+
+        should_encrypt = not bool(row.get("is_public"))
+        dest_bucket_name = row.get("bucket_name")
 
         # Store in Redis via chunked cache API (encrypt for private, meta-first for readiness)
         redis_start = time.time()
         chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
         if should_encrypt:
+            # Resolve per-account+bucket encryption key (no fallback)
+            from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
+
+            try:
+                key_bytes = await get_or_create_encryption_key_bytes(
+                    subaccount_id=request.state.account.main_account,
+                    bucket_name=str(dest_bucket_name or ""),
+                )
+            except Exception:
+                return s3_error_response(
+                    "InternalError",
+                    "Failed to resolve encryption key for private bucket",
+                    status_code=500,
+                )
             chunks_bytes = CryptoService.encrypt_part_to_chunks(
                 file_data,
                 object_id=str(object_id),
                 part_number=int(part_number),
                 seed_phrase=request.state.seed_phrase,
                 chunk_size=chunk_size,
+                key=key_bytes,
             )
         else:
             # Plaintext is chunked identically to ciphertext (no encryption)
             chunks_bytes = [file_data[i : i + chunk_size] for i in range(0, len(file_data), chunk_size)]
 
-        total_size_bytes = sum(len(c) for c in chunks_bytes)
-        # Write meta first for readiness
-        await obj_cache.set_meta(
+        # Write meta first for readiness (store plaintext size)
+        await write_cache_meta(
+            obj_cache,
             str(object_id),
             int(part_number),
             chunk_size=chunk_size,
             num_chunks=len(chunks_bytes),
-            size_bytes=total_size_bytes,
+            plain_size=len(file_data),
             ttl=1800,
         )
         # Then write chunk data

@@ -151,10 +151,9 @@ class Uploader:
     ) -> Tuple[str, int]:
         part_number = int(chunk.id)
         logger.debug(f"Uploading chunk object_id={object_id} part={part_number}")
-
-        chunk_data = await self.obj_cache.get(object_id, part_number)
-        if chunk_data is None:
-            raise ValueError(f"Chunk data missing for object_id={object_id} part={part_number}")
+        # Prefer chunked path when cache meta indicates multiple ciphertext chunks
+        meta = await self.obj_cache.get_meta(object_id, part_number)
+        num_chunks_meta = int(meta.get("num_chunks", 0)) if isinstance(meta, dict) else 0
 
         # Ensure we have a non-null upload_id for parts table operations
         resolved_upload_id: Optional[str] = upload_id
@@ -174,6 +173,82 @@ class Uploader:
             )
             resolved_upload_id = object_id
 
+        # Look up part_id and sizing metadata for part_chunks upsert
+        part_row = await self.db.fetchrow(
+            """
+            SELECT part_id, COALESCE(chunk_size_bytes, 0) AS chunk_size_bytes, COALESCE(size_bytes, 0) AS size_bytes
+            FROM parts
+            WHERE object_id = $1 AND part_number = $2
+            LIMIT 1
+            """,
+            object_id,
+            part_number,
+        )
+        part_id: Optional[str] = str(part_row[0]) if part_row else None
+        part_chunk_size: int = int(part_row[1] or 0) if part_row else 0
+        part_plain_size: int = int(part_row[2] or 0) if part_row else 0
+
+        if num_chunks_meta > 0 and part_id:
+            # Upload each ciphertext chunk and upsert part_chunks rows
+            first_chunk_cid = ""
+            for ci in range(num_chunks_meta):
+                piece = await self.obj_cache.get_chunk(object_id, part_number, ci)
+                if not isinstance(piece, (bytes, bytearray)):
+                    raise RuntimeError("missing_cipher_chunk")
+                up_res = await self.ipfs_service.upload_file(
+                    file_data=bytes(piece),
+                    file_name=f"{object_key}.part{part_number}.chunk{ci}",
+                    content_type="application/octet-stream",
+                    encrypt=False,
+                )
+                piece_cid = str(up_res["cid"])  # textual CID
+                if ci == 0:
+                    first_chunk_cid = piece_cid
+
+                # Compute plaintext size for this chunk if possible
+                if part_chunk_size > 0 and part_plain_size > 0 and num_chunks_meta > 0:
+                    if ci < num_chunks_meta - 1:
+                        pt_len = int(part_chunk_size)
+                    else:
+                        pt_len = max(0, int(part_plain_size) - int(part_chunk_size) * int(num_chunks_meta - 1))
+                else:
+                    pt_len = None  # type: ignore[assignment]
+
+                await self.db.execute(
+                    get_query("upsert_part_chunk"),
+                    part_id,
+                    int(ci),
+                    piece_cid,
+                    int(len(piece)),
+                    int(pt_len) if isinstance(pt_len, int) else None,
+                    None,
+                )
+
+            # Set parts.ipfs_cid to first chunk CID for manifest compatibility
+            cid_row = await self.db.fetchrow(get_query("upsert_cid"), first_chunk_cid) if first_chunk_cid else None
+            cid_id = cid_row["id"] if cid_row else None
+            await self.db.execute(
+                """
+                UPDATE parts
+                SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
+                WHERE object_id = $1 AND part_number = $2
+                """,
+                object_id,
+                part_number,
+                first_chunk_cid,
+                cid_id,
+            )
+
+            logger.debug(
+                f"Uploaded {num_chunks_meta} chunk pieces for object_id={object_id} part={part_number}; first_cid={first_chunk_cid}"
+            )
+            return first_chunk_cid or "", part_number
+
+        # Fallback: whole-part upload (legacy)
+        chunk_data = await self.obj_cache.get(object_id, part_number)
+        if chunk_data is None:
+            raise ValueError(f"Chunk data missing for object_id={object_id} part={part_number}")
+
         upload_result = await self.ipfs_service.upload_file(
             file_data=chunk_data,
             file_name=f"{object_key}.part{part_number}",
@@ -186,8 +261,8 @@ class Uploader:
 
         cid_id = None
         try:
-            cid_row = await self.db.fetchrow(get_query("upsert_cid"), chunk_cid)
-            cid_id = cid_row["id"] if cid_row else None
+            cid_row2 = await self.db.fetchrow(get_query("upsert_cid"), chunk_cid)
+            cid_id = cid_row2["id"] if cid_row2 else None
         except Exception:
             cid_id = None
 
@@ -195,13 +270,12 @@ class Uploader:
             updated = await self.db.execute(
                 """
                 UPDATE parts
-                SET ipfs_cid = $3, size_bytes = $4, cid_id = COALESCE($5, cid_id)
+                SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
                 WHERE object_id = $1 AND part_number = $2
                 """,
                 object_id,
                 part_number,
                 chunk_cid,
-                len(chunk_data),
                 cid_id,
             )
             updated_str = str(updated or "")
@@ -216,13 +290,12 @@ class Uploader:
                 updated2 = await self.db.execute(
                     """
                     UPDATE parts
-                    SET ipfs_cid = $3, size_bytes = $4, cid_id = COALESCE($5, cid_id)
+                    SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
                     WHERE upload_id = $1 AND part_number = $2
                     """,
                     resolved_upload_id,
                     part_number,
                     chunk_cid,
-                    len(chunk_data),
                     cid_id,
                 )
                 updated2_str = str(updated2 or "")

@@ -5,6 +5,7 @@ Separates authoritative DB reads from cache-only readiness checks.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 from typing import TypedDict
 
@@ -20,7 +21,7 @@ class DBMeta(TypedDict):
 class CacheMeta(TypedDict):
     chunk_size: int
     num_chunks: int
-    size_bytes: int
+    plain_size: int
 
 
 async def read_db_meta(
@@ -91,11 +92,82 @@ async def read_cache_meta(
     try:
         raw = await obj_cache.get_meta(object_id, part_number)
         if isinstance(raw, dict):
+            # Back-compat: use legacy size_bytes as plain_size
+            chunk_size = int(raw.get("chunk_size", 4 * 1024 * 1024))
+            num_chunks = int(raw.get("num_chunks", 0))
+            size_bytes = int(raw.get("size_bytes", 0))
+            plain_size = size_bytes
             return {
-                "chunk_size": int(raw.get("chunk_size", 4 * 1024 * 1024)),
-                "num_chunks": int(raw.get("num_chunks", 0)),
-                "size_bytes": int(raw.get("size_bytes", 0)),
+                "chunk_size": chunk_size,
+                "num_chunks": num_chunks,
+                "plain_size": plain_size,
             }
     except Exception:
         pass
     return None
+
+
+class NormalizedMeta(TypedDict):
+    chunk_size: int
+    num_chunks: int
+    plain_size: int
+
+
+async def ensure_cache_meta(
+    db: Any,
+    obj_cache: Any,
+    object_id: str,
+    part_number: int,
+) -> NormalizedMeta:
+    """Return authoritative meta, hydrating cache from DB when missing/invalid.
+
+    - Tries Redis cache first; if valid, returns it.
+    - Otherwise reads DB meta, writes normalized cache meta, and returns it.
+    - If neither available, returns zeros.
+    """
+    try:
+        c = await read_cache_meta(obj_cache, object_id, part_number)
+        if (
+            c
+            and int(c.get("chunk_size", 0)) > 0
+            and int(c.get("num_chunks", 0)) > 0
+            and int(c.get("plain_size", 0)) > 0
+        ):
+            return {
+                "chunk_size": int(c.get("chunk_size", 0)),
+                "num_chunks": int(c.get("num_chunks", 0)),
+                "plain_size": int(c.get("plain_size", 0)),
+            }
+    except Exception:
+        pass
+
+    # Fallback to DB
+    try:
+        dbm = await read_db_meta(db, object_id, part_number)
+    except Exception:
+        dbm = None
+
+    if dbm:
+        cs = int(dbm.get("chunk_size_bytes") or 0)
+        nc = int(dbm.get("num_chunks_db") or 0)
+        ps = int(dbm.get("plain_size") or 0)
+        # If chunk size is known but DB has no chunk rows yet, infer num_chunks from plaintext size
+        if cs > 0 and ps > 0 and nc <= 0:
+            nc = int(math.ceil(ps / cs))
+        if cs > 0 and nc > 0 and ps > 0:
+            try:
+                from hippius_s3.metadata.meta_writer import write_cache_meta  # local import to avoid cycles
+
+                await write_cache_meta(
+                    obj_cache,
+                    object_id,
+                    int(part_number),
+                    chunk_size=cs,
+                    num_chunks=nc,
+                    plain_size=ps,
+                )
+            except Exception:
+                pass
+            return {"chunk_size": cs, "num_chunks": nc, "plain_size": ps}
+
+    return {"chunk_size": 0, "num_chunks": 0, "plain_size": 0}

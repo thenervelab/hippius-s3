@@ -7,6 +7,9 @@ from pathlib import Path
 
 import redis.asyncio as async_redis
 from hippius_sdk.client import HippiusClient
+from redis.exceptions import BusyLoadingError
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 
 # Add parent directory to path to import hippius_s3 modules
@@ -21,6 +24,7 @@ from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import dequeue_download_request
 from hippius_s3.utils import get_query
 from hippius_s3.utils.timing import log_timing
+from hippius_s3.metadata.meta_reader import read_db_meta
 
 
 config = get_config()
@@ -63,13 +67,14 @@ async def process_download_request(
         async def download_chunk(chunk):
             chunk_logger = logging.getLogger(__name__)
             async with semaphore:
+                part_num = int(chunk.part_id)
                 # Build per-part download plan from DB; optionally restrict to in-range chunk indices
                 cid_plan: list[tuple[int, str, int | None]] = []
                 try:
                     rows = await db.fetch(
                         get_query("get_part_chunks_by_object_and_number"),
                         download_request.object_id,
-                        int(chunk.part_id),
+                        part_num,
                     )
                     all_entries = [(int(r[0]), str(r[1]), int(r[2]) if r[2] is not None else None) for r in rows or []]
                     # Restrict to requested indices if provided
@@ -133,7 +138,6 @@ async def process_download_request(
             base_sleep = getattr(config, "downloader_retry_base_seconds", 0.25)
             jitter = getattr(config, "downloader_retry_jitter_seconds", 0.2)
 
-            import hashlib as _hashlib
             import random as _random
 
             for attempt in range(1, max_attempts + 1):
@@ -148,7 +152,7 @@ async def process_download_request(
                     # Download per plan entry (DB-driven chunk layout if available)
                     # Deduplicate CID fetches to avoid redundant IPFS downloads
                     cid_cache: dict[str, bytes] = {}
-                    assembled: list[tuple[int, bytes]] = []  # (chunk_index, data)
+                    # Switch to write-on-arrival: persist each chunk as soon as it's fetched
 
                     # Derive authoritative chunk_size from DB plan if provided (third column)
                     auth_chunk_size = 0
@@ -160,11 +164,15 @@ async def process_download_request(
                     except Exception:
                         auth_chunk_size = 0
 
-                    for ci, cid_val, expected_len in cid_plan:
+                    # Order plan to prioritize the lowest chunk index for faster first byte
+                    ordered_plan = sorted(cid_plan, key=lambda x: int(x[0]))
+                    total_size_bytes = 0
+
+                    async def fetch_and_store(entry: tuple[int, str, int | None]) -> int:
+                        ci, cid_val, expected_len = entry
                         chunk_logger.debug(
                             f"Downloading part {chunk.part_id} ci={ci} CID={cid_val[:10]}... expected={expected_len}"
                         )
-                        # Check if we already fetched this CID
                         if cid_val in cid_cache:
                             data_i = cid_cache[cid_val]
                             chunk_logger.debug(f"Using cached CID data for ci={ci}")
@@ -178,93 +186,39 @@ async def process_download_request(
                                 return_bytes=True,
                             )
                             cid_cache[cid_val] = data_i
-
                         if expected_len is not None and len(data_i) != int(expected_len):
                             chunk_logger.warning(
                                 f"Cipher len mismatch for part {chunk.part_id} ci={ci}: got={len(data_i)} expected={expected_len}"
                             )
-                        assembled.append((ci, data_i))
+                        await obj_cache.set_chunk(download_request.object_id, part_num, int(ci), data_i)
+                        return len(data_i)
 
-                    # Sort by chunk index and concatenate; also map by index for targeted writes
-                    assembled.sort(key=lambda x: x[0])
-                    by_index: dict[int, bytes] = {int(i): bytes(d) for i, d in assembled}
-                    chunk_data = b"".join([data for _, data in assembled])
+                    # Fetch the first (lowest) chunk synchronously and write immediately
+                    head_len = 0
+                    if ordered_plan:
+                        head_len = await fetch_and_store(ordered_plan[0])
+                        total_size_bytes += head_len
 
-                    md5 = _hashlib.md5(chunk_data).hexdigest()
-                    head_hex = chunk_data[:8].hex()
-                    tail_hex = chunk_data[-8:].hex() if len(chunk_data) >= 8 else head_hex
-                    chunk_logger.debug(
-                        f"Downloaded chunk {chunk.part_id} cid={str(chunk.cid)}... len={len(chunk_data)} md5={md5} "
-                        f"head8={head_hex} tail8={tail_hex}"
-                    )
+                    # Fetch and store the remaining chunks concurrently
+                    if len(ordered_plan) > 1:
+                        tail = ordered_plan[1:]
+                        # Limit intra-part concurrency by the same semaphore already held
+                        # Note: semaphore guards outer part processing; this inner gather is fine
+                        results = await asyncio.gather(*[fetch_and_store(e) for e in tail])
+                        total_size_bytes += sum(int(x or 0) for x in results)
 
-                    # Store bytes in Redis cache with meta-first write order (readiness signal before chunks)
-                    part_num = int(chunk.part_id)
+                    # Store bytes in Redis cache
                     if cid_plan and len(cid_plan) > 1:
-                        # Multiple chunks in DB: ensure non-zero chunk_size and prefer DB count
-                        eff_chunk_size = auth_chunk_size
-                        db_chunks = 0
-                        if eff_chunk_size <= 0:
-                            try:
-                                from hippius_s3.metadata.meta_reader import read_db_meta  # local import
-
-                                db_meta = await read_db_meta(db, download_request.object_id, part_num)
-                                if db_meta:
-                                    eff_chunk_size = int(db_meta.get("chunk_size_bytes") or 0)
-                                    db_chunks = int(db_meta.get("num_chunks_db") or 0)
-                            except Exception:
-                                eff_chunk_size = 0
-                        if eff_chunk_size <= 0:
-                            eff_chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-
-                        await obj_cache.set_meta(
-                            download_request.object_id,
-                            part_num,
-                            chunk_size=eff_chunk_size,
-                            # Prefer DB total; if unknown, keep 0 (reader polls per-chunk)
-                            num_chunks=db_chunks,
-                            size_bytes=len(chunk_data),
-                        )
-                        for ci, _cid, _exp in cid_plan:
-                            data_i = by_index.get(int(ci), b"")
-                            await obj_cache.set_chunk(download_request.object_id, part_num, int(ci), data_i)
                         chunk_logger.info(
-                            f"OBJ-CACHE stored (DB layout) object_id={download_request.object_id} part={part_num} ct_chunks={len(cid_plan)} total_bytes={len(chunk_data)}"
+                            f"OBJ-CACHE stored (DB layout) object_id={download_request.object_id} part={part_num} ct_chunks={len(cid_plan)} total_bytes={int(total_size_bytes)}"
                         )
                     else:
-                        # Single-chunk case: write meta first, then chunk at the requested index (default 0)
-                        # Ensure meta reflects at least the requested index (e.g., idx=1 => num_chunks >= 2)
+                        # Single-chunk case: fetch and write target chunk directly (no whole-part assembly)
                         target_index = int(cid_plan[0][0]) if cid_plan else 0
-
-                        # If chunk_size not known from DB plan, try to read authoritative value from DB meta
-                        eff_chunk_size = auth_chunk_size
-                        if eff_chunk_size <= 0:
-                            try:
-                                from hippius_s3.metadata.meta_reader import read_db_meta  # local import to avoid cycles
-
-                                db_meta = await read_db_meta(db, download_request.object_id, int(chunk.part_id))
-                                eff_chunk_size = (
-                                    int(db_meta["chunk_size_bytes"])
-                                    if db_meta and db_meta.get("chunk_size_bytes")
-                                    else 0
-                                )
-                            except Exception:
-                                eff_chunk_size = 0
-                        if eff_chunk_size <= 0:
-                            # Final fallback to configured chunk size to avoid stalling range math
-                            eff_chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-
-                        await obj_cache.set_meta(
-                            download_request.object_id,
-                            part_num,
-                            chunk_size=eff_chunk_size,
-                            num_chunks=max(1, target_index + 1),
-                            size_bytes=len(chunk_data),
-                        )
-                        data_i = by_index.get(target_index, chunk_data)
-                        await obj_cache.set_chunk(download_request.object_id, part_num, target_index, data_i)
+                        entry = ordered_plan[0] if ordered_plan else (target_index, str(chunk.cid), None)
+                        _ = await fetch_and_store(entry)
                         chunk_logger.info(
-                            f"OBJ-CACHE stored (single) object_id={download_request.object_id} part={part_num} idx={target_index} bytes={len(data_i)}"
+                            f"OBJ-CACHE stored (single) object_id={download_request.object_id} part={part_num} idx={target_index}"
                         )
                     # Log download timing
                     chunk_ms = (_dtime.perf_counter() - chunk_start) * 1000.0
@@ -274,7 +228,7 @@ async def process_download_request(
                         extra={
                             "object_id": download_request.object_id,
                             "part_id": chunk.part_id,
-                            "size_bytes": len(chunk_data),
+                            "size_bytes": int(total_size_bytes) if (cid_plan and len(cid_plan) > 1) else None,
                             "num_cids": len(cid_plan),
                         },
                     )
@@ -337,18 +291,37 @@ async def run_downloader_loop():
 
     try:
         while True:
-            download_request = await dequeue_download_request(redis_client)
+            try:
+                download_request = await dequeue_download_request(redis_client)
+            except (BusyLoadingError, RedisConnectionError, RedisTimeoutError) as e:
+                logger.warning(f"Redis error while dequeuing download request: {e}. Reconnecting in 2s...")
+                with contextlib.suppress(Exception):
+                    await redis_client.aclose()
+                await asyncio.sleep(2)
+                redis_client = async_redis.from_url(config.redis_url)
+                continue
 
             if download_request:
-                success = await process_download_request(download_request, redis_client)
-                if success:
-                    logger.info(
-                        f"Successfully processed download request {download_request.bucket_name}/{download_request.object_key}"
+                try:
+                    success = await process_download_request(download_request, redis_client)
+                    if success:
+                        logger.info(
+                            f"Successfully processed download request {download_request.bucket_name}/{download_request.object_key}"
+                        )
+                    else:
+                        logger.error(
+                            f"Failed to process download request {download_request.bucket_name}/{download_request.object_key}"
+                        )
+                except (RedisConnectionError, RedisTimeoutError, BusyLoadingError) as e:
+                    logger.warning(
+                        f"Redis connection issue during processing: {e}. Reconnecting in 2s and continuing..."
                     )
-                else:
-                    logger.error(
-                        f"Failed to process download request {download_request.bucket_name}/{download_request.object_key}"
-                    )
+                    with contextlib.suppress(Exception):
+                        await redis_client.aclose()
+                    await asyncio.sleep(2)
+                    redis_client = async_redis.from_url(config.redis_url)
+                    # Continue main loop; item-specific retry/backoff is handled by callers
+                    continue
             else:
                 # Wait a bit before checking again
                 await asyncio.sleep(config.downloader_sleep_loop)
