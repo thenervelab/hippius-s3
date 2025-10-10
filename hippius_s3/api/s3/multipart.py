@@ -278,6 +278,7 @@ async def initiate_multipart_upload(
             "",  # initial md5_hash (will be updated on completion)
             0,  # initial size_bytes (will be updated on completion)
             initiated_at,  # created_at
+            int(getattr(config, "target_storage_version", 3)),
         )
 
         # Create the multipart upload in the database with object_id

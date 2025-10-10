@@ -3,7 +3,7 @@
 INSERT INTO objects (
     object_id, bucket_id, object_key, content_type, metadata, md5_hash, size_bytes, created_at, status, multipart, storage_version
 )
-VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, 'publishing', FALSE, 3)
+VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, 'publishing', FALSE, $9)
 ON CONFLICT (bucket_id, object_key)
 DO UPDATE SET
     object_id = EXCLUDED.object_id,
@@ -14,5 +14,5 @@ DO UPDATE SET
     created_at = EXCLUDED.created_at,
     status = 'publishing',
     multipart = FALSE,
-    storage_version = 3
+    storage_version = EXCLUDED.storage_version
 RETURNING object_id, bucket_id, object_key, content_type, metadata, md5_hash, size_bytes, created_at, status, multipart, storage_version

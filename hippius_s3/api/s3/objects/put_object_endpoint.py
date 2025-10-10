@@ -165,6 +165,7 @@ async def handle_put_object(
                 md5_hash,
                 file_size,
                 created_at,
+                int(getattr(config, "target_storage_version", 3)),
             )
 
             # If overwriting a previous object, remove its parts since we're replacing it

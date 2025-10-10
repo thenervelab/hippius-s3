@@ -34,6 +34,8 @@ class ObjectRepository:
         created_at: Any,
         metadata_json: str,
         md5_hash: str,
+        *,
+        storage_version: int,
     ) -> Any:
         return await self._db.fetchrow(
             get_query("upsert_object_with_cid"),
@@ -46,4 +48,5 @@ class ObjectRepository:
             created_at,
             metadata_json,
             md5_hash,
+            storage_version,
         )
