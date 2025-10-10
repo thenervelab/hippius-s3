@@ -230,6 +230,7 @@ async def handle_copy_object(
         created_at,
         json.dumps(metadata),
         md5_hash,
+        storage_version=int(getattr(config, "target_storage_version", 3)),
     )
 
     # Success XML

@@ -311,54 +311,48 @@ async def handle_append(
     # Write-through cache: store appended bytes for immediate reads
 
     with contextlib.suppress(Exception):
-        logger.info(
-            f"APPEND cache write object_id={object_id} part={int(next_part)} bytes={len(incoming_bytes)} public={bucket['is_public']}"
-        )
+        logger.info(f"APPEND cache write object_id={object_id} part={int(next_part)} bytes={len(incoming_bytes)}")
         obj_cache = RedisObjectPartsCache(redis_client)
-        if not bucket["is_public"]:
-            chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-            from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
+        chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+        from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
 
-            key_bytes = await get_or_create_encryption_key_bytes(
-                subaccount_id=request.state.account.main_account,
-                bucket_name=bucket_name,
-            )
-            try:
-                ct_chunks = CryptoService.encrypt_part_to_chunks(
-                    incoming_bytes,
-                    object_id=object_id,
-                    part_number=int(next_part),
-                    seed_phrase=request.state.seed_phrase,
-                    chunk_size=chunk_size,
-                    key=key_bytes,
-                )
-            except Exception:
-                from hippius_s3.api.s3.errors import s3_error_response
-
-                return s3_error_response(
-                    "InternalError",
-                    "Failed to resolve encryption key for private bucket",
-                    status_code=500,
-                )
-            # Write meta first using unified writer with plaintext size
-            await write_cache_meta(
-                obj_cache,
-                object_id,
-                int(next_part),
+        key_bytes = await get_or_create_encryption_key_bytes(
+            subaccount_id=request.state.account.main_account,
+            bucket_name=bucket_name,
+        )
+        try:
+            ct_chunks = CryptoService.encrypt_part_to_chunks(
+                incoming_bytes,
+                object_id=object_id,
+                part_number=int(next_part),
+                seed_phrase=request.state.seed_phrase,
                 chunk_size=chunk_size,
-                num_chunks=len(ct_chunks),
-                plain_size=len(incoming_bytes),
-                ttl=1800,
+                key=key_bytes,
             )
-            # Then write chunk data
-            for i, ct in enumerate(ct_chunks):
-                await obj_cache.set_chunk(object_id, int(next_part), i, ct, ttl=1800)
-        else:
-            await obj_cache.set(object_id, int(next_part), incoming_bytes, ttl=1800)
+        except Exception:
+            from hippius_s3.api.s3.errors import s3_error_response
+
+            return s3_error_response(
+                "InternalError",
+                "Failed to resolve encryption key",
+                status_code=500,
+            )
+        # Write meta first using unified writer with plaintext size
+        await write_cache_meta(
+            obj_cache,
+            object_id,
+            int(next_part),
+            chunk_size=chunk_size,
+            num_chunks=len(ct_chunks),
+            plain_size=len(incoming_bytes),
+            ttl=1800,
+        )
+        # Then write chunk data
+        for i, ct in enumerate(ct_chunks):
+            await obj_cache.set_chunk(object_id, int(next_part), i, ct, ttl=1800)
 
     # Enqueue background publish of this part via the pinner worker
     try:
-        should_encrypt = not bucket["is_public"]
         logger.debug(
             f"APPEND about to enqueue UploadChainRequest for object_id={object_id}, part={int(next_part)}, upload_id={str(upload_id)}"
         )
@@ -370,7 +364,6 @@ async def handle_append(
             subaccount_seed_phrase=request.state.seed_phrase,
             bucket_name=bucket_name,
             object_key=object_key,
-            should_encrypt=should_encrypt,
             object_id=object_id,
             upload_id=str(upload_id),
             chunks=[Chunk(id=int(next_part))],

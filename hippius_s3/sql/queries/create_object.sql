@@ -3,7 +3,8 @@
 --             $5: size_bytes, $6: content_type, $7: created_at, $8: metadata, $9: md5_hash
 INSERT INTO objects (
     object_id, bucket_id, object_key, ipfs_cid,
-    size_bytes, content_type, created_at, metadata, md5_hash
+    size_bytes, content_type, created_at, metadata, md5_hash,
+    storage_version
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING object_id, bucket_id, object_key, ipfs_cid, md5_hash
