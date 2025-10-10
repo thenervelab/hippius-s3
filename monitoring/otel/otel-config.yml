@@ -1,0 +1,66 @@
+receivers:
+  # OTLP receiver for OpenTelemetry data
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # Prometheus receiver to scrape metrics from services
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: 'hippius-s3-api'
+          scrape_interval: 10s
+          static_configs:
+            - targets: ['api:8000']
+
+processors:
+  # Add resource attributes for better identification
+  resource:
+    attributes:
+      - key: service.name
+        value: "hippius-s3"
+        action: upsert
+      - key: service.version
+        value: "1.0.0"
+        action: upsert
+
+  # Batch processor for better performance
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+
+  # Memory limiter to prevent OOM
+  memory_limiter:
+    limit_mib: 256
+    check_interval: 1s
+
+exporters:
+  # Export to Prometheus for Grafana
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    send_timestamps: true
+    metric_expiration: 180m
+    enable_open_metrics: true
+
+  # Debug exporter for debugging
+  debug:
+    verbosity: normal
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1888
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+service:
+  extensions: [health_check, pprof, zpages]
+  pipelines:
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, resource, batch]
+      exporters: [prometheus]

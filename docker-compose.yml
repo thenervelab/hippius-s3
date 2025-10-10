@@ -38,6 +38,8 @@ services:
       - REDIS_CHAIN_URL=redis://redis-chain:6379/0
       - HIPPIUS_DLQ_DIR=/tmp/hippius_dlq
       - HIPPIUS_DLQ_ARCHIVE_DIR=/tmp/hippius_dlq_archive
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     networks:
       - hippius_net
 
@@ -149,6 +151,8 @@ services:
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - HIPPIUS_DLQ_DIR=/tmp/hippius_dlq
       - HIPPIUS_DLQ_ARCHIVE_DIR=/tmp/hippius_dlq_archive
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     volumes:
       - .:/app
       - /var/lib/hippius/dlq:/tmp/hippius_dlq
@@ -174,6 +178,8 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     volumes:
       - .:/app
     networks:
@@ -198,6 +204,8 @@ services:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     networks:
       - hippius_net
 
@@ -219,6 +227,8 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     networks:
       - hippius_net
 
@@ -240,6 +250,8 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_CHAIN_URL=redis://redis-chain:6379/0
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     networks:
       - hippius_net
 
@@ -261,6 +273,8 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_CHAIN_URL=redis://redis-chain:6379/0
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     networks:
       - hippius_net
 

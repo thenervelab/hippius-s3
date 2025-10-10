@@ -61,8 +61,8 @@ async def rate_limit_middleware(
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    # Skip rate limiting for documentation and health check endpoints
-    skip_paths = ["/openapi.json", "/docs", "/redoc", "/health", "/robots.txt"]
+    # Skip rate limiting for documentation, health check, and metrics endpoints
+    skip_paths = ["/openapi.json", "/docs", "/redoc", "/health", "/robots.txt", "/metrics"]
     if request.url.path in skip_paths:
         return await call_next(request)
 

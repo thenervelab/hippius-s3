@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hippius_s3.config import get_config
 from hippius_s3.ipfs_service import IPFSService
+from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.queue import dequeue_upload_request
 from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.queue import move_due_retries_to_primary
@@ -25,8 +26,7 @@ from hippius_s3.workers.uploader import compute_backoff_ms
 
 config = get_config()
 
-log_level = getattr(logging, config.log_level.upper(), logging.INFO)
-logging.basicConfig(level=log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+setup_loki_logging(config, "uploader")
 logger = logging.getLogger(__name__)
 
 

@@ -33,6 +33,8 @@ services:
       - PORT=8000
       - HIPPIUS_SUBSTRATE_URL=wss://rpc.hippius.network
       - HIPPIUS_VALIDATOR_REGION=decentralized
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     depends_on:
       db:
         condition: service_healthy
@@ -71,6 +73,8 @@ services:
       - HIPPIUS_UPLOADER_MAX_ATTEMPTS=2
       - HIPPIUS_UPLOADER_BACKOFF_BASE_MS=100
       - HIPPIUS_UPLOADER_BACKOFF_MAX_MS=500
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     depends_on:
       db:
         condition: service_healthy
@@ -114,6 +118,8 @@ services:
       - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
       - HIPPIUS_SUBSTRATE_BATCH_SIZE=1
       - HIPPIUS_SUBSTRATE_BATCH_MAX_AGE_SEC=1
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     depends_on:
       db:
         condition: service_healthy
@@ -140,6 +146,8 @@ services:
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
       - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     depends_on:
       db:
         condition: service_healthy
@@ -167,6 +175,8 @@ services:
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
       - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     depends_on:
       db:
         condition: service_healthy
@@ -194,6 +204,8 @@ services:
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
       - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     depends_on:
       db:
         condition: service_healthy
@@ -230,6 +242,8 @@ services:
       - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
       - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
       - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
     depends_on:
       db:
         condition: service_healthy

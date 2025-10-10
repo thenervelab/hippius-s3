@@ -19,16 +19,12 @@ from hippius_s3.queue import dequeue_unpin_request
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hippius_s3.config import get_config
+from hippius_s3.logging_config import setup_loki_logging
 
 
 config = get_config()
 
-# Set logging level based on config
-log_level = getattr(logging, config.log_level.upper(), logging.INFO)
-logging.basicConfig(
-    level=log_level,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+setup_loki_logging(config, "unpinner")
 logger = logging.getLogger(__name__)
 
 
