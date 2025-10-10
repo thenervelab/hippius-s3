@@ -109,6 +109,7 @@ max-complexity = 13 # TODO: get this down to 8
 "examples/*.py" = ["T201", "PTH"]
 "tests/**/*.py" = ["T201", "ERA001"]
 "hippius_s3/scripts/*.py" = ["T201", "PTH"]
+"scripts/*.py" = ["T201", "PTH", "SIM105"]
 
 [tool.mypy]
 python_version = "3.10"

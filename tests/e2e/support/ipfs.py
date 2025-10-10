@@ -1,9 +1,37 @@
+from __future__ import annotations
+
 import os
 import subprocess
 from pathlib import Path
 from typing import Any
+from typing import Optional
 
-import requests
+import requests  # type: ignore[import-untyped]
+
+
+def build_ipfs_url(cid: str, base_url: Optional[str] = None) -> str:
+    print(f"DEBUG: build_ipfs_url: cid={cid}, base_url={base_url}")
+    base = base_url.strip() if base_url and base_url.strip() else "http://127.0.0.1:8080/ipfs"
+    base = base.rstrip("/")
+
+    print(f"DEBUG: build_ipfs_url: base={base}")
+    if not base.endswith("/ipfs"):
+        base = f"{base}/ipfs"
+    print(f"DEBUG: build_ipfs_url: final={base}/{cid}")
+    return f"{base}/{cid}"
+
+
+def fetch_raw_cid(cid: str, *, base_url: Optional[str] = None, timeout_sec: float = 30.0) -> bytes:
+    """Fetch raw bytes for a CID from the configured IPFS gateway.
+
+    This performs a simple HTTP GET to the gateway and returns the body bytes.
+    """
+    url = build_ipfs_url(cid, base_url=base_url)
+    print(f"DEBUG: fetch_raw_cid: url={url}")
+    resp = requests.get(url, timeout=timeout_sec)
+    print(f"DEBUG: fetch_raw_cid: resp={resp}")
+    resp.raise_for_status()
+    return resp.content
 
 
 def ipfs_ls(cid: str, *, timeout: float = 5.0) -> dict[str, Any]:

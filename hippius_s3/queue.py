@@ -35,7 +35,8 @@ class ChainRequest(BaseModel):
     subaccount_seed_phrase: str
     bucket_name: str
     object_key: str
-    should_encrypt: bool
+    # Deprecated: retained for backward compatibility; uploads are pre-encrypted
+    should_encrypt: bool | None = None
     object_id: str
 
     # Retry & tracing metadata

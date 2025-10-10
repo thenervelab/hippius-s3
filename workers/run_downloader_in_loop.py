@@ -23,7 +23,6 @@ from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import dequeue_download_request
 from hippius_s3.utils import get_query
 from hippius_s3.utils.timing import log_timing
-from hippius_s3.metadata.meta_reader import read_db_meta
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -140,6 +139,10 @@ async def process_download_request(
 
             import random as _random
 
+            # Deduplicate CID fetches to avoid redundant IPFS downloads
+            # Define outside the retry loop to avoid B023 loop variable binding issues
+            cid_cache: dict[str, bytes] = {}
+
             for attempt in range(1, max_attempts + 1):
                 try:
                     import time as _dtime
@@ -150,19 +153,7 @@ async def process_download_request(
                     )
 
                     # Download per plan entry (DB-driven chunk layout if available)
-                    # Deduplicate CID fetches to avoid redundant IPFS downloads
-                    cid_cache: dict[str, bytes] = {}
                     # Switch to write-on-arrival: persist each chunk as soon as it's fetched
-
-                    # Derive authoritative chunk_size from DB plan if provided (third column)
-                    auth_chunk_size = 0
-                    try:
-                        for _ci, _cidv, _exp in cid_plan:
-                            if _exp is not None and int(_exp) > 0:
-                                auth_chunk_size = int(_exp)
-                                break
-                    except Exception:
-                        auth_chunk_size = 0
 
                     # Order plan to prioritize the lowest chunk index for faster first byte
                     ordered_plan = sorted(cid_plan, key=lambda x: int(x[0]))
