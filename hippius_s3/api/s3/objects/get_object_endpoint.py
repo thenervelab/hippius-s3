@@ -167,7 +167,7 @@ async def handle_get_object(
             "storage_version": int(object_info.get("storage_version") or 2),
         }
 
-        return await read_response(
+        response = await read_response(
             db=db,
             redis=request.app.state.redis_client,
             obj_cache=request.app.state.obj_cache,
@@ -179,43 +179,35 @@ async def handle_get_object(
             range_was_invalid=range_was_invalid,
         )
 
-        # Record metrics on successful download
-        metrics = get_metrics_collector()
-        if metrics and response.status_code == 200:
-            bytes_transferred = info.size_bytes
+        if response.status_code in (200, 206):
+            bytes_transferred = int(object_info["size_bytes"])
             if range_header and start_byte is not None and end_byte is not None:
                 bytes_transferred = end_byte - start_byte + 1
 
-            metrics.record_s3_operation(
+            get_metrics_collector().record_s3_operation(
                 operation="get_object",
                 bucket_name=bucket_name,
-                object_key=object_key,
                 main_account=account.main_account if account else None,
-                subaccount_id=account.id if account else None,
                 success=True,
             )
-            metrics.record_data_transfer(
+            get_metrics_collector().record_data_transfer(
                 operation="get_object",
                 bytes_transferred=bytes_transferred,
                 bucket_name=bucket_name,
-                object_key=object_key,
                 main_account=account.main_account if account else None,
-                subaccount_id=account.id if account else None,
             )
 
         return response
 
     except errors.S3Error as e:
         logger.exception(f"S3 Error getting object {bucket_name}/{object_key}: {e.message}")
-        metrics = get_metrics_collector()
-        if metrics:
-            account = getattr(request.state, "account", None)
-            metrics.record_error(
-                error_type=e.code,
-                operation="get_object",
-                bucket_name=bucket_name,
-                main_account=account.main_account if account else None,
-            )
+        account = getattr(request.state, "account", None)
+        get_metrics_collector().record_error(
+            error_type=e.code,
+            operation="get_object",
+            bucket_name=bucket_name,
+            main_account=account.main_account if account else None,
+        )
         return errors.s3_error_response(
             code=e.code,
             message=e.message,
@@ -223,21 +215,18 @@ async def handle_get_object(
         )
 
     except DownloadNotReadyError as e:
-        # Map download readiness issues to 503 SlowDown response
         error_msg = str(e)
         if "Parts not ready" in error_msg:
             logger.warning(f"GET {bucket_name}/{object_key}: parts not ready for download: {error_msg}")
         else:
             logger.warning(f"GET {bucket_name}/{object_key}: download not ready: {error_msg}")
-        metrics = get_metrics_collector()
-        if metrics:
-            account = getattr(request.state, "account", None)
-            metrics.record_error(
-                error_type="download_not_ready",
-                operation="get_object",
-                bucket_name=bucket_name,
-                main_account=account.main_account if account else None,
-            )
+        account = getattr(request.state, "account", None)
+        get_metrics_collector().record_error(
+            error_type="download_not_ready",
+            operation="get_object",
+            bucket_name=bucket_name,
+            main_account=account.main_account if account else None,
+        )
         return errors.s3_error_response(
             code="SlowDown",
             message="Object not ready for download yet. Please retry.",
@@ -247,15 +236,13 @@ async def handle_get_object(
 
     except Exception as e:
         logger.exception(f"Error getting object {bucket_name}/{object_key}: {e}")
-        metrics = get_metrics_collector()
-        if metrics:
-            account = getattr(request.state, "account", None)
-            metrics.record_error(
-                error_type="internal_error",
-                operation="get_object",
-                bucket_name=bucket_name,
-                main_account=account.main_account if account else None,
-            )
+        account = getattr(request.state, "account", None)
+        get_metrics_collector().record_error(
+            error_type="internal_error",
+            operation="get_object",
+            bucket_name=bucket_name,
+            main_account=account.main_account if account else None,
+        )
         return errors.s3_error_response(
             code="InternalError",
             message=f"We encountered an internal error: {str(e)}. Please try again.",

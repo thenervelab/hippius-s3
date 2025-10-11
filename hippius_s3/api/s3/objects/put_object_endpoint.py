@@ -229,25 +229,18 @@ async def handle_put_object(
             redis_client=redis_client,
         )
 
-        # Record metrics
-        metrics = get_metrics_collector()
-        if metrics:
-            metrics.record_s3_operation(
-                operation="put_object",
-                bucket_name=bucket_name,
-                object_key=object_key,
-                main_account=main_account_id,
-                subaccount_id=request.state.account.id,
-                success=True,
-            )
-            metrics.record_data_transfer(
-                operation="put_object",
-                bytes_transferred=file_size,
-                bucket_name=bucket_name,
-                object_key=object_key,
-                main_account=main_account_id,
-                subaccount_id=request.state.account.id,
-            )
+        get_metrics_collector().record_s3_operation(
+            operation="put_object",
+            bucket_name=bucket_name,
+            main_account=main_account_id,
+            success=True,
+        )
+        get_metrics_collector().record_data_transfer(
+            operation="put_object",
+            bytes_transferred=file_size,
+            bucket_name=bucket_name,
+            main_account=main_account_id,
+        )
 
         # New or overwrite base object: expose append-version so clients can start append flow without HEAD
         return Response(
@@ -260,14 +253,12 @@ async def handle_put_object(
 
     except Exception as e:
         logger.exception(f"Error uploading object: {e}")
-        metrics = get_metrics_collector()
-        if metrics:
-            metrics.record_error(
-                error_type="internal_error",
-                operation="put_object",
-                bucket_name=bucket_name,
-                main_account=getattr(request.state, "account", None) and request.state.account.main_account,
-            )
+        get_metrics_collector().record_error(
+            error_type="internal_error",
+            operation="put_object",
+            bucket_name=bucket_name,
+            main_account=getattr(request.state, "account", None) and request.state.account.main_account,
+        )
         return errors.s3_error_response(
             "InternalError",
             "We encountered an internal error. Please try again.",

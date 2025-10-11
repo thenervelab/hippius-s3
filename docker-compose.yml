@@ -4,11 +4,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.base
-    profiles:
-      - build-base
 
   api:
-    build: .
+    build:
+      context: .
+      additional_contexts:
+        hippius-s3-base: service:base
     ports:
       - "8000:8000"
     env_file:
@@ -31,7 +32,6 @@ services:
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
-      - UVICORN_LOG_LEVEL=debug
       - DEBUG=true
       - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
@@ -40,6 +40,18 @@ services:
       - HIPPIUS_DLQ_ARCHIVE_DIR=/tmp/hippius_dlq_archive
       - LOKI_URL=http://loki:3100/loki/api/v1/push
       - LOKI_ENABLED=false
+      - ASGI_SERVER=uvicorn
+      - ASGI_WORKERS=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
+      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+      - OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://tempo:4317
+      - OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://tempo:4317
+      - OTEL_SERVICE_NAME=hippius-s3-api
+      - OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED=true
+      - OTEL_PYTHON_LOG_CORRELATION=true
+      - OTEL_TRACES_EXPORTER=otlp
+      - OTEL_METRICS_EXPORTER=otlp
+      - OTEL_LOGS_EXPORTER=none
     networks:
       - hippius_net
 
@@ -136,7 +148,8 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["watchfiles", "--filter", "python", "python workers/run_uploader_in_loop.py"]
+      additional_contexts:
+        hippius-s3-base: service:base
     env_file:
       - .env
     depends_on:
@@ -153,6 +166,11 @@ services:
       - HIPPIUS_DLQ_ARCHIVE_DIR=/tmp/hippius_dlq_archive
       - LOKI_URL=http://loki:3100/loki/api/v1/push
       - LOKI_ENABLED=false
+      - WORKER_SCRIPT=workers/run_uploader_in_loop.py
+      - ENABLE_WATCHFILES=true
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
+      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+      - OTEL_SERVICE_NAME=hippius-s3-uploader
     volumes:
       - .:/app
       - /var/lib/hippius/dlq:/tmp/hippius_dlq
@@ -164,7 +182,8 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["watchfiles", "--filter", "python", "python workers/run_substrate_in_loop.py"]
+      additional_contexts:
+        hippius-s3-base: service:base
     env_file:
       - .env
     depends_on:
@@ -180,6 +199,11 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - LOKI_URL=http://loki:3100/loki/api/v1/push
       - LOKI_ENABLED=false
+      - WORKER_SCRIPT=workers/run_substrate_in_loop.py
+      - ENABLE_WATCHFILES=true
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
+      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+      - OTEL_SERVICE_NAME=hippius-s3-substrate
     volumes:
       - .:/app
     networks:
@@ -189,7 +213,8 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["watchfiles", "--filter", "python", "python workers/run_unpinner_in_loop.py"]
+      additional_contexts:
+        hippius-s3-base: service:base
     env_file:
       - .env
     depends_on:
@@ -206,6 +231,11 @@ services:
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - LOKI_URL=http://loki:3100/loki/api/v1/push
       - LOKI_ENABLED=false
+      - WORKER_SCRIPT=workers/run_unpinner_in_loop.py
+      - ENABLE_WATCHFILES=true
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
+      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+      - OTEL_SERVICE_NAME=hippius-s3-unpinner
     networks:
       - hippius_net
 
@@ -213,7 +243,8 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["watchfiles", "--filter", "python", "python workers/run_downloader_in_loop.py"]
+      additional_contexts:
+        hippius-s3-base: service:base
     env_file:
       - .env
     depends_on:
@@ -229,6 +260,11 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - LOKI_URL=http://loki:3100/loki/api/v1/push
       - LOKI_ENABLED=false
+      - WORKER_SCRIPT=workers/run_downloader_in_loop.py
+      - ENABLE_WATCHFILES=true
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
+      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+      - OTEL_SERVICE_NAME=hippius-s3-downloader
     networks:
       - hippius_net
 
@@ -236,7 +272,8 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["watchfiles", "--filter", "python", "python workers/chain_pin_checker.py"]
+      additional_contexts:
+        hippius-s3-base: service:base
     env_file:
       - .env
     depends_on:
@@ -252,6 +289,11 @@ services:
       - REDIS_CHAIN_URL=redis://redis-chain:6379/0
       - LOKI_URL=http://loki:3100/loki/api/v1/push
       - LOKI_ENABLED=false
+      - WORKER_SCRIPT=workers/chain_pin_checker.py
+      - ENABLE_WATCHFILES=true
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
+      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+      - OTEL_SERVICE_NAME=hippius-s3-chain-pin-checker
     networks:
       - hippius_net
 
@@ -259,7 +301,8 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["watchfiles", "--filter", "python", "python workers/chain_profile_cacher.py"]
+      additional_contexts:
+        hippius-s3-base: service:base
     env_file:
       - .env
     depends_on:
@@ -275,6 +318,11 @@ services:
       - REDIS_CHAIN_URL=redis://redis-chain:6379/0
       - LOKI_URL=http://loki:3100/loki/api/v1/push
       - LOKI_ENABLED=false
+      - WORKER_SCRIPT=workers/chain_profile_cacher.py
+      - ENABLE_WATCHFILES=true
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
+      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+      - OTEL_SERVICE_NAME=hippius-s3-chain-profile-cacher
     networks:
       - hippius_net
 
@@ -287,5 +335,4 @@ volumes:
 
 networks:
   hippius_net:
-    external: true
     name: hippius_net

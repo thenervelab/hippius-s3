@@ -212,28 +212,22 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
                 main_account_id,
             )
 
-            # Record metrics
-            metrics = get_metrics_collector()
-            if metrics:
-                metrics.record_s3_operation(
-                    operation="put_bucket",
-                    bucket_name=bucket_name,
-                    main_account=main_account_id,
-                    subaccount_id=request.state.account.id,
-                    success=True,
-                )
+            get_metrics_collector().record_s3_operation(
+                operation="put_bucket",
+                bucket_name=bucket_name,
+                main_account=main_account_id,
+                success=True,
+            )
 
             return Response(status_code=200)
 
         except asyncpg.UniqueViolationError:
-            metrics = get_metrics_collector()
-            if metrics:
-                metrics.record_error(
-                    error_type="BucketAlreadyExists",
-                    operation="put_bucket",
-                    bucket_name=bucket_name,
-                    main_account=request.state.account.main_account,
-                )
+            get_metrics_collector().record_error(
+                error_type="BucketAlreadyExists",
+                operation="put_bucket",
+                bucket_name=bucket_name,
+                main_account=request.state.account.main_account,
+            )
             return errors.s3_error_response(
                 "BucketAlreadyExists",
                 f"The requested bucket {bucket_name} already exists",
@@ -242,14 +236,12 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
             )
         except Exception:
             logger.exception("Error creating bucket via S3 protocol")
-            metrics = get_metrics_collector()
-            if metrics:
-                metrics.record_error(
-                    error_type="internal_error",
-                    operation="put_bucket",
-                    bucket_name=bucket_name,
-                    main_account=request.state.account.main_account,
-                )
+            get_metrics_collector().record_error(
+                error_type="internal_error",
+                operation="put_bucket",
+                bucket_name=bucket_name,
+                main_account=request.state.account.main_account,
+            )
             return errors.s3_error_response(
                 "InternalError",
                 "We encountered an internal error. Please try again.",

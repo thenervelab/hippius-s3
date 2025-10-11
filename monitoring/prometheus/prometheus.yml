@@ -48,10 +48,3 @@ scrape_configs:
     static_configs:
       - targets: ['postgres-exporter:9187']
     scrape_interval: 30s
-
-  # Background processes (workers/unpinner) if they expose metrics
-  - job_name: 'hippius-background-processes'
-    static_configs:
-      - targets: ['workers:8001', 'unpinner:8002']
-    metrics_path: '/metrics'
-    scrape_interval: 10s

@@ -14,9 +14,17 @@ logger = logging.getLogger(__name__)
 class BackgroundMetricsCollector:
     """Background task for collecting custom metrics from Redis and other sources."""
 
-    def __init__(self, metrics_collector: MetricsCollector, redis_client: async_redis.Redis):
+    def __init__(
+        self,
+        metrics_collector: MetricsCollector,
+        redis_client: async_redis.Redis,
+        redis_accounts_client: async_redis.Redis,
+        redis_chain_client: Optional[async_redis.Redis] = None,
+    ):
         self.metrics_collector = metrics_collector
         self.redis_client = redis_client
+        self.redis_accounts_client = redis_accounts_client
+        self.redis_chain_client = redis_chain_client
         self.running = False
         self._task: Optional[asyncio.Task] = None
 
@@ -51,42 +59,22 @@ class BackgroundMetricsCollector:
                 await asyncio.sleep(5)  # Wait 5 seconds on error
 
     async def _collect_redis_metrics(self) -> None:
-        """Collect metrics from Redis."""
         try:
-            # Update queue metrics
-            await self.metrics_collector.update_queue_metrics()
+            self.metrics_collector._upload_len = int(await self.redis_client.llen("upload_requests") or 0)
+            self.metrics_collector._unpin_len = int(await self.redis_client.llen("unpin_requests") or 0)
+            self.metrics_collector._substrate_len = int(await self.redis_client.llen("substrate_requests") or 0)
 
-            # Update multipart chunks metric
-            await self.metrics_collector.update_multipart_chunks_metric()
+            self.metrics_collector._main_db_size = int(await self.redis_client.dbsize() or 0)
+            self.metrics_collector._accounts_db_size = int(await self.redis_accounts_client.dbsize() or 0)
 
-            # Collect Redis memory info
+            if self.redis_chain_client:
+                self.metrics_collector._chain_db_size = int(await self.redis_chain_client.dbsize() or 0)
+
             info = await self.redis_client.info("memory")
-            used_memory = info.get("used_memory", 0)
-            max_memory = info.get("maxmemory", 0)
-
-            # Record Redis memory metrics
-            self.metrics_collector.meter.create_gauge(
-                name="redis_memory_used_bytes", description="Redis memory usage in bytes"
-            ).set(used_memory, attributes={"type": "used_memory"})
-
-            if max_memory > 0:
-                self.metrics_collector.meter.create_gauge(
-                    name="redis_memory_max_bytes", description="Redis max memory in bytes"
-                ).set(max_memory, attributes={"type": "max_memory"})
+            self.metrics_collector._used_mem = info.get("used_memory", 0)
+            self.metrics_collector._max_mem = info.get("maxmemory", 0)
 
             logger.debug("Redis metrics collected successfully")
 
         except Exception as e:
             logger.error(f"Failed to collect Redis metrics: {e}")
-
-    async def collect_multipart_chunks_count(self) -> int:
-        """Collect count of multipart chunks in Redis."""
-        try:
-            count = 0
-            pattern = "multipart:*:part:*"
-            async for _key in self.redis_client.scan_iter(match=pattern):
-                count += 1
-            return count
-        except Exception as e:
-            logger.error(f"Failed to count multipart chunks: {e}")
-            return 0

@@ -44,15 +44,27 @@ async def get_all_unique_users(
 
 
 async def fetch_profile_content(http_client: httpx.AsyncClient, cid: str, gateway_url: str) -> dict:
-    """Fetch user profile parquet content from IPFS gateway with timeout."""
     url = f"{gateway_url}/ipfs/{cid}"
     response = await http_client.get(url)
 
     if response.status_code == 200:
-        df = pd.read_parquet(io.BytesIO(response.content))
-        profile_data = df.to_dict(orient="records")
-        logger.debug(f"Successfully fetched profile content for CID {cid}")
-        return profile_data
+        try:
+            df = pd.read_parquet(io.BytesIO(response.content))
+            profile_data = df.to_dict(orient="records")
+            logger.debug(f"Successfully fetched profile content for CID {cid}")
+            return profile_data
+        except Exception as e:
+            if "ArrowInvalid" in str(type(e).__name__) or "Parquet magic bytes not found" in str(e):
+                logger.info(f"Parquet read failed for {cid}, attempting JSON fallback")
+                try:
+                    profile_data = json.loads(response.content)
+                    logger.debug(f"Successfully parsed profile as JSON for CID {cid}")
+                    return profile_data
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse {cid} as both Parquet and JSON")
+                    return {}
+            logger.error(f"Unexpected error reading profile {cid}: {e}")
+            return {}
     logger.warning(f"Failed to fetch profile {cid}: HTTP {response.status_code}")
     return {}
 

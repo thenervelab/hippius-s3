@@ -18,13 +18,17 @@ async def audit_log_middleware(
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
     """Log all S3 operations for security and compliance."""
+    path = str(request.url.path)
+
+    if path == "/metrics":
+        return await call_next(request)
+
     start_time = time.time()
 
     # Extract key information before processing
     client_ip = request.client.host if request.client else "unknown"
     user_agent = request.headers.get("user-agent", "unknown")
     method = request.method
-    path = str(request.url.path)
     query_params = dict(request.query_params)
 
     # Extract account info if available (after HMAC middleware)
