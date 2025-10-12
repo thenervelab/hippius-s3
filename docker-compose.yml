@@ -1,6 +1,8 @@
 services:
   base:
     image: hippius-s3-base:latest
+    profiles:
+      - build-base
     build:
       context: .
       dockerfile: Dockerfile.base
