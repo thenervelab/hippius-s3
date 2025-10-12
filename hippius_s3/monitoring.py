@@ -145,10 +145,11 @@ class MetricsCollector:
         response: Response,
         duration: float,
         main_account: Optional[str] = None,
+        handler: Optional[str] = None,
     ) -> None:
         attributes = {
             "method": request.method,
-            "handler": request.url.path,
+            "handler": handler or request.url.path,
             "status_code": str(response.status_code),
         }
 
@@ -158,13 +159,13 @@ class MetricsCollector:
         self.http_requests_total.add(1, attributes=attributes)
         self.http_request_duration.record(duration, attributes=attributes)
 
-        if hasattr(request, "content_length") and request.content_length:
-            self.http_request_bytes.add(request.content_length, attributes={**attributes, "direction": "in"})
+        request_content_length = request.headers.get("content-length")
+        if request_content_length:
+            self.http_request_bytes.add(int(request_content_length), attributes={**attributes, "direction": "in"})
 
-        if hasattr(response, "content_length") and response.headers.get("content-length"):
-            self.http_response_bytes.add(
-                int(response.headers["content-length"]), attributes={**attributes, "direction": "out"}
-            )
+        response_content_length = response.headers.get("content-length")
+        if response_content_length:
+            self.http_response_bytes.add(int(response_content_length), attributes={**attributes, "direction": "out"})
 
     def record_s3_operation(
         self,

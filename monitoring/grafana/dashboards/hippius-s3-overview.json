@@ -110,7 +110,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(http_requests_total{job=\"hippius-s3-api\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", handler=~\"$endpoint\", handler!=\"/metrics\"}[5m])) by (method)",
+          "expr": "sum(rate(http_requests_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", handler=~\"$endpoint\", handler!=\"metrics_endpoint\"}[5m])) by (method)",
           "interval": "",
           "legendFormat": "{{method}} Requests/sec",
           "refId": "A"
@@ -155,7 +155,7 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 12,
+        "w": 4,
         "x": 12,
         "y": 0
       },
@@ -186,13 +186,165 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "(redis_memory_used_bytes / (redis_memory_max_bytes or redis_memory_used_bytes * 2)) * 100",
+          "expr": "(redis_memory_used_bytes{job=\"redis-main\"} / (redis_memory_max_bytes{job=\"redis-main\"} or redis_memory_used_bytes{job=\"redis-main\"} * 2)) * 100",
           "interval": "",
-          "legendFormat": "Main Redis Cache Usage",
+          "legendFormat": "Chunk Cache",
           "refId": "A"
         }
       ],
-      "title": "Main Redis Cache Usage",
+      "title": "Chunk Cache Usage",
+      "type": "gauge"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 70
+              },
+              {
+                "color": "red",
+                "value": 85
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 16,
+        "y": 0
+      },
+      "id": 18,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "minVizHeight": 75,
+        "minVizWidth": 75,
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true,
+        "sizing": "auto",
+        "textMode": "value_and_name"
+      },
+      "pluginVersion": "12.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "(redis_memory_used_bytes{job=\"redis-accounts\"} / (redis_memory_max_bytes{job=\"redis-accounts\"} or redis_memory_used_bytes{job=\"redis-accounts\"} * 2)) * 100",
+          "interval": "",
+          "legendFormat": "Accounts Cache",
+          "refId": "A"
+        }
+      ],
+      "title": "Accounts Cache Usage",
+      "type": "gauge"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 70
+              },
+              {
+                "color": "red",
+                "value": 85
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      },
+      "id": 19,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "minVizHeight": 75,
+        "minVizWidth": 75,
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true,
+        "sizing": "auto",
+        "textMode": "value_and_name"
+      },
+      "pluginVersion": "12.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "(redis_memory_used_bytes{job=\"redis-chain\"} / (redis_memory_max_bytes{job=\"redis-chain\"} or redis_memory_used_bytes{job=\"redis-chain\"} * 2)) * 100",
+          "interval": "",
+          "legendFormat": "Chain Cache",
+          "refId": "A"
+        }
+      ],
+      "title": "Chain Cache Usage",
       "type": "gauge"
     },
     {
@@ -373,7 +525,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job=\"hippius-s3-api\", handler!=\"/metrics\"}[5m]))",
+          "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job=\"otel-collector\", handler!=\"metrics_endpoint\"}[5m]))",
           "interval": "",
           "legendFormat": "95th percentile - {{method}} {{handler}}",
           "refId": "A"
@@ -383,7 +535,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "histogram_quantile(0.50, rate(http_request_duration_seconds_bucket{job=\"hippius-s3-api\", handler!=\"/metrics\"}[5m]))",
+          "expr": "histogram_quantile(0.50, rate(http_request_duration_seconds_bucket{job=\"otel-collector\", handler!=\"metrics_endpoint\"}[5m]))",
           "interval": "",
           "legendFormat": "50th percentile - {{method}} {{handler}}",
           "refId": "B"
@@ -567,7 +719,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "topk(10, sum by (main_account) (increase(s3_operations_total{job=\"hippius-s3-api\"}[1h])))",
+          "expr": "topk(10, sum by (main_account) (increase(s3_operations_total{job=\"otel-collector\"}[1h])))",
           "format": "table",
           "instant": true,
           "interval": "",
@@ -656,7 +808,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "(sum(rate(cache_hits_total{job=\"hippius-s3-api\"}[5m])) or vector(0)) / ((sum(rate(cache_hits_total{job=\"hippius-s3-api\"}[5m])) or vector(0)) + (sum(rate(cache_misses_total{job=\"hippius-s3-api\"}[5m])) or vector(0)) + 0.0001) * 100",
+          "expr": "(sum(rate(cache_hits_total{job=\"otel-collector\"}[5m])) or vector(0)) / ((sum(rate(cache_hits_total{job=\"otel-collector\"}[5m])) or vector(0)) + (sum(rate(cache_misses_total{job=\"otel-collector\"}[5m])) or vector(0)) + 0.0001) * 100",
           "interval": "",
           "legendFormat": "Cache Hit Ratio",
           "refId": "A"
@@ -786,7 +938,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(cache_hits_total{job=\"hippius-s3-api\", main_account=~\"$main_account\"}[5m]))",
+          "expr": "sum(rate(cache_hits_total{job=\"otel-collector\", main_account=~\"$main_account\"}[5m]))",
           "interval": "",
           "legendFormat": "Cache Hits",
           "refId": "A"
@@ -796,7 +948,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(cache_misses_total{job=\"hippius-s3-api\", main_account=~\"$main_account\"}[5m]))",
+          "expr": "sum(rate(cache_misses_total{job=\"otel-collector\", main_account=~\"$main_account\"}[5m]))",
           "interval": "",
           "legendFormat": "Cache Misses",
           "refId": "B"
@@ -895,7 +1047,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(http_request_bytes_bytes_total{job=\"hippius-s3-api\", direction=\"in\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", handler=~\"$endpoint\", handler!=\"/metrics\"}[5m]))",
+          "expr": "sum(rate(http_request_bytes_total{job=\"otel-collector\", direction=\"in\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", handler=~\"$endpoint\", handler!=\"metrics_endpoint\"}[5m]))",
           "interval": "",
           "legendFormat": "Bytes In/sec",
           "refId": "A"
@@ -905,7 +1057,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(http_response_bytes_bytes_total{job=\"hippius-s3-api\", direction=\"out\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", handler=~\"$endpoint\", handler!=\"/metrics\"}[5m]))",
+          "expr": "sum(rate(http_response_bytes_total{job=\"otel-collector\", direction=\"out\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", handler=~\"$endpoint\", handler!=\"metrics_endpoint\"}[5m]))",
           "interval": "",
           "legendFormat": "Bytes Out/sec",
           "refId": "B"
@@ -1004,112 +1156,13 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum by (error_type) (rate(s3_errors_total{job=\"hippius-s3-api\", main_account=~\"$main_account\"}[5m]))",
+          "expr": "sum by (error_type) (rate(s3_errors_total{job=\"otel-collector\", main_account=~\"$main_account\"}[5m]))",
           "interval": "",
           "legendFormat": "{{error_type}}",
           "refId": "A"
         }
       ],
       "title": "Error Rate by Type",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "bars",
-            "fillOpacity": 100,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "vis": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 35
-      },
-      "id": 15,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "single",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "12.2.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "expr": "topk(10, sum by (bucket_name) (increase(s3_operations_total{job=\"hippius-s3-api\", main_account=~\"$main_account\"}[1h])))",
-          "interval": "",
-          "legendFormat": "{{bucket_name}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Top Buckets by Operations (Last Hour)",
       "type": "timeseries"
     },
     {
@@ -1175,7 +1228,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum by (operation) (increase(s3_operations_total{job=\"hippius-s3-api\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", success=\"true\"}[1h]))",
+          "expr": "sum by (operation) (increase(s3_operations_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", success=\"true\"}[1h]))",
           "interval": "",
           "legendFormat": "{{operation}}",
           "refId": "A"
@@ -1274,7 +1327,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(s3_bytes_uploaded_bytes_total{job=\"hippius-s3-api\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\"}[5m])) by (operation)",
+          "expr": "sum(rate(s3_bytes_uploaded_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\"}[5m])) by (operation)",
           "interval": "",
           "legendFormat": "Upload - {{operation}}",
           "refId": "A"
@@ -1284,7 +1337,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(s3_bytes_downloaded_bytes_total{job=\"hippius-s3-api\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\"}[5m])) by (operation)",
+          "expr": "sum(rate(s3_bytes_downloaded_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\"}[5m])) by (operation)",
           "interval": "",
           "legendFormat": "Download - {{operation}}",
           "refId": "B"
@@ -1414,7 +1467,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(s3_operations_total{job=\"hippius-s3-api\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", success=\"true\"}[5m]))",
+          "expr": "sum(rate(s3_operations_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", success=\"true\"}[5m]))",
           "interval": "",
           "legendFormat": "Success",
           "refId": "A"
@@ -1424,7 +1477,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(s3_operations_total{job=\"hippius-s3-api\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", success=\"false\"}[5m]))",
+          "expr": "sum(rate(s3_operations_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", success=\"false\"}[5m]))",
           "interval": "",
           "legendFormat": "Failed",
           "refId": "B"
@@ -1432,89 +1485,6 @@
       ],
       "title": "S3 Success vs Failure Rate",
       "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "vis": false,
-              "viz": false
-            },
-            "scaleDistribution": {
-              "type": "linear"
-            }
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 12,
-        "w": 24,
-        "x": 0,
-        "y": 51
-      },
-      "id": 16,
-      "options": {
-        "calculate": false,
-        "calculation": {},
-        "cellGap": 2,
-        "cellValues": {},
-        "color": {
-          "exponent": 0.5,
-          "fill": "dark-orange",
-          "mode": "scheme",
-          "reverse": false,
-          "scale": "exponential",
-          "scheme": "Spectral",
-          "steps": 128
-        },
-        "exemplars": {
-          "color": "rgba(255,0,255,0.7)"
-        },
-        "filterValues": {
-          "le": 1e-9
-        },
-        "legend": {
-          "show": true,
-          "showLegend": true
-        },
-        "rowsFrame": {
-          "layout": "auto"
-        },
-        "tooltip": {
-          "mode": "single",
-          "showColorScale": false,
-          "yHistogram": false
-        },
-        "yAxis": {
-          "axisPlacement": "left",
-          "reverse": false,
-          "unit": "bytes"
-        }
-      },
-      "pluginVersion": "12.2.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "expr": "sum(rate(object_size_bytes_bucket{job=\"hippius-s3-api\", main_account=~\"$main_account\"}[5m])) by (le)",
-          "format": "heatmap",
-          "interval": "",
-          "legendFormat": "{{le}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Object Size Distribution",
-      "type": "heatmap"
     }
   ],
   "preload": false,
@@ -1539,14 +1509,14 @@
           "type": "prometheus",
           "uid": "PBFA97CFB590B2093"
         },
-        "definition": "label_values(http_requests_total{job=\"hippius-s3-api\"}, main_account)",
+        "definition": "label_values(http_requests_total{job=\"otel-collector\"}, main_account)",
         "includeAll": true,
         "label": "Main Account",
         "multi": true,
         "name": "main_account",
         "options": [],
         "query": {
-          "query": "label_values(http_requests_total{job=\"hippius-s3-api\"}, main_account)",
+          "query": "label_values(http_requests_total{job=\"otel-collector\"}, main_account)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 1,
@@ -1567,14 +1537,14 @@
           "type": "prometheus",
           "uid": "PBFA97CFB590B2093"
         },
-        "definition": "label_values(http_requests_total{job=\"hippius-s3-api\", main_account=~\"$main_account\"}, subaccount_id)",
+        "definition": "label_values(http_requests_total{job=\"otel-collector\", main_account=~\"$main_account\"}, subaccount_id)",
         "includeAll": true,
         "label": "Subaccount",
         "multi": true,
         "name": "subaccount_id",
         "options": [],
         "query": {
-          "query": "label_values(http_requests_total{job=\"hippius-s3-api\", main_account=~\"$main_account\"}, subaccount_id)",
+          "query": "label_values(http_requests_total{job=\"otel-collector\", main_account=~\"$main_account\"}, subaccount_id)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 1,
@@ -1595,14 +1565,14 @@
           "type": "prometheus",
           "uid": "PBFA97CFB590B2093"
         },
-        "definition": "label_values(http_requests_total{job=\"hippius-s3-api\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\"}, handler)",
+        "definition": "label_values(http_requests_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\"}, handler)",
         "includeAll": true,
         "label": "Endpoint",
         "multi": true,
         "name": "endpoint",
         "options": [],
         "query": {
-          "query": "label_values(http_requests_total{job=\"hippius-s3-api\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\"}, handler)",
+          "query": "label_values(http_requests_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\"}, handler)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 1,

@@ -35,9 +35,11 @@ exporters:
     metric_expiration: 180m
     enable_open_metrics: true
 
-  # Debug exporter for debugging
-  debug:
-    verbosity: normal
+  # Forward traces to Tempo
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
 
 extensions:
   health_check:
@@ -54,3 +56,10 @@ service:
       receivers: [otlp]
       processors: [memory_limiter, resource, batch]
       exporters: [prometheus]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlp/tempo]
+  telemetry:
+    logs:
+      level: info

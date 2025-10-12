@@ -8,10 +8,11 @@ ASGI_WORKERS=${ASGI_WORKERS:-1}
 ASGI_WORKER_CLASS=${ASGI_WORKER_CLASS:-uvloop}
 
 export OTEL_EXPORTER_OTLP_PROTOCOL="grpc"
-export OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://tempo:4317}
+export OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
 export OTEL_SERVICE_NAME=${OTEL_SERVICE_NAME:-hippius-s3-api}
-export OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED=true
-export OTEL_PYTHON_LOG_CORRELATION=true
+export OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED=false
+export OTEL_PYTHON_LOG_CORRELATION=false
+export OTEL_LOGS_EXPORTER=none
 
 echo "Running database migrations..."
 python -m hippius_s3.scripts.migrate
@@ -20,7 +21,7 @@ if [[ $ASGI_SERVER == "uvicorn" ]]; then
     echo "Starting hippius-s3-api via uvicorn with OpenTelemetry instrumentation"
 
     opentelemetry-instrument \
-        --logs_exporter otlp \
+        --logs_exporter none \
         --traces_exporter otlp \
         --metrics_exporter otlp \
         --service_name hippius-s3-api \
@@ -41,7 +42,7 @@ if [[ $ASGI_SERVER == "gunicorn" ]]; then
     echo "Starting hippius-s3-api via gunicorn with OpenTelemetry instrumentation"
 
     opentelemetry-instrument \
-        --logs_exporter otlp \
+        --logs_exporter none \
         --traces_exporter otlp \
         --metrics_exporter otlp \
         --service_name hippius-s3-api \

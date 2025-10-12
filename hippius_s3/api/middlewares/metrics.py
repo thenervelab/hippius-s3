@@ -1,3 +1,4 @@
+import re
 import time
 from typing import Awaitable
 from typing import Callable
@@ -9,7 +10,10 @@ from hippius_s3.monitoring import enrich_span_with_account_info
 from hippius_s3.monitoring import get_metrics_collector
 
 
-async def metrics_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+async def metrics_middleware(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
     start_time = time.time()
     response = await call_next(request)
     duration = time.time() - start_time
@@ -29,7 +33,10 @@ async def metrics_middleware(request: Request, call_next: Callable[[Request], Aw
         object_key = request.state.object_key
 
     enrich_span_with_account_info(
-        main_account=main_account, subaccount_id=subaccount_id, bucket_name=bucket_name, object_key=object_key
+        main_account=main_account,
+        subaccount_id=subaccount_id,
+        bucket_name=bucket_name,
+        object_key=object_key,
     )
 
     endpoint_name = "unknown"
@@ -41,19 +48,31 @@ async def metrics_middleware(request: Request, call_next: Callable[[Request], Aw
     except Exception:
         pass
 
-    metrics_collector = get_metrics_collector()
-    attributes = {
-        "method": request.method,
-        "handler": endpoint_name,
-        "status_code": str(response.status_code),
-    }
+    get_metrics_collector().record_http_request(
+        request=request,
+        response=response,
+        duration=duration,
+        main_account=main_account,
+        handler=endpoint_name,
+    )
 
-    if main_account:
-        attributes["main_account"] = main_account
+    if response.status_code >= 400:
+        error_type = f"http_{response.status_code}"
 
-    if hasattr(metrics_collector, "http_requests_total") and metrics_collector.http_requests_total:
-        metrics_collector.http_requests_total.add(1, attributes=attributes)
-    if hasattr(metrics_collector, "http_request_duration") and metrics_collector.http_request_duration:
-        metrics_collector.http_request_duration.record(duration, attributes=attributes)
+        if hasattr(response, "body"):
+            try:
+                body = response.body.decode("utf-8") if isinstance(response.body, bytes) else str(response.body)
+                code_match = re.search(r"<Code>([^<]+)</Code>", body)
+                if code_match:
+                    error_type = code_match.group(1)
+            except Exception:
+                pass
+
+        get_metrics_collector().record_error(
+            error_type=error_type,
+            operation=endpoint_name,
+            bucket_name=bucket_name,
+            main_account=main_account,
+        )
 
     return response

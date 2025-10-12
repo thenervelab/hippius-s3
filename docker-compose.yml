@@ -42,16 +42,6 @@ services:
       - LOKI_ENABLED=false
       - ASGI_SERVER=uvicorn
       - ASGI_WORKERS=1
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
-      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
-      - OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://tempo:4317
-      - OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://tempo:4317
-      - OTEL_SERVICE_NAME=hippius-s3-api
-      - OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED=true
-      - OTEL_PYTHON_LOG_CORRELATION=true
-      - OTEL_TRACES_EXPORTER=otlp
-      - OTEL_METRICS_EXPORTER=otlp
-      - OTEL_LOGS_EXPORTER=none
     networks:
       - hippius_net
 
@@ -168,9 +158,6 @@ services:
       - LOKI_ENABLED=false
       - WORKER_SCRIPT=workers/run_uploader_in_loop.py
       - ENABLE_WATCHFILES=true
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
-      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
-      - OTEL_SERVICE_NAME=hippius-s3-uploader
     volumes:
       - .:/app
       - /var/lib/hippius/dlq:/tmp/hippius_dlq
@@ -201,9 +188,6 @@ services:
       - LOKI_ENABLED=false
       - WORKER_SCRIPT=workers/run_substrate_in_loop.py
       - ENABLE_WATCHFILES=true
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
-      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
-      - OTEL_SERVICE_NAME=hippius-s3-substrate
     volumes:
       - .:/app
     networks:
@@ -233,9 +217,6 @@ services:
       - LOKI_ENABLED=false
       - WORKER_SCRIPT=workers/run_unpinner_in_loop.py
       - ENABLE_WATCHFILES=true
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
-      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
-      - OTEL_SERVICE_NAME=hippius-s3-unpinner
     networks:
       - hippius_net
 
@@ -262,9 +243,6 @@ services:
       - LOKI_ENABLED=false
       - WORKER_SCRIPT=workers/run_downloader_in_loop.py
       - ENABLE_WATCHFILES=true
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
-      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
-      - OTEL_SERVICE_NAME=hippius-s3-downloader
     networks:
       - hippius_net
 
@@ -291,9 +269,6 @@ services:
       - LOKI_ENABLED=false
       - WORKER_SCRIPT=workers/chain_pin_checker.py
       - ENABLE_WATCHFILES=true
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
-      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
-      - OTEL_SERVICE_NAME=hippius-s3-chain-pin-checker
     networks:
       - hippius_net
 
@@ -320,9 +295,6 @@ services:
       - LOKI_ENABLED=false
       - WORKER_SCRIPT=workers/chain_profile_cacher.py
       - ENABLE_WATCHFILES=true
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
-      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
-      - OTEL_SERVICE_NAME=hippius-s3-chain-profile-cacher
     networks:
       - hippius_net
 

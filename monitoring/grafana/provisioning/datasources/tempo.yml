@@ -8,6 +8,8 @@ datasources:
     url: http://tempo:3200
     jsonData:
       httpMethod: GET
+      tracesToPrometheus:
+        datasourceUid: 'prometheus'
       tracesToLogs:
         datasourceUid: 'loki'
         tags: ['job', 'instance', 'pod', 'namespace']
