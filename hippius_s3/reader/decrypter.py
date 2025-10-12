@@ -19,8 +19,8 @@ async def decrypt_chunk_if_needed(
 ) -> bytes:
     if not should_decrypt:
         return cbytes
-    # v2: decrypt using per-bucket key from SDK key storage. No seed fallback.
-    if int(storage_version) == 2:
+    # v2+ (modern): decrypt using per-bucket key from SDK key storage. No seed fallback.
+    if int(storage_version) >= 2:
         from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
 
         if not address or not bucket_name:

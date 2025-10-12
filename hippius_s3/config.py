@@ -146,6 +146,10 @@ class Config:
     # Legacy SDK compatibility (temporary; set LEGACY_SDK_COMPAT=true to enable)
     enable_legacy_sdk_compat: bool = env("LEGACY_SDK_COMPAT:true", convert=lambda x: x.lower() == "true")
 
+    # Storage version to assign for newly created/overwritten objects
+    # Defaults to 3 (latest layout)
+    target_storage_version: int = env("HIPPIUS_TARGET_STORAGE_VERSION:3", convert=int)
+
 
 def get_config() -> Config:
     """Get application configuration."""
