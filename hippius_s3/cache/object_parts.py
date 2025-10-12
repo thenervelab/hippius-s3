@@ -6,6 +6,7 @@ from typing import Optional
 from typing import Protocol
 
 from hippius_s3.config import get_config
+from hippius_s3.monitoring import get_metrics_collector
 
 
 DEFAULT_OBJ_PART_TTL_SECONDS = get_config().cache_ttl_seconds
@@ -70,19 +71,24 @@ class RedisObjectPartsCache:
         try:
             meta_raw = await self.redis.get(self.build_meta_key(object_id, part_number))
             if not meta_raw:
+                get_metrics_collector().record_cache_operation(hit=False, operation="get")
                 return None
             meta = _json.loads(meta_raw)
             num_chunks = int(meta.get("num_chunks", 0))
             if num_chunks <= 0:
+                get_metrics_collector().record_cache_operation(hit=False, operation="get")
                 return None
             chunks: list[bytes] = []
             for i in range(num_chunks):
                 c = await self.redis.get(self.build_chunk_key(object_id, part_number, i))
                 if not isinstance(c, bytes):
+                    get_metrics_collector().record_cache_operation(hit=False, operation="get")
                     return None
                 chunks.append(c)
+            get_metrics_collector().record_cache_operation(hit=True, operation="get")
             return b"".join(chunks)
         except Exception:
+            get_metrics_collector().record_cache_operation(hit=False, operation="get")
             return None
 
     async def set(
@@ -142,7 +148,12 @@ class RedisObjectPartsCache:
     # Chunked API
     async def get_chunk(self, object_id: str, part_number: int, chunk_index: int) -> Optional[bytes]:
         result = await self.redis.get(self.build_chunk_key(object_id, part_number, chunk_index))
-        return result if isinstance(result, bytes) else None
+        is_hit = isinstance(result, bytes)
+        get_metrics_collector().record_cache_operation(
+            hit=is_hit,
+            operation="get_chunk",
+        )
+        return result if is_hit else None
 
     async def set_chunk(
         self,
@@ -156,7 +167,12 @@ class RedisObjectPartsCache:
         await self.redis.setex(self.build_chunk_key(object_id, part_number, chunk_index), ttl, data)
 
     async def chunk_exists(self, object_id: str, part_number: int, chunk_index: int) -> bool:
-        return bool(await self.redis.exists(self.build_chunk_key(object_id, part_number, chunk_index)))
+        exists = bool(await self.redis.exists(self.build_chunk_key(object_id, part_number, chunk_index)))
+        get_metrics_collector().record_cache_operation(
+            hit=exists,
+            operation="chunk_exists",
+        )
+        return exists
 
     async def set_meta(
         self,

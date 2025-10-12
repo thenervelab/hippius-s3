@@ -30,6 +30,8 @@ class Config:
 
     # Logging
     log_level: str = env("LOG_LEVEL")
+    loki_url: str = env("LOKI_URL:", convert=str)
+    loki_enabled: bool = env("LOKI_ENABLED:false", convert=lambda x: x.lower() == "true")
 
     # Server Configuration
     host: str = env("HOST")

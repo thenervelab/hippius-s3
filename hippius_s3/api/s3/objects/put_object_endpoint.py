@@ -17,6 +17,7 @@ from hippius_s3.api.s3.extensions.append import handle_append
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.metadata.meta_writer import write_cache_meta
+from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
@@ -220,6 +221,19 @@ async def handle_put_object(
             redis_client=redis_client,
         )
 
+        get_metrics_collector().record_s3_operation(
+            operation="put_object",
+            bucket_name=bucket_name,
+            main_account=main_account_id,
+            success=True,
+        )
+        get_metrics_collector().record_data_transfer(
+            operation="put_object",
+            bytes_transferred=file_size,
+            bucket_name=bucket_name,
+            main_account=main_account_id,
+        )
+
         # New or overwrite base object: expose append-version so clients can start append flow without HEAD
         return Response(
             status_code=200,
@@ -231,6 +245,12 @@ async def handle_put_object(
 
     except Exception as e:
         logger.exception(f"Error uploading object: {e}")
+        get_metrics_collector().record_error(
+            error_type="internal_error",
+            operation="put_object",
+            bucket_name=bucket_name,
+            main_account=getattr(request.state, "account", None) and request.state.account.main_account,
+        )
         return errors.s3_error_response(
             "InternalError",
             "We encountered an internal error. Please try again.",
