@@ -69,7 +69,8 @@ jobs:
             export GRAFANA_ADMIN_USER="${GRAFANA_ADMIN_USER}"
             export GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD}"
             docker compose -f docker-compose.yml -f docker-compose.staging.yml -f docker-compose.monitoring.yml down || true
-            docker compose --profile build-base -f docker-compose.yml -f docker-compose.staging.yml -f docker-compose.monitoring.yml build --no-cache
+            docker compose --profile build-base -f docker-compose.yml -f docker-compose.staging.yml -f docker-compose.monitoring.yml build --no-cache base
+            docker compose -f docker-compose.yml -f docker-compose.staging.yml -f docker-compose.monitoring.yml build --no-cache
             docker compose -f docker-compose.yml -f docker-compose.staging.yml -f docker-compose.monitoring.yml up -d
 
             echo "Waiting for database to be ready..."
