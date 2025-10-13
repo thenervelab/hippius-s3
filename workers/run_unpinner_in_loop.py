@@ -4,6 +4,7 @@ import json
 import logging
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import aiofiles
@@ -20,6 +21,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
+from hippius_s3.monitoring import MetricsCollector
+from hippius_s3.monitoring import get_metrics_collector
+from hippius_s3.monitoring import set_metrics_collector
 
 
 config = get_config()
@@ -30,9 +34,10 @@ logger = logging.getLogger(__name__)
 
 async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool:
     """Process unpin requests by creating a manifest and canceling storage request using the Hippius SDK."""
-
+    start_time = time.time()
     seed_phrase = None
     manifest_objects = []
+    user_address = None
 
     for req in unpin_requests:
         cid = req.cid
@@ -41,6 +46,7 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
             continue
         subaccount = req.subaccount
         seed_phrase = req.subaccount_seed_phrase
+        user_address = req.address
         file_name = f"{req.bucket_name}/{req.object_key}"
         logger.info(f"Processing unpin request for CID={cid}, subaccount={subaccount}")
 
@@ -146,16 +152,38 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
 
         logger.info(f"Successfully submitted unpin manifest {manifest['cid']} with transaction: {tx_hash}")
         logger.info(f"Unpinned {len(manifest_objects)} files in batch")
+
+        if user_address:
+            duration = time.time() - start_time
+            get_metrics_collector().record_unpinner_operation(
+                main_account=user_address,
+                success=True,
+                num_files=len(manifest_objects),
+                duration=duration,
+            )
+
         return True
 
     except Exception as e:
         logger.error(f"Failed to process unpin manifest: {e}")
+
+        if user_address:
+            duration = time.time() - start_time
+            get_metrics_collector().record_unpinner_operation(
+                main_account=user_address,
+                success=False,
+                num_files=len(manifest_objects),
+                duration=duration,
+            )
+
         return False
 
 
 async def run_unpinner_loop():
     """Main loop that monitors the Redis queue and processes unpin requests."""
     redis_client = async_redis.from_url(config.redis_url)
+
+    set_metrics_collector(MetricsCollector(redis_client))
 
     logger.info("Starting unpinner service...")
     logger.info(f"Redis URL: {config.redis_url}")

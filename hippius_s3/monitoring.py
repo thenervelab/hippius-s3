@@ -101,6 +101,78 @@ class MetricsCollector:
             name="object_size_bytes", description="Distribution of object sizes", unit="bytes"
         )
 
+        self.substrate_requests_total = self.meter.create_counter(
+            name="substrate_requests_total",
+            description="Total substrate blockchain requests processed",
+            unit="1",
+        )
+
+        self.substrate_requests_retried_total = self.meter.create_counter(
+            name="substrate_requests_retried_total",
+            description="Total substrate requests retried",
+            unit="1",
+        )
+
+        self.substrate_batch_duration = self.meter.create_histogram(
+            name="substrate_batch_duration_seconds",
+            description="Duration of substrate batch processing",
+            unit="s",
+        )
+
+        self.substrate_cids_submitted = self.meter.create_counter(
+            name="substrate_cids_submitted_total",
+            description="Total CIDs submitted to substrate blockchain",
+            unit="1",
+        )
+
+        self.uploader_requests_total = self.meter.create_counter(
+            name="uploader_requests_total",
+            description="Total uploader requests processed",
+            unit="1",
+        )
+
+        self.uploader_requests_retried_total = self.meter.create_counter(
+            name="uploader_requests_retried_total",
+            description="Total uploader requests retried",
+            unit="1",
+        )
+
+        self.uploader_duration = self.meter.create_histogram(
+            name="uploader_duration_seconds",
+            description="Duration of uploader processing",
+            unit="s",
+        )
+
+        self.uploader_chunks_uploaded = self.meter.create_counter(
+            name="uploader_chunks_uploaded_total",
+            description="Total chunks uploaded to IPFS",
+            unit="1",
+        )
+
+        self.uploader_dlq_total = self.meter.create_counter(
+            name="uploader_dlq_total",
+            description="Total requests moved to Dead Letter Queue",
+            unit="1",
+        )
+
+        self.unpinner_requests_total = self.meter.create_counter(
+            name="unpinner_requests_total",
+            description="Total unpinner requests processed",
+            unit="1",
+        )
+
+        self.unpinner_files_unpinned = self.meter.create_counter(
+            name="unpinner_files_unpinned_total",
+            description="Total files unpinned from IPFS",
+            unit="1",
+        )
+
+        self.unpinner_duration = self.meter.create_histogram(
+            name="unpinner_duration_seconds",
+            description="Duration of unpinner processing",
+            unit="s",
+        )
+
         self.meter.create_observable_gauge(
             name="redis_memory_used_bytes", callbacks=[self._obs_redis_used_mem], description="Redis used memory bytes"
         )
@@ -308,6 +380,89 @@ class MetricsCollector:
         else:
             self.cache_misses.add(1, attributes=attributes)
 
+    def record_substrate_operation(
+        self,
+        main_account: str,
+        success: bool,
+        num_cids: int = 0,
+        duration: Optional[float] = None,
+        attempt: Optional[int] = None,
+    ) -> None:
+        attributes = {
+            "main_account": main_account,
+            "success": str(success).lower(),
+        }
+
+        if attempt is not None:
+            retry_attributes = {
+                "main_account": main_account,
+                "attempt": str(attempt),
+            }
+            self.substrate_requests_retried_total.add(1, attributes=retry_attributes)
+        else:
+            self.substrate_requests_total.add(1, attributes=attributes)
+
+            if num_cids > 0:
+                self.substrate_cids_submitted.add(num_cids, attributes=attributes)
+
+            if duration is not None:
+                self.substrate_batch_duration.record(duration, attributes=attributes)
+
+    def record_uploader_operation(
+        self,
+        main_account: str,
+        success: bool,
+        num_chunks: int = 0,
+        duration: Optional[float] = None,
+        attempt: Optional[int] = None,
+        error_type: Optional[str] = None,
+    ) -> None:
+        attributes = {
+            "main_account": main_account,
+            "success": str(success).lower(),
+        }
+
+        if attempt is not None:
+            retry_attributes = {
+                "main_account": main_account,
+                "attempt": str(attempt),
+            }
+            self.uploader_requests_retried_total.add(1, attributes=retry_attributes)
+        elif error_type is not None:
+            dlq_attributes = {
+                "main_account": main_account,
+                "error_type": error_type,
+            }
+            self.uploader_dlq_total.add(1, attributes=dlq_attributes)
+        else:
+            self.uploader_requests_total.add(1, attributes=attributes)
+
+            if num_chunks > 0:
+                self.uploader_chunks_uploaded.add(num_chunks, attributes=attributes)
+
+            if duration is not None:
+                self.uploader_duration.record(duration, attributes=attributes)
+
+    def record_unpinner_operation(
+        self,
+        main_account: str,
+        success: bool,
+        num_files: int = 0,
+        duration: Optional[float] = None,
+    ) -> None:
+        attributes = {
+            "main_account": main_account,
+            "success": str(success).lower(),
+        }
+
+        self.unpinner_requests_total.add(1, attributes=attributes)
+
+        if num_files > 0:
+            self.unpinner_files_unpinned.add(num_files, attributes=attributes)
+
+        if duration is not None:
+            self.unpinner_duration.record(duration, attributes=attributes)
+
 
 class NullMetricsCollector:
     def __init__(self) -> None:
@@ -336,6 +491,15 @@ class NullMetricsCollector:
         pass
 
     def record_cache_operation(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_substrate_operation(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_uploader_operation(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_unpinner_operation(self, *args: object, **kwargs: object) -> None:
         pass
 
 

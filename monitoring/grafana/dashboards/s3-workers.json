@@ -17,7 +17,7 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
-  "id": 1,
+  "id": null,
   "links": [],
   "panels": [
     {
@@ -44,8 +44,7 @@
             "hideFrom": {
               "legend": false,
               "tooltip": false,
-              "vis": false,
-              "viz": false
+              "vis": false
             },
             "insertNulls": false,
             "lineInterpolation": "linear",
@@ -55,7 +54,6 @@
               "type": "linear"
             },
             "showPoints": "never",
-            "showValues": false,
             "spanNulls": false,
             "stacking": {
               "group": "A",
@@ -71,7 +69,7 @@
             "steps": [
               {
                 "color": "green",
-                "value": 0
+                "value": null
               },
               {
                 "color": "red",
@@ -79,12 +77,12 @@
               }
             ]
           },
-          "unit": "reqps"
+          "unit": "ops"
         },
         "overrides": []
       },
       "gridPos": {
-        "h": 11,
+        "h": 8,
         "w": 12,
         "x": 0,
         "y": 0
@@ -98,7 +96,6 @@
           "showLegend": true
         },
         "tooltip": {
-          "hideZeros": false,
           "mode": "single",
           "sort": "none"
         }
@@ -110,305 +107,8 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(http_requests_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", handler=~\"$endpoint\", handler!=\"metrics_endpoint\"}[5m])) by (method)",
-          "interval": "",
-          "legendFormat": "{{method}} Requests/sec",
-          "refId": "A"
-        }
-      ],
-      "title": "HTTP Request Rate by Account",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "max": 100,
-          "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "yellow",
-                "value": 70
-              },
-              {
-                "color": "red",
-                "value": 85
-              }
-            ]
-          },
-          "unit": "percent"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 5,
-        "w": 4,
-        "x": 12,
-        "y": 0
-      },
-      "id": 17,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "minVizHeight": 75,
-        "minVizWidth": 75,
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "showThresholdLabels": false,
-        "showThresholdMarkers": true,
-        "sizing": "auto",
-        "textMode": "value_and_name"
-      },
-      "pluginVersion": "12.2.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "expr": "(redis_memory_used_bytes{job=\"redis-main\"} / (redis_memory_max_bytes{job=\"redis-main\"} or redis_memory_used_bytes{job=\"redis-main\"} * 2)) * 100",
-          "interval": "",
-          "legendFormat": "Chunk Cache",
-          "refId": "A"
-        }
-      ],
-      "title": "Chunk Cache Usage",
-      "type": "gauge"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "max": 100,
-          "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "yellow",
-                "value": 70
-              },
-              {
-                "color": "red",
-                "value": 85
-              }
-            ]
-          },
-          "unit": "percent"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 5,
-        "w": 4,
-        "x": 16,
-        "y": 0
-      },
-      "id": 18,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "minVizHeight": 75,
-        "minVizWidth": 75,
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "showThresholdLabels": false,
-        "showThresholdMarkers": true,
-        "sizing": "auto",
-        "textMode": "value_and_name"
-      },
-      "pluginVersion": "12.2.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "expr": "(redis_memory_used_bytes{job=\"redis-accounts\"} / (redis_memory_max_bytes{job=\"redis-accounts\"} or redis_memory_used_bytes{job=\"redis-accounts\"} * 2)) * 100",
-          "interval": "",
-          "legendFormat": "Accounts Cache",
-          "refId": "A"
-        }
-      ],
-      "title": "Accounts Cache Usage",
-      "type": "gauge"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "max": 100,
-          "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "yellow",
-                "value": 70
-              },
-              {
-                "color": "red",
-                "value": 85
-              }
-            ]
-          },
-          "unit": "percent"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 5,
-        "w": 4,
-        "x": 20,
-        "y": 0
-      },
-      "id": 19,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "minVizHeight": 75,
-        "minVizWidth": 75,
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "showThresholdLabels": false,
-        "showThresholdMarkers": true,
-        "sizing": "auto",
-        "textMode": "value_and_name"
-      },
-      "pluginVersion": "12.2.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "expr": "(redis_memory_used_bytes{job=\"redis-chain\"} / (redis_memory_max_bytes{job=\"redis-chain\"} or redis_memory_used_bytes{job=\"redis-chain\"} * 2)) * 100",
-          "interval": "",
-          "legendFormat": "Chain Cache",
-          "refId": "A"
-        }
-      ],
-      "title": "Chain Cache Usage",
-      "type": "gauge"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 6,
-        "w": 12,
-        "x": 12,
-        "y": 5
-      },
-      "id": 2,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "percentChangeColorMode": "standard",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "showPercentChange": false,
-        "textMode": "auto",
-        "wideLayout": true
-      },
-      "pluginVersion": "12.2.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "expr": "hippius_redis_db_size{redis_instance=\"main\"}",
-          "interval": "",
-          "legendFormat": "Object Cache",
+          "expr": "sum(rate(substrate_requests_total{job=\"otel-collector\", main_account=~\"$main_account\", success=\"true\"}[5m]))",
+          "legendFormat": "Success",
           "refId": "A"
         },
         {
@@ -416,24 +116,13 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "hippius_redis_db_size{redis_instance=\"accounts\"}",
-          "interval": "",
-          "legendFormat": "Login Cache",
+          "expr": "sum(rate(substrate_requests_total{job=\"otel-collector\", main_account=~\"$main_account\", success=\"false\"}[5m]))",
+          "legendFormat": "Failure",
           "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "expr": "hippius_redis_db_size{redis_instance=\"chain\"}",
-          "interval": "",
-          "legendFormat": "User Profile Cache",
-          "refId": "C"
         }
       ],
-      "title": "Redis Key Counts by Instance",
-      "type": "stat"
+      "title": "Substrate Worker - Request Rate",
+      "type": "timeseries"
     },
     {
       "datasource": {
@@ -459,8 +148,7 @@
             "hideFrom": {
               "legend": false,
               "tooltip": false,
-              "vis": false,
-              "viz": false
+              "vis": false
             },
             "insertNulls": false,
             "lineInterpolation": "linear",
@@ -470,7 +158,6 @@
               "type": "linear"
             },
             "showPoints": "never",
-            "showValues": false,
             "spanNulls": false,
             "stacking": {
               "group": "A",
@@ -486,7 +173,102 @@
             "steps": [
               {
                 "color": "green",
-                "value": 0
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "sum(rate(substrate_requests_retried_total{job=\"otel-collector\", main_account=~\"$main_account\"}[5m])) by (attempt)",
+          "legendFormat": "Attempt {{attempt}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Substrate Worker - Retry Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "vis": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
               },
               {
                 "color": "red",
@@ -502,116 +284,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 11
-      },
-      "id": 6,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "single",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "12.2.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job=\"otel-collector\", handler!=\"metrics_endpoint\"}[5m]))",
-          "interval": "",
-          "legendFormat": "95th percentile - {{method}} {{handler}}",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "expr": "histogram_quantile(0.50, rate(http_request_duration_seconds_bucket{job=\"otel-collector\", handler!=\"metrics_endpoint\"}[5m]))",
-          "interval": "",
-          "legendFormat": "50th percentile - {{method}} {{handler}}",
-          "refId": "B"
-        }
-      ],
-      "title": "HTTP Response Times",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "vis": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 11
+        "y": 8
       },
       "id": 3,
       "options": {
@@ -622,7 +295,6 @@
           "showLegend": true
         },
         "tooltip": {
-          "hideZeros": false,
           "mode": "single",
           "sort": "none"
         }
@@ -634,9 +306,8 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "hippius_queue_length{queue_name=\"upload_requests\"}",
-          "interval": "",
-          "legendFormat": "Upload Queue",
+          "expr": "histogram_quantile(0.95, rate(substrate_batch_duration_seconds_bucket{job=\"otel-collector\", main_account=~\"$main_account\"}[5m]))",
+          "legendFormat": "p95",
           "refId": "A"
         },
         {
@@ -644,317 +315,12 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "hippius_queue_length{queue_name=\"unpin_requests\"}",
-          "interval": "",
-          "legendFormat": "Unpin Queue",
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "expr": "hippius_queue_length{queue_name=\"substrate_requests\"}",
-          "interval": "",
-          "legendFormat": "Substrate Queue",
-          "refId": "C"
-        }
-      ],
-      "title": "Redis Queue Lengths",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "custom": {
-            "align": "auto",
-            "cellOptions": {
-              "type": "auto"
-            },
-            "footer": {
-              "reducers": []
-            },
-            "inspect": false
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 19
-      },
-      "id": 14,
-      "options": {
-        "cellHeight": "sm",
-        "showHeader": true,
-        "sortBy": []
-      },
-      "pluginVersion": "12.2.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "expr": "topk(10, sum by (main_account) (increase(s3_operations_total{job=\"otel-collector\"}[1h])))",
-          "format": "table",
-          "instant": true,
-          "interval": "",
-          "legendFormat": "",
-          "refId": "A"
-        }
-      ],
-      "title": "Top Accounts by Operations (Last Hour)",
-      "transformations": [
-        {
-          "id": "organize",
-          "options": {
-            "excludeByName": {
-              "Time": true
-            },
-            "indexByName": {},
-            "renameByName": {
-              "Value": "Operations",
-              "main_account": "Account"
-            }
-          }
-        }
-      ],
-      "type": "table"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": 0
-              },
-              {
-                "color": "yellow",
-                "value": 50
-              },
-              {
-                "color": "green",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "percent"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 12,
-        "y": 19
-      },
-      "id": 13,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "percentChangeColorMode": "standard",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "showPercentChange": false,
-        "textMode": "auto",
-        "wideLayout": true
-      },
-      "pluginVersion": "12.2.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "expr": "(sum(rate(cache_hits_total{job=\"otel-collector\"}[5m])) or vector(0)) / ((sum(rate(cache_hits_total{job=\"otel-collector\"}[5m])) or vector(0)) + (sum(rate(cache_misses_total{job=\"otel-collector\"}[5m])) or vector(0)) + 0.0001) * 100",
-          "interval": "",
-          "legendFormat": "Cache Hit Ratio",
-          "refId": "A"
-        }
-      ],
-      "title": "Cache Hit Ratio",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 30,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "vis": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "normal"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "ops"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Cache Hits"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "green",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Cache Misses"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "orange",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 18,
-        "y": 19
-      },
-      "id": 12,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "single",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "12.2.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "expr": "sum(rate(cache_hits_total{job=\"otel-collector\"}[5m]))",
-          "interval": "",
-          "legendFormat": "Cache Hits",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "expr": "sum(rate(cache_misses_total{job=\"otel-collector\"}[5m]))",
-          "interval": "",
-          "legendFormat": "Cache Misses",
+          "expr": "histogram_quantile(0.50, rate(substrate_batch_duration_seconds_bucket{job=\"otel-collector\", main_account=~\"$main_account\"}[5m]))",
+          "legendFormat": "p50",
           "refId": "B"
         }
       ],
-      "title": "Cache Performance (Hits vs Misses)",
+      "title": "Substrate Worker - Processing Duration",
       "type": "timeseries"
     },
     {
@@ -981,8 +347,7 @@
             "hideFrom": {
               "legend": false,
               "tooltip": false,
-              "vis": false,
-              "viz": false
+              "vis": false
             },
             "insertNulls": false,
             "lineInterpolation": "linear",
@@ -992,7 +357,6 @@
               "type": "linear"
             },
             "showPoints": "never",
-            "showValues": false,
             "spanNulls": false,
             "stacking": {
               "group": "A",
@@ -1008,7 +372,7 @@
             "steps": [
               {
                 "color": "green",
-                "value": 0
+                "value": null
               },
               {
                 "color": "red",
@@ -1016,7 +380,102 @@
               }
             ]
           },
-          "unit": "Bps"
+          "unit": "cids"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "sum(rate(substrate_cids_submitted_total{job=\"otel-collector\", main_account=~\"$main_account\"}[5m]))",
+          "legendFormat": "CIDs/sec",
+          "refId": "A"
+        }
+      ],
+      "title": "Substrate Worker - CIDs Submitted Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "vis": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ops"
         },
         "overrides": []
       },
@@ -1024,7 +483,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 27
+        "y": 16
       },
       "id": 5,
       "options": {
@@ -1035,7 +494,6 @@
           "showLegend": true
         },
         "tooltip": {
-          "hideZeros": false,
           "mode": "single",
           "sort": "none"
         }
@@ -1047,9 +505,8 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(http_request_bytes_total{job=\"otel-collector\", direction=\"in\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", handler=~\"$endpoint\", handler!=\"metrics_endpoint\"}[5m]))",
-          "interval": "",
-          "legendFormat": "Bytes In/sec",
+          "expr": "sum(rate(uploader_requests_total{job=\"otel-collector\", main_account=~\"$main_account\", success=\"true\"}[5m]))",
+          "legendFormat": "Success",
           "refId": "A"
         },
         {
@@ -1057,13 +514,12 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(http_response_bytes_total{job=\"otel-collector\", direction=\"out\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", handler=~\"$endpoint\", handler!=\"metrics_endpoint\"}[5m]))",
-          "interval": "",
-          "legendFormat": "Bytes Out/sec",
+          "expr": "sum(rate(uploader_requests_total{job=\"otel-collector\", main_account=~\"$main_account\", success=\"false\"}[5m]))",
+          "legendFormat": "Failure",
           "refId": "B"
         }
       ],
-      "title": "Data Transfer Rate by Account",
+      "title": "Uploader Worker - Request Rate",
       "type": "timeseries"
     },
     {
@@ -1090,8 +546,7 @@
             "hideFrom": {
               "legend": false,
               "tooltip": false,
-              "vis": false,
-              "viz": false
+              "vis": false
             },
             "insertNulls": false,
             "lineInterpolation": "linear",
@@ -1101,7 +556,6 @@
               "type": "linear"
             },
             "showPoints": "never",
-            "showValues": false,
             "spanNulls": false,
             "stacking": {
               "group": "A",
@@ -1117,7 +571,7 @@
             "steps": [
               {
                 "color": "green",
-                "value": 0
+                "value": null
               },
               {
                 "color": "red",
@@ -1133,9 +587,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 27
+        "y": 16
       },
-      "id": 11,
+      "id": 6,
       "options": {
         "legend": {
           "calcs": [],
@@ -1144,7 +598,6 @@
           "showLegend": true
         },
         "tooltip": {
-          "hideZeros": false,
           "mode": "single",
           "sort": "none"
         }
@@ -1156,86 +609,13 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum by (error_type) (increase(s3_errors_total{job=\"otel-collector\", main_account=~\"$main_account\"}[$__interval]))",
-          "interval": "",
-          "legendFormat": "{{error_type}}",
+          "expr": "sum(rate(uploader_requests_retried_total{job=\"otel-collector\", main_account=~\"$main_account\"}[5m])) by (attempt)",
+          "legendFormat": "Attempt {{attempt}}",
           "refId": "A"
         }
       ],
-      "title": "Errors by Type",
+      "title": "Uploader Worker - Retry Rate",
       "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "vis": false,
-              "viz": false
-            }
-          },
-          "mappings": [],
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 35
-      },
-      "id": 8,
-      "options": {
-        "displayLabels": [
-          "name",
-          "percent"
-        ],
-        "legend": {
-          "displayMode": "list",
-          "placement": "right",
-          "showLegend": true,
-          "values": []
-        },
-        "pieType": "pie",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "sort": "desc",
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "single",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "12.2.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "expr": "sum by (operation) (increase(s3_operations_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", success=\"true\"}[1h]))",
-          "interval": "",
-          "legendFormat": "{{operation}}",
-          "refId": "A"
-        }
-      ],
-      "title": "S3 Operations by Type (Last Hour)",
-      "type": "piechart"
     },
     {
       "datasource": {
@@ -1261,8 +641,7 @@
             "hideFrom": {
               "legend": false,
               "tooltip": false,
-              "vis": false,
-              "viz": false
+              "vis": false
             },
             "insertNulls": false,
             "lineInterpolation": "linear",
@@ -1272,7 +651,6 @@
               "type": "linear"
             },
             "showPoints": "never",
-            "showValues": false,
             "spanNulls": false,
             "stacking": {
               "group": "A",
@@ -1288,7 +666,7 @@
             "steps": [
               {
                 "color": "green",
-                "value": 0
+                "value": null
               },
               {
                 "color": "red",
@@ -1296,7 +674,7 @@
               }
             ]
           },
-          "unit": "Bps"
+          "unit": "s"
         },
         "overrides": []
       },
@@ -1304,7 +682,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 43
+        "y": 24
       },
       "id": 7,
       "options": {
@@ -1315,7 +693,6 @@
           "showLegend": true
         },
         "tooltip": {
-          "hideZeros": false,
           "mode": "single",
           "sort": "none"
         }
@@ -1327,9 +704,8 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(s3_bytes_uploaded_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\"}[5m])) by (operation)",
-          "interval": "",
-          "legendFormat": "Upload - {{operation}}",
+          "expr": "histogram_quantile(0.95, rate(uploader_duration_seconds_bucket{job=\"otel-collector\", main_account=~\"$main_account\"}[5m]))",
+          "legendFormat": "p95",
           "refId": "A"
         },
         {
@@ -1337,13 +713,12 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(s3_bytes_downloaded_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\"}[5m])) by (operation)",
-          "interval": "",
-          "legendFormat": "Download - {{operation}}",
+          "expr": "histogram_quantile(0.50, rate(uploader_duration_seconds_bucket{job=\"otel-collector\", main_account=~\"$main_account\"}[5m]))",
+          "legendFormat": "p50",
           "refId": "B"
         }
       ],
-      "title": "S3 Data Transfer Rate",
+      "title": "Uploader Worker - Processing Duration",
       "type": "timeseries"
     },
     {
@@ -1365,13 +740,12 @@
             "barAlignment": 0,
             "barWidthFactor": 0.6,
             "drawStyle": "line",
-            "fillOpacity": 30,
+            "fillOpacity": 10,
             "gradientMode": "none",
             "hideFrom": {
               "legend": false,
               "tooltip": false,
-              "vis": false,
-              "viz": false
+              "vis": false
             },
             "insertNulls": false,
             "lineInterpolation": "linear",
@@ -1381,11 +755,10 @@
               "type": "linear"
             },
             "showPoints": "never",
-            "showValues": false,
             "spanNulls": false,
             "stacking": {
               "group": "A",
-              "mode": "normal"
+              "mode": "none"
             },
             "thresholdsStyle": {
               "mode": "off"
@@ -1397,7 +770,7 @@
             "steps": [
               {
                 "color": "green",
-                "value": 0
+                "value": null
               },
               {
                 "color": "red",
@@ -1407,46 +780,15 @@
           },
           "unit": "ops"
         },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Failed"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "red",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Success"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "green",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          }
-        ]
+        "overrides": []
       },
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 43
+        "y": 24
       },
-      "id": 9,
+      "id": 8,
       "options": {
         "legend": {
           "calcs": [],
@@ -1455,7 +797,6 @@
           "showLegend": true
         },
         "tooltip": {
-          "hideZeros": false,
           "mode": "single",
           "sort": "none"
         }
@@ -1467,8 +808,197 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(s3_operations_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", success=\"true\"}[5m]))",
-          "interval": "",
+          "expr": "sum(rate(uploader_dlq_total{job=\"otel-collector\", main_account=~\"$main_account\"}[5m])) by (error_type)",
+          "legendFormat": "{{error_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Uploader Worker - Dead Letter Queue Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "vis": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "chunks"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "sum(rate(uploader_chunks_uploaded_total{job=\"otel-collector\", main_account=~\"$main_account\"}[5m]))",
+          "legendFormat": "Chunks/sec",
+          "refId": "A"
+        }
+      ],
+      "title": "Uploader Worker - Chunks Uploaded Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "vis": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "sum(rate(unpinner_requests_total{job=\"otel-collector\", main_account=~\"$main_account\", success=\"true\"}[5m]))",
           "legendFormat": "Success",
           "refId": "A"
         },
@@ -1477,102 +1007,239 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(s3_operations_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", success=\"false\"}[5m]))",
-          "interval": "",
-          "legendFormat": "Failed",
+          "expr": "sum(rate(unpinner_requests_total{job=\"otel-collector\", main_account=~\"$main_account\", success=\"false\"}[5m]))",
+          "legendFormat": "Failure",
           "refId": "B"
         }
       ],
-      "title": "S3 Success vs Failure Rate",
+      "title": "Unpinner Worker - Request Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "vis": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "histogram_quantile(0.95, rate(unpinner_duration_seconds_bucket{job=\"otel-collector\", main_account=~\"$main_account\"}[5m]))",
+          "legendFormat": "p95",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "histogram_quantile(0.50, rate(unpinner_duration_seconds_bucket{job=\"otel-collector\", main_account=~\"$main_account\"}[5m]))",
+          "legendFormat": "p50",
+          "refId": "B"
+        }
+      ],
+      "title": "Unpinner Worker - Processing Duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "vis": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "files"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.2.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "sum(rate(unpinner_files_unpinned_total{job=\"otel-collector\", main_account=~\"$main_account\"}[5m]))",
+          "legendFormat": "Files/sec",
+          "refId": "A"
+        }
+      ],
+      "title": "Unpinner Worker - Files Unpinned Rate",
       "type": "timeseries"
     }
   ],
-  "preload": false,
   "refresh": "30s",
   "schemaVersion": 42,
   "tags": [
     "hippius-s3",
-    "monitoring"
+    "workers"
   ],
   "templating": {
     "list": [
       {
         "current": {
-          "text": [
-            "All"
-          ],
-          "value": [
-            "$__all"
-          ]
+          "text": "All",
+          "value": "$__all"
         },
         "datasource": {
           "type": "prometheus",
           "uid": "PBFA97CFB590B2093"
         },
-        "definition": "label_values(http_requests_total{job=\"otel-collector\"}, main_account)",
+        "definition": "label_values(substrate_requests_total{job=\"otel-collector\"}, main_account)",
         "includeAll": true,
         "label": "Main Account",
         "multi": true,
         "name": "main_account",
         "options": [],
         "query": {
-          "query": "label_values(http_requests_total{job=\"otel-collector\"}, main_account)",
-          "refId": "StandardVariableQuery"
-        },
-        "refresh": 1,
-        "regex": "",
-        "sort": 1,
-        "type": "query"
-      },
-      {
-        "current": {
-          "text": [
-            "All"
-          ],
-          "value": [
-            "$__all"
-          ]
-        },
-        "datasource": {
-          "type": "prometheus",
-          "uid": "PBFA97CFB590B2093"
-        },
-        "definition": "label_values(http_requests_total{job=\"otel-collector\", main_account=~\"$main_account\"}, subaccount_id)",
-        "includeAll": true,
-        "label": "Subaccount",
-        "multi": true,
-        "name": "subaccount_id",
-        "options": [],
-        "query": {
-          "query": "label_values(http_requests_total{job=\"otel-collector\", main_account=~\"$main_account\"}, subaccount_id)",
-          "refId": "StandardVariableQuery"
-        },
-        "refresh": 1,
-        "regex": "",
-        "sort": 1,
-        "type": "query"
-      },
-      {
-        "current": {
-          "text": [
-            "All"
-          ],
-          "value": [
-            "$__all"
-          ]
-        },
-        "datasource": {
-          "type": "prometheus",
-          "uid": "PBFA97CFB590B2093"
-        },
-        "definition": "label_values(http_requests_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\"}, handler)",
-        "includeAll": true,
-        "label": "Endpoint",
-        "multi": true,
-        "name": "endpoint",
-        "options": [],
-        "query": {
-          "query": "label_values(http_requests_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\"}, handler)",
+          "query": "label_values(substrate_requests_total{job=\"otel-collector\"}, main_account)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 1,
@@ -1588,7 +1255,7 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Hippius S3 Overview",
-  "uid": "hippius-s3-overview",
-  "version": 15
+  "title": "Hippius S3 Workers",
+  "uid": "hippius-s3-workers",
+  "version": 1
 }

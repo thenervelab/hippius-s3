@@ -15,6 +15,7 @@ from substrateinterface import Keypair
 from substrateinterface import SubstrateInterface
 from substrateinterface.exceptions import SubstrateRequestException
 
+from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import SubstratePinningRequest
 
 
@@ -189,7 +190,26 @@ class SubstrateWorker:
                 )
                 logger.info(f"Updated object status to 'uploaded' object_id={req.object_id}")
 
+            for user_address, user_requests in user_request_map.items():
+                total_cids = sum(len(r.cids) for r in user_requests)
+                get_metrics_collector().record_substrate_operation(
+                    main_account=user_address,
+                    success=True,
+                    num_cids=total_cids,
+                    duration=total_duration,
+                )
+
             return True
 
         logger.error(f"Batched transaction failed: {error_msg}")
+
+        for user_address, user_requests in user_request_map.items():
+            total_cids = sum(len(r.cids) for r in user_requests)
+            get_metrics_collector().record_substrate_operation(
+                main_account=user_address,
+                success=False,
+                num_cids=total_cids,
+                duration=time.time() - start_time,
+            )
+
         raise SubstrateRequestException(f"Transaction failed: {error_msg}")

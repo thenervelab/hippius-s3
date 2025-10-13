@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
+from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import dequeue_substrate_request
 from hippius_s3.queue import enqueue_substrate_retry_request
 from hippius_s3.queue import move_substrate_due_retries_to_primary
@@ -108,6 +109,11 @@ async def run_substrate_loop():
                             await enqueue_substrate_retry_request(
                                 req, redis_client, delay_seconds=delay_ms / 1000.0, last_error=err_str
                             )
+                            get_metrics_collector().record_substrate_operation(
+                                main_account=req.address,
+                                success=False,
+                                attempt=attempts_next,
+                            )
                     else:
                         for req in pending_requests:
                             await db.execute("UPDATE objects SET status = 'failed' WHERE object_id = $1", req.object_id)
@@ -138,6 +144,11 @@ async def run_substrate_loop():
                             )
                             await enqueue_substrate_retry_request(
                                 req, redis_client, delay_seconds=delay_ms / 1000.0, last_error=err_str
+                            )
+                            get_metrics_collector().record_substrate_operation(
+                                main_account=req.address,
+                                success=False,
+                                attempt=attempts_next,
                             )
                     else:
                         for req in pending_requests:
