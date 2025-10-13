@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hippius_s3.config import get_config
 from hippius_s3.ipfs_service import IPFSService
 from hippius_s3.logging_config import setup_loki_logging
+from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import dequeue_upload_request
 from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.queue import move_due_retries_to_primary
@@ -85,6 +86,11 @@ async def run_uploader_loop():
                     )
                     await enqueue_retry_request(
                         upload_request, redis_client, delay_seconds=delay_ms / 1000.0, last_error=err_str
+                    )
+                    get_metrics_collector().record_uploader_operation(
+                        main_account=upload_request.address,
+                        success=False,
+                        attempt=attempts_next,
                     )
                 else:
                     await uploader._push_to_dlq(upload_request, err_str, error_type)

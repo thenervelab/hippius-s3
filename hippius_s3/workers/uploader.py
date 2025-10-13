@@ -11,6 +11,7 @@ from typing import Tuple
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.dlq.storage import DLQStorage
 from hippius_s3.ipfs_service import IPFSService
+from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import SubstratePinningRequest
 from hippius_s3.queue import UploadChainRequest
@@ -104,6 +105,14 @@ class Uploader:
             f"Upload complete object_id={payload.object_id} cids={len(all_cids)} "
             f"chunks={chunk_duration:.2f}s manifest={manifest_duration:.2f}s total={total_duration:.2f}s"
         )
+
+        get_metrics_collector().record_uploader_operation(
+            main_account=payload.address,
+            success=True,
+            num_chunks=len(payload.chunks),
+            duration=total_duration,
+        )
+
         return all_cids
 
     async def _upload_chunks(
@@ -413,6 +422,12 @@ class Uploader:
 
         await self.redis_client.lpush("upload_requests:dlq", json.dumps(dlq_entry))
         logger.warning(f"Pushed to DLQ: object_id={payload.object_id}, error_type={error_type}, error={last_error}")
+
+        get_metrics_collector().record_uploader_operation(
+            main_account=payload.address,
+            success=False,
+            error_type=etype,
+        )
 
     async def _persist_chunks_to_dlq(self, payload: UploadChainRequest) -> None:
         """Persist all available chunks + metadata from cache to DLQ filesystem."""
