@@ -27,6 +27,7 @@ from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import get_object_reader
 from hippius_s3.metadata.meta_writer import write_cache_meta
+from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
@@ -304,6 +305,11 @@ async def initiate_multipart_upload(
 """
         xml_bytes = xml_string.encode("utf-8")
 
+        get_metrics_collector().record_multipart_operation(
+            operation="initiate_upload",
+            main_account=request.state.account.main_account,
+        )
+
         # Return response with proper headers
         return Response(
             content=xml_bytes,
@@ -316,6 +322,12 @@ async def initiate_multipart_upload(
         )
     except Exception as e:
         logger.exception(f"Error initiating multipart upload: {e}")
+        get_metrics_collector().record_error(
+            error_type="internal_error",
+            operation="initiate_multipart_upload",
+            bucket_name=bucket_name,
+            main_account=getattr(request.state, "account", None) and request.state.account.main_account,
+        )
         return s3_error_response(
             "InternalError",
             f"Error initiating multipart upload: {str(e)}",
@@ -702,6 +714,18 @@ async def upload_part(
 
         total_time = time.time() - start_time
         logger.debug(f"Part {part_number}: TOTAL processing time: {total_time:.3f}s")
+
+        get_metrics_collector().record_multipart_operation(
+            operation="upload_part",
+            main_account=request.state.account.main_account,
+        )
+        get_metrics_collector().record_data_transfer(
+            operation="upload_part",
+            bytes_transferred=file_size,
+            bucket_name=ongoing_multipart_upload.get("bucket_name", ""),
+            main_account=request.state.account.main_account,
+            subaccount_id=request.state.account.id,
+        )
 
         # Return response
         if copy_source:
@@ -1152,6 +1176,25 @@ async def complete_multipart_upload(
 </CompleteMultipartUploadResult>
 """.encode("utf-8")
 
+        get_metrics_collector().record_multipart_operation(
+            operation="complete_upload",
+            main_account=request.state.account.main_account,
+        )
+        get_metrics_collector().record_s3_operation(
+            operation="complete_multipart_upload",
+            bucket_name=bucket_name,
+            main_account=request.state.account.main_account,
+            subaccount_id=request.state.account.id,
+            success=True,
+        )
+        get_metrics_collector().record_data_transfer(
+            operation="complete_multipart_upload",
+            bytes_transferred=total_size,
+            bucket_name=bucket_name,
+            main_account=request.state.account.main_account,
+            subaccount_id=request.state.account.id,
+        )
+
         # Return with proper headers
         return Response(
             content=xml_bytes,
@@ -1163,6 +1206,12 @@ async def complete_multipart_upload(
         )
     except Exception as e:
         logger.exception(f"Error completing multipart upload: {e}")
+        get_metrics_collector().record_error(
+            error_type="internal_error",
+            operation="complete_multipart_upload",
+            bucket_name=bucket_name,
+            main_account=getattr(request.state, "account", None) and request.state.account.main_account,
+        )
         return s3_error_response(
             "InternalError",
             f"Error completing multipart upload: {str(e)}",
