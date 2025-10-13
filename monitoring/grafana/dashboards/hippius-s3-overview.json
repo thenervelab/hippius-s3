@@ -938,7 +938,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(cache_hits_total{job=\"otel-collector\", main_account=~\"$main_account\"}[5m]))",
+          "expr": "sum(rate(cache_hits_total{job=\"otel-collector\"}[5m]))",
           "interval": "",
           "legendFormat": "Cache Hits",
           "refId": "A"
@@ -948,7 +948,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(cache_misses_total{job=\"otel-collector\", main_account=~\"$main_account\"}[5m]))",
+          "expr": "sum(rate(cache_misses_total{job=\"otel-collector\"}[5m]))",
           "interval": "",
           "legendFormat": "Cache Misses",
           "refId": "B"

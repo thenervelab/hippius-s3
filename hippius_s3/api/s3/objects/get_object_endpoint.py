@@ -201,6 +201,7 @@ async def handle_get_object(
                 operation="get_object",
                 bucket_name=bucket_name,
                 main_account=account.main_account if account else None,
+                subaccount_id=account.id if account else None,
                 success=True,
             )
             get_metrics_collector().record_data_transfer(
@@ -208,6 +209,7 @@ async def handle_get_object(
                 bytes_transferred=bytes_transferred,
                 bucket_name=bucket_name,
                 main_account=account.main_account if account else None,
+                subaccount_id=account.id if account else None,
             )
 
         return response

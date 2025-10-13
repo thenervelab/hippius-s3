@@ -225,6 +225,7 @@ async def handle_put_object(
             operation="put_object",
             bucket_name=bucket_name,
             main_account=main_account_id,
+            subaccount_id=request.state.account.id,
             success=True,
         )
         get_metrics_collector().record_data_transfer(
@@ -232,6 +233,7 @@ async def handle_put_object(
             bytes_transferred=file_size,
             bucket_name=bucket_name,
             main_account=main_account_id,
+            subaccount_id=request.state.account.id,
         )
 
         # New or overwrite base object: expose append-version so clients can start append flow without HEAD

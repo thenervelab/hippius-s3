@@ -145,6 +145,7 @@ class MetricsCollector:
         response: Response,
         duration: float,
         main_account: Optional[str] = None,
+        subaccount_id: Optional[str] = None,
         handler: Optional[str] = None,
     ) -> None:
         attributes = {
@@ -155,6 +156,9 @@ class MetricsCollector:
 
         if main_account:
             attributes["main_account"] = main_account
+
+        if subaccount_id:
+            attributes["subaccount_id"] = subaccount_id
 
         self.http_requests_total.add(1, attributes=attributes)
         self.http_request_duration.record(duration, attributes=attributes)
@@ -172,12 +176,16 @@ class MetricsCollector:
         operation: str,
         bucket_name: str,
         main_account: Optional[str] = None,
+        subaccount_id: Optional[str] = None,
         success: bool = True,
     ) -> None:
         attributes = {"operation": operation, "success": str(success).lower()}
 
         if main_account:
             attributes["main_account"] = main_account
+
+        if subaccount_id:
+            attributes["subaccount_id"] = subaccount_id
 
         self.s3_operations_total.add(1, attributes=attributes)
 
@@ -224,6 +232,7 @@ class MetricsCollector:
         bytes_transferred: int,
         bucket_name: str,
         main_account: Optional[str] = None,
+        subaccount_id: Optional[str] = None,
     ) -> None:
         attributes = {
             "operation": operation,
@@ -231,6 +240,9 @@ class MetricsCollector:
 
         if main_account:
             attributes["main_account"] = main_account
+
+        if subaccount_id:
+            attributes["subaccount_id"] = subaccount_id
 
         if operation in ["upload", "put_object", "post_object", "upload_part"]:
             self.s3_bytes_uploaded.add(bytes_transferred, attributes=attributes)

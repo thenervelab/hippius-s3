@@ -216,6 +216,7 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
                 operation="put_bucket",
                 bucket_name=bucket_name,
                 main_account=main_account_id,
+                subaccount_id=request.state.account.id,
                 success=True,
             )
 

@@ -53,6 +53,7 @@ async def metrics_middleware(
         response=response,
         duration=duration,
         main_account=main_account,
+        subaccount_id=subaccount_id,
         handler=endpoint_name,
     )
 
