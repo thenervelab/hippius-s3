@@ -42,7 +42,11 @@ async def run_substrate_loop():
 
     while True:
         try:
-            moved = await move_substrate_due_retries_to_primary(redis_client, now_ts=time.time(), max_items=64)
+            moved = await move_substrate_due_retries_to_primary(
+                redis_client,
+                now_ts=time.time(),
+                max_items=64,
+            )
             if moved:
                 logger.info(f"Moved {moved} due substrate retry requests back to primary queue")
         except BusyLoadingError:
@@ -128,7 +132,9 @@ async def run_substrate_loop():
                         for req in pending_requests:
                             attempts_next = (req.attempts or 0) + 1
                             delay_ms = compute_substrate_backoff_ms(
-                                attempts_next, config.substrate_retry_base_ms, config.substrate_retry_max_ms
+                                attempts_next,
+                                config.substrate_retry_base_ms,
+                                config.substrate_retry_max_ms,
                             )
                             await enqueue_substrate_retry_request(
                                 req, redis_client, delay_seconds=delay_ms / 1000.0, last_error=err_str

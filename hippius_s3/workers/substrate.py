@@ -44,7 +44,10 @@ class SubstrateWorker:
         logger.info(f"Connected to substrate {self.config.substrate_url} using account {self.keypair.ss58_address}")
 
     async def _upload_file_list_to_ipfs(self, file_list: List[Dict[str, str]]) -> str:
-        files_json = json.dumps(file_list, indent=2)
+        files_json = json.dumps(
+            file_list,
+            indent=2,
+        )
         logger.debug(f"Uploading file list with {len(file_list)} entries to IPFS")
 
         url = f"{self.config.ipfs_store_url.rstrip('/')}/api/v0/add"
@@ -118,7 +121,7 @@ class SubstrateWorker:
         file_list_start = time.time()
         calls = []
         for user_address, cids in user_cid_map.items():
-            file_list = [{"file_hash": cid, "file_name": f"s3-{cid}"} for cid in cids]
+            file_list = [{"cid": cid, "filename": f"s3-{cid}"} for cid in cids]
 
             file_list_cid = await self._upload_file_list_to_ipfs(file_list)
             logger.info(f"Uploaded {file_list_cid=}")
