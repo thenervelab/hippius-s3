@@ -37,6 +37,7 @@ jobs:
           REPO_URL: "git@github.com:${{ github.repository }}.git"
           GRAFANA_ADMIN_USER: ${{ secrets.GRAFANA_ADMIN_USER }}
           GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           # Deploy directly via SSH commands
           ssh ${DEPLOYMENT_USER}@${DEPLOYMENT_IP} << EOF
@@ -68,6 +69,7 @@ jobs:
             echo "Building and starting Docker containers with production config..."
             export GRAFANA_ADMIN_USER="${GRAFANA_ADMIN_USER}"
             export GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD}"
+            export DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL}"
             docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.monitoring.yml down || true
             docker compose --profile build-base -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.monitoring.yml build --no-cache base
             docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.monitoring.yml build --no-cache
