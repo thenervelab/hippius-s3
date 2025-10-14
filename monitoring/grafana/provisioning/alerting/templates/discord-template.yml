@@ -3,17 +3,53 @@ apiVersion: 1
 templates:
   - name: discord.title
     template: |
-      [{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .GroupLabels.alertname }}
+      {{ if eq .Status "firing" }}🚨 FIRING{{ else }}✅ RESOLVED{{ end }} - {{ .GroupLabels.alertname }}
 
   - name: discord.message
     template: |
       {{ range .Alerts }}
-      **Status:** {{ .Status | toUpper }}
       **Alert:** {{ .Labels.alertname }}
-      **Severity:** {{ .Labels.severity }}
-      {{ if .Annotations.summary }}**Summary:** {{ .Annotations.summary }}{{ end }}
-      {{ if .Annotations.description }}**Description:** {{ .Annotations.description }}{{ end }}
-      {{ if .DashboardURL }}**Dashboard:** {{ .DashboardURL }}{{ end }}
-      {{ if .SilenceURL }}**Silence:** {{ .SilenceURL }}{{ end }}
+      **Severity:** {{ .Labels.severity | toUpper }}
+      **Status:** {{ .Status | toUpper }}
+      {{ if .Annotations.summary }}
+      **Summary:** {{ .Annotations.summary }}{{ end }}
+      {{ if .Annotations.description }}
+      **Description:** {{ .Annotations.description }}{{ end }}
+      {{ if .DashboardURL }}
+      **Dashboard:** {{ .DashboardURL }}{{ end }}
       ---
       {{ end }}
+
+  - name: discord.webhook
+    template: |
+      {
+        "content": "{{ template "discord.title" . }}",
+        "embeds": [
+          {{- $first := true -}}
+          {{- range .Alerts }}
+          {{- if not $first }},{{ end }}
+          {{- $first = false }}
+          {
+            "title": "{{ .Labels.alertname }}",
+            "description": "{{ if .Annotations.summary }}{{ .Annotations.summary }}\n{{ end }}{{ if .Annotations.description }}{{ .Annotations.description }}{{ end }}",
+            "color": {{ if eq .Status "firing" }}15158332{{ else }}3066993{{ end }},
+            "fields": [
+              {
+                "name": "Severity",
+                "value": "{{ .Labels.severity }}",
+                "inline": true
+              },
+              {
+                "name": "Status",
+                "value": "{{ .Status }}",
+                "inline": true
+              }
+            ],
+            "footer": {
+              "text": "Hippius S3 Monitoring"
+            },
+            "timestamp": "{{ .StartsAt.Format \"2006-01-02T15:04:05Z07:00\" }}"
+          }
+          {{- end }}
+        ]
+      }

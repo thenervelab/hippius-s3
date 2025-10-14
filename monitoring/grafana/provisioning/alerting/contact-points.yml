@@ -4,9 +4,9 @@ contactPoints:
   - orgId: 1
     name: discord-alerts
     receivers:
-      - uid: discord-webhook
-        type: webhook
+      - uid: discord-integration
+        type: discord
         settings:
           url: ${DISCORD_WEBHOOK_URL}
-          httpMethod: POST
-          maxAlerts: 0
+          message: '{{ template "discord.message" . }}'
+          title: '{{ template "discord.title" . }}'
