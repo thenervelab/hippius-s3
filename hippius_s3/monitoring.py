@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Optional
 
 import redis.asyncio as async_redis
@@ -6,6 +7,10 @@ from fastapi import Request
 from fastapi import Response
 from opentelemetry import metrics
 from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.sdk.resources import Resource
 
 
 logger = logging.getLogger(__name__)
@@ -513,6 +518,25 @@ def get_metrics_collector() -> MetricsCollector | NullMetricsCollector:
 def set_metrics_collector(collector: MetricsCollector | NullMetricsCollector) -> None:
     global _metrics_collector
     _metrics_collector = collector
+
+
+def initialize_metrics_collector(redis_client: async_redis.Redis) -> MetricsCollector:
+    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
+    service_name = os.getenv("OTEL_SERVICE_NAME", "hippius-s3")
+
+    resource = Resource.create({"service.name": service_name})
+
+    metric_reader = PeriodicExportingMetricReader(
+        OTLPMetricExporter(endpoint=endpoint, insecure=True),
+        export_interval_millis=10000,
+    )
+
+    provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+    metrics.set_meter_provider(provider)
+
+    collector = MetricsCollector(redis_client)
+    set_metrics_collector(collector)
+    return collector
 
 
 def enrich_span_with_account_info(
