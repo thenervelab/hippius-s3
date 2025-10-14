@@ -1,0 +1,707 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: hippius-s3-critical
+    folder: Hippius S3 Alerts
+    interval: 1m
+    rules:
+      - uid: high-error-rate
+        title: High Error Rate
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'sum(rate(s3_errors_total{job="otel-collector"}[5m])) / sum(rate(http_requests_total{job="otel-collector"}[5m])) * 100'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 5
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: 'Error rate is {{ printf "%.2f" $values.B.Value }}% (threshold: 5%)'
+          summary: S3 API error rate exceeds 5%
+        labels:
+          severity: critical
+
+      - uid: http-5xx-errors
+        title: High 5xx Error Rate
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'sum(rate(http_requests_total{job="otel-collector",status_code=~"5.."}[5m])) / sum(rate(http_requests_total{job="otel-collector"}[5m])) * 100'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 1
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: '5xx error rate is {{ printf "%.2f" $values.B.Value }}% (threshold: 1%)'
+          summary: Server errors exceeding 1% of requests
+        labels:
+          severity: critical
+
+      - uid: redis-memory-exhaustion
+        title: Redis Memory Exhaustion
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: '(redis_memory_used_bytes / redis_memory_max_bytes) * 100'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 90
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+        for: 3m
+        annotations:
+          description: 'Redis memory usage is {{ printf "%.2f" $values.B.Value }}% (threshold: 90%)'
+          summary: Redis memory usage critically high
+        labels:
+          severity: critical
+
+      - uid: response-time-degradation
+        title: Response Time Degradation
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job="otel-collector"}[5m]))'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 5
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: 'P95 response time is {{ printf "%.2f" $values.B.Value }}s (threshold: 5s)'
+          summary: API response times are degraded
+        labels:
+          severity: critical
+
+      - uid: data-transfer-anomaly
+        title: Data Transfer Rate Collapse
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'rate(s3_bytes_uploaded_total{job="otel-collector"}[5m]) + rate(s3_bytes_downloaded_total{job="otel-collector"}[5m])'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 1000
+                    type: lt
+                  type: query
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+        for: 10m
+        annotations:
+          description: 'Data transfer rate dropped to {{ printf "%.0f" $values.B.Value }} bytes/sec'
+          summary: Data transfer rate has collapsed
+        labels:
+          severity: critical
+
+  - orgId: 1
+    name: hippius-s3-high-priority
+    folder: Hippius S3 Alerts
+    interval: 1m
+    rules:
+      - uid: upload-queue-backup
+        title: Upload Queue Backup
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'hippius_queue_length{queue_name="upload_requests"}'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 1000
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: 'Upload queue has {{ printf "%.0f" $values.B.Value }} items (threshold: 1000)'
+          summary: Upload processing is falling behind
+        labels:
+          severity: high
+
+      - uid: substrate-queue-backup
+        title: Substrate Queue Backup
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'hippius_queue_length{queue_name="substrate_requests"}'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 500
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: 'Substrate queue has {{ printf "%.0f" $values.B.Value }} items (threshold: 500)'
+          summary: Blockchain publishing is falling behind
+        labels:
+          severity: high
+
+      - uid: dlq-growth
+        title: Dead Letter Queue Growth
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'sum(uploader_dlq_total{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 50
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: 'DLQ has {{ printf "%.0f" $values.B.Value }} items (threshold: 50)'
+          summary: Upload failures accumulating in DLQ
+        labels:
+          severity: high
+
+      - uid: worker-retry-rate
+        title: High Worker Retry Rate
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'sum(rate(uploader_requests_retried_total{job="otel-collector"}[5m])) / sum(rate(uploader_requests_total{job="otel-collector"}[5m])) * 100'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 10
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: 'Worker retry rate is {{ printf "%.2f" $values.B.Value }}% (threshold: 10%)'
+          summary: High rate of transient upload failures
+        labels:
+          severity: high
+
+      - uid: substrate-submission-failures
+        title: Substrate Submission Failures
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'sum(rate(substrate_requests_total{job="otel-collector",success="false"}[5m])) / sum(rate(substrate_requests_total{job="otel-collector"}[5m])) * 100'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 5
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: 'Substrate failure rate is {{ printf "%.2f" $values.B.Value }}% (threshold: 5%)'
+          summary: Blockchain integration experiencing failures
+        labels:
+          severity: high
+
+      - uid: ipfs-operation-failures
+        title: IPFS Operation Failures
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'sum(rate(ipfs_operations_total{job="otel-collector",success="false"}[5m])) / sum(rate(ipfs_operations_total{job="otel-collector"}[5m])) * 100'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 10
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: 'IPFS failure rate is {{ printf "%.2f" $values.B.Value }}% (threshold: 10%)'
+          summary: IPFS connectivity or storage issues
+        labels:
+          severity: high
+
+  - orgId: 1
+    name: hippius-s3-medium-priority
+    folder: Hippius S3 Alerts
+    interval: 2m
+    rules:
+      - uid: cache-hit-ratio-drop
+        title: Cache Hit Ratio Drop
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: '(sum(rate(cache_hits_total{job="otel-collector"}[5m])) / (sum(rate(cache_hits_total{job="otel-collector"}[5m])) + sum(rate(cache_misses_total{job="otel-collector"}[5m])) + 0.0001)) * 100'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 50
+                    type: lt
+                  type: query
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+        for: 10m
+        annotations:
+          description: 'Cache hit ratio is {{ printf "%.2f" $values.B.Value }}% (threshold: 50%)'
+          summary: Poor cache performance detected
+        labels:
+          severity: medium
+
+      - uid: multipart-upload-stalls
+        title: Multipart Upload Stalls
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'multipart_uploads_active{job="otel-collector"}'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 10
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+        for: 30m
+        annotations:
+          description: '{{ printf "%.0f" $values.B.Value }} multipart uploads active for >30min'
+          summary: Large uploads may be stalled
+        labels:
+          severity: medium
+
+      - uid: account-error-spike
+        title: Account-Level Error Spike
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'sum(rate(s3_errors_total{job="otel-collector"}[5m])) by (main_account) * 60'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 50
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: 'Account has {{ printf "%.0f" $values.B.Value }} errors/min (threshold: 50)'
+          summary: Specific account experiencing high error rate
+        labels:
+          severity: medium
+
+      - uid: unpinner-queue-growth
+        title: Unpinner Queue Growth
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'hippius_queue_length{queue_name="unpin_requests"}'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 500
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+        for: 15m
+        annotations:
+          description: 'Unpinner queue has {{ printf "%.0f" $values.B.Value }} items (threshold: 500)'
+          summary: Cleanup falling behind
+        labels:
+          severity: medium

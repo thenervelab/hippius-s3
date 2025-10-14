@@ -525,7 +525,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job=\"otel-collector\", handler!=\"metrics_endpoint\"}[5m]))",
+          "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", handler=~\"$endpoint\", handler!=\"metrics_endpoint\"}[5m]))",
           "interval": "",
           "legendFormat": "95th percentile - {{method}} {{handler}}",
           "refId": "A"
@@ -535,7 +535,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "histogram_quantile(0.50, rate(http_request_duration_seconds_bucket{job=\"otel-collector\", handler!=\"metrics_endpoint\"}[5m]))",
+          "expr": "histogram_quantile(0.50, rate(http_request_duration_seconds_bucket{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", handler=~\"$endpoint\", handler!=\"metrics_endpoint\"}[5m]))",
           "interval": "",
           "legendFormat": "50th percentile - {{method}} {{handler}}",
           "refId": "B"
@@ -808,7 +808,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "(sum(rate(cache_hits_total{job=\"otel-collector\"}[5m])) or vector(0)) / ((sum(rate(cache_hits_total{job=\"otel-collector\"}[5m])) or vector(0)) + (sum(rate(cache_misses_total{job=\"otel-collector\"}[5m])) or vector(0)) + 0.0001) * 100",
+          "expr": "(sum(rate(cache_hits_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\"}[5m])) or vector(0)) / ((sum(rate(cache_hits_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\"}[5m])) or vector(0)) + (sum(rate(cache_misses_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\"}[5m])) or vector(0)) + 0.0001) * 100",
           "interval": "",
           "legendFormat": "Cache Hit Ratio",
           "refId": "A"
@@ -938,7 +938,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(cache_hits_total{job=\"otel-collector\"}[5m]))",
+          "expr": "sum(rate(cache_hits_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\"}[5m]))",
           "interval": "",
           "legendFormat": "Cache Hits",
           "refId": "A"
@@ -948,7 +948,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(rate(cache_misses_total{job=\"otel-collector\"}[5m]))",
+          "expr": "sum(rate(cache_misses_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\"}[5m]))",
           "interval": "",
           "legendFormat": "Cache Misses",
           "refId": "B"
@@ -1156,7 +1156,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum by (error_type) (increase(s3_errors_total{job=\"otel-collector\", main_account=~\"$main_account\"}[$__interval]))",
+          "expr": "sum by (error_type) (increase(s3_errors_total{job=\"otel-collector\", main_account=~\"$main_account\", subaccount_id=~\"$subaccount_id\", handler=~\"$endpoint\"}[$__interval]))",
           "interval": "",
           "legendFormat": "{{error_type}}",
           "refId": "A"

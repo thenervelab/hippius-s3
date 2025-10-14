@@ -21,9 +21,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
-from hippius_s3.monitoring import MetricsCollector
 from hippius_s3.monitoring import get_metrics_collector
-from hippius_s3.monitoring import set_metrics_collector
+from hippius_s3.monitoring import initialize_metrics_collector
 
 
 config = get_config()
@@ -183,7 +182,7 @@ async def run_unpinner_loop():
     """Main loop that monitors the Redis queue and processes unpin requests."""
     redis_client = async_redis.from_url(config.redis_url)
 
-    set_metrics_collector(MetricsCollector(redis_client))
+    initialize_metrics_collector(redis_client)
 
     logger.info("Starting unpinner service...")
     logger.info(f"Redis URL: {config.redis_url}")

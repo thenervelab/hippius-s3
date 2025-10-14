@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.monitoring import get_metrics_collector
+from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.queue import dequeue_substrate_request
 from hippius_s3.queue import enqueue_substrate_retry_request
 from hippius_s3.queue import move_substrate_due_retries_to_primary
@@ -31,6 +32,8 @@ logger = logging.getLogger(__name__)
 async def run_substrate_loop():
     db = await asyncpg.connect(config.database_url)
     redis_client = async_redis.from_url(config.redis_url)
+
+    initialize_metrics_collector(redis_client)
 
     logger.info("Starting substrate service...")
     logger.info(f"Redis URL: {config.redis_url}")
