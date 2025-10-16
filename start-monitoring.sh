@@ -57,13 +57,6 @@ else
     echo "❌ Grafana health check failed"
 fi
 
-# Check API metrics endpoint
-if curl -s http://localhost:8000/metrics >/dev/null; then
-    echo "✅ API metrics endpoint is responding"
-else
-    echo "❌ API metrics endpoint check failed"
-fi
-
 echo ""
 echo "🎉 Monitoring stack started successfully!"
 echo ""
@@ -74,6 +67,5 @@ echo "     Password:   $GRAFANA_ADMIN_PASSWORD"
 echo ""
 echo "  📈 Prometheus: http://localhost:9090"
 echo "  🔧 API Health: http://localhost:8000/health"
-echo "  📋 API Metrics: http://localhost:8000/metrics"
 echo ""
 echo "📖 See MONITORING.md for detailed configuration and usage instructions."

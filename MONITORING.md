@@ -23,18 +23,21 @@ PostgreSQL Exporter -----------> Prometheus
 ## Quick Start
 
 1. **Install monitoring dependencies:**
+
    ```bash
    source .venv
    uv pip install -r monitoring-requirements.txt
    ```
 
 2. **Set up environment variables:**
+
    ```bash
    export GRAFANA_ADMIN_USER=admin
    export GRAFANA_ADMIN_PASSWORD=your_secure_password
    ```
 
 3. **Start the monitoring stack:**
+
    ```bash
    docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
    ```
@@ -42,31 +45,35 @@ PostgreSQL Exporter -----------> Prometheus
 4. **Access services:**
    - Grafana: http://localhost:3000 (admin/your_secure_password)
    - Prometheus: http://localhost:9090
-   - API Metrics: http://localhost:8000/metrics
 
 ## Key Metrics
 
 ### HTTP API Metrics
+
 - `http_requests_total` - Total HTTP requests with method, handler, account tags
 - `http_request_duration_seconds` - Request latency percentiles
 - `http_request_bytes_total` - Data transfer in (bytes)
 - `http_response_bytes_total` - Data transfer out (bytes)
 
 ### S3 Operations
+
 - `s3_objects_total` - Objects created/deleted by account
 - `s3_buckets_total` - Buckets created/deleted by account
 
 ### Redis Metrics
+
 - `queue_length` - Length of upload/unpin request queues
 - `multipart_chunks_redis_total` - Count of multipart chunks in Redis
 - `redis_memory_used_bytes` - Redis memory usage
 - `redis_connected_clients` - Active Redis connections
 
 ### IPFS Operations
+
 - `ipfs_operations_total` - IPFS upload/download operations
 - `ipfs_operation_duration_seconds` - IPFS operation latency
 
 ### Database Metrics
+
 - PostgreSQL connection pool metrics
 - Query execution times
 - Transaction rates
@@ -74,6 +81,7 @@ PostgreSQL Exporter -----------> Prometheus
 ## Account-Based Filtering
 
 All custom metrics include these labels for account-based filtering:
+
 - `main_account` - Main account identifier from request.app.state.account.main_account
 - `subaccount_id` - Subaccount identifier from request.app.state.account.id
 
@@ -89,6 +97,7 @@ The pre-configured dashboard "Hippius S3 Overview" includes:
 6. **HTTP Response Times** - Latency monitoring with percentiles
 
 ### Dashboard Variables
+
 - `$main_account` - Filter by main account (multi-select)
 - `$subaccount_id` - Filter by subaccount (multi-select)
 
@@ -97,31 +106,37 @@ The pre-configured dashboard "Hippius S3 Overview" includes:
 ### Docker Compose Services
 
 **Prometheus** (port 9090):
+
 - Scrapes metrics from API, Redis exporter, PostgreSQL exporter
 - 30-day retention
 - Admin API enabled
 
 **Grafana** (port 3000):
+
 - Auto-provisioned Prometheus datasource
 - Pre-loaded dashboards
 - Admin user configured via environment variables
 
 **OpenTelemetry Collector** (ports 4317/4318):
+
 - Receives telemetry from FastAPI app
 - Exports to Prometheus format
 - Health check on port 13133
 
 **Redis Exporter** (port 9121):
+
 - Monitors Redis performance and queue lengths
 - Checks multipart chunk keys automatically
 
 **PostgreSQL Exporter** (port 9187):
+
 - Database connection pool metrics
 - Query performance monitoring
 
 ### Custom Metrics Collection
 
 The `BackgroundMetricsCollector` runs every 10 seconds to collect:
+
 - Redis queue lengths (`upload_requests`, `unpin_requests`)
 - Multipart chunk counts (keys matching `multipart:*:part:*`)
 - Redis memory statistics
@@ -131,16 +146,19 @@ The `BackgroundMetricsCollector` runs every 10 seconds to collect:
 ### Alerting Rules (Recommended)
 
 1. **High Error Rate**:
+
    ```promql
    rate(http_requests_total{status_code=~"5.."}[5m]) > 0.1
    ```
 
 2. **High Queue Length**:
+
    ```promql
    queue_length > 1000
    ```
 
 3. **Low Disk Space**:
+
    ```promql
    redis_memory_used_bytes / redis_memory_max_bytes > 0.9
    ```
@@ -162,10 +180,12 @@ The `BackgroundMetricsCollector` runs every 10 seconds to collect:
 ### Common Issues
 
 1. **Metrics not appearing in Grafana**:
+
    - Check Prometheus targets at http://localhost:9090/targets
    - Verify OpenTelemetry collector logs: `docker logs hippius-otel-collector`
 
 2. **High Redis memory usage**:
+
    - Check multipart chunk cleanup
    - Monitor `multipart_chunks_redis_total` metric
 
@@ -190,11 +210,13 @@ docker logs hippius-otel-collector
 ### Security Considerations
 
 1. **Change default passwords**:
+
    ```bash
    export GRAFANA_ADMIN_PASSWORD=$(openssl rand -base64 32)
    ```
 
 2. **Restrict network access**:
+
    - Bind Grafana to internal network only
    - Use reverse proxy with authentication
 
