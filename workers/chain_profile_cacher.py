@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hippius_s3.config import get_config
+from hippius_s3.logging_config import setup_loki_logging
 from workers.substrate import SubstrateClient
 from workers.substrate import get_all_storage_requests
 
@@ -25,9 +26,7 @@ from workers.substrate import get_all_storage_requests
 load_dotenv()
 config = get_config()
 
-# Set logging level based on config
-log_level = getattr(logging, config.log_level.upper(), logging.INFO)
-logging.basicConfig(level=log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+setup_loki_logging(config, "chain-profile-cacher")
 logger = logging.getLogger(__name__)
 
 
@@ -45,15 +44,27 @@ async def get_all_unique_users(
 
 
 async def fetch_profile_content(http_client: httpx.AsyncClient, cid: str, gateway_url: str) -> dict:
-    """Fetch user profile parquet content from IPFS gateway with timeout."""
     url = f"{gateway_url}/ipfs/{cid}"
     response = await http_client.get(url)
 
     if response.status_code == 200:
-        df = pd.read_parquet(io.BytesIO(response.content))
-        profile_data = df.to_dict(orient="records")
-        logger.debug(f"Successfully fetched profile content for CID {cid}")
-        return profile_data
+        try:
+            df = pd.read_parquet(io.BytesIO(response.content))
+            profile_data = df.to_dict(orient="records")
+            logger.debug(f"Successfully fetched profile content for CID {cid}")
+            return profile_data
+        except Exception as e:
+            if "ArrowInvalid" in str(type(e).__name__) or "Parquet magic bytes not found" in str(e):
+                logger.info(f"Parquet read failed for {cid}, attempting JSON fallback")
+                try:
+                    profile_data = json.loads(response.content)
+                    logger.debug(f"Successfully parsed profile as JSON for CID {cid}")
+                    return profile_data
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse {cid} as both Parquet and JSON")
+                    return {}
+            logger.error(f"Unexpected error reading profile {cid}: {e}")
+            return {}
     logger.warning(f"Failed to fetch profile {cid}: HTTP {response.status_code}")
     return {}
 

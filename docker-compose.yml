@@ -1,16 +1,17 @@
 services:
   base:
     image: hippius-s3-base:latest
+    profiles:
+      - build-base
     build:
       context: .
       dockerfile: Dockerfile.base
-    profiles:
-      - build-base
 
   api:
-    build: .
+    build:
+      context: .
     ports:
-      - "8000:8000"
+      - "${HOST_BIND_IP:-127.0.0.1}:8000:8000"
     env_file:
       - .env
     depends_on:
@@ -31,13 +32,16 @@ services:
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
-      - UVICORN_LOG_LEVEL=debug
       - DEBUG=true
       - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - REDIS_CHAIN_URL=redis://redis-chain:6379/0
       - HIPPIUS_DLQ_DIR=/tmp/hippius_dlq
       - HIPPIUS_DLQ_ARCHIVE_DIR=/tmp/hippius_dlq_archive
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
+      - ASGI_SERVER=uvicorn
+      - ASGI_WORKERS=1
     networks:
       - hippius_net
 
@@ -134,7 +138,6 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["watchfiles", "--filter", "python", "python workers/run_uploader_in_loop.py"]
     env_file:
       - .env
     depends_on:
@@ -149,6 +152,10 @@ services:
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - HIPPIUS_DLQ_DIR=/tmp/hippius_dlq
       - HIPPIUS_DLQ_ARCHIVE_DIR=/tmp/hippius_dlq_archive
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
+      - WORKER_SCRIPT=workers/run_uploader_in_loop.py
+      - ENABLE_WATCHFILES=true
     volumes:
       - .:/app
       - /var/lib/hippius/dlq:/tmp/hippius_dlq
@@ -160,7 +167,6 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["watchfiles", "--filter", "python", "python workers/run_substrate_in_loop.py"]
     env_file:
       - .env
     depends_on:
@@ -174,6 +180,10 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
+      - WORKER_SCRIPT=workers/run_substrate_in_loop.py
+      - ENABLE_WATCHFILES=true
     volumes:
       - .:/app
     networks:
@@ -183,7 +193,6 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["watchfiles", "--filter", "python", "python workers/run_unpinner_in_loop.py"]
     env_file:
       - .env
     depends_on:
@@ -198,6 +207,10 @@ services:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
+      - WORKER_SCRIPT=workers/run_unpinner_in_loop.py
+      - ENABLE_WATCHFILES=true
     networks:
       - hippius_net
 
@@ -205,7 +218,6 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["watchfiles", "--filter", "python", "python workers/run_downloader_in_loop.py"]
     env_file:
       - .env
     depends_on:
@@ -219,6 +231,10 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
+      - WORKER_SCRIPT=workers/run_downloader_in_loop.py
+      - ENABLE_WATCHFILES=true
     networks:
       - hippius_net
 
@@ -226,7 +242,6 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["watchfiles", "--filter", "python", "python workers/chain_pin_checker.py"]
     env_file:
       - .env
     depends_on:
@@ -240,6 +255,10 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_CHAIN_URL=redis://redis-chain:6379/0
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
+      - WORKER_SCRIPT=workers/chain_pin_checker.py
+      - ENABLE_WATCHFILES=true
     networks:
       - hippius_net
 
@@ -247,7 +266,6 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
-    command: ["watchfiles", "--filter", "python", "python workers/chain_profile_cacher.py"]
     env_file:
       - .env
     depends_on:
@@ -261,6 +279,10 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_CHAIN_URL=redis://redis-chain:6379/0
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
+      - WORKER_SCRIPT=workers/chain_profile_cacher.py
+      - ENABLE_WATCHFILES=true
     networks:
       - hippius_net
 

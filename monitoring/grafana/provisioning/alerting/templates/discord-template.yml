@@ -1,0 +1,16 @@
+apiVersion: 1
+
+templates:
+  - name: discord.title
+    template: |
+      {{ if eq .Status "firing" }}🚨 ALERT FIRING{{ else }}✅ RESOLVED{{ end }}
+
+  - name: discord.message
+    template: |
+      {{ range .Alerts -}}
+      Alert: {{ .Labels.alertname }}
+      Severity: {{ .Labels.severity }}
+      Status: {{ .Status }}
+      {{ if .Annotations.summary }}Summary: {{ .Annotations.summary }}{{ end }}
+      {{ if .Annotations.description }}Description: {{ .Annotations.description }}{{ end }}
+      {{ end -}}

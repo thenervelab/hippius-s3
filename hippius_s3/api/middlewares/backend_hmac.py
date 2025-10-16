@@ -207,7 +207,7 @@ async def verify_hmac_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
-    exempt_paths = ["/docs", "/openapi.json", "/user/", "/robots.txt"]
+    exempt_paths = ["/docs", "/openapi.json", "/user/", "/robots.txt", "/metrics"]
 
     if request.method == "OPTIONS":
         return await call_next(request)

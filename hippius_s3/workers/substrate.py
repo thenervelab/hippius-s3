@@ -15,6 +15,7 @@ from substrateinterface import Keypair
 from substrateinterface import SubstrateInterface
 from substrateinterface.exceptions import SubstrateRequestException
 
+from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import SubstratePinningRequest
 
 
@@ -44,7 +45,10 @@ class SubstrateWorker:
         logger.info(f"Connected to substrate {self.config.substrate_url} using account {self.keypair.ss58_address}")
 
     async def _upload_file_list_to_ipfs(self, file_list: List[Dict[str, str]]) -> str:
-        files_json = json.dumps(file_list, indent=2)
+        files_json = json.dumps(
+            file_list,
+            indent=2,
+        )
         logger.debug(f"Uploading file list with {len(file_list)} entries to IPFS")
 
         url = f"{self.config.ipfs_store_url.rstrip('/')}/api/v0/add"
@@ -118,7 +122,7 @@ class SubstrateWorker:
         file_list_start = time.time()
         calls = []
         for user_address, cids in user_cid_map.items():
-            file_list = [{"file_hash": cid, "file_name": f"s3-{cid}"} for cid in cids]
+            file_list = [{"cid": cid, "filename": f"s3-{cid}"} for cid in cids]
 
             file_list_cid = await self._upload_file_list_to_ipfs(file_list)
             logger.info(f"Uploaded {file_list_cid=}")
@@ -186,7 +190,26 @@ class SubstrateWorker:
                 )
                 logger.info(f"Updated object status to 'uploaded' object_id={req.object_id}")
 
+            for user_address, user_requests in user_request_map.items():
+                total_cids = sum(len(r.cids) for r in user_requests)
+                get_metrics_collector().record_substrate_operation(
+                    main_account=user_address,
+                    success=True,
+                    num_cids=total_cids,
+                    duration=total_duration,
+                )
+
             return True
 
         logger.error(f"Batched transaction failed: {error_msg}")
+
+        for user_address, user_requests in user_request_map.items():
+            total_cids = sum(len(r.cids) for r in user_requests)
+            get_metrics_collector().record_substrate_operation(
+                main_account=user_address,
+                success=False,
+                num_cids=total_cids,
+                duration=time.time() - start_time,
+            )
+
         raise SubstrateRequestException(f"Transaction failed: {error_msg}")

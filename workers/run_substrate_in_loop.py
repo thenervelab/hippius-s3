@@ -13,6 +13,9 @@ from redis.exceptions import BusyLoadingError
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hippius_s3.config import get_config
+from hippius_s3.logging_config import setup_loki_logging
+from hippius_s3.monitoring import get_metrics_collector
+from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.queue import dequeue_substrate_request
 from hippius_s3.queue import enqueue_substrate_retry_request
 from hippius_s3.queue import move_substrate_due_retries_to_primary
@@ -22,14 +25,15 @@ from hippius_s3.workers.substrate import compute_substrate_backoff_ms
 
 config = get_config()
 
-log_level = getattr(logging, config.log_level.upper(), logging.INFO)
-logging.basicConfig(level=log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+setup_loki_logging(config, "substrate")
 logger = logging.getLogger(__name__)
 
 
 async def run_substrate_loop():
     db = await asyncpg.connect(config.database_url)
     redis_client = async_redis.from_url(config.redis_url)
+
+    initialize_metrics_collector(redis_client)
 
     logger.info("Starting substrate service...")
     logger.info(f"Redis URL: {config.redis_url}")
@@ -42,7 +46,11 @@ async def run_substrate_loop():
 
     while True:
         try:
-            moved = await move_substrate_due_retries_to_primary(redis_client, now_ts=time.time(), max_items=64)
+            moved = await move_substrate_due_retries_to_primary(
+                redis_client,
+                now_ts=time.time(),
+                max_items=64,
+            )
             if moved:
                 logger.info(f"Moved {moved} due substrate retry requests back to primary queue")
         except BusyLoadingError:
@@ -104,6 +112,11 @@ async def run_substrate_loop():
                             await enqueue_substrate_retry_request(
                                 req, redis_client, delay_seconds=delay_ms / 1000.0, last_error=err_str
                             )
+                            get_metrics_collector().record_substrate_operation(
+                                main_account=req.address,
+                                success=False,
+                                attempt=attempts_next,
+                            )
                     else:
                         for req in pending_requests:
                             await db.execute("UPDATE objects SET status = 'failed' WHERE object_id = $1", req.object_id)
@@ -128,10 +141,17 @@ async def run_substrate_loop():
                         for req in pending_requests:
                             attempts_next = (req.attempts or 0) + 1
                             delay_ms = compute_substrate_backoff_ms(
-                                attempts_next, config.substrate_retry_base_ms, config.substrate_retry_max_ms
+                                attempts_next,
+                                config.substrate_retry_base_ms,
+                                config.substrate_retry_max_ms,
                             )
                             await enqueue_substrate_retry_request(
                                 req, redis_client, delay_seconds=delay_ms / 1000.0, last_error=err_str
+                            )
+                            get_metrics_collector().record_substrate_operation(
+                                main_account=req.address,
+                                success=False,
+                                attempt=attempts_next,
                             )
                     else:
                         for req in pending_requests:

@@ -35,6 +35,9 @@ jobs:
           STAGING_PATH: ${{ secrets.STAGING_PATH }}
           STAGING_DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
           REPO_URL: "git@github.com:${{ github.repository }}.git"
+          GRAFANA_ADMIN_USER: ${{ secrets.GRAFANA_ADMIN_USER }}
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           # Deploy directly via SSH commands
           ssh ${STAGING_USER}@${STAGING_IP} << EOF
@@ -64,15 +67,19 @@ jobs:
             # Ensure external Docker network exists
             docker network inspect hippius_net >/dev/null 2>&1 || docker network create hippius_net
             echo "Building and starting Docker containers with staging config..."
-            docker compose -f docker-compose.yml -f docker-compose.staging.yml down || true
-            docker compose -f docker-compose.yml -f docker-compose.staging.yml build --no-cache
-            docker compose -f docker-compose.yml -f docker-compose.staging.yml up -d
+            export GRAFANA_ADMIN_USER="${GRAFANA_ADMIN_USER}"
+            export GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD}"
+            export DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL}"
+            docker compose -f docker-compose.yml -f docker-compose.staging.yml -f docker-compose.monitoring.yml down || true
+            docker compose --profile build-base -f docker-compose.yml -f docker-compose.staging.yml -f docker-compose.monitoring.yml build --no-cache base
+            docker compose -f docker-compose.yml -f docker-compose.staging.yml -f docker-compose.monitoring.yml build --no-cache
+            docker compose -f docker-compose.yml -f docker-compose.staging.yml -f docker-compose.monitoring.yml up -d
 
             echo "Waiting for database to be ready..."
             sleep 10
 
             echo "Running database migrations..."
-            docker compose -f docker-compose.yml -f docker-compose.staging.yml exec -T api dbmate up
+            docker compose -f docker-compose.yml -f docker-compose.staging.yml -f docker-compose.monitoring.yml exec -T api dbmate up
 
             echo "Staging deployment completed successfully!"
 
@@ -82,4 +89,4 @@ jobs:
           STAGING_USER: ${{ secrets.STAGING_USER }}
           STAGING_PATH: ${{ secrets.STAGING_PATH }}
         run: |
-          ssh ${STAGING_USER}@${STAGING_IP} "cd ${STAGING_PATH} && docker compose -f docker-compose.yml -f docker-compose.staging.yml ps"
+          ssh ${STAGING_USER}@${STAGING_IP} "cd ${STAGING_PATH} && docker compose -f docker-compose.yml -f docker-compose.staging.yml -f docker-compose.monitoring.yml ps"

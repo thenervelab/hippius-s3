@@ -15,6 +15,7 @@ from hippius_s3.api.s3.common import parse_range
 from hippius_s3.api.s3.common import parse_read_mode
 from hippius_s3.api.s3.range_utils import parse_range_header
 from hippius_s3.config import get_config
+from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.services.manifest_service import ManifestService
 from hippius_s3.services.object_reader import DownloadNotReadyError
 from hippius_s3.utils import get_query
@@ -179,7 +180,7 @@ async def handle_get_object(
         # For anonymous reads, avoid passing any client seed; decrypter uses server-side keys for v2+
         resolved_seed = "" if is_anonymous else getattr(request.state, "seed_phrase", "")
 
-        return await read_response(
+        response = await read_response(
             db=db,
             redis=request.app.state.redis_client,
             obj_cache=request.app.state.obj_cache,
@@ -191,8 +192,37 @@ async def handle_get_object(
             range_was_invalid=range_was_invalid,
         )
 
+        if response.status_code in (200, 206):
+            bytes_transferred = int(object_info["size_bytes"])
+            if range_header and start_byte is not None and end_byte is not None:
+                bytes_transferred = end_byte - start_byte + 1
+
+            get_metrics_collector().record_s3_operation(
+                operation="get_object",
+                bucket_name=bucket_name,
+                main_account=account.main_account if account else None,
+                subaccount_id=account.id if account else None,
+                success=True,
+            )
+            get_metrics_collector().record_data_transfer(
+                operation="get_object",
+                bytes_transferred=bytes_transferred,
+                bucket_name=bucket_name,
+                main_account=account.main_account if account else None,
+                subaccount_id=account.id if account else None,
+            )
+
+        return response
+
     except errors.S3Error as e:
         logger.exception(f"S3 Error getting object {bucket_name}/{object_key}: {e.message}")
+        account = getattr(request.state, "account", None)
+        get_metrics_collector().record_error(
+            error_type=e.code,
+            operation="get_object",
+            bucket_name=bucket_name,
+            main_account=account.main_account if account else None,
+        )
         return errors.s3_error_response(
             code=e.code,
             message=e.message,
@@ -200,12 +230,18 @@ async def handle_get_object(
         )
 
     except DownloadNotReadyError as e:
-        # Map download readiness issues to 503 SlowDown response
         error_msg = str(e)
         if "Parts not ready" in error_msg:
             logger.warning(f"GET {bucket_name}/{object_key}: parts not ready for download: {error_msg}")
         else:
             logger.warning(f"GET {bucket_name}/{object_key}: download not ready: {error_msg}")
+        account = getattr(request.state, "account", None)
+        get_metrics_collector().record_error(
+            error_type="download_not_ready",
+            operation="get_object",
+            bucket_name=bucket_name,
+            main_account=account.main_account if account else None,
+        )
         return errors.s3_error_response(
             code="SlowDown",
             message="Object not ready for download yet. Please retry.",
@@ -215,6 +251,13 @@ async def handle_get_object(
 
     except Exception as e:
         logger.exception(f"Error getting object {bucket_name}/{object_key}: {e}")
+        account = getattr(request.state, "account", None)
+        get_metrics_collector().record_error(
+            error_type="internal_error",
+            operation="get_object",
+            bucket_name=bucket_name,
+            main_account=account.main_account if account else None,
+        )
         return errors.s3_error_response(
             code="InternalError",
             message=f"We encountered an internal error: {str(e)}. Please try again.",

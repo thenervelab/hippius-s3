@@ -19,17 +19,17 @@ import asyncpg
 
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
+from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import dequeue_download_request
 from hippius_s3.utils import get_query
 from hippius_s3.utils.timing import log_timing
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-
-
 config = get_config()
+
+setup_loki_logging(config, "downloader")
+logger = logging.getLogger(__name__)
 
 
 async def process_download_request(
