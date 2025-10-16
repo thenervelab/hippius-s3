@@ -1,13 +1,20 @@
 """User API endpoints for frontend JSON responses."""
 
 import base64
+import hashlib
+import hmac
 import logging
+from datetime import datetime
+from datetime import timezone
 from typing import Optional
+from urllib.parse import quote
+from urllib.parse import urlencode
 
 from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import HTTPException
 from fastapi import Query
+from fastapi import Request
 from fastapi.responses import JSONResponse
 from hippius_sdk.substrate import SubstrateClient
 from starlette import status
@@ -63,6 +70,110 @@ async def list_buckets(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to list buckets",
         ) from e
+
+
+@router.get("/presign_url")
+async def presign_url(
+    request: Request,
+    method: str = Query("GET", description="HTTP method to presign: GET|PUT|HEAD|DELETE"),
+    bucket_name: str = Query(..., description="Bucket name"),
+    object_key: str = Query(..., description="Object key (path)"),
+    expires: int = Query(900, description="Expiry in seconds, max 7 days"),
+) -> JSONResponse:
+    """Generate an AWS SigV4 presigned URL for S3-compatible access.
+
+    This endpoint requires SigV4 on the request so the server derives the seed
+    from the Authorization header; no seed phrase is accepted via parameters.
+    """
+    try:
+        # Validate method
+        method = method.upper()
+        if method not in {"GET", "PUT", "HEAD", "DELETE"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported method")
+
+        # Determine seed phrase to sign with
+        seed_phrase = getattr(request.state, "seed_phrase", "")
+        if not seed_phrase:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Authentication required")
+
+        # Cap expiry to AWS maximum (7 days)
+        if expires <= 0:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="expires must be > 0")
+        max_expires = 7 * 24 * 3600
+        if expires > max_expires:
+            expires = max_expires
+
+        # Prepare SigV4 elements
+        host = (
+            request.headers.get("x-forwarded-host")
+            or request.headers.get("x-original-host")
+            or request.headers.get("host", "localhost:8000")
+        )
+        scheme = "https" if request.headers.get("x-forwarded-proto", "http") == "https" else "http"
+        region = config.validator_region
+        service = "s3"
+        now = datetime.now(timezone.utc)
+        amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+        date_scope = now.strftime("%Y%m%d")
+
+        # Access key is base64-encoded seed phrase, like our SigV4 header flow
+        access_key = base64.b64encode(seed_phrase.encode()).decode()
+        credential = f"{access_key}/{date_scope}/{region}/{service}/aws4_request"
+
+        # Signed headers for presign: host only is sufficient for GET/PUT/HEAD/DELETE
+        signed_headers = "host"
+
+        # Build canonical request pieces
+        # Encode per S3 SigV4 rules (RFC3986). Keep '/', don't encode -_.~
+        path = f"/{bucket_name}/{quote(object_key, safe='/-_.~')}"
+        q_params = {
+            "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+            "X-Amz-Credential": credential,
+            "X-Amz-Date": amz_date,
+            "X-Amz-Expires": str(expires),
+            "X-Amz-SignedHeaders": signed_headers,
+        }
+        canonical_qs = urlencode(sorted(q_params.items()), quote_via=quote, safe="-_.~")
+        canonical_headers = f"host:{host}\n"
+        payload_hash = "UNSIGNED-PAYLOAD"
+        canonical_request = "\n".join([method, path, canonical_qs, canonical_headers, "", signed_headers, payload_hash])
+
+        # String to sign
+        credential_scope = f"{date_scope}/{region}/{service}/aws4_request"
+        hashed_canonical_request = hashlib.sha256(canonical_request.encode()).hexdigest()
+        string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{hashed_canonical_request}"
+
+        # Derive signing key from seed phrase
+        def _sign(key: bytes, msg: str) -> bytes:
+            return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+        k_secret = ("AWS4" + seed_phrase).encode("utf-8")
+        k_date = _sign(k_secret, date_scope)
+        k_region = _sign(k_date, region)
+        k_service = _sign(k_region, service)
+        k_signing = _sign(k_service, "aws4_request")
+        signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+        # Final presigned URL
+        q_params["X-Amz-Signature"] = signature
+        # Align final presign URL encoding with canonicalization for parity
+        final_qs = urlencode(sorted(q_params.items()), quote_via=quote, safe="-_.~")
+        url = f"{scheme}://{host}{path}?{final_qs}"
+
+        return JSONResponse(
+            {
+                "url": url,
+                "method": method,
+                "expires_in": expires,
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Error generating presigned URL for {bucket_name}/{object_key}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate presigned URL"
+        ) from None
 
 
 @router.get("/get_bucket_location")

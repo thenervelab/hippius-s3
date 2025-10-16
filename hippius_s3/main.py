@@ -247,9 +247,12 @@ Disallow: /"""
     app.include_router(s3_router_new, prefix="")
     app.include_router(multipart_router, prefix="")
 
-    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    try:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor  # type: ignore
 
-    FastAPIInstrumentor.instrument_app(app)
+        FastAPIInstrumentor.instrument_app(app)
+    except Exception:
+        logger.info("OpenTelemetry FastAPI instrumentation not available; skipping")
 
     return app
 

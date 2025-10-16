@@ -134,6 +134,70 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
             capture_output=True,
         )
 
+    # Ensure shared base image exists and images are built before bringing services up
+    try:
+        base_probe = subprocess.run(["docker", "image", "inspect", "hippius-s3-base:latest"], check=False)
+        if base_probe.returncode != 0:
+            # Build base image once (cached on subsequent runs)
+            service_dir = Path(project_root) / "hippius-s3"
+            build_base = subprocess.run(
+                [
+                    "docker",
+                    "build",
+                    "-f",
+                    "Dockerfile.base",
+                    "-t",
+                    "hippius-s3-base:latest",
+                    ".",
+                ],
+                cwd=str(service_dir),
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            if build_base.returncode != 0:
+                try:
+                    artifacts_dir = Path(project_root) / "artifacts"
+                    artifacts_dir.mkdir(parents=True, exist_ok=True)
+                    (artifacts_dir / "build_base.stdout.txt").write_text(build_base.stdout or "")
+                    (artifacts_dir / "build_base.stderr.txt").write_text(build_base.stderr or "")
+                except Exception:
+                    pass
+                raise RuntimeError("docker build base image failed; see artifacts/build_base.stderr.txt for details")
+
+        # Build all compose images, including the base profile
+        build_result = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                "docker-compose.yml",
+                "-f",
+                "docker-compose.e2e.yml",
+                "--profile",
+                "build-base",
+                "build",
+            ],
+            env=env,
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+        )
+        if build_result.returncode != 0:
+            try:
+                artifacts_dir = Path(project_root) / "artifacts"
+                artifacts_dir.mkdir(parents=True, exist_ok=True)
+                (artifacts_dir / "compose_build.stdout.txt").write_text(build_result.stdout or "")
+                (artifacts_dir / "compose_build.stderr.txt").write_text(build_result.stderr or "")
+            except Exception:
+                pass
+            raise RuntimeError("docker compose build failed; see artifacts/compose_build.stderr.txt for details")
+    except RuntimeError:
+        raise
+    except Exception:
+        # Do not hard-fail on unexpected build errors; compose up may still succeed locally
+        pass
+
     # Determine if environment is already running (any container for this project)
     ps = compose_cmd(["ps", "-q"])
     already_running = ps.returncode == 0 and bool(ps.stdout.strip())
@@ -150,6 +214,7 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
             "up",
             "-d",
             "--wait",
+            "--build",
         ]
         result = subprocess.run(up_cmd, env=env, cwd=project_root, capture_output=True, text=True)
         if result.returncode != 0:
@@ -167,21 +232,29 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
         print("Waiting for services to be ready...")
         time.sleep(10)
 
-    # Health check for API service
+    # Health check for API service:
+    # If endpoint is localhost, perform HTTP probe; otherwise rely on `--wait` and proceed.
+    from urllib.parse import urlparse
+
     import requests  # type: ignore[import-untyped]
 
-    max_retries = 10
-    for attempt in range(max_retries):
-        try:
-            response = requests.get("http://localhost:8000/", timeout=5)
-            if response.status_code in [200, 400, 403]:  # API is responding
-                print("API service is ready")
-                break
-        except requests.exceptions.RequestException:
-            print(f"API not ready yet, attempt {attempt + 1}/{max_retries}")
-            time.sleep(5)
+    endpoint = os.getenv("S3_ENDPOINT_URL", "http://localhost:8000")
+    parsed = urlparse(endpoint)
+    if parsed.hostname in {"localhost", "127.0.0.1"}:
+        max_retries = 10
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(endpoint + "/robots.txt", timeout=5)
+                if response.status_code in [200, 400, 403]:
+                    print("API service is ready")
+                    break
+            except requests.exceptions.RequestException:
+                print(f"API not ready yet, attempt {attempt + 1}/{max_retries}")
+                time.sleep(5)
+        else:
+            raise RuntimeError("API service failed to start within timeout")
     else:
-        raise RuntimeError("API service failed to start within timeout")
+        print(f"Skipping host HTTP health check; endpoint is {endpoint}")
 
     yield
 
