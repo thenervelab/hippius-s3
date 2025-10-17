@@ -1,11 +1,11 @@
 apiVersion: 1
 
 templates:
-  - name: discord.default.title
+  - name: discord.title
     template: |
       {{ if eq .Status "firing" }}🚨 ALERT FIRING{{ else }}✅ RESOLVED{{ end }}
 
-  - name: discord.default.message
+  - name: discord.message
     template: |
       {{ range .Alerts -}}
       Alert: {{ .Labels.alertname }}

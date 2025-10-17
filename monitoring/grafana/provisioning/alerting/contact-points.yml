@@ -8,5 +8,5 @@ contactPoints:
         type: discord
         settings:
           url: ${DISCORD_WEBHOOK_URL}
-          message: '{{ template "discord.default.message" . }}'
-          title: '{{ template "discord.default.title" . }}'
+          message: '{{ template "discord.message" . }}'
+          title: '{{ template "discord.title" . }}'
