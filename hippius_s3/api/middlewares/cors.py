@@ -41,21 +41,27 @@ async def cors_middleware(
         if "Access-Control-Request-Method" in request.headers:
             response.headers["Access-Control-Allow-Methods"] = request.headers["Access-Control-Request-Method"]
 
-    # Add your other security headers...
     response.headers["X-Robots-Tag"] = "noindex, nofollow, nosnippet, noarchive"
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
 
-    # CSP and other headers...
     path = request.url.path
-    if path in ["/docs", "/redoc"] or path.startswith("/docs/"):
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: https:; frame-ancestors 'none';"
-        )
-    else:
-        response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none';"
+    is_api_endpoint = (
+        path in ["/docs", "/redoc", "/openapi.json"]
+        or path.startswith("/docs/")
+        or path.startswith("/user/")
+        or path.startswith("/metrics")
+    )
+
+    if is_api_endpoint:
+        response.headers["X-Frame-Options"] = "DENY"
+        if path in ["/docs", "/redoc"] or path.startswith("/docs/"):
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: https:; frame-ancestors 'none';"
+            )
+        else:
+            response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none';"
 
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
