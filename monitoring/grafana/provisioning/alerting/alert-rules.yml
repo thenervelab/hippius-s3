@@ -47,7 +47,7 @@ groups:
         execErrState: Error
         for: 5m
         annotations:
-          description: 'Error rate is {{ printf "%.2f" $values.B.Value }}% (threshold: 5%)'
+          description: 'Error rate is {{ if $values.B }}{{ printf "%.2f" $values.B.Value }}{{ else }}N/A{{ end }}% (threshold: 5%)'
           summary: S3 API error rate exceeds 5%
         labels:
           severity: critical
@@ -93,7 +93,7 @@ groups:
         execErrState: Error
         for: 5m
         annotations:
-          description: '5xx error rate is {{ printf "%.2f" $values.B.Value }}% (threshold: 1%)'
+          description: '5xx error rate is {{ if $values.B }}{{ printf "%.2f" $values.B.Value }}{{ else }}N/A{{ end }}% (threshold: 1%)'
           summary: Server errors exceeding 1% of requests
         labels:
           severity: critical
@@ -139,7 +139,7 @@ groups:
         execErrState: Error
         for: 3m
         annotations:
-          description: 'Redis memory usage is {{ printf "%.2f" $values.B.Value }}% (threshold: 90%)'
+          description: 'Redis memory usage is {{ if $values.B }}{{ printf "%.2f" $values.B.Value }}{{ else }}N/A{{ end }}% (threshold: 90%)'
           summary: Redis memory usage critically high
         labels:
           severity: critical
@@ -185,7 +185,7 @@ groups:
         execErrState: Error
         for: 5m
         annotations:
-          description: 'P95 response time is {{ printf "%.2f" $values.B.Value }}s (threshold: 5s)'
+          description: 'P95 response time is {{ if $values.B }}{{ printf "%.2f" $values.B.Value }}{{ else }}N/A{{ end }}s (threshold: 5s)'
           summary: API response times are degraded
         labels:
           severity: critical
@@ -231,7 +231,7 @@ groups:
         execErrState: Error
         for: 10m
         annotations:
-          description: 'Data transfer rate dropped to {{ printf "%.0f" $values.B.Value }} bytes/sec'
+          description: 'Data transfer rate dropped to {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} bytes/sec'
           summary: Data transfer rate has collapsed
         labels:
           severity: critical
@@ -282,7 +282,7 @@ groups:
         execErrState: Error
         for: 5m
         annotations:
-          description: 'Upload queue has {{ printf "%.0f" $values.B.Value }} items (threshold: 1000)'
+          description: 'Upload queue has {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} items (threshold: 1000)'
           summary: Upload processing is falling behind
         labels:
           severity: high
@@ -328,7 +328,7 @@ groups:
         execErrState: Error
         for: 5m
         annotations:
-          description: 'Substrate queue has {{ printf "%.0f" $values.B.Value }} items (threshold: 500)'
+          description: 'Substrate queue has {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} items (threshold: 500)'
           summary: Blockchain publishing is falling behind
         labels:
           severity: high
@@ -374,7 +374,7 @@ groups:
         execErrState: Error
         for: 5m
         annotations:
-          description: 'DLQ has {{ printf "%.0f" $values.B.Value }} items (threshold: 50)'
+          description: 'DLQ has {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} items (threshold: 50)'
           summary: Upload failures accumulating in DLQ
         labels:
           severity: high
@@ -420,7 +420,7 @@ groups:
         execErrState: Error
         for: 5m
         annotations:
-          description: 'Worker retry rate is {{ printf "%.2f" $values.B.Value }}% (threshold: 10%)'
+          description: 'Worker retry rate is {{ if $values.B }}{{ printf "%.2f" $values.B.Value }}{{ else }}N/A{{ end }}% (threshold: 10%)'
           summary: High rate of transient upload failures
         labels:
           severity: high
@@ -466,7 +466,7 @@ groups:
         execErrState: Error
         for: 5m
         annotations:
-          description: 'Substrate failure rate is {{ printf "%.2f" $values.B.Value }}% (threshold: 5%)'
+          description: 'Substrate failure rate is {{ if $values.B }}{{ printf "%.2f" $values.B.Value }}{{ else }}N/A{{ end }}% (threshold: 5%)'
           summary: Blockchain integration experiencing failures
         labels:
           severity: high
@@ -512,7 +512,7 @@ groups:
         execErrState: Error
         for: 5m
         annotations:
-          description: 'IPFS failure rate is {{ printf "%.2f" $values.B.Value }}% (threshold: 10%)'
+          description: 'IPFS failure rate is {{ if $values.B }}{{ printf "%.2f" $values.B.Value }}{{ else }}N/A{{ end }}% (threshold: 10%)'
           summary: IPFS connectivity or storage issues
         labels:
           severity: high
@@ -563,7 +563,7 @@ groups:
         execErrState: Error
         for: 10m
         annotations:
-          description: 'Cache hit ratio is {{ printf "%.2f" $values.B.Value }}% (threshold: 50%)'
+          description: 'Cache hit ratio is {{ if $values.B }}{{ printf "%.2f" $values.B.Value }}{{ else }}N/A{{ end }}% (threshold: 50%)'
           summary: Poor cache performance detected
         labels:
           severity: medium
@@ -609,7 +609,7 @@ groups:
         execErrState: Error
         for: 30m
         annotations:
-          description: '{{ printf "%.0f" $values.B.Value }} multipart uploads active for >30min'
+          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} multipart uploads active for >30min'
           summary: Large uploads may be stalled
         labels:
           severity: medium
@@ -655,7 +655,7 @@ groups:
         execErrState: Error
         for: 5m
         annotations:
-          description: 'Account has {{ printf "%.0f" $values.B.Value }} errors/min (threshold: 50)'
+          description: 'Account has {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} errors/min (threshold: 50)'
           summary: Specific account experiencing high error rate
         labels:
           severity: medium
@@ -701,7 +701,7 @@ groups:
         execErrState: Error
         for: 15m
         annotations:
-          description: 'Unpinner queue has {{ printf "%.0f" $values.B.Value }} items (threshold: 500)'
+          description: 'Unpinner queue has {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} items (threshold: 500)'
           summary: Cleanup falling behind
         labels:
           severity: medium
