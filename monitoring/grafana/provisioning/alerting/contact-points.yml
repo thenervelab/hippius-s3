@@ -5,7 +5,8 @@ contactPoints:
     name: discord-alerts
     receivers:
       - uid: discord-webhook
-        type: webhook
+        type: discord
         settings:
           url: ${DISCORD_WEBHOOK_URL}
-          httpMethod: POST
+          message: '{{ template "discord.default.message" . }}'
+          title: '{{ template "discord.default.title" . }}'
