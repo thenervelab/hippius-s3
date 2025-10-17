@@ -10,8 +10,6 @@ services:
     build: .
     # Ensure CI does not depend on a local .env file
     env_file: []
-    ports:
-      - "8000:8000"
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable

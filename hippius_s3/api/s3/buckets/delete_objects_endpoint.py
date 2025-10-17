@@ -117,6 +117,11 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                             should_encrypt=not bucket["is_public"],
                             cid=str(deleted_object["ipfs_cid"]),
                             object_id=str(deleted_object["object_id"]) if deleted_object.get("object_id") else "",
+                            object_version=int(
+                                deleted_object.get("object_version")
+                                or deleted_object.get("current_object_version")
+                                or 1
+                            ),
                         ),
                         redis_client=redis_client,
                     )

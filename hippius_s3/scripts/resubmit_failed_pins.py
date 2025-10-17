@@ -102,6 +102,7 @@ async def main() -> None:
                 object_key=object_key,
                 should_encrypt=should_encrypt,
                 object_id=object_id,
+                object_version=1,
                 chunks=[Chunk(id=1)],
                 upload_id=None,
             )

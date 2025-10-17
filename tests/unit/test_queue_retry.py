@@ -26,6 +26,7 @@ async def test_enqueue_retry_request_sets_attempts_and_schedules() -> None:
         object_key="test-key",
         should_encrypt=False,
         object_id="obj-123",
+        object_version=1,
         chunks=[Chunk(id=1)],
         upload_id=None,
         attempts=1,

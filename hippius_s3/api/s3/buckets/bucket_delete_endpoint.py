@@ -139,6 +139,7 @@ async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redi
                         should_encrypt=False,  # Not needed for unpin
                         object_id=str(obj["object_id"]),
                         cid=obj["ipfs_cid"],
+                        object_version=obj.get("current_object_version"),
                     ),
                     redis_client=redis_client,
                 )

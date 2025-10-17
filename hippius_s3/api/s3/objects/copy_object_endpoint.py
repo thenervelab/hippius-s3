@@ -166,6 +166,7 @@ async def handle_copy_object(
             req = DownloadChainRequest(
                 request_id=f"{src_info.object_id}::copy",
                 object_id=src_info.object_id,
+                object_version=int(src_obj_row.get("current_object_version") or 1),
                 object_key=source_object_key,
                 bucket_name=source_bucket_name,
                 address=request.state.account.main_account,
