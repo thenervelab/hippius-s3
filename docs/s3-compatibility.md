@@ -105,6 +105,7 @@ Notes:
 | PutBucketVersioning                             |           |                                                            |                                               |                                                                      |
 | PutBucketWebsite                                |           |                                                            |                                               |                                                                      |
 | PutObject                                       | ✔         | MD5 as ETag; x-amz-meta-\*                                 | PUT /{bucket}/{key}                           | test_PutObject.py, test_PutObject_Metadata.py                        |
+| PresignedUrl (SigV4 query params)               | ✔         |                                                            |                                               | test_PresignedUrl.py                                                 |
 | PutObjectAcl                                    |           |                                                            |                                               |                                                                      |
 | PutObjectLegalHold                              |           |                                                            |                                               |                                                                      |
 | PutObjectLockConfiguration                      |           |                                                            |                                               |                                                                      |
@@ -126,6 +127,7 @@ Notes:
 
   - HMAC SigV4 via custom credentials (seed phrase based)
   - Path-style addressing
+  - Presigned URLs (SigV4 via query params)
 
 - **Bucket operations**
 
@@ -161,6 +163,7 @@ Notes:
   - `PUT /{bucket}/{key}` — Upload object (stores metadata, content type, MD5 as ETag)
   - `GET /{bucket}/{key}` — Download object (supports Range requests; returns S3-like headers)
   - `HEAD /{bucket}/{key}` — Object metadata (size, content type, ETag, Last-Modified)
+  - Presigned URLs: Supported for GET, PUT, and HEAD.
   - `x-amz-object-status` on HEAD (if present):
     - `uploaded` — object uploaded and available
     - `pinning` — publishing/pinning in progress
