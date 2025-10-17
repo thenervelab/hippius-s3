@@ -86,6 +86,7 @@ class Uploader:
         manifest_cid = await self._build_and_upload_manifest(
             object_id=payload.object_id,
             object_key=payload.object_key,
+            version_seq=int(payload.version_seq or 1),
         )
         manifest_duration = time.time() - manifest_start
 
@@ -332,6 +333,7 @@ class Uploader:
         self,
         object_id: str,
         object_key: str,
+        version_seq: int,
     ) -> str:
         logger.debug(f"Building manifest for object_id={object_id}")
 
@@ -400,14 +402,6 @@ class Uploader:
         cid_row = await self.db.fetchrow(get_query("upsert_cid"), manifest_cid)
         cid_id = cid_row["id"] if cid_row else None
 
-        # Write manifest CID and status to a specific version row (avoid implicit current_version_seq)
-        # Resolve version_seq for this object once
-        version_seq_row = await self.db.fetchrow(
-            "SELECT current_version_seq FROM objects WHERE object_id = $1",
-            object_id,
-        )
-        version_seq_value = int(version_seq_row[0]) if version_seq_row else 1
-
         await self.db.execute(
             """
             UPDATE object_versions
@@ -417,7 +411,7 @@ class Uploader:
             WHERE object_id = $1 AND version_seq = $2
             """,
             object_id,
-            version_seq_value,
+            version_seq,
             manifest_cid,
             cid_id,
         )

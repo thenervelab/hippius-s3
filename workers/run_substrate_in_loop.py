@@ -75,9 +75,9 @@ async def run_substrate_loop():
             if not config.publish_to_chain:
                 logger.info(f"Skipping substrate publish (disabled) object_id={substrate_request.object_id}")
                 await db.execute(
-                    "UPDATE object_versions SET status = 'published' WHERE object_id = $1 AND version_seq = $2",
+                    "UPDATE object_versions SET status = 'uploaded' WHERE object_id = $1 AND version_seq = $2",
                     substrate_request.object_id,
-                    int(getattr(substrate_request, "version_seq")),
+                    int(getattr(substrate_request, "version_seq", 1) or 1),
                 )
                 continue
 
