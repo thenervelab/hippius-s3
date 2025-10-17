@@ -36,7 +36,7 @@ class ChainRequest(BaseModel):
     bucket_name: str
     object_key: str
     # Deprecated: retained for backward compatibility; uploads are pre-encrypted
-    should_encrypt: bool | None = None
+    should_encrypt: bool = False
     object_id: str
 
     # Retry & tracing metadata
