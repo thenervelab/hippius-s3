@@ -3,13 +3,15 @@
 WITH object_info AS (
     SELECT
         o.object_id,
-        o.multipart,
-        o.cid_id as simple_cid_id,
+        ov.multipart,
+        ov.cid_id as simple_cid_id,
         b.is_public,
-        c.cid as simple_cid
+        c.cid as simple_cid,
+        ov.version_seq as version_seq
     FROM objects o
+    JOIN object_versions ov ON ov.object_id = o.object_id AND ov.version_seq = o.current_version_seq
     JOIN buckets b ON o.bucket_id = b.bucket_id
-    LEFT JOIN cids c ON o.cid_id = c.id
+    LEFT JOIN cids c ON ov.cid_id = c.id
     WHERE b.bucket_name = $1
       AND o.object_key = $2
       AND b.main_account_id = $3
@@ -21,7 +23,7 @@ multipart_chunks AS (
         p.size_bytes,
         oi.object_id
     FROM object_info oi
-    JOIN parts p ON p.object_id = oi.object_id
+    JOIN parts p ON p.object_id = oi.object_id AND p.object_version_seq = oi.version_seq
     JOIN cids c ON p.cid_id = c.id
     WHERE oi.multipart = TRUE
     ORDER BY p.part_number ASC

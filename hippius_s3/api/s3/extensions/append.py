@@ -113,9 +113,15 @@ async def handle_append(
         )
 
     # PHASE 0: Preflight CAS check (no lock) to reduce contention
-    # Check if object exists and get current version
+    # Check if object exists and get current version (from object_versions)
     current_row = await db.fetchrow(
-        "SELECT append_version, object_id FROM objects WHERE bucket_id = $1 AND object_key = $2 LIMIT 1",
+        """
+        SELECT ov.append_version, o.object_id, o.current_version_seq
+        FROM objects o
+        JOIN object_versions ov ON ov.object_id = o.object_id AND ov.version_seq = o.current_version_seq
+        WHERE o.bucket_id = $1 AND o.object_key = $2
+        LIMIT 1
+        """,
         bucket_id,
         object_key,
     )
@@ -129,6 +135,7 @@ async def handle_append(
 
     current_version = int(current_row.get("append_version") or 0)
     object_id = str(current_row["object_id"])
+    current_version_seq = int(current_row.get("current_version_seq") or 1)
 
     with contextlib.suppress(Exception):
         logger.info(
@@ -157,7 +164,14 @@ async def handle_append(
         for attempt in range(lock_attempts):
             try:
                 current = await db.fetchrow(
-                    "SELECT * FROM objects WHERE bucket_id = $1 AND object_key = $2 FOR UPDATE NOWAIT",
+                    """
+                    SELECT o.object_id, o.bucket_id, o.object_key, o.current_version_seq,
+                           ov.append_version, ov.metadata
+                    FROM objects o
+                    JOIN object_versions ov ON ov.object_id = o.object_id AND ov.version_seq = o.current_version_seq
+                    WHERE o.bucket_id = $1 AND o.object_key = $2
+                    FOR UPDATE NOWAIT
+                    """,
                     bucket_id,
                     object_key,
                 )
@@ -169,7 +183,12 @@ async def handle_append(
                         logger.info(f"APPEND lock not available for {bucket_name}/{object_key}: {e}")
                     try:
                         fresh = await db.fetchrow(
-                            "SELECT append_version FROM objects WHERE bucket_id = $1 AND object_key = $2",
+                            """
+                            SELECT ov.append_version
+                            FROM objects o
+                            JOIN object_versions ov ON ov.object_id = o.object_id AND ov.version_seq = o.current_version_seq
+                            WHERE o.bucket_id = $1 AND o.object_key = $2
+                            """,
                             bucket_id,
                             object_key,
                         )
@@ -239,13 +258,28 @@ async def handle_append(
                 object_id,
             )
 
-        # Mark object as multipart (part 0 exists from PUT, now adding more parts)
-        await db.execute("UPDATE objects SET multipart = TRUE WHERE object_id = $1", object_id)
+        # Mark object as multipart on the current version
+        await db.execute(
+            """
+            UPDATE object_versions
+            SET multipart = TRUE
+            WHERE object_id = $1
+              AND version_seq = $2
+            """,
+            object_id,
+            current_version_seq,
+        )
 
         # Determine next part number
         next_part = await db.fetchval(
-            "SELECT COALESCE(MAX(part_number), 0) + 1 FROM parts WHERE object_id = $1",
+            """
+            SELECT COALESCE(MAX(part_number), 0) + 1
+            FROM parts
+            WHERE object_id = $1
+              AND object_version_seq = $2
+            """,
             object_id,
+            current_version_seq,
         )
         with contextlib.suppress(Exception):
             logger.info(f"APPEND next_part_decided object_id={object_id} next_part={int(next_part)}")
@@ -260,6 +294,7 @@ async def handle_append(
             size_bytes=int(delta_size),
             etag=delta_md5,
             chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
+            object_version_seq=current_version_seq,
         )
 
         # Recompute composite ETag from base object MD5 + all appended part etags
@@ -277,8 +312,15 @@ async def handle_append(
         md5s = [bytes.fromhex(base_md5)]
 
         parts = await db.fetch(
-            "SELECT part_number, etag FROM parts WHERE object_id = $1 ORDER BY part_number",
+            """
+            SELECT part_number, etag
+            FROM parts
+            WHERE object_id = $1
+              AND object_version_seq = $2
+            ORDER BY part_number
+            """,
             object_id,
+            current_version_seq,
         )
         for p in parts:
             e = str(p["etag"]).strip('"')  # type: ignore
@@ -289,16 +331,20 @@ async def handle_append(
         combined_md5 = hashlib.md5(b"".join(md5s)).hexdigest()
         composite_etag = f"{combined_md5}-{len(md5s)}"
 
-        # Update object size, etag, and append_version
+        # Update version size, etag, and append_version on the current version
         await db.execute(
             """
-            UPDATE objects
-            SET size_bytes = size_bytes + $2,
-                md5_hash = $3,
-                append_version = append_version + 1
+            UPDATE object_versions
+            SET size_bytes = size_bytes + $3,
+                md5_hash = $4,
+                append_version = append_version + 1,
+                last_modified = NOW(),
+                last_append_at = NOW()
             WHERE object_id = $1
+              AND version_seq = $2
             """,
             object_id,
+            current_version_seq,
             int(delta_size),
             composite_etag,
         )
@@ -365,6 +411,7 @@ async def handle_append(
             bucket_name=bucket_name,
             object_key=object_key,
             object_id=object_id,
+            version_seq=int(current_version_seq),
             upload_id=str(upload_id),
             chunks=[Chunk(id=int(next_part))],
         )

@@ -124,9 +124,10 @@ def wait_for_parts_cids(
             # First, get object_id for debugging
             cur.execute(
                 """
-                SELECT o.object_id, o.ipfs_cid, c.cid as object_cid
+                SELECT o.object_id, ov.ipfs_cid, c.cid as object_cid
                 FROM objects o
-                LEFT JOIN cids c ON o.cid_id = c.id
+                JOIN object_versions ov ON ov.object_id = o.object_id AND ov.version_seq = o.current_version_seq
+                LEFT JOIN cids c ON ov.cid_id = c.id
                 JOIN buckets b ON b.bucket_id = o.bucket_id
                 WHERE b.bucket_name = %s AND o.object_key = %s
                 """,
@@ -141,7 +142,8 @@ def wait_for_parts_cids(
                 SELECT p.part_number, p.ipfs_cid, p.size_bytes, p.etag, c.cid as part_cid
                 FROM parts p
                 LEFT JOIN cids c ON p.cid_id = c.id
-                JOIN objects o ON o.object_id = p.object_id
+                JOIN object_versions ov ON p.object_version_seq = ov.version_seq AND ov.object_id = p.object_id
+                JOIN objects o ON o.object_id = ov.object_id
                 JOIN buckets b ON b.bucket_id = o.bucket_id
                 WHERE b.bucket_name = %s AND o.object_key = %s
                 ORDER BY p.part_number
@@ -155,9 +157,10 @@ def wait_for_parts_cids(
                 """
                     SELECT COUNT(*)
                     FROM (
-                        SELECT COALESCE(c.cid, o.ipfs_cid) as cid
+                        SELECT COALESCE(c.cid, ov.ipfs_cid) as cid
                         FROM objects o
-                        LEFT JOIN cids c ON o.cid_id = c.id
+                        JOIN object_versions ov ON ov.object_id = o.object_id AND ov.version_seq = o.current_version_seq
+                        LEFT JOIN cids c ON ov.cid_id = c.id
                         JOIN buckets b ON b.bucket_id = o.bucket_id
                         WHERE b.bucket_name = %s AND o.object_key = %s
 
@@ -222,14 +225,18 @@ def make_all_object_parts_pending(
             (object_id,),
         )
 
-        # Also set object-level CID to pending
+        # Also set object-level CID to pending (in object_versions table) for current version
         cur.execute(
             """
-            UPDATE objects
-            SET cid_id = NULL, ipfs_cid = 'pending'
-            WHERE object_id = %s
+            UPDATE object_versions ov
+               SET cid_id = NULL, ipfs_cid = 'pending'
+            FROM objects o
+            WHERE ov.object_id = o.object_id
+              AND ov.object_id = %s
+              AND o.object_id = %s
+              AND ov.version_seq = o.current_version_seq
             """,
-            (object_id,),
+            (object_id, object_id),
         )
 
         conn.commit()

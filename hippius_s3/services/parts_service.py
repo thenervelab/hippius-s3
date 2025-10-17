@@ -18,6 +18,7 @@ async def upsert_part_placeholder(
     etag: str,
     placeholder_cid: str = "pending",
     chunk_size_bytes: int | None = None,
+    object_version_seq: int,
 ) -> None:
     """Ensure a parts row exists with NOT NULL fields before uploader runs.
 
@@ -33,9 +34,9 @@ async def upsert_part_placeholder(
     if chunk_size_bytes is None:
         await db.execute(
             """
-            INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            ON CONFLICT (object_id, part_number) DO UPDATE SET
+            INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, object_version_seq, cid_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (object_id, object_version_seq, part_number) DO UPDATE SET
                 ipfs_cid = EXCLUDED.ipfs_cid,
                 size_bytes = EXCLUDED.size_bytes,
                 etag = EXCLUDED.etag,
@@ -50,15 +51,16 @@ async def upsert_part_placeholder(
             etag,
             now,
             object_id,
+            int(object_version_seq),
             cid_id,
         )
         return
 
     await db.execute(
         """
-        INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, cid_id, chunk_size_bytes)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        ON CONFLICT (object_id, part_number) DO UPDATE SET
+        INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, object_version_seq, cid_id, chunk_size_bytes)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (object_id, object_version_seq, part_number) DO UPDATE SET
             ipfs_cid = EXCLUDED.ipfs_cid,
             size_bytes = EXCLUDED.size_bytes,
             etag = EXCLUDED.etag,
@@ -74,6 +76,7 @@ async def upsert_part_placeholder(
         etag,
         now,
         object_id,
+        int(object_version_seq),
         cid_id,
         int(chunk_size_bytes),
     )

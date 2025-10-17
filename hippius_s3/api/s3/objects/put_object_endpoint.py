@@ -156,7 +156,7 @@ async def handle_put_object(
         logger.info(f"PUT cache encrypted write object_id={object_id} part=1 chunks={len(ct_chunks)} bytes={total_ct}")
 
         async with db.transaction():
-            await db.fetchrow(
+            object_row = await db.fetchrow(
                 get_query("upsert_object_basic"),
                 object_id,
                 bucket_id,
@@ -175,6 +175,9 @@ async def handle_put_object(
                     await db.execute("DELETE FROM parts WHERE object_id = $1", prev["object_id"])  # type: ignore[index]
             except Exception:
                 logger.debug("Failed to cleanup previous parts on overwrite", exc_info=True)
+
+        # Use current_version_seq returned by upsert (avoid an extra round-trip)
+        current_version_seq = int(object_row["current_version_seq"])
 
         # Ensure upload row and parts(1) placeholder exist atomically before enqueueing
         async with db.transaction():
@@ -202,6 +205,7 @@ async def handle_put_object(
                 size_bytes=int(file_size),
                 etag=md5_hash,
                 chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
+                object_version_seq=current_version_seq,
             )
 
         # Only enqueue after DB state (object, upload row, and part 1) is persisted to avoid race with pinner
@@ -215,6 +219,7 @@ async def handle_put_object(
                 bucket_name=bucket_name,
                 object_key=object_key,
                 object_id=object_id,
+                version_seq=int(current_version_seq),
                 upload_id=str(upload_id),
                 chunks=[Chunk(id=1)],
             ),

@@ -96,6 +96,7 @@ class Uploader:
                 cids=all_cids,
                 address=payload.address,
                 object_id=payload.object_id,
+                version_seq=int(payload.version_seq or 1),
             ),
             self.redis_client,
         )
@@ -185,9 +186,12 @@ class Uploader:
         # Look up part_id and sizing metadata for part_chunks upsert
         part_row = await self.db.fetchrow(
             """
-            SELECT part_id, COALESCE(chunk_size_bytes, 0) AS chunk_size_bytes, COALESCE(size_bytes, 0) AS size_bytes
-            FROM parts
-            WHERE object_id = $1 AND part_number = $2
+            SELECT p.part_id,
+                   COALESCE(p.chunk_size_bytes, 0) AS chunk_size_bytes,
+                   COALESCE(p.size_bytes, 0) AS size_bytes
+            FROM parts p
+            JOIN objects o ON o.object_id = p.object_id
+            WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version_seq = o.current_version_seq
             LIMIT 1
             """,
             object_id,
@@ -238,9 +242,10 @@ class Uploader:
             cid_id = cid_row["id"] if cid_row else None
             await self.db.execute(
                 """
-                UPDATE parts
+                UPDATE parts p
                 SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
-                WHERE object_id = $1 AND part_number = $2
+                FROM objects o
+                WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version_seq = o.current_version_seq
                 """,
                 object_id,
                 part_number,
@@ -278,9 +283,10 @@ class Uploader:
         try:
             updated = await self.db.execute(
                 """
-                UPDATE parts
+                UPDATE parts p
                 SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
-                WHERE object_id = $1 AND part_number = $2
+                FROM objects o
+                WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version_seq = o.current_version_seq
                 """,
                 object_id,
                 part_number,
@@ -353,7 +359,18 @@ class Uploader:
                 return "pending"
             parts_data.append({"part_number": part_number, "cid": cid, "size_bytes": size})
 
-        obj_row = await self.db.fetchrow("SELECT content_type FROM objects WHERE object_id = $1", object_id)
+        # Fetch content type from the current object version
+        obj_row = await self.db.fetchrow(
+            """
+            SELECT ov.content_type
+            FROM objects o
+            JOIN object_versions ov
+              ON ov.object_id = o.object_id
+             AND ov.version_seq = o.current_version_seq
+            WHERE o.object_id = $1
+            """,
+            object_id,
+        )
         content_type = obj_row["content_type"] if obj_row else "application/octet-stream"
 
         manifest_data = {
@@ -383,15 +400,24 @@ class Uploader:
         cid_row = await self.db.fetchrow(get_query("upsert_cid"), manifest_cid)
         cid_id = cid_row["id"] if cid_row else None
 
+        # Write manifest CID and status to a specific version row (avoid implicit current_version_seq)
+        # Resolve version_seq for this object once
+        version_seq_row = await self.db.fetchrow(
+            "SELECT current_version_seq FROM objects WHERE object_id = $1",
+            object_id,
+        )
+        version_seq_value = int(version_seq_row[0]) if version_seq_row else 1
+
         await self.db.execute(
             """
-            UPDATE objects
-            SET ipfs_cid = $2,
-                cid_id = COALESCE($3, cid_id),
+            UPDATE object_versions
+            SET ipfs_cid = $3,
+                cid_id = COALESCE($4, cid_id),
                 status = 'pinning'
-            WHERE object_id = $1
+            WHERE object_id = $1 AND version_seq = $2
             """,
             object_id,
+            version_seq_value,
             manifest_cid,
             cid_id,
         )
