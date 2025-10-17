@@ -57,7 +57,7 @@ services:
     image: grafana/grafana:latest
     container_name: hippius-grafana
     ports:
-      - "127.0.0.1:3000:3000"
+      - "${HOST_BIND_IP:-127.0.0.1}:3000:3000"
     volumes:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
