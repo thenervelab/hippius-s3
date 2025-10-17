@@ -11,9 +11,9 @@ WITH object_info AS (
         b.bucket_name,
         b.is_public,
         c.cid as simple_cid,
-        ov.version_seq as version_seq
+        ov.object_version as object_version
     FROM objects o
-    JOIN object_versions ov ON ov.object_id = o.object_id AND ov.version_seq = o.current_version_seq
+    JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
     JOIN buckets b ON o.bucket_id = b.bucket_id
     LEFT JOIN cids c ON ov.cid_id = c.id
     WHERE o.bucket_id = $1
@@ -27,7 +27,7 @@ multipart_chunks AS (
         p.size_bytes,
         oi.object_id
     FROM object_info oi
-    JOIN parts p ON p.object_id = oi.object_id AND p.object_version_seq = oi.version_seq
+    JOIN parts p ON p.object_id = oi.object_id AND p.object_version = oi.object_version
     JOIN cids c ON p.cid_id = c.id
     WHERE oi.multipart = TRUE
     ORDER BY p.part_number ASC

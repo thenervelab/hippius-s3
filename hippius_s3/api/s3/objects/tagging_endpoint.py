@@ -136,8 +136,8 @@ async def set_object_tags(
         metadata["tags"] = tag_dict
 
         object_id = object_info["object_id"]
-        version_seq = object_info.get("version_seq") or object_info.get("ov.version_seq")
-        await db.fetchrow(get_query("update_object_metadata"), json.dumps(metadata), object_id, int(version_seq))
+        object_version = object_info.get("object_version") or object_info.get("ov.object_version")
+        await db.fetchrow(get_query("update_object_metadata"), json.dumps(metadata), object_id, int(object_version))
         return Response(status_code=200)
 
     except Exception:
@@ -186,8 +186,8 @@ async def delete_object_tags(
             metadata["tags"] = {}
 
         object_id = object_info["object_id"]
-        version_seq = object_info.get("version_seq") or object_info.get("ov.version_seq")
-        await db.fetchrow(get_query("update_object_metadata"), json.dumps(metadata), object_id, int(version_seq))
+        object_version = object_info.get("object_version") or object_info.get("ov.object_version")
+        await db.fetchrow(get_query("update_object_metadata"), json.dumps(metadata), object_id, int(object_version))
         return Response(status_code=204)
 
     except Exception:

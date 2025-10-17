@@ -185,9 +185,9 @@ class SubstrateWorker:
 
             for req in requests:
                 await self.db.execute(
-                    "UPDATE object_versions SET status = 'uploaded' WHERE object_id = $1 AND version_seq = $2 AND status != 'uploaded'",
+                    "UPDATE object_versions SET status = 'uploaded' WHERE object_id = $1 AND object_version = $2 AND status != 'uploaded'",
                     req.object_id,
-                    int(getattr(req, "version_seq", 1) or 1),
+                    int(getattr(req, "object_version", 1) or 1),
                 )
                 logger.info(f"Updated object status to 'uploaded' object_id={req.object_id}")
 

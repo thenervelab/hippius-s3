@@ -176,8 +176,7 @@ async def handle_put_object(
             except Exception:
                 logger.debug("Failed to cleanup previous parts on overwrite", exc_info=True)
 
-        # Use current_version_seq returned by upsert (avoid an extra round-trip)
-        current_version_seq = int(object_row["current_version_seq"])
+        current_object_version = int(object_row["current_object_version"] or 1)
 
         # Ensure upload row and parts(1) placeholder exist atomically before enqueueing
         async with db.transaction():
@@ -205,7 +204,7 @@ async def handle_put_object(
                 size_bytes=int(file_size),
                 etag=md5_hash,
                 chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
-                object_version_seq=current_version_seq,
+                object_version=current_object_version,
             )
 
         # Only enqueue after DB state (object, upload row, and part 1) is persisted to avoid race with pinner
@@ -219,7 +218,7 @@ async def handle_put_object(
                 bucket_name=bucket_name,
                 object_key=object_key,
                 object_id=object_id,
-                version_seq=int(current_version_seq),
+                object_version=int(current_object_version),
                 upload_id=str(upload_id),
                 chunks=[Chunk(id=1)],
             ),

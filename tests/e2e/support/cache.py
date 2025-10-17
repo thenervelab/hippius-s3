@@ -126,7 +126,7 @@ def wait_for_parts_cids(
                 """
                 SELECT o.object_id, ov.ipfs_cid, c.cid as object_cid
                 FROM objects o
-                JOIN object_versions ov ON ov.object_id = o.object_id AND ov.version_seq = o.current_version_seq
+                JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
                 LEFT JOIN cids c ON ov.cid_id = c.id
                 JOIN buckets b ON b.bucket_id = o.bucket_id
                 WHERE b.bucket_name = %s AND o.object_key = %s
@@ -142,7 +142,7 @@ def wait_for_parts_cids(
                 SELECT p.part_number, p.ipfs_cid, p.size_bytes, p.etag, c.cid as part_cid
                 FROM parts p
                 LEFT JOIN cids c ON p.cid_id = c.id
-                JOIN object_versions ov ON p.object_version_seq = ov.version_seq AND ov.object_id = p.object_id
+                JOIN object_versions ov ON p.object_version = ov.object_version AND ov.object_id = p.object_id
                 JOIN objects o ON o.object_id = ov.object_id
                 JOIN buckets b ON b.bucket_id = o.bucket_id
                 WHERE b.bucket_name = %s AND o.object_key = %s
@@ -159,7 +159,7 @@ def wait_for_parts_cids(
                     FROM (
                         SELECT COALESCE(c.cid, ov.ipfs_cid) as cid
                         FROM objects o
-                        JOIN object_versions ov ON ov.object_id = o.object_id AND ov.version_seq = o.current_version_seq
+                        JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
                         LEFT JOIN cids c ON ov.cid_id = c.id
                         JOIN buckets b ON b.bucket_id = o.bucket_id
                         WHERE b.bucket_name = %s AND o.object_key = %s
@@ -234,7 +234,7 @@ def make_all_object_parts_pending(
             WHERE ov.object_id = o.object_id
               AND ov.object_id = %s
               AND o.object_id = %s
-              AND ov.version_seq = o.current_version_seq
+              AND ov.object_version = o.current_object_version
             """,
             (object_id, object_id),
         )

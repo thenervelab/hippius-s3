@@ -99,8 +99,8 @@ async def handle_head_object(
         # Fallback: if md5_hash is missing/empty for multipart object, compute combined ETag from parts
         if (not md5_hash) and bool(row.get("multipart")):
             try:
-                version_seq = int(row.get("version_seq"))
-                parts = await db.fetch(get_query("get_parts_etags_for_version"), row["object_id"], version_seq)
+                object_version = int(row.get("object_version"))
+                parts = await db.fetch(get_query("get_parts_etags_for_version"), row["object_id"], object_version)
                 etags = [p["etag"].split("-")[0] for p in parts]
                 import hashlib as _hashlib
 
@@ -135,7 +135,7 @@ async def handle_head_object(
                     FROM objects o
                     JOIN object_versions ov
                       ON ov.object_id = o.object_id
-                     AND ov.version_seq = o.current_version_seq
+                     AND ov.object_version = o.current_object_version
                     WHERE o.object_id = $1
                     """,
                     row["object_id"],

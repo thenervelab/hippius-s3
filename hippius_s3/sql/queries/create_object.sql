@@ -1,12 +1,12 @@
 -- Create a new object and its initial version
 WITH ins_obj AS (
-  INSERT INTO objects (object_id, bucket_id, object_key, created_at, current_version_seq)
+  INSERT INTO objects (object_id, bucket_id, object_key, created_at, current_object_version)
   VALUES ($1, $2, $3, $7, 1)
   RETURNING object_id
 ), ins_ver AS (
   INSERT INTO object_versions (
     object_id,
-    version_seq,
+    object_version,
     version_type,
     storage_version,
     size_bytes,

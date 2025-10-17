@@ -116,9 +116,9 @@ async def handle_append(
     # Check if object exists and get current version (from object_versions)
     current_row = await db.fetchrow(
         """
-        SELECT ov.append_version, o.object_id, o.current_version_seq
+        SELECT ov.append_version, o.object_id, o.current_object_version
         FROM objects o
-        JOIN object_versions ov ON ov.object_id = o.object_id AND ov.version_seq = o.current_version_seq
+        JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
         WHERE o.bucket_id = $1 AND o.object_key = $2
         LIMIT 1
         """,
@@ -135,7 +135,7 @@ async def handle_append(
 
     current_version = int(current_row.get("append_version") or 0)
     object_id = str(current_row["object_id"])
-    current_version_seq = int(current_row.get("current_version_seq") or 1)
+    current_object_version = int(current_row.get("current_object_version") or 1)
 
     with contextlib.suppress(Exception):
         logger.info(
@@ -165,10 +165,10 @@ async def handle_append(
             try:
                 current = await db.fetchrow(
                     """
-                    SELECT o.object_id, o.bucket_id, o.object_key, o.current_version_seq,
+                    SELECT o.object_id, o.bucket_id, o.object_key, o.current_object_version,
                            ov.append_version, ov.metadata
                     FROM objects o
-                    JOIN object_versions ov ON ov.object_id = o.object_id AND ov.version_seq = o.current_version_seq
+                    JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
                     WHERE o.bucket_id = $1 AND o.object_key = $2
                     FOR UPDATE NOWAIT
                     """,
@@ -186,7 +186,7 @@ async def handle_append(
                             """
                             SELECT ov.append_version
                             FROM objects o
-                            JOIN object_versions ov ON ov.object_id = o.object_id AND ov.version_seq = o.current_version_seq
+                            JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
                             WHERE o.bucket_id = $1 AND o.object_key = $2
                             """,
                             bucket_id,
@@ -264,10 +264,10 @@ async def handle_append(
             UPDATE object_versions
             SET multipart = TRUE
             WHERE object_id = $1
-              AND version_seq = $2
+              AND object_version = $2
             """,
             object_id,
-            current_version_seq,
+            current_object_version,
         )
 
         # Determine next part number
@@ -276,10 +276,10 @@ async def handle_append(
             SELECT COALESCE(MAX(part_number), 0) + 1
             FROM parts
             WHERE object_id = $1
-              AND object_version_seq = $2
+              AND object_version = $2
             """,
             object_id,
-            current_version_seq,
+            current_object_version,
         )
         with contextlib.suppress(Exception):
             logger.info(f"APPEND next_part_decided object_id={object_id} next_part={int(next_part)}")
@@ -294,7 +294,7 @@ async def handle_append(
             size_bytes=int(delta_size),
             etag=delta_md5,
             chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
-            object_version_seq=current_version_seq,
+            object_version=current_object_version,
         )
 
         # Recompute composite ETag from base object MD5 + all appended part etags
@@ -316,11 +316,11 @@ async def handle_append(
             SELECT part_number, etag
             FROM parts
             WHERE object_id = $1
-              AND object_version_seq = $2
+              AND object_version = $2
             ORDER BY part_number
             """,
             object_id,
-            current_version_seq,
+            current_object_version,
         )
         for p in parts:
             e = str(p["etag"]).strip('"')  # type: ignore
@@ -341,10 +341,10 @@ async def handle_append(
                 last_modified = NOW(),
                 last_append_at = NOW()
             WHERE object_id = $1
-              AND version_seq = $2
+              AND object_version = $2
             """,
             object_id,
-            current_version_seq,
+            current_object_version,
             int(delta_size),
             composite_etag,
         )
@@ -411,7 +411,7 @@ async def handle_append(
             bucket_name=bucket_name,
             object_key=object_key,
             object_id=object_id,
-            version_seq=int(current_version_seq),
+            object_version=int(current_object_version),
             upload_id=str(upload_id),
             chunks=[Chunk(id=int(next_part))],
         )

@@ -75,9 +75,9 @@ async def run_substrate_loop():
             if not config.publish_to_chain:
                 logger.info(f"Skipping substrate publish (disabled) object_id={substrate_request.object_id}")
                 await db.execute(
-                    "UPDATE object_versions SET status = 'uploaded' WHERE object_id = $1 AND version_seq = $2",
+                    "UPDATE object_versions SET status = 'uploaded' WHERE object_id = $1 AND object_version = $2",
                     substrate_request.object_id,
-                    int(getattr(substrate_request, "version_seq", 1) or 1),
+                    int(getattr(substrate_request, "object_version", 1) or 1),
                 )
                 continue
 
@@ -121,9 +121,9 @@ async def run_substrate_loop():
                     else:
                         for req in pending_requests:
                             await db.execute(
-                                "UPDATE object_versions SET status = 'failed' WHERE object_id = $1 AND version_seq = $2",
+                                "UPDATE object_versions SET status = 'failed' WHERE object_id = $1 AND object_version = $2",
                                 req.object_id,
-                                int(getattr(req, "version_seq", 1) or 1),
+                                int(getattr(req, "object_version", 1) or 1),
                             )
 
                 pending_requests = []
@@ -161,9 +161,9 @@ async def run_substrate_loop():
                     else:
                         for req in pending_requests:
                             await db.execute(
-                                "UPDATE object_versions SET status = 'failed' WHERE object_id = $1 AND version_seq = $2",
+                                "UPDATE object_versions SET status = 'failed' WHERE object_id = $1 AND object_version = $2",
                                 req.object_id,
-                                int(getattr(req, "version_seq", 1) or 1),
+                                int(getattr(req, "object_version", 1) or 1),
                             )
 
                 pending_requests = []

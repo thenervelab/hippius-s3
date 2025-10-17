@@ -1,14 +1,14 @@
 -- Upsert object and set cid_id on latest version
 WITH upsert_object AS (
-  INSERT INTO objects (object_id, bucket_id, object_key, created_at, current_version_seq)
+  INSERT INTO objects (object_id, bucket_id, object_key, created_at, current_object_version)
   VALUES ($1, $2, $3, $7, 1)
   ON CONFLICT (bucket_id, object_key)
-  DO UPDATE SET object_id = EXCLUDED.object_id, current_version_seq = COALESCE(objects.current_version_seq, 1)
-  RETURNING object_id, current_version_seq
+  DO UPDATE SET object_id = EXCLUDED.object_id, current_object_version = COALESCE(objects.current_object_version, 1)
+  RETURNING object_id, current_object_version
 )
 INSERT INTO object_versions (
   object_id,
-  version_seq,
+  object_version,
   version_type,
   storage_version,
   size_bytes,
@@ -29,7 +29,7 @@ INSERT INTO object_versions (
 )
 SELECT
   uo.object_id,
-  uo.current_version_seq,
+  uo.current_object_version,
   'user',
   $10,
   $5,
@@ -48,7 +48,7 @@ SELECT
   $7,
   $7
 FROM upsert_object uo
-ON CONFLICT (object_id, version_seq)
+ON CONFLICT (object_id, object_version)
 DO UPDATE SET
   storage_version = EXCLUDED.storage_version,
   size_bytes = EXCLUDED.size_bytes,

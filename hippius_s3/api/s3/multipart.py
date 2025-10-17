@@ -146,7 +146,7 @@ async def list_parts_internal(
     all_parts = await db.fetch(
         get_query("list_parts_for_version"),
         object_id,
-        int(mpu.get("current_version_seq") or 1),
+        int(mpu.get("current_object_version") or 1),
     )
     visible_parts = [p for p in all_parts if p["part_number"] > part_marker][:max_parts]
 
@@ -395,9 +395,9 @@ async def upload_part(
             status_code=400,
         )
 
-    # Get object_id and current_version_seq from multipart upload
+    # Get object_id and current_object_version from multipart upload
     object_id = ongoing_multipart_upload["object_id"]
-    current_version_seq = ongoing_multipart_upload["current_version_seq"]
+    current_object_version = ongoing_multipart_upload["current_object_version"]
 
     start_time = time.time()
     logger.info(f"Starting part {part_number} upload for upload {upload_id} (object_id={object_id})")
@@ -692,7 +692,7 @@ async def upload_part(
             etag=str(etag),
             # Treat plaintext and ciphertext identically for chunking
             chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
-            object_version_seq=int(current_version_seq),
+            object_version=int(current_object_version),
         )
         db_time = time.time() - db_start
         logger.debug(f"Part {part_number}: Database insert took {db_time:.3f}s")
@@ -781,11 +781,11 @@ async def abort_multipart_upload(
         object_id = multipart_upload["object_id"]
 
         # Clean up Redis keys for cached parts (meta + chunks)
-        version_seq = int(multipart_upload.get("current_version_seq") or 1)
+        object_version = int(multipart_upload.get("current_object_version") or 1)
         parts = await db.fetch(
             get_query("list_parts_for_version"),
             object_id,
-            version_seq,
+            object_version,
         )
         if parts:
             redis_client = request.app.state.redis_client
@@ -918,13 +918,13 @@ async def list_multipart_uploads(
 
 async def hash_all_etags(
     object_id: str,
-    object_version_seq: int,
+    object_version: int,
     db: dependencies.DBConnection,
 ) -> str:
     parts = await db.fetch(
         get_query("get_parts_etags_for_version"),
         object_id,
-        object_version_seq,
+        object_version,
     )
 
     etags = [part["etag"].split("-")[0] for part in parts]
@@ -980,8 +980,8 @@ async def complete_multipart_upload(
             else:
                 # Fallback: recompute combined ETag from parts by object_id
                 try:
-                    version_seq = int(multipart_upload.get("current_version_seq") or 1)
-                    final_etag = await hash_all_etags(object_id, version_seq, db)
+                    object_version = int(multipart_upload.get("current_object_version") or 1)
+                    final_etag = await hash_all_etags(object_id, object_version, db)
                 except Exception:
                     final_etag = "completed"
             xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -1031,11 +1031,11 @@ async def complete_multipart_upload(
         part_info.sort(key=lambda x: x[0])
 
         # Get the parts from the database for the version captured on MPU initiation
-        version_seq = int(multipart_upload.get("current_version_seq") or 1)
+        object_version = int(multipart_upload.get("current_object_version") or 1)
         db_parts = await db.fetch(
             get_query("list_parts_for_version"),
             object_id,
-            version_seq,
+            object_version,
         )
         logger.info(f"Found {len(db_parts)} parts for upload {upload_id} (object_id={object_id})")
         db_parts_dict = {p["part_number"]: p for p in db_parts}
@@ -1059,7 +1059,7 @@ async def complete_multipart_upload(
 
         final_md5_hash = await hash_all_etags(
             object_id,
-            version_seq,
+            object_version,
             db,
         )
         logger.info(f"MPU complete: upload_id={upload_id} key={object_key} final_etag={final_md5_hash}")
@@ -1093,7 +1093,7 @@ async def complete_multipart_upload(
         parts = await db.fetch(
             get_query("list_parts_for_version"),
             object_id,
-            version_seq,
+            object_version,
         )
         total_size = sum(part["size_bytes"] for part in parts)
         logger.info(
@@ -1101,7 +1101,7 @@ async def complete_multipart_upload(
         )
         # Also log each part's ETag and size for debugging
         try:
-            part_rows = await db.fetch(get_query("list_parts_for_version"), object_id, version_seq)
+            part_rows = await db.fetch(get_query("list_parts_for_version"), object_id, object_version)
             dbg = [
                 {
                     "part": r["part_number"],
@@ -1123,12 +1123,12 @@ async def complete_multipart_upload(
                 last_modified = NOW(),
                 status = 'publishing'
             WHERE ov.object_id = $3
-              AND ov.version_seq = $4
+              AND ov.object_version = $4
             """,
             final_md5_hash,
             total_size,
             object_id,
-            version_seq,
+            object_version,
         )
 
         # Mark multipart upload as completed and only enqueue after DB commit
@@ -1158,7 +1158,7 @@ async def complete_multipart_upload(
                 subaccount=request.state.account.main_account,
                 subaccount_seed_phrase=request.state.seed_phrase,
                 object_id=str(object_id),
-                version_seq=int(version_seq),
+                object_version=int(object_version),
             ),
             request.app.state.redis_client,
         )

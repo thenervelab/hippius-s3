@@ -86,7 +86,7 @@ class Uploader:
         manifest_cid = await self._build_and_upload_manifest(
             object_id=payload.object_id,
             object_key=payload.object_key,
-            version_seq=int(payload.version_seq or 1),
+            object_version=int(payload.object_version or 1),
         )
         manifest_duration = time.time() - manifest_start
 
@@ -97,7 +97,7 @@ class Uploader:
                 cids=all_cids,
                 address=payload.address,
                 object_id=payload.object_id,
-                version_seq=int(payload.version_seq or 1),
+                object_version=int(payload.object_version or 1),
             ),
             self.redis_client,
         )
@@ -192,7 +192,7 @@ class Uploader:
                    COALESCE(p.size_bytes, 0) AS size_bytes
             FROM parts p
             JOIN objects o ON o.object_id = p.object_id
-            WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version_seq = o.current_version_seq
+            WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = o.current_object_version
             LIMIT 1
             """,
             object_id,
@@ -246,7 +246,7 @@ class Uploader:
                 UPDATE parts p
                 SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
                 FROM objects o
-                WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version_seq = o.current_version_seq
+                WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = o.current_object_version
                 """,
                 object_id,
                 part_number,
@@ -287,7 +287,7 @@ class Uploader:
                 UPDATE parts p
                 SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
                 FROM objects o
-                WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version_seq = o.current_version_seq
+                WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = o.current_object_version
                 """,
                 object_id,
                 part_number,
@@ -333,7 +333,7 @@ class Uploader:
         self,
         object_id: str,
         object_key: str,
-        version_seq: int,
+        object_version: int,
     ) -> str:
         logger.debug(f"Building manifest for object_id={object_id}")
 
@@ -368,7 +368,7 @@ class Uploader:
             FROM objects o
             JOIN object_versions ov
               ON ov.object_id = o.object_id
-             AND ov.version_seq = o.current_version_seq
+             AND ov.object_version = o.current_object_version
             WHERE o.object_id = $1
             """,
             object_id,
@@ -408,10 +408,10 @@ class Uploader:
             SET ipfs_cid = $3,
                 cid_id = COALESCE($4, cid_id),
                 status = 'pinning'
-            WHERE object_id = $1 AND version_seq = $2
+            WHERE object_id = $1 AND object_version = $2
             """,
             object_id,
-            version_seq,
+            object_version,
             manifest_cid,
             cid_id,
         )
