@@ -286,11 +286,19 @@ class ObjectWriter:
                 object_id,
                 cov,
             )
-            try:
-                base_bytes = await self.obj_cache.get(object_id, int(cov), 1)
-                base_md5 = hashlib.md5(base_bytes).hexdigest() if base_bytes else "0" * 32
-            except Exception:
-                base_md5 = "0" * 32
+            # Prefer DB md5_hash for current version; fallback to cache base part
+            base_md5_row = await self.db.fetchrow(
+                "SELECT md5_hash FROM object_versions WHERE object_id = $1 AND object_version = $2",
+                object_id,
+                cov,
+            )
+            base_md5 = (base_md5_row and (base_md5_row["md5_hash"] or "").strip()) or ""
+            if len(base_md5) != 32:
+                try:
+                    base_bytes = await self.obj_cache.get(object_id, int(cov), 1)
+                    base_md5 = hashlib.md5(base_bytes).hexdigest() if base_bytes else "0" * 32
+                except Exception:
+                    base_md5 = "0" * 32
             md5s = [bytes.fromhex(base_md5)]
             for p in parts:
                 e = str(p["etag"]).strip('"').split("-")[0]  # type: ignore
@@ -342,6 +350,8 @@ class ObjectWriter:
 
         return {
             "object_id": object_id,
+            "object_version": int(cov),
+            "upload_id": str(upload_id),
             "new_append_version": int(current_version + 1),
             "etag": composite_etag,
             "part_number": int(next_part),

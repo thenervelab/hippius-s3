@@ -292,7 +292,8 @@ async def handle_append(
     object_id = result["object_id"]
     next_part = int(result["part_number"])  # type: ignore[index]
     composite_etag = str(result["etag"])  # type: ignore[index]
-    current_version = int(result.get("new_append_version", current_version)) - 1
+    object_version = int(result.get("object_version", current_object_version))
+    new_append_version = int(result.get("new_append_version", current_version + 1))
 
     # Enqueue background publish of this part via the pinner worker
     try:
@@ -308,8 +309,8 @@ async def handle_append(
             bucket_name=bucket_name,
             object_key=object_key,
             object_id=object_id,
-            object_version=int(current_object_version),
-            upload_id=str(upload_id),
+            object_version=int(object_version),
+            upload_id=str(result.get("upload_id", upload_id)),
             chunks=[Chunk(id=int(next_part))],
         )
         logger.debug(f"APPEND UploadChainRequest payload created: {payload}")
@@ -328,12 +329,12 @@ async def handle_append(
         status_code=200,
         headers={
             "ETag": f'"{composite_etag}"',
-            "x-amz-meta-append-version": str(int(result.get("new_append_version", current_version + 1))),
+            "x-amz-meta-append-version": str(new_append_version),
         },
     )
     with contextlib.suppress(Exception):
         logger.info(
-            f"APPEND success bucket={bucket_name} key={object_key} new_version={int(result.get('new_append_version', current_version + 1))} next_part={int(next_part)} size_delta={len(incoming_bytes)}"
+            f"APPEND success bucket={bucket_name} key={object_key} new_version={new_append_version} next_part={int(next_part)} size_delta={len(incoming_bytes)}"
         )
 
     # Record idempotency result for future retries (best-effort)
