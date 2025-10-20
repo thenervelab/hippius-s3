@@ -38,6 +38,7 @@ class ChainRequest(BaseModel):
     # Deprecated: retained for backward compatibility; uploads are pre-encrypted
     should_encrypt: bool = False
     object_id: str
+    object_version: int
 
     # Retry & tracing metadata
     request_id: str | None = None
@@ -90,6 +91,7 @@ class SubstratePinningRequest(BaseModel):
     cids: list[str]
     address: str
     object_id: str
+    object_version: int
     request_id: str | None = None
     attempts: int = 0
     first_enqueued_at: float | None = None
