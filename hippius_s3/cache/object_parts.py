@@ -5,11 +5,22 @@ from typing import Any
 from typing import Optional
 from typing import Protocol
 
-from hippius_s3.config import get_config
 from hippius_s3.monitoring import get_metrics_collector
 
 
-DEFAULT_OBJ_PART_TTL_SECONDS = get_config().cache_ttl_seconds
+# Lazy-config: avoid importing application config at module import time.
+# Use a conservative default TTL and resolve real config only when needed inside methods.
+DEFAULT_OBJ_PART_TTL_SECONDS = 1800
+
+def _get_config_value(name: str, default: int) -> int:
+    try:
+        # Local import to avoid triggering httpx and other deps at module import time
+        from hippius_s3.config import get_config  # type: ignore
+
+        value = getattr(get_config(), name, default)
+        return int(value) if isinstance(value, (int,)) else default
+    except Exception:
+        return default
 
 
 class ObjectPartsCache(Protocol):
@@ -113,10 +124,7 @@ class RedisObjectPartsCache:
         ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
     ) -> None:
         # Split into fixed-size chunks and store meta first (for cheap readiness checks), then chunk keys
-        try:
-            chunk_size = int(get_config().object_chunk_size_bytes)
-        except Exception:
-            chunk_size = 4 * 1024 * 1024
+        chunk_size = _get_config_value("object_chunk_size_bytes", 4 * 1024 * 1024)
         total = len(data) if isinstance(data, (bytes, bytearray)) else 0
         if total == 0:
             # Still write empty meta with zero chunks for consistency
@@ -158,7 +166,10 @@ class RedisObjectPartsCache:
         self, object_id: str, object_version: int, part_number: int, *, ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS
     ) -> None:
         """Set TTL on meta and all chunk keys for this part to prevent orphaned chunk bytes."""
-        await self.redis.expire(self.build_meta_key(object_id, object_version, part_number), ttl)
+        await self.redis.expire(
+            self.build_meta_key(object_id, object_version, part_number),
+            int(ttl if ttl is not None else _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS)),
+        )
         # Also expire all chunk keys for this part (scan pattern to catch all indices)
         pattern = f"obj:{object_id}:v:{int(object_version)}:part:{int(part_number)}:chunk:*"
         cursor = 0
@@ -195,7 +206,11 @@ class RedisObjectPartsCache:
         *,
         ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
     ) -> None:
-        await self.redis.setex(self.build_chunk_key(object_id, object_version, part_number, chunk_index), ttl, data)
+        await self.redis.setex(
+            self.build_chunk_key(object_id, object_version, part_number, chunk_index),
+            int(ttl if ttl is not None else _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS)),
+            data,
+        )
 
     async def chunk_exists(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> bool:
         exists = bool(
@@ -219,7 +234,11 @@ class RedisObjectPartsCache:
         ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
     ) -> None:
         payload = {"chunk_size": int(chunk_size), "num_chunks": int(num_chunks), "size_bytes": int(size_bytes)}
-        await self.redis.setex(self.build_meta_key(object_id, object_version, part_number), ttl, _json.dumps(payload))
+        await self.redis.setex(
+            self.build_meta_key(object_id, object_version, part_number),
+            int(ttl if ttl is not None else _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS)),
+            _json.dumps(payload),
+        )
 
     async def get_meta(self, object_id: str, object_version: int, part_number: int) -> Optional[dict]:
         raw = await self.redis.get(self.build_meta_key(object_id, object_version, part_number))
