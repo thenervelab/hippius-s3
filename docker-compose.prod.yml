@@ -8,10 +8,10 @@ services:
       dockerfile: Dockerfile.base
 
   api:
-    command: ["sh", "-c", "python -m hippius_s3.scripts.migrate && gunicorn hippius_s3.main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --worker-connections 1000 --max-requests 10000 --max-requests-jitter 1000 --preload --log-level info --access-logfile -"]
     environment:
-      - UVICORN_LOG_LEVEL=info
+      - HIPPIUS_ENVIRONMENT=production
       - DEBUG=false
+      - UVICORN_LOG_LEVEL=info
       - HIPPIUS_IPFS_GET_URL=http://192.168.1.173:8080
       - HIPPIUS_IPFS_STORE_URL=http://192.168.1.173:5001
 
