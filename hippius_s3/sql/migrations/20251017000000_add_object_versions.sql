@@ -2,9 +2,14 @@
 
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'version_type') THEN
-        CREATE TYPE version_type AS ENUM ('user', 'migration');
-    END IF;
+    -- Create enum type in a concurrency-safe way; ignore if created by another session
+    BEGIN
+        EXECUTE 'CREATE TYPE public.version_type AS ENUM (''user'', ''migration'')';
+    EXCEPTION
+        WHEN duplicate_object OR unique_violation THEN
+            -- Type already exists in this schema; proceed
+            NULL;
+    END;
 END$$;
 
 -- Create table for per-object versions with sequential numbering
@@ -311,8 +316,11 @@ ALTER TABLE public.objects DROP COLUMN IF EXISTS current_version_seq;
 DO $$
 BEGIN
     IF EXISTS (
-        SELECT 1 FROM pg_type WHERE typname = 'version_type'
+        SELECT 1
+        FROM pg_type t
+        JOIN pg_namespace n ON n.oid = t.typnamespace
+        WHERE t.typname = 'version_type' AND n.nspname = 'public'
     ) THEN
-        DROP TYPE version_type;
+        EXECUTE 'DROP TYPE public.version_type';
     END IF;
 END $$;
