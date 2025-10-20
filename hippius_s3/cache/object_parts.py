@@ -5,7 +5,22 @@ from typing import Any
 from typing import Optional
 from typing import Protocol
 
-from hippius_s3.monitoring import get_metrics_collector
+# Lazy monitoring import: avoid pulling opentelemetry at import-time
+class _MetricsLike(Protocol):
+    def record_cache_operation(self, hit: bool, operation: str) -> None: ...
+
+
+def _get_metrics_collector() -> _MetricsLike:
+    try:
+        from hippius_s3.monitoring import get_metrics_collector  # type: ignore
+
+        return get_metrics_collector()
+    except Exception:
+        class _Noop:
+            def record_cache_operation(self, hit: bool, operation: str) -> None:
+                return None
+
+        return _Noop()
 
 
 # Lazy-config: avoid importing application config at module import time.
@@ -94,24 +109,24 @@ class RedisObjectPartsCache:
         try:
             meta_raw = await self.redis.get(self.build_meta_key(object_id, object_version, part_number))
             if not meta_raw:
-                get_metrics_collector().record_cache_operation(hit=False, operation="get")
+                _get_metrics_collector().record_cache_operation(hit=False, operation="get")
                 return None
             meta = _json.loads(meta_raw)
             num_chunks = int(meta.get("num_chunks", 0))
             if num_chunks <= 0:
-                get_metrics_collector().record_cache_operation(hit=False, operation="get")
+                _get_metrics_collector().record_cache_operation(hit=False, operation="get")
                 return None
             chunks: list[bytes] = []
             for i in range(num_chunks):
                 c = await self.redis.get(self.build_chunk_key(object_id, object_version, part_number, i))
                 if not isinstance(c, bytes):
-                    get_metrics_collector().record_cache_operation(hit=False, operation="get")
+                    _get_metrics_collector().record_cache_operation(hit=False, operation="get")
                     return None
                 chunks.append(c)
-            get_metrics_collector().record_cache_operation(hit=True, operation="get")
+            _get_metrics_collector().record_cache_operation(hit=True, operation="get")
             return b"".join(chunks)
         except Exception:
-            get_metrics_collector().record_cache_operation(hit=False, operation="get")
+            _get_metrics_collector().record_cache_operation(hit=False, operation="get")
             return None
 
     async def set(
@@ -190,7 +205,7 @@ class RedisObjectPartsCache:
     ) -> Optional[bytes]:
         result = await self.redis.get(self.build_chunk_key(object_id, object_version, part_number, chunk_index))
         is_hit = isinstance(result, bytes)
-        get_metrics_collector().record_cache_operation(
+        _get_metrics_collector().record_cache_operation(
             hit=is_hit,
             operation="get_chunk",
         )
@@ -216,7 +231,7 @@ class RedisObjectPartsCache:
         exists = bool(
             await self.redis.exists(self.build_chunk_key(object_id, object_version, part_number, chunk_index))
         )
-        get_metrics_collector().record_cache_operation(
+        _get_metrics_collector().record_cache_operation(
             hit=exists,
             operation="chunk_exists",
         )
