@@ -14,15 +14,11 @@ from fastapi import Response
 from hippius_s3 import utils
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.extensions.append import handle_append
-from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.monitoring import get_metrics_collector
-from hippius_s3.queue import Chunk
-from hippius_s3.queue import UploadChainRequest
-from hippius_s3.queue import enqueue_upload_request
-from hippius_s3.services.crypto_service import CryptoService
-from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.utils import get_query
+from hippius_s3.writer.object_writer import ObjectWriter
+from hippius_s3.writer.queue import enqueue_upload as writer_enqueue_upload
 
 
 logger = logging.getLogger(__name__)
@@ -146,86 +142,37 @@ async def handle_put_object(
             )
         current_object_version = int(object_row["current_object_version"] or 1)
 
-        # Unified cache: write base part as part 1 (1-based indexing) directly
-        obj_cache = RedisObjectPartsCache(redis_client)
-        chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-
-        from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
-
-        try:
-            key_bytes = await get_or_create_encryption_key_bytes(
-                subaccount_id=request.state.account.main_account,
-                bucket_name=bucket_name,
-            )
-            ct_chunks = CryptoService.encrypt_part_to_chunks(
-                file_data,
-                object_id=object_id,
-                part_number=1,
-                seed_phrase=request.state.seed_phrase,
-                chunk_size=chunk_size,
-                key=key_bytes,
-            )
-        except Exception:
-            from hippius_s3.api.s3.errors import s3_error_response
-
-            return s3_error_response(
-                "InternalError",
-                "Failed to resolve encryption key",
-                status_code=500,
-            )
-        total_ct = sum(len(ct) for ct in ct_chunks)
-        await obj_cache.set_meta(object_id, int(current_object_version), 1, chunk_size=chunk_size, num_chunks=len(ct_chunks), size_bytes=len(file_data))
-        for i, ct in enumerate(ct_chunks):
-            await obj_cache.set_chunk(object_id, int(current_object_version), 1, i, ct)
-        logger.info(
-            f"PUT cache encrypted write object_id={object_id} v={current_object_version} part=1 chunks={len(ct_chunks)} bytes={total_ct}"
+        # Use ObjectWriter to write cache and DB placeholder for part 1
+        writer = ObjectWriter(db=db, redis_client=redis_client)
+        put_res = await writer.put_simple(
+            bucket_id=bucket_id,
+            bucket_name=bucket_name,
+            object_id=object_id,
+            object_key=object_key,
+            object_version=int(current_object_version),
+            account_address=request.state.account.main_account,
+            seed_phrase=request.state.seed_phrase,
+            content_type=content_type,
+            metadata=metadata,
+            body_bytes=file_data,
         )
 
-        # Ensure upload row and parts(1) placeholder exist atomically before enqueueing
-        async with db.transaction():
-            # Generate a fresh upload_id per simple PUT to avoid conflicts with previous sessions
-            new_upload_id = uuid.uuid4()
-            upload_row = await db.fetchrow(
-                get_query("create_multipart_upload"),
-                new_upload_id,
-                bucket_id,
-                object_key,
-                created_at,
-                content_type,
-                json.dumps(metadata),
-                created_at,
-                uuid.UUID(object_id),
-            )
-            upload_id = upload_row["upload_id"] if upload_row else new_upload_id
+        # Upload row and part(1) placeholder already handled by ObjectWriter.put_simple
 
-            # Insert parts(1) placeholder for simple objects (1-based indexing)
-            await upsert_part_placeholder(
-                db,
-                object_id=object_id,
-                upload_id=str(upload_id),
-                part_number=1,
-                size_bytes=int(file_size),
-                etag=md5_hash,
-                chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
-                object_version=current_object_version,
-            )
-
-        # Only enqueue after DB state (object, upload row, and part 1) is persisted to avoid race with pinner
-        await enqueue_upload_request(
-            payload=UploadChainRequest(
-                substrate_url=config.substrate_url,
-                ipfs_node=config.ipfs_store_url,
-                address=request.state.account.main_account,
-                subaccount=request.state.account.main_account,
-                subaccount_seed_phrase=request.state.seed_phrase,
-                bucket_name=bucket_name,
-                object_key=object_key,
-                object_id=object_id,
-                object_version=int(current_object_version),
-                upload_id=str(upload_id),
-                chunks=[Chunk(id=1)],
-            ),
+        # Only enqueue after DB state is persisted; use writer queue helper
+        await writer_enqueue_upload(
             redis_client=redis_client,
+            address=request.state.account.main_account,
+            subaccount_seed_phrase=request.state.seed_phrase,
+            subaccount=request.state.account.main_account,
+            bucket_name=bucket_name,
+            object_key=object_key,
+            object_id=object_id,
+            object_version=int(current_object_version),
+            upload_id=str(put_res.upload_id),
+            chunk_ids=[1],
+            substrate_url=config.substrate_url,
+            ipfs_node=config.ipfs_store_url,
         )
 
         get_metrics_collector().record_s3_operation(
@@ -247,7 +194,7 @@ async def handle_put_object(
         return Response(
             status_code=200,
             headers={
-                "ETag": f'"{md5_hash}"',
+                "ETag": f'"{put_res.etag}"',
                 "x-amz-meta-append-version": "0",
             },
         )

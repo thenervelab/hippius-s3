@@ -1,6 +1,5 @@
 """S3-compatible multipart upload implementation for handling large file uploads."""
 
-import asyncio
 import contextlib
 import hashlib
 import json
@@ -30,10 +29,9 @@ from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
-from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.object_reader import ObjectReader
-from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.utils import get_query
+from hippius_s3.writer.object_writer import ObjectWriter
 
 
 logger = logging.getLogger(__name__)
@@ -579,7 +577,7 @@ async def upload_part(
             status_code=400,
         )
 
-    # Cache part data in chunked layout (no IPFS upload for parts)
+    # Cache part data in chunked layout via ObjectWriter (no IPFS upload for parts)
     redis_client = request.app.state.redis_client
     obj_cache = RedisObjectPartsCache(redis_client)
 
@@ -629,47 +627,25 @@ async def upload_part(
 
         # Store in Redis via chunked cache API (encrypt for private, meta-first for readiness)
         redis_start = time.time()
-        chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-        # Always encrypt chunks before caching
-        from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
-
-        try:
-            key_bytes = await get_or_create_encryption_key_bytes(
-                subaccount_id=request.state.account.main_account,
-                bucket_name=str(dest_bucket_name or ""),
-            )
-        except Exception:
-            return s3_error_response("InternalError", "Failed to resolve encryption key", status_code=500)
-        chunks_bytes = CryptoService.encrypt_part_to_chunks(
-            file_data,
+        # Route through ObjectWriter for standardized behavior
+        writer = ObjectWriter(db=db, redis_client=redis_client)
+        part_res = await writer.mpu_upload_part(
+            upload_id=str(upload_id),
             object_id=str(object_id),
-            part_number=int(part_number),
+            object_version=int(current_object_version),
+            bucket_name=str(dest_bucket_name or ""),
+            account_address=request.state.account.main_account,
             seed_phrase=request.state.seed_phrase,
-            chunk_size=chunk_size,
-            key=key_bytes,
+            part_number=int(part_number),
+            body_bytes=file_data,
         )
-
-        # Write meta first for readiness (store plaintext size)
-        await obj_cache.set_meta(
-            str(object_id), int(current_object_version), int(part_number), chunk_size=chunk_size, num_chunks=len(chunks_bytes), size_bytes=len(file_data), ttl=1800
-        )
-        # Then write chunk data
-        for i, piece in enumerate(chunks_bytes):
-            await obj_cache.set_chunk(str(object_id), int(current_object_version), int(part_number), i, piece, ttl=1800)
         redis_time = time.time() - redis_start
         logger.debug(
             f"Part {part_number}: Cached via RedisObjectPartsCache in {redis_time:.3f}s (object_id={object_id}, encrypted=True)"
         )
 
         # Create mock part result (no IPFS upload needed for individual parts)
-        md5_start = time.time()
-        # Move MD5 calculation to thread pool to avoid blocking event loop
-        loop = asyncio.get_event_loop()
-        md5_hash = await loop.run_in_executor(None, lambda: hashlib.md5(file_data).hexdigest())
-        md5_time = time.time() - md5_start
-        logger.debug(f"Part {part_number}: MD5 calculation took {md5_time:.3f}s (threaded) md5={md5_hash}")
-
-        etag = f"{md5_hash}-{part_number}" if not copy_source else md5_hash
+        etag = part_res.etag
 
         part_result = {
             "size_bytes": file_size,
@@ -679,17 +655,7 @@ async def upload_part(
 
         # Save the part information in the database
         db_start = time.time()
-        await upsert_part_placeholder(
-            db,
-            object_id=str(object_id),
-            upload_id=str(upload_id),
-            part_number=int(part_number),
-            size_bytes=int(file_size),
-            etag=str(etag),
-            # Treat plaintext and ciphertext identically for chunking
-            chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
-            object_version=int(current_object_version),
-        )
+        # (placeholder upsert already handled by writer)
         db_time = time.time() - db_start
         logger.debug(f"Part {part_number}: Database insert took {db_time:.3f}s")
 
@@ -1054,88 +1020,23 @@ async def complete_multipart_upload(
                 status_code=400,
             )
 
-        final_md5_hash = await hash_all_etags(
-            object_id,
-            object_version,
-            db,
-        )
-        logger.info(f"MPU complete: upload_id={upload_id} key={object_key} final_etag={final_md5_hash}")
-
-        # Upload concatenated file to IPFS
-        # Re-enable encryption for multipart uploads based on bucket privacy
-        should_encrypt = not bucket["is_public"]
-
-        # Prepare metadata
-        metadata = multipart_upload["metadata"] if multipart_upload["metadata"] else {}
-        if isinstance(metadata, str):
-            metadata = json.loads(metadata)
-
-        # Add metadata for final concatenated file
-        metadata.update(
-            {
-                "multipart": True,
-                "encrypted": should_encrypt,
-            }
+        writer = ObjectWriter(db=db, redis_client=request.app.state.redis_client)
+        complete_res = await writer.mpu_complete(
+            bucket_name=bucket_name,
+            object_id=str(object_id),
+            object_key=object_key,
+            upload_id=str(upload_id),
+            object_version=int(object_version),
+            address=request.state.account.main_account,
+            seed_phrase=request.state.seed_phrase,
         )
 
-        # Mark the upload as completed
-        await db.fetchrow(
-            get_query("complete_multipart_upload"),
-            upload_id,
-        )
-
-        # Do not delete the object row; it was created at initiation. Update it below.
-
-        # Calculate total size from all parts
+        # After commit, enqueue background publish
         parts = await db.fetch(
             get_query("list_parts_for_version"),
             object_id,
             object_version,
         )
-        total_size = sum(part["size_bytes"] for part in parts)
-        logger.info(
-            f"MPU sizes: upload_id={upload_id} total_size={total_size} parts={[p['size_bytes'] for p in parts]}"
-        )
-        # Also log each part's ETag and size for debugging
-        try:
-            part_rows = await db.fetch(get_query("list_parts_for_version"), object_id, object_version)
-            dbg = [
-                {
-                    "part": r["part_number"],
-                    "size": r["size_bytes"],
-                    "etag": r["etag"],
-                }
-                for r in part_rows
-            ]
-            logger.info(f"MPU parts detail: upload_id={upload_id} parts={dbg}")
-        except Exception:
-            logger.debug("Failed to log parts detail after MPU", exc_info=True)
-
-        # Update the current object version with final metadata and touch last_modified
-        await db.execute(
-            """
-            UPDATE object_versions ov
-            SET md5_hash = $1,
-                size_bytes = $2,
-                last_modified = NOW(),
-                status = 'publishing'
-            WHERE ov.object_id = $3
-              AND ov.object_version = $4
-            """,
-            final_md5_hash,
-            total_size,
-            object_id,
-            object_version,
-        )
-
-        # Mark multipart upload as completed and only enqueue after DB commit
-        async with db.transaction():
-            await db.execute(
-                "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
-                upload_id,
-            )
-
-        # After commit, enqueue background publish
         await enqueue_upload_request(
             UploadChainRequest(
                 object_key=object_key,
@@ -1166,7 +1067,7 @@ async def complete_multipart_upload(
   <Location>http://{request.headers.get("Host", "")}/{bucket_name}/{object_key}</Location>
   <Bucket>{bucket_name}</Bucket>
   <Key>{object_key}</Key>
-  <ETag>"{final_md5_hash}"</ETag>
+  <ETag>"{complete_res.etag}"</ETag>
 </CompleteMultipartUploadResult>
 """.encode("utf-8")
 
@@ -1183,7 +1084,7 @@ async def complete_multipart_upload(
         )
         get_metrics_collector().record_data_transfer(
             operation="complete_multipart_upload",
-            bytes_transferred=total_size,
+            bytes_transferred=int(complete_res.size_bytes),
             bucket_name=bucket_name,
             main_account=request.state.account.main_account,
             subaccount_id=request.state.account.id,

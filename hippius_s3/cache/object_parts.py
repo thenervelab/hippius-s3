@@ -5,6 +5,7 @@ from typing import Any
 from typing import Optional
 from typing import Protocol
 
+
 # Lazy monitoring import: avoid pulling opentelemetry at import-time
 class _MetricsLike(Protocol):
     def record_cache_operation(self, hit: bool, operation: str) -> None: ...
@@ -16,6 +17,7 @@ def _get_metrics_collector() -> _MetricsLike:
 
         return get_metrics_collector()
     except Exception:
+
         class _Noop:
             def record_cache_operation(self, hit: bool, operation: str) -> None:
                 return None
@@ -26,6 +28,7 @@ def _get_metrics_collector() -> _MetricsLike:
 # Lazy-config: avoid importing application config at module import time.
 # Use a conservative default TTL and resolve real config only when needed inside methods.
 DEFAULT_OBJ_PART_TTL_SECONDS = 1800
+
 
 def _get_config_value(name: str, default: int) -> int:
     try:

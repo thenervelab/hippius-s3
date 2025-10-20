@@ -48,6 +48,7 @@ def test_dlq_requeue_multipart_upload(
 
     # Get object_id for later use (no need to wait for parts yet)
     from .support.cache import get_object_id_and_version
+
     object_id, ov = get_object_id_and_version(bucket, key)
 
     # Break IPFS at the docker layer for a deterministic window
@@ -146,7 +147,7 @@ def test_dlq_requeue_multipart_upload(
         clear_object_cache(object_id, parts=[0, 1])
 
         # Verify cache is actually cleared (meta) using versioned keys
-    # version already fetched above
+        # version already fetched above
         assert not r.exists(f"obj:{object_id}:v:{ov}:part:0:meta"), "Part 0 cache not cleared"
         assert not r.exists(f"obj:{object_id}:v:{ov}:part:1:meta"), "Part 1 cache not cleared"
 

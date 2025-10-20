@@ -78,6 +78,7 @@ def test_range_downloads_only_needed_chunks(
 
     # Clear all cache for this object
     from .support.cache import get_object_id_and_version
+
     object_id, ov = get_object_id_and_version(bucket, key)
     clear_object_cache(object_id)
 

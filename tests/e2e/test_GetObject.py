@@ -123,6 +123,7 @@ def test_get_object_eventual_consistency(
 
     # Step 3: Get object_id and verify cache exists
     from .support.cache import get_object_id_and_version
+
     object_id, _ = get_object_id_and_version(bucket_name, key)
     object_id, object_version = get_object_id_and_version(bucket_name, key)
 
@@ -132,8 +133,10 @@ def test_get_object_eventual_consistency(
     # object_version already resolved above
     # Count meta keys via cache helper (no raw key construction)
     from hippius_s3.cache import RedisObjectPartsCache
+
     roc = RedisObjectPartsCache(redis_client)
     import psycopg  # type: ignore[import-untyped]
+
     with psycopg.connect("postgresql://postgres:postgres@localhost:5432/hippius") as conn, conn.cursor() as cur:
         cur.execute(
             """

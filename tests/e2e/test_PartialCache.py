@@ -70,6 +70,7 @@ def test_get_partial_cache_fallbacks(
 
     # Get object_id and clear appended part from obj: cache to simulate partial cache
     from .support.cache import get_object_id_and_version
+
     object_id, ov = get_object_id_and_version(bucket, key)
     clear_object_cache(object_id, parts=[1])
 
@@ -79,7 +80,7 @@ def test_get_partial_cache_fallbacks(
 
         r = _redis.Redis.from_url("redis://localhost:6379/0")
         # Fetch current_object_version for versioned cache keys
-    # version already fetched above
+        # version already fetched above
         has1 = bool(r.exists(f"obj:{object_id}:v:{ov}:part:1:meta"))
         has2 = bool(r.exists(f"obj:{object_id}:v:{ov}:part:2:meta"))
         print(f"DEBUG cache before GET: object_id={object_id} part1meta={has1} part2meta={has2}")
