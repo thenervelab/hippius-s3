@@ -129,7 +129,7 @@ class Uploader:
         concurrency = self.config.uploader_multipart_max_concurrency
         semaphore = asyncio.Semaphore(concurrency)
 
-        async def upload_chunk(chunk: Chunk) -> Tuple[str, int]:
+        async def upload_chunk(chunk: Chunk) -> Tuple[List[str], int]:
             async with semaphore:
                 return await self._upload_single_chunk(
                     object_id=object_id,
@@ -140,18 +140,21 @@ class Uploader:
 
         chunks_sorted = sorted(chunks, key=lambda c: c.id)
 
-        first_cid, first_part = await upload_chunk(chunks_sorted[0])
+        first_cids, first_part = await upload_chunk(chunks_sorted[0])
 
         if len(chunks_sorted) > 1:
             remaining_results = await asyncio.gather(*[upload_chunk(c) for c in chunks_sorted[1:]])
-            all_results = [(first_cid, first_part)] + list(remaining_results)
+            all_results = [(first_cids, first_part)] + list(remaining_results)
         else:
-            all_results = [(first_cid, first_part)]
+            all_results = [(first_cids, first_part)]
 
-        for _cid, part_number in all_results:
+        for _cids, part_number in all_results:
             await self.obj_cache.expire(object_id, part_number, ttl=self.config.cache_ttl_seconds)
 
-        return [cid for cid, _ in all_results]
+        all_cids = []
+        for cid_list, _ in all_results:
+            all_cids.extend(cid_list)
+        return all_cids
 
     async def _upload_single_chunk(
         self,
@@ -159,7 +162,7 @@ class Uploader:
         object_key: str,
         chunk: Chunk,
         upload_id: Optional[str],
-    ) -> Tuple[str, int]:
+    ) -> Tuple[List[str], int]:
         part_number = int(chunk.id)
         logger.debug(f"Uploading chunk object_id={object_id} part={part_number}")
         # Prefer chunked path when cache meta indicates multiple ciphertext chunks
@@ -204,7 +207,7 @@ class Uploader:
 
         if num_chunks_meta > 0 and part_id:
             # Upload each ciphertext chunk and upsert part_chunks rows
-            first_chunk_cid = ""
+            all_chunk_cids = []
             for ci in range(num_chunks_meta):
                 piece = await self.obj_cache.get_chunk(object_id, part_number, ci)
                 if not isinstance(piece, (bytes, bytearray)):
@@ -215,9 +218,8 @@ class Uploader:
                     content_type="application/octet-stream",
                     encrypt=False,
                 )
-                piece_cid = str(up_res["cid"])  # textual CID
-                if ci == 0:
-                    first_chunk_cid = piece_cid
+                piece_cid = str(up_res["cid"])
+                all_chunk_cids.append(piece_cid)
 
                 # Compute plaintext size for this chunk if possible
                 if part_chunk_size > 0 and part_plain_size > 0 and num_chunks_meta > 0:
@@ -239,6 +241,7 @@ class Uploader:
                 )
 
             # Set parts.ipfs_cid to first chunk CID for manifest compatibility
+            first_chunk_cid = all_chunk_cids[0] if all_chunk_cids else ""
             cid_row = await self.db.fetchrow(get_query("upsert_cid"), first_chunk_cid) if first_chunk_cid else None
             cid_id = cid_row["id"] if cid_row else None
             await self.db.execute(
@@ -255,9 +258,9 @@ class Uploader:
             )
 
             logger.debug(
-                f"Uploaded {num_chunks_meta} chunk pieces for object_id={object_id} part={part_number}; first_cid={first_chunk_cid}"
+                f"Uploaded {num_chunks_meta} chunk pieces for object_id={object_id} part={part_number}; all_cids={len(all_chunk_cids)}"
             )
-            return first_chunk_cid or "", part_number
+            return all_chunk_cids, part_number
 
         # Fallback: whole-part upload (legacy)
         chunk_data = await self.obj_cache.get(object_id, part_number)
@@ -327,7 +330,7 @@ class Uploader:
             logger.debug("Uploader update failed; will requeue (no synthesize)", exc_info=True)
             raise
 
-        return chunk_cid, part_number
+        return [chunk_cid], part_number
 
     async def _build_and_upload_manifest(
         self,

@@ -31,19 +31,20 @@ async def get_user_cids_from_db(
     db: asyncpg.Connection,
     user: str,
 ) -> List[str]:
-    """Get all CIDs for a user from the database (manifest CIDs and chunk CIDs)."""
+    """Get all CIDs for a user from the database (manifest CIDs, part CIDs, and individual chunk CIDs)."""
     user_cids = []
 
-    # Get manifest CIDs from objects.ipfs_cid (all objects now use manifest structure)
+    # Get manifest CIDs from object_versions.ipfs_cid (moved from objects in migration 20251017000000)
     manifest_cids = await db.fetch(
         """
-        SELECT DISTINCT o.ipfs_cid as cid
-        FROM objects o
+        SELECT DISTINCT ov.ipfs_cid as cid
+        FROM object_versions ov
+        JOIN objects o ON o.object_id = ov.object_id AND o.current_version_seq = ov.version_seq
         JOIN buckets b ON o.bucket_id = b.bucket_id
         WHERE b.main_account_id = $1
-        AND o.ipfs_cid IS NOT NULL
-        AND o.ipfs_cid != ''
-        AND o.status = 'uploaded'
+        AND ov.ipfs_cid IS NOT NULL
+        AND ov.ipfs_cid != ''
+        AND ov.status = 'uploaded'
         AND o.created_at < NOW() - INTERVAL '1 hour'
         """,
         user,
@@ -51,7 +52,7 @@ async def get_user_cids_from_db(
 
     user_cids.extend(row["cid"] for row in manifest_cids if row["cid"])
 
-    # Get chunk CIDs from parts.ipfs_cid
+    # Get part CIDs from parts.ipfs_cid (first chunk or legacy whole part)
     parts_cids = await db.fetch(
         """
         SELECT DISTINCT p.ipfs_cid as cid
@@ -61,13 +62,30 @@ async def get_user_cids_from_db(
         WHERE b.main_account_id = $1
         AND p.ipfs_cid IS NOT NULL
         AND p.ipfs_cid != ''
-        AND o.status = 'uploaded'
         AND o.created_at < NOW() - INTERVAL '1 hour'
         """,
         user,
     )
 
     user_cids.extend(row["cid"] for row in parts_cids if row["cid"])
+
+    # Get individual chunk CIDs from part_chunks.cid (new chunked paradigm)
+    chunk_cids = await db.fetch(
+        """
+        SELECT DISTINCT pc.cid
+        FROM part_chunks pc
+        JOIN parts p ON p.part_id = pc.part_id
+        JOIN objects o ON o.object_id = p.object_id
+        JOIN buckets b ON b.bucket_id = o.bucket_id
+        WHERE b.main_account_id = $1
+        AND pc.cid IS NOT NULL
+        AND pc.cid != ''
+        AND o.created_at < NOW() - INTERVAL '1 hour'
+        """,
+        user,
+    )
+
+    user_cids.extend(row["cid"] for row in chunk_cids if row["cid"])
 
     return list(set(user_cids))  # Remove duplicates
 
