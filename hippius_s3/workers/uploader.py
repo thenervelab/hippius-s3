@@ -79,6 +79,7 @@ class Uploader:
             object_key=payload.object_key,
             chunks=payload.chunks,
             upload_id=payload.upload_id,
+            object_version=int(payload.object_version or 1),
         )
         chunk_duration = time.time() - chunk_start
 
@@ -123,6 +124,7 @@ class Uploader:
         object_key: str,
         chunks: List[Chunk],
         upload_id: Optional[str],
+        object_version: int,
     ) -> List[str]:
         logger.debug(f"Uploading {len(chunks)} chunks for object_id={object_id}")
 
@@ -136,6 +138,7 @@ class Uploader:
                     object_key=object_key,
                     chunk=chunk,
                     upload_id=upload_id,
+                    object_version=int(object_version),
                 )
 
         chunks_sorted = sorted(chunks, key=lambda c: c.id)
@@ -149,7 +152,7 @@ class Uploader:
             all_results = [(first_cid, first_part)]
 
         for _cid, part_number in all_results:
-            await self.obj_cache.expire(object_id, part_number, ttl=self.config.cache_ttl_seconds)
+            await self.obj_cache.expire(object_id, int(object_version), part_number, ttl=self.config.cache_ttl_seconds)
 
         return [cid for cid, _ in all_results]
 
@@ -159,11 +162,12 @@ class Uploader:
         object_key: str,
         chunk: Chunk,
         upload_id: Optional[str],
+        object_version: int,
     ) -> Tuple[str, int]:
         part_number = int(chunk.id)
         logger.debug(f"Uploading chunk object_id={object_id} part={part_number}")
-        # Prefer chunked path when cache meta indicates multiple ciphertext chunks
-        meta = await self.obj_cache.get_meta(object_id, part_number)
+        # Prefer chunked path when cache meta indicates multiple ciphertext chunks (version-aware)
+        meta = await self.obj_cache.get_meta(object_id, int(object_version), part_number)
         num_chunks_meta = int(meta.get("num_chunks", 0)) if isinstance(meta, dict) else 0
 
         # Ensure we have a non-null upload_id for parts table operations
@@ -191,12 +195,12 @@ class Uploader:
                    COALESCE(p.chunk_size_bytes, 0) AS chunk_size_bytes,
                    COALESCE(p.size_bytes, 0) AS size_bytes
             FROM parts p
-            JOIN objects o ON o.object_id = p.object_id
-            WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = o.current_object_version
+            WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = $3
             LIMIT 1
             """,
             object_id,
             part_number,
+            int(object_version),
         )
         part_id: Optional[str] = str(part_row[0]) if part_row else None
         part_chunk_size: int = int(part_row[1] or 0) if part_row else 0
@@ -206,7 +210,7 @@ class Uploader:
             # Upload each ciphertext chunk and upsert part_chunks rows
             first_chunk_cid = ""
             for ci in range(num_chunks_meta):
-                piece = await self.obj_cache.get_chunk(object_id, part_number, ci)
+                piece = await self.obj_cache.get_chunk(object_id, int(object_version), part_number, ci)
                 if not isinstance(piece, (bytes, bytearray)):
                     raise RuntimeError("missing_cipher_chunk")
                 up_res = await self.ipfs_service.upload_file(
@@ -245,13 +249,13 @@ class Uploader:
                 """
                 UPDATE parts p
                 SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
-                FROM objects o
-                WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = o.current_object_version
+                WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = $5
                 """,
                 object_id,
                 part_number,
                 first_chunk_cid,
                 cid_id,
+                int(object_version),
             )
 
             logger.debug(
@@ -260,7 +264,7 @@ class Uploader:
             return first_chunk_cid or "", part_number
 
         # Fallback: whole-part upload (legacy)
-        chunk_data = await self.obj_cache.get(object_id, part_number)
+        chunk_data = await self.obj_cache.get(object_id, int(object_version), part_number)
         if chunk_data is None:
             raise ValueError(f"Chunk data missing for object_id={object_id} part={part_number}")
 
@@ -286,13 +290,13 @@ class Uploader:
                 """
                 UPDATE parts p
                 SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
-                FROM objects o
-                WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = o.current_object_version
+                WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = $5
                 """,
                 object_id,
                 part_number,
                 chunk_cid,
                 cid_id,
+                int(object_version),
             )
             updated_str = str(updated or "")
             rows_affected = 0
@@ -457,7 +461,7 @@ class Uploader:
             for chunk in payload.chunks:
                 part_number = int(chunk.id)
 
-                meta = await self.obj_cache.get_meta(object_id, part_number)
+                meta = await self.obj_cache.get_meta(object_id, int(payload.object_version), part_number)
                 if not meta:
                     logger.warning(
                         f"No cached meta for object {object_id} part {part_number}, skipping DLQ persistence"
@@ -478,7 +482,7 @@ class Uploader:
 
                 pieces_saved = 0
                 for ci in range(num_chunks):
-                    piece = await self.obj_cache.get_chunk(object_id, part_number, ci)
+                    piece = await self.obj_cache.get_chunk(object_id, int(payload.object_version), part_number, ci)
                     if isinstance(piece, (bytes, bytearray)) and len(piece) > 0:
                         try:
                             self.dlq_storage.save_chunk_piece(object_id, part_number, ci, bytes(piece))

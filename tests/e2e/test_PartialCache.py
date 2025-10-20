@@ -10,7 +10,6 @@ except Exception:  # pragma: no cover - allow skipping if unavailable
     redis = None  # type: ignore[assignment]
 
 from .support.cache import clear_object_cache
-from .support.cache import get_object_id
 from .support.cache import wait_for_parts_cids
 
 
@@ -70,7 +69,8 @@ def test_get_partial_cache_fallbacks(
     assert wait_for_parts_cids(bucket, key, min_count=2), "parts not ready with CIDs"
 
     # Get object_id and clear appended part from obj: cache to simulate partial cache
-    object_id = get_object_id(bucket, key)
+    from .support.cache import get_object_id_and_version
+    object_id, ov = get_object_id_and_version(bucket, key)
     clear_object_cache(object_id, parts=[1])
 
     # Diagnostic: verify chunked cache presence before first GET
@@ -78,8 +78,10 @@ def test_get_partial_cache_fallbacks(
         import redis as _redis  # type: ignore[import-untyped]
 
         r = _redis.Redis.from_url("redis://localhost:6379/0")
-        has1 = bool(r.exists(f"obj:{object_id}:part:1:meta"))
-        has2 = bool(r.exists(f"obj:{object_id}:part:2:meta"))
+        # Fetch current_object_version for versioned cache keys
+    # version already fetched above
+        has1 = bool(r.exists(f"obj:{object_id}:v:{ov}:part:1:meta"))
+        has2 = bool(r.exists(f"obj:{object_id}:v:{ov}:part:2:meta"))
         print(f"DEBUG cache before GET: object_id={object_id} part1meta={has1} part2meta={has2}")
     except Exception as _e:  # pragma: no cover
         print(f"DEBUG cache probe failed: {_e}")

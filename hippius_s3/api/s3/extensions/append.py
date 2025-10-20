@@ -26,7 +26,6 @@ from fastapi import Response
 from hippius_s3.api.s3 import errors
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
-from hippius_s3.metadata.meta_writer import write_cache_meta
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
@@ -303,7 +302,7 @@ async def handle_append(
             # Fallback: compute MD5 from cache if available (1-based base part)
             try:
                 obj_cache = RedisObjectPartsCache(redis_client)
-                base_bytes = await obj_cache.get(object_id, 1)
+                base_bytes = await obj_cache.get(object_id, int(current_object_version), 1)
                 base_md5 = hashlib.md5(base_bytes).hexdigest() if base_bytes else "00000000000000000000000000000000"
             except Exception:
                 base_md5 = "00000000000000000000000000000000"  # Placeholder
@@ -384,18 +383,12 @@ async def handle_append(
                 status_code=500,
             )
         # Write meta first using unified writer with plaintext size
-        await write_cache_meta(
-            obj_cache,
-            object_id,
-            int(next_part),
-            chunk_size=chunk_size,
-            num_chunks=len(ct_chunks),
-            plain_size=len(incoming_bytes),
-            ttl=1800,
+        await obj_cache.set_meta(
+            object_id, int(current_object_version), int(next_part), chunk_size=chunk_size, num_chunks=len(ct_chunks), size_bytes=len(incoming_bytes), ttl=1800
         )
         # Then write chunk data
         for i, ct in enumerate(ct_chunks):
-            await obj_cache.set_chunk(object_id, int(next_part), i, ct, ttl=1800)
+            await obj_cache.set_chunk(object_id, int(current_object_version), int(next_part), i, ct, ttl=1800)
 
     # Enqueue background publish of this part via the pinner worker
     try:

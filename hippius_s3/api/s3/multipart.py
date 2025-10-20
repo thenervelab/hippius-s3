@@ -26,7 +26,6 @@ from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import get_object_reader
-from hippius_s3.metadata.meta_writer import write_cache_meta
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
@@ -461,9 +460,10 @@ async def upload_part(
 
             # Enqueue downloader for any missing chunk indices in cache
             obj_cache = RedisObjectPartsCache(request.app.state.redis_client)
+            src_ver = int(source_obj.get("object_version") or 1)
             indices_by_part: dict[int, list[int]] = {}
             for it in plan:
-                exists = await obj_cache.chunk_exists(object_id_str, int(it.part_number), int(it.chunk_index))  # type: ignore[attr-defined]
+                exists = await obj_cache.chunk_exists(object_id_str, src_ver, int(it.part_number), int(it.chunk_index))
                 if not exists:
                     arr = indices_by_part.setdefault(int(it.part_number), [])
                     arr.append(int(it.chunk_index))
@@ -480,6 +480,7 @@ async def upload_part(
                 req = DownloadChainRequest(
                     request_id=f"{object_id_str}::upload_part_copy",
                     object_id=object_id_str,
+                    object_version=src_ver,
                     object_key=source_object_key,
                     bucket_name=source_bucket_name,
                     address=request.state.account.main_account,
@@ -498,6 +499,7 @@ async def upload_part(
             chunks_iter = stream_plan(
                 obj_cache=obj_cache,
                 object_id=object_id_str,
+                object_version=src_ver,
                 plan=plan,
                 should_decrypt=True,
                 seed_phrase=request.state.seed_phrase,
@@ -648,18 +650,12 @@ async def upload_part(
         )
 
         # Write meta first for readiness (store plaintext size)
-        await write_cache_meta(
-            obj_cache,
-            str(object_id),
-            int(part_number),
-            chunk_size=chunk_size,
-            num_chunks=len(chunks_bytes),
-            plain_size=len(file_data),
-            ttl=1800,
+        await obj_cache.set_meta(
+            str(object_id), int(current_object_version), int(part_number), chunk_size=chunk_size, num_chunks=len(chunks_bytes), size_bytes=len(file_data), ttl=1800
         )
         # Then write chunk data
         for i, piece in enumerate(chunks_bytes):
-            await obj_cache.set_chunk(str(object_id), int(part_number), i, piece, ttl=1800)
+            await obj_cache.set_chunk(str(object_id), int(current_object_version), int(part_number), i, piece, ttl=1800)
         redis_time = time.time() - redis_start
         logger.debug(
             f"Part {part_number}: Cached via RedisObjectPartsCache in {redis_time:.3f}s (object_id={object_id}, encrypted=True)"
@@ -732,13 +728,13 @@ async def upload_part(
         try:
             # Delete meta and any chunk keys
             try:
-                meta_key = f"obj:{object_id}:part:{part_number}:meta"
+                # Delete versioned meta and chunk keys using cache helpers
+                object_version = int(ongoing_multipart_upload.get("current_object_version") or 1)
+                delegate = RedisObjectPartsCache(redis_client)
+                meta_key = delegate.build_meta_key(str(object_id), object_version, int(part_number))
                 await redis_client.delete(meta_key)
-            except Exception:
-                pass
-            try:
-                # Best-effort wildcard delete for chunk keys (non-blocking SCAN)
-                async for k in redis_client.scan_iter(f"obj:{object_id}:part:{part_number}:chunk:*", count=1000):
+                base_key = delegate.build_key(str(object_id), object_version, int(part_number))
+                async for k in redis_client.scan_iter(f"{base_key}:chunk:*", count=1000):
                     await redis_client.delete(k)
             except Exception:
                 pass
@@ -789,12 +785,13 @@ async def abort_multipart_upload(
         )
         if parts:
             redis_client = request.app.state.redis_client
+            delegate = RedisObjectPartsCache(redis_client)
             for part in parts:
                 part_num = int(part["part_number"])
-                # Delete meta key
-                await redis_client.delete(f"obj:{object_id}:part:{part_num}:meta")
-                # Delete all chunk keys for this part using SCAN (non-blocking)
-                async for key in redis_client.scan_iter(f"obj:{object_id}:part:{part_num}:chunk:*"):
+                meta_key = delegate.build_meta_key(str(object_id), object_version, part_num)
+                await redis_client.delete(meta_key)
+                base_key = delegate.build_key(str(object_id), object_version, part_num)
+                async for key in redis_client.scan_iter(f"{base_key}:chunk:*"):
                     await redis_client.delete(key)
 
         # Fully remove the multipart upload (and cascade parts) so it disappears from listings immediately

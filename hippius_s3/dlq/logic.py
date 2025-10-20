@@ -29,7 +29,7 @@ class DLQLogic:
         """Lazy import to avoid circular dependencies."""
         return RedisObjectPartsCache
 
-    async def hydrate_cache_from_dlq(self, object_id: str) -> bool:
+    async def hydrate_cache_from_dlq(self, object_id: str, object_version: int) -> bool:
         """Hydrate Redis cache with exactly the meta + per-chunk pieces from DLQ.
 
         Never infer chunk boundaries or slice concatenated files. Only restore from
@@ -84,6 +84,7 @@ class DLQLogic:
 
             await cache.set_meta(
                 object_id,
+                int(object_version),
                 part_number,
                 chunk_size=chunk_size,
                 num_chunks=len(pieces),
@@ -92,7 +93,7 @@ class DLQLogic:
 
             # Then write each chunk piece
             for ci, b in pieces:
-                await cache.set_chunk(object_id, part_number, ci, b)
+                await cache.set_chunk(object_id, int(object_version), part_number, ci, b)
 
             logger.debug(
                 f"Hydrated object {object_id} part {part_number} with {len(pieces)} pieces (bytes={total_bytes})"
@@ -119,7 +120,7 @@ class DLQLogic:
 
         # Hydrate cache from DLQ
         logger.info(f"Hydrating cache from DLQ for object {object_id}")
-        hydration_success = await self.hydrate_cache_from_dlq(object_id)
+        hydration_success = await self.hydrate_cache_from_dlq(object_id, int(payload.object_version or 1))
 
         if not hydration_success:
             if force:

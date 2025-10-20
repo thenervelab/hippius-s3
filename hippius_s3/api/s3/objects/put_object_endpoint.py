@@ -16,7 +16,6 @@ from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.extensions.append import handle_append
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
-from hippius_s3.metadata.meta_writer import write_cache_meta
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
@@ -112,9 +111,43 @@ async def handle_put_object(
         else:
             object_id = str(uuid.uuid4())
 
-        # Unified cache: write base part as part 1 (1-based indexing)
+        async with db.transaction():
+            object_row = await db.fetchrow(
+                get_query("upsert_object_basic"),
+                object_id,
+                bucket_id,
+                object_key,
+                content_type,
+                json.dumps(metadata),
+                md5_hash,
+                file_size,
+                created_at,
+                int(getattr(config, "target_storage_version", 3)),
+            )
+
+            # If overwriting a previous object, remove its parts since we're replacing it
+            try:
+                if prev:
+                    await db.execute("DELETE FROM parts WHERE object_id = $1", prev["object_id"])  # type: ignore[index]
+            except Exception:
+                logger.debug("Failed to cleanup previous parts on overwrite", exc_info=True)
+
+        if not object_row:
+            logger.error(
+                "upsert_object_basic returned no row (object_id=%s, bucket_id=%s, key=%s)",
+                object_id,
+                bucket_id,
+                object_key,
+            )
+            return errors.s3_error_response(
+                "InternalError",
+                "Failed to create object version",
+                status_code=500,
+            )
+        current_object_version = int(object_row["current_object_version"] or 1)
+
+        # Unified cache: write base part as part 1 (1-based indexing) directly
         obj_cache = RedisObjectPartsCache(redis_client)
-        # Encrypt-before-Redis: store ciphertext meta first (readiness signal), then chunks
         chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
 
         from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
@@ -141,42 +174,12 @@ async def handle_put_object(
                 status_code=500,
             )
         total_ct = sum(len(ct) for ct in ct_chunks)
-        # Write meta first using unified writer; store plaintext size for readers
-        await write_cache_meta(
-            obj_cache,
-            object_id,
-            1,
-            chunk_size=chunk_size,
-            num_chunks=len(ct_chunks),
-            plain_size=len(file_data),
-        )
-        # Then write chunk data
+        await obj_cache.set_meta(object_id, int(current_object_version), 1, chunk_size=chunk_size, num_chunks=len(ct_chunks), size_bytes=len(file_data))
         for i, ct in enumerate(ct_chunks):
-            await obj_cache.set_chunk(object_id, 1, i, ct)
-        logger.info(f"PUT cache encrypted write object_id={object_id} part=1 chunks={len(ct_chunks)} bytes={total_ct}")
-
-        async with db.transaction():
-            object_row = await db.fetchrow(
-                get_query("upsert_object_basic"),
-                object_id,
-                bucket_id,
-                object_key,
-                content_type,
-                json.dumps(metadata),
-                md5_hash,
-                file_size,
-                created_at,
-                int(getattr(config, "target_storage_version", 3)),
-            )
-
-            # If overwriting a previous object, remove its parts since we're replacing it
-            try:
-                if prev:
-                    await db.execute("DELETE FROM parts WHERE object_id = $1", prev["object_id"])  # type: ignore[index]
-            except Exception:
-                logger.debug("Failed to cleanup previous parts on overwrite", exc_info=True)
-
-        current_object_version = int(object_row["current_object_version"] or 1)
+            await obj_cache.set_chunk(object_id, int(current_object_version), 1, i, ct)
+        logger.info(
+            f"PUT cache encrypted write object_id={object_id} v={current_object_version} part=1 chunks={len(ct_chunks)} bytes={total_ct}"
+        )
 
         # Ensure upload row and parts(1) placeholder exist atomically before enqueueing
         async with db.transaction():

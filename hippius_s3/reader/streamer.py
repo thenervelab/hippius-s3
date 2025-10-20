@@ -14,6 +14,7 @@ async def stream_plan(
     *,
     obj_cache: Any,
     object_id: str,
+    object_version: int,
     plan: Iterable[ChunkPlanItem],
     should_decrypt: bool,
     seed_phrase: str,
@@ -24,7 +25,12 @@ async def stream_plan(
 ) -> AsyncGenerator[bytes, None]:
     for item in plan:
         c = await fetch_chunk_blocking(
-            obj_cache, object_id, int(item.part_number), int(item.chunk_index), sleep_seconds=sleep_seconds
+            obj_cache,
+            object_id,
+            int(object_version),
+            int(item.part_number),
+            int(item.chunk_index),
+            sleep_seconds=sleep_seconds,
         )
         pt = await decrypt_chunk_if_needed(
             should_decrypt,

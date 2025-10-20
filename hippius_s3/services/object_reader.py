@@ -72,7 +72,12 @@ async def read_response(
     source = "cache"
     try:
         for item in plan:
-            exists = await obj_cache.chunk_exists(info["object_id"], int(item.part_number), int(item.chunk_index))  # type: ignore[attr-defined]
+            exists = await obj_cache.chunk_exists(
+                info["object_id"],
+                int(info.get("object_version") or info.get("current_object_version") or 1),
+                int(item.part_number),
+                int(item.chunk_index),
+            )  # type: ignore[attr-defined]
             if not exists:
                 source = "pipeline"
                 break
@@ -94,7 +99,12 @@ async def read_response(
         # Build index sets
         indices_by_part: dict[int, set[int]] = {}
         for item in plan:
-            ok = await obj_cache.chunk_exists(info["object_id"], int(item.part_number), int(item.chunk_index))  # type: ignore[attr-defined]
+            ok = await obj_cache.chunk_exists(
+                info["object_id"],
+                int(info.get("object_version") or info.get("current_object_version") or 1),
+                int(item.part_number),
+                int(item.chunk_index),
+            )  # type: ignore[attr-defined]
             if ok:
                 continue
             s = indices_by_part.setdefault(int(item.part_number), set())
@@ -116,6 +126,7 @@ async def read_response(
             req = DownloadChainRequest(
                 request_id=f"{info['object_id']}::shared",
                 object_id=info["object_id"],
+                object_version=int(info.get("object_version") or info.get("current_object_version") or 1),
                 object_key=info.get("object_key", ""),
                 bucket_name=info.get("bucket_name", ""),
                 address=address,
@@ -131,9 +142,11 @@ async def read_response(
             await enqueue_download_request(req, redis)
 
     storage_version = int(info.get("storage_version") or 2)
+    object_version = int(info.get("object_version") or info.get("current_object_version") or 1)
     gen = stream_plan(
         obj_cache=obj_cache,
         object_id=info["object_id"],
+        object_version=object_version,
         plan=plan,
         should_decrypt=bool(info.get("should_decrypt")),
         seed_phrase=seed_phrase,

@@ -181,7 +181,13 @@ async def process_download_request(
                             chunk_logger.warning(
                                 f"Cipher len mismatch for part {chunk.part_id} ci={ci}: got={len(data_i)} expected={expected_len}"
                             )
-                        await obj_cache.set_chunk(download_request.object_id, part_num, int(ci), data_i)
+                        await obj_cache.set_chunk(
+                            download_request.object_id,
+                            int(download_request.object_version),
+                            part_num,
+                            int(ci),
+                            data_i,
+                        )
                         return len(data_i)
 
                     # Fetch the first (lowest) chunk synchronously and write immediately

@@ -4,7 +4,6 @@ import os
 import time
 from typing import Any
 from typing import Callable
-from typing import cast
 
 import redis
 
@@ -123,12 +122,35 @@ def test_get_object_eventual_consistency(
     assert wait_for_parts_cids(bucket_name, key, min_count=2, timeout_seconds=20.0)
 
     # Step 3: Get object_id and verify cache exists
-    object_id = get_object_id(bucket_name, key)
+    from .support.cache import get_object_id_and_version
+    object_id, _ = get_object_id_and_version(bucket_name, key)
+    object_id, object_version = get_object_id_and_version(bucket_name, key)
 
     # Verify Redis has cached part chunk meta
     redis_client = redis.Redis.from_url("redis://localhost:6379/0")
-    cache_keys = cast(list[bytes], redis_client.keys(f"obj:{object_id}:part:*:meta"))
-    assert len(cache_keys) >= 2, f"Expected at least 2 cached parts, found {len(cache_keys)}"
+    # Use versioned cache keys (fetch current_object_version)
+    # object_version already resolved above
+    # Count meta keys via cache helper (no raw key construction)
+    from hippius_s3.cache import RedisObjectPartsCache
+    roc = RedisObjectPartsCache(redis_client)
+    import psycopg  # type: ignore[import-untyped]
+    with psycopg.connect("postgresql://postgres:postgres@localhost:5432/hippius") as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT part_number
+            FROM parts
+            WHERE object_id = %s AND object_version = %s
+            ORDER BY part_number
+            """,
+            (object_id, object_version),
+        )
+        part_numbers = [int(row[0]) for row in cur.fetchall()]
+    present = 0
+    for pn in part_numbers:
+        meta_key = roc.build_meta_key(object_id, object_version, pn)
+        if redis_client.exists(meta_key):
+            present += 1
+    assert present >= 2, f"Expected at least 2 cached parts, found {present}"
 
     # Step 4: Simulate eventual consistency issue - force all CIDs to 'pending'
     # This simulates the state where upload succeeded but background processing hasn't completed
