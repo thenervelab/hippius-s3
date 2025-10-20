@@ -32,29 +32,20 @@ async def get_user_cids_from_db(
     user: str,
 ) -> List[str]:
     """Get all CIDs for a user from the database (manifest CIDs, part CIDs, and individual chunk CIDs)."""
-    user_cids = []
-
-    # Get manifest CIDs from object_versions.ipfs_cid (moved from objects in migration 20251017000000)
-    manifest_cids = await db.fetch(
+    rows = await db.fetch(
         """
         SELECT DISTINCT ov.ipfs_cid as cid
         FROM object_versions ov
-        JOIN objects o ON o.object_id = ov.object_id AND o.current_version_seq = ov.version_seq
+        JOIN objects o ON o.object_id = ov.object_id AND o.current_object_version = ov.object_version
         JOIN buckets b ON o.bucket_id = b.bucket_id
         WHERE b.main_account_id = $1
         AND ov.ipfs_cid IS NOT NULL
         AND ov.ipfs_cid != ''
         AND ov.status = 'uploaded'
         AND o.created_at < NOW() - INTERVAL '1 hour'
-        """,
-        user,
-    )
 
-    user_cids.extend(row["cid"] for row in manifest_cids if row["cid"])
+        UNION
 
-    # Get part CIDs from parts.ipfs_cid (first chunk or legacy whole part)
-    parts_cids = await db.fetch(
-        """
         SELECT DISTINCT p.ipfs_cid as cid
         FROM parts p
         JOIN objects o ON p.object_id = o.object_id
@@ -63,15 +54,9 @@ async def get_user_cids_from_db(
         AND p.ipfs_cid IS NOT NULL
         AND p.ipfs_cid != ''
         AND o.created_at < NOW() - INTERVAL '1 hour'
-        """,
-        user,
-    )
 
-    user_cids.extend(row["cid"] for row in parts_cids if row["cid"])
+        UNION
 
-    # Get individual chunk CIDs from part_chunks.cid (new chunked paradigm)
-    chunk_cids = await db.fetch(
-        """
         SELECT DISTINCT pc.cid
         FROM part_chunks pc
         JOIN parts p ON p.part_id = pc.part_id
@@ -85,9 +70,7 @@ async def get_user_cids_from_db(
         user,
     )
 
-    user_cids.extend(row["cid"] for row in chunk_cids if row["cid"])
-
-    return list(set(user_cids))  # Remove duplicates
+    return [row["cid"] for row in rows]
 
 
 async def get_cached_chain_cids(
@@ -190,38 +173,23 @@ async def _wait_for_table(
 
 async def run_chain_pin_checker_loop() -> None:
     """Main loop that checks user CIDs against chain data."""
-    # Connect to database
     db = await asyncpg.connect(config.database_url)
-
-    # Connect to redis-chain (identical to redis-accounts)
-    redis_chain_url = config.redis_chain_url
-    redis_chain = async_redis.from_url(redis_chain_url)
+    redis_chain = async_redis.from_url(config.redis_chain_url)
 
     logger.info("Starting chain pin checker service...")
     logger.info(f"Database: {config.database_url}")
-    logger.info(f"Redis Chain: {redis_chain_url}")
+    logger.info(f"Redis Chain: {config.redis_chain_url}")
 
-    # Wait for schema readiness (buckets is required; others are joined later)
-    try:
-        await _wait_for_table(db, "buckets", timeout_seconds=180)
-    except Exception as e:
-        logger.error(f"Schema not ready: {e}")
-        # Give up this run cycle to avoid tight crash loops
-        await asyncio.sleep(config.pin_checker_loop_sleep)
-        return
+    await _wait_for_table(db, "buckets", timeout_seconds=180)
 
     while True:
-        # Get all users
         users = await get_all_users(db)
         logger.info(f"Checking {len(users)} users for CID consistency")
 
-        # Process each user
         for user in users:
             await check_user_cids(db, redis_chain, user)
 
         logger.info(f"Completed checking all {len(users)} users")
-
-        # Sleep before next iteration
         await asyncio.sleep(config.pin_checker_loop_sleep)
 
 
