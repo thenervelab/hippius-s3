@@ -13,7 +13,10 @@ from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.utils import get_query
 from hippius_s3.writer.cache_writer import CacheWriter
 from hippius_s3.writer.db import ensure_upload_row
+from hippius_s3.writer.types import AppendPreconditionFailed
 from hippius_s3.writer.types import CompleteResult
+from hippius_s3.writer.types import EmptyAppendError
+from hippius_s3.writer.types import ObjectNotFound
 from hippius_s3.writer.types import PartResult
 from hippius_s3.writer.types import PutResult
 
@@ -219,34 +222,55 @@ class ObjectWriter:
         Returns: {"object_id", "new_append_version", "etag", "part_number"}
         """
         if not incoming_bytes:
-            raise ValueError("Empty append not allowed")
+            raise EmptyAppendError("Empty append not allowed")
 
         row = await self.db.fetchrow(
             """
-            SELECT o.object_id, o.current_object_version AS cov, ov.append_version
+            SELECT o.object_id, o.current_object_version AS cov
             FROM objects o
-            JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
             WHERE o.bucket_id = $1 AND o.object_key = $2
             """,
             bucket_id,
             object_key,
         )
         if not row:
-            raise KeyError("NoSuchKey")
+            raise ObjectNotFound("NoSuchKey")
 
         object_id = str(row["object_id"])  # type: ignore
         cov = int(row["cov"])  # type: ignore
-        current_version = int(row["append_version"])  # type: ignore
-        if expected_version != current_version:
-            return {"precondition_failed": True, "current_version": current_version}
 
         # Reserve part and update version state
         delta_md5 = hashlib.md5(incoming_bytes).hexdigest()
         delta_size = len(incoming_bytes)
+        next_part = None
+        upload_id = None
+        composite_etag = None
+        new_append_version_val = None
         async with self.db.transaction():
-            # Determine next part number
+            # 1) Lock the current version row and re-check CAS atomically
+            locked = await self.db.fetchrow(
+                """
+                SELECT append_version
+                  FROM object_versions
+                 WHERE object_id = $1 AND object_version = $2
+                 FOR UPDATE
+                """,
+                object_id,
+                cov,
+            )
+            if not locked:
+                raise ObjectNotFound("NoSuchKey")
+            current_version = int(locked["append_version"])  # type: ignore
+            if expected_version != current_version:
+                raise AppendPreconditionFailed(current_version)
+
+            # 2) Compute next part number AFTER holding the lock
             next_part = await self.db.fetchval(
-                "SELECT COALESCE(MAX(part_number), 0) + 1 FROM parts WHERE object_id = $1 AND object_version = $2",
+                """
+                SELECT COALESCE(MAX(part_number), 0) + 1
+                  FROM parts
+                 WHERE object_id = $1 AND object_version = $2
+                """,
                 object_id,
                 cov,
             )
@@ -308,21 +332,33 @@ class ObjectWriter:
                     md5s.append(bytes.fromhex(e))
             composite_etag = hashlib.md5(b"".join(md5s)).hexdigest() + f"-{len(md5s)}"
 
-            await self.db.execute(
+            # 3) CAS update on append_version to ensure no other writer slipped in
+            updated = await self.db.fetchrow(
                 """
                 UPDATE object_versions
-                SET size_bytes = size_bytes + $3,
-                    md5_hash = $4,
-                    append_version = append_version + 1,
-                    last_modified = NOW(),
-                    last_append_at = NOW()
-                WHERE object_id = $1 AND object_version = $2
+                   SET size_bytes     = size_bytes + $3,
+                       md5_hash       = $4,
+                       multipart      = TRUE,
+                       append_version = append_version + 1,
+                       last_modified  = NOW(),
+                       last_append_at = NOW()
+                 WHERE object_id = $1 AND object_version = $2 AND append_version = $5
+                RETURNING append_version
                 """,
                 object_id,
                 cov,
                 int(delta_size),
                 composite_etag,
+                current_version,
             )
+            if not updated:
+                fresh = await self.db.fetchval(
+                    "SELECT append_version FROM object_versions WHERE object_id = $1 AND object_version = $2",
+                    object_id,
+                    cov,
+                )
+                raise AppendPreconditionFailed(int(fresh or 0))
+            new_append_version_val = int(updated["append_version"])  # type: ignore
 
         # Cache write-through
         chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
@@ -354,7 +390,7 @@ class ObjectWriter:
             "object_id": object_id,
             "object_version": int(cov),
             "upload_id": str(upload_id),
-            "new_append_version": int(current_version + 1),
+            "new_append_version": int(new_append_version_val) if new_append_version_val is not None else 0,
             "etag": composite_etag,
             "part_number": int(next_part),
         }

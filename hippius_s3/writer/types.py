@@ -40,3 +40,18 @@ class PartResult:
 class CompleteResult:
     etag: str
     size_bytes: int
+
+
+# Typed domain errors for writer operations
+class AppendPreconditionFailed(Exception):
+    def __init__(self, current_version: int) -> None:
+        super().__init__("Append precondition failed")
+        self.current_version = int(current_version)
+
+
+class ObjectNotFound(Exception):
+    pass
+
+
+class EmptyAppendError(Exception):
+    pass
