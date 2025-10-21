@@ -65,7 +65,7 @@ CREATE INDEX IF NOT EXISTS idx_object_versions_manifest_builder
 ALTER TABLE public.objects
   ADD COLUMN IF NOT EXISTS current_object_version bigint NULL;
 
--- Backfill: create initial version_seq=1 for each object, and set current_version_seq
+-- Backfill: create initial object_version=1 for each object, and set current_object_version
 WITH ins AS (
   INSERT INTO public.object_versions (
     object_id,
@@ -112,7 +112,7 @@ WITH ins AS (
   WHERE NOT EXISTS (
     SELECT 1 FROM public.object_versions ov WHERE ov.object_id = o.object_id
   )
-  RETURNING object_id, version_seq
+  RETURNING object_id, object_version
 )
 UPDATE public.objects o
 SET current_object_version = 1
@@ -127,20 +127,21 @@ ALTER TABLE public.objects
   ADD CONSTRAINT objects_current_version_fk
   FOREIGN KEY (object_id, current_object_version)
   REFERENCES public.object_versions(object_id, object_version)
-  ON DELETE RESTRICT;
+  ON DELETE RESTRICT
+  DEFERRABLE INITIALLY DEFERRED;
 
 -- Parts now link to object_versions
 ALTER TABLE public.parts
   ADD COLUMN IF NOT EXISTS object_version bigint NULL;
 
--- Backfill parts.object_version_seq from objects.current_version_seq
+-- Backfill parts.object_version from objects.current_object_version
 UPDATE public.parts p
 SET object_version = o.current_object_version
 FROM public.objects o
 WHERE p.object_id = o.object_id
   AND p.object_version IS NULL;
 
--- Add FK to composite key (object_id, version_seq)
+-- Add FK to composite key (object_id, object_version)
 ALTER TABLE public.parts
   DROP CONSTRAINT IF EXISTS parts_object_version_fk;
 ALTER TABLE public.parts
@@ -149,7 +150,7 @@ ALTER TABLE public.parts
   REFERENCES public.object_versions(object_id, object_version)
   ON DELETE CASCADE;
 
--- Replace uniqueness: (object_id, part_number) -> (object_id, object_version_seq, part_number)
+-- Replace uniqueness: (object_id, part_number) -> (object_id, object_version, part_number)
 ALTER TABLE public.parts
   DROP CONSTRAINT IF EXISTS parts_object_id_part_number_key;
 ALTER TABLE public.parts
@@ -188,7 +189,7 @@ ALTER TABLE public.objects
   DROP COLUMN IF EXISTS last_modified,
   DROP COLUMN IF EXISTS storage_version;
 
--- Strengthen invariant: versions must exist for every object; prevent null current_version_seq
+-- Strengthen invariant: versions must exist for every object; prevent null current_object_version
 ALTER TABLE public.objects
   ALTER COLUMN current_object_version SET DEFAULT 1;
 -- Ensure no NULLs remain (backfill already set to 1)
@@ -220,7 +221,7 @@ ALTER TABLE public.objects
   ADD COLUMN IF NOT EXISTS last_modified timestamptz NULL,
   ADD COLUMN IF NOT EXISTS storage_version int2 NULL;
 
--- 3) Backfill object columns from the latest version (current_version_seq if present, else max)
+-- 3) Backfill object columns from the latest version (current_object_version if present, else max)
 WITH latest AS (
   SELECT ov.*
   FROM public.object_versions ov
