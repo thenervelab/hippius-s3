@@ -70,6 +70,7 @@ class UnpinChainRequest(ChainRequest):
 class DownloadChainRequest(BaseModel):
     request_id: str
     object_id: str
+    object_version: int
     object_key: str
     bucket_name: str
     address: str
@@ -279,49 +280,3 @@ async def dequeue_substrate_request(
         _, queue_data = result
         return SubstratePinningRequest.model_validate_json(queue_data)
     return None
-
-
-async def enqueue_substrate_retry_request(
-    payload: SubstratePinningRequest,
-    redis_client: async_redis.Redis,
-    delay_seconds: float = 0.0,
-    last_error: str | None = None,
-) -> None:
-    """Add a substrate request to retry queue with delay."""
-    payload.attempts = (payload.attempts or 0) + 1
-    if last_error:
-        payload.last_error = last_error
-
-    retry_key = f"substrate_requests:retry:{int((time.time() + delay_seconds) * 1000)}"
-    await redis_client.lpush(retry_key, payload.model_dump_json())
-    await redis_client.expire(retry_key, int(delay_seconds) + 60)
-    logger.info(
-        f"Enqueued substrate retry request {payload.name=} attempt={payload.attempts} delay={delay_seconds:.2f}s"
-    )
-
-
-async def move_substrate_due_retries_to_primary(
-    redis_client: async_redis.Redis,
-    now_ts: float,
-    max_items: int = 64,
-) -> int:
-    """Move due substrate retry requests back to primary queue."""
-    now_ms = int(now_ts * 1000)
-    moved = 0
-
-    keys = await redis_client.keys("substrate_requests:retry:*")
-    for key in keys:
-        try:
-            key_str = key.decode() if isinstance(key, bytes) else str(key)
-            due_time_ms = int(key_str.split(":")[-1])
-
-            if due_time_ms <= now_ms:
-                items = await redis_client.lrange(key, 0, max_items - 1)
-                for item in items:
-                    await redis_client.lpush(SUBSTRATE_QUEUE, item)
-                    moved += 1
-                await redis_client.delete(key)
-        except Exception:
-            logger.debug(f"Error moving substrate retry key {key}", exc_info=True)
-
-    return moved

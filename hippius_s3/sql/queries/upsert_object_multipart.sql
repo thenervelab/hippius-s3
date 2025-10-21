@@ -74,5 +74,4 @@ SELECT uo.object_id,
        ov.multipart,
        ov.storage_version
 FROM upsert_object uo
-JOIN ins_version iv ON iv.object_id = uo.object_id AND iv.object_version = uo.current_object_version
-JOIN object_versions ov ON ov.object_id = iv.object_id AND ov.object_version = iv.object_version
+JOIN object_versions ov ON ov.object_id = uo.object_id AND ov.object_version = uo.current_object_version

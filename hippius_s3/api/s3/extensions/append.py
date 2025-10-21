@@ -9,14 +9,10 @@ and the current value exposed on HEAD as ``x-amz-meta-append-version``. ETag is
 maintained for clients, but is not used for CAS.
 """
 
-import asyncio
 import contextlib
-import hashlib
 import json
 import logging
 import uuid
-from datetime import datetime
-from datetime import timezone
 from typing import Any
 from typing import cast
 
@@ -24,15 +20,13 @@ from fastapi import Request
 from fastapi import Response
 
 from hippius_s3.api.s3 import errors
-from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
-from hippius_s3.metadata.meta_writer import write_cache_meta
-from hippius_s3.queue import Chunk
-from hippius_s3.queue import UploadChainRequest
-from hippius_s3.queue import enqueue_upload_request
-from hippius_s3.services.crypto_service import CryptoService
-from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.utils import get_query
+from hippius_s3.writer.object_writer import ObjectWriter
+from hippius_s3.writer.queue import enqueue_upload as writer_enqueue_upload
+from hippius_s3.writer.types import AppendPreconditionFailed
+from hippius_s3.writer.types import EmptyAppendError
+from hippius_s3.writer.types import ObjectNotFound
 
 
 logger = logging.getLogger(__name__)
@@ -69,7 +63,6 @@ async def handle_append(
     # Version-based CAS for append
     expected_version_header = request.headers.get("x-amz-meta-append-if-version")
     append_id = request.headers.get("x-amz-meta-append-id")
-    content_type = request.headers.get("Content-Type", "application/octet-stream")
 
     # Reject empty append deltas to avoid bloating manifests
     if not incoming_bytes:
@@ -112,318 +105,70 @@ async def handle_append(
             status_code=400,
         )
 
-    # PHASE 0: Preflight CAS check (no lock) to reduce contention
-    # Check if object exists and get current version (from object_versions)
-    current_row = await db.fetchrow(
-        """
-        SELECT ov.append_version, o.object_id, o.current_object_version
-        FROM objects o
-        JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
-        WHERE o.bucket_id = $1 AND o.object_key = $2
-        LIMIT 1
-        """,
-        bucket_id,
-        object_key,
-    )
-    if not current_row:
+    # Endpoint delegates CAS and locking to writer.append
+
+    # PHASE 2 (out-of-DB): delegate to ObjectWriter to append, cache, and update version
+    writer = ObjectWriter(db=db, redis_client=redis_client)
+    try:
+        result = await writer.append(
+            bucket_id=bucket_id,
+            bucket_name=bucket_name,
+            object_key=object_key,
+            expected_version=int(expected_version),
+            account_address=request.state.account.main_account,
+            seed_phrase=request.state.seed_phrase,
+            incoming_bytes=incoming_bytes,
+        )
+    except AppendPreconditionFailed as exc:
+        return errors.s3_error_response(
+            code="PreconditionFailed",
+            message="Version precondition failed",
+            status_code=412,
+            extra_headers={
+                "x-amz-meta-append-version": str(exc.current_version),
+                "Retry-After": "0.1",
+            },
+        )
+    except ObjectNotFound:
         return errors.s3_error_response(
             code="NoSuchKey",
             message=f"The specified key {object_key} does not exist",
             status_code=404,
             Key=object_key,
         )
-
-    current_version = int(current_row.get("append_version") or 0)
-    object_id = str(current_row["object_id"])
-    current_object_version = int(current_row.get("current_object_version") or 1)
-
-    with contextlib.suppress(Exception):
-        logger.info(
-            f"APPEND preflight bucket={bucket_name} key={object_key} expected={expected_version} current={current_version}"
-        )
-    if expected_version != current_version:
-        with contextlib.suppress(Exception):
-            logger.info(
-                f"APPEND preflight-mismatch bucket={bucket_name} key={object_key} expected={expected_version} current={current_version} -> 412"
-            )
+    except EmptyAppendError:
         return errors.s3_error_response(
-            code="PreconditionFailed",
-            message="Version precondition failed",
-            status_code=412,
-            extra_headers={
-                "x-amz-meta-append-version": str(current_version),
-                "Retry-After": "0.1",  # Small jitter to spread retries
-            },
+            code="InvalidRequest",
+            message="Empty append not allowed",
+            status_code=400,
         )
+    object_id = result["object_id"]
+    next_part = int(result["part_number"])  # type: ignore[index]
+    composite_etag = str(result["etag"])  # type: ignore[index]
+    object_version = int(result.get("object_version", 1))
+    new_append_version = int(result.get("new_append_version", 0))
 
-    # PHASE 1: Transactional phase (with lock) - only reached if preflight passed
-    async with db.transaction():
-        # Try to acquire row lock with brief retries to avoid spurious 412s in serial clients
-        lock_attempts = 3
-        current = None
-        for attempt in range(lock_attempts):
-            try:
-                current = await db.fetchrow(
-                    """
-                    SELECT o.object_id, o.bucket_id, o.object_key, o.current_object_version,
-                           ov.append_version, ov.metadata
-                    FROM objects o
-                    JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
-                    WHERE o.bucket_id = $1 AND o.object_key = $2
-                    FOR UPDATE NOWAIT
-                    """,
-                    bucket_id,
-                    object_key,
-                )
-                break
-            except Exception as e:
-                if attempt == lock_attempts - 1:
-                    # If still not available, convert to a fast 412 with refreshed version
-                    with contextlib.suppress(Exception):
-                        logger.info(f"APPEND lock not available for {bucket_name}/{object_key}: {e}")
-                    try:
-                        fresh = await db.fetchrow(
-                            """
-                            SELECT ov.append_version
-                            FROM objects o
-                            JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
-                            WHERE o.bucket_id = $1 AND o.object_key = $2
-                            """,
-                            bucket_id,
-                            object_key,
-                        )
-                        fresh_version = int((fresh or {}).get("append_version") or current_version)
-                    except Exception:
-                        fresh_version = current_version
-                    return errors.s3_error_response(
-                        code="PreconditionFailed",
-                        message="Concurrent append in progress",
-                        status_code=412,
-                        extra_headers={
-                            "x-amz-meta-append-version": str(fresh_version),
-                            "Retry-After": "0.1",
-                        },
-                    )
-                # brief backoff before retrying lock acquisition
-                await asyncio.sleep(0.03 * (attempt + 1))
-
-        if not current:
-            # Double-check in case of race (though preflight checked)
-            return errors.s3_error_response(
-                code="NoSuchKey",
-                message=f"The specified key {object_key} does not exist",
-                status_code=404,
-                Key=object_key,
-            )
-
-        # Double-check version (TOCTOU protection)
-        current_version_txn = int(current.get("append_version") or 0)
-        if expected_version != current_version_txn:
-            # This should be extremely rare since we checked preflight
-            with contextlib.suppress(Exception):
-                logger.warning(
-                    f"APPEND txn-version-mismatch bucket={bucket_name} key={object_key} expected={expected_version} current_txn={current_version_txn} -> 412"
-                )
-            return errors.s3_error_response(
-                code="PreconditionFailed",
-                message="Version precondition failed",
-                status_code=412,
-                extra_headers={
-                    "x-amz-meta-append-version": str(current_version_txn),
-                    "Retry-After": "0.1",
-                },
-            )
-
-        # Ensure multipart_uploads row exists for parts FK constraint
-        upload_row = await db.fetchrow(
-            "SELECT upload_id FROM multipart_uploads WHERE object_id = $1 ORDER BY initiated_at DESC LIMIT 1",
-            object_id,
-        )
-        if upload_row:
-            upload_id = str(upload_row["upload_id"])  # type: ignore[index]
-        else:
-            upload_id = str(uuid.uuid4())
-            await db.execute(
-                """
-                INSERT INTO multipart_uploads (upload_id, bucket_id, object_key, initiated_at, is_completed, content_type, metadata, object_id)
-                VALUES ($1, $2, $3, $4, TRUE, $5, $6, $7)
-                ON CONFLICT (upload_id) DO NOTHING
-                """,
-                upload_id,
-                bucket_id,
-                object_key,
-                datetime.now(timezone.utc),
-                content_type,
-                json.dumps(current.get("metadata") or {}),
-                object_id,
-            )
-
-        # Mark object as multipart on the current version
-        await db.execute(
-            """
-            UPDATE object_versions
-            SET multipart = TRUE
-            WHERE object_id = $1
-              AND object_version = $2
-            """,
-            object_id,
-            current_object_version,
-        )
-
-        # Determine next part number
-        next_part = await db.fetchval(
-            """
-            SELECT COALESCE(MAX(part_number), 0) + 1
-            FROM parts
-            WHERE object_id = $1
-              AND object_version = $2
-            """,
-            object_id,
-            current_object_version,
-        )
-        with contextlib.suppress(Exception):
-            logger.info(f"APPEND next_part_decided object_id={object_id} next_part={int(next_part)}")
-        # PHASE 1 (in-DB reservation): insert placeholder part and update object metadata atomically
-        delta_md5 = hashlib.md5(incoming_bytes).hexdigest()
-        delta_size = len(incoming_bytes)
-        await upsert_part_placeholder(
-            db,
-            object_id=object_id,
-            upload_id=str(upload_id),
-            part_number=int(next_part),
-            size_bytes=int(delta_size),
-            etag=delta_md5,
-            chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
-            object_version=current_object_version,
-        )
-
-        # Recompute composite ETag from base object MD5 + all appended part etags
-        base_md5 = str(current.get("md5_hash") or "").strip()
-        if not base_md5 or len(base_md5) != 32:
-            # Fallback: compute MD5 from cache if available (1-based base part)
-            try:
-                obj_cache = RedisObjectPartsCache(redis_client)
-                base_bytes = await obj_cache.get(object_id, 1)
-                base_md5 = hashlib.md5(base_bytes).hexdigest() if base_bytes else "00000000000000000000000000000000"
-            except Exception:
-                base_md5 = "00000000000000000000000000000000"  # Placeholder
-
-        # Collect all part MD5s (base + appended parts)
-        md5s = [bytes.fromhex(base_md5)]
-
-        parts = await db.fetch(
-            """
-            SELECT part_number, etag
-            FROM parts
-            WHERE object_id = $1
-              AND object_version = $2
-            ORDER BY part_number
-            """,
-            object_id,
-            current_object_version,
-        )
-        for p in parts:
-            e = str(p["etag"]).strip('"')  # type: ignore
-            e = e.split("-")[0]  # type: ignore
-            if len(e) == 32:  # type: ignore
-                md5s.append(bytes.fromhex(e))  # type: ignore
-
-        combined_md5 = hashlib.md5(b"".join(md5s)).hexdigest()
-        composite_etag = f"{combined_md5}-{len(md5s)}"
-
-        # Update version size, etag, and append_version on the current version
-        await db.execute(
-            """
-            UPDATE object_versions
-            SET size_bytes = size_bytes + $3,
-                md5_hash = $4,
-                append_version = append_version + 1,
-                last_modified = NOW(),
-                last_append_at = NOW()
-            WHERE object_id = $1
-              AND object_version = $2
-            """,
-            object_id,
-            current_object_version,
-            int(delta_size),
-            composite_etag,
-        )
-
-        # End of transactional phase; publish outside of the lock window
-
-    # PHASE 2 (out-of-DB): enqueue background publish for the reserved part and return immediately
-    # Write-through cache first for immediate reads
-
-    # Write-through cache: store appended bytes for immediate reads
-
-    with contextlib.suppress(Exception):
-        logger.info(f"APPEND cache write object_id={object_id} part={int(next_part)} bytes={len(incoming_bytes)}")
-        obj_cache = RedisObjectPartsCache(redis_client)
-        chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-        from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
-
-        key_bytes = await get_or_create_encryption_key_bytes(
-            subaccount_id=request.state.account.main_account,
-            bucket_name=bucket_name,
-        )
-        try:
-            ct_chunks = CryptoService.encrypt_part_to_chunks(
-                incoming_bytes,
-                object_id=object_id,
-                part_number=int(next_part),
-                seed_phrase=request.state.seed_phrase,
-                chunk_size=chunk_size,
-                key=key_bytes,
-            )
-        except Exception:
-            from hippius_s3.api.s3.errors import s3_error_response
-
-            return s3_error_response(
-                "InternalError",
-                "Failed to resolve encryption key",
-                status_code=500,
-            )
-        # Write meta first using unified writer with plaintext size
-        await write_cache_meta(
-            obj_cache,
-            object_id,
-            int(next_part),
-            chunk_size=chunk_size,
-            num_chunks=len(ct_chunks),
-            plain_size=len(incoming_bytes),
-            ttl=1800,
-        )
-        # Then write chunk data
-        for i, ct in enumerate(ct_chunks):
-            await obj_cache.set_chunk(object_id, int(next_part), i, ct, ttl=1800)
-
-    # Enqueue background publish of this part via the pinner worker
+    # Enqueue background publish of this part via the pinner worker (writer helper)
     try:
-        logger.debug(
-            f"APPEND about to enqueue UploadChainRequest for object_id={object_id}, part={int(next_part)}, upload_id={str(upload_id)}"
-        )
-        payload = UploadChainRequest(
-            substrate_url=config.substrate_url,
-            ipfs_node=config.ipfs_store_url,
+        await writer_enqueue_upload(
+            redis_client=redis_client,
             address=request.state.account.main_account,
-            subaccount=request.state.account.main_account,
             subaccount_seed_phrase=request.state.seed_phrase,
+            subaccount=request.state.account.main_account,
             bucket_name=bucket_name,
             object_key=object_key,
             object_id=object_id,
-            object_version=int(current_object_version),
-            upload_id=str(upload_id),
-            chunks=[Chunk(id=int(next_part))],
+            object_version=int(object_version),
+            upload_id=str(result["upload_id"]),
+            chunk_ids=[int(next_part)],
+            substrate_url=config.substrate_url,
+            ipfs_node=config.ipfs_store_url,
         )
-        logger.debug(f"APPEND UploadChainRequest payload created: {payload}")
-        await enqueue_upload_request(payload, redis_client)
-        logger.debug("APPEND UploadChainRequest successfully enqueued")
         with contextlib.suppress(Exception):
             logger.info(
-                f"APPEND enqueued background publish object_id={object_id} part={int(next_part)} upload_id={str(upload_id)}"
+                f"APPEND enqueued background publish object_id={object_id} part={int(next_part)} upload_id={str(result.get('upload_id', ''))}"
             )
     except Exception:
-        # Non-fatal; the object state is already updated, and cache serves reads
         logger.exception("Failed to enqueue append publish request")
 
     # Successful append: return the new append version so clients can avoid a HEAD
@@ -431,12 +176,12 @@ async def handle_append(
         status_code=200,
         headers={
             "ETag": f'"{composite_etag}"',
-            "x-amz-meta-append-version": str(current_version + 1),
+            "x-amz-meta-append-version": str(new_append_version),
         },
     )
     with contextlib.suppress(Exception):
         logger.info(
-            f"APPEND success bucket={bucket_name} key={object_key} new_version={current_version + 1} next_part={int(next_part)} size_delta={delta_size}"
+            f"APPEND success bucket={bucket_name} key={object_key} new_version={new_append_version} next_part={int(next_part)} size_delta={len(incoming_bytes)}"
         )
 
     # Record idempotency result for future retries (best-effort)

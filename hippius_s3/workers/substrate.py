@@ -185,11 +185,11 @@ class SubstrateWorker:
 
             for req in requests:
                 await self.db.execute(
-                    "UPDATE object_versions SET status = 'uploaded' WHERE object_id = $1 AND object_version = $2 AND status != 'uploaded'",
+                    "UPDATE object_versions SET status = 'uploaded' WHERE object_id = $1 AND object_version = $2",
                     req.object_id,
                     int(getattr(req, "object_version", 1) or 1),
                 )
-                logger.info(f"Updated object status to 'uploaded' object_id={req.object_id}")
+                logger.info(f"Ensured object status is 'uploaded' object_id={req.object_id}")
 
             for user_address, user_requests in user_request_map.items():
                 total_cids = sum(len(r.cids) for r in user_requests)

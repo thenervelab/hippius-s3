@@ -76,7 +76,7 @@ def test_append_single_writer(
             break
         import time
 
-        time.sleep(0.2)
+        time.sleep(0.05)
     assert resp_pipe is not None
     assert resp_pipe.status_code == 200
     assert resp_pipe.content == initial + delta
