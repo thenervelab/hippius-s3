@@ -24,11 +24,9 @@ from fastapi import Response
 
 from hippius_s3.api.s3 import errors
 from hippius_s3.config import get_config
-from hippius_s3.queue import Chunk
-from hippius_s3.queue import UploadChainRequest
-from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.utils import get_query
 from hippius_s3.writer.object_writer import ObjectWriter
+from hippius_s3.writer.queue import enqueue_upload as writer_enqueue_upload
 
 
 logger = logging.getLogger(__name__)
@@ -295,33 +293,27 @@ async def handle_append(
     object_version = int(result.get("object_version", current_object_version))
     new_append_version = int(result.get("new_append_version", current_version + 1))
 
-    # Enqueue background publish of this part via the pinner worker
+    # Enqueue background publish of this part via the pinner worker (writer helper)
     try:
-        logger.debug(
-            f"APPEND about to enqueue UploadChainRequest for object_id={object_id}, part={int(next_part)}, upload_id={str(upload_id)}"
-        )
-        payload = UploadChainRequest(
-            substrate_url=config.substrate_url,
-            ipfs_node=config.ipfs_store_url,
+        await writer_enqueue_upload(
+            redis_client=redis_client,
             address=request.state.account.main_account,
-            subaccount=request.state.account.main_account,
             subaccount_seed_phrase=request.state.seed_phrase,
+            subaccount=request.state.account.main_account,
             bucket_name=bucket_name,
             object_key=object_key,
             object_id=object_id,
             object_version=int(object_version),
             upload_id=str(result.get("upload_id", upload_id)),
-            chunks=[Chunk(id=int(next_part))],
+            chunk_ids=[int(next_part)],
+            substrate_url=config.substrate_url,
+            ipfs_node=config.ipfs_store_url,
         )
-        logger.debug(f"APPEND UploadChainRequest payload created: {payload}")
-        await enqueue_upload_request(payload, redis_client)
-        logger.debug("APPEND UploadChainRequest successfully enqueued")
         with contextlib.suppress(Exception):
             logger.info(
                 f"APPEND enqueued background publish object_id={object_id} part={int(next_part)} upload_id={str(upload_id)}"
             )
     except Exception:
-        # Non-fatal; the object state is already updated, and cache serves reads
         logger.exception("Failed to enqueue append publish request")
 
     # Successful append: return the new append version so clients can avoid a HEAD
