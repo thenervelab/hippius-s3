@@ -13,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
-from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.queue import dequeue_substrate_request
 from hippius_s3.queue import enqueue_substrate_request
@@ -74,7 +73,7 @@ async def run_substrate_loop():
         try:
             await substrate_worker.process_batch(requests)
             logger.info(f"Successfully submitted batch of {len(requests)} requests")
-        except Exception as e:
+        except Exception:
             logger.exception(f"Substrate batch submission failed for {len(requests)} requests")
             for req in requests:
                 await enqueue_substrate_request(req, redis_client)
