@@ -14,7 +14,16 @@ ALTER TABLE public.objects
 
 -- 2) Ensure every object has its current version row; if missing, create it with minimal defaults
 WITH missing AS (
-  SELECT o.object_id, COALESCE(o.current_object_version, 1) AS v, o.created_at
+  SELECT o.object_id,
+         COALESCE(o.current_object_version, 1) AS v,
+         o.created_at,
+         o.size_bytes,
+         o.content_type,
+         o.metadata,
+         o.md5_hash,
+         o.ipfs_cid,
+         o.cid_id,
+         COALESCE(o.multipart, FALSE) AS multipart
   FROM public.objects o
   LEFT JOIN public.object_versions ov
     ON ov.object_id = o.object_id AND ov.object_version = COALESCE(o.current_object_version, 1)
@@ -46,13 +55,13 @@ SELECT
   m.v,
   'user'::public.version_type,
   3,                                -- storage_version (default latest)
-  0,                                -- size_bytes
-  'application/octet-stream',       -- content_type
-  '{}'::jsonb,                      -- metadata
-  '',                               -- md5_hash
-  NULL,                             -- ipfs_cid
-  NULL,                             -- cid_id
-  FALSE,                            -- multipart
+  COALESCE(m.size_bytes, 0),        -- size_bytes backfill from objects
+  COALESCE(m.content_type, 'application/octet-stream'),
+  COALESCE(m.metadata, '{}'::jsonb),
+  COALESCE(NULLIF(m.md5_hash, ''), ''),
+  m.ipfs_cid,
+  m.cid_id,
+  m.multipart,
   'publishing',                     -- status
   0,                                -- append_version
   NULL,                             -- manifest_cid

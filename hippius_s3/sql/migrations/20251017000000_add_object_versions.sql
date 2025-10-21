@@ -15,7 +15,7 @@ END$$;
 -- Create table for per-object versions with sequential numbering
 CREATE TABLE IF NOT EXISTS public.object_versions (
     object_id uuid NOT NULL REFERENCES public.objects(object_id) ON DELETE CASCADE,
-    version_seq bigint NOT NULL,
+    object_version bigint NOT NULL,
     version_type version_type NOT NULL DEFAULT 'user',
 
     -- per-version fields moved from objects
@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS public.object_versions (
 
     created_at timestamptz NOT NULL DEFAULT now(),
 
-    CONSTRAINT object_versions_pkey PRIMARY KEY (object_id, version_seq),
+    CONSTRAINT object_versions_pkey PRIMARY KEY (object_id, object_version),
     CONSTRAINT object_versions_status_check CHECK (((status)::text = ANY (ARRAY['publishing'::text, 'pinning'::text, 'uploaded'::text, 'failed'::text])))
 );
 
@@ -63,13 +63,13 @@ CREATE INDEX IF NOT EXISTS idx_object_versions_manifest_builder
 
 -- Pointer on objects to current version sequence
 ALTER TABLE public.objects
-  ADD COLUMN IF NOT EXISTS current_version_seq bigint NULL;
+  ADD COLUMN IF NOT EXISTS current_object_version bigint NULL;
 
 -- Backfill: create initial version_seq=1 for each object, and set current_version_seq
 WITH ins AS (
   INSERT INTO public.object_versions (
     object_id,
-    version_seq,
+    object_version,
     version_type,
     storage_version,
     size_bytes,
@@ -90,7 +90,7 @@ WITH ins AS (
   )
   SELECT
     o.object_id,
-    1 AS version_seq,
+    1 AS object_version,
     'user'::version_type,
     o.storage_version,
     o.size_bytes,
@@ -115,38 +115,38 @@ WITH ins AS (
   RETURNING object_id, version_seq
 )
 UPDATE public.objects o
-SET current_version_seq = 1
+SET current_object_version = 1
 FROM ins
 WHERE o.object_id = ins.object_id
-  AND o.current_version_seq IS NULL;
+  AND o.current_object_version IS NULL;
 
 -- Enforce FK from objects to object_versions (composite)
 ALTER TABLE public.objects
   DROP CONSTRAINT IF EXISTS objects_current_version_fk;
 ALTER TABLE public.objects
   ADD CONSTRAINT objects_current_version_fk
-  FOREIGN KEY (object_id, current_version_seq)
-  REFERENCES public.object_versions(object_id, version_seq)
+  FOREIGN KEY (object_id, current_object_version)
+  REFERENCES public.object_versions(object_id, object_version)
   ON DELETE RESTRICT;
 
 -- Parts now link to object_versions
 ALTER TABLE public.parts
-  ADD COLUMN IF NOT EXISTS object_version_seq bigint NULL;
+  ADD COLUMN IF NOT EXISTS object_version bigint NULL;
 
 -- Backfill parts.object_version_seq from objects.current_version_seq
 UPDATE public.parts p
-SET object_version_seq = o.current_version_seq
+SET object_version = o.current_object_version
 FROM public.objects o
 WHERE p.object_id = o.object_id
-  AND p.object_version_seq IS NULL;
+  AND p.object_version IS NULL;
 
 -- Add FK to composite key (object_id, version_seq)
 ALTER TABLE public.parts
   DROP CONSTRAINT IF EXISTS parts_object_version_fk;
 ALTER TABLE public.parts
   ADD CONSTRAINT parts_object_version_fk
-  FOREIGN KEY (object_id, object_version_seq)
-  REFERENCES public.object_versions(object_id, version_seq)
+  FOREIGN KEY (object_id, object_version)
+  REFERENCES public.object_versions(object_id, object_version)
   ON DELETE CASCADE;
 
 -- Replace uniqueness: (object_id, part_number) -> (object_id, object_version_seq, part_number)
@@ -154,12 +154,12 @@ ALTER TABLE public.parts
   DROP CONSTRAINT IF EXISTS parts_object_id_part_number_key;
 ALTER TABLE public.parts
   ADD CONSTRAINT parts_object_version_part_unique
-  UNIQUE (object_id, object_version_seq, part_number);
+  UNIQUE (object_id, object_version, part_number);
 
 -- Helpful index for parts lookup by version
 DROP INDEX IF EXISTS idx_parts_object_id;
 CREATE INDEX IF NOT EXISTS idx_parts_object_version
-  ON public.parts (object_id, object_version_seq);
+  ON public.parts (object_id, object_version);
 
 -- Drop obsolete indexes on objects
 DROP INDEX IF EXISTS idx_objects_ipfs_cid;
@@ -190,11 +190,11 @@ ALTER TABLE public.objects
 
 -- Strengthen invariant: versions must exist for every object; prevent null current_version_seq
 ALTER TABLE public.objects
-  ALTER COLUMN current_version_seq SET DEFAULT 1;
+  ALTER COLUMN current_object_version SET DEFAULT 1;
 -- Ensure no NULLs remain (backfill already set to 1)
-UPDATE public.objects SET current_version_seq = 1 WHERE current_version_seq IS NULL;
+UPDATE public.objects SET current_object_version = 1 WHERE current_object_version IS NULL;
 ALTER TABLE public.objects
-  ALTER COLUMN current_version_seq SET NOT NULL;
+  ALTER COLUMN current_object_version SET NOT NULL;
 
 -- migrate:down
 
@@ -226,9 +226,9 @@ WITH latest AS (
   FROM public.object_versions ov
   JOIN (
     SELECT o.object_id,
-           COALESCE(o.current_version_seq, (SELECT MAX(version_seq) FROM public.object_versions x WHERE x.object_id = o.object_id)) AS v
+           COALESCE(o.current_object_version, (SELECT MAX(object_version) FROM public.object_versions x WHERE x.object_id = o.object_id)) AS v
     FROM public.objects o
-  ) sel ON sel.object_id = ov.object_id AND sel.v = ov.version_seq
+  ) sel ON sel.object_id = ov.object_id AND sel.v = ov.object_version
 )
 UPDATE public.objects o
 SET ipfs_cid = l.ipfs_cid,
@@ -278,9 +278,9 @@ ALTER TABLE public.objects
 DELETE FROM public.parts p
 USING public.objects o
 WHERE p.object_id = o.object_id
-  AND p.object_version_seq IS NOT NULL
-  AND o.current_version_seq IS NOT NULL
-  AND p.object_version_seq <> o.current_version_seq;
+  AND p.object_version IS NOT NULL
+  AND o.current_object_version IS NOT NULL
+  AND p.object_version <> o.current_object_version;
 
 -- Drop FK to object_versions and versioned uniqueness
 ALTER TABLE public.parts
@@ -291,7 +291,7 @@ ALTER TABLE public.parts
 -- Drop version index and column
 DROP INDEX IF EXISTS idx_parts_object_version;
 ALTER TABLE public.parts
-  DROP COLUMN IF EXISTS object_version_seq;
+  DROP COLUMN IF EXISTS object_version;
 
 -- Restore original uniqueness and index
 ALTER TABLE public.parts
@@ -311,7 +311,7 @@ CREATE INDEX IF NOT EXISTS idx_objects_last_modified ON public.objects (last_mod
 
 -- 7) Drop object_versions and helper type, and current_version_seq column
 DROP TABLE IF EXISTS public.object_versions;
-ALTER TABLE public.objects DROP COLUMN IF EXISTS current_version_seq;
+ALTER TABLE public.objects DROP COLUMN IF EXISTS current_object_version;
 
 DO $$
 BEGIN

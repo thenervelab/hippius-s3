@@ -296,9 +296,11 @@ class ObjectWriter:
             if len(base_md5) != 32:
                 try:
                     base_bytes = await self.obj_cache.get(object_id, int(cov), 1)
-                    base_md5 = hashlib.md5(base_bytes).hexdigest() if base_bytes else "0" * 32
+                    # If no base bytes, use MD5 of empty content for correctness
+                    base_md5 = hashlib.md5(base_bytes or b"").hexdigest()
                 except Exception:
-                    base_md5 = "0" * 32
+                    # As a last resort, treat as empty content
+                    base_md5 = hashlib.md5(b"").hexdigest()
             md5s = [bytes.fromhex(base_md5)]
             for p in parts:
                 e = str(p["etag"]).strip('"').split("-")[0]  # type: ignore
