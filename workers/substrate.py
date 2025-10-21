@@ -174,8 +174,15 @@ def get_all_pinned_cids(
 async def get_all_storage_requests(
     substrate_url: str,
     http_client,
+    filter_users: set = None,
 ) -> Dict[str, List[str]]:
-    """Get all storage request CIDs for all users from substrate chain."""
+    """Get all storage request CIDs for specified users from substrate chain.
+
+    Args:
+        substrate_url: Substrate node URL
+        http_client: HTTP client for IPFS requests
+        filter_users: Optional set of user addresses to filter. If None, fetches for all users.
+    """
     client = SubstrateClient(substrate_url)
 
     try:
@@ -190,6 +197,11 @@ async def get_all_storage_requests(
                 # Handle double map key (owner_account_id, file_hash)
                 if isinstance(key, (tuple, list)) and len(key) >= 2:
                     account = str(key[0].value) if hasattr(key[0], "value") else str(key[0])
+
+                    # Skip if filtering is enabled and user not in filter set
+                    if filter_users is not None and account not in filter_users:
+                        continue
+
                     file_hash_hex = str(key[1].value) if hasattr(key[1], "value") else str(key[1])
 
                     # Convert hex-encoded file_hash to CID string

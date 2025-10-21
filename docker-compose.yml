@@ -25,6 +25,8 @@ services:
         condition: service_healthy
       redis-chain:
         condition: service_healthy
+      redis-rate-limiting:
+        condition: service_healthy
     volumes:
       - .:/app
       - /var/lib/hippius/dlq:/tmp/hippius_dlq
@@ -36,6 +38,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
       - REDIS_CHAIN_URL=redis://redis-chain:6379/0
+      - REDIS_RATE_LIMITING_URL=redis://redis-rate-limiting:6379/0
       - HIPPIUS_DLQ_DIR=/tmp/hippius_dlq
       - HIPPIUS_DLQ_ARCHIVE_DIR=/tmp/hippius_dlq_archive
       - LOKI_URL=http://loki:3100/loki/api/v1/push
@@ -125,6 +128,23 @@ services:
       - redis_chain_data:/data
       - ./redis.conf:/usr/local/etc/redis/redis.conf
     command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - hippius_net
+
+  redis-rate-limiting:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6383:6379"
+    volumes:
+      - redis_rate_limiting_data:/data
+      - ./redis.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--maxmemory", "1gb"]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -292,6 +312,7 @@ volumes:
   redis_data:
   redis_accounts_data:
   redis_chain_data:
+  redis_rate_limiting_data:
 
 networks:
   hippius_net:

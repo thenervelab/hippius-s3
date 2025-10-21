@@ -165,7 +165,7 @@ async def check_user_cids(
             request = SubstratePinningRequest(
                 cids=cids,
                 address=user,
-                object_id=object_id,
+                object_id=str(object_id),
                 object_version=object_version,
             )
             await enqueue_substrate_request(request, redis_client)
