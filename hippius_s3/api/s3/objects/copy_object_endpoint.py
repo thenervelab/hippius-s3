@@ -137,6 +137,7 @@ async def handle_copy_object(
         # Assemble bytes via ObjectReader (hydrate cache and read parts in order)
         logger.info("CopyObject assembling bytes via flat-plan reader")
         obj_cache = RedisObjectPartsCache(redis_client)
+        src_ver = int(src_obj_row.get("object_version") or 1)
         # Build plan and stream
         # Build manifest from DB (part_number, cid, plain_size, chunk_size_bytes)
         manifest = await read_parts_manifest(db, src_info.object_id)
@@ -145,7 +146,7 @@ async def handle_copy_object(
         # Minimal enqueue: determine missing indices
         indices_by_part: dict[int, list[int]] = {}
         for it in plan:
-            exists = await obj_cache.chunk_exists(src_info.object_id, int(it.part_number), int(it.chunk_index))  # type: ignore[attr-defined]
+            exists = await obj_cache.chunk_exists(src_info.object_id, src_ver, int(it.part_number), int(it.chunk_index))
             if not exists:
                 arr = indices_by_part.setdefault(int(it.part_number), [])
                 arr.append(int(it.chunk_index))
@@ -166,7 +167,7 @@ async def handle_copy_object(
             req = DownloadChainRequest(
                 request_id=f"{src_info.object_id}::copy",
                 object_id=src_info.object_id,
-                object_version=int(src_obj_row.get("current_object_version") or 1),
+                object_version=src_ver,
                 object_key=source_object_key,
                 bucket_name=source_bucket_name,
                 address=request.state.account.main_account,
@@ -185,6 +186,7 @@ async def handle_copy_object(
         chunks_iter = stream_plan(
             obj_cache=obj_cache,
             object_id=src_info.object_id,
+            object_version=src_ver,
             plan=plan,
             should_decrypt=not source_is_public,
             seed_phrase=request.state.seed_phrase,
