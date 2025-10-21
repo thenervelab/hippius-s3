@@ -8,7 +8,6 @@ import pytest
 from botocore.exceptions import ClientError
 
 from .support.cache import clear_object_cache
-from .support.cache import get_object_id
 from .support.cache import wait_for_parts_cids
 
 
@@ -78,7 +77,9 @@ def test_range_downloads_only_needed_chunks(
     assert wait_for_parts_cids(bucket, key, min_count=1, timeout_seconds=20.0)
 
     # Clear all cache for this object
-    object_id = get_object_id(bucket, key)
+    from .support.cache import get_object_id_and_version
+
+    object_id, ov = get_object_id_and_version(bucket, key)
     clear_object_cache(object_id)
 
     # Request a small range within the first chunk
@@ -86,17 +87,18 @@ def test_range_downloads_only_needed_chunks(
     assert r.status_code == 206
     assert r.headers.get("x-hippius-source") in {"pipeline", "cache"}
 
-    # Inspect Redis for which chunk keys were created
+    # Inspect Redis for which chunk keys were created (versioned namespace)
     rcli = redis.Redis.from_url("redis://localhost:6379/0")
+    # version already fetched above
     keys = sorted(
         [
             k.decode()
-            for k in rcli.scan_iter(match=f"obj:{object_id}:part:1:chunk:*", count=1000)  # 1-based part number
+            for k in rcli.scan_iter(match=f"obj:{object_id}:v:{ov}:part:1:chunk:*", count=1000)  # 1-based part number
         ]
     )
     # Expect at minimum chunk:0 exists for the first-range request
     # (downloader may prefetch additional chunks, but the in-range chunk must be present)
-    expected_chunk = f"obj:{object_id}:part:1:chunk:0"
+    expected_chunk = f"obj:{object_id}:v:{ov}:part:1:chunk:0"
     assert expected_chunk in keys, f"expected chunk {expected_chunk} not found in {keys}"
     # Verify minimal hydration: should not have fetched chunks far outside the range
     # (allow adjacent chunks due to prefetch, but not all chunks)
@@ -108,8 +110,8 @@ def test_range_downloads_only_needed_chunks(
     end = start + 128 * 1024 - 1
     r2 = signed_http_get(bucket, key, {"Range": f"bytes={start}-{end}"})
     assert r2.status_code == 206
-    keys2 = sorted([k.decode() for k in rcli.scan_iter(match=f"obj:{object_id}:part:1:chunk:*", count=1000)])
-    expected_chunk2 = f"obj:{object_id}:part:1:chunk:1"
+    keys2 = sorted([k.decode() for k in rcli.scan_iter(match=f"obj:{object_id}:v:{ov}:part:1:chunk:*", count=1000)])
+    expected_chunk2 = f"obj:{object_id}:v:{ov}:part:1:chunk:1"
     assert expected_chunk2 in keys2, f"expected chunk {expected_chunk2} not found in {keys2}"
     # Verify minimal hydration: should not have fetched all chunks
     assert len(keys2) <= 3, f"too many chunks hydrated: {keys2}"

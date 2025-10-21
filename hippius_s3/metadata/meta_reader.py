@@ -77,6 +77,7 @@ async def read_db_meta(
 async def read_cache_meta(
     obj_cache: Any,
     object_id: str,
+    object_version: int,
     part_number: int,
 ) -> CacheMeta | None:
     """Read cache meta if present; for readiness checks only.
@@ -90,7 +91,7 @@ async def read_cache_meta(
         {chunk_size, num_chunks, size_bytes} or None if not cached.
     """
     try:
-        raw = await obj_cache.get_meta(object_id, part_number)
+        raw = await obj_cache.get_meta(object_id, int(object_version), part_number)
         if isinstance(raw, dict):
             # Back-compat: use legacy size_bytes as plain_size
             chunk_size = int(raw.get("chunk_size", 4 * 1024 * 1024))
@@ -117,6 +118,7 @@ async def ensure_cache_meta(
     db: Any,
     obj_cache: Any,
     object_id: str,
+    object_version: int,
     part_number: int,
 ) -> NormalizedMeta:
     """Return authoritative meta, hydrating cache from DB when missing/invalid.
@@ -126,7 +128,7 @@ async def ensure_cache_meta(
     - If neither available, returns zeros.
     """
     try:
-        c = await read_cache_meta(obj_cache, object_id, part_number)
+        c = await read_cache_meta(obj_cache, object_id, int(object_version), part_number)
         if (
             c
             and int(c.get("chunk_size", 0)) > 0
@@ -161,6 +163,7 @@ async def ensure_cache_meta(
                 await write_cache_meta(
                     obj_cache,
                     object_id,
+                    int(object_version),
                     int(part_number),
                     chunk_size=cs,
                     num_chunks=nc,

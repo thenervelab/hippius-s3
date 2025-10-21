@@ -5,10 +5,10 @@ from typing import cast
 
 
 async def fetch_chunk_blocking(
-    obj_cache: Any, object_id: str, part_number: int, chunk_index: int, *, sleep_seconds: float
+    obj_cache: Any, object_id: str, object_version: int, part_number: int, chunk_index: int, *, sleep_seconds: float
 ) -> bytes:
     while True:
-        c = await obj_cache.get_chunk(object_id, int(part_number), int(chunk_index))  # type: ignore[attr-defined]
+        c = await obj_cache.get_chunk(object_id, int(object_version), int(part_number), int(chunk_index))  # type: ignore[attr-defined]
         if c is not None:
             return cast(bytes, c)
         import asyncio as _asyncio

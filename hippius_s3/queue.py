@@ -70,6 +70,7 @@ class UnpinChainRequest(ChainRequest):
 class DownloadChainRequest(BaseModel):
     request_id: str
     object_id: str
+    object_version: int
     object_key: str
     bucket_name: str
     address: str
