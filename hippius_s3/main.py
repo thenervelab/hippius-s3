@@ -31,7 +31,6 @@ from hippius_s3.api.user import router as user_router
 from hippius_s3.cache import RedisDownloadChunksCache
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
-from hippius_s3.ipfs_service import IPFSService
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
 
@@ -85,8 +84,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.banhammer_service = BanHammerService(app.state.redis_rate_limiting_client)
         logger.info("Banhammer service initialized")
 
-        app.state.ipfs_service = IPFSService(config, app.state.redis_client)
-        logger.info("IPFS service initialized with Redis client")
+        # IPFS service not needed in API container; workers own IPFS interactions
 
         # Cache repositories
         app.state.obj_cache = RedisObjectPartsCache(app.state.redis_client)
