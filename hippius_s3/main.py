@@ -149,12 +149,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.exception("Error shutting down Redis rate limiting client")
 
         try:
-            await app.state.redis_substrate_client.close()
-            logger.info("Redis substrate client closed")
-        except Exception:
-            logger.exception("Error shutting down Redis substrate client")
-
-        try:
             await app.state.postgres_pool.close()
             logger.info("Postgres connection pool closed")
         except Exception:
