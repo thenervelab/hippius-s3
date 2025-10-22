@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 from typing import Any
 from typing import AsyncGenerator
 
@@ -174,6 +175,8 @@ async def migrate_one(
 
 
 async def main_async(args: argparse.Namespace) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    log = logging.getLogger("migrator")
     config = get_config()
     db = await asyncpg.connect(config.database_url)  # type: ignore[arg-type]
     redis_client = async_redis.from_url(config.redis_url)
@@ -195,44 +198,59 @@ async def main_async(args: argparse.Namespace) -> int:
                     "metadata": json.loads(r["metadata"]) if isinstance(r["metadata"], str) else (r["metadata"] or {}),
                 }
 
-        # Owner identity: for now, use main account equal to bucket owner; resolve per object
-        # We fetch owner/main account via get_object_for_download_with_permissions in callers normally;
-        # For migration we assume address/seed in env or external context.
-        address = args.address or ""
-        seed_phrase = args.seed or ""
+        # Identity: default to per-bucket owner unless explicitly overridden by flags
+        override_address = args.address or ""
+        override_seed = args.seed or ""
 
-        rc = 0
-        async for o in _iter_targets():
-            md5_row = await db.fetchrow(
-                """
-                SELECT ov.md5_hash
-                FROM objects o
-                JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
-                WHERE o.object_id = $1
-                """,
-                o["object_id"],
-            )
-            md5 = (md5_row and (md5_row[0] or "")) or ""
+        sem = asyncio.Semaphore(max(1, int(getattr(args, "concurrency", 4))))
+        results: list[bool] = []
 
-            ok = await migrate_one(
-                db=db,
-                redis_client=redis_client,
-                object_id=o["object_id"],
-                bucket_id=o["bucket_id"],
-                bucket_name=o["bucket_name"],
-                object_key=o["object_key"],
-                content_type=o["content_type"],
-                metadata=o["metadata"] or {},
-                expected_old_version=int(o["object_version"]),
-                expected_md5=md5,
-                is_public=bool(o.get("is_public", False)),
-                source_storage_version=int(o.get("storage_version", 2)),
-                address=address,
-                seed_phrase=seed_phrase,
-            )
-            if not ok:
-                rc = 1
-        return rc
+        async def _process(o: dict[str, Any]) -> None:
+            async with sem:
+                address = override_address or str(o.get("main_account_id", ""))
+                seed_phrase = override_seed
+                obj_display = f"{o['bucket_name']}/{o['object_key']} ({o['object_id']})"
+                if args.dry_run:
+                    log.info(f"DRY-RUN migrate {obj_display} from ov={o['object_version']}")
+                    results.append(True)
+                    return
+                md5_row = await db.fetchrow(
+                    """
+                    SELECT ov.md5_hash
+                    FROM objects o
+                    JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
+                    WHERE o.object_id = $1
+                    """,
+                    o["object_id"],
+                )
+                md5 = (md5_row and (md5_row[0] or "")) or ""
+                log.info(f"START migrate {obj_display}")
+                ok = await migrate_one(
+                    db=db,
+                    redis_client=redis_client,
+                    object_id=o["object_id"],
+                    bucket_id=o["bucket_id"],
+                    bucket_name=o["bucket_name"],
+                    object_key=o["object_key"],
+                    content_type=o["content_type"],
+                    metadata=o["metadata"] or {},
+                    expected_old_version=int(o["object_version"]),
+                    expected_md5=md5,
+                    is_public=bool(o.get("is_public", False)),
+                    source_storage_version=int(o.get("storage_version", 2)),
+                    address=address,
+                    seed_phrase=seed_phrase,
+                )
+                results.append(ok)
+                if ok:
+                    log.info(f"DONE migrate {obj_display}")
+                else:
+                    log.error(f"FAILED migrate {obj_display}")
+
+        tasks = [asyncio.create_task(_process(o)) async for o in _iter_targets()]
+        if tasks:
+            await asyncio.gather(*tasks)
+        return 0 if all(results or [True]) else 1
     finally:
         try:
             # redis.asyncio client exposes aclose(); if unavailable, fall back
@@ -251,8 +269,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Migrate objects to target storage version")
     ap.add_argument("--bucket", default="", help="Bucket name (optional; with --key for single object)")
     ap.add_argument("--key", default="", help="Object key (optional; requires --bucket)")
-    ap.add_argument("--address", default="", help="Account address to use for decrypt/encrypt context")
-    ap.add_argument("--seed", default="", help="Seed phrase for decrypt/encrypt context")
+    ap.add_argument("--address", default="", help="Override: account address to use for decrypt/encrypt context")
+    ap.add_argument("--seed", default="", help="Override: seed phrase for decrypt/encrypt context")
+    ap.add_argument("--dry-run", action="store_true", help="Print planned migrations without executing")
+    ap.add_argument("--concurrency", type=int, default=4, help="Max objects to migrate in parallel")
     args = ap.parse_args()
 
     rc = asyncio.run(main_async(args))

@@ -8,6 +8,7 @@ WITH cur AS (
          o.object_key,
          b.bucket_name,
          b.is_public,
+         b.main_account_id,
          ov.object_version,
          ov.storage_version,
          ov.content_type,
