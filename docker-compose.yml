@@ -93,7 +93,7 @@ services:
     volumes:
       - redis_data:/data
       - ./redis.conf:/usr/local/etc/redis/redis.conf
-    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--save", "60 1", "--save", "300 10", "--save", "900 100", "--appendonly", "yes", "--appendfsync", "everysec"]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -110,7 +110,7 @@ services:
     volumes:
       - redis_accounts_data:/data
       - ./redis.conf:/usr/local/etc/redis/redis.conf
-    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--save", "60 1", "--save", "300 10", "--save", "900 100", "--appendonly", "yes", "--appendfsync", "everysec"]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -127,7 +127,7 @@ services:
     volumes:
       - redis_chain_data:/data
       - ./redis.conf:/usr/local/etc/redis/redis.conf
-    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--save", "60 1", "--save", "300 10", "--save", "900 100", "--appendonly", "yes", "--appendfsync", "everysec"]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]

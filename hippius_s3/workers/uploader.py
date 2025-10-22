@@ -6,7 +6,8 @@ import time
 from typing import Any
 from typing import List
 from typing import Optional
-from typing import Tuple
+
+from pydantic import BaseModel
 
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.dlq.storage import DLQStorage
@@ -20,6 +21,11 @@ from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
+
+
+class ChunkUploadResult(BaseModel):
+    cids: List[str]
+    part_number: int
 
 
 def classify_error(error: Exception) -> str:
@@ -131,7 +137,7 @@ class Uploader:
         concurrency = self.config.uploader_multipart_max_concurrency
         semaphore = asyncio.Semaphore(concurrency)
 
-        async def upload_chunk(chunk: Chunk) -> Tuple[List[str], int]:
+        async def upload_chunk(chunk: Chunk) -> ChunkUploadResult:
             async with semaphore:
                 return await self._upload_single_chunk(
                     object_id=object_id,
@@ -143,20 +149,22 @@ class Uploader:
 
         chunks_sorted = sorted(chunks, key=lambda c: c.id)
 
-        first_cids, first_part = await upload_chunk(chunks_sorted[0])
+        first_result = await upload_chunk(chunks_sorted[0])
 
         if len(chunks_sorted) > 1:
             remaining_results = await asyncio.gather(*[upload_chunk(c) for c in chunks_sorted[1:]])
-            all_results = [(first_cids, first_part)] + list(remaining_results)
+            all_results = [first_result] + list(remaining_results)
         else:
-            all_results = [(first_cids, first_part)]
+            all_results = [first_result]
 
-        for _cid, part_number in all_results:
-            await self.obj_cache.expire(object_id, int(object_version), part_number, ttl=self.config.cache_ttl_seconds)
+        for result in all_results:
+            await self.obj_cache.expire(
+                object_id, int(object_version), result.part_number, ttl=self.config.cache_ttl_seconds
+            )
 
         all_cids = []
-        for cid_list, _ in all_results:
-            all_cids.extend(cid_list)
+        for result in all_results:
+            all_cids.extend(result.cids)
         return all_cids
 
     async def _upload_single_chunk(
@@ -166,7 +174,7 @@ class Uploader:
         chunk: Chunk,
         upload_id: Optional[str],
         object_version: int,
-    ) -> Tuple[List[str], int]:
+    ) -> ChunkUploadResult:
         part_number = int(chunk.id)
         logger.debug(f"Uploading chunk object_id={object_id} part={part_number}")
         # Prefer chunked path when cache meta indicates multiple ciphertext chunks (version-aware)
@@ -264,7 +272,7 @@ class Uploader:
             logger.debug(
                 f"Uploaded {num_chunks_meta} chunk pieces for object_id={object_id} part={part_number}; all_cids={len(all_chunk_cids)}"
             )
-            return all_chunk_cids, part_number
+            return ChunkUploadResult(cids=all_chunk_cids, part_number=part_number)
 
         # Fallback: whole-part upload (legacy)
         chunk_data = await self.obj_cache.get(object_id, int(object_version), part_number)
@@ -334,7 +342,7 @@ class Uploader:
             logger.debug("Uploader update failed; will requeue (no synthesize)", exc_info=True)
             raise
 
-        return [chunk_cid], part_number
+        return ChunkUploadResult(cids=[chunk_cid], part_number=part_number)
 
     async def _build_and_upload_manifest(
         self,

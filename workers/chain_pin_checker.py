@@ -8,11 +8,11 @@ from pathlib import Path
 from typing import Dict
 from typing import List
 from typing import Optional
-from typing import Tuple
 
 import asyncpg
 import redis.asyncio as async_redis
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -32,10 +32,16 @@ setup_loki_logging(config, "chain-pin-checker")
 logger = logging.getLogger(__name__)
 
 
+class UserCidRecord(BaseModel):
+    object_id: str
+    object_version: int
+    cid: str
+
+
 async def get_user_cids_from_db(
     db: asyncpg.Connection,
     user: str,
-) -> List[Tuple[str, int, str]]:
+) -> List[UserCidRecord]:
     """Get all CIDs for a user with their object metadata (object_id, object_version, cid).
 
     Performance note: This query uses a 3-way UNION across object_versions, parts, and part_chunks.
@@ -84,7 +90,9 @@ async def get_user_cids_from_db(
         user,
     )
 
-    return [(row["object_id"], row["object_version"], row["cid"]) for row in rows]
+    return [
+        UserCidRecord(object_id=str(row["object_id"]), object_version=row["object_version"], cid=row["cid"]) for row in rows
+    ]
 
 
 async def get_cached_chain_cids(
@@ -127,21 +135,21 @@ async def check_user_cids(
     """Check a single user's CIDs against their chain profile."""
     logger.debug(f"Checking CIDs for user {user}")
 
-    db_cid_rows = await get_user_cids_from_db(db, user)
-    if not db_cid_rows:
+    db_cid_records = await get_user_cids_from_db(db, user)
+    if not db_cid_records:
         logger.debug(f"User {user} has no uploaded objects with CIDs")
         return
 
-    cid_to_object: Dict[str, Tuple[str, int]] = {}
+    cid_to_record: Dict[str, UserCidRecord] = {}
 
-    for object_id, object_version, cid in db_cid_rows:
-        cid_to_object[cid] = (object_id, object_version)
+    for record in db_cid_records:
+        cid_to_record[record.cid] = record
 
     chain_cids = await get_cached_chain_cids(redis_chain, user)
     if not chain_cids:
         return
 
-    db_cids_set = set(cid_to_object.keys())
+    db_cids_set = set(cid_to_record.keys())
     chain_cids_set = set(chain_cids)
     missing_cids = list(db_cids_set - chain_cids_set)
 
@@ -154,9 +162,10 @@ async def check_user_cids(
     if missing_cids:
         logger.info(f"Resubmitting {len(missing_cids)} missing CIDs for user {user}")
 
-        missing_by_object: Dict[Tuple[str, int], List[str]] = {}
+        missing_by_object: Dict[tuple[str, int], List[str]] = {}
         for cid in missing_cids:
-            obj_key = cid_to_object[cid]
+            record = cid_to_record[cid]
+            obj_key = (record.object_id, record.object_version)
             if obj_key not in missing_by_object:
                 missing_by_object[obj_key] = []
             missing_by_object[obj_key].append(cid)
