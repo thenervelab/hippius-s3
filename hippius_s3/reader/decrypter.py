@@ -9,7 +9,6 @@ async def decrypt_chunk_if_needed(
     should_decrypt: bool,
     cbytes: bytes,
     *,
-    seed_phrase: str,
     object_id: str,
     part_number: int,
     chunk_index: int,
@@ -31,7 +30,7 @@ async def decrypt_chunk_if_needed(
         )
         return CryptoService.decrypt_chunk(
             cbytes,
-            seed_phrase=seed_phrase,
+            seed_phrase="",
             object_id=object_id,
             part_number=int(part_number),
             chunk_index=int(chunk_index),

@@ -32,7 +32,6 @@ async def handle_get_object(
     object_key: str,
     request: Request,
     db: Any,
-    ipfs_service: Any,
     redis_client: Any,
     object_reader: Any | None = None,
 ) -> Response:
@@ -209,9 +208,6 @@ async def handle_get_object(
             "storage_version": storage_version,
         }
 
-        # For anonymous reads, avoid passing any client seed; decrypter uses server-side keys for v2+
-        resolved_seed = "" if is_anonymous else getattr(request.state, "seed_phrase", "")
-
         with tracer.start_as_current_span("get_object.read_response") as span:
             span.set_attribute("resolved_address", resolved_address)
             span.set_attribute("read_mode", hdr_mode or "auto")
@@ -224,7 +220,6 @@ async def handle_get_object(
                 read_mode=hdr_mode or "auto",
                 rng=v2_rng,
                 address=resolved_address,
-                seed_phrase=resolved_seed,
                 range_was_invalid=range_was_invalid,
             )
             span.set_attribute("http.status_code", response.status_code)

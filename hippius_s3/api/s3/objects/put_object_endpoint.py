@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import uuid
 from datetime import datetime
 from datetime import timezone
 from typing import Any
+from typing import AsyncIterator
 
 from fastapi import Request
 from fastapi import Response
@@ -32,7 +32,6 @@ async def handle_put_object(
     object_key: str,
     request: Request,
     db: Any,
-    ipfs_service: Any,
     redis_client: Any,
 ) -> Response:
     try:
@@ -77,7 +76,6 @@ async def handle_put_object(
             return await handle_append(
                 request,
                 db,
-                ipfs_service,
                 redis_client,
                 bucket=bucket,
                 bucket_id=bucket_id,
@@ -92,9 +90,7 @@ async def handle_put_object(
         md5_hash = hashlib.md5(file_data).hexdigest()
         logger.info(f"PUT {bucket_name}/{object_key}: size={len(file_data)}, md5={md5_hash}")
 
-        created_at = datetime.now(timezone.utc)
-
-        metadata = {}
+        metadata: dict[str, Any] = {}
         for key, value in request.headers.items():
             if key.lower().startswith("x-amz-meta-"):
                 meta_key = key[11:]
@@ -118,66 +114,32 @@ async def handle_put_object(
         else:
             object_id = str(uuid.uuid4())
 
-        with tracer.start_as_current_span("put_object.upsert_object_metadata") as span:
-            span.set_attribute("object_id", object_id)
-            span.set_attribute("file_size_bytes", file_size)
-            span.set_attribute("content_type", content_type)
-            async with db.transaction():
-                object_row = await db.fetchrow(
-                    get_query("upsert_object_basic"),
-                    object_id,
-                    bucket_id,
-                    object_key,
-                    content_type,
-                    json.dumps(metadata),
-                    md5_hash,
-                    file_size,
-                    created_at,
-                    int(getattr(config, "target_storage_version", 3)),
-                )
+        # Use ObjectWriter streaming upsert/write (single-part)
+        writer = ObjectWriter(db=db, redis_client=redis_client)
 
-                # If overwriting a previous object, remove its parts since we're replacing it
-                try:
-                    if prev:
-                        await db.execute("DELETE FROM parts WHERE object_id = $1", prev["object_id"])  # type: ignore[index]
-                except Exception:
-                    logger.debug("Failed to cleanup previous parts on overwrite", exc_info=True)
+        async def _iter_once() -> AsyncIterator[bytes]:
+            yield file_data
 
-        if not object_row:
-            logger.error(
-                "upsert_object_basic returned no row (object_id=%s, bucket_id=%s, key=%s)",
-                object_id,
-                bucket_id,
-                object_key,
-            )
-            return errors.s3_error_response(
-                "InternalError",
-                "Failed to create object version",
-                status_code=500,
-            )
-        current_object_version = int(object_row["current_object_version"] or 1)
+        put_res = await writer.put_simple_stream_full(
+            bucket_id=bucket_id,
+            bucket_name=bucket_name,
+            object_id=object_id,
+            object_key=object_key,
+            account_address=request.state.account.main_account,
+            content_type=content_type,
+            metadata=metadata,
+            storage_version=int(getattr(config, "target_storage_version", 3)),
+            body_iter=_iter_once(),
+        )
 
-        # Use ObjectWriter to write cache and DB placeholder for part 1
-        with tracer.start_as_current_span("put_object.encrypt_and_cache") as span:
-            span.set_attribute("object_id", object_id)
-            span.set_attribute("object_version", current_object_version)
-            writer = ObjectWriter(db=db, redis_client=redis_client)
-            put_res = await writer.put_simple(
-                bucket_id=bucket_id,
-                bucket_name=bucket_name,
-                object_id=object_id,
-                object_key=object_key,
-                object_version=int(current_object_version),
-                account_address=request.state.account.main_account,
-                seed_phrase=request.state.seed_phrase,
-                content_type=content_type,
-                metadata=metadata,
-                body_bytes=file_data,
-            )
-            span.set_attribute("upload_id", put_res.upload_id)
-            span.set_attribute("etag", put_res.etag)
-
-        # Upload row and part(1) placeholder already handled by ObjectWriter.put_simple
+        # Fetch current version to enqueue background publish
+        object_row = await db.fetchrow(
+            get_query("get_object_by_path"),
+            bucket_id,
+            object_key,
+        )
+        # get_object_by_path exposes 'object_version' (the current version), not 'current_object_version'
+        current_object_version = int(object_row["object_version"] or 1) if object_row else 1
 
         # Only enqueue after DB state is persisted; use writer queue helper
         with tracer.start_as_current_span("put_object.enqueue_upload") as span:

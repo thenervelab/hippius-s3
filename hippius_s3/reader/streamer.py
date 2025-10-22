@@ -17,7 +17,6 @@ async def stream_plan(
     object_version: int,
     plan: Iterable[ChunkPlanItem],
     should_decrypt: bool,
-    seed_phrase: str,
     sleep_seconds: float,
     address: str = "",
     bucket_name: str = "",
@@ -35,7 +34,6 @@ async def stream_plan(
         pt = await decrypt_chunk_if_needed(
             should_decrypt,
             c,
-            seed_phrase=seed_phrase,
             object_id=object_id,
             part_number=int(item.part_number),
             chunk_index=int(item.chunk_index),

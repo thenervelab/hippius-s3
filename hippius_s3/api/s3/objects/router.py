@@ -45,7 +45,6 @@ async def get_object(
     object_key: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    ipfs_service: Any = Depends(dependencies.get_ipfs_service),
     redis_client: Any = Depends(dependencies.get_redis),
     object_reader: ObjectReader = Depends(get_object_reader),
 ) -> Response:
@@ -56,7 +55,7 @@ async def get_object(
         )
     if "uploadId" in request.query_params:
         return await list_parts_internal(bucket_name, object_key, request, db)
-    return await handle_get_object(bucket_name, object_key, request, db, ipfs_service, redis_client, object_reader)
+    return await handle_get_object(bucket_name, object_key, request, db, redis_client, object_reader)
 
 
 @router.put("/{bucket_name}/{object_key:path}", status_code=200)
@@ -66,20 +65,19 @@ async def put_object(
     object_key: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    ipfs_service: Any = Depends(dependencies.get_ipfs_service),
     redis_client: Any = Depends(dependencies.get_redis),
 ) -> Response:
     upload_id = request.query_params.get("uploadId")
     part_number = request.query_params.get("partNumber")
     if upload_id and part_number:
-        return await upload_part(request, db, ipfs_service)
+        return await upload_part(request, db)
     if "tagging" in request.query_params:
         return await tags_set_object_tags(
             bucket_name, object_key, request, db, request.state.seed_phrase, request.state.account.main_account
         )
     if request.headers.get("x-amz-copy-source"):
-        return await handle_copy_object(bucket_name, object_key, request, db, ipfs_service, redis_client)
-    return await handle_put_object(bucket_name, object_key, request, db, ipfs_service, redis_client)
+        return await handle_copy_object(bucket_name, object_key, request, db, redis_client)
+    return await handle_put_object(bucket_name, object_key, request, db, redis_client)
 
 
 @router.delete("/{bucket_name}/{object_key:path}", status_code=204)

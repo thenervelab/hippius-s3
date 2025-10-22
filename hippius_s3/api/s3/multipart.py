@@ -346,7 +346,6 @@ async def get_all_cached_chunks(
 async def upload_part(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    ipfs_service=Depends(dependencies.get_ipfs_service),
     object_reader: ObjectReader = Depends(get_object_reader),
 ) -> Response:
     """Upload a part for a multipart upload (PUT with partNumber & uploadId)."""
@@ -505,7 +504,6 @@ async def upload_part(
                 object_version=src_ver,
                 plan=plan,
                 should_decrypt=True,
-                seed_phrase=request.state.seed_phrase,
                 sleep_seconds=float(config.http_download_sleep_loop),
                 address=request.state.account.main_account,
                 bucket_name=source_bucket_name,
@@ -721,7 +719,6 @@ async def abort_multipart_upload(
     __: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    ___=Depends(dependencies.get_ipfs_service),
 ) -> Response:
     """Abort a multipart upload (DELETE with uploadId)."""
     upload_id = request.query_params.get("uploadId")
