@@ -115,31 +115,44 @@ async def handle_put_object(
             object_id = str(uuid.uuid4())
 
         # Use ObjectWriter streaming upsert/write (single-part)
-        writer = ObjectWriter(db=db, redis_client=redis_client)
+        with tracer.start_as_current_span("put_object.stream_and_upsert") as span:
+            span.set_attribute("object_id", object_id)
+            span.set_attribute("file_size_bytes", file_size)
+            span.set_attribute("content_type", content_type)
+            span.set_attribute("storage_version", int(getattr(config, "target_storage_version", 3)))
 
-        async def _iter_once() -> AsyncIterator[bytes]:
-            yield file_data
+            writer = ObjectWriter(db=db, redis_client=redis_client)
 
-        put_res = await writer.put_simple_stream_full(
-            bucket_id=bucket_id,
-            bucket_name=bucket_name,
-            object_id=object_id,
-            object_key=object_key,
-            account_address=request.state.account.main_account,
-            content_type=content_type,
-            metadata=metadata,
-            storage_version=int(getattr(config, "target_storage_version", 3)),
-            body_iter=_iter_once(),
-        )
+            async def _iter_once() -> AsyncIterator[bytes]:
+                yield file_data
+
+            put_res = await writer.put_simple_stream_full(
+                bucket_id=bucket_id,
+                bucket_name=bucket_name,
+                object_id=object_id,
+                object_key=object_key,
+                account_address=request.state.account.main_account,
+                content_type=content_type,
+                metadata=metadata,
+                storage_version=int(getattr(config, "target_storage_version", 3)),
+                body_iter=_iter_once(),
+            )
+
+            span.set_attribute("upload_id", put_res.upload_id)
+            span.set_attribute("etag", put_res.etag)
+            span.set_attribute("returned_size_bytes", put_res.size_bytes)
 
         # Fetch current version to enqueue background publish
-        object_row = await db.fetchrow(
-            get_query("get_object_by_path"),
-            bucket_id,
-            object_key,
-        )
-        # get_object_by_path exposes 'object_version' (the current version), not 'current_object_version'
-        current_object_version = int(object_row["object_version"] or 1) if object_row else 1
+        with tracer.start_as_current_span("put_object.fetch_current_version") as span:
+            span.set_attribute("object_id", object_id)
+            object_row = await db.fetchrow(
+                get_query("get_object_by_path"),
+                bucket_id,
+                object_key,
+            )
+            # get_object_by_path exposes 'object_version' (the current version), not 'current_object_version'
+            current_object_version = int(object_row["object_version"] or 1) if object_row else 1
+            span.set_attribute("current_object_version", current_object_version)
 
         # Only enqueue after DB state is persisted; use writer queue helper
         with tracer.start_as_current_span("put_object.enqueue_upload") as span:
