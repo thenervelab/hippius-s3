@@ -91,7 +91,8 @@ async def get_user_cids_from_db(
     )
 
     return [
-        UserCidRecord(object_id=str(row["object_id"]), object_version=row["object_version"], cid=row["cid"]) for row in rows
+        UserCidRecord(object_id=str(row["object_id"]), object_version=row["object_version"], cid=row["cid"])
+        for row in rows
     ]
 
 
