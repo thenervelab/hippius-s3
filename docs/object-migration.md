@@ -49,7 +49,7 @@ Containerized runner (optional)
 - Build: from repo root, `docker build -f migrator/Dockerfile -t hippius-migrator .`
 - Run: set envs and run `hippius-migrator`. Supported envs:
   - `MIGRATE_BUCKET`, `MIGRATE_KEY`, `MIGRATE_DRY_RUN`
-  - `MIGRATE_CONCURRENCY`, `MIGRATE_ADDRESS`, `MIGRATE_SEED`
+  - `MIGRATE_CONCURRENCY`
 
 Operational Safety
 

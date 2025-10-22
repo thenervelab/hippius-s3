@@ -10,8 +10,6 @@ async def main() -> int:
     key = os.environ.get("MIGRATE_KEY", "")
     dry = os.environ.get("MIGRATE_DRY_RUN", "false").lower() == "true"
     concurrency = os.environ.get("MIGRATE_CONCURRENCY", "")
-    address = os.environ.get("MIGRATE_ADDRESS", "")
-    seed = os.environ.get("MIGRATE_SEED", "")
 
     args = [sys.executable, "-m", "hippius_s3.scripts.migrate_objects"]
     if bucket:
@@ -22,10 +20,6 @@ async def main() -> int:
         args += ["--dry-run"]
     if concurrency:
         args += ["--concurrency", concurrency]
-    if address:
-        args += ["--address", address]
-    if seed:
-        args += ["--seed", seed]
 
     proc = await asyncio.create_subprocess_exec(*args)
     return await proc.wait()

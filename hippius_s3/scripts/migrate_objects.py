@@ -63,7 +63,6 @@ async def migrate_one(
     is_public: bool,
     source_storage_version: int,
     address: str,
-    seed_phrase: str,
 ) -> bool:
     config = get_config()
     log = logging.getLogger("migrator")
@@ -156,7 +155,7 @@ async def migrate_one(
                 object_version=int(new_version),
                 bucket_name=bucket_name,
                 account_address=address,
-                seed_phrase=seed_phrase,
+                seed_phrase="",
                 part_number=int(part_number),
                 body_bytes=bytes(buf),
             )
@@ -196,7 +195,7 @@ async def migrate_one(
         upload_id=str(upload_id),
         object_version=int(new_version),
         address=address,
-        seed_phrase=seed_phrase,
+        seed_phrase="",
     )
     swapped = await writer.swap_current_version_cas(
         object_id=object_id,
@@ -251,7 +250,6 @@ async def main_async(args: argparse.Namespace) -> int:
         async def _process(o: dict[str, Any]) -> None:
             async with sem:
                 address = str(o.get("main_account_id", ""))
-                seed_phrase = ""
                 obj_display = f"{o['bucket_name']}/{o['object_key']} ({o['object_id']})"
                 if args.dry_run:
                     log.info(f"DRY-RUN migrate {obj_display} from ov={o['object_version']}")
@@ -272,7 +270,6 @@ async def main_async(args: argparse.Namespace) -> int:
                     is_public=bool(o.get("is_public", False)),
                     source_storage_version=int(o.get("storage_version", 2)),
                     address=address,
-                    seed_phrase=seed_phrase,
                 )
                 results.append(ok)
                 if ok:
@@ -318,8 +315,6 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Migrate objects to target storage version")
     ap.add_argument("--bucket", default="", help="Bucket name (optional; with --key for single object)")
     ap.add_argument("--key", default="", help="Object key (optional; requires --bucket)")
-    ap.add_argument("--address", default="", help="Override: account address to use for decrypt/encrypt context")
-    ap.add_argument("--seed", default="", help="Override: seed phrase for decrypt/encrypt context")
     ap.add_argument("--dry-run", action="store_true", help="Print planned migrations without executing")
     ap.add_argument("--concurrency", type=int, default=4, help="Max objects to migrate in parallel")
     args = ap.parse_args()
