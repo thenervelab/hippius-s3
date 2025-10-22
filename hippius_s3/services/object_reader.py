@@ -14,6 +14,7 @@ from hippius_s3.queue import enqueue_download_request
 from hippius_s3.reader.db_meta import read_parts_manifest
 from hippius_s3.reader.planner import build_chunk_plan
 from hippius_s3.reader.streamer import stream_plan
+from hippius_s3.reader.types import ChunkPlanItem
 from hippius_s3.reader.types import RangeRequest
 
 
@@ -51,24 +52,30 @@ class ObjectReader:  # noqa: D401 (compat shim)
         self.config = config
 
 
-async def read_response(
+@dataclass
+class StreamContext:
+    plan: list[ChunkPlanItem]
+    object_version: int
+    storage_version: int
+    should_decrypt: bool
+    source: str
+
+
+async def build_stream_context(
     db: Any,
     redis: Any,
     obj_cache: Any,
     info: dict,
     *,
-    read_mode: str,
     rng: RangeRequest | None,
     address: str,
     seed_phrase: str,
-    range_was_invalid: bool = False,
-) -> Response:
+) -> StreamContext:
     cfg = get_config()
 
     parts = await read_parts_manifest(db, info["object_id"])
     plan = await build_chunk_plan(db, info["object_id"], parts, rng)
 
-    # Decide source header based on whether all planned chunks are already cached
     source = "cache"
     try:
         for item in plan:
@@ -84,9 +91,7 @@ async def read_response(
     except Exception:
         source = "pipeline"
 
-    # Enqueue downloader for missing chunks (minimal indices per-part)
     if source == "pipeline":
-        # Map part_number -> cid from manifest
         cid_by_part: dict[int, str] = {}
         for p in parts:
             try:
@@ -96,7 +101,6 @@ async def read_response(
                     cid_by_part[pn] = str(cid_raw)
             except Exception:
                 continue
-        # Build index sets
         indices_by_part: dict[int, set[int]] = {}
         for item in plan:
             ok = await obj_cache.chunk_exists(
@@ -143,21 +147,58 @@ async def read_response(
 
     storage_version = int(info.get("storage_version") or 2)
     object_version = int(info.get("object_version") or info.get("current_object_version") or 1)
+    if "should_decrypt" in info:
+        should_decrypt = bool(info.get("should_decrypt"))
+    else:
+        is_public = bool(info.get("is_public", False))
+        should_decrypt = (storage_version >= 3) or (not is_public)
+
+    return StreamContext(
+        plan=plan,
+        object_version=object_version,
+        storage_version=storage_version,
+        should_decrypt=should_decrypt,
+        source=source,
+    )
+
+
+async def read_response(
+    db: Any,
+    redis: Any,
+    obj_cache: Any,
+    info: dict,
+    *,
+    read_mode: str,
+    rng: RangeRequest | None,
+    address: str,
+    seed_phrase: str,
+    range_was_invalid: bool = False,
+) -> Response:
+    cfg = get_config()
+    ctx = await build_stream_context(
+        db,
+        redis,
+        obj_cache,
+        info,
+        rng=rng,
+        address=address,
+        seed_phrase=seed_phrase,
+    )
     gen = stream_plan(
         obj_cache=obj_cache,
         object_id=info["object_id"],
-        object_version=object_version,
-        plan=plan,
-        should_decrypt=bool(info.get("should_decrypt")),
+        object_version=ctx.object_version,
+        plan=ctx.plan,
+        should_decrypt=ctx.should_decrypt,
         seed_phrase=seed_phrase,
         sleep_seconds=float(cfg.http_download_sleep_loop),
         address=address,
         bucket_name=str(info.get("bucket_name", "")),
-        storage_version=storage_version,
+        storage_version=ctx.storage_version,
     )
     headers = build_headers(
         info,
-        source=source,
+        source=ctx.source,
         metadata=info.get("metadata") or {},
         rng=(rng.start, rng.end) if rng is not None else None,
         range_was_invalid=range_was_invalid,

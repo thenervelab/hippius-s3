@@ -28,6 +28,40 @@ class ObjectWriter:
         self.config = get_config()
         self.obj_cache = RedisObjectPartsCache(redis_client)
 
+    async def create_version_for_migration(
+        self,
+        *,
+        object_id: str,
+        content_type: str,
+        metadata: dict[str, Any],
+        storage_version_target: int,
+    ) -> int:
+        row = await self.db.fetchrow(
+            get_query("create_migration_version"),
+            object_id,
+            content_type,
+            metadata,
+            int(storage_version_target),
+        )
+        if not row:
+            raise RuntimeError("Failed to create migration version")
+        return int(row[0])
+
+    async def swap_current_version_cas(
+        self,
+        *,
+        object_id: str,
+        expected_old_version: int,
+        new_version: int,
+    ) -> bool:
+        row = await self.db.fetchrow(
+            get_query("swap_current_version_cas"),
+            object_id,
+            int(expected_old_version),
+            int(new_version),
+        )
+        return bool(row)
+
     async def put_simple(
         self,
         *,
