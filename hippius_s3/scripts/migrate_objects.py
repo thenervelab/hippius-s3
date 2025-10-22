@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import logging
+from contextlib import suppress
 from typing import Any
 from typing import AsyncGenerator
 
@@ -32,6 +33,22 @@ async def _fetch_current_md5(db: Any, object_id: str) -> str:
     return (row and (row[0] or "")) or ""
 
 
+async def _fetch_current_markers(db: Any, object_id: str) -> tuple[str, int, float]:
+    row = await db.fetchrow(
+        """
+        SELECT ov.md5_hash, ov.append_version, EXTRACT(EPOCH FROM COALESCE(ov.last_modified, NOW()))
+        FROM objects o
+        JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
+        WHERE o.object_id = $1
+        """,
+        object_id,
+    )
+    md5 = (row and (row[0] or "")) or ""
+    av = int(row[1] or 0) if row else 0
+    lm = float(row[2] or 0.0) if row else 0.0
+    return md5, av, lm
+
+
 async def migrate_one(
     *,
     db: Any,
@@ -43,28 +60,15 @@ async def migrate_one(
     content_type: str,
     metadata: dict[str, Any],
     expected_old_version: int,
-    expected_md5: str,
     is_public: bool,
     source_storage_version: int,
     address: str,
     seed_phrase: str,
 ) -> bool:
     config = get_config()
+    log = logging.getLogger("migrator")
 
-    # Restart policy: delete any non-current migration versions for this object
-    rows_old = await db.fetch(
-        """
-        SELECT ov.object_version
-        FROM object_versions ov
-        JOIN objects o ON o.object_id = ov.object_id
-        WHERE ov.object_id = $1
-          AND ov.version_type = 'migration'
-          AND ov.object_version <> o.current_object_version
-        """,
-        object_id,
-    )
-    for r in rows_old:
-        await db.execute(get_query("delete_version_and_parts"), object_id, int(r["object_version"]))
+    # Do not delete prior migration versions here; cleanup tool handles unpin + delete safely
 
     writer = ObjectWriter(db=db, redis_client=redis_client)
     new_version = await writer.create_version_for_migration(
@@ -97,6 +101,17 @@ async def migrate_one(
     )
     plan = ctx.plan
 
+    # Skip objects without any chunks/parts in plan (mark version failed)
+    if not plan:
+        with suppress(Exception):
+            await db.execute(
+                "UPDATE object_versions SET status='failed', last_modified=NOW() WHERE object_id = $1 AND object_version = $2",
+                object_id,
+                int(new_version),
+            )
+        log.error(f"Skipping {bucket_name}/{object_key} ({object_id}) — no parts/plan")
+        return False
+
     # Ensure single upload row for this migration version
     upload_id = await ensure_upload_row(
         db,
@@ -112,44 +127,67 @@ async def migrate_one(
     for it in plan:
         by_part.setdefault(int(it.part_number), []).append(it)
 
+    # Baseline markers before first part
+    base_md5, base_av, base_lm = await _fetch_current_markers(db, object_id)
+
     # Upload parts sequentially
     for part_number in sorted(by_part.keys()):
-        # Stream this part only
         part_plan = by_part[int(part_number)]
-        gen = stream_plan(
-            obj_cache=obj_cache,
-            object_id=object_id,
-            object_version=ctx.object_version,
-            plan=part_plan,
-            should_decrypt=ctx.should_decrypt,
-            seed_phrase=seed_phrase,
-            sleep_seconds=float(config.http_download_sleep_loop),
-            address=address,
-            bucket_name=bucket_name,
-            storage_version=ctx.storage_version,
-        )
-        # Accumulate bytes for this part
-        buf = bytearray()
-        async for chunk in gen:
-            buf.extend(chunk)
+        try:
+            gen = stream_plan(
+                obj_cache=obj_cache,
+                object_id=object_id,
+                object_version=ctx.object_version,
+                plan=part_plan,
+                should_decrypt=ctx.should_decrypt,
+                seed_phrase=seed_phrase,
+                sleep_seconds=float(config.http_download_sleep_loop),
+                address=address,
+                bucket_name=bucket_name,
+                storage_version=ctx.storage_version,
+            )
+            # Accumulate bytes for this part
+            buf = bytearray()
+            async for chunk in gen:
+                buf.extend(chunk)
 
-        # Upload part into new version
-        await writer.mpu_upload_part(
-            upload_id=str(upload_id),
-            object_id=object_id,
-            object_version=int(new_version),
-            bucket_name=bucket_name,
-            account_address=address,
-            seed_phrase=seed_phrase,
-            part_number=int(part_number),
-            body_bytes=bytes(buf),
-        )
+            # Upload part into new version
+            await writer.mpu_upload_part(
+                upload_id=str(upload_id),
+                object_id=object_id,
+                object_version=int(new_version),
+                bucket_name=bucket_name,
+                account_address=address,
+                seed_phrase=seed_phrase,
+                part_number=int(part_number),
+                body_bytes=bytes(buf),
+            )
 
-        # Soft md5 check: abort if changed
-        cur_md5 = await _fetch_current_md5(db, object_id)
-        if (cur_md5 or "") != (expected_md5 or ""):
-            # Delete in-progress new version and its parts
-            await db.execute(get_query("delete_version_and_parts"), object_id, int(new_version))
+            # Soft change detection: md5 + append_version + last_modified
+            cur_md5, cur_av, cur_lm = await _fetch_current_markers(db, object_id)
+            if (cur_md5 or "") != (base_md5 or "") or int(cur_av) != int(base_av) or float(cur_lm) != float(base_lm):
+                # Mark failed; allow cleanup to unpin + delete later
+                with suppress(Exception):
+                    await db.execute(
+                        "UPDATE object_versions SET status='failed', last_modified=NOW() WHERE object_id = $1 AND object_version = $2",
+                        object_id,
+                        int(new_version),
+                    )
+                log.warning(
+                    f"Source changed during migrate {bucket_name}/{object_key} ({object_id}); aborting and cleaned up"
+                )
+                return False
+        except Exception:
+            # Clean up on any part failure
+            with suppress(Exception):
+                await db.execute(
+                    "UPDATE object_versions SET status='failed', last_modified=NOW() WHERE object_id = $1 AND object_version = $2",
+                    object_id,
+                    int(new_version),
+                )
+            log.exception(
+                f"Error migrating part {part_number} for {bucket_name}/{object_key} ({object_id}); cleaned up new version"
+            )
             return False
 
     # Finalize + CAS swap
@@ -168,7 +206,12 @@ async def migrate_one(
         new_version=int(new_version),
     )
     if not swapped:
-        await db.execute(get_query("delete_version_and_parts"), object_id, int(new_version))
+        with suppress(Exception):
+            await db.execute(
+                "UPDATE object_versions SET status='failed', last_modified=NOW() WHERE object_id = $1 AND object_version = $2",
+                object_id,
+                int(new_version),
+            )
         return False
 
     return True
@@ -193,6 +236,9 @@ async def main_async(args: argparse.Namespace) -> int:
                     "bucket_id": str(r["bucket_id"]),
                     "bucket_name": str(r["bucket_name"]),
                     "object_key": str(r["object_key"]),
+                    "is_public": bool(r["is_public"]),
+                    "main_account_id": str(r["main_account_id"]),
+                    "storage_version": int(r["storage_version"]),
                     "object_version": int(r["object_version"]),
                     "content_type": str(r["content_type"]),
                     "metadata": json.loads(r["metadata"]) if isinstance(r["metadata"], str) else (r["metadata"] or {}),
@@ -204,6 +250,9 @@ async def main_async(args: argparse.Namespace) -> int:
 
         sem = asyncio.Semaphore(max(1, int(getattr(args, "concurrency", 4))))
         results: list[bool] = []
+        migrated: list[str] = []
+        failed: list[str] = []
+        planned: list[str] = []
 
         async def _process(o: dict[str, Any]) -> None:
             async with sem:
@@ -213,17 +262,8 @@ async def main_async(args: argparse.Namespace) -> int:
                 if args.dry_run:
                     log.info(f"DRY-RUN migrate {obj_display} from ov={o['object_version']}")
                     results.append(True)
+                    planned.append(obj_display)
                     return
-                md5_row = await db.fetchrow(
-                    """
-                    SELECT ov.md5_hash
-                    FROM objects o
-                    JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
-                    WHERE o.object_id = $1
-                    """,
-                    o["object_id"],
-                )
-                md5 = (md5_row and (md5_row[0] or "")) or ""
                 log.info(f"START migrate {obj_display}")
                 ok = await migrate_one(
                     db=db,
@@ -235,7 +275,6 @@ async def main_async(args: argparse.Namespace) -> int:
                     content_type=o["content_type"],
                     metadata=o["metadata"] or {},
                     expected_old_version=int(o["object_version"]),
-                    expected_md5=md5,
                     is_public=bool(o.get("is_public", False)),
                     source_storage_version=int(o.get("storage_version", 2)),
                     address=address,
@@ -244,13 +283,29 @@ async def main_async(args: argparse.Namespace) -> int:
                 results.append(ok)
                 if ok:
                     log.info(f"DONE migrate {obj_display}")
+                    migrated.append(obj_display)
                 else:
                     log.error(f"FAILED migrate {obj_display}")
+                    failed.append(obj_display)
 
         tasks = [asyncio.create_task(_process(o)) async for o in _iter_targets()]
         if tasks:
             await asyncio.gather(*tasks)
-        return 0 if all(results or [True]) else 1
+
+        # End-of-run report
+        total = len(results)
+        ok_count = sum(1 for r in results if r)
+        fail_count = total - ok_count
+        log.info(
+            "Migration report: total=%d migrated=%d failed=%d planned=%d",
+            total,
+            len(migrated),
+            len(failed),
+            len(planned),
+        )
+        if failed:
+            log.error("Failed objects (%d): %s", len(failed), ", ".join(failed))
+        return 0 if fail_count == 0 else 1
     finally:
         try:
             # redis.asyncio client exposes aclose(); if unavailable, fall back
@@ -274,6 +329,9 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="Print planned migrations without executing")
     ap.add_argument("--concurrency", type=int, default=4, help="Max objects to migrate in parallel")
     args = ap.parse_args()
+
+    if args.key and not args.bucket:
+        raise SystemExit("--key requires --bucket")
 
     rc = asyncio.run(main_async(args))
     raise SystemExit(rc)
