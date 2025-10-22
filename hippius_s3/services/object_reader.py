@@ -69,7 +69,6 @@ async def build_stream_context(
     *,
     rng: RangeRequest | None,
     address: str,
-    seed_phrase: str,
 ) -> StreamContext:
     cfg = get_config()
 
@@ -135,7 +134,7 @@ async def build_stream_context(
                 bucket_name=info.get("bucket_name", ""),
                 address=address,
                 subaccount=address,
-                subaccount_seed_phrase=seed_phrase,
+                subaccount_seed_phrase="",
                 substrate_url=cfg.substrate_url,
                 ipfs_node=cfg.ipfs_get_url,
                 should_decrypt=bool(info.get("should_decrypt")),
@@ -171,7 +170,6 @@ async def read_response(
     read_mode: str,
     rng: RangeRequest | None,
     address: str,
-    seed_phrase: str,
     range_was_invalid: bool = False,
 ) -> Response:
     cfg = get_config()
@@ -182,7 +180,6 @@ async def read_response(
         info,
         rng=rng,
         address=address,
-        seed_phrase=seed_phrase,
     )
     gen = stream_plan(
         obj_cache=obj_cache,
@@ -190,7 +187,6 @@ async def read_response(
         object_version=ctx.object_version,
         plan=ctx.plan,
         should_decrypt=ctx.should_decrypt,
-        seed_phrase=seed_phrase,
         sleep_seconds=float(cfg.http_download_sleep_loop),
         address=address,
         bucket_name=str(info.get("bucket_name", "")),

@@ -500,7 +500,6 @@ async def upload_part(
                 object_version=src_ver,
                 plan=plan,
                 should_decrypt=True,
-                seed_phrase=request.state.seed_phrase,
                 sleep_seconds=float(config.http_download_sleep_loop),
                 address=request.state.account.main_account,
                 bucket_name=source_bucket_name,

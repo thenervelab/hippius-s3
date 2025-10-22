@@ -177,9 +177,6 @@ async def handle_get_object(
             "storage_version": storage_version,
         }
 
-        # For anonymous reads, avoid passing any client seed; decrypter uses server-side keys for v2+
-        resolved_seed = "" if is_anonymous else getattr(request.state, "seed_phrase", "")
-
         response = await read_response(
             db=db,
             redis=request.app.state.redis_client,
@@ -188,7 +185,6 @@ async def handle_get_object(
             read_mode=hdr_mode or "auto",
             rng=v2_rng,
             address=resolved_address,
-            seed_phrase=resolved_seed,
             range_was_invalid=range_was_invalid,
         )
 

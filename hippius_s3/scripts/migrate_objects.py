@@ -97,7 +97,6 @@ async def migrate_one(
         info,
         rng=None,
         address=address,
-        seed_phrase=seed_phrase,
     )
     plan = ctx.plan
 
@@ -140,7 +139,6 @@ async def migrate_one(
                 object_version=ctx.object_version,
                 plan=part_plan,
                 should_decrypt=ctx.should_decrypt,
-                seed_phrase=seed_phrase,
                 sleep_seconds=float(config.http_download_sleep_loop),
                 address=address,
                 bucket_name=bucket_name,
@@ -244,10 +242,6 @@ async def main_async(args: argparse.Namespace) -> int:
                     "metadata": json.loads(r["metadata"]) if isinstance(r["metadata"], str) else (r["metadata"] or {}),
                 }
 
-        # Identity: default to per-bucket owner unless explicitly overridden by flags
-        override_address = args.address or ""
-        override_seed = args.seed or ""
-
         sem = asyncio.Semaphore(max(1, int(getattr(args, "concurrency", 4))))
         results: list[bool] = []
         migrated: list[str] = []
@@ -256,8 +250,8 @@ async def main_async(args: argparse.Namespace) -> int:
 
         async def _process(o: dict[str, Any]) -> None:
             async with sem:
-                address = override_address or str(o.get("main_account_id", ""))
-                seed_phrase = override_seed
+                address = str(o.get("main_account_id", ""))
+                seed_phrase = ""
                 obj_display = f"{o['bucket_name']}/{o['object_key']} ({o['object_id']})"
                 if args.dry_run:
                     log.info(f"DRY-RUN migrate {obj_display} from ov={o['object_version']}")
