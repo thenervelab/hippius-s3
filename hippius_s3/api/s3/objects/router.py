@@ -21,12 +21,14 @@ from hippius_s3.api.s3.objects.tagging_endpoint import get_object_tags as tags_g
 from hippius_s3.api.s3.objects.tagging_endpoint import set_object_tags as tags_set_object_tags
 from hippius_s3.dependencies import get_object_reader
 from hippius_s3.services.object_reader import ObjectReader
+from hippius_s3.tracing import trace_s3_operation
 
 
 router = APIRouter()
 
 
 @router.head("/{bucket_name}/{object_key:path}", status_code=200)
+@trace_s3_operation("head_object")
 async def head_object(
     bucket_name: str,
     object_key: str,
@@ -37,6 +39,7 @@ async def head_object(
 
 
 @router.get("/{bucket_name}/{object_key:path}", status_code=200)
+@trace_s3_operation("get_object")
 async def get_object(
     bucket_name: str,
     object_key: str,
@@ -57,6 +60,7 @@ async def get_object(
 
 
 @router.put("/{bucket_name}/{object_key:path}", status_code=200)
+@trace_s3_operation("put_object")
 async def put_object(
     bucket_name: str,
     object_key: str,
@@ -79,6 +83,7 @@ async def put_object(
 
 
 @router.delete("/{bucket_name}/{object_key:path}", status_code=204)
+@trace_s3_operation("delete_object")
 async def delete_object(
     bucket_name: str,
     object_key: str,

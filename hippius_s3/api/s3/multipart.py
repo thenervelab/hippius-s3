@@ -16,6 +16,7 @@ from fastapi import Depends
 from fastapi import Request
 from fastapi import Response
 from lxml import etree as ET
+from opentelemetry import trace
 from redis.asyncio import Redis
 from starlette.requests import ClientDisconnect
 
@@ -38,6 +39,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["s3-multipart"])
 
 config = get_config()
+tracer = trace.get_tracer(__name__)
 
 
 async def get_request_body(request: Request) -> bytes:
@@ -72,24 +74,27 @@ async def handle_post_object(
 
     # Check for uploads parameter (Initiate Multipart Upload)
     if "uploads" in request.query_params:
-        return await initiate_multipart_upload(
-            bucket_name,
-            object_key,
-            request,
-            db,
-        )
-
-    # Check for uploadId parameter (Complete Multipart Upload)
-    if "uploadId" in request.query_params:
-        upload_id = request.query_params.get("uploadId")
-        if upload_id is not None:
-            return await complete_multipart_upload(
+        with tracer.start_as_current_span("multipart.route_initiate"):
+            return await initiate_multipart_upload(
                 bucket_name,
                 object_key,
-                upload_id,
                 request,
                 db,
             )
+
+    # Check for uploadId parameter (Complete Multipart Upload)
+    if "uploadId" in request.query_params:
+        with tracer.start_as_current_span("multipart.route_complete") as span:
+            upload_id = request.query_params.get("uploadId")
+            if upload_id is not None:
+                span.set_attribute("upload_id", upload_id)
+                return await complete_multipart_upload(
+                    bucket_name,
+                    object_key,
+                    upload_id,
+                    request,
+                    db,
+                )
 
     # Not a multipart operation we handle
     return None
