@@ -25,7 +25,6 @@ async def get_public_object(
     object_key: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    ipfs_service: Any = Depends(dependencies.get_ipfs_service),
     redis_client: Any = Depends(dependencies.get_redis),
     object_reader: Any = Depends(dependencies.get_object_reader),
 ) -> Response:
@@ -39,7 +38,7 @@ async def get_public_object(
             status_code=403,
         )
     # Call the regular get_object handler with anonymous account
-    response = await handle_get_object(bucket_name, object_key, request, db, ipfs_service, redis_client, object_reader)
+    response = await handle_get_object(bucket_name, object_key, request, db, redis_client, object_reader)
 
     # Add anonymous access header
     response.headers["x-hippius-access-mode"] = "anon"
