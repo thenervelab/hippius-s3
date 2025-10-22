@@ -68,6 +68,9 @@ class Config:
     # Redis for chain operations
     redis_chain_url: str = env("REDIS_CHAIN_URL:redis://127.0.0.1:6381/0")
 
+    # Redis for rate limiting and banhammer
+    redis_rate_limiting_url: str = env("REDIS_RATE_LIMITING_URL:redis://127.0.0.1:6383/0")
+
     # API signing key for pre-signed URLs
     # Generated on first run if not provided
     api_signing_key: str = env("API_SIGNING_KEY:" + str(uuid.uuid4()))
@@ -94,11 +97,11 @@ class Config:
     uploader_validate_coverage: bool = env("UPLOADER_VALIDATE_COVERAGE:false", convert=lambda x: x.lower() == "true")
 
     # Substrate worker configuration
-    substrate_batch_size: int = env("HIPPIUS_SUBSTRATE_BATCH_SIZE:16", convert=int)
-    substrate_batch_max_age_sec: int = env("HIPPIUS_SUBSTRATE_BATCH_MAX_AGE_SEC:10", convert=int)
+    substrate_batch_size: int = env("HIPPIUS_SUBSTRATE_BATCH_SIZE:5000", convert=int)
+    substrate_batch_max_age_sec: int = env("HIPPIUS_SUBSTRATE_BATCH_MAX_AGE_SEC:60", convert=int)
     substrate_max_retries: int = env("HIPPIUS_SUBSTRATE_MAX_RETRIES:3", convert=int)
-    substrate_retry_base_ms: int = env("HIPPIUS_SUBSTRATE_RETRY_BASE_MS:500", convert=int)
-    substrate_retry_max_ms: int = env("HIPPIUS_SUBSTRATE_RETRY_MAX_MS:5000", convert=int)
+    substrate_retry_base_ms: int = env("HIPPIUS_SUBSTRATE_RETRY_BASE_MS:5000", convert=int)
+    substrate_retry_max_ms: int = env("HIPPIUS_SUBSTRATE_RETRY_MAX_MS:15000", convert=int)
     substrate_call_timeout_seconds: float = env("HIPPIUS_SUBSTRATE_CALL_TIMEOUT_SECONDS:20.0", convert=float)
 
     # Upload queue configuration

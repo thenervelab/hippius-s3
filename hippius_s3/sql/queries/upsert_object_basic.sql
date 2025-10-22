@@ -59,19 +59,19 @@ WITH upsert_object AS (
     status = EXCLUDED.status,
     last_append_at = EXCLUDED.last_append_at,
     last_modified = EXCLUDED.last_modified
-  RETURNING object_id, object_version
+  RETURNING object_id, object_version, content_type, metadata, md5_hash, size_bytes, status, multipart, storage_version
 )
 SELECT uo.object_id,
        uo.bucket_id,
        uo.object_key,
        uo.current_object_version,
-       ov.content_type,
-       ov.metadata,
-       ov.md5_hash,
-       ov.size_bytes,
+       iv.content_type,
+       iv.metadata,
+       iv.md5_hash,
+       iv.size_bytes,
        uo.created_at,
-       ov.status,
-       ov.multipart,
-       ov.storage_version
+       iv.status,
+       iv.multipart,
+       iv.storage_version
 FROM upsert_object uo
-JOIN object_versions ov ON ov.object_id = uo.object_id AND ov.object_version = uo.current_object_version
+JOIN ins_version iv ON iv.object_id = uo.object_id AND iv.object_version = uo.current_object_version

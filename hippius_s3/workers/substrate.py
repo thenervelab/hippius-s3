@@ -80,7 +80,10 @@ class SubstrateWorker:
                 return await asyncio.wait_for(
                     asyncio.get_event_loop().run_in_executor(
                         None,
-                        lambda: self.substrate.submit_extrinsic(extrinsic, wait_for_finalization=True),
+                        lambda: self.substrate.submit_extrinsic(
+                            extrinsic,
+                            wait_for_finalization=True,
+                        ),
                     ),
                     timeout=timeout_seconds,
                 )
@@ -120,17 +123,25 @@ class SubstrateWorker:
             user_request_map[req.address].append(req)
 
         file_list_start = time.time()
-        calls = []
-        for user_address, cids in user_cid_map.items():
-            file_list = [{"cid": cid, "filename": f"s3-{cid}"} for cid in cids]
+        storage_request_substrate_calls = []
+        for user_addr, cids in user_cid_map.items():
+            file_list = [
+                {
+                    "cid": cid,
+                    "filename": f"s3-{cid}",
+                }
+                for cid in cids
+            ]
 
-            file_list_cid = await self._upload_file_list_to_ipfs(file_list)
-            logger.info(f"Uploaded {file_list_cid=}")
+            storage_request_cid = await self._upload_file_list_to_ipfs(
+                file_list,
+            )
+
             call_params = {
-                "owner": user_address,
+                "owner": user_addr,
                 "file_inputs": [
                     {
-                        "file_hash": file_list_cid,
+                        "file_hash": storage_request_cid,
                         "file_name": f"files_list_{uuid.uuid4()}",
                     }
                 ],
@@ -141,16 +152,19 @@ class SubstrateWorker:
                 call_function="submit_storage_request_for_user",
                 call_params=call_params,
             )
-            calls.append(call)
+            storage_request_substrate_calls.append(call)
+
         file_list_duration = time.time() - file_list_start
 
         batch_call = self.substrate.compose_call(
             call_module="Utility",
             call_function="batch",
-            call_params={"calls": calls},
+            call_params={
+                "calls": storage_request_substrate_calls,
+            },
         )
 
-        logger.info(f"{pprint.pformat(calls)}")
+        logger.info(f"{pprint.pformat(storage_request_substrate_calls)}")
 
         extrinsic = self.substrate.create_signed_extrinsic(
             call=batch_call,
@@ -158,13 +172,17 @@ class SubstrateWorker:
         )
 
         submit_start = time.time()
-        logger.info(f"Submitting batched transaction users={len(user_cid_map)} total_calls={len(calls)}")
+        logger.info(
+            f"Submitting batched transaction users={len(user_cid_map)} total_calls={len(storage_request_substrate_calls)}"
+        )
+
         receipt = await self._submit_extrinsic_with_retry(
             extrinsic,
             max_retries=self.config.substrate_max_retries,
             timeout_seconds=self.config.substrate_call_timeout_seconds,
         )
         submit_duration = time.time() - submit_start
+
         error_msg = None
 
         try:
@@ -185,16 +203,16 @@ class SubstrateWorker:
 
             for req in requests:
                 await self.db.execute(
-                    "UPDATE object_versions SET status = 'uploaded' WHERE object_id = $1 AND object_version = $2 AND status != 'uploaded'",
+                    "UPDATE object_versions SET status = 'uploaded' WHERE object_id = $1 AND object_version = $2",
                     req.object_id,
                     int(getattr(req, "object_version", 1) or 1),
                 )
-                logger.info(f"Updated object status to 'uploaded' object_id={req.object_id}")
+                logger.info(f"Ensured object status is 'uploaded' object_id={req.object_id}")
 
-            for user_address, user_requests in user_request_map.items():
+            for user_addr, user_requests in user_request_map.items():
                 total_cids = sum(len(r.cids) for r in user_requests)
                 get_metrics_collector().record_substrate_operation(
-                    main_account=user_address,
+                    main_account=user_addr,
                     success=True,
                     num_cids=total_cids,
                     duration=total_duration,
@@ -204,10 +222,10 @@ class SubstrateWorker:
 
         logger.error(f"Batched transaction failed: {error_msg}")
 
-        for user_address, user_requests in user_request_map.items():
+        for user_addr, user_requests in user_request_map.items():
             total_cids = sum(len(r.cids) for r in user_requests)
             get_metrics_collector().record_substrate_operation(
-                main_account=user_address,
+                main_account=user_addr,
                 success=False,
                 num_cids=total_cids,
                 duration=time.time() - start_time,

@@ -20,11 +20,13 @@ class BackgroundMetricsCollector:
         redis_client: async_redis.Redis,
         redis_accounts_client: async_redis.Redis,
         redis_chain_client: Optional[async_redis.Redis] = None,
+        redis_rate_limiting_client: Optional[async_redis.Redis] = None,
     ):
         self.metrics_collector = metrics_collector
         self.redis_client = redis_client
         self.redis_accounts_client = redis_accounts_client
         self.redis_chain_client = redis_chain_client
+        self.redis_rate_limiting_client = redis_rate_limiting_client
         self.running = False
         self._task: Optional[asyncio.Task] = None
 
@@ -69,6 +71,9 @@ class BackgroundMetricsCollector:
 
             if self.redis_chain_client:
                 self.metrics_collector._chain_db_size = int(await self.redis_chain_client.dbsize() or 0)
+
+            if self.redis_rate_limiting_client:
+                self.metrics_collector._rate_limiting_db_size = int(await self.redis_rate_limiting_client.dbsize() or 0)
 
             info = await self.redis_client.info("memory")
             self.metrics_collector._used_mem = info.get("used_memory", 0)

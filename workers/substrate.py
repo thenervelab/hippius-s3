@@ -174,8 +174,15 @@ def get_all_pinned_cids(
 async def get_all_storage_requests(
     substrate_url: str,
     http_client,
+    filter_users: set = None,
 ) -> Dict[str, List[str]]:
-    """Get all storage request CIDs for all users from substrate chain."""
+    """Get all storage request CIDs for specified users from substrate chain.
+
+    Args:
+        substrate_url: Substrate node URL
+        http_client: HTTP client for IPFS requests
+        filter_users: Optional set of user addresses to filter. If None, fetches for all users.
+    """
     client = SubstrateClient(substrate_url)
 
     try:
@@ -190,6 +197,11 @@ async def get_all_storage_requests(
                 # Handle double map key (owner_account_id, file_hash)
                 if isinstance(key, (tuple, list)) and len(key) >= 2:
                     account = str(key[0].value) if hasattr(key[0], "value") else str(key[0])
+
+                    # Skip if filtering is enabled and user not in filter set
+                    if filter_users is not None and account not in filter_users:
+                        continue
+
                     file_hash_hex = str(key[1].value) if hasattr(key[1], "value") else str(key[1])
 
                     # Convert hex-encoded file_hash to CID string
@@ -321,73 +333,3 @@ async def submit_storage_request(
     if last_exc:
         raise last_exc
     raise HippiusSubstrateError("Unknown substrate submission failure")
-
-
-async def submit_storage_request_for_user(
-    user: str,
-    cids: List[str],
-    seed_phrase: str,
-    substrate_url: str,
-) -> str:
-    """Submit a storage request to substrate for a specific user's missing CIDs."""
-    if not cids:
-        raise ValueError("CID list cannot be empty")
-
-    # Create FileInput objects from CIDs
-    files = [FileInput(file_hash=cid, file_name=f"s3-{cid}") for cid in cids]
-
-    # Create substrate client for this request
-    substrate_client = HippiusSubstrateClient(
-        url=substrate_url,
-        seed_phrase=seed_phrase,
-    )
-
-    # Submit storage request
-    tx_hash = await substrate_client.storage_request(
-        files=files,
-        miner_ids=[],
-        seed_phrase=seed_phrase,
-        pallet_name="IpfsPallet",
-        fn_name="submit_storage_request_for_user",
-        extra_params={
-            "owner": user,
-        },
-    )
-
-    logger.info(f"Submitted storage request for user {user} with {len(cids)} CIDs")
-    logger.debug(f"Substrate call result: {tx_hash}")
-
-    if not tx_hash or tx_hash == "0x" or len(tx_hash) < 10:
-        logger.error(f"Invalid transaction hash received: {tx_hash}")
-        raise HippiusSubstrateError(
-            f"Invalid transaction hash received: {tx_hash}. "
-            "This might indicate insufficient credits or transaction failure."
-        )
-
-    logger.info(f"Successfully submitted storage request for user {user} with transaction: {tx_hash}")
-    return tx_hash
-
-
-async def resubmit_substrate_pinning_request(
-    user: str,
-    cids: List[str],
-    seed_phrase: str,
-    substrate_url: str,
-) -> None:
-    """Resubmit pinning requests for missing CIDs."""
-    if not cids:
-        logger.info(f"No missing CIDs to resubmit for user {user}")
-        return
-
-    logger.info(
-        f"Resubmitting pinning for user {user} with {len(cids)} CIDs: {cids[:5]}{'...' if len(cids) > 5 else ''}"
-    )
-
-    # Call the substrate submission function
-    tx_hash = await submit_storage_request_for_user(
-        user,
-        cids,
-        seed_phrase,
-        substrate_url,
-    )
-    logger.info(f"Successfully resubmitted CIDs for user {user} with transaction: {tx_hash}")
