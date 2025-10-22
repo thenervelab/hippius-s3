@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import uuid
 from typing import Any
+from typing import AsyncIterator
 
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
@@ -13,6 +14,7 @@ from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.utils import get_query
 from hippius_s3.writer.cache_writer import CacheWriter
 from hippius_s3.writer.db import ensure_upload_row
+from hippius_s3.writer.db import upsert_object_basic
 from hippius_s3.writer.types import AppendPreconditionFailed
 from hippius_s3.writer.types import CompleteResult
 from hippius_s3.writer.types import EmptyAppendError
@@ -76,6 +78,10 @@ class ObjectWriter:
         metadata: dict[str, Any],
         body_bytes: bytes,
     ) -> PutResult:
+        """Deprecated: prefer put_simple_full which will upsert + write.
+
+        This method assumes the object row/version already exists in DB.
+        """
         # Encrypt into chunks
         chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
         key_bytes = await get_or_create_encryption_key_bytes(
@@ -126,6 +132,145 @@ class ObjectWriter:
         )
 
         return PutResult(etag=md5_hash, size_bytes=len(body_bytes), upload_id=str(upload_id))
+
+    async def put_simple_stream_full(
+        self,
+        *,
+        bucket_id: str,
+        bucket_name: str,
+        object_id: str,
+        object_key: str,
+        account_address: str,
+        content_type: str,
+        metadata: dict[str, Any],
+        storage_version: int | None = None,
+        body_iter: AsyncIterator[bytes],
+    ) -> PutResult:
+        """Upsert destination object and write content (single-part) using a streaming iterator.
+
+        - Consumes an AsyncIterator[bytes] and encrypts/writes chunk-by-chunk to cache.
+        - Keeps peak memory bounded to configured chunk size.
+        - Uses server-side keys; seed phrases are not required.
+        """
+        chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+        ttl = int(getattr(self.config, "cache_ttl_seconds", 1800))
+        key_bytes = await get_or_create_encryption_key_bytes(
+            subaccount_id=account_address,
+            bucket_name=bucket_name,
+        )
+
+        part_number = 1
+        # Resolve current object_version for this object_id if exists; default to 1 for new objects
+        try:
+            row = await self.db.fetchrow(
+                "SELECT current_object_version FROM objects WHERE object_id = $1",
+                object_id,
+            )
+            object_version = int(row["current_object_version"]) if row and row.get("current_object_version") else 1
+        except Exception:
+            object_version = 1
+
+        hasher = hashlib.md5()
+        total_size = 0
+        cw = CacheWriter(self.obj_cache, ttl_seconds=ttl)
+
+        pt_buf = bytearray()
+        next_chunk_index = 0
+
+        async def _encrypt_and_write(buf: bytes) -> None:
+            nonlocal total_size, next_chunk_index
+            if not buf:
+                return
+            hasher.update(buf)
+            total_size += len(buf)
+            ct_list = CryptoService.encrypt_part_to_chunks(
+                buf,
+                object_id=object_id,
+                part_number=part_number,
+                seed_phrase="",
+                chunk_size=chunk_size,
+                key=key_bytes,
+            )
+            # Write each produced ciphertext chunk immediately with increasing indices
+            for ct in ct_list:
+                await self.obj_cache.set_chunk(
+                    object_id,
+                    int(object_version),
+                    int(part_number),
+                    int(next_chunk_index),
+                    ct,
+                    ttl=ttl,
+                )
+                next_chunk_index += 1
+
+        async for piece in body_iter:
+            if not piece:
+                continue
+            pt_buf.extend(piece)
+            while len(pt_buf) >= chunk_size:
+                to_write = bytes(pt_buf[:chunk_size])
+                del pt_buf[:chunk_size]
+                await _encrypt_and_write(to_write)
+
+        # Flush remainder
+        if pt_buf:
+            await _encrypt_and_write(bytes(pt_buf))
+            pt_buf.clear()
+
+        md5_hash = hasher.hexdigest()
+
+        # Upsert DB row with final md5/size and storage version
+        await upsert_object_basic(
+            self.db,
+            object_id=object_id,
+            bucket_id=bucket_id,
+            object_key=object_key,
+            content_type=content_type,
+            metadata=metadata,
+            md5_hash=md5_hash,
+            size_bytes=int(total_size),
+            storage_version=int(
+                storage_version if storage_version is not None else getattr(self.config, "target_storage_version", 3)
+            ),
+        )
+
+        # Now that we know counts and sizes, write meta last using exact chunk count
+        num_chunks = int(next_chunk_index)
+        await cw.write_meta(
+            object_id,
+            int(object_version),
+            int(part_number),
+            chunk_size=chunk_size,
+            num_chunks=int(num_chunks),
+            plain_size=int(total_size),
+        )
+
+        # Ensure upload row and return PutResult-compatible values
+        upload_id = await ensure_upload_row(
+            self.db,
+            object_id=object_id,
+            bucket_id=bucket_id,
+            object_key=object_key,
+            content_type=content_type,
+            metadata=metadata,
+        )
+
+        # Ensure parts table has placeholder for base part (part 1) so append/read paths see it
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            await upsert_part_placeholder(
+                self.db,
+                object_id=object_id,
+                upload_id=str(upload_id),
+                part_number=int(part_number),
+                size_bytes=int(total_size),
+                etag=md5_hash,
+                chunk_size_bytes=int(chunk_size),
+                object_version=int(object_version),
+            )
+
+        return PutResult(etag=md5_hash, size_bytes=int(total_size), upload_id=str(upload_id))
 
     async def mpu_upload_part(
         self,

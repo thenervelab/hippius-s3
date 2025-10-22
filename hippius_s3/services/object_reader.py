@@ -206,3 +206,39 @@ async def read_response(
         media_type=info.get("content_type", "application/octet-stream"),
         headers=headers,
     )
+
+
+async def stream_object(
+    db: Any,
+    redis: Any,
+    obj_cache: Any,
+    info: dict,
+    *,
+    rng: RangeRequest | None,
+    address: str,
+) -> Any:
+    """Return an async iterator of plaintext bytes for the requested object.
+
+    This wraps build_stream_context and stream_plan so callers don't need to know
+    about manifests, chunk plans, or downloader details.
+    """
+    cfg = get_config()
+    ctx = await build_stream_context(
+        db,
+        redis,
+        obj_cache,
+        info,
+        rng=rng,
+        address=address,
+    )
+    return stream_plan(
+        obj_cache=obj_cache,
+        object_id=info["object_id"],
+        object_version=ctx.object_version,
+        plan=ctx.plan,
+        should_decrypt=ctx.should_decrypt,
+        sleep_seconds=float(cfg.http_download_sleep_loop),
+        address=address,
+        bucket_name=str(info.get("bucket_name", "")),
+        storage_version=ctx.storage_version,
+    )

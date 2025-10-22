@@ -36,7 +36,6 @@ config = get_config()
 async def handle_append(
     request: Request,
     db: Any,
-    ipfs_service: Any,
     redis_client: Any,
     *,
     bucket: dict,
@@ -50,7 +49,7 @@ async def handle_append(
     Args:
         request: FastAPI request (contains headers and state)
         db: asyncpg connection
-        ipfs_service: IPFS service dependency
+        redis_client: Redis async client
         redis_client: Redis async client
         bucket: bucket row dict
         bucket_id: bucket ID

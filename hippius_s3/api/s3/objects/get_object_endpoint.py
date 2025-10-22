@@ -30,7 +30,6 @@ async def handle_get_object(
     object_key: str,
     request: Request,
     db: Any,
-    ipfs_service: Any,
     redis_client: Any,
     object_reader: Any | None = None,
 ) -> Response:
