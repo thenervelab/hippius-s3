@@ -22,9 +22,9 @@ async def stream_plan(
     plan: Iterable[ChunkPlanItem],
     should_decrypt: bool,
     sleep_seconds: float,
-    address: str = "",
-    bucket_name: str = "",
-    storage_version: int = 2,
+    address: str,
+    bucket_name: str,
+    storage_version: int,
 ) -> AsyncGenerator[bytes, None]:
     for item in plan:
         c = await fetch_chunk_blocking(

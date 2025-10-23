@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from typing import Optional
 
 
 async def read_object_info(db: Any, bucket_name: str, object_key: str, account_id: str | None) -> dict | None:
@@ -10,10 +11,14 @@ async def read_object_info(db: Any, bucket_name: str, object_key: str, account_i
     return dict(row) if row else None
 
 
-async def read_parts_manifest(db: Any, object_id: str) -> list[dict]:
+async def read_parts_manifest(db: Any, object_id: str, object_version: Optional[int] = None) -> list[dict]:
     from hippius_s3.services.manifest_service import ManifestService
 
-    return await ManifestService.build_initial_download_chunks(db, {"object_id": object_id})
+    payload: dict[str, Any] = {"object_id": object_id}
+    if object_version is not None:
+        # Keep as Any to satisfy downstream JSON-agnostic consumers
+        payload["object_version"] = int(object_version)
+    return await ManifestService.build_initial_download_chunks(db, payload)
 
 
 async def read_part_plain_and_chunk_size(db: Any, object_id: str, part_number: int) -> tuple[int, int]:

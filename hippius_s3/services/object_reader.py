@@ -72,7 +72,9 @@ async def build_stream_context(
 ) -> StreamContext:
     cfg = get_config()
 
-    parts = await read_parts_manifest(db, info["object_id"])
+    parts = await read_parts_manifest(
+        db, info["object_id"], int(info.get("object_version") or info.get("current_object_version") or 1)
+    )
     plan = await build_chunk_plan(db, info["object_id"], parts, rng)
 
     source = "cache"
