@@ -8,6 +8,7 @@ from typing import AsyncIterator
 
 from opentelemetry import trace
 
+from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.services.crypto_service import CryptoService
@@ -160,9 +161,13 @@ class ObjectWriter:
         chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
         ttl = int(getattr(self.config, "cache_ttl_seconds", 1800))
 
-        with tracer.start_as_current_span("put_simple_stream_full.key_retrieval") as span:
-            span.set_attribute("account_address", account_address)
-            span.set_attribute("bucket_name", bucket_name)
+        with tracer.start_as_current_span(
+            "put_simple_stream_full.key_retrieval",
+            attributes={
+                "account_address": account_address,
+                "bucket_name": bucket_name,
+            },
+        ):
             key_bytes = await get_or_create_encryption_key_bytes(
                 subaccount_id=account_address,
                 bucket_name=bucket_name,
@@ -222,26 +227,34 @@ class ObjectWriter:
                     del pt_buf[:chunk_size]
                     await _encrypt_and_write(to_write)
 
-            # Flush remainder
             if pt_buf:
                 await _encrypt_and_write(bytes(pt_buf))
                 pt_buf.clear()
 
             md5_hash = hasher.hexdigest()
-            span.set_attribute("total_size", total_size)
-            span.set_attribute("num_chunks", next_chunk_index)
-            span.set_attribute("md5_hash", md5_hash)
+            set_span_attributes(
+                span,
+                {
+                    "total_size": total_size,
+                    "num_chunks": next_chunk_index,
+                    "md5_hash": md5_hash,
+                },
+            )
 
         # Upsert DB row with final md5/size and storage version
-        with tracer.start_as_current_span("put_simple_stream_full.upsert_metadata") as span:
-            span.set_attribute("object_id", object_id)
-            span.set_attribute("size_bytes", int(total_size))
-            span.set_attribute("md5_hash", md5_hash)
-            resolved_storage_version = int(
-                storage_version if storage_version is not None else getattr(self.config, "target_storage_version", 3)
-            )
-            span.set_attribute("storage_version", resolved_storage_version)
-
+        resolved_storage_version = int(
+            storage_version if storage_version is not None else getattr(self.config, "target_storage_version", 3)
+        )
+        with tracer.start_as_current_span(
+            "put_simple_stream_full.upsert_metadata",
+            attributes={
+                "object_id": object_id,
+                "has_object_id": True,
+                "size_bytes": int(total_size),
+                "md5_hash": md5_hash,
+                "storage_version": resolved_storage_version,
+            },
+        ):
             await upsert_object_basic(
                 self.db,
                 object_id=object_id,

@@ -84,10 +84,12 @@ async def handle_post_object(
 
     # Check for uploadId parameter (Complete Multipart Upload)
     if "uploadId" in request.query_params:
-        with tracer.start_as_current_span("multipart.route_complete") as span:
-            upload_id = request.query_params.get("uploadId")
-            if upload_id is not None:
-                span.set_attribute("upload_id", upload_id)
+        upload_id = request.query_params.get("uploadId")
+        if upload_id is not None:
+            with tracer.start_as_current_span(
+                "multipart.route_complete",
+                attributes={"upload_id": upload_id, "has_upload_id": True},
+            ):
                 return await complete_multipart_upload(
                     bucket_name,
                     object_key,

@@ -9,6 +9,7 @@ from fastapi import Request
 from fastapi import Response
 from opentelemetry import trace
 
+from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
 from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
@@ -61,13 +62,12 @@ async def handle_head_object(
     object_reader: ObjectReader | None = None,
 ) -> Response:
     # Compute anonymity before accessing request.state.account
-    with tracer.start_as_current_span("head_object.detect_anonymous_access") as span:
-        is_anonymous = getattr(request.state, "access_mode", None) == "anon"
-        account = getattr(request.state, "account", None)
-        is_public_bucket = False
+    is_anonymous = getattr(request.state, "access_mode", None) == "anon"
+    account = getattr(request.state, "account", None)
+    is_public_bucket = False
 
+    with tracer.start_as_current_span("head_object.detect_anonymous_access") as span:
         if (not is_anonymous) and (account is None):
-            # Check bucket publicity and switch to anon if public
             from hippius_s3.repositories.buckets import BucketRepository
 
             bucket = await BucketRepository(db).get_by_name(bucket_name)
@@ -82,8 +82,13 @@ async def handle_head_object(
                 account = request.state.account
                 is_public_bucket = True
 
-        span.set_attribute("is_anonymous", is_anonymous)
-        span.set_attribute("is_public_bucket", is_public_bucket)
+        set_span_attributes(
+            span,
+            {
+                "is_anonymous": is_anonymous,
+                "is_public_bucket": is_public_bucket,
+            },
+        )
 
     main_account_id = None if is_anonymous else (account.main_account if account else None)
 
@@ -102,10 +107,16 @@ async def handle_head_object(
     try:
         with tracer.start_as_current_span("head_object.get_object_metadata") as span:
             row = await _get_object_with_permissions_min(bucket_name, object_key, db, main_account_id)
-            span.set_attribute("object_id", str(row["object_id"]))
-            span.set_attribute("size_bytes", int(row.get("size_bytes") or 0))
-            span.set_attribute("multipart", bool(row.get("multipart")))
-            span.set_attribute("content_type", row.get("content_type", ""))
+            set_span_attributes(
+                span,
+                {
+                    "object_id": str(row["object_id"]),
+                    "has_object_id": True,
+                    "size_bytes": int(row.get("size_bytes") or 0),
+                    "multipart": bool(row.get("multipart")),
+                    "content_type": row.get("content_type", ""),
+                },
+            )
         # Build headers
         created_at = row["created_at"]
         size_bytes = int(row["size_bytes"]) if row.get("size_bytes") is not None else 0
@@ -122,8 +133,13 @@ async def handle_head_object(
                     if etags:
                         binary = b"".join(bytes.fromhex(e) for e in etags)
                         md5_hash = f"{_hashlib.md5(binary).hexdigest()}-{len(etags)}"
-                        span.set_attribute("num_parts", len(etags))
-                        span.set_attribute("computed_etag", md5_hash)
+                        set_span_attributes(
+                            span,
+                            {
+                                "num_parts": len(etags),
+                                "computed_etag": md5_hash,
+                            },
+                        )
                 except Exception:
                     md5_hash = md5_hash or ""
         content_type = row["content_type"]
@@ -135,22 +151,22 @@ async def handle_head_object(
         }
         # Source hint: cache vs pipeline
         with tracer.start_as_current_span("head_object.check_cache_status") as span:
+            source = "pipeline"
             try:
-                obj_id_str = str(row["object_id"])  # type: ignore[index]
+                obj_id_str = str(row["object_id"])
                 oc = request.app.state.obj_cache
                 has1 = await oc.exists(obj_id_str, 1)
                 source = "cache" if has1 else "pipeline"
                 headers["x-hippius-source"] = source
-                span.set_attribute("source", source)
             except Exception:
                 headers["x-hippius-source"] = "pipeline"
-                span.set_attribute("source", "pipeline")
+            set_span_attributes(span, {"source": source})
+
         # Append version header if present
         with tracer.start_as_current_span("head_object.fetch_append_version") as span:
             try:
                 append_version = row.get("append_version")
                 if append_version is None:
-                    # Fetch explicitly from object_versions for the current version
                     append_version = await db.fetchval(
                         """
                         SELECT ov.append_version
@@ -164,7 +180,7 @@ async def handle_head_object(
                     )
                 if append_version is not None:
                     headers["x-amz-meta-append-version"] = str(int(append_version))
-                    span.set_attribute("append_version", int(append_version))
+                    set_span_attributes(span, {"append_version": int(append_version)})
             except Exception:
                 pass
         # Metadata passthrough

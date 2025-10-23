@@ -6,7 +6,6 @@ from pathlib import Path
 
 import asyncpg
 import redis.asyncio as async_redis
-from redis.exceptions import BusyLoadingError
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -16,6 +15,7 @@ from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.queue import dequeue_substrate_request
 from hippius_s3.queue import enqueue_substrate_request
+from hippius_s3.redis_utils import with_redis_retry
 from hippius_s3.workers.substrate import SubstrateWorker
 
 
@@ -43,12 +43,12 @@ async def run_substrate_loop():
         requests = []
 
         while True:
-            try:
-                substrate_request = await dequeue_substrate_request(redis_client)
-            except BusyLoadingError:
-                logger.warning("Redis is still loading dataset, waiting 2 seconds...")
-                await asyncio.sleep(2)
-                continue
+            substrate_request, redis_client = await with_redis_retry(
+                dequeue_substrate_request,
+                redis_client,
+                config.redis_url,
+                "dequeue substrate request",
+            )
 
             if substrate_request:
                 if not config.publish_to_chain:

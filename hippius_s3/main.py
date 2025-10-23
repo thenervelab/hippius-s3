@@ -22,6 +22,7 @@ from hippius_s3.api.middlewares.metrics import metrics_middleware
 from hippius_s3.api.middlewares.profiler import SpeedscopeProfilerMiddleware
 from hippius_s3.api.middlewares.rate_limit import RateLimitService
 from hippius_s3.api.middlewares.rate_limit import rate_limit_wrapper
+from hippius_s3.api.middlewares.tracing import tracing_middleware
 from hippius_s3.api.middlewares.trailing_slash import trailing_slash_normalizer
 from hippius_s3.api.s3 import errors as s3_errors
 from hippius_s3.api.s3.multipart import router as multipart_router
@@ -194,6 +195,7 @@ def factory() -> FastAPI:
     # Custom middlewares - middleware("http") executes in REVERSE order
     app.middleware("http")(rate_limit_wrapper)
     app.middleware("http")(metrics_middleware)
+    app.middleware("http")(tracing_middleware)
     app.middleware("http")(audit_log_middleware)
     app.middleware("http")(check_credit_for_all_operations)
     app.middleware("http")(trailing_slash_normalizer)

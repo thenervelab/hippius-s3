@@ -91,15 +91,15 @@ services:
     ports:
       - "127.0.0.1:6379:6379"
     volumes:
-      - redis_data:/data
       - ./redis.conf:/usr/local/etc/redis/redis.conf
-    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--save", "60 1", "--save", "300 10", "--save", "900 100", "--appendonly", "yes", "--appendfsync", "everysec"]
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--appendonly", "no", "--save", ""]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 50
+      start_period: 120s
     networks:
       - hippius_net
 
@@ -113,10 +113,11 @@ services:
     command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--save", "60 1", "--save", "300 10", "--save", "900 100", "--appendonly", "yes", "--appendfsync", "everysec"]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 50
+      start_period: 120s
     networks:
       - hippius_net
 
@@ -130,10 +131,11 @@ services:
     command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--save", "60 1", "--save", "300 10", "--save", "900 100", "--appendonly", "yes", "--appendfsync", "everysec"]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 50
+      start_period: 120s
     networks:
       - hippius_net
 
@@ -147,10 +149,11 @@ services:
     command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--maxmemory", "1gb"]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 50
+      start_period: 120s
     networks:
       - hippius_net
 

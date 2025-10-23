@@ -12,9 +12,6 @@ import httpx
 import redis.asyncio as async_redis
 from hippius_sdk.substrate import SubstrateClient
 
-from hippius_s3.queue import UnpinChainRequest
-from hippius_s3.queue import dequeue_unpin_request
-
 
 # Add parent directory to path to import hippius_s3 modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -23,6 +20,9 @@ from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.monitoring import initialize_metrics_collector
+from hippius_s3.queue import UnpinChainRequest
+from hippius_s3.queue import dequeue_unpin_request
+from hippius_s3.redis_utils import with_redis_retry
 
 
 config = get_config()
@@ -190,7 +190,12 @@ async def run_unpinner_loop():
 
     try:
         while True:
-            unpin_request = await dequeue_unpin_request(redis_client)
+            unpin_request, redis_client = await with_redis_retry(
+                dequeue_unpin_request,
+                redis_client,
+                config.redis_url,
+                "dequeue unpin request",
+            )
 
             if unpin_request:
                 try:
@@ -199,17 +204,15 @@ async def run_unpinner_loop():
                     user_unpin_requests[unpin_request.address] = [unpin_request]
 
             else:
-                # No items in queue, wait a bit before checking again
                 for user in list(user_unpin_requests.keys()):
                     success = await process_unpin_request(user_unpin_requests[user])
                     if success:
                         logger.info(f"SUCCESSFULLY processed user's {user} with {len(user_unpin_requests[user])} files")
-                        # Remove that user
                         user_unpin_requests.pop(user)
                     else:
                         logger.warning(
                             f"Some unpins failed for user {user}, will retry later"
-                        )  # Keep the user in the dict to retry later
+                        )
 
                 await asyncio.sleep(config.unpinner_sleep_loop)
 

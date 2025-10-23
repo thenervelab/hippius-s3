@@ -7,6 +7,7 @@ from fastapi import Request
 from fastapi import Response
 from opentelemetry import trace
 
+from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
 from hippius_s3.config import get_config
 from hippius_s3.queue import UnpinChainRequest
@@ -33,7 +34,7 @@ async def handle_delete_object(
     try:
         with tracer.start_as_current_span("delete_object.ensure_user") as span:
             user = await UserRepository(db).ensure_by_main_account(request.state.account.main_account)
-            span.set_attribute("main_account_id", user["main_account_id"])
+            set_span_attributes(span, {"main_account_id": user["main_account_id"]})
 
         with tracer.start_as_current_span("delete_object.get_bucket") as span:
             bucket = await BucketRepository(db).get_by_name_and_owner(bucket_name, user["main_account_id"])
@@ -45,12 +46,12 @@ async def handle_delete_object(
                     BucketName=bucket_name,
                 )
             bucket_id = bucket["bucket_id"]
-            span.set_attribute("bucket_id", bucket_id)
+            set_span_attributes(span, {"bucket_id": str(bucket_id)})
 
         with tracer.start_as_current_span("delete_object.check_object_exists") as span:
             result = await ObjectRepository(db).get_by_path(bucket_id, object_key)
             object_exists = result is not None
-            span.set_attribute("object_exists", object_exists)
+            set_span_attributes(span, {"object_exists": object_exists})
             if not result:
                 return Response(status_code=204)
 
@@ -66,10 +67,15 @@ async def handle_delete_object(
                     status_code=403,
                     Key=object_key,
                 )
-            span.set_attribute("object_id", str(deleted_object["object_id"]))
-            span.set_attribute(
-                "object_version",
-                int(deleted_object.get("object_version") or deleted_object.get("current_object_version") or 1),
+            set_span_attributes(
+                span,
+                {
+                    "object_id": str(deleted_object["object_id"]),
+                    "has_object_id": True,
+                    "object_version": int(
+                        deleted_object.get("object_version") or deleted_object.get("current_object_version") or 1
+                    ),
+                },
             )
 
         # Cleanup provisional multipart uploads
@@ -86,13 +92,18 @@ async def handle_delete_object(
         # Enqueue unpin if CID exists
         cid = deleted_object.get("ipfs_cid") or ""
         if cid and cid.strip():
-            with tracer.start_as_current_span("delete_object.enqueue_unpin") as span:
-                span.set_attribute("cid", cid)
-                span.set_attribute("object_id", str(deleted_object["object_id"]))
-                span.set_attribute(
-                    "object_version",
-                    int(deleted_object.get("object_version") or deleted_object.get("current_object_version") or 1),
-                )
+            with tracer.start_as_current_span(
+                "delete_object.enqueue_unpin",
+                attributes={
+                    "cid": cid,
+                    "has_cid": True,
+                    "object_id": str(deleted_object["object_id"]),
+                    "has_object_id": True,
+                    "object_version": int(
+                        deleted_object.get("object_version") or deleted_object.get("current_object_version") or 1
+                    ),
+                },
+            ):
                 await enqueue_unpin_request(
                     payload=UnpinChainRequest(
                         substrate_url=config.substrate_url,

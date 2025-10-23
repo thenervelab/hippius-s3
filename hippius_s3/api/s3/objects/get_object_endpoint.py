@@ -11,6 +11,7 @@ from fastapi import Request
 from fastapi import Response
 from opentelemetry import trace
 
+from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.common import parse_range
 from hippius_s3.api.s3.common import parse_read_mode
@@ -52,19 +53,25 @@ async def handle_get_object(
 
     # List parts for an ongoing multipart upload
     if "uploadId" in request.query_params:
-        with tracer.start_as_current_span("get_object.check_list_parts_request") as span:
-            upload_id = request.query_params.get("uploadId", "")
-            span.set_attribute("upload_id", upload_id)
-            from hippius_s3.api.s3.multipart import list_parts_internal  # local import to avoid cycles
+        upload_id = request.query_params.get("uploadId", "")
+        with tracer.start_as_current_span(
+            "get_object.check_list_parts_request",
+            attributes={"upload_id": upload_id, "has_upload_id": bool(upload_id)},
+        ):
+            from hippius_s3.api.s3.multipart import list_parts_internal
 
             return await list_parts_internal(bucket_name, object_key, request, db)
 
     # Parse read mode and range
-    with tracer.start_as_current_span("get_object.parse_request_headers") as span:
-        hdr_mode = parse_read_mode(request)
-        rng_obj, range_header = parse_range(request, total_size=10**12)  # provisional; validated below with real size
-        span.set_attribute("read_mode", hdr_mode or "auto")
-        span.set_attribute("has_range_header", bool(range_header))
+    hdr_mode = parse_read_mode(request)
+    rng_obj, range_header = parse_range(request, total_size=10**12)
+    with tracer.start_as_current_span(
+        "get_object.parse_request_headers",
+        attributes={
+            "read_mode": hdr_mode or "auto",
+            "has_range_header": bool(range_header),
+        },
+    ):
         logger.info(f"GET start {bucket_name}/{object_key} read_mode={hdr_mode or 'auto'} range={bool(range_header)}")
 
     try:
@@ -74,10 +81,13 @@ async def handle_get_object(
         account_id = None if is_anonymous else (account.main_account if account else None)
 
         if not is_anonymous and account:
-            with tracer.start_as_current_span("get_object.get_or_create_user") as span:
-                span.set_attribute("main_account_id", account.main_account)
-                span.set_attribute("is_anonymous", False)
-                # Get user for user-scoped bucket lookup (creates user if not exists)
+            with tracer.start_as_current_span(
+                "get_object.get_or_create_user",
+                attributes={
+                    "main_account_id": account.main_account,
+                    "is_anonymous": False,
+                },
+            ):
                 await db.fetchrow(
                     get_query("get_or_create_user_by_main_account"),
                     account.main_account,
@@ -85,8 +95,10 @@ async def handle_get_object(
                 )
 
         # Get object info for download with permission checks
-        with tracer.start_as_current_span("get_object.get_object_with_permissions") as span:
-            span.set_attribute("is_anonymous", is_anonymous)
+        with tracer.start_as_current_span(
+            "get_object.get_object_with_permissions",
+            attributes={"is_anonymous": is_anonymous},
+        ) as span:
             object_info = await db.fetchrow(
                 get_query("get_object_for_download_with_permissions"),
                 bucket_name,
@@ -94,11 +106,17 @@ async def handle_get_object(
                 account_id,
             )
             if object_info:
-                span.set_attribute("object_id", str(object_info["object_id"]))
-                span.set_attribute("size_bytes", int(object_info.get("size_bytes") or 0))
-                span.set_attribute("multipart", bool(object_info.get("multipart")))
-                span.set_attribute("storage_version", int(object_info.get("storage_version") or 2))
-                span.set_attribute("is_public", bool(object_info.get("is_public")))
+                set_span_attributes(
+                    span,
+                    {
+                        "object_id": str(object_info["object_id"]),
+                        "has_object_id": True,
+                        "size_bytes": int(object_info.get("size_bytes") or 0),
+                        "multipart": bool(object_info.get("multipart")),
+                        "storage_version": int(object_info.get("storage_version") or 2),
+                        "is_public": bool(object_info.get("is_public")),
+                    },
+                )
 
         if not object_info:
             return errors.s3_error_response(
@@ -111,20 +129,27 @@ async def handle_get_object(
         # Build manifest purely from DB parts, 0-based; prefer ObjectReader if provided
         with tracer.start_as_current_span("get_object.build_manifest") as span:
             download_chunks = json.loads(object_info["download_chunks"]) if object_info.get("download_chunks") else []
+            manifest_source = "unknown"
             try:
                 built_chunks = await ManifestService.build_initial_download_chunks(
                     db, object_info if isinstance(object_info, dict) else dict(object_info)
                 )
                 if built_chunks:
                     download_chunks = built_chunks
-                    span.set_attribute("manifest_source", "db")
+                    manifest_source = "db"
                 else:
-                    span.set_attribute("manifest_source", "cached")
+                    manifest_source = "cached"
             except Exception:
                 logger.debug("Failed to build manifest from ManifestService", exc_info=True)
-                span.set_attribute("manifest_source", "cached_fallback")
+                manifest_source = "cached_fallback"
 
-            span.set_attribute("num_download_chunks", len(download_chunks))
+            set_span_attributes(
+                span,
+                {
+                    "manifest_source": manifest_source,
+                    "num_download_chunks": len(download_chunks),
+                },
+            )
 
             # Attach manifest to object_info for cache assembly
             try:
@@ -146,10 +171,7 @@ async def handle_get_object(
                         except Exception:
                             effective_size = 0
                     start_byte, end_byte = parse_range_header(range_header, effective_size)
-                    span.set_attribute("start_byte", start_byte)
-                    span.set_attribute("end_byte", end_byte)
-                    span.set_attribute("effective_size", effective_size)
-                    # Check if this was originally an invalid range (start > end) that got converted to full range
+
                     original_parts = range_header.lower().strip()
                     if original_parts.startswith("bytes="):
                         spec = original_parts[len("bytes=") :]
@@ -158,9 +180,20 @@ async def handle_get_object(
                             orig_start = int(range_parts[0])
                             orig_end = int(range_parts[1])
                             if orig_end < orig_start:
-                                # This was originally an invalid range (start > end) converted to full range
                                 range_was_invalid = True
-                                span.set_attribute("range_was_invalid", True)
+
+                    set_span_attributes(
+                        span,
+                        {
+                            "start_byte": start_byte,
+                            "end_byte": end_byte,
+                            "effective_size": effective_size,
+                            "range_size_bytes": (end_byte - start_byte + 1)
+                            if start_byte is not None and end_byte is not None
+                            else effective_size,
+                            "range_was_invalid": range_was_invalid,
+                        },
+                    )
                 except ValueError:
                     return Response(
                         status_code=416,
@@ -208,10 +241,14 @@ async def handle_get_object(
             "storage_version": storage_version,
         }
 
-        with tracer.start_as_current_span("get_object.read_response") as span:
-            span.set_attribute("resolved_address", resolved_address)
-            span.set_attribute("read_mode", hdr_mode or "auto")
-            span.set_attribute("has_range", v2_rng is not None)
+        with tracer.start_as_current_span(
+            "get_object.read_response",
+            attributes={
+                "resolved_address": resolved_address,
+                "read_mode": hdr_mode or "auto",
+                "has_range": v2_rng is not None,
+            },
+        ) as span:
             response = await read_response(
                 db=db,
                 redis=request.app.state.redis_client,
@@ -222,7 +259,7 @@ async def handle_get_object(
                 address=resolved_address,
                 range_was_invalid=range_was_invalid,
             )
-            span.set_attribute("http.status_code", response.status_code)
+            set_span_attributes(span, {"http.status_code": response.status_code})
 
         if response.status_code in (200, 206):
             bytes_transferred = int(object_info["size_bytes"])
