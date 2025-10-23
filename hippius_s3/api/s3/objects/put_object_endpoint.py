@@ -166,6 +166,9 @@ async def handle_put_object(
             current_object_version = int(object_row["object_version"] or 1) if object_row else 1
             set_span_attributes(span, {"current_object_version": current_object_version})
 
+        # Explicit COMMIT ensures parts rows are visible to uploader before enqueue
+        await db.execute("COMMIT")
+
         # Only enqueue after DB state is persisted; use writer queue helper
         with tracer.start_as_current_span(
             "put_object.enqueue_upload",
