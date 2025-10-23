@@ -8,7 +8,7 @@
 WITH lock AS (
   SELECT pg_advisory_xact_lock(hashtext($1::text))
 ), cur AS (
-  SELECT current_object_version FROM objects WHERE object_id = $1 FOR UPDATE
+  SELECT current_object_version FROM objects WHERE object_id = $1::uuid FOR UPDATE
 ), ins AS (
   INSERT INTO object_versions (
     object_id,
@@ -31,7 +31,7 @@ WITH lock AS (
     last_modified,
     created_at
   )
-  SELECT $1,
+  SELECT $1::uuid,
          COALESCE((SELECT current_object_version FROM cur), 0) + 1 AS v,
          'migration',
          $4,
