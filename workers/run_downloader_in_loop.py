@@ -7,6 +7,9 @@ from pathlib import Path
 
 import redis.asyncio as async_redis
 from hippius_sdk.client import HippiusClient
+from redis.exceptions import BusyLoadingError
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 
 # Add parent directory to path to import hippius_s3 modules
@@ -19,7 +22,6 @@ from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import dequeue_download_request
-from hippius_s3.redis_utils import with_redis_retry
 from hippius_s3.utils import get_query
 from hippius_s3.utils.timing import log_timing
 
@@ -71,6 +73,7 @@ async def process_download_request(
                     rows = await db.fetch(
                         get_query("get_part_chunks_by_object_and_number"),
                         download_request.object_id,
+                        int(download_request.object_version),
                         part_num,
                     )
                     all_entries = [(int(r[0]), str(r[1]), int(r[2]) if r[2] is not None else None) for r in rows or []]
@@ -291,29 +294,39 @@ async def run_downloader_loop():
 
     try:
         while True:
-            download_request, redis_client = await with_redis_retry(
-                dequeue_download_request,
-                redis_client,
-                config.redis_url,
-                "dequeue download request",
-            )
+            try:
+                download_request = await dequeue_download_request(redis_client)
+            except (BusyLoadingError, RedisConnectionError, RedisTimeoutError) as e:
+                logger.warning(f"Redis error while dequeuing download request: {e}. Reconnecting in 2s...")
+                with contextlib.suppress(Exception):
+                    await redis_client.aclose()
+                await asyncio.sleep(2)
+                redis_client = async_redis.from_url(config.redis_url)
+                continue
 
             if download_request:
-                success, redis_client = await with_redis_retry(
-                    lambda rc, req=download_request: process_download_request(req, rc),
-                    redis_client,
-                    config.redis_url,
-                    "process download request",
-                )
-                if success:
-                    logger.info(
-                        f"Successfully processed download request {download_request.bucket_name}/{download_request.object_key}"
+                try:
+                    success = await process_download_request(download_request, redis_client)
+                    if success:
+                        logger.info(
+                            f"Successfully processed download request {download_request.bucket_name}/{download_request.object_key}"
+                        )
+                    else:
+                        logger.error(
+                            f"Failed to process download request {download_request.bucket_name}/{download_request.object_key}"
+                        )
+                except (RedisConnectionError, RedisTimeoutError, BusyLoadingError) as e:
+                    logger.warning(
+                        f"Redis connection issue during processing: {e}. Reconnecting in 2s and continuing..."
                     )
-                else:
-                    logger.error(
-                        f"Failed to process download request {download_request.bucket_name}/{download_request.object_key}"
-                    )
+                    with contextlib.suppress(Exception):
+                        await redis_client.aclose()
+                    await asyncio.sleep(2)
+                    redis_client = async_redis.from_url(config.redis_url)
+                    # Continue main loop; item-specific retry/backoff is handled by callers
+                    continue
             else:
+                # Wait a bit before checking again
                 await asyncio.sleep(config.downloader_sleep_loop)
 
     except KeyboardInterrupt:
@@ -322,7 +335,7 @@ async def run_downloader_loop():
         logger.error(f"Error in downloader loop: {e}")
         raise
     finally:
-        await redis_client.close()
+        await redis_client.aclose()
 
 
 if __name__ == "__main__":
