@@ -210,9 +210,7 @@ async def run_unpinner_loop():
                         logger.info(f"SUCCESSFULLY processed user's {user} with {len(user_unpin_requests[user])} files")
                         user_unpin_requests.pop(user)
                     else:
-                        logger.warning(
-                            f"Some unpins failed for user {user}, will retry later"
-                        )
+                        logger.warning(f"Some unpins failed for user {user}, will retry later")
 
                 await asyncio.sleep(config.unpinner_sleep_loop)
 
