@@ -75,6 +75,26 @@ class Uploader:
         self.obj_cache = RedisObjectPartsCache(redis_client)
         self.dlq_storage = DLQStorage()
 
+    class _ConnCtx:
+        def __init__(self, conn: Any):
+            self._conn = conn
+
+        async def __aenter__(self):
+            return self._conn
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    def _acquire_conn(self):
+        """Return an async context manager yielding a connection.
+
+        Works with either a Pool (has acquire) or a single Connection.
+        """
+        acquire = getattr(self.db, "acquire", None)
+        if callable(acquire):
+            return acquire()
+        return Uploader._ConnCtx(self.db)
+
     async def process_upload(self, payload: UploadChainRequest) -> List[str]:
         start_time = time.time()
         logger.info(f"Processing upload object_id={payload.object_id} chunks={len(payload.chunks)}")
@@ -185,10 +205,11 @@ class Uploader:
         resolved_upload_id: Optional[str] = upload_id
         if not resolved_upload_id:
             try:
-                row = await self.db.fetchrow(
-                    "SELECT upload_id FROM multipart_uploads WHERE object_id = $1 ORDER BY initiated_at DESC LIMIT 1",
-                    object_id,
-                )
+                async with self._acquire_conn() as conn:
+                    row = await conn.fetchrow(
+                        "SELECT upload_id FROM multipart_uploads WHERE object_id = $1 ORDER BY initiated_at DESC LIMIT 1",
+                        object_id,
+                    )
                 if row and row[0] is not None:
                     resolved_upload_id = str(row[0])
             except Exception:
@@ -200,19 +221,20 @@ class Uploader:
             resolved_upload_id = object_id
 
         # Look up part_id and sizing metadata for part_chunks upsert
-        part_row = await self.db.fetchrow(
-            """
-            SELECT p.part_id,
-                   COALESCE(p.chunk_size_bytes, 0) AS chunk_size_bytes,
-                   COALESCE(p.size_bytes, 0) AS size_bytes
-            FROM parts p
-            WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = $3
-            LIMIT 1
-            """,
-            object_id,
-            part_number,
-            int(object_version),
-        )
+        async with self._acquire_conn() as conn:
+            part_row = await conn.fetchrow(
+                """
+                SELECT p.part_id,
+                       COALESCE(p.chunk_size_bytes, 0) AS chunk_size_bytes,
+                       COALESCE(p.size_bytes, 0) AS size_bytes
+                FROM parts p
+                WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = $3
+                LIMIT 1
+                """,
+                object_id,
+                part_number,
+                int(object_version),
+            )
         part_id: Optional[str] = str(part_row[0]) if part_row else None
         part_chunk_size: int = int(part_row[1] or 0) if part_row else 0
         part_plain_size: int = int(part_row[2] or 0) if part_row else 0
@@ -242,32 +264,35 @@ class Uploader:
                 else:
                     pt_len = None  # type: ignore[assignment]
 
-                await self.db.execute(
-                    get_query("upsert_part_chunk"),
-                    part_id,
-                    int(ci),
-                    piece_cid,
-                    int(len(piece)),
-                    int(pt_len) if isinstance(pt_len, int) else None,
-                    None,
-                )
+                async with self._acquire_conn() as conn:
+                    await conn.execute(
+                        get_query("upsert_part_chunk"),
+                        part_id,
+                        int(ci),
+                        piece_cid,
+                        int(len(piece)),
+                        int(pt_len) if isinstance(pt_len, int) else None,
+                        None,
+                    )
 
             # Set parts.ipfs_cid to first chunk CID for manifest compatibility
             first_chunk_cid = all_chunk_cids[0] if all_chunk_cids else ""
-            cid_row = await self.db.fetchrow(get_query("upsert_cid"), first_chunk_cid) if first_chunk_cid else None
+            async with self._acquire_conn() as conn:
+                cid_row = await conn.fetchrow(get_query("upsert_cid"), first_chunk_cid) if first_chunk_cid else None
             cid_id = cid_row["id"] if cid_row else None
-            await self.db.execute(
-                """
-                UPDATE parts p
-                SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
-                WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = $5
-                """,
-                object_id,
-                part_number,
-                first_chunk_cid,
-                cid_id,
-                int(object_version),
-            )
+            async with self._acquire_conn() as conn:
+                await conn.execute(
+                    """
+                    UPDATE parts p
+                    SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
+                    WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = $5
+                    """,
+                    object_id,
+                    part_number,
+                    first_chunk_cid,
+                    cid_id,
+                    int(object_version),
+                )
 
             logger.debug(
                 f"Uploaded {num_chunks_meta} chunk pieces for object_id={object_id} part={part_number}; all_cids={len(all_chunk_cids)}"
@@ -291,24 +316,26 @@ class Uploader:
 
         cid_id = None
         try:
-            cid_row2 = await self.db.fetchrow(get_query("upsert_cid"), chunk_cid)
-            cid_id = cid_row2["id"] if cid_row2 else None
+            async with self._acquire_conn() as conn:
+                cid_row2 = await conn.fetchrow(get_query("upsert_cid"), chunk_cid)
+                cid_id = cid_row2["id"] if cid_row2 else None
         except Exception:
             cid_id = None
 
         try:
-            updated = await self.db.execute(
-                """
-                UPDATE parts p
-                SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
-                WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = $5
-                """,
-                object_id,
-                part_number,
-                chunk_cid,
-                cid_id,
-                int(object_version),
-            )
+            async with self._acquire_conn() as conn:
+                updated = await conn.execute(
+                    """
+                    UPDATE parts p
+                    SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
+                    WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = $5
+                    """,
+                    object_id,
+                    part_number,
+                    chunk_cid,
+                    cid_id,
+                    int(object_version),
+                )
             updated_str = str(updated or "")
             rows_affected = 0
             if updated_str.upper().startswith("UPDATE"):
@@ -318,17 +345,18 @@ class Uploader:
 
             if rows_affected == 0:
                 # Fallback: try update by upload_id
-                updated2 = await self.db.execute(
-                    """
-                    UPDATE parts
-                    SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
-                    WHERE upload_id = $1 AND part_number = $2
-                    """,
-                    resolved_upload_id,
-                    part_number,
-                    chunk_cid,
-                    cid_id,
-                )
+                async with self._acquire_conn() as conn:
+                    updated2 = await conn.execute(
+                        """
+                        UPDATE parts
+                        SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
+                        WHERE upload_id = $1 AND part_number = $2
+                        """,
+                        resolved_upload_id,
+                        part_number,
+                        chunk_cid,
+                        cid_id,
+                    )
                 updated2_str = str(updated2 or "")
                 rows_affected2 = 0
                 if updated2_str.upper().startswith("UPDATE"):
@@ -352,8 +380,9 @@ class Uploader:
     ) -> str:
         logger.debug(f"Building manifest for object_id={object_id}")
 
-        rows = await self.db.fetch(
-            """
+        async with self._acquire_conn() as conn:
+            rows = await conn.fetch(
+                """
             SELECT p.part_number,
                    COALESCE(c.cid, p.ipfs_cid) AS cid,
                    p.size_bytes::bigint AS size_bytes
@@ -365,8 +394,8 @@ class Uploader:
             WHERE o.object_id = $1
             ORDER BY p.part_number
             """,
-            object_id,
-        )
+                object_id,
+            )
         # If any part is missing a concrete CID, skip manifest build for now
         parts_data = []
         for r in rows:
@@ -380,8 +409,9 @@ class Uploader:
             parts_data.append({"part_number": part_number, "cid": cid, "size_bytes": size})
 
         # Fetch content type from the current object version
-        obj_row = await self.db.fetchrow(
-            """
+        async with self._acquire_conn() as conn:
+            obj_row = await conn.fetchrow(
+                """
             SELECT ov.content_type
             FROM objects o
             JOIN object_versions ov
@@ -389,8 +419,8 @@ class Uploader:
              AND ov.object_version = o.current_object_version
             WHERE o.object_id = $1
             """,
-            object_id,
-        )
+                object_id,
+            )
         content_type = obj_row["content_type"] if obj_row else "application/octet-stream"
 
         manifest_data = {
