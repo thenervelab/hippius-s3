@@ -185,12 +185,12 @@ async def handle_get_object(
                     set_span_attributes(
                         span,
                         {
-                            "start_byte": start_byte,
-                            "end_byte": end_byte,
-                            "effective_size": effective_size,
-                            "range_size_bytes": (end_byte - start_byte + 1)
+                            "start_byte": int(start_byte) if start_byte is not None else None,
+                            "end_byte": int(end_byte) if end_byte is not None else None,
+                            "effective_size": int(effective_size),
+                            "range_size_bytes": int(end_byte - start_byte + 1)
                             if start_byte is not None and end_byte is not None
-                            else effective_size,
+                            else int(effective_size),
                             "range_was_invalid": range_was_invalid,
                         },
                     )
@@ -259,7 +259,7 @@ async def handle_get_object(
                 address=resolved_address,
                 range_was_invalid=range_was_invalid,
             )
-            set_span_attributes(span, {"http.status_code": response.status_code})
+            set_span_attributes(span, {"http.status_code": int(response.status_code)})
 
         if response.status_code in (200, 206):
             bytes_transferred = int(object_info["size_bytes"])

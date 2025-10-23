@@ -115,59 +115,57 @@ async def handle_put_object(
         else:
             object_id = str(uuid.uuid4())
 
-        # Use ObjectWriter streaming upsert/write (single-part)
-        with tracer.start_as_current_span(
-            "put_object.stream_and_upsert",
-            attributes={
-                "object_id": object_id,
-                "has_object_id": True,
-                "file_size_bytes": file_size,
-                "content_type": content_type,
-                "storage_version": int(getattr(config, "target_storage_version", 3)),
-            },
-        ) as span:
-            writer = ObjectWriter(db=db, redis_client=redis_client)
-
-            async def _iter_once() -> AsyncIterator[bytes]:
-                yield file_data
-
-            put_res = await writer.put_simple_stream_full(
-                bucket_id=bucket_id,
-                bucket_name=bucket_name,
-                object_id=object_id,
-                object_key=object_key,
-                account_address=request.state.account.main_account,
-                content_type=content_type,
-                metadata=metadata,
-                storage_version=int(getattr(config, "target_storage_version", 3)),
-                body_iter=_iter_once(),
-            )
-
-            set_span_attributes(
-                span,
-                {
-                    "upload_id": put_res.upload_id,
-                    "has_upload_id": True,
-                    "etag": put_res.etag,
-                    "returned_size_bytes": put_res.size_bytes,
+        async with db.transaction():
+            # Use ObjectWriter streaming upsert/write (single-part)
+            with tracer.start_as_current_span(
+                "put_object.stream_and_upsert",
+                attributes={
+                    "object_id": object_id,
+                    "has_object_id": True,
+                    "file_size_bytes": file_size,
+                    "content_type": content_type,
+                    "storage_version": int(getattr(config, "target_storage_version", 3)),
                 },
-            )
+            ) as span:
+                writer = ObjectWriter(db=db, redis_client=redis_client)
 
-        # Fetch current version to enqueue background publish
-        with tracer.start_as_current_span(
-            "put_object.fetch_current_version",
-            attributes={"object_id": object_id, "has_object_id": True},
-        ) as span:
-            object_row = await db.fetchrow(
-                get_query("get_object_by_path"),
-                bucket_id,
-                object_key,
-            )
-            current_object_version = int(object_row["object_version"] or 1) if object_row else 1
-            set_span_attributes(span, {"current_object_version": current_object_version})
+                async def _iter_once() -> AsyncIterator[bytes]:
+                    yield file_data
 
-        # Explicit COMMIT ensures parts rows are visible to uploader before enqueue
-        await db.execute("COMMIT")
+                put_res = await writer.put_simple_stream_full(
+                    bucket_id=bucket_id,
+                    bucket_name=bucket_name,
+                    object_id=object_id,
+                    object_key=object_key,
+                    account_address=request.state.account.main_account,
+                    content_type=content_type,
+                    metadata=metadata,
+                    storage_version=int(getattr(config, "target_storage_version", 3)),
+                    body_iter=_iter_once(),
+                )
+
+                set_span_attributes(
+                    span,
+                    {
+                        "upload_id": put_res.upload_id,
+                        "has_upload_id": True,
+                        "etag": put_res.etag,
+                        "returned_size_bytes": put_res.size_bytes,
+                    },
+                )
+
+            # Fetch current version to enqueue background publish
+            with tracer.start_as_current_span(
+                "put_object.fetch_current_version",
+                attributes={"object_id": object_id, "has_object_id": True},
+            ) as span:
+                object_row = await db.fetchrow(
+                    get_query("get_object_by_path"),
+                    bucket_id,
+                    object_key,
+                )
+                current_object_version = int(object_row["object_version"] or 1) if object_row else 1
+                set_span_attributes(span, {"current_object_version": current_object_version})
 
         # Only enqueue after DB state is persisted; use writer queue helper
         with tracer.start_as_current_span(

@@ -393,24 +393,24 @@ class ObjectWriter:
         )
         total_size = sum(int(p["size_bytes"]) for p in all_parts)
 
-        # Update object_versions
-        await self.db.execute(
-            """
-            UPDATE object_versions ov
-            SET md5_hash = $1,
-                size_bytes = $2,
-                last_modified = NOW(),
-                status = 'publishing'
-            WHERE ov.object_id = $3 AND ov.object_version = $4
-            """,
-            final_md5,
-            int(total_size),
-            object_id,
-            int(object_version),
-        )
-
-        # Mark MPU completed
         async with self.db.transaction():
+            # Update object_versions
+            await self.db.execute(
+                """
+                UPDATE object_versions ov
+                SET md5_hash = $1,
+                    size_bytes = $2,
+                    last_modified = NOW(),
+                    status = 'publishing'
+                WHERE ov.object_id = $3 AND ov.object_version = $4
+                """,
+                final_md5,
+                int(total_size),
+                object_id,
+                int(object_version),
+            )
+
+            # Mark MPU completed
             await self.db.execute(
                 "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
                 upload_id,

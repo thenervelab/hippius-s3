@@ -56,7 +56,7 @@ def classify_error(error: Exception) -> str:
     ) or any(keyword in err_type for keyword in ["connectionerror", "timeouterror", "httperror"]):
         return "transient"
 
-    return "transient"
+    return "unknown"
 
 
 def compute_backoff_ms(attempt: int, base_ms: int = 1000, max_ms: int = 30000) -> float:

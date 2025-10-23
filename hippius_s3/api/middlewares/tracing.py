@@ -1,3 +1,4 @@
+import logging
 from typing import Any
 from typing import Awaitable
 from typing import Callable
@@ -10,6 +11,7 @@ from opentelemetry.trace import Status
 from opentelemetry.trace import StatusCode
 
 
+logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
 
 
@@ -50,7 +52,7 @@ async def tracing_middleware(
                     },
                 )
 
-            set_span_attributes(span, {"http.status_code": response.status_code})
+            set_span_attributes(span, {"http.status_code": int(response.status_code)})
 
             if 400 <= response.status_code < 600:
                 span.set_status(Status(StatusCode.ERROR))
@@ -102,8 +104,8 @@ def _get_operation_name(request: Request) -> str:
             route = request.scope["route"]
             if hasattr(route, "endpoint") and hasattr(route.endpoint, "__name__"):
                 return str(route.endpoint.__name__)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Failed to get operation name from route: {e}")
 
     return f"{request.method.lower()}_unknown"
 
@@ -151,6 +153,8 @@ def set_span_attributes(span: Span, attributes: dict[str, Any]) -> None:
             "size_bytes": 1024,
         })
     """
+    if span is None:
+        return
     if span.is_recording():
         for key, value in attributes.items():
             if value is not None:
