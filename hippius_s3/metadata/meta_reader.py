@@ -9,8 +9,6 @@ import math
 from typing import Any
 from typing import TypedDict
 
-from asyncpg import Connection
-
 
 class DBMeta(TypedDict):
     plain_size: int
@@ -25,11 +23,12 @@ class CacheMeta(TypedDict):
 
 
 async def read_db_meta(
-    db: Connection,
+    db: Any,
     object_id: str,
     part_number: int,
+    object_version: int,
 ) -> DBMeta | None:
-    """Read authoritative part metadata from DB.
+    """Read authoritative part metadata from DB for a specific version.
 
     Args:
         db: asyncpg connection.
@@ -39,15 +38,16 @@ async def read_db_meta(
     Returns:
         {plain_size, chunk_size_bytes, num_chunks_db} or None if part doesn't exist.
     """
-    # Get part metadata
+    # Get part metadata for the specified object version
     part_row = await db.fetchrow(
         """
         SELECT part_id, size_bytes, chunk_size_bytes
         FROM parts
-        WHERE object_id = $1 AND part_number = $2
+        WHERE object_id = $1 AND part_number = $2 AND object_version = $3
         """,
         object_id,
         part_number,
+        int(object_version),
     )
     if not part_row:
         return None
@@ -145,7 +145,7 @@ async def ensure_cache_meta(
 
     # Fallback to DB
     try:
-        dbm = await read_db_meta(db, object_id, part_number)
+        dbm = await read_db_meta(db, object_id, part_number, int(object_version))
     except Exception:
         dbm = None
 

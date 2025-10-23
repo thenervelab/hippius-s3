@@ -19,8 +19,8 @@ WITH cur AS (
    AND ov.object_version = o.current_object_version
   JOIN buckets b ON b.bucket_id = o.bucket_id
   WHERE ov.storage_version < $1
-    AND ($2 IS NULL OR b.bucket_name = $2)
-    AND ($3 IS NULL OR o.object_key = $3)
+    AND ($2::text IS NULL OR b.bucket_name = $2::text)
+    AND ($3::text IS NULL OR o.object_key = $3::text)
 )
 SELECT * FROM cur
 ORDER BY bucket_id, object_key

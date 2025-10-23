@@ -29,6 +29,7 @@ multipart_chunks AS (
 SELECT
     oi.object_id,
     oi.multipart,
+    oi.object_version,
     NOT oi.is_public as needs_decryption,
     CASE
         WHEN oi.multipart = FALSE THEN

@@ -236,6 +236,8 @@ async def handle_get_object(
             "created_at": object_info["created_at"],
             "metadata": object_info.get("metadata") or {},
             "multipart": bool(object_info["multipart"]),
+            # Ensure reader uses the current object version for cache keys and downloader
+            "object_version": int(object_info.get("object_version") or 1),
             # should_decrypt derived in reader from storage_version; keep for now to avoid breaking
             "should_decrypt": storage_version >= 3 or (not is_public_bucket),
             "storage_version": storage_version,

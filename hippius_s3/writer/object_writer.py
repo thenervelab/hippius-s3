@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import uuid
 from typing import Any
 from typing import AsyncIterator
 
-from opentelemetry import trace
+from opentelemetry import trace  # type: ignore[import-not-found]
 
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.cache import RedisObjectPartsCache
@@ -48,7 +49,7 @@ class ObjectWriter:
             get_query("create_migration_version"),
             object_id,
             content_type,
-            metadata,
+            json.dumps(metadata),
             int(storage_version_target),
         )
         if not row:
@@ -91,7 +92,7 @@ class ObjectWriter:
         # Encrypt into chunks
         chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
         key_bytes = await get_or_create_encryption_key_bytes(
-            subaccount_id=account_address,
+            main_account_id=account_address,
             bucket_name=bucket_name,
         )
         ct_chunks = CryptoService.encrypt_part_to_chunks(
@@ -169,7 +170,7 @@ class ObjectWriter:
             },
         ):
             key_bytes = await get_or_create_encryption_key_bytes(
-                subaccount_id=account_address,
+                main_account_id=account_address,
                 bucket_name=bucket_name,
             )
 
@@ -323,7 +324,7 @@ class ObjectWriter:
 
         chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
         key_bytes = await get_or_create_encryption_key_bytes(
-            subaccount_id=account_address,
+            main_account_id=account_address,
             bucket_name=bucket_name,
         )
         ct_chunks = CryptoService.encrypt_part_to_chunks(
@@ -575,7 +576,7 @@ class ObjectWriter:
         # Cache write-through
         chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
         key_bytes = await get_or_create_encryption_key_bytes(
-            subaccount_id=account_address,
+            main_account_id=account_address,
             bucket_name=bucket_name,
         )
         ct_chunks = CryptoService.encrypt_part_to_chunks(

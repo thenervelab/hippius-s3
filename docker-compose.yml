@@ -43,8 +43,6 @@ services:
       - HIPPIUS_DLQ_ARCHIVE_DIR=/tmp/hippius_dlq_archive
       - LOKI_URL=http://loki:3100/loki/api/v1/push
       - LOKI_ENABLED=false
-      - ASGI_SERVER=uvicorn
-      - ASGI_WORKERS=1
     networks:
       - hippius_net
 
