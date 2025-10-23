@@ -222,7 +222,7 @@ async def run_unpinner_loop():
         logger.error(f"Error in unpinner loop: {e}")
         raise
     finally:
-        await redis_client.aclose()
+        await redis_client.close()
 
 
 if __name__ == "__main__":

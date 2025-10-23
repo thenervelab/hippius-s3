@@ -99,11 +99,12 @@ async def run_uploader_loop():
                     )
                 else:
                     await uploader._push_to_dlq(upload_request, err_str, error_type)
-                    await db.execute(
-                        "UPDATE object_versions SET status = 'failed' WHERE object_id = $1 AND object_version = $2",
-                        upload_request.object_id,
-                        int(getattr(upload_request, "object_version", 1) or 1),
-                    )
+                    async with db_pool.acquire() as db:
+                        await db.execute(
+                            "UPDATE object_versions SET status = 'failed' WHERE object_id = $1 AND object_version = $2",
+                            upload_request.object_id,
+                            int(getattr(upload_request, "object_version", 1) or 1),
+                        )
         else:
             await asyncio.sleep(0.1)
 

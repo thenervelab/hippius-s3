@@ -295,7 +295,7 @@ async def run_downloader_loop():
 
             if download_request:
                 success, redis_client = await with_redis_retry(
-                    lambda rc: process_download_request(download_request, rc),
+                    lambda rc, req=download_request: process_download_request(req, rc),
                     redis_client,
                     config.redis_url,
                     "process download request",
@@ -317,7 +317,7 @@ async def run_downloader_loop():
         logger.error(f"Error in downloader loop: {e}")
         raise
     finally:
-        await redis_client.aclose()
+        await redis_client.close()
 
 
 if __name__ == "__main__":

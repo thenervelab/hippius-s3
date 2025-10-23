@@ -200,7 +200,7 @@ async def run_chain_profile_cacher_loop():
 
     finally:
         await http_client.aclose()
-        await redis_chain.aclose()
+        await redis_chain.close()
         await db.close()
 
 
