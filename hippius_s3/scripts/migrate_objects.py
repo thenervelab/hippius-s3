@@ -13,6 +13,9 @@ import redis.asyncio as async_redis  # type: ignore[import-untyped]
 
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
+from hippius_s3.queue import Chunk
+from hippius_s3.queue import UploadChainRequest
+from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.reader.streamer import stream_plan
 from hippius_s3.services.object_reader import build_stream_context
 from hippius_s3.utils import get_query
@@ -197,6 +200,32 @@ async def migrate_one(
         address=address,
         seed_phrase="",
     )
+    # Enqueue background publish for the migrated version
+    try:
+        parts = await db.fetch(
+            get_query("list_parts_for_version"),
+            object_id,
+            int(new_version),
+        )
+        if parts:
+            req = UploadChainRequest(
+                object_key=object_key,
+                bucket_name=bucket_name,
+                upload_id=str(upload_id),
+                chunks=[Chunk(id=int(p["part_number"])) for p in parts],
+                substrate_url=config.substrate_url,
+                ipfs_node=config.ipfs_store_url,
+                address=address,
+                subaccount=address,
+                subaccount_seed_phrase="",
+                object_id=str(object_id),
+                object_version=int(new_version),
+            )
+            await enqueue_upload_request(req, redis_client)
+    except Exception:
+        log.exception(
+            f"Failed to enqueue background publish for migrated {bucket_name}/{object_key} ({object_id}) v={int(new_version)}"
+        )
     swapped = await writer.swap_current_version_cas(
         object_id=object_id,
         expected_old_version=int(expected_old_version),
