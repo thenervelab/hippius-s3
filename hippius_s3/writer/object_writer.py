@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import uuid
 from typing import Any
 from typing import AsyncIterator
@@ -42,7 +43,7 @@ class ObjectWriter:
             get_query("create_migration_version"),
             object_id,
             content_type,
-            metadata,
+            json.dumps(metadata),
             int(storage_version_target),
         )
         if not row:
