@@ -14,6 +14,8 @@ async def build_chunk_plan(
     object_id: str,
     parts: Iterable[dict],
     rng: RangeRequest | None,
+    *,
+    object_version: int,
 ) -> List[ChunkPlanItem]:
     # Normalize and sort parts
     ordered = sorted(parts, key=lambda x: int(x.get("part_number", 0)))
@@ -22,7 +24,7 @@ async def build_chunk_plan(
     sizes: list[tuple[int, int, int]] = []  # (part_number, plain_size, chunk_size)
     for p in ordered:
         pn = int(p.get("part_number", 0))
-        ps, cs = await read_part_plain_and_chunk_size(db, object_id, pn)
+        ps, cs = await read_part_plain_and_chunk_size(db, object_id, pn, int(object_version))
         sizes.append((pn, ps, cs))
 
     offsets: dict[int, int] = {}

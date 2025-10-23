@@ -452,12 +452,12 @@ async def upload_part(
                 return s3_error_response("InternalError", "Reader pipeline unavailable", status_code=500)
 
             object_id_str = str(source_obj["object_id"])  # type: ignore[index]
-            manifest = await read_parts_manifest(db, object_id_str)
-            plan = await build_chunk_plan(db, object_id_str, manifest, None)
+            src_ver = int(source_obj.get("object_version") or 1)
+            manifest = await read_parts_manifest(db, object_id_str, src_ver)
+            plan = await build_chunk_plan(db, object_id_str, manifest, None, object_version=src_ver)
 
             # Enqueue downloader for any missing chunk indices in cache
             obj_cache = RedisObjectPartsCache(request.app.state.redis_client)
-            src_ver = int(source_obj.get("object_version") or 1)
             indices_by_part: dict[int, list[int]] = {}
             for it in plan:
                 exists = await obj_cache.chunk_exists(object_id_str, src_ver, int(it.part_number), int(it.chunk_index))

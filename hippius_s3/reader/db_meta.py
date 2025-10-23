@@ -21,10 +21,12 @@ async def read_parts_manifest(db: Any, object_id: str, object_version: Optional[
     return await ManifestService.build_initial_download_chunks(db, payload)
 
 
-async def read_part_plain_and_chunk_size(db: Any, object_id: str, part_number: int) -> tuple[int, int]:
+async def read_part_plain_and_chunk_size(
+    db: Any, object_id: str, part_number: int, object_version: int
+) -> tuple[int, int]:
     from hippius_s3.metadata.meta_reader import read_db_meta
 
-    dbm = await read_db_meta(db, object_id, int(part_number))
+    dbm = await read_db_meta(db, object_id, int(part_number), int(object_version))
     if not dbm:
         return 0, 0
     ps = int(dbm.get("plain_size") or 0)
