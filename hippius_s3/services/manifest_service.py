@@ -23,10 +23,13 @@ class ManifestService:
                 SELECT p.part_number,
                        COALESCE(c.cid, p.ipfs_cid) AS cid,
                        p.size_bytes::bigint AS size_bytes
-                FROM parts p
+                FROM objects o
+                JOIN parts p
+                  ON p.object_id = o.object_id
+                 AND p.object_version = o.current_object_version
                 LEFT JOIN cids c ON p.cid_id = c.id
-                WHERE p.object_id = $1
-                ORDER BY part_number
+                WHERE o.object_id = $1
+                ORDER BY p.part_number
                 """,
                 object_info["object_id"],
             )
@@ -67,9 +70,12 @@ class ManifestService:
                 rows = await db.fetch(
                     """
                     SELECT p.part_number, COALESCE(c.cid, p.ipfs_cid) AS cid, p.size_bytes
-                    FROM parts p
+                    FROM objects o
+                    JOIN parts p
+                      ON p.object_id = o.object_id
+                     AND p.object_version = o.current_object_version
                     LEFT JOIN cids c ON p.cid_id = c.id
-                    WHERE p.object_id = $1
+                    WHERE o.object_id = $1
                     ORDER BY p.part_number
                     """,
                     object_id,

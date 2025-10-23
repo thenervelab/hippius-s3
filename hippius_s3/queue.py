@@ -120,7 +120,11 @@ async def enqueue_upload_request(
     config = get_config()
     raw = payload.model_dump_json()
     queue_names_str: str = getattr(config, "upload_queue_names", "upload_requests")
-    queue_names: List[str] = [q.strip() for q in queue_names_str.split(",") if q.strip()]
+
+    def _norm(name: str) -> str:
+        return name.strip().strip('"').strip("'")
+
+    queue_names: List[str] = [_norm(q) for q in queue_names_str.split(",") if _norm(q)]
     for qname in queue_names:
         await redis_client.lpush(qname, raw)
     logger.info(f"Enqueued upload request {payload.name=} queues={queue_names}")
@@ -131,7 +135,8 @@ async def dequeue_upload_request(
 ) -> UploadChainRequest | None:
     """Get the next upload request from the Redis queue."""
     config = get_config()
-    queue_name: str = getattr(config, "pinner_consume_queue", "upload_requests")
+    raw_qname: str = getattr(config, "pinner_consume_queue", "upload_requests")
+    queue_name: str = raw_qname.strip().strip('"').strip("'")
     # Use a short blocking timeout to enable timely batch flushes
     result = await redis_client.brpop(queue_name, timeout=0.5)
     if result:
