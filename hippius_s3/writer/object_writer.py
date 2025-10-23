@@ -6,6 +6,9 @@ import uuid
 from typing import Any
 from typing import AsyncIterator
 
+from opentelemetry import trace
+
+from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.services.crypto_service import CryptoService
@@ -21,6 +24,9 @@ from hippius_s3.writer.types import EmptyAppendError
 from hippius_s3.writer.types import ObjectNotFound
 from hippius_s3.writer.types import PartResult
 from hippius_s3.writer.types import PutResult
+
+
+tracer = trace.get_tracer(__name__)
 
 
 class ObjectWriter:
@@ -154,10 +160,18 @@ class ObjectWriter:
         """
         chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
         ttl = int(getattr(self.config, "cache_ttl_seconds", 1800))
-        key_bytes = await get_or_create_encryption_key_bytes(
-            subaccount_id=account_address,
-            bucket_name=bucket_name,
-        )
+
+        with tracer.start_as_current_span(
+            "put_simple_stream_full.key_retrieval",
+            attributes={
+                "account_address": account_address,
+                "bucket_name": bucket_name,
+            },
+        ):
+            key_bytes = await get_or_create_encryption_key_bytes(
+                subaccount_id=account_address,
+                bucket_name=bucket_name,
+            )
 
         part_number = 1
         # Resolve current object_version for this object_id if exists; default to 1 for new objects
@@ -203,36 +217,55 @@ class ObjectWriter:
                 )
                 next_chunk_index += 1
 
-        async for piece in body_iter:
-            if not piece:
-                continue
-            pt_buf.extend(piece)
-            while len(pt_buf) >= chunk_size:
-                to_write = bytes(pt_buf[:chunk_size])
-                del pt_buf[:chunk_size]
-                await _encrypt_and_write(to_write)
+        with tracer.start_as_current_span("put_simple_stream_full.encrypt_and_cache") as span:
+            async for piece in body_iter:
+                if not piece:
+                    continue
+                pt_buf.extend(piece)
+                while len(pt_buf) >= chunk_size:
+                    to_write = bytes(pt_buf[:chunk_size])
+                    del pt_buf[:chunk_size]
+                    await _encrypt_and_write(to_write)
 
-        # Flush remainder
-        if pt_buf:
-            await _encrypt_and_write(bytes(pt_buf))
-            pt_buf.clear()
+            if pt_buf:
+                await _encrypt_and_write(bytes(pt_buf))
+                pt_buf.clear()
 
-        md5_hash = hasher.hexdigest()
+            md5_hash = hasher.hexdigest()
+            set_span_attributes(
+                span,
+                {
+                    "total_size": total_size,
+                    "num_chunks": next_chunk_index,
+                    "md5_hash": md5_hash,
+                },
+            )
 
         # Upsert DB row with final md5/size and storage version
-        await upsert_object_basic(
-            self.db,
-            object_id=object_id,
-            bucket_id=bucket_id,
-            object_key=object_key,
-            content_type=content_type,
-            metadata=metadata,
-            md5_hash=md5_hash,
-            size_bytes=int(total_size),
-            storage_version=int(
-                storage_version if storage_version is not None else getattr(self.config, "target_storage_version", 3)
-            ),
+        resolved_storage_version = int(
+            storage_version if storage_version is not None else getattr(self.config, "target_storage_version", 3)
         )
+        with tracer.start_as_current_span(
+            "put_simple_stream_full.upsert_metadata",
+            attributes={
+                "object_id": object_id,
+                "has_object_id": True,
+                "size_bytes": int(total_size),
+                "md5_hash": md5_hash,
+                "storage_version": resolved_storage_version,
+            },
+        ):
+            await upsert_object_basic(
+                self.db,
+                object_id=object_id,
+                bucket_id=bucket_id,
+                object_key=object_key,
+                content_type=content_type,
+                metadata=metadata,
+                md5_hash=md5_hash,
+                size_bytes=int(total_size),
+                storage_version=resolved_storage_version,
+            )
 
         # Now that we know counts and sizes, write meta last using exact chunk count
         num_chunks = int(next_chunk_index)
@@ -360,24 +393,24 @@ class ObjectWriter:
         )
         total_size = sum(int(p["size_bytes"]) for p in all_parts)
 
-        # Update object_versions
-        await self.db.execute(
-            """
-            UPDATE object_versions ov
-            SET md5_hash = $1,
-                size_bytes = $2,
-                last_modified = NOW(),
-                status = 'publishing'
-            WHERE ov.object_id = $3 AND ov.object_version = $4
-            """,
-            final_md5,
-            int(total_size),
-            object_id,
-            int(object_version),
-        )
-
-        # Mark MPU completed
         async with self.db.transaction():
+            # Update object_versions
+            await self.db.execute(
+                """
+                UPDATE object_versions ov
+                SET md5_hash = $1,
+                    size_bytes = $2,
+                    last_modified = NOW(),
+                    status = 'publishing'
+                WHERE ov.object_id = $3 AND ov.object_version = $4
+                """,
+                final_md5,
+                int(total_size),
+                object_id,
+                int(object_version),
+            )
+
+            # Mark MPU completed
             await self.db.execute(
                 "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
                 upload_id,

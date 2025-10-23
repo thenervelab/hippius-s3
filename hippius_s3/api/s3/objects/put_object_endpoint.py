@@ -10,8 +10,10 @@ from typing import AsyncIterator
 
 from fastapi import Request
 from fastapi import Response
+from opentelemetry import trace
 
 from hippius_s3 import utils
+from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.extensions.append import handle_append
 from hippius_s3.config import get_config
@@ -23,6 +25,7 @@ from hippius_s3.writer.queue import enqueue_upload as writer_enqueue_upload
 
 logger = logging.getLogger(__name__)
 config = get_config()
+tracer = trace.get_tracer(__name__)
 
 
 async def handle_put_object(
@@ -35,17 +38,22 @@ async def handle_put_object(
     try:
         # Get or create user and bucket for this main account
         main_account_id = request.state.account.main_account
-        await db.fetchrow(
-            get_query("get_or_create_user_by_main_account"),
-            main_account_id,
-            datetime.now(timezone.utc),
-        )
 
-        bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
-            bucket_name,
-            main_account_id,
-        )
+        with tracer.start_as_current_span(
+            "put_object.get_or_create_user", attributes={"main_account_id": main_account_id}
+        ):
+            await db.fetchrow(
+                get_query("get_or_create_user_by_main_account"),
+                main_account_id,
+                datetime.now(timezone.utc),
+            )
+
+        with tracer.start_as_current_span("put_object.get_bucket", attributes={"bucket_name": bucket_name}):
+            bucket = await db.fetchrow(
+                get_query("get_bucket_by_name_and_owner"),
+                bucket_name,
+                main_account_id,
+            )
 
         if not bucket:
             return errors.s3_error_response(
@@ -58,7 +66,9 @@ async def handle_put_object(
         bucket_id = bucket["bucket_id"]
 
         # Read request body properly handling chunked encoding
-        incoming_bytes = await utils.get_request_body(request)
+        with tracer.start_as_current_span("put_object.read_request_body") as span:
+            incoming_bytes = await utils.get_request_body(request)
+            set_span_attributes(span, {"body_size_bytes": len(incoming_bytes)})
         content_type = request.headers.get("Content-Type", "application/octet-stream")
 
         # Detect S4 append semantics via metadata
@@ -90,61 +100,92 @@ async def handle_put_object(
                     metadata[meta_key] = value
 
         # Capture previous object (to clean up multipart parts if overwriting)
-        prev = await db.fetchrow(
-            get_query("get_object_by_path"),
-            bucket_id,
-            object_key,
-        )
+        with tracer.start_as_current_span("put_object.check_existing_object") as span:
+            prev = await db.fetchrow(
+                get_query("get_object_by_path"),
+                bucket_id,
+                object_key,
+            )
+            set_span_attributes(span, {"is_overwrite": prev is not None})
 
         # Generate object_id or reuse existing one
         if prev:
-            object_id = str(prev["object_id"])  # ensure string for model validation and cache keys
+            object_id = str(prev["object_id"])
             logger.debug(f"Reusing existing object_id {object_id} for overwrite")
         else:
             object_id = str(uuid.uuid4())
 
-        # Use ObjectWriter streaming upsert/write (single-part)
-        writer = ObjectWriter(db=db, redis_client=redis_client)
+        async with db.transaction():
+            # Use ObjectWriter streaming upsert/write (single-part)
+            with tracer.start_as_current_span(
+                "put_object.stream_and_upsert",
+                attributes={
+                    "object_id": object_id,
+                    "has_object_id": True,
+                    "file_size_bytes": file_size,
+                    "content_type": content_type,
+                    "storage_version": int(getattr(config, "target_storage_version", 3)),
+                },
+            ) as span:
+                writer = ObjectWriter(db=db, redis_client=redis_client)
 
-        async def _iter_once() -> AsyncIterator[bytes]:
-            yield file_data
+                async def _iter_once() -> AsyncIterator[bytes]:
+                    yield file_data
 
-        put_res = await writer.put_simple_stream_full(
-            bucket_id=bucket_id,
-            bucket_name=bucket_name,
-            object_id=object_id,
-            object_key=object_key,
-            account_address=request.state.account.main_account,
-            content_type=content_type,
-            metadata=metadata,
-            storage_version=int(getattr(config, "target_storage_version", 3)),
-            body_iter=_iter_once(),
-        )
+                put_res = await writer.put_simple_stream_full(
+                    bucket_id=bucket_id,
+                    bucket_name=bucket_name,
+                    object_id=object_id,
+                    object_key=object_key,
+                    account_address=request.state.account.main_account,
+                    content_type=content_type,
+                    metadata=metadata,
+                    storage_version=int(getattr(config, "target_storage_version", 3)),
+                    body_iter=_iter_once(),
+                )
 
-        # Fetch current version to enqueue background publish
-        object_row = await db.fetchrow(
-            get_query("get_object_by_path"),
-            bucket_id,
-            object_key,
-        )
-        # get_object_by_path exposes 'object_version' (the current version), not 'current_object_version'
-        current_object_version = int(object_row["object_version"] or 1) if object_row else 1
+                set_span_attributes(
+                    span,
+                    {
+                        "upload_id": put_res.upload_id,
+                        "has_upload_id": True,
+                        "etag": put_res.etag,
+                        "returned_size_bytes": put_res.size_bytes,
+                    },
+                )
+
+            # Fetch current version to enqueue background publish
+            with tracer.start_as_current_span(
+                "put_object.fetch_current_version",
+                attributes={"object_id": object_id, "has_object_id": True},
+            ) as span:
+                object_row = await db.fetchrow(
+                    get_query("get_object_by_path"),
+                    bucket_id,
+                    object_key,
+                )
+                current_object_version = int(object_row["object_version"] or 1) if object_row else 1
+                set_span_attributes(span, {"current_object_version": current_object_version})
 
         # Only enqueue after DB state is persisted; use writer queue helper
-        await writer_enqueue_upload(
-            redis_client=redis_client,
-            address=request.state.account.main_account,
-            subaccount_seed_phrase=request.state.seed_phrase,
-            subaccount=request.state.account.main_account,
-            bucket_name=bucket_name,
-            object_key=object_key,
-            object_id=object_id,
-            object_version=int(current_object_version),
-            upload_id=str(put_res.upload_id),
-            chunk_ids=[1],
-            substrate_url=config.substrate_url,
-            ipfs_node=config.ipfs_store_url,
-        )
+        with tracer.start_as_current_span(
+            "put_object.enqueue_upload",
+            attributes={"upload_id": str(put_res.upload_id), "has_upload_id": True},
+        ):
+            await writer_enqueue_upload(
+                redis_client=redis_client,
+                address=request.state.account.main_account,
+                subaccount_seed_phrase=request.state.seed_phrase,
+                subaccount=request.state.account.main_account,
+                bucket_name=bucket_name,
+                object_key=object_key,
+                object_id=object_id,
+                object_version=int(current_object_version),
+                upload_id=str(put_res.upload_id),
+                chunk_ids=[1],
+                substrate_url=config.substrate_url,
+                ipfs_node=config.ipfs_store_url,
+            )
 
         get_metrics_collector().record_s3_operation(
             operation="put_object",

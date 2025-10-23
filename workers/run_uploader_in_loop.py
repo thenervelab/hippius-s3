@@ -8,7 +8,6 @@ from pathlib import Path
 import asyncpg
 import redis.asyncio as async_redis
 from pydantic import ValidationError
-from redis.exceptions import BusyLoadingError
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -21,6 +20,7 @@ from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.queue import dequeue_upload_request
 from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.queue import move_due_retries_to_primary
+from hippius_s3.redis_utils import with_redis_retry
 from hippius_s3.workers.uploader import Uploader
 from hippius_s3.workers.uploader import classify_error
 from hippius_s3.workers.uploader import compute_backoff_ms
@@ -33,41 +33,43 @@ logger = logging.getLogger(__name__)
 
 
 async def run_uploader_loop():
-    db = await asyncpg.connect(config.database_url)
+    db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=10)
     redis_client = async_redis.from_url(config.redis_url)
 
     initialize_metrics_collector(redis_client)
 
     logger.info("Starting uploader service...")
     logger.info(f"Redis URL: {config.redis_url}")
-    logger.info(f"Database connected: {config.database_url}")
+    logger.info(f"Database pool created: {config.database_url}")
 
     ipfs_service = IPFSService(config, redis_client)
-    uploader = Uploader(db, ipfs_service, redis_client, config)
+    uploader = Uploader(db_pool, ipfs_service, redis_client, config)
 
     while True:
         try:
-            moved = await move_due_retries_to_primary(redis_client, now_ts=time.time(), max_items=64)
+            moved, redis_client = await with_redis_retry(
+                lambda rc: move_due_retries_to_primary(rc, now_ts=time.time(), max_items=64),
+                redis_client,
+                config.redis_url,
+                "move due retries",
+            )
             if moved:
                 logger.info(f"Moved {moved} due retry requests back to primary queue")
-        except BusyLoadingError:
-            logger.warning("Redis is still loading dataset, waiting 2 seconds...")
-            await asyncio.sleep(2)
-            continue
         except Exception as e:
             logger.error(f"Error moving retry requests: {e}")
             await asyncio.sleep(1)
             continue
 
         try:
-            upload_request = await dequeue_upload_request(redis_client)
+            upload_request, redis_client = await with_redis_retry(
+                dequeue_upload_request,
+                redis_client,
+                config.redis_url,
+                "dequeue upload request",
+            )
         except ValidationError as e:
             logger.error(f"Invalid queue data, skipping: {e}")
             await asyncio.sleep(0.1)
-            continue
-        except BusyLoadingError:
-            logger.warning("Redis is still loading dataset, waiting 2 seconds...")
-            await asyncio.sleep(2)
             continue
 
         if upload_request:
@@ -97,11 +99,12 @@ async def run_uploader_loop():
                     )
                 else:
                     await uploader._push_to_dlq(upload_request, err_str, error_type)
-                    await db.execute(
-                        "UPDATE object_versions SET status = 'failed' WHERE object_id = $1 AND object_version = $2",
-                        upload_request.object_id,
-                        int(getattr(upload_request, "object_version", 1) or 1),
-                    )
+                    async with db_pool.acquire() as db:
+                        await db.execute(
+                            "UPDATE object_versions SET status = 'failed' WHERE object_id = $1 AND object_version = $2",
+                            upload_request.object_id,
+                            int(getattr(upload_request, "object_version", 1) or 1),
+                        )
         else:
             await asyncio.sleep(0.1)
 
