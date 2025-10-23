@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 from typing import AsyncGenerator
 from typing import Iterable
@@ -8,6 +9,9 @@ from .decrypter import decrypt_chunk_if_needed
 from .decrypter import maybe_slice
 from .fetcher import fetch_chunk_blocking
 from .types import ChunkPlanItem
+
+
+logger = logging.getLogger(__name__)
 
 
 async def stream_plan(
@@ -31,6 +35,20 @@ async def stream_plan(
             int(item.chunk_index),
             sleep_seconds=sleep_seconds,
         )
+        try:
+            clen = len(c) if isinstance(c, (bytes, bytearray)) else None
+            head8 = c[:8].hex() if isinstance(c, (bytes, bytearray)) else None
+            logger.debug(
+                "STREAM fetched key=obj:%s:v:%s:part:%s:chunk:%s len=%s head8=%s",
+                object_id,
+                int(object_version),
+                int(item.part_number),
+                int(item.chunk_index),
+                str(clen),
+                head8,
+            )
+        except Exception:
+            pass
         pt = await decrypt_chunk_if_needed(
             should_decrypt,
             c,
