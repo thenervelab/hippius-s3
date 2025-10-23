@@ -53,6 +53,7 @@ SELECT
     oi.storage_version,
     oi.is_public,
     oi.bucket_owner_id,
+    oi.object_version,
     (
         SELECT mu.upload_id
         FROM multipart_uploads mu
