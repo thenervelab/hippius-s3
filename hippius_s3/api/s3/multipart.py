@@ -449,8 +449,8 @@ async def upload_part(
         if source_bytes is None:
             # Read plaintext via reader pipeline (manifest → plan → stream decrypt)
             try:
-                from hippius_s3.queue import ChunkToDownload  # local import
                 from hippius_s3.queue import DownloadChainRequest  # local import
+                from hippius_s3.queue import PartToDownload  # local import
                 from hippius_s3.queue import enqueue_download_request  # local import
                 from hippius_s3.reader.db_meta import read_parts_manifest  # local import to avoid cycles
                 from hippius_s3.reader.planner import build_chunk_plan  # local import
@@ -472,15 +472,36 @@ async def upload_part(
                     arr = indices_by_part.setdefault(int(it.part_number), [])
                     arr.append(int(it.chunk_index))
             if indices_by_part:
-                dl_parts = [
-                    ChunkToDownload(
-                        cid=str(next((c["cid"] for c in manifest if int(c.get("part_number", 0)) == pn), "")),
-                        part_id=int(pn),
-                        redis_key=None,
-                        chunk_indices=sorted(set(idxs)),
-                    )
-                    for pn, idxs in indices_by_part.items()
-                ]
+                dl_parts: list[PartToDownload] = []
+                for pn, idxs in indices_by_part.items():
+                    try:
+                        rows = await db.fetch(
+                            get_query("get_part_chunks_by_object_and_number"),
+                            object_id_str,
+                            src_ver,
+                            int(pn),
+                        )
+                        all_entries = [
+                            (int(r[0]), str(r[1]), int(r[2]) if r[2] is not None else None) for r in rows or []
+                        ]
+                        chunk_specs = []
+                        include = {int(i) for i in idxs}
+                        for ci, cid, clen in all_entries:
+                            if int(ci) in include:
+                                chunk_specs.append(
+                                    {
+                                        "index": int(ci),
+                                        "cid": str(cid),
+                                        "cipher_size_bytes": int(clen) if clen is not None else None,
+                                    }
+                                )
+                        if not chunk_specs:
+                            continue
+                        dl_parts.append(
+                            PartToDownload(part_number=int(pn), chunks=chunk_specs)  # type: ignore[arg-type]
+                        )
+                    except Exception:
+                        continue
                 req = DownloadChainRequest(
                     request_id=f"{object_id_str}::upload_part_copy",
                     object_id=object_id_str,

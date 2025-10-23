@@ -18,13 +18,15 @@ class Chunk(BaseModel):
     id: int
 
 
-class ChunkToDownload(BaseModel):
+class PartChunkSpec(BaseModel):
+    index: int
     cid: str
-    part_id: int
-    # Temporary backward-compat: accept legacy payloads that include or expect a redis_key
-    redis_key: str | None = None
-    # Optional subset of chunk indices to hydrate for this part (minimal range fetch)
-    chunk_indices: list[int] | None = None
+    cipher_size_bytes: int | None = None
+
+
+class PartToDownload(BaseModel):
+    part_number: int
+    chunks: list[PartChunkSpec]
 
 
 class ChainRequest(BaseModel):
@@ -81,7 +83,7 @@ class DownloadChainRequest(BaseModel):
     should_decrypt: bool
     size: int
     multipart: bool
-    chunks: list[ChunkToDownload]
+    chunks: list[PartToDownload]
 
     @property
     def name(self):
