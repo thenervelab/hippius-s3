@@ -86,7 +86,7 @@ class ObjectWriter:
         # Encrypt into chunks
         chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
         key_bytes = await get_or_create_encryption_key_bytes(
-            subaccount_id=account_address,
+            main_account_id=account_address,
             bucket_name=bucket_name,
         )
         ct_chunks = CryptoService.encrypt_part_to_chunks(
@@ -156,7 +156,7 @@ class ObjectWriter:
         chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
         ttl = int(getattr(self.config, "cache_ttl_seconds", 1800))
         key_bytes = await get_or_create_encryption_key_bytes(
-            subaccount_id=account_address,
+            main_account_id=account_address,
             bucket_name=bucket_name,
         )
 
@@ -291,7 +291,7 @@ class ObjectWriter:
 
         chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
         key_bytes = await get_or_create_encryption_key_bytes(
-            subaccount_id=account_address,
+            main_account_id=account_address,
             bucket_name=bucket_name,
         )
         ct_chunks = CryptoService.encrypt_part_to_chunks(
@@ -543,7 +543,7 @@ class ObjectWriter:
         # Cache write-through
         chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
         key_bytes = await get_or_create_encryption_key_bytes(
-            subaccount_id=account_address,
+            main_account_id=account_address,
             bucket_name=bucket_name,
         )
         ct_chunks = CryptoService.encrypt_part_to_chunks(

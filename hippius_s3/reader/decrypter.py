@@ -25,7 +25,7 @@ async def decrypt_chunk_if_needed(
         if not address or not bucket_name:
             raise RuntimeError("missing_address_or_bucket")
         key_bytes = await get_or_create_encryption_key_bytes(
-            subaccount_id=address,
+            main_account_id=address,
             bucket_name=bucket_name,
         )
         return CryptoService.decrypt_chunk(
