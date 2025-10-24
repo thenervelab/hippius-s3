@@ -8,12 +8,21 @@ from unittest.mock import patch
 import asyncpg
 import pytest
 
-from hippius_s3.config import get_config
 from hippius_s3.queue import SubstratePinningRequest
 from hippius_s3.workers.substrate import SubstrateWorker
 from tests.e2e.conftest import is_real_aws
 from tests.e2e.support.cache import get_object_cids
 from tests.e2e.support.cache import wait_for_parts_cids
+
+
+class MockConfig:
+    substrate_url = "ws://localhost:9944"
+    resubmission_seed_phrase = "test seed phrase here"
+    ipfs_store_url = "http://localhost:5001"
+    substrate_retry_base_ms = 500
+    substrate_retry_max_ms = 5000
+    substrate_max_retries = 3
+    substrate_call_timeout_seconds = 20.0
 
 
 @pytest.mark.skipif(
@@ -81,15 +90,15 @@ def test_substrate_worker_batch_call_structure(
         return call_obj
 
     def mock_create_signed_extrinsic(
-        _: Any,
-        __: Any,
+        call: Any = None,
+        keypair: Any = None,
     ) -> Any:
         return MagicMock()
 
     async def run_test() -> None:
         nonlocal captured_batch_call, captured_storage_requests, all_cids
 
-        config = get_config()
+        config = MockConfig()
         db = await asyncpg.connect("postgresql://postgres:postgres@localhost:5432/hippius")
 
         worker = SubstrateWorker(db, config)
