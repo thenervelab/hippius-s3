@@ -46,7 +46,7 @@ def get_object_cids(
     *,
     dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
 ) -> tuple[str, int, str, list[str], Optional[str]]:
-    """Get all CIDs for an object including parts and manifest.
+    """Get all CIDs for an object including parts, chunks, and manifest.
 
     Returns: (object_id, object_version, main_account_id, part_cids, manifest_cid)
     """
@@ -81,6 +81,20 @@ def get_object_cids(
 
         cur.execute(
             """
+            SELECT pc.cid
+            FROM parts p
+            JOIN part_chunks pc ON pc.part_id = p.part_id
+            WHERE p.object_id = %s AND p.object_version = %s
+            AND pc.cid IS NOT NULL
+            AND pc.cid != 'pending'
+            ORDER BY p.part_number, pc.chunk_index
+            """,
+            (object_id, object_version),
+        )
+        chunk_cids = [str(row[0]) for row in cur.fetchall()]
+
+        cur.execute(
+            """
             SELECT COALESCE(c.cid, ov.ipfs_cid) as cid
             FROM object_versions ov
             LEFT JOIN cids c ON ov.cid_id = c.id
@@ -93,7 +107,7 @@ def get_object_cids(
         manifest_row = cur.fetchone()
         manifest_cid = str(manifest_row[0]) if manifest_row else None
 
-        return object_id, object_version, main_account_id, part_cids, manifest_cid
+        return object_id, object_version, main_account_id, part_cids + chunk_cids, manifest_cid
 
 
 essentially_all_parts = range(0, 256)

@@ -102,9 +102,9 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                 logger.exception("Delete query failed for key %s", key)
                 deleted_object = None
 
-            if deleted_object and (deleted_object.get("ipfs_cid") or "").strip():
-                # Enqueue unpin
-                try:
+            all_cids = deleted_object.get("all_cids") or [] if deleted_object else []
+            if all_cids:
+                for cid in all_cids:
                     await enqueue_unpin_request(
                         payload=UnpinChainRequest(
                             substrate_url=config.substrate_url,
@@ -115,18 +115,20 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                             bucket_name=bucket_name,
                             object_key=key,
                             should_encrypt=not bucket["is_public"],
-                            cid=str(deleted_object["ipfs_cid"]),
-                            object_id=str(deleted_object["object_id"]) if deleted_object.get("object_id") else "",
+                            cid=cid,
+                            object_id=str(deleted_object["object_id"])
+                            if deleted_object and deleted_object.get("object_id")
+                            else "",
                             object_version=int(
                                 deleted_object.get("object_version")
                                 or deleted_object.get("current_object_version")
                                 or 1
-                            ),
+                            )
+                            if deleted_object
+                            else 1,
                         ),
                         redis_client=redis_client,
                     )
-                except Exception:
-                    logger.debug("Failed to enqueue unpin request for %s", key, exc_info=True)
 
             # S3 semantics: even if not found, include as Deleted (unless Quiet)
             deleted_keys.append(key)

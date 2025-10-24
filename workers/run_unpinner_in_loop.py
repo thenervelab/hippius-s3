@@ -39,16 +39,15 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
     user_address = None
 
     for req in unpin_requests:
-        cid = req.cid
         if not req.cid:
-            # skip files that have not yet been pinned
             continue
         subaccount = req.subaccount
         seed_phrase = req.subaccount_seed_phrase
         user_address = req.address
         file_name = f"{req.bucket_name}/{req.object_key}"
-        logger.info(f"Processing unpin request for CID={cid}, subaccount={subaccount}")
+        cid = req.cid
 
+        logger.info(f"Processing unpin request for CID={cid}, subaccount={subaccount}")
         manifest_objects.append({"cid": cid, "filename": file_name})
         logger.info(f"Added to unpin manifest: {subaccount=} {file_name=} {cid=}")
 
@@ -63,122 +62,106 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
         indent=2,
     )
 
-    # Upload manifest to IPFS
-    try:
-        # Create temporary file with manifest
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=".json",
-            delete=False,
-        ) as temp_file:
-            temp_file.write(manifest_data)
-            temp_path = temp_file.name
+    # Create temporary file with manifest
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".json",
+        delete=False,
+    ) as temp_file:
+        temp_file.write(manifest_data)
+        temp_path = temp_file.name
 
-        # Upload manifest to IPFS using httpx with proper redirect handling
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            # Read manifest data
-            async with aiofiles.open(temp_path, "rb") as f:
-                file_data = await f.read()
+    # Upload manifest to IPFS using httpx with proper redirect handling
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        # Read manifest data
+        async with aiofiles.open(temp_path, "rb") as f:
+            file_data = await f.read()
 
-            # Ensure we're using HTTPS and the correct endpoint
-            base_url = config.ipfs_store_url.rstrip("/")
+        # Ensure we're using HTTPS and the correct endpoint
+        base_url = config.ipfs_store_url.rstrip("/")
 
-            upload_url = f"{base_url}/api/v0/add?wrap-with-directory=false&cid-version=1"
-            logger.info(f"Uploading manifest to: {upload_url}")
+        upload_url = f"{base_url}/api/v0/add?wrap-with-directory=false&cid-version=1"
+        logger.info(f"Uploading manifest to: {upload_url}")
 
-            # Prepare multipart form data
-            files = {"file": ("manifest.json", file_data, "application/json")}
+        # Prepare multipart form data
+        files = {"file": ("manifest.json", file_data, "application/json")}
 
-            # Use POST with proper redirect handling that maintains method
-            response = await client.post(upload_url, files=files)
+        # Use POST with proper redirect handling that maintains method
+        response = await client.post(upload_url, files=files)
 
-            logger.info(f"Upload response: {response.status_code} from {response.url}")
-            response.raise_for_status()
+        logger.info(f"Upload response: {response.status_code} from {response.url}")
+        response.raise_for_status()
 
-            # Parse IPFS response (newline-delimited JSON)
-            response_text = response.text
-            logger.debug(f"IPFS response: {response_text}")
+        # Parse IPFS response (newline-delimited JSON)
+        response_text = response.text
+        logger.debug(f"IPFS response: {response_text}")
 
-            # Handle newline-delimited JSON response from IPFS
-            for line in response_text.strip().split("\n"):
-                if line.strip():
-                    result = json.loads(line)
-                    if "Hash" in result:
-                        manifest_cid = result["Hash"]
-                        break
-            else:
-                raise Exception(f"No valid CID found in IPFS response: {response_text}")
+        # Handle newline-delimited JSON response from IPFS
+        for line in response_text.strip().split("\n"):
+            if line.strip():
+                result = json.loads(line)
+                if "Hash" in result:
+                    manifest_cid = result["Hash"]
+                    break
+        else:
+            raise Exception(f"No valid CID found in IPFS response: {response_text}")
 
-        logger.info(f"Uploaded manifest directly to IPFS with CID: {manifest_cid}")
+    logger.info(f"Uploaded manifest directly to IPFS with CID: {manifest_cid}")
 
-        # Pin the manifest to local IPFS node
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            pin_url = f"{base_url}/api/v0/pin/add?arg={manifest_cid}"
-            logger.debug(f"Pinning manifest to local IPFS: {pin_url}")
-            pin_response = await client.post(pin_url)
-            pin_response.raise_for_status()
-            logger.info(f"Pinned manifest to local IPFS node: {manifest_cid}")
+    # Pin the manifest to local IPFS node
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        pin_url = f"{base_url}/api/v0/pin/add?arg={manifest_cid}"
+        logger.debug(f"Pinning manifest to local IPFS: {pin_url}")
+        pin_response = await client.post(pin_url)
+        pin_response.raise_for_status()
+        logger.info(f"Pinned manifest to local IPFS node: {manifest_cid}")
 
-        manifest = {"cid": manifest_cid}
+    manifest = {"cid": manifest_cid}
 
-        logger.info(f"Created unpin manifest with CID: {manifest['cid']}")
+    logger.info(f"Created unpin manifest with CID: {manifest['cid']}")
 
-        # Clean up temp file
-        Path(temp_path).unlink(missing_ok=True)
+    # Clean up temp file
+    Path(temp_path).unlink(missing_ok=True)
 
-        # Submit manifest CID to substrate for cancellation
-        logger.info(f"Initializing SubstrateClient with seed_phrase: {'[PRESENT]' if seed_phrase else '[MISSING]'}")
-        if not seed_phrase:
-            logger.error("No seed phrase available for SubstrateClient initialization")
-            return False
-
-        substrate_client = SubstrateClient(
-            seed_phrase=seed_phrase,
-            url=config.substrate_url,
-        )
-
-        tx_hash = await substrate_client.cancel_storage_request(
-            cid=manifest["cid"],
-            seed_phrase=seed_phrase,
-        )
-
-        logger.debug(f"Substrate call result for manifest {manifest['cid']}: {tx_hash}")
-
-        # Check if we got a valid transaction hash
-        if not tx_hash or tx_hash == "0x" or len(tx_hash) < 10:
-            logger.error(f"Invalid transaction hash received for manifest {manifest['cid']}: {tx_hash}")
-            return False
-
-        logger.info(f"Successfully submitted unpin manifest {manifest['cid']} with transaction: {tx_hash}")
-        logger.info(f"Unpinned {len(manifest_objects)} files in batch")
-
-        if user_address:
-            duration = time.time() - start_time
-            get_metrics_collector().record_unpinner_operation(
-                main_account=user_address,
-                success=True,
-                num_files=len(manifest_objects),
-                duration=duration,
-            )
-
-        return True
-
-    except Exception as e:
-        logger.error(f"Failed to process unpin manifest: {e}")
-
-        if user_address:
-            duration = time.time() - start_time
-            get_metrics_collector().record_unpinner_operation(
-                main_account=user_address,
-                success=False,
-                num_files=len(manifest_objects),
-                duration=duration,
-            )
-
+    # Submit manifest CID to substrate for cancellation
+    logger.info(f"Initializing SubstrateClient with seed_phrase: {'[PRESENT]' if seed_phrase else '[MISSING]'}")
+    if not seed_phrase:
+        logger.error("No seed phrase available for SubstrateClient initialization")
         return False
 
+    substrate_client = SubstrateClient(
+        seed_phrase=seed_phrase,
+        url=config.substrate_url,
+    )
 
-async def run_unpinner_loop():
+    tx_hash = await substrate_client.cancel_storage_request(
+        cid=manifest["cid"],
+        seed_phrase=seed_phrase,
+    )
+
+    logger.debug(f"Substrate call result for manifest {manifest['cid']}: {tx_hash}")
+
+    # Check if we got a valid transaction hash
+    if not tx_hash or tx_hash == "0x" or len(tx_hash) < 10:
+        logger.error(f"Invalid transaction hash received for manifest {manifest['cid']}: {tx_hash}")
+        return False
+
+    logger.info(f"Successfully submitted unpin manifest {manifest['cid']} with transaction: {tx_hash}")
+    logger.info(f"Unpinned {len(manifest_objects)} files in batch")
+
+    if user_address:
+        duration = time.time() - start_time
+        get_metrics_collector().record_unpinner_operation(
+            main_account=user_address,
+            success=True,
+            num_files=len(manifest_objects),
+            duration=duration,
+        )
+
+    return True
+
+
+async def run_unpinner_loop() -> None:
     """Main loop that monitors the Redis queue and processes unpin requests."""
     redis_client = async_redis.from_url(config.redis_url)
 
@@ -186,7 +169,7 @@ async def run_unpinner_loop():
 
     logger.info("Starting unpinner service...")
     logger.info(f"Redis URL: {config.redis_url}")
-    user_unpin_requests = {}
+    user_unpin_requests: dict[str, list[UnpinChainRequest]] = {}
 
     try:
         while True:
