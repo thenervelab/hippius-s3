@@ -117,13 +117,11 @@ async def process_download_request(
                                 return_bytes=True,
                             )
                             cid_cache[cid_for_ci] = data_i
-                        try:
+                        with contextlib.suppress(Exception):
                             head8 = data_i[:8].hex()
                             chunk_logger.info(
                                 f"FETCHED cid={cid_val[:10]} part={part_number} ci={int(ci)} len={len(data_i)} head8={head8}"
                             )
-                        except Exception:
-                            pass
                         if expected_len is not None and len(data_i) != int(expected_len):
                             chunk_logger.warning(
                                 f"Cipher len mismatch for part {part_number} ci={ci}: got={len(data_i)} expected={expected_len}"
@@ -135,12 +133,10 @@ async def process_download_request(
                             int(ci),
                             data_i,
                         )
-                        try:
+                        with contextlib.suppress(Exception):
                             chunk_logger.info(
                                 f"STORED part={part_number} ci={int(ci)} key=obj:{download_request.object_id}:v:{int(download_request.object_version)}:part:{part_number}:chunk:{int(ci)} head8={data_i[:8].hex()} len={len(data_i)}"
                             )
-                        except Exception:
-                            pass
                         return len(data_i)
 
                     # Fetch the first (lowest) chunk synchronously and write immediately
