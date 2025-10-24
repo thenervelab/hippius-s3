@@ -16,9 +16,9 @@ from tests.e2e.support.cache import wait_for_parts_cids
 
 
 class MockConfig:
-    substrate_url = os.environ["HIPPIUS_SUBSTRATE_URL"]
-    resubmission_seed_phrase = os.environ["RESUBMISSION_SEED_PHRASE"]
-    ipfs_store_url = os.environ["HIPPIUS_IPFS_STORE_URL"]
+    substrate_url = "ws://localhost:9944"
+    resubmission_seed_phrase = "test seed phrase here"
+    ipfs_store_url = "http://toxiproxy:15001"
     substrate_retry_base_ms = 500
     substrate_retry_max_ms = 5000
     substrate_max_retries = 3
