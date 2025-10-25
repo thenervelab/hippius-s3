@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   lint-and-format:
+    name: Lint & Format (ruff)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -51,7 +52,8 @@ jobs:
             exit 1
           )
 
-  test:
+  type-check:
+    name: Type Check (mypy)
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -121,7 +123,7 @@ jobs:
           path: reports/*.xml
 
   e2e:
-    name: E2E Tests (docker-compose)
+    name: E2E Tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
