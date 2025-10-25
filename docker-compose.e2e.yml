@@ -23,6 +23,8 @@ services:
       - HIPPIUS_IPFS_STORE_URL=http://toxiproxy:15001
       - REDIS_URL=redis://redis:6379/0
       - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
+      - REDIS_CHAIN_URL=redis://redis-chain:6379/0
+      - REDIS_RATE_LIMITING_URL=redis://redis-rate-limiting:6379/0
       - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
       - HTTP_STREAM_INITIAL_TIMEOUT_SECONDS=0.5
       - LOG_LEVEL=DEBUG
@@ -41,6 +43,10 @@ services:
       redis:
         condition: service_healthy
       redis-accounts:
+        condition: service_healthy
+      redis-chain:
+        condition: service_healthy
+      redis-rate-limiting:
         condition: service_healthy
     volumes:
       - .:/app
@@ -252,6 +258,8 @@ services:
 
   db:
     image: postgres:15
+    ports:
+      - "127.0.0.1:5432:5432"
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
@@ -279,6 +287,8 @@ services:
 
   redis:
     image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -288,6 +298,30 @@ services:
 
   redis-accounts:
     image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+    networks:
+      - hippius_net
+
+  redis-chain:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6381:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+    networks:
+      - hippius_net
+
+  redis-rate-limiting:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6383:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

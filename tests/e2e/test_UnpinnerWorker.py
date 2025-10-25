@@ -26,6 +26,15 @@ def test_unpinner_worker_manifest_structure(
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
 ) -> None:
+    import subprocess
+
+    subprocess.run(
+        ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.e2e.yml", "stop", "unpinner"],
+        env={**os.environ, "COMPOSE_PROJECT_NAME": "hippius-e2e"},
+        check=True,
+        capture_output=True,
+    )
+
     bucket_name = unique_bucket_name("unpinner-test")
     cleanup_buckets(bucket_name)
 
@@ -44,8 +53,8 @@ def test_unpinner_worker_manifest_structure(
     assert wait_for_parts_cids(
         bucket_name,
         key,
-        min_count=1,
-        timeout_seconds=20.0,
+        min_count=2,
+        timeout_seconds=60.0,
     )
 
     captured_manifest: list[dict[str, str]] | None = None
@@ -56,7 +65,7 @@ def test_unpinner_worker_manifest_structure(
         nonlocal captured_manifest, captured_cancel_cid, captured_seed_phrase
 
         object_id, object_version, main_account, part_cids, manifest_cid = get_object_cids(bucket_name, key)
-        all_cids = part_cids + ([manifest_cid] if manifest_cid else [])
+        all_cids = list(set(part_cids + ([manifest_cid] if manifest_cid else [])))
         assert len(all_cids) > 0, "No CIDs found for object"
 
         boto3_client.delete_object(Bucket=bucket_name, Key=key)
@@ -145,7 +154,7 @@ def test_unpinner_worker_manifest_structure(
 
             assert isinstance(cid, str), f"CID should be string, got {type(cid)}"
             assert cid.startswith("baf") or cid.startswith("Qm"), f"CID should be valid IPFS CID, got {cid}"
-            assert filename == f"{bucket_name}/{key}", f"Filename should be '{{bucket}}/{{key}}', got {filename}"
+            assert filename == f"s3-{cid}", f"Filename should be 's3-{{cid}}', got {filename}"
 
         manifest_cids = [entry["cid"] for entry in captured_manifest]
         for expected_cid in all_cids:

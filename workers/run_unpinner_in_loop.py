@@ -34,22 +34,22 @@ logger = logging.getLogger(__name__)
 async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool:
     """Process unpin requests by creating a manifest and canceling storage request using the Hippius SDK."""
     start_time = time.time()
-    seed_phrase = None
     manifest_objects = []
     user_address = None
 
     for req in unpin_requests:
         if not req.cid:
             continue
-        subaccount = req.subaccount
-        seed_phrase = req.subaccount_seed_phrase
         user_address = req.address
-        file_name = f"{req.bucket_name}/{req.object_key}"
-        cid = req.cid
+        file_name = f"s3-{req.cid}"
 
-        logger.info(f"Processing unpin request for CID={cid}, subaccount={subaccount}")
-        manifest_objects.append({"cid": cid, "filename": file_name})
-        logger.info(f"Added to unpin manifest: {subaccount=} {file_name=} {cid=}")
+        manifest_objects.append(
+            {
+                "cid": req.cid,
+                "filename": file_name,
+            },
+        )
+        logger.info(f"Added to unpin manifest: {req.address=} {file_name=} {req.cid=}")
 
     # Check if we have any objects to unpin
     if not manifest_objects:
@@ -72,7 +72,10 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
         temp_path = temp_file.name
 
     # Upload manifest to IPFS using httpx with proper redirect handling
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=30.0,
+        follow_redirects=True,
+    ) as client:
         # Read manifest data
         async with aiofiles.open(temp_path, "rb") as f:
             file_data = await f.read()
@@ -124,6 +127,7 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
     Path(temp_path).unlink(missing_ok=True)
 
     # Submit manifest CID to substrate for cancellation
+    seed_phrase = config.resubmission_seed_phrase
     logger.info(f"Initializing SubstrateClient with seed_phrase: {'[PRESENT]' if seed_phrase else '[MISSING]'}")
     if not seed_phrase:
         logger.error("No seed phrase available for SubstrateClient initialization")
