@@ -129,11 +129,11 @@ async def get_cached_chain_cids(
 
 async def check_user_cids(
     db: asyncpg.Connection,
-    redis_chain: async_redis.Redis,
-    redis_client: async_redis.Redis,
     user: str,
 ) -> None:
     """Check a single user's CIDs against their chain profile."""
+    from hippius_s3.redis_chain import get_chain_client
+
     logger.debug(f"Checking CIDs for user {user}")
 
     db_cid_records = await get_user_cids_from_db(db, user)
@@ -146,7 +146,7 @@ async def check_user_cids(
     for record in db_cid_records:
         cid_to_record[record.cid] = record
 
-    chain_cids = await get_cached_chain_cids(redis_chain, user)
+    chain_cids = await get_cached_chain_cids(get_chain_client(), user)
     if not chain_cids:
         return
 
@@ -253,8 +253,12 @@ async def run_chain_pin_checker_loop() -> None:
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
 
     from hippius_s3.queue import initialize_queue_client
+    from hippius_s3.redis_cache import initialize_cache_client
+    from hippius_s3.redis_chain import initialize_chain_client
 
     initialize_queue_client(redis_queues_client)
+    initialize_chain_client(redis_chain)
+    initialize_cache_client(redis_client)
     initialize_metrics_collector(redis_chain)
 
     logger.info("Starting chain pin checker service...")
@@ -272,7 +276,7 @@ async def run_chain_pin_checker_loop() -> None:
         logger.info(f"Checking {len(users)} users for CID consistency")
 
         for user in users:
-            await check_user_cids(db, redis_chain, redis_client, user)
+            await check_user_cids(db, user)
 
         logger.info(f"Completed checking all {len(users)} users")
 

@@ -38,8 +38,10 @@ async def run_uploader_loop():
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
 
     from hippius_s3.queue import initialize_queue_client
+    from hippius_s3.redis_cache import initialize_cache_client
 
     initialize_queue_client(redis_queues_client)
+    initialize_cache_client(redis_client)
     initialize_metrics_collector(redis_client)
 
     logger.info("Starting uploader service...")

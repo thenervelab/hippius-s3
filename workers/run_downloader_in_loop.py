@@ -232,8 +232,10 @@ async def run_downloader_loop():
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
 
     from hippius_s3.queue import initialize_queue_client
+    from hippius_s3.redis_cache import initialize_cache_client
 
     initialize_queue_client(redis_queues_client)
+    initialize_cache_client(redis_client)
 
     logger = logging.getLogger(__name__)
     logger.info("Starting downloader service...")
@@ -276,7 +278,7 @@ async def run_downloader_loop():
                         await redis_client.aclose()
                     await asyncio.sleep(2)
                     redis_client = async_redis.from_url(config.redis_url)
-                    # Continue main loop; item-specific retry/backoff is handled by callers
+                    initialize_cache_client(redis_client)
                     continue
             else:
                 # Wait a bit before checking again
