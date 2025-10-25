@@ -245,6 +245,10 @@ async def run_downloader_loop():
                 await asyncio.sleep(2)
                 redis_client = async_redis.from_url(config.redis_url)
                 continue
+            except Exception as e:
+                logger.error(f"Failed to dequeue/parse download request, skipping: {e}", exc_info=True)
+                # Skip bad item (already removed by BRPOP) and continue loop
+                continue
 
             if download_request:
                 try:
