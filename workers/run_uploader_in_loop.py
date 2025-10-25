@@ -94,9 +94,7 @@ async def run_uploader_loop():
                     delay_ms = compute_backoff_ms(
                         attempts_next, config.uploader_backoff_base_ms, config.uploader_backoff_max_ms
                     )
-                    await enqueue_retry_request(
-                        upload_request, delay_seconds=delay_ms / 1000.0, last_error=err_str
-                    )
+                    await enqueue_retry_request(upload_request, delay_seconds=delay_ms / 1000.0, last_error=err_str)
                     get_metrics_collector().record_uploader_operation(
                         main_account=upload_request.address,
                         success=False,
