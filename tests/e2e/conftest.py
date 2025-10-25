@@ -1,4 +1,12 @@
-"""E2E test configuration and fixtures for Hippius S3."""
+"""E2E test configuration and fixtures for Hippius S3.
+
+Environment configuration:
+- E2E tests run via docker-compose which loads:
+  - .env.test (base test config with localhost URLs)
+  - .env.test-e2e (docker-compose overrides with service DNS names)
+- Integration tests load .env.test directly via python-dotenv
+- See .env.test and .env.test-e2e for test environment variables
+"""
 
 import base64
 import os

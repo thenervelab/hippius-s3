@@ -8,33 +8,9 @@ services:
       - build-base
   api:
     build: .
-    # Ensure CI does not depend on a local .env file
-    env_file: []
-    environment:
-      - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - HIPPIUS_BYPASS_CREDIT_CHECK=true
-      - ENVIRONMENT=dev
-      - PUBLISH_TO_CHAIN=false
-      - ENABLE_REQUEST_PROFILING=false
-      - ENABLE_BANHAMMER=false
-      - RATE_LIMIT_PER_MINUTE=100000
-      - HIPPIUS_IPFS_GET_URL=http://toxiproxy:18080
-      - HIPPIUS_IPFS_STORE_URL=http://toxiproxy:15001
-      - REDIS_URL=redis://redis:6379/0
-      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
-      - REDIS_CHAIN_URL=redis://redis-chain:6379/0
-      - REDIS_RATE_LIMITING_URL=redis://redis-rate-limiting:6379/0
-      - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
-      - HTTP_STREAM_INITIAL_TIMEOUT_SECONDS=0.5
-      - LOG_LEVEL=DEBUG
-      - FRONTEND_HMAC_SECRET=e2e_test_secret
-      - HOST=0.0.0.0
-      - PORT=8000
-      - HIPPIUS_SUBSTRATE_URL=wss://rpc.hippius.network
-      - HIPPIUS_VALIDATOR_REGION=decentralized
-      - LOKI_URL=http://loki:3100/loki/api/v1/push
-      - LOKI_ENABLED=false
+    env_file:
+      - .env.test
+      - .env.test-e2e
     depends_on:
       db:
         condition: service_healthy
@@ -60,25 +36,9 @@ services:
       context: .
       dockerfile: workers/Dockerfile
     command: ["python", "workers/run_uploader_in_loop.py"]
-    env_file: []
-    environment:
-      - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - ENABLE_REQUEST_PROFILING=false
-      - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - ENVIRONMENT=dev
-      - PUBLISH_TO_CHAIN=false
-      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
-      - REDIS_URL=redis://redis:6379/0
-      - HIPPIUS_IPFS_GET_URL=http://toxiproxy:18080
-      - HIPPIUS_IPFS_STORE_URL=http://toxiproxy:15001
-      - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
-      - LOG_LEVEL=DEBUG
-      - HIPPIUS_IPFS_MAX_RETRIES=1
-      - HIPPIUS_UPLOADER_MAX_ATTEMPTS=2
-      - HIPPIUS_UPLOADER_BACKOFF_BASE_MS=100
-      - HIPPIUS_UPLOADER_BACKOFF_MAX_MS=500
-      - LOKI_URL=http://loki:3100/loki/api/v1/push
-      - LOKI_ENABLED=false
+    env_file:
+      - .env.test
+      - .env.test-e2e
     depends_on:
       db:
         condition: service_healthy
@@ -96,34 +56,9 @@ services:
       context: .
       dockerfile: workers/Dockerfile
     command: ["python", "workers/run_substrate_in_loop.py"]
-    env_file: []
-    environment:
-      - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - HIPPIUS_IPFS_GET_URL=http://toxiproxy:18080
-      - HIPPIUS_IPFS_STORE_URL=http://toxiproxy:15001
-      - FRONTEND_HMAC_SECRET=unused
-      - RATE_LIMIT_PER_MINUTE=1
-      - MAX_REQUEST_SIZE_MB=1
-      - LOG_LEVEL=DEBUG
-      - HOST=0.0.0.0
-      - PORT=8000
-      - ENVIRONMENT=dev
-      - MIN_BUCKET_NAME_LENGTH=1
-      - MAX_BUCKET_NAME_LENGTH=1
-      - MAX_OBJECT_KEY_LENGTH=1
-      - MAX_METADATA_SIZE=1
-      - HIPPIUS_VALIDATOR_REGION=unused
-      - REDIS_URL=redis://redis:6379/0
-      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
-      - ENABLE_REQUEST_PROFILING=false
-      - PUBLISH_TO_CHAIN=false
-      - HIPPIUS_SUBSTRATE_URL=wss://rpc.hippius.network
-      - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
-      - HIPPIUS_SUBSTRATE_BATCH_SIZE=1
-      - HIPPIUS_SUBSTRATE_BATCH_MAX_AGE_SEC=1
-      - LOKI_URL=http://loki:3100/loki/api/v1/push
-      - LOKI_ENABLED=false
+    env_file:
+      - .env.test
+      - .env.test-e2e
     depends_on:
       db:
         condition: service_healthy
@@ -139,19 +74,9 @@ services:
       context: .
       dockerfile: workers/Dockerfile
     command: ["python", "workers/run_unpinner_in_loop.py"]
-    env_file: []
-    environment:
-      - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - ENABLE_REQUEST_PROFILING=false
-      - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - ENVIRONMENT=dev
-      - PUBLISH_TO_CHAIN=false
-      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
-      - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
-      - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
-      - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
-      - LOKI_URL=http://loki:3100/loki/api/v1/push
-      - LOKI_ENABLED=false
+    env_file:
+      - .env.test
+      - .env.test-e2e
     depends_on:
       db:
         condition: service_healthy
@@ -167,20 +92,9 @@ services:
       context: .
       dockerfile: workers/Dockerfile
     command: ["python", "workers/run_downloader_in_loop.py"]
-    env_file: []
-    environment:
-      - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - ENABLE_REQUEST_PROFILING=false
-      - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - ENVIRONMENT=dev
-      - PUBLISH_TO_CHAIN=false
-      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
-      - REDIS_URL=redis://redis:6379/0
-      - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
-      - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
-      - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
-      - LOKI_URL=http://loki:3100/loki/api/v1/push
-      - LOKI_ENABLED=false
+    env_file:
+      - .env.test
+      - .env.test-e2e
     depends_on:
       db:
         condition: service_healthy
@@ -196,20 +110,9 @@ services:
       context: .
       dockerfile: workers/Dockerfile
     command: ["python", "workers/chain_pin_checker.py"]
-    env_file: []
-    environment:
-      - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - ENABLE_REQUEST_PROFILING=false
-      - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - ENVIRONMENT=dev
-      - PUBLISH_TO_CHAIN=false
-      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
-      - REDIS_URL=redis://redis:6379/0
-      - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
-      - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
-      - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
-      - LOKI_URL=http://loki:3100/loki/api/v1/push
-      - LOKI_ENABLED=false
+    env_file:
+      - .env.test
+      - .env.test-e2e
     depends_on:
       db:
         condition: service_healthy
@@ -234,20 +137,9 @@ services:
       context: .
       dockerfile: workers/Dockerfile
     command: ["python", "workers/chain_profile_cacher.py"]
-    env_file: []
-    environment:
-      - DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - ENABLE_REQUEST_PROFILING=false
-      - HIPPIUS_KEYSTORE_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
-      - ENVIRONMENT=dev
-      - PUBLISH_TO_CHAIN=false
-      - REDIS_ACCOUNTS_URL=redis://redis-accounts:6379/0
-      - REDIS_URL=redis://redis:6379/0
-      - HIPPIUS_IPFS_GET_URL=http://ipfs:8080
-      - HIPPIUS_IPFS_STORE_URL=http://ipfs:5001
-      - RESUBMISSION_SEED_PHRASE=about acid actor absent action able actual abandon abstract above ability achieve
-      - LOKI_URL=http://loki:3100/loki/api/v1/push
-      - LOKI_ENABLED=false
+    env_file:
+      - .env.test
+      - .env.test-e2e
     depends_on:
       db:
         condition: service_healthy

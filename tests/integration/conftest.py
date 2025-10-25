@@ -7,9 +7,9 @@ from typing import Any
 from typing import Callable
 from typing import Generator
 from typing import Iterator
-from unittest.mock import patch
 
 import boto3
+import dotenv
 import pytest
 from botocore.config import Config
 
@@ -17,14 +17,11 @@ from tests.e2e.conftest import is_real_aws
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _mock_env_vars() -> Generator[None, None, None]:
-    """Set minimal env vars required for worker imports in integration tests."""
-    env_vars = {
-        "DATABASE_URL": "postgresql://test:test@localhost:5432/test",
-        "REDIS_URL": "redis://localhost:6379/0",
-    }
-    with patch.dict(os.environ, env_vars):
-        yield
+def _load_test_env() -> Generator[None, None, None]:
+    """Load test environment variables from .env.test file."""
+    test_env_file = Path(__file__).parents[2] / ".env.test"
+    dotenv.load_dotenv(test_env_file, override=True)
+    yield
 
 
 @pytest.fixture
