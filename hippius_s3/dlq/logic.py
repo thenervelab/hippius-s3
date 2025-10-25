@@ -115,7 +115,7 @@ class DLQLogic:
         if not self.storage.has_object(object_id):
             logger.warning(f"No DLQ data available for object {object_id}, proceeding without hydration")
             # Still requeue but don't archive since no DLQ data
-            await enqueue_upload_request(payload, redis_client)
+            await enqueue_upload_request(payload)
             return True
 
         # Hydrate cache from DLQ
@@ -131,7 +131,7 @@ class DLQLogic:
 
         # Requeue the payload
         logger.info(f"Requeueing object {object_id}")
-        await enqueue_upload_request(payload, redis_client)
+        await enqueue_upload_request(payload)
 
         # Archive the DLQ data (move to archive directory)
         try:

@@ -271,9 +271,15 @@ async def main() -> None:
     # Setup logging
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-    # Get Redis client
+    # Get Redis clients
     config = get_config()
+
     redis_client = async_redis.from_url(config.redis_url)
+    redis_queues_client = async_redis.from_url(config.redis_queues_url)
+
+    from hippius_s3.queue import initialize_queue_client
+
+    initialize_queue_client(redis_queues_client)
 
     try:
         dlq_manager = DLQManager(redis_client)
@@ -397,6 +403,8 @@ async def main() -> None:
     finally:
         if redis_client:
             await redis_client.close()
+        if redis_queues_client:
+            await redis_queues_client.close()
 
 
 if __name__ == "__main__":

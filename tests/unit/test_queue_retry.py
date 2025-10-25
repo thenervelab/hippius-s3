@@ -9,6 +9,7 @@ from fakeredis.aioredis import FakeRedis
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_retry_request
+from hippius_s3.queue import initialize_queue_client
 from hippius_s3.queue import move_due_retries_to_primary
 
 
@@ -16,6 +17,7 @@ from hippius_s3.queue import move_due_retries_to_primary
 async def test_enqueue_retry_request_sets_attempts_and_schedules() -> None:
     """Test that enqueue_retry_request increments attempts and schedules with delay."""
     redis = FakeRedis()
+    initialize_queue_client(redis)
     payload = UploadChainRequest(
         substrate_url="http://test",
         ipfs_node="http://test",
@@ -34,7 +36,7 @@ async def test_enqueue_retry_request_sets_attempts_and_schedules() -> None:
         request_id="req-456",
     )
 
-    await enqueue_retry_request(payload, redis, delay_seconds=10.0, last_error="test error")
+    await enqueue_retry_request(payload, delay_seconds=10.0, last_error="test error")
 
     # Check ZSET has the item
     members = await redis.zrange("upload_retries", 0, -1, withscores=True)
@@ -59,6 +61,7 @@ async def test_enqueue_retry_request_sets_attempts_and_schedules() -> None:
 async def test_move_due_retries_to_primary() -> None:
     """Test that due retries are moved to primary queue."""
     redis = FakeRedis()
+    initialize_queue_client(redis)
 
     # Add a due retry (score = past time)
     past_time = time.time() - 10
@@ -69,7 +72,7 @@ async def test_move_due_retries_to_primary() -> None:
     future_time = time.time() + 100
     await redis.zadd("upload_retries", {json.dumps({"not_due": True}): future_time})
 
-    moved = await move_due_retries_to_primary(redis, now_ts=time.time())
+    moved = await move_due_retries_to_primary(now_ts=time.time())
 
     assert moved == 1  # Only the due one moved
 
@@ -86,6 +89,7 @@ async def test_move_due_retries_to_primary() -> None:
 async def test_move_due_retries_respects_max_items() -> None:
     """Test that move_due_retries_to_primary respects max_items limit."""
     redis = FakeRedis()
+    initialize_queue_client(redis)
 
     # Add multiple due retries
     past_time = time.time() - 10
@@ -94,7 +98,7 @@ async def test_move_due_retries_respects_max_items() -> None:
         await redis.zadd("upload_retries", {json.dumps(payload_data): past_time})
 
     # Move with limit
-    moved = await move_due_retries_to_primary(redis, max_items=2)
+    moved = await move_due_retries_to_primary(max_items=2)
 
     assert moved == 2
 

@@ -97,42 +97,37 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
 
             # Perform permission-aware delete; non-existent counts as success
             try:
-                deleted_object = await db.fetchrow(get_query("delete_object"), bucket_id, key, user["main_account_id"])
+                deleted_object = await db.fetchrow(
+                    get_query("delete_object"),
+                    bucket_id,
+                    key,
+                    user["main_account_id"],
+                )
             except Exception:
                 logger.exception("Delete query failed for key %s", key)
                 deleted_object = None
 
-            if deleted_object and (deleted_object.get("ipfs_cid") or "").strip():
-                # Enqueue unpin
-                try:
+            all_cids = deleted_object.get("all_cids") or [] if deleted_object else []
+            if deleted_object:
+                obj_version = deleted_object.get("object_version") or deleted_object.get("current_object_version") or 1
+                for cid in all_cids:
                     await enqueue_unpin_request(
                         payload=UnpinChainRequest(
-                            substrate_url=config.substrate_url,
-                            ipfs_node=config.ipfs_store_url,
                             address=request.state.account.main_account,
-                            subaccount=request.state.account.main_account,
-                            subaccount_seed_phrase=request.state.seed_phrase,
-                            bucket_name=bucket_name,
-                            object_key=key,
-                            should_encrypt=not bucket["is_public"],
-                            cid=str(deleted_object["ipfs_cid"]),
-                            object_id=str(deleted_object["object_id"]) if deleted_object.get("object_id") else "",
-                            object_version=int(
-                                deleted_object.get("object_version")
-                                or deleted_object.get("current_object_version")
-                                or 1
-                            ),
+                            object_id=str(deleted_object["object_id"]),
+                            object_version=int(obj_version),
+                            cid=cid,
                         ),
-                        redis_client=redis_client,
                     )
-                except Exception:
-                    logger.debug("Failed to enqueue unpin request for %s", key, exc_info=True)
 
             # S3 semantics: even if not found, include as Deleted (unless Quiet)
             deleted_keys.append(key)
 
         # Build XML response
-        resp_root = ET.Element("DeleteResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+        resp_root = ET.Element(
+            "DeleteResult",
+            xmlns="http://s3.amazonaws.com/doc/2006-03-01/",
+        )
 
         if not quiet:
             for key in deleted_keys:

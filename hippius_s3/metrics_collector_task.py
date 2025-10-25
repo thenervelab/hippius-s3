@@ -21,12 +21,14 @@ class BackgroundMetricsCollector:
         redis_accounts_client: async_redis.Redis,
         redis_chain_client: Optional[async_redis.Redis] = None,
         redis_rate_limiting_client: Optional[async_redis.Redis] = None,
+        redis_queues_client: Optional[async_redis.Redis] = None,
     ):
         self.metrics_collector = metrics_collector
         self.redis_client = redis_client
         self.redis_accounts_client = redis_accounts_client
         self.redis_chain_client = redis_chain_client
         self.redis_rate_limiting_client = redis_rate_limiting_client
+        self.redis_queues_client = redis_queues_client
         self.running = False
         self._task: Optional[asyncio.Task] = None
 
@@ -62,9 +64,16 @@ class BackgroundMetricsCollector:
 
     async def _collect_redis_metrics(self) -> None:
         try:
-            self.metrics_collector._upload_len = int(await self.redis_client.llen("upload_requests") or 0)
-            self.metrics_collector._unpin_len = int(await self.redis_client.llen("unpin_requests") or 0)
-            self.metrics_collector._substrate_len = int(await self.redis_client.llen("substrate_requests") or 0)
+            if self.redis_queues_client:
+                self.metrics_collector._upload_len = int(await self.redis_queues_client.llen("upload_requests") or 0)
+                self.metrics_collector._unpin_len = int(await self.redis_queues_client.llen("unpin_requests") or 0)
+                self.metrics_collector._substrate_len = int(
+                    await self.redis_queues_client.llen("substrate_requests") or 0
+                )
+            else:
+                self.metrics_collector._upload_len = int(await self.redis_client.llen("upload_requests") or 0)
+                self.metrics_collector._unpin_len = int(await self.redis_client.llen("unpin_requests") or 0)
+                self.metrics_collector._substrate_len = int(await self.redis_client.llen("substrate_requests") or 0)
 
             self.metrics_collector._main_db_size = int(await self.redis_client.dbsize() or 0)
             self.metrics_collector._accounts_db_size = int(await self.redis_accounts_client.dbsize() or 0)
