@@ -150,7 +150,6 @@ async def handle_append(
     # Enqueue background publish of this part via the pinner worker (writer helper)
     try:
         await writer_enqueue_upload(
-            redis_client=redis_client,
             address=request.state.account.main_account,
             bucket_name=bucket_name,
             object_key=object_key,

@@ -14,6 +14,11 @@ from hippius_s3.queue import enqueue_unpin_request
 async def main_async(args: argparse.Namespace) -> int:
     config = get_config()
     db = await asyncpg.connect(config.database_url)  # type: ignore[arg-type]
+    redis_queues_client = async_redis.from_url(config.redis_queues_url)
+
+    from hippius_s3.queue import initialize_queue_client
+
+    initialize_queue_client(redis_queues_client)
     try:
         rows = await db.fetch(
             """
@@ -55,7 +60,6 @@ async def main_async(args: argparse.Namespace) -> int:
                                 object_version=int(r["object_version"]),
                                 cid=str(cid),
                             ),
-                            redis_client=redis_client,
                         )
                 await db.execute(
                     """

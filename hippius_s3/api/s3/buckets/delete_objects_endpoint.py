@@ -118,7 +118,6 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                             object_version=int(obj_version),
                             cid=cid,
                         ),
-                        redis_client=redis_client,
                     )
 
             # S3 semantics: even if not found, include as Deleted (unless Quiet)

@@ -111,7 +111,6 @@ async def handle_delete_object(
                             object_version=int(obj_version),
                             cid=cid,
                         ),
-                        redis_client=redis_client,
                     )
         return Response(status_code=204)
 

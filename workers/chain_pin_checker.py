@@ -178,7 +178,7 @@ async def check_user_cids(
                 object_id=str(object_id),
                 object_version=object_version,
             )
-            await enqueue_substrate_request(request, redis_client)
+            await enqueue_substrate_request(request)
             logger.info(f"Enqueued substrate request object_id={object_id} version={object_version} cids={len(cids)}")
     else:
         logger.info(f"All S3 CIDs for user {user} are present on chain")
@@ -250,13 +250,18 @@ async def run_chain_pin_checker_loop() -> None:
     db = await asyncpg.connect(config.database_url)
     redis_chain = async_redis.from_url(config.redis_chain_url)
     redis_client = async_redis.from_url(config.redis_url)
+    redis_queues_client = async_redis.from_url(config.redis_queues_url)
 
+    from hippius_s3.queue import initialize_queue_client
+
+    initialize_queue_client(redis_queues_client)
     initialize_metrics_collector(redis_chain)
 
     logger.info("Starting chain pin checker service...")
     logger.info(f"Database: {config.database_url}")
     logger.info(f"Redis Chain: {config.redis_chain_url}")
     logger.info(f"Redis: {config.redis_url}")
+    logger.info(f"Redis Queues: {config.redis_queues_url}")
 
     await _wait_for_table(db, "buckets", timeout_seconds=180)
     await _validate_redis_connection(redis_chain, "redis_chain", timeout_seconds=30)

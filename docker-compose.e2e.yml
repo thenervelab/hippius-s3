@@ -24,6 +24,8 @@ services:
         condition: service_healthy
       redis-rate-limiting:
         condition: service_healthy
+      redis-queues:
+        condition: service_healthy
     volumes:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
@@ -43,6 +45,8 @@ services:
       db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      redis-queues:
         condition: service_healthy
     volumes:
       - .:/app
@@ -64,6 +68,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      redis-queues:
+        condition: service_healthy
     volumes:
       - .:/app
     networks:
@@ -81,6 +87,8 @@ services:
       db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      redis-queues:
         condition: service_healthy
     volumes:
       - .:/app
@@ -100,6 +108,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      redis-queues:
+        condition: service_healthy
     volumes:
       - .:/app
     networks:
@@ -117,6 +127,8 @@ services:
       db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      redis-queues:
         condition: service_healthy
     volumes:
       - .:/app
@@ -214,6 +226,24 @@ services:
     image: redis:7-alpine
     ports:
       - "127.0.0.1:6383:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+    networks:
+      - hippius_net
+
+  redis-queues:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6382:6379"
+    command: [
+      "redis-server",
+      "--maxmemory", "2gb",
+      "--maxmemory-policy", "allkeys-lru",
+      "--appendonly", "yes",
+      "--appendfsync", "everysec"
+    ]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

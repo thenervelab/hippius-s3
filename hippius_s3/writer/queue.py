@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
 from typing import Iterable
 
 from hippius_s3.queue import Chunk
@@ -10,7 +9,6 @@ from hippius_s3.queue import enqueue_upload_request
 
 async def enqueue_upload(
     *,
-    redis_client: Any,
     address: str,
     bucket_name: str,
     object_key: str,
@@ -28,4 +26,4 @@ async def enqueue_upload(
         chunks=[Chunk(id=int(i)) for i in chunk_ids],
         upload_id=str(upload_id),
     )
-    await enqueue_upload_request(payload, redis_client)
+    await enqueue_upload_request(payload)

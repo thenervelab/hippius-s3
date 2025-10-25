@@ -57,6 +57,11 @@ async def main() -> None:
     config = get_config()
     db = await asyncpg.connect(config.database_url)
     redis_client = async_redis.from_url(config.redis_url)
+    redis_queues_client = async_redis.from_url(config.redis_queues_url)
+
+    from hippius_s3.queue import initialize_queue_client
+
+    initialize_queue_client(redis_queues_client)
     obj_cache = RedisObjectPartsCache(redis_client)
 
     try:
@@ -107,7 +112,7 @@ async def main() -> None:
             else:
                 # Mark as pinning and enqueue
                 await db.execute("UPDATE objects SET status = 'pinning' WHERE object_id = $1", object_id)
-                await enqueue_upload_request(payload=payload, redis_client=redis_client)
+                await enqueue_upload_request(payload=payload)
                 enqueued += 1
 
         logger.info(
@@ -117,6 +122,8 @@ async def main() -> None:
     finally:
         with contextlib.suppress(Exception):
             await redis_client.close()
+        with contextlib.suppress(Exception):
+            await redis_queues_client.close()
         with contextlib.suppress(Exception):
             await db.close()
 

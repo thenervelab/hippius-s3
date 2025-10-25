@@ -518,7 +518,7 @@ async def upload_part(
                     multipart=bool((json.loads(source_obj.get("metadata") or "{}") or {}).get("multipart", False)),
                     chunks=dl_parts,
                 )
-                await enqueue_download_request(req, request.app.state.redis_client)
+                await enqueue_download_request(req)
 
             # Stream plaintext bytes
             chunks_iter = stream_plan(
@@ -1077,7 +1077,6 @@ async def complete_multipart_upload(
                 ],
                 upload_id=upload_id,
             ),
-            request.app.state.redis_client,
         )
 
         # Create XML response

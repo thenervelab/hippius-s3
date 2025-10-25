@@ -128,7 +128,6 @@ class Uploader:
                     object_id=payload.object_id,
                     object_version=int(payload.object_version or 1),
                 ),
-                self.redis_client,
             )
 
         total_duration = time.time() - start_time

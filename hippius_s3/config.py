@@ -71,6 +71,9 @@ class Config:
     # Redis for rate limiting and banhammer
     redis_rate_limiting_url: str = env("REDIS_RATE_LIMITING_URL:redis://127.0.0.1:6383/0")
 
+    # Redis for queues (persistent)
+    redis_queues_url: str = env("REDIS_QUEUES_URL:redis://127.0.0.1:6382/0")
+
     # API signing key for pre-signed URLs
     # Generated on first run if not provided
     api_signing_key: str = env("API_SIGNING_KEY:" + str(uuid.uuid4()))

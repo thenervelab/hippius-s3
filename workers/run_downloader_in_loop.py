@@ -229,21 +229,28 @@ async def process_download_request(
 async def run_downloader_loop():
     """Main loop for downloader service."""
     redis_client = async_redis.from_url(config.redis_url)
+    redis_queues_client = async_redis.from_url(config.redis_queues_url)
+
+    from hippius_s3.queue import initialize_queue_client
+
+    initialize_queue_client(redis_queues_client)
 
     logger = logging.getLogger(__name__)
     logger.info("Starting downloader service...")
     logger.info(f"Redis URL: {config.redis_url}")
+    logger.info(f"Redis Queues URL: {config.redis_queues_url}")
 
     try:
         while True:
             try:
-                download_request = await dequeue_download_request(redis_client)
+                download_request = await dequeue_download_request()
             except (BusyLoadingError, RedisConnectionError, RedisTimeoutError) as e:
                 logger.warning(f"Redis error while dequeuing download request: {e}. Reconnecting in 2s...")
                 with contextlib.suppress(Exception):
-                    await redis_client.aclose()
+                    await redis_queues_client.aclose()
                 await asyncio.sleep(2)
-                redis_client = async_redis.from_url(config.redis_url)
+                redis_queues_client = async_redis.from_url(config.redis_queues_url)
+                initialize_queue_client(redis_queues_client)
                 continue
             except Exception as e:
                 logger.error(f"Failed to dequeue/parse download request, skipping: {e}", exc_info=True)
@@ -282,6 +289,7 @@ async def run_downloader_loop():
         raise
     finally:
         await redis_client.aclose()
+        await redis_queues_client.aclose()
 
 
 if __name__ == "__main__":

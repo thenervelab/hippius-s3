@@ -168,19 +168,24 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
 async def run_unpinner_loop() -> None:
     """Main loop that monitors the Redis queue and processes unpin requests."""
     redis_client = async_redis.from_url(config.redis_url)
+    redis_queues_client = async_redis.from_url(config.redis_queues_url)
 
+    from hippius_s3.queue import initialize_queue_client
+
+    initialize_queue_client(redis_queues_client)
     initialize_metrics_collector(redis_client)
 
     logger.info("Starting unpinner service...")
     logger.info(f"Redis URL: {config.redis_url}")
+    logger.info(f"Redis Queues URL: {config.redis_queues_url}")
     user_unpin_requests: dict[str, list[UnpinChainRequest]] = {}
 
     try:
         while True:
-            unpin_request, redis_client = await with_redis_retry(
-                dequeue_unpin_request,
-                redis_client,
-                config.redis_url,
+            unpin_request, redis_queues_client = await with_redis_retry(
+                lambda rc: dequeue_unpin_request(),
+                redis_queues_client,
+                config.redis_queues_url,
                 "dequeue unpin request",
             )
 

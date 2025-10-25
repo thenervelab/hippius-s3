@@ -134,7 +134,6 @@ async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redi
                         object_version=obj.get("current_object_version"),
                         cid=obj["ipfs_cid"],
                     ),
-                    redis_client=redis_client,
                 )
             except Exception:
                 logger.debug("Failed to enqueue unpin for object during bucket delete", exc_info=True)
