@@ -129,17 +129,10 @@ async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redi
             try:
                 await enqueue_unpin_request(
                     payload=UnpinChainRequest(
-                        substrate_url=config.substrate_url,
-                        ipfs_node=config.ipfs_store_url,
                         address=request.state.account.main_account,
-                        subaccount=request.state.account.main_account,
-                        subaccount_seed_phrase=request.state.seed_phrase,
-                        bucket_name=bucket_name,
-                        object_key=obj["object_key"],
-                        should_encrypt=False,  # Not needed for unpin
                         object_id=str(obj["object_id"]),
-                        cid=obj["ipfs_cid"],
                         object_version=obj.get("current_object_version"),
+                        cid=obj["ipfs_cid"],
                     ),
                     redis_client=redis_client,
                 )

@@ -93,14 +93,9 @@ async def main() -> None:
                 continue
 
             payload = UploadChainRequest(
-                substrate_url=config.substrate_url,
-                ipfs_node=config.ipfs_store_url,
                 address=address,
-                subaccount=address,
-                subaccount_seed_phrase=seed_phrase,
                 bucket_name=bucket_name,
                 object_key=object_key,
-                should_encrypt=should_encrypt,
                 object_id=object_id,
                 object_version=1,
                 chunks=[Chunk(id=1)],

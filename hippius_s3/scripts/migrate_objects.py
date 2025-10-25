@@ -209,17 +209,13 @@ async def migrate_one(
         )
         if parts:
             req = UploadChainRequest(
-                object_key=object_key,
-                bucket_name=bucket_name,
-                upload_id=str(upload_id),
-                chunks=[Chunk(id=int(p["part_number"])) for p in parts],
-                substrate_url=config.substrate_url,
-                ipfs_node=config.ipfs_store_url,
                 address=address,
-                subaccount=address,
-                subaccount_seed_phrase="",
+                bucket_name=bucket_name,
+                object_key=object_key,
                 object_id=str(object_id),
                 object_version=int(new_version),
+                chunks=[Chunk(id=int(p["part_number"])) for p in parts],
+                upload_id=str(upload_id),
             )
             await enqueue_upload_request(req, redis_client)
     except Exception:

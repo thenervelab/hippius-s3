@@ -175,16 +175,12 @@ async def handle_put_object(
             await writer_enqueue_upload(
                 redis_client=redis_client,
                 address=request.state.account.main_account,
-                subaccount_seed_phrase=request.state.seed_phrase,
-                subaccount=request.state.account.main_account,
                 bucket_name=bucket_name,
                 object_key=object_key,
                 object_id=object_id,
                 object_version=int(current_object_version),
                 upload_id=str(put_res.upload_id),
                 chunk_ids=[1],
-                substrate_url=config.substrate_url,
-                ipfs_node=config.ipfs_store_url,
             )
 
         get_metrics_collector().record_s3_operation(

@@ -152,16 +152,12 @@ async def handle_append(
         await writer_enqueue_upload(
             redis_client=redis_client,
             address=request.state.account.main_account,
-            subaccount_seed_phrase=request.state.seed_phrase,
-            subaccount=request.state.account.main_account,
             bucket_name=bucket_name,
             object_key=object_key,
             object_id=object_id,
             object_version=int(object_version),
             upload_id=str(result["upload_id"]),
             chunk_ids=[int(next_part)],
-            substrate_url=config.substrate_url,
-            ipfs_node=config.ipfs_store_url,
         )
         with contextlib.suppress(Exception):
             logger.info(

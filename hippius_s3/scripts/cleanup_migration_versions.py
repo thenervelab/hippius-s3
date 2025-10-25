@@ -50,17 +50,10 @@ async def main_async(args: argparse.Namespace) -> int:
                     with suppress(Exception):
                         await enqueue_unpin_request(
                             payload=UnpinChainRequest(
-                                substrate_url=config.substrate_url,
-                                ipfs_node=config.ipfs_store_url,
                                 address=r["main_account_id"],
-                                subaccount=r["main_account_id"],
-                                subaccount_seed_phrase="",
-                                bucket_name=r["bucket_name"],
-                                object_key=r["object_key"],
-                                should_encrypt=False,
                                 object_id=str(r["object_id"]),
-                                cid=str(cid),
                                 object_version=int(r["object_version"]),
+                                cid=str(cid),
                             ),
                             redis_client=redis_client,
                         )

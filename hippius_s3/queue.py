@@ -29,48 +29,41 @@ class PartToDownload(BaseModel):
     chunks: list[PartChunkSpec]
 
 
-class ChainRequest(BaseModel):
-    substrate_url: str
-    ipfs_node: str
-    address: str
-    subaccount: str
-    subaccount_seed_phrase: str
-    bucket_name: str
-    object_key: str
-    # Deprecated: retained for backward compatibility; uploads are pre-encrypted
-    should_encrypt: bool = False
-    object_id: str
-    object_version: int
-
-    # Retry & tracing metadata
+class RetryableRequest(BaseModel):
     request_id: str | None = None
     attempts: int = 0
     first_enqueued_at: float | None = None
     last_error: str | None = None
 
-    @property
-    def name(self):
-        # Unified request uses upload_id; legacy multipart uses multipart_upload_id
-        if hasattr(self, "upload_id") and self.upload_id is not None:
-            return f"multipart::{self.object_id}::{self.upload_id}::{self.address}"
-        if hasattr(self, "multipart_upload_id") and self.multipart_upload_id is not None:
-            return f"multipart::{self.object_id}::{self.multipart_upload_id}::{self.address}"
-        return f"simple::{self.object_id}::{self.address}"
 
-
-class UploadChainRequest(ChainRequest):
-    """Unified upload request type that combines simple and multipart uploads."""
-
+class UploadChainRequest(RetryableRequest):
+    address: str
+    bucket_name: str
+    object_key: str
+    object_id: str
+    object_version: int
     chunks: list[Chunk]
     upload_id: str | None = None
 
+    @property
+    def name(self):
+        if self.upload_id is not None:
+            return f"multipart::{self.object_id}::{self.upload_id}::{self.address}"
+        return f"simple::{self.object_id}::{self.address}"
 
-class UnpinChainRequest(ChainRequest):
+
+class UnpinChainRequest(RetryableRequest):
+    address: str
+    object_id: str
+    object_version: int
     cid: str
 
+    @property
+    def name(self):
+        return f"unpin::{self.cid}::{self.address}::{self.object_id}"
 
-class DownloadChainRequest(BaseModel):
-    request_id: str
+
+class DownloadChainRequest(RetryableRequest):
     object_id: str
     object_version: int
     object_key: str
@@ -90,15 +83,11 @@ class DownloadChainRequest(BaseModel):
         return f"download::{self.request_id}::{self.object_id}::{self.address}"
 
 
-class SubstratePinningRequest(BaseModel):
+class SubstratePinningRequest(RetryableRequest):
     cids: list[str]
     address: str
     object_id: str
     object_version: int
-    request_id: str | None = None
-    attempts: int = 0
-    first_enqueued_at: float | None = None
-    last_error: str | None = None
 
     @property
     def name(self):

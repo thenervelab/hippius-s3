@@ -17,16 +17,10 @@ async def test_unpinner_worker_manifest_structure() -> None:
 
     unpin_requests = [
         UnpinChainRequest(
-            cid=cid,
             address=user_address,
-            substrate_url="ws://test",
-            ipfs_node="http://test",
-            subaccount=user_address,
-            subaccount_seed_phrase="test seed",
-            bucket_name="test-bucket",
-            object_key="test-key",
             object_id="test-obj-789",
             object_version=1,
+            cid=cid,
         )
         for cid in fake_cids
     ]
@@ -97,16 +91,10 @@ async def test_unpinner_worker_handles_empty_cids() -> None:
     """Test that unpinner handles requests with empty CIDs gracefully."""
     unpin_requests = [
         UnpinChainRequest(
-            cid="",
             address="5TestUser",
-            substrate_url="ws://test",
-            ipfs_node="http://test",
-            subaccount="5TestUser",
-            subaccount_seed_phrase="test seed",
-            bucket_name="test-bucket",
-            object_key="test-key",
             object_id="test-obj-empty",
             object_version=1,
+            cid="",
         )
     ]
 
