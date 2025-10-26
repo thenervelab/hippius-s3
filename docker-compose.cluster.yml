@@ -1,0 +1,124 @@
+# Docker Compose for Redis Cluster - Local Development
+# This file sets up a minimal 3-node Redis Cluster for local development
+# Usage: docker compose -f docker-compose.yml -f docker-compose.cluster.yml up
+
+services:
+  redis-cluster-1:
+    image: redis:7-alpine
+    container_name: redis-cluster-1
+    ports:
+      - "127.0.0.1:7001:6379"
+      - "127.0.0.1:17001:16379"
+    volumes:
+      - redis_cluster_1_data:/data
+      - ./redis-cluster.conf:/usr/local/etc/redis/redis-cluster.conf
+    command: redis-server /usr/local/etc/redis/redis-cluster.conf --maxmemory 2gb
+    networks:
+      hippius_net:
+        ipv4_address: 172.20.0.20
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 50
+      start_period: 30s
+
+  redis-cluster-2:
+    image: redis:7-alpine
+    container_name: redis-cluster-2
+    ports:
+      - "127.0.0.1:7002:6379"
+      - "127.0.0.1:17002:16379"
+    volumes:
+      - redis_cluster_2_data:/data
+      - ./redis-cluster.conf:/usr/local/etc/redis/redis-cluster.conf
+    command: redis-server /usr/local/etc/redis/redis-cluster.conf --maxmemory 2gb
+    networks:
+      hippius_net:
+        ipv4_address: 172.20.0.21
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 50
+      start_period: 30s
+
+  redis-cluster-3:
+    image: redis:7-alpine
+    container_name: redis-cluster-3
+    ports:
+      - "127.0.0.1:7003:6379"
+      - "127.0.0.1:17003:16379"
+    volumes:
+      - redis_cluster_3_data:/data
+      - ./redis-cluster.conf:/usr/local/etc/redis/redis-cluster.conf
+    command: redis-server /usr/local/etc/redis/redis-cluster.conf --maxmemory 2gb
+    networks:
+      hippius_net:
+        ipv4_address: 172.20.0.22
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 50
+      start_period: 30s
+
+  redis-cluster-init:
+    image: redis:7-alpine
+    container_name: redis-cluster-init
+    depends_on:
+      redis-cluster-1:
+        condition: service_healthy
+      redis-cluster-2:
+        condition: service_healthy
+      redis-cluster-3:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -c
+      - |
+        redis-cli --cluster create \
+          172.20.0.20:6379 \
+          172.20.0.21:6379 \
+          172.20.0.22:6379 \
+          --cluster-replicas 0 \
+          --cluster-yes
+    networks:
+      - hippius_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis-cluster-proxy
+    depends_on:
+      redis-cluster-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:6379:6379"
+    command:
+      - /bin/sh
+      - -c
+      - |
+        # This is a proxy container that clients can connect to
+        # It redirects to the cluster nodes
+        # In production, clients connect directly to cluster nodes
+        echo "Redis Cluster is ready!"
+        echo "Cluster nodes: 172.20.0.20:6379, 172.20.0.21:6379, 172.20.0.22:6379"
+        echo "Connect using: redis://172.20.0.20:6379,172.20.0.21:6379,172.20.0.22:6379"
+        sleep infinity
+    networks:
+      - hippius_net
+
+networks:
+  hippius_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  redis_cluster_1_data:
+  redis_cluster_2_data:
+  redis_cluster_3_data:

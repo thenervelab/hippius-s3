@@ -1,0 +1,80 @@
+# Default values for redis-cluster Helm chart
+# This configuration deploys a 3-node Redis Cluster (master-only, no replicas)
+
+replicaCount: 3
+
+image:
+  repository: redis
+  tag: "7-alpine"
+  pullPolicy: IfNotPresent
+
+cluster:
+  enabled: true
+  replicas: 0
+
+resources:
+  limits:
+    cpu: 2000m
+    memory: 65Gi
+  requests:
+    cpu: 1000m
+    memory: 60Gi
+
+persistence:
+  enabled: false
+  storageClass: ""
+  size: 100Gi
+
+redis:
+  maxMemory: "60gb"
+  maxMemoryPolicy: "allkeys-lru"
+  port: 6379
+  clusterBusPort: 16379
+
+service:
+  type: ClusterIP
+  port: 6379
+
+configMap:
+  redisConfig: |
+    bind 0.0.0.0
+    port 6379
+    timeout 0
+    tcp-keepalive 300
+    cluster-enabled yes
+    cluster-config-file nodes.conf
+    cluster-node-timeout 5000
+    cluster-require-full-coverage no
+    maxmemory 60gb
+    maxmemory-policy allkeys-lru
+    maxmemory-samples 10
+    save ""
+    appendonly no
+    hz 100
+    hash-max-ziplist-entries 512
+    hash-max-ziplist-value 64
+    list-max-ziplist-size -2
+    set-max-intset-entries 512
+    zset-max-ziplist-entries 128
+    zset-max-ziplist-value 64
+    tcp-backlog 2048
+    databases 1
+    lazyfree-lazy-eviction yes
+    lazyfree-lazy-expire yes
+    lazyfree-lazy-server-del yes
+    activedefrag yes
+    active-defrag-ignore-bytes 100mb
+    active-defrag-threshold-lower 10
+    active-defrag-threshold-upper 100
+    active-defrag-cycle-min 1
+    active-defrag-cycle-max 25
+    maxclients 10000
+    client-output-buffer-limit normal 0 0 0
+    client-output-buffer-limit replica 256mb 64mb 60
+    client-output-buffer-limit pubsub 32mb 8mb 60
+    protected-mode no
+    loglevel notice
+    syslog-enabled no
+    rename-command FLUSHDB ""
+    rename-command FLUSHALL ""
+    rename-command DEBUG ""

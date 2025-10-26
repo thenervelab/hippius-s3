@@ -61,6 +61,7 @@ class Config:
 
     # Redis for caching/rate limiting
     redis_url: str = env("REDIS_URL")
+    redis_cluster_enabled: bool = env("REDIS_CLUSTER_ENABLED:false", convert=lambda x: x.lower() == "true")
 
     # Redis for account caching (persistent)
     redis_accounts_url: str = env("REDIS_ACCOUNTS_URL")

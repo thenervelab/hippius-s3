@@ -1,0 +1,134 @@
+# Docker Compose for Redis Cluster - Production
+# This file sets up a 3-node Redis Cluster for production (3x60GB = 180GB total)
+# Usage: docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.prod.cluster.yml up
+
+services:
+  redis-cluster-1:
+    image: redis:7-alpine
+    container_name: redis-cluster-1
+    ports:
+      - "6379:6379"
+      - "16379:16379"
+    volumes:
+      - redis_cluster_1_data:/data
+      - ./redis-cluster.conf:/usr/local/etc/redis/redis-cluster.conf
+    command: redis-server /usr/local/etc/redis/redis-cluster.conf --maxmemory 60gb
+    networks:
+      hippius_net:
+        ipv4_address: 172.20.0.20
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 65G
+        reservations:
+          memory: 60G
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 50
+      start_period: 60s
+
+  redis-cluster-2:
+    image: redis:7-alpine
+    container_name: redis-cluster-2
+    ports:
+      - "6380:6379"
+      - "16380:16379"
+    volumes:
+      - redis_cluster_2_data:/data
+      - ./redis-cluster.conf:/usr/local/etc/redis/redis-cluster.conf
+    command: redis-server /usr/local/etc/redis/redis-cluster.conf --maxmemory 60gb
+    networks:
+      hippius_net:
+        ipv4_address: 172.20.0.21
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 65G
+        reservations:
+          memory: 60G
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 50
+      start_period: 60s
+
+  redis-cluster-3:
+    image: redis:7-alpine
+    container_name: redis-cluster-3
+    ports:
+      - "6381:6379"
+      - "16381:16379"
+    volumes:
+      - redis_cluster_3_data:/data
+      - ./redis-cluster.conf:/usr/local/etc/redis/redis-cluster.conf
+    command: redis-server /usr/local/etc/redis/redis-cluster.conf --maxmemory 60gb
+    networks:
+      hippius_net:
+        ipv4_address: 172.20.0.22
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 65G
+        reservations:
+          memory: 60G
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 50
+      start_period: 60s
+
+  redis-cluster-init:
+    image: redis:7-alpine
+    container_name: redis-cluster-init
+    depends_on:
+      redis-cluster-1:
+        condition: service_healthy
+      redis-cluster-2:
+        condition: service_healthy
+      redis-cluster-3:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -c
+      - |
+        redis-cli --cluster create \
+          172.20.0.20:6379 \
+          172.20.0.21:6379 \
+          172.20.0.22:6379 \
+          --cluster-replicas 0 \
+          --cluster-yes
+        echo "Redis Cluster initialized successfully!"
+        echo "Node 1: 172.20.0.20:6379 (slots 0-5460)"
+        echo "Node 2: 172.20.0.21:6379 (slots 5461-10922)"
+        echo "Node 3: 172.20.0.22:6379 (slots 10923-16383)"
+    networks:
+      - hippius_net
+
+  redis:
+    profiles:
+      - disabled
+    image: redis:7-alpine
+    container_name: redis-standalone-disabled
+    command: echo "Redis standalone is disabled - using cluster mode"
+
+networks:
+  hippius_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  redis_cluster_1_data:
+  redis_cluster_2_data:
+  redis_cluster_3_data:

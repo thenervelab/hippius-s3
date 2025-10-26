@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "redis-cluster.fullname" . }}-init
+  labels:
+    {{- include "redis-cluster.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "10"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+        {{- include "redis-cluster.selectorLabels" . | nindent 8 }}
+        job: cluster-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: cluster-init
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        command:
+          - /bin/sh
+          - -c
+          - |
+            set -e
+            echo "Waiting for Redis nodes to be ready..."
+            {{- range $i := until (int .Values.replicaCount) }}
+            until redis-cli -h {{ include "redis-cluster.fullname" $ }}-{{ $i }}.{{ include "redis-cluster.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local ping; do
+              echo "Waiting for node {{ $i }}..."
+              sleep 2
+            done
+            {{- end }}
+
+            echo "All nodes are ready. Creating cluster..."
+            redis-cli --cluster create \
+            {{- range $i := until (int .Values.replicaCount) }}
+              {{ include "redis-cluster.fullname" $ }}-{{ $i }}.{{ include "redis-cluster.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.redis.port }} \
+            {{- end }}
+              --cluster-replicas {{ .Values.cluster.replicas }} \
+              --cluster-yes
+
+            echo "Redis Cluster created successfully!"
+            redis-cli --cluster check {{ include "redis-cluster.fullname" . }}-0.{{ include "redis-cluster.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.redis.port }}

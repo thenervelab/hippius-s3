@@ -7,6 +7,8 @@ from typing import TypeVar
 
 import redis.asyncio as async_redis
 from redis.exceptions import BusyLoadingError
+from redis.exceptions import ClusterDownError
+from redis.exceptions import ClusterError
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
@@ -56,7 +58,7 @@ async def with_redis_retry(
         try:
             result = await func(current_client)
             return result, current_client
-        except (BusyLoadingError, RedisConnectionError, RedisTimeoutError) as e:
+        except (BusyLoadingError, RedisConnectionError, RedisTimeoutError, ClusterDownError, ClusterError) as e:
             last_error = e
             if attempt < max_retries - 1:
                 logger.warning(

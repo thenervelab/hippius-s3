@@ -1,0 +1,13 @@
+apiVersion: v2
+name: redis-cluster
+description: Redis Cluster deployment for Hippius S3
+type: application
+version: 1.0.0
+appVersion: "7.0"
+keywords:
+  - redis
+  - cluster
+  - cache
+  - database
+maintainers:
+  - name: Hippius Team

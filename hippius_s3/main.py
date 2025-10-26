@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi import Response
 from fastapi.openapi.utils import get_openapi
+from redis.asyncio.cluster import RedisCluster
 
 from hippius_s3.api.middlewares.audit_log import audit_log_middleware
 from hippius_s3.api.middlewares.backend_hmac import verify_hmac_middleware
@@ -57,6 +58,45 @@ async def postgres_create_pool(database_url: str) -> asyncpg.Pool:
     )
 
 
+async def create_redis_client(redis_url: str, cluster_enabled: bool):
+    """Create Redis client in standalone or cluster mode based on configuration.
+
+    Args:
+        redis_url: Redis connection URL(s) - can be comma-separated for cluster mode
+        cluster_enabled: Whether to use cluster mode
+
+    Returns:
+        Redis client (standalone or cluster)
+    """
+    if cluster_enabled:
+        startup_nodes = []
+        for url in redis_url.split(","):
+            url = url.strip()
+            if "://" in url:
+                parts = url.split("://")[1].split("/")[0]
+                if ":" in parts:
+                    host, port = parts.split(":")
+                else:
+                    host = parts
+                    port = "6379"
+            else:
+                if ":" in url:
+                    host, port = url.split(":")
+                else:
+                    host = url
+                    port = "6379"
+
+            from redis.asyncio.cluster import ClusterNode
+
+            startup_nodes.append(ClusterNode(host, int(port)))
+
+        cluster: RedisCluster = RedisCluster(startup_nodes=startup_nodes, decode_responses=False)
+        await cluster.initialize()
+        logger.info(f"Redis Cluster initialized with {len(startup_nodes)} nodes")
+        return cluster
+    return async_redis.from_url(redis_url)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """FastAPI application lifespan handler."""
@@ -67,8 +107,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.postgres_pool = await postgres_create_pool(config.database_url)
         logger.info("Postgres connection pool created")
 
-        app.state.redis_client = async_redis.from_url(config.redis_url)
-        logger.info("Redis client initialized")
+        app.state.redis_client = await create_redis_client(config.redis_url, config.redis_cluster_enabled)
+        logger.info(f"Redis client initialized ({'cluster' if config.redis_cluster_enabled else 'standalone'} mode)")
 
         app.state.redis_accounts_client = async_redis.from_url(config.redis_accounts_url)
         logger.info("Redis accounts client initialized")

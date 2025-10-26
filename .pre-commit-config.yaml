@@ -20,6 +20,7 @@ repos:
         stages: [pre-commit]
       - id: check-yaml
         stages: [pre-commit]
+        exclude: ^k8s/.*/templates/
       - id: check-added-large-files
         stages: [pre-commit]
       - id: debug-statements
