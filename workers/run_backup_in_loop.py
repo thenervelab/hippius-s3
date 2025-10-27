@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 
 import boto3
@@ -85,7 +86,7 @@ class DatabaseBackup:
                 raise
 
     def create_backup(self, database: str) -> tuple[str, Path]:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
         backup_filename = f"{timestamp}_{database}.bak"
         backup_path = Path(f"/tmp/{backup_filename}")
 
