@@ -18,9 +18,10 @@ from tests.e2e.conftest import is_real_aws
 
 @pytest.fixture(scope="session", autouse=True)
 def _load_test_env() -> Generator[None, None, None]:
-    """Load test environment variables from .env.test file."""
-    test_env_file = Path(__file__).parents[2] / ".env.test"
-    dotenv.load_dotenv(test_env_file, override=True)
+    """Load test environment variables from base + local env files."""
+    project_root = Path(__file__).parents[2]
+    dotenv.load_dotenv(project_root / ".env.test-base", override=True)
+    dotenv.load_dotenv(project_root / ".env.test-local", override=True)
     yield
 
 

@@ -2,10 +2,10 @@
 
 Environment configuration:
 - E2E tests run via docker-compose which loads:
-  - .env.test (base test config with localhost URLs)
-  - .env.test-e2e (docker-compose overrides with service DNS names)
-- Integration tests load .env.test directly via python-dotenv
-- See .env.test and .env.test-e2e for test environment variables
+  - .env.test-base (common test configuration)
+  - .env.test-docker (Docker service DNS names)
+- Integration tests and pytest conftest use .env.test (base + localhost URLs)
+- See .env.test-base, .env.test-local, and .env.test-docker for configuration
 """
 
 import base64

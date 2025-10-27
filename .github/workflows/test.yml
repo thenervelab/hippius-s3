@@ -153,8 +153,9 @@ jobs:
 
       - name: Verify test environment files exist
         run: |
-          test -f .env.test
-          test -f .env.test-e2e
+          test -f .env.test-base
+          test -f .env.test-local
+          test -f .env.test-docker
 
       - name: Prepare .env for docker-compose
         run: |
