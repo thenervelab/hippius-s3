@@ -236,6 +236,98 @@ groups:
         labels:
           severity: critical
 
+      - uid: backup-missing
+        title: Database Backup Missing
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 93600
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'time() - backup_last_success_timestamp{job="otel-collector"}'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 93600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 93600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 93600
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: Alerting
+        execErrState: Error
+        for: 10m
+        annotations:
+          description: 'Last successful backup was {{ if $values.B }}{{ printf "%.1f" (div $values.B.Value 3600) }}{{ else }}N/A{{ end }} hours ago (threshold: 26 hours)'
+          summary: Database backup has not run successfully in over 26 hours
+        labels:
+          severity: critical
+
+      - uid: backup-failure
+        title: Database Backup Failure
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'sum(rate(backup_cycles_total{job="otel-collector",success="false"}[5m])) * 300'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: 'Database backup cycle failed'
+          summary: One or more database backups have failed
+        labels:
+          severity: critical
+
   - orgId: 1
     name: hippius-s3-high-priority
     folder: Hippius S3 Alerts
