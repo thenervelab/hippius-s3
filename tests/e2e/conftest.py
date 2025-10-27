@@ -199,6 +199,23 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
             print(f"API not ready yet, attempt {attempt + 1}/{max_retries}")
             time.sleep(5)
     else:
+        print("\nAPI HEALTH CHECK FAILED")
+        print("=" * 80)
+
+        ps_result = compose_cmd(["ps"])
+        print("\nContainer status:")
+        print(ps_result.stdout.decode() if ps_result.stdout else "(empty)")
+
+        logs_result = compose_cmd(["logs", "--tail=100"])
+        print("\nRecent logs:")
+        print(logs_result.stdout.decode() if logs_result.stdout else "(empty)")
+
+        artifacts_dir = Path(project_root) / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (artifacts_dir / "health_check_ps.txt").write_bytes(ps_result.stdout or b"")
+        (artifacts_dir / "health_check_logs.txt").write_bytes(logs_result.stdout or b"")
+        print(f"\nDiagnostics saved to: {artifacts_dir}")
+
         raise RuntimeError("API service failed to start within timeout")
 
     yield
