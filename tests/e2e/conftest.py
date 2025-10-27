@@ -161,6 +161,13 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
         ]
         result = subprocess.run(up_cmd, env=env, cwd=project_root, capture_output=True, text=True)
         if result.returncode != 0:
+            print("DOCKER COMPOSE UP FAILED")
+            print("=" * 80)
+            print("\nSTDOUT:")
+            print(result.stdout or "(empty)")
+            print("\nSTDERR:")
+            print(result.stderr or "(empty)")
+
             # Capture diagnostics to artifacts for CI visibility
             try:
                 artifacts_dir = Path(project_root) / "artifacts"
@@ -169,9 +176,12 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
                 (artifacts_dir / "compose_up.stderr.txt").write_text(result.stderr or "")
                 ps_out = compose_cmd(["ps"]).stdout
                 (artifacts_dir / "ps.txt").write_bytes(ps_out or b"")
+                print(f"\nDiagnostics saved to: {artifacts_dir}")
             except Exception as e:  # noqa: PERF203
                 print(f"Warning: failed to write compose diagnostics: {e}")
-            raise RuntimeError("docker compose up failed; see artifacts/compose_up.stderr.txt for details")
+            raise RuntimeError(
+                "docker compose up failed; see output above and artifacts/compose_up.stderr.txt for details"
+            )
         print("Waiting for services to be ready...")
         time.sleep(10)
 
