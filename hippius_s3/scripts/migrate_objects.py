@@ -209,19 +209,15 @@ async def migrate_one(
         )
         if parts:
             req = UploadChainRequest(
-                object_key=object_key,
-                bucket_name=bucket_name,
-                upload_id=str(upload_id),
-                chunks=[Chunk(id=int(p["part_number"])) for p in parts],
-                substrate_url=config.substrate_url,
-                ipfs_node=config.ipfs_store_url,
                 address=address,
-                subaccount=address,
-                subaccount_seed_phrase="",
+                bucket_name=bucket_name,
+                object_key=object_key,
                 object_id=str(object_id),
                 object_version=int(new_version),
+                chunks=[Chunk(id=int(p["part_number"])) for p in parts],
+                upload_id=str(upload_id),
             )
-            await enqueue_upload_request(req, redis_client)
+            await enqueue_upload_request(req)
     except Exception:
         log.exception(
             f"Failed to enqueue background publish for migrated {bucket_name}/{object_key} ({object_id}) v={int(new_version)}"
@@ -249,6 +245,11 @@ async def main_async(args: argparse.Namespace) -> int:
     config = get_config()
     db = await asyncpg.connect(config.database_url)  # type: ignore[arg-type]
     redis_client = async_redis.from_url(config.redis_url)
+    redis_queues_client = async_redis.from_url(config.redis_queues_url)
+
+    from hippius_s3.queue import initialize_queue_client
+
+    initialize_queue_client(redis_queues_client)
     try:
         target = int(getattr(config, "target_storage_version", 3))
 
@@ -336,6 +337,9 @@ async def main_async(args: argparse.Namespace) -> int:
                 close2 = getattr(redis_client, "close", None)
                 if callable(close2):
                     close2()
+            close_q = getattr(redis_queues_client, "aclose", None)
+            if callable(close_q):
+                await close_q()
         finally:
             await db.close()
 

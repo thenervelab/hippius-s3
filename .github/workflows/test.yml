@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   lint-and-format:
+    name: Lint & Format (ruff)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -51,7 +52,8 @@ jobs:
             exit 1
           )
 
-  test:
+  type-check:
+    name: Type Check (mypy)
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -81,8 +83,47 @@ jobs:
           source .venv/bin/activate
           mypy hippius_s3 tests
 
+  unit-integration:
+    name: Unit & Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Install dependencies
+        run: |
+          uv venv
+          source .venv/bin/activate
+          uv pip install -e ".[dev]"
+
+      - name: Run unit tests
+        run: |
+          mkdir -p reports
+          source .venv/bin/activate
+          pytest tests/unit -v --junitxml=reports/unit-junit.xml
+
+      - name: Run integration tests
+        run: |
+          source .venv/bin/activate
+          pytest tests/integration -v --junitxml=reports/integration-junit.xml
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-integration-reports-${{ github.run_id }}
+          path: reports/*.xml
+
   e2e:
-    name: E2E Tests (docker-compose)
+    name: E2E Tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -109,6 +150,12 @@ jobs:
         run: |
           docker --version
           docker compose version
+
+      - name: Verify test environment files exist
+        run: |
+          test -f .env.test-base
+          test -f .env.test-local
+          test -f .env.test-docker
 
       - name: Prepare .env for docker-compose
         run: |

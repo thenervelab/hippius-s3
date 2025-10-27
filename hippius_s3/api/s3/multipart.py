@@ -518,7 +518,7 @@ async def upload_part(
                     multipart=bool((json.loads(source_obj.get("metadata") or "{}") or {}).get("multipart", False)),
                     chunks=dl_parts,
                 )
-                await enqueue_download_request(req, request.app.state.redis_client)
+                await enqueue_download_request(req)
 
             # Stream plaintext bytes
             chunks_iter = stream_plan(
@@ -1064,26 +1064,19 @@ async def complete_multipart_upload(
         )
         await enqueue_upload_request(
             UploadChainRequest(
-                object_key=object_key,
+                address=request.state.account.id,
                 bucket_name=bucket_name,
-                upload_id=upload_id,
+                object_key=object_key,
+                object_id=str(object_id),
+                object_version=int(object_version),
                 chunks=[
                     Chunk(
                         id=part["part_number"],
                     )
                     for part in parts
                 ],
-                substrate_url=config.substrate_url,
-                ipfs_node=config.ipfs_store_url,
-                address=request.state.account.id,
-                # use main account instead of subaccount to make encryption
-                # be based on main account not only readable by subaccounts
-                subaccount=request.state.account.main_account,
-                subaccount_seed_phrase=request.state.seed_phrase,
-                object_id=str(object_id),
-                object_version=int(object_version),
+                upload_id=upload_id,
             ),
-            request.app.state.redis_client,
         )
 
         # Create XML response

@@ -30,11 +30,16 @@ EPOCH_SLEEP_SECONDS = 600
 async def run_substrate_loop():
     db = await asyncpg.connect(config.database_url)
     redis_client = async_redis.from_url(config.redis_url)
+    redis_queues_client = async_redis.from_url(config.redis_queues_url)
 
+    from hippius_s3.queue import initialize_queue_client
+
+    initialize_queue_client(redis_queues_client)
     initialize_metrics_collector(redis_client)
 
     logger.info("Starting substrate service...")
     logger.info(f"Redis URL: {config.redis_url}")
+    logger.info(f"Redis Queues URL: {config.redis_queues_url}")
     logger.info(f"Database connected: {config.database_url}")
 
     substrate_worker = SubstrateWorker(db, config)
@@ -43,10 +48,10 @@ async def run_substrate_loop():
         requests = []
 
         while True:
-            substrate_request, redis_client = await with_redis_retry(
-                dequeue_substrate_request,
-                redis_client,
-                config.redis_url,
+            substrate_request, redis_queues_client = await with_redis_retry(
+                lambda rc: dequeue_substrate_request(),
+                redis_queues_client,
+                config.redis_queues_url,
                 "dequeue substrate request",
             )
 
@@ -76,7 +81,7 @@ async def run_substrate_loop():
         except Exception:
             logger.exception(f"Substrate batch submission failed for {len(requests)} requests")
             for req in requests:
-                await enqueue_substrate_request(req, redis_client)
+                await enqueue_substrate_request(req)
             logger.info(f"Requeued {len(requests)} failed requests")
         finally:
             logger.info(f"Sleeping {EPOCH_SLEEP_SECONDS}s until next epoch...")

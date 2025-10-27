@@ -35,11 +35,18 @@ logger = logging.getLogger(__name__)
 async def run_uploader_loop():
     db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=10)
     redis_client = async_redis.from_url(config.redis_url)
+    redis_queues_client = async_redis.from_url(config.redis_queues_url)
 
+    from hippius_s3.queue import initialize_queue_client
+    from hippius_s3.redis_cache import initialize_cache_client
+
+    initialize_queue_client(redis_queues_client)
+    initialize_cache_client(redis_client)
     initialize_metrics_collector(redis_client)
 
     logger.info("Starting uploader service...")
     logger.info(f"Redis URL: {config.redis_url}")
+    logger.info(f"Redis Queues URL: {config.redis_queues_url}")
     logger.info(f"Database pool created: {config.database_url}")
 
     ipfs_service = IPFSService(config, redis_client)
@@ -47,10 +54,10 @@ async def run_uploader_loop():
 
     while True:
         try:
-            moved, redis_client = await with_redis_retry(
-                lambda rc: move_due_retries_to_primary(rc, now_ts=time.time(), max_items=64),
-                redis_client,
-                config.redis_url,
+            moved, redis_queues_client = await with_redis_retry(
+                lambda rc: move_due_retries_to_primary(now_ts=time.time(), max_items=64),
+                redis_queues_client,
+                config.redis_queues_url,
                 "move due retries",
             )
             if moved:
@@ -61,10 +68,10 @@ async def run_uploader_loop():
             continue
 
         try:
-            upload_request, redis_client = await with_redis_retry(
-                dequeue_upload_request,
-                redis_client,
-                config.redis_url,
+            upload_request, redis_queues_client = await with_redis_retry(
+                lambda rc: dequeue_upload_request(),
+                redis_queues_client,
+                config.redis_queues_url,
                 "dequeue upload request",
             )
         except ValidationError as e:
@@ -89,9 +96,7 @@ async def run_uploader_loop():
                     delay_ms = compute_backoff_ms(
                         attempts_next, config.uploader_backoff_base_ms, config.uploader_backoff_max_ms
                     )
-                    await enqueue_retry_request(
-                        upload_request, redis_client, delay_seconds=delay_ms / 1000.0, last_error=err_str
-                    )
+                    await enqueue_retry_request(upload_request, delay_seconds=delay_ms / 1000.0, last_error=err_str)
                     get_metrics_collector().record_uploader_operation(
                         main_account=upload_request.address,
                         success=False,
