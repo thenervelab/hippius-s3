@@ -156,6 +156,11 @@ class Config:
     # Defaults to 3 (latest layout)
     target_storage_version: int = env("HIPPIUS_TARGET_STORAGE_VERSION:3", convert=int)
 
+    # Cachet health monitoring
+    cachet_api_url: str = env("CACHET_API_URL", convert=str)
+    cachet_api_key: str = env("CACHET_API_KEY", convert=str)
+    cachet_component_id: int = env("CACHET_COMPONENT_ID", convert=int)
+
 
 def get_config() -> Config:
     """Get application configuration."""

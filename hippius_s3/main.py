@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi import Response
 from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse
 
 from hippius_s3.api.middlewares.audit_log import audit_log_middleware
 from hippius_s3.api.middlewares.backend_hmac import verify_hmac_middleware
@@ -274,6 +275,11 @@ Disallow: /"""
             content=content,
             media_type="text/plain",
         )
+
+    @app.get("/health", include_in_schema=False, response_class=JSONResponse)
+    async def health():
+        """Health check endpoint for monitoring."""
+        return JSONResponse(content={"status": "healthy"})
 
     app.include_router(user_router, prefix="/user")
     app.include_router(public_router, prefix="")

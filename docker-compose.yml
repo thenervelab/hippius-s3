@@ -319,6 +319,27 @@ services:
     networks:
       - hippius_net
 
+  cachet-health-checker:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    env_file:
+      - .env
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
+      - WORKER_SCRIPT=workers/cachet_health_check.py
+      - ENABLE_WATCHFILES=true
+    volumes:
+      - .:/app
+    networks:
+      - hippius_net
+
 volumes:
   postgres_data:
   ipfs_data:
