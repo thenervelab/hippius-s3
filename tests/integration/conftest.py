@@ -20,7 +20,7 @@ from tests.e2e.conftest import is_real_aws
 def _load_test_env() -> Generator[None, None, None]:
     """Load test environment variables from base + local env files."""
     project_root = Path(__file__).parents[2]
-    dotenv.load_dotenv(project_root / ".env.test-base", override=True)
+    dotenv.load_dotenv(project_root / ".env.defaults", override=True)
     dotenv.load_dotenv(project_root / ".env.test-local", override=True)
     yield
 

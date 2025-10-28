@@ -2,10 +2,10 @@
 
 Environment configuration:
 - E2E tests run via docker-compose which loads:
-  - .env.test-base (common test configuration)
+  - .env.defaults (common test configuration)
   - .env.test-docker (Docker service DNS names)
-- Integration tests and pytest conftest use .env.test (base + localhost URLs)
-- See .env.test-base, .env.test-local, and .env.test-docker for configuration
+- Integration tests and pytest conftest use .env.defaults + .env.test-local (base + localhost URLs)
+- See .env.defaults, .env.test-local, and .env.test-docker for configuration
 """
 
 import base64
