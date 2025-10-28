@@ -9,7 +9,7 @@ services:
   api:
     build: .
     env_file:
-      - .env.test-base
+      - .env.defaults
       - .env.test-docker
     depends_on:
       db:
@@ -39,7 +39,7 @@ services:
       dockerfile: workers/Dockerfile
     command: ["python", "workers/run_uploader_in_loop.py"]
     env_file:
-      - .env.test-base
+      - .env.defaults
       - .env.test-docker
     depends_on:
       db:
@@ -61,7 +61,7 @@ services:
       dockerfile: workers/Dockerfile
     command: ["python", "workers/run_substrate_in_loop.py"]
     env_file:
-      - .env.test-base
+      - .env.defaults
       - .env.test-docker
     depends_on:
       db:
@@ -81,7 +81,7 @@ services:
       dockerfile: workers/Dockerfile
     command: ["python", "workers/run_unpinner_in_loop.py"]
     env_file:
-      - .env.test-base
+      - .env.defaults
       - .env.test-docker
     depends_on:
       db:
@@ -101,7 +101,7 @@ services:
       dockerfile: workers/Dockerfile
     command: ["python", "workers/run_downloader_in_loop.py"]
     env_file:
-      - .env.test-base
+      - .env.defaults
       - .env.test-docker
     depends_on:
       db:
@@ -121,7 +121,7 @@ services:
       dockerfile: workers/Dockerfile
     command: ["python", "workers/chain_pin_checker.py"]
     env_file:
-      - .env.test-base
+      - .env.defaults
       - .env.test-docker
     depends_on:
       db:
@@ -150,7 +150,7 @@ services:
       dockerfile: workers/Dockerfile
     command: ["python", "workers/chain_profile_cacher.py"]
     env_file:
-      - .env.test-base
+      - .env.defaults
       - .env.test-docker
     depends_on:
       db:

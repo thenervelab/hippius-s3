@@ -87,16 +87,37 @@ Works with standard S3 clients including:
 
 ## Configuration
 
+### Environment File Hierarchy
+
+The project uses a layered environment configuration approach with multiple env files:
+
+- **`.env.defaults`** - Base configuration shared across all environments
+  - Feature flags (ENABLE_AUDIT_LOGGING, PUBLISH_TO_CHAIN, etc.)
+  - Worker configuration (retry limits, batch sizes, timeouts)
+  - Security limits (rate limits, request sizes, S3 limits)
+
+- **`.env`** - Production/development overrides and connection strings
+  - Database URLs with production credentials
+  - Redis connection strings for Docker services
+  - IPFS endpoints
+  - Secrets (HMAC keys, seed phrases)
+
+- **`.env.test-local`** - Localhost connection strings for pytest
+  - Used by integration tests running on host machine
+  - Points to localhost:5432, localhost:6379, etc.
+
+- **`.env.test-docker`** - Docker connection (service names) for E2E test containers
+  - Used by E2E tests running in docker-compose
+  - Points to db:5432, redis:6379, etc.
+
+**Loading order:**
+- Main stack: `.env.defaults` → `.env` (production/dev)
+- E2E stack: `.env.defaults` → `.env.test-docker` (containers)
+- Pytest tests: `.env.defaults` → `.env.test-local` (host)
+
 ### Required Environment Variables
 
 Create a `.env` file with the required variables. See [`.env.example`](.env.example) for all configuration options and their descriptions.
-
-### IPFS URLs (optional)
-
-- `HIPPIUS_IPFS_STORE_URL`: IPFS API URL used for storing/pinning (e.g., `http://ipfs:5001` in Docker Compose)
-- `HIPPIUS_IPFS_GET_URL`: IPFS gateway URL used for reads (e.g., `http://ipfs:8080` in Docker Compose)
-
-These can be set via environment variables (see `docker-compose.yml`).
 
 ## Usage Examples
 
@@ -236,12 +257,6 @@ python hippius_s3/scripts/benchmark_copy_vs_append.py \
 ```
 
 The benchmark measures end-to-end latency and throughput for building objects via different copy/append mechanisms, with configurable concurrency and validation options.
-
-## TODO Features
-
-- [ ] **Access Control Lists (ACLs)** - Fine-grained permissions
-- [ ] **Pre-signed URLs** - Temporary access without credentials
-- [ ] **Lifecycle Management** - Automated object expiration
 
 ## License
 

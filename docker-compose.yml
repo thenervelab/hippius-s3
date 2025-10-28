@@ -13,6 +13,7 @@ services:
     ports:
       - "${HOST_BIND_IP:-127.0.0.1}:8000:8000"
     env_file:
+      - .env.defaults
       - .env
     depends_on:
       db:
@@ -177,6 +178,7 @@ services:
       context: .
       dockerfile: workers/Dockerfile
     env_file:
+      - .env.defaults
       - .env
     depends_on:
       db:
@@ -202,6 +204,7 @@ services:
       context: .
       dockerfile: workers/Dockerfile
     env_file:
+      - .env.defaults
       - .env
     depends_on:
       db:
@@ -227,6 +230,7 @@ services:
       context: .
       dockerfile: workers/Dockerfile
     env_file:
+      - .env.defaults
       - .env
     depends_on:
       db:
@@ -250,6 +254,7 @@ services:
       context: .
       dockerfile: workers/Dockerfile
     env_file:
+      - .env.defaults
       - .env
     depends_on:
       db:
@@ -273,6 +278,7 @@ services:
       context: .
       dockerfile: workers/Dockerfile
     env_file:
+      - .env.defaults
       - .env
     depends_on:
       db:
@@ -296,6 +302,7 @@ services:
       context: .
       dockerfile: workers/Dockerfile
     env_file:
+      - .env.defaults
       - .env
     depends_on:
       db:

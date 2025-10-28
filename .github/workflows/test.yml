@@ -153,7 +153,7 @@ jobs:
 
       - name: Verify test environment files exist
         run: |
-          test -f .env.test-base
+          test -f .env.defaults
           test -f .env.test-local
           test -f .env.test-docker
 
