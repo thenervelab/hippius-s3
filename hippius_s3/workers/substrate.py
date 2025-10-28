@@ -93,7 +93,9 @@ class SubstrateWorker:
                     logger.error(f"Substrate submit failed after {attempt} attempts: {e}")
                     raise
                 backoff_ms = compute_substrate_backoff_ms(
-                    attempt, self.config.substrate_retry_base_ms, self.config.substrate_retry_max_ms
+                    attempt,
+                    self.config.substrate_retry_base_ms,
+                    self.config.substrate_retry_max_ms,
                 )
                 logger.warning(f"Substrate submit failed (attempt {attempt}), retrying in {backoff_ms:.0f}ms: {e}")
                 await asyncio.sleep(backoff_ms / 1000.0)

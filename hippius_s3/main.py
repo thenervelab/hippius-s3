@@ -80,6 +80,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.redis_rate_limiting_client = async_redis.from_url(config.redis_rate_limiting_url)
         logger.info("Redis rate limiting client initialized")
 
+        app.state.redis_queues_client = async_redis.from_url(config.redis_queues_url)
+        logger.info("Redis queues client initialized")
+
+        from hippius_s3.queue import initialize_queue_client
+        from hippius_s3.redis_cache import initialize_cache_client
+        from hippius_s3.redis_chain import initialize_chain_client
+
+        initialize_queue_client(app.state.redis_queues_client)
+        logger.info("Queue client initialized")
+
+        initialize_chain_client(app.state.redis_chain_client)
+        logger.info("Chain Redis client initialized")
+
+        initialize_cache_client(app.state.redis_client)
+        logger.info("Cache Redis client initialized")
+
         app.state.rate_limit_service = RateLimitService(app.state.redis_rate_limiting_client)
         logger.info("Rate limiting service initialized")
 
@@ -109,6 +125,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             app.state.redis_accounts_client,
             app.state.redis_chain_client,
             app.state.redis_rate_limiting_client,
+            app.state.redis_queues_client,
         )
         await app.state.background_metrics_collector.start()
         logger.info("Background metrics collection started")
@@ -147,6 +164,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.info("Redis rate limiting client closed")
         except Exception:
             logger.exception("Error shutting down Redis rate limiting client")
+
+        try:
+            await app.state.redis_queues_client.close()
+            logger.info("Redis queues client closed")
+        except Exception:
+            logger.exception("Error shutting down Redis queues client")
 
         try:
             await app.state.postgres_pool.close()
