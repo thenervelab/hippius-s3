@@ -171,7 +171,7 @@ async def build_stream_context(
                 multipart=bool(info.get("multipart")),
                 chunks=dl_parts,
             )
-            await enqueue_download_request(req, redis)
+            await enqueue_download_request(req)
 
     storage_version = int(info.get("storage_version") or 2)
     object_version = int(info.get("object_version") or info.get("current_object_version") or 1)
