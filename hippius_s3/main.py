@@ -22,6 +22,7 @@ from hippius_s3.api.middlewares.metrics import metrics_middleware
 from hippius_s3.api.middlewares.profiler import SpeedscopeProfilerMiddleware
 from hippius_s3.api.middlewares.rate_limit import RateLimitService
 from hippius_s3.api.middlewares.rate_limit import rate_limit_wrapper
+from hippius_s3.api.middlewares.tracing import tracing_middleware
 from hippius_s3.api.middlewares.trailing_slash import trailing_slash_normalizer
 from hippius_s3.api.s3 import errors as s3_errors
 from hippius_s3.api.s3.multipart import router as multipart_router
@@ -31,7 +32,6 @@ from hippius_s3.api.user import router as user_router
 from hippius_s3.cache import RedisDownloadChunksCache
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
-from hippius_s3.ipfs_service import IPFSService
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
 
@@ -76,14 +76,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.redis_chain_client = async_redis.from_url(config.redis_chain_url)
         logger.info("Redis chain client initialized")
 
-        app.state.rate_limit_service = RateLimitService(app.state.redis_client)
+        app.state.redis_rate_limiting_client = async_redis.from_url(config.redis_rate_limiting_url)
+        logger.info("Redis rate limiting client initialized")
+
+        app.state.rate_limit_service = RateLimitService(app.state.redis_rate_limiting_client)
         logger.info("Rate limiting service initialized")
 
-        app.state.banhammer_service = BanHammerService(app.state.redis_client)
+        app.state.banhammer_service = BanHammerService(app.state.redis_rate_limiting_client)
         logger.info("Banhammer service initialized")
 
-        app.state.ipfs_service = IPFSService(config, app.state.redis_client)
-        logger.info("IPFS service initialized with Redis client")
+        # IPFS service not needed in API container; workers own IPFS interactions
 
         # Cache repositories
         app.state.obj_cache = RedisObjectPartsCache(app.state.redis_client)
@@ -105,6 +107,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             app.state.redis_client,
             app.state.redis_accounts_client,
             app.state.redis_chain_client,
+            app.state.redis_rate_limiting_client,
         )
         await app.state.background_metrics_collector.start()
         logger.info("Background metrics collection started")
@@ -137,6 +140,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.info("Redis chain client closed")
         except Exception:
             logger.exception("Error shutting down Redis chain client")
+
+        try:
+            await app.state.redis_rate_limiting_client.close()
+            logger.info("Redis rate limiting client closed")
+        except Exception:
+            logger.exception("Error shutting down Redis rate limiting client")
 
         try:
             await app.state.postgres_pool.close()
@@ -186,6 +195,7 @@ def factory() -> FastAPI:
     # Custom middlewares - middleware("http") executes in REVERSE order
     app.middleware("http")(rate_limit_wrapper)
     app.middleware("http")(metrics_middleware)
+    app.middleware("http")(tracing_middleware)
     app.middleware("http")(audit_log_middleware)
     app.middleware("http")(check_credit_for_all_operations)
     app.middleware("http")(trailing_slash_normalizer)
@@ -246,10 +256,6 @@ Disallow: /"""
     app.include_router(public_router, prefix="")
     app.include_router(s3_router_new, prefix="")
     app.include_router(multipart_router, prefix="")
-
-    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-
-    FastAPIInstrumentor.instrument_app(app)
 
     return app
 

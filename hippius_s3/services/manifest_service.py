@@ -18,17 +18,28 @@ class ManifestService:
         """
         try:
             logger.debug(f"MANIFEST build_initial_download_chunks called for object_id={object_info['object_id']}")
+            # Safely coerce optional object_version to int or None for SQL param $2
+            ov_raw = object_info.get("object_version")
+            try:
+                ov_param = int(ov_raw)  # type: ignore[arg-type]
+            except Exception:
+                ov_param = None
+
             rows = await db.fetch(
                 """
                 SELECT p.part_number,
                        COALESCE(c.cid, p.ipfs_cid) AS cid,
                        p.size_bytes::bigint AS size_bytes
-                FROM parts p
+                FROM objects o
+                JOIN parts p
+                  ON p.object_id = o.object_id
+                 AND p.object_version = COALESCE($2, o.current_object_version)
                 LEFT JOIN cids c ON p.cid_id = c.id
-                WHERE p.object_id = $1
-                ORDER BY part_number
+                WHERE o.object_id = $1
+                ORDER BY p.part_number
                 """,
                 object_info["object_id"],
+                ov_param,
             )
             logger.debug(f"MANIFEST found {len(rows)} parts rows: {[(r[0], r[1], r[2]) for r in rows]}")
 
@@ -67,9 +78,12 @@ class ManifestService:
                 rows = await db.fetch(
                     """
                     SELECT p.part_number, COALESCE(c.cid, p.ipfs_cid) AS cid, p.size_bytes
-                    FROM parts p
+                    FROM objects o
+                    JOIN parts p
+                      ON p.object_id = o.object_id
+                     AND p.object_version = o.current_object_version
                     LEFT JOIN cids c ON p.cid_id = c.id
-                    WHERE p.object_id = $1
+                    WHERE o.object_id = $1
                     ORDER BY p.part_number
                     """,
                     object_id,

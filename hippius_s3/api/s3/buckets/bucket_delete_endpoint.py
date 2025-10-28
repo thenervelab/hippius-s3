@@ -139,19 +139,20 @@ async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redi
                         should_encrypt=False,  # Not needed for unpin
                         object_id=str(obj["object_id"]),
                         cid=obj["ipfs_cid"],
+                        object_version=obj.get("current_object_version"),
                     ),
                     redis_client=redis_client,
                 )
             except Exception:
                 logger.debug("Failed to enqueue unpin for object during bucket delete", exc_info=True)
 
-        # Clean up cache keys under obj:{object_id}:part:N (best effort)
+        # Clean up cache keys under versioned obj namespace (best effort)
         try:
             roc = RedisObjectPartsCache(redis_client)
             for obj in objects:
                 # probe a small set of parts to expire keys
                 for pn in range(0, 4):
-                    await roc.expire(str(obj["object_id"]), pn, ttl=1)
+                    await roc.expire(str(obj["object_id"]), int(obj.get("current_object_version") or 1), pn, ttl=1)
         except Exception:
             logger.debug("Failed to expire object part cache during bucket delete", exc_info=True)
 

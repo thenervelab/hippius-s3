@@ -7,15 +7,17 @@ from typing import Optional
 import psycopg  # type: ignore[import-untyped]
 import redis  # type: ignore[import-untyped]
 
+from hippius_s3.cache import RedisObjectPartsCache
 
-def get_object_id(
+
+def get_object_id_and_version(
     bucket_name: str, object_key: str, *, dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius"
-) -> str:
-    """Fetch object_id for a (bucket_name, object_key) pair from Postgres."""
+) -> tuple[str, int]:
+    """Fetch (object_id, current_object_version) for a (bucket_name, object_key)."""
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
         cur.execute(
             """
-                SELECT o.object_id
+                SELECT o.object_id, o.current_object_version
                 FROM objects o
                 JOIN buckets b ON b.bucket_id = o.bucket_id
                 WHERE b.bucket_name = %s AND o.object_key = %s
@@ -27,7 +29,15 @@ def get_object_id(
         row = cur.fetchone()
         if not row:
             raise RuntimeError("object_not_found")
-        return str(row[0])
+        return str(row[0]), int(row[1] or 1)
+
+
+def get_object_id(
+    bucket_name: str, object_key: str, *, dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius"
+) -> str:
+    """Back-compat helper: return only object_id."""
+    oid, _ver = get_object_id_and_version(bucket_name, object_key, dsn=dsn)
+    return oid
 
 
 essentially_all_parts = range(0, 256)
@@ -66,12 +76,33 @@ def clear_object_cache(
                 parts_list.insert(0, 1)
             parts = parts_list
 
+    # Determine current object_version for namespacing
+    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT o.current_object_version
+            FROM objects o
+            WHERE o.object_id = %s
+            LIMIT 1
+            """,
+            (object_id,),
+        )
+        row = cur.fetchone()
+        object_version = int(row[0]) if row and row[0] is not None else 1
+
+    roc = RedisObjectPartsCache(r)
     for pn in parts:
-        # Delete meta first, then all chunk keys
-        r.delete(f"obj:{object_id}:part:{int(pn)}:meta")
-        # Scan and delete chunk keys
-        for k in r.scan_iter(match=f"obj:{object_id}:part:{int(pn)}:chunk:*"):
+        # Delete meta first, then all chunk keys (versioned namespace)
+        meta_key = roc.build_meta_key(object_id, int(object_version), int(pn))
+        r.delete(meta_key)
+        # Scan and delete chunk keys using cache key prefix
+        base_key = roc.build_key(object_id, int(object_version), int(pn))
+        for k in r.scan_iter(match=f"{base_key}:chunk:*"):
             r.delete(k)
+    # Sanity: assert no meta remains for requested parts
+    for pn in parts:
+        meta_key = roc.build_meta_key(object_id, int(object_version), int(pn))
+        assert not r.exists(meta_key), f"Part {pn} cache not cleared"
 
 
 def read_part_from_cache(
@@ -79,10 +110,27 @@ def read_part_from_cache(
     part_number: int,
     *,
     redis_url: str = "redis://localhost:6379/0",
+    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
 ) -> Optional[bytes]:
     """Assemble part bytes from chunked cache if present; returns None if missing."""
     r = redis.Redis.from_url(redis_url)
-    meta = r.get(f"obj:{object_id}:part:{int(part_number)}:meta")
+    # Fetch current object_version
+    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT o.current_object_version
+            FROM objects o
+            WHERE o.object_id = %s
+            LIMIT 1
+            """,
+            (object_id,),
+        )
+        row = cur.fetchone()
+        object_version = int(row[0]) if row and row[0] is not None else 1
+
+    roc = RedisObjectPartsCache(r)
+    meta_key = roc.build_meta_key(object_id, int(object_version), int(part_number))
+    meta = r.get(meta_key)
     if not meta:
         return None
     import json as _json
@@ -96,7 +144,8 @@ def read_part_from_cache(
         return b""
     chunks: list[bytes] = []
     for i in range(num_chunks):
-        c = r.get(f"obj:{object_id}:part:{int(part_number)}:chunk:{i}")
+        chunk_key = roc.build_chunk_key(object_id, int(object_version), int(part_number), i)
+        c = r.get(chunk_key)
         if not isinstance(c, (bytes, bytearray)):
             return None
         chunks.append(bytes(c))
@@ -124,9 +173,10 @@ def wait_for_parts_cids(
             # First, get object_id for debugging
             cur.execute(
                 """
-                SELECT o.object_id, o.ipfs_cid, c.cid as object_cid
+                SELECT o.object_id, ov.ipfs_cid, c.cid as object_cid
                 FROM objects o
-                LEFT JOIN cids c ON o.cid_id = c.id
+                JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
+                LEFT JOIN cids c ON ov.cid_id = c.id
                 JOIN buckets b ON b.bucket_id = o.bucket_id
                 WHERE b.bucket_name = %s AND o.object_key = %s
                 """,
@@ -141,7 +191,8 @@ def wait_for_parts_cids(
                 SELECT p.part_number, p.ipfs_cid, p.size_bytes, p.etag, c.cid as part_cid
                 FROM parts p
                 LEFT JOIN cids c ON p.cid_id = c.id
-                JOIN objects o ON o.object_id = p.object_id
+                JOIN object_versions ov ON p.object_version = ov.object_version AND ov.object_id = p.object_id
+                JOIN objects o ON o.object_id = ov.object_id
                 JOIN buckets b ON b.bucket_id = o.bucket_id
                 WHERE b.bucket_name = %s AND o.object_key = %s
                 ORDER BY p.part_number
@@ -155,9 +206,10 @@ def wait_for_parts_cids(
                 """
                     SELECT COUNT(*)
                     FROM (
-                        SELECT COALESCE(c.cid, o.ipfs_cid) as cid
+                        SELECT COALESCE(c.cid, ov.ipfs_cid) as cid
                         FROM objects o
-                        LEFT JOIN cids c ON o.cid_id = c.id
+                        JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
+                        LEFT JOIN cids c ON ov.cid_id = c.id
                         JOIN buckets b ON b.bucket_id = o.bucket_id
                         WHERE b.bucket_name = %s AND o.object_key = %s
 
@@ -222,14 +274,18 @@ def make_all_object_parts_pending(
             (object_id,),
         )
 
-        # Also set object-level CID to pending
+        # Also set object-level CID to pending (in object_versions table) for current version
         cur.execute(
             """
-            UPDATE objects
-            SET cid_id = NULL, ipfs_cid = 'pending'
-            WHERE object_id = %s
+            UPDATE object_versions ov
+               SET cid_id = NULL, ipfs_cid = 'pending'
+            FROM objects o
+            WHERE ov.object_id = o.object_id
+              AND ov.object_id = %s
+              AND o.object_id = %s
+              AND ov.object_version = o.current_object_version
             """,
-            (object_id,),
+            (object_id, object_id),
         )
 
         conn.commit()

@@ -12,7 +12,6 @@ from hippius_sdk.substrate import SubstrateClient
 from starlette import status
 
 from hippius_s3.config import Config
-from hippius_s3.ipfs_service import IPFSService
 from hippius_s3.repositories import BucketRepository
 from hippius_s3.repositories import ObjectRepository
 from hippius_s3.repositories import UserRepository
@@ -65,12 +64,6 @@ def get_config(request: Request) -> Config:
     """Extract the application Config from the request."""
     config: Config = request.app.state.config
     return config
-
-
-def get_ipfs_service(request: Request) -> IPFSService:
-    """Extract the IPFS service from the request."""
-    service: IPFSService = request.app.state.ipfs_service
-    return service
 
 
 def get_redis(request: Request) -> async_redis.Redis:

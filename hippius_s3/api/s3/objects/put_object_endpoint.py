@@ -1,33 +1,31 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import uuid
 from datetime import datetime
 from datetime import timezone
 from typing import Any
+from typing import AsyncIterator
 
 from fastapi import Request
 from fastapi import Response
+from opentelemetry import trace
 
 from hippius_s3 import utils
+from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.extensions.append import handle_append
-from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
-from hippius_s3.metadata.meta_writer import write_cache_meta
 from hippius_s3.monitoring import get_metrics_collector
-from hippius_s3.queue import Chunk
-from hippius_s3.queue import UploadChainRequest
-from hippius_s3.queue import enqueue_upload_request
-from hippius_s3.services.crypto_service import CryptoService
-from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.utils import get_query
+from hippius_s3.writer.object_writer import ObjectWriter
+from hippius_s3.writer.queue import enqueue_upload as writer_enqueue_upload
 
 
 logger = logging.getLogger(__name__)
 config = get_config()
+tracer = trace.get_tracer(__name__)
 
 
 async def handle_put_object(
@@ -35,23 +33,27 @@ async def handle_put_object(
     object_key: str,
     request: Request,
     db: Any,
-    ipfs_service: Any,
     redis_client: Any,
 ) -> Response:
     try:
         # Get or create user and bucket for this main account
         main_account_id = request.state.account.main_account
-        await db.fetchrow(
-            get_query("get_or_create_user_by_main_account"),
-            main_account_id,
-            datetime.now(timezone.utc),
-        )
 
-        bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
-            bucket_name,
-            main_account_id,
-        )
+        with tracer.start_as_current_span(
+            "put_object.get_or_create_user", attributes={"main_account_id": main_account_id}
+        ):
+            await db.fetchrow(
+                get_query("get_or_create_user_by_main_account"),
+                main_account_id,
+                datetime.now(timezone.utc),
+            )
+
+        with tracer.start_as_current_span("put_object.get_bucket", attributes={"bucket_name": bucket_name}):
+            bucket = await db.fetchrow(
+                get_query("get_bucket_by_name_and_owner"),
+                bucket_name,
+                main_account_id,
+            )
 
         if not bucket:
             return errors.s3_error_response(
@@ -64,7 +66,9 @@ async def handle_put_object(
         bucket_id = bucket["bucket_id"]
 
         # Read request body properly handling chunked encoding
-        incoming_bytes = await utils.get_request_body(request)
+        with tracer.start_as_current_span("put_object.read_request_body") as span:
+            incoming_bytes = await utils.get_request_body(request)
+            set_span_attributes(span, {"body_size_bytes": len(incoming_bytes)})
         content_type = request.headers.get("Content-Type", "application/octet-stream")
 
         # Detect S4 append semantics via metadata
@@ -73,7 +77,6 @@ async def handle_put_object(
             return await handle_append(
                 request,
                 db,
-                ipfs_service,
                 redis_client,
                 bucket=bucket,
                 bucket_id=bucket_id,
@@ -88,9 +91,7 @@ async def handle_put_object(
         md5_hash = hashlib.md5(file_data).hexdigest()
         logger.info(f"PUT {bucket_name}/{object_key}: size={len(file_data)}, md5={md5_hash}")
 
-        created_at = datetime.now(timezone.utc)
-
-        metadata = {}
+        metadata: dict[str, Any] = {}
         for key, value in request.headers.items():
             if key.lower().startswith("x-amz-meta-"):
                 meta_key = key[11:]
@@ -99,127 +100,92 @@ async def handle_put_object(
                     metadata[meta_key] = value
 
         # Capture previous object (to clean up multipart parts if overwriting)
-        prev = await db.fetchrow(
-            get_query("get_object_by_path"),
-            bucket_id,
-            object_key,
-        )
+        with tracer.start_as_current_span("put_object.check_existing_object") as span:
+            prev = await db.fetchrow(
+                get_query("get_object_by_path"),
+                bucket_id,
+                object_key,
+            )
+            set_span_attributes(span, {"is_overwrite": prev is not None})
 
         # Generate object_id or reuse existing one
         if prev:
-            object_id = str(prev["object_id"])  # ensure string for model validation and cache keys
+            object_id = str(prev["object_id"])
             logger.debug(f"Reusing existing object_id {object_id} for overwrite")
         else:
             object_id = str(uuid.uuid4())
 
-        # Unified cache: write base part as part 1 (1-based indexing)
-        obj_cache = RedisObjectPartsCache(redis_client)
-        # Encrypt-before-Redis: store ciphertext meta first (readiness signal), then chunks
-        chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-
-        from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
-
-        try:
-            key_bytes = await get_or_create_encryption_key_bytes(
-                subaccount_id=request.state.account.main_account,
-                bucket_name=bucket_name,
-            )
-            ct_chunks = CryptoService.encrypt_part_to_chunks(
-                file_data,
-                object_id=object_id,
-                part_number=1,
-                seed_phrase=request.state.seed_phrase,
-                chunk_size=chunk_size,
-                key=key_bytes,
-            )
-        except Exception:
-            from hippius_s3.api.s3.errors import s3_error_response
-
-            return s3_error_response(
-                "InternalError",
-                "Failed to resolve encryption key",
-                status_code=500,
-            )
-        total_ct = sum(len(ct) for ct in ct_chunks)
-        # Write meta first using unified writer; store plaintext size for readers
-        await write_cache_meta(
-            obj_cache,
-            object_id,
-            1,
-            chunk_size=chunk_size,
-            num_chunks=len(ct_chunks),
-            plain_size=len(file_data),
-        )
-        # Then write chunk data
-        for i, ct in enumerate(ct_chunks):
-            await obj_cache.set_chunk(object_id, 1, i, ct)
-        logger.info(f"PUT cache encrypted write object_id={object_id} part=1 chunks={len(ct_chunks)} bytes={total_ct}")
-
         async with db.transaction():
-            await db.fetchrow(
-                get_query("upsert_object_basic"),
-                object_id,
-                bucket_id,
-                object_key,
-                content_type,
-                json.dumps(metadata),
-                md5_hash,
-                file_size,
-                created_at,
-                int(getattr(config, "target_storage_version", 3)),
-            )
+            # Use ObjectWriter streaming upsert/write (single-part)
+            with tracer.start_as_current_span(
+                "put_object.stream_and_upsert",
+                attributes={
+                    "object_id": object_id,
+                    "has_object_id": True,
+                    "file_size_bytes": file_size,
+                    "content_type": content_type,
+                    "storage_version": int(getattr(config, "target_storage_version", 3)),
+                },
+            ) as span:
+                writer = ObjectWriter(db=db, redis_client=redis_client)
 
-            # If overwriting a previous object, remove its parts since we're replacing it
-            try:
-                if prev:
-                    await db.execute("DELETE FROM parts WHERE object_id = $1", prev["object_id"])  # type: ignore[index]
-            except Exception:
-                logger.debug("Failed to cleanup previous parts on overwrite", exc_info=True)
+                async def _iter_once() -> AsyncIterator[bytes]:
+                    yield file_data
 
-        # Ensure upload row and parts(1) placeholder exist atomically before enqueueing
-        async with db.transaction():
-            # Generate a fresh upload_id per simple PUT to avoid conflicts with previous sessions
-            new_upload_id = uuid.uuid4()
-            upload_row = await db.fetchrow(
-                get_query("create_multipart_upload"),
-                new_upload_id,
-                bucket_id,
-                object_key,
-                created_at,
-                content_type,
-                json.dumps(metadata),
-                created_at,
-                uuid.UUID(object_id),
-            )
-            upload_id = upload_row["upload_id"] if upload_row else new_upload_id
+                put_res = await writer.put_simple_stream_full(
+                    bucket_id=bucket_id,
+                    bucket_name=bucket_name,
+                    object_id=object_id,
+                    object_key=object_key,
+                    account_address=request.state.account.main_account,
+                    content_type=content_type,
+                    metadata=metadata,
+                    storage_version=int(getattr(config, "target_storage_version", 3)),
+                    body_iter=_iter_once(),
+                )
 
-            # Insert parts(1) placeholder for simple objects (1-based indexing)
-            await upsert_part_placeholder(
-                db,
-                object_id=object_id,
-                upload_id=str(upload_id),
-                part_number=1,
-                size_bytes=int(file_size),
-                etag=md5_hash,
-                chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
-            )
+                set_span_attributes(
+                    span,
+                    {
+                        "upload_id": put_res.upload_id,
+                        "has_upload_id": True,
+                        "etag": put_res.etag,
+                        "returned_size_bytes": put_res.size_bytes,
+                    },
+                )
 
-        # Only enqueue after DB state (object, upload row, and part 1) is persisted to avoid race with pinner
-        await enqueue_upload_request(
-            payload=UploadChainRequest(
-                substrate_url=config.substrate_url,
-                ipfs_node=config.ipfs_store_url,
+            # Fetch current version to enqueue background publish
+            with tracer.start_as_current_span(
+                "put_object.fetch_current_version",
+                attributes={"object_id": object_id, "has_object_id": True},
+            ) as span:
+                object_row = await db.fetchrow(
+                    get_query("get_object_by_path"),
+                    bucket_id,
+                    object_key,
+                )
+                current_object_version = int(object_row["object_version"] or 1) if object_row else 1
+                set_span_attributes(span, {"current_object_version": current_object_version})
+
+        # Only enqueue after DB state is persisted; use writer queue helper
+        with tracer.start_as_current_span(
+            "put_object.enqueue_upload",
+            attributes={"upload_id": str(put_res.upload_id), "has_upload_id": True},
+        ):
+            await writer_enqueue_upload(
+                redis_client=redis_client,
                 address=request.state.account.main_account,
-                subaccount=request.state.account.main_account,
                 subaccount_seed_phrase=request.state.seed_phrase,
+                subaccount=request.state.account.main_account,
                 bucket_name=bucket_name,
                 object_key=object_key,
                 object_id=object_id,
-                upload_id=str(upload_id),
-                chunks=[Chunk(id=1)],
-            ),
-            redis_client=redis_client,
-        )
+                object_version=int(current_object_version),
+                upload_id=str(put_res.upload_id),
+                chunk_ids=[1],
+                substrate_url=config.substrate_url,
+                ipfs_node=config.ipfs_store_url,
+            )
 
         get_metrics_collector().record_s3_operation(
             operation="put_object",
@@ -240,7 +206,7 @@ async def handle_put_object(
         return Response(
             status_code=200,
             headers={
-                "ETag": f'"{md5_hash}"',
+                "ETag": f'"{put_res.etag}"',
                 "x-amz-meta-append-version": "0",
             },
         )

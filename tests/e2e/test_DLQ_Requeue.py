@@ -10,7 +10,6 @@ import pytest
 import redis  # type: ignore[import-untyped]
 
 from .support.cache import clear_object_cache
-from .support.cache import get_object_id
 from .support.cache import wait_for_parts_cids
 from .support.compose import disable_ipfs_proxy
 from .support.compose import enable_ipfs_proxy
@@ -48,7 +47,9 @@ def test_dlq_requeue_multipart_upload(
     etag2 = boto3_client.upload_part(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=2, Body=part2_data)["ETag"]
 
     # Get object_id for later use (no need to wait for parts yet)
-    object_id = get_object_id(bucket, key)
+    from .support.cache import get_object_id_and_version
+
+    object_id, ov = get_object_id_and_version(bucket, key)
 
     # Break IPFS at the docker layer for a deterministic window
     disable_ipfs_proxy()
@@ -145,9 +146,10 @@ def test_dlq_requeue_multipart_upload(
         # Clear Redis cache to simulate cache eviction
         clear_object_cache(object_id, parts=[0, 1])
 
-        # Verify cache is actually cleared (meta)
-        assert not r.exists(f"obj:{object_id}:part:0:meta"), "Part 0 cache not cleared"
-        assert not r.exists(f"obj:{object_id}:part:1:meta"), "Part 1 cache not cleared"
+        # Verify cache is actually cleared (meta) using versioned keys
+        # version already fetched above
+        assert not r.exists(f"obj:{object_id}:v:{ov}:part:0:meta"), "Part 0 cache not cleared"
+        assert not r.exists(f"obj:{object_id}:v:{ov}:part:1:meta"), "Part 1 cache not cleared"
 
         # Heal IPFS before requeue so uploader can complete successfully
         enable_ipfs_proxy()

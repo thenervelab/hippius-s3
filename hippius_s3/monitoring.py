@@ -27,8 +27,12 @@ class MetricsCollector:
         self._main_db_size = 0
         self._accounts_db_size = 0
         self._chain_db_size = 0
+        self._substrate_db_size = 0
+        self._rate_limiting_db_size = 0
         self._used_mem = 0
         self._max_mem = 0
+        self._pin_checker_missing_cids: dict[str, int] = {}
+        self._object_status_counts: dict[str, int] = {}
         self._setup_metrics()
 
     def _setup_metrics(self) -> None:
@@ -196,6 +200,18 @@ class MetricsCollector:
             description="Total keys in Redis databases (DBSIZE)",
         )
 
+        self.meter.create_observable_gauge(
+            name="pin_checker_missing_cids",
+            callbacks=[self._obs_pin_checker_missing_cids],
+            description="Number of missing CIDs per user (S3 DB vs Chain)",
+        )
+
+        self.meter.create_observable_gauge(
+            name="object_status_counts",
+            callbacks=[self._obs_object_status_counts],
+            description="Total count of objects by status across all users",
+        )
+
     def _obs_redis_used_mem(self, _: object) -> list[metrics.Observation]:
         return [metrics.Observation(self._used_mem, {})]
 
@@ -214,7 +230,17 @@ class MetricsCollector:
             metrics.Observation(self._main_db_size, {"redis_instance": "main"}),
             metrics.Observation(self._accounts_db_size, {"redis_instance": "accounts"}),
             metrics.Observation(self._chain_db_size, {"redis_instance": "chain"}),
+            metrics.Observation(self._substrate_db_size, {"redis_instance": "substrate"}),
+            metrics.Observation(self._rate_limiting_db_size, {"redis_instance": "rate_limiting"}),
         ]
+
+    def _obs_pin_checker_missing_cids(self, _: object) -> list[metrics.Observation]:
+        return [
+            metrics.Observation(count, {"main_account": user}) for user, count in self._pin_checker_missing_cids.items()
+        ]
+
+    def _obs_object_status_counts(self, _: object) -> list[metrics.Observation]:
+        return [metrics.Observation(count, {"status": status}) for status, count in self._object_status_counts.items()]
 
     def record_http_request(
         self,
@@ -468,6 +494,12 @@ class MetricsCollector:
         if duration is not None:
             self.unpinner_duration.record(duration, attributes=attributes)
 
+    def set_pin_checker_missing_cids(self, user: str, count: int) -> None:
+        self._pin_checker_missing_cids[user] = count
+
+    def set_object_status_counts(self, status_counts: dict[str, int]) -> None:
+        self._object_status_counts = status_counts
+
 
 class NullMetricsCollector:
     def __init__(self) -> None:
@@ -505,6 +537,12 @@ class NullMetricsCollector:
         pass
 
     def record_unpinner_operation(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def set_pin_checker_missing_cids(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def set_object_status_counts(self, *args: object, **kwargs: object) -> None:
         pass
 
 

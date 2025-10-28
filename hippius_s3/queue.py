@@ -18,13 +18,15 @@ class Chunk(BaseModel):
     id: int
 
 
-class ChunkToDownload(BaseModel):
+class PartChunkSpec(BaseModel):
+    index: int
     cid: str
-    part_id: int
-    # Temporary backward-compat: accept legacy payloads that include or expect a redis_key
-    redis_key: str | None = None
-    # Optional subset of chunk indices to hydrate for this part (minimal range fetch)
-    chunk_indices: list[int] | None = None
+    cipher_size_bytes: int | None = None
+
+
+class PartToDownload(BaseModel):
+    part_number: int
+    chunks: list[PartChunkSpec]
 
 
 class ChainRequest(BaseModel):
@@ -38,6 +40,7 @@ class ChainRequest(BaseModel):
     # Deprecated: retained for backward compatibility; uploads are pre-encrypted
     should_encrypt: bool = False
     object_id: str
+    object_version: int
 
     # Retry & tracing metadata
     request_id: str | None = None
@@ -69,6 +72,7 @@ class UnpinChainRequest(ChainRequest):
 class DownloadChainRequest(BaseModel):
     request_id: str
     object_id: str
+    object_version: int
     object_key: str
     bucket_name: str
     address: str
@@ -79,7 +83,7 @@ class DownloadChainRequest(BaseModel):
     should_decrypt: bool
     size: int
     multipart: bool
-    chunks: list[ChunkToDownload]
+    chunks: list[PartToDownload]
 
     @property
     def name(self):
@@ -90,6 +94,7 @@ class SubstratePinningRequest(BaseModel):
     cids: list[str]
     address: str
     object_id: str
+    object_version: int
     request_id: str | None = None
     attempts: int = 0
     first_enqueued_at: float | None = None
@@ -117,7 +122,11 @@ async def enqueue_upload_request(
     config = get_config()
     raw = payload.model_dump_json()
     queue_names_str: str = getattr(config, "upload_queue_names", "upload_requests")
-    queue_names: List[str] = [q.strip() for q in queue_names_str.split(",") if q.strip()]
+
+    def _norm(name: str) -> str:
+        return name.strip().strip('"').strip("'")
+
+    queue_names: List[str] = [_norm(q) for q in queue_names_str.split(",") if _norm(q)]
     for qname in queue_names:
         await redis_client.lpush(qname, raw)
     logger.info(f"Enqueued upload request {payload.name=} queues={queue_names}")
@@ -128,7 +137,8 @@ async def dequeue_upload_request(
 ) -> UploadChainRequest | None:
     """Get the next upload request from the Redis queue."""
     config = get_config()
-    queue_name: str = getattr(config, "pinner_consume_queue", "upload_requests")
+    raw_qname: str = getattr(config, "pinner_consume_queue", "upload_requests")
+    queue_name: str = raw_qname.strip().strip('"').strip("'")
     # Use a short blocking timeout to enable timely batch flushes
     result = await redis_client.brpop(queue_name, timeout=0.5)
     if result:
@@ -277,49 +287,3 @@ async def dequeue_substrate_request(
         _, queue_data = result
         return SubstratePinningRequest.model_validate_json(queue_data)
     return None
-
-
-async def enqueue_substrate_retry_request(
-    payload: SubstratePinningRequest,
-    redis_client: async_redis.Redis,
-    delay_seconds: float = 0.0,
-    last_error: str | None = None,
-) -> None:
-    """Add a substrate request to retry queue with delay."""
-    payload.attempts = (payload.attempts or 0) + 1
-    if last_error:
-        payload.last_error = last_error
-
-    retry_key = f"substrate_requests:retry:{int((time.time() + delay_seconds) * 1000)}"
-    await redis_client.lpush(retry_key, payload.model_dump_json())
-    await redis_client.expire(retry_key, int(delay_seconds) + 60)
-    logger.info(
-        f"Enqueued substrate retry request {payload.name=} attempt={payload.attempts} delay={delay_seconds:.2f}s"
-    )
-
-
-async def move_substrate_due_retries_to_primary(
-    redis_client: async_redis.Redis,
-    now_ts: float,
-    max_items: int = 64,
-) -> int:
-    """Move due substrate retry requests back to primary queue."""
-    now_ms = int(now_ts * 1000)
-    moved = 0
-
-    keys = await redis_client.keys("substrate_requests:retry:*")
-    for key in keys:
-        try:
-            key_str = key.decode() if isinstance(key, bytes) else str(key)
-            due_time_ms = int(key_str.split(":")[-1])
-
-            if due_time_ms <= now_ms:
-                items = await redis_client.lrange(key, 0, max_items - 1)
-                for item in items:
-                    await redis_client.lpush(SUBSTRATE_QUEUE, item)
-                    moved += 1
-                await redis_client.delete(key)
-        except Exception:
-            logger.debug(f"Error moving substrate retry key {key}", exc_info=True)
-
-    return moved

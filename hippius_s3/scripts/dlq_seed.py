@@ -56,10 +56,17 @@ async def seed_object_to_dlq(object_id: str) -> bool:
             logger.error(f"No parts found for object_id={object_id}")
             return False
 
-        # Copy each part from Redis cache to DLQ filesystem
+        # Copy each part from Redis cache to DLQ filesystem (use current object_version)
         cache = RedisObjectPartsCache(redis)
+        # Resolve current object version from DB for safety
+        conn2 = await asyncpg.connect(config.database_url)  # type: ignore[arg-type]
+        try:
+            row = await conn2.fetchrow("SELECT current_object_version FROM objects WHERE object_id = $1", object_id)
+            current_version = int(row[0]) if row and row[0] is not None else 1
+        finally:
+            await conn2.close()
         for pn in part_numbers:
-            data = await cache.get(object_id, pn)
+            data = await cache.get(object_id, current_version, pn)
             if data is None:
                 logger.warning(f"No cache bytes for object {object_id} part {pn}; skipping")
                 continue

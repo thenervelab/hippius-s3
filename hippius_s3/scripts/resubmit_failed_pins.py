@@ -81,8 +81,8 @@ async def main() -> None:
             if not object_id or not object_key or not bucket_name or not address:
                 continue
 
-            # Ensure part 0 is still in cache
-            if not await obj_cache.exists(object_id, 1):
+            # Ensure part 0 is still in cache (assume current version = 1 for legacy script)
+            if not await obj_cache.exists(object_id, 1, 1):
                 skipped_no_cache += 1
                 continue
 
@@ -102,6 +102,7 @@ async def main() -> None:
                 object_key=object_key,
                 should_encrypt=should_encrypt,
                 object_id=object_id,
+                object_version=1,
                 chunks=[Chunk(id=1)],
                 upload_id=None,
             )

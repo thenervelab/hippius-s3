@@ -3,13 +3,15 @@
 WITH object_info AS (
     SELECT
         o.object_id,
-        o.multipart,
-        o.cid_id as simple_cid_id,
+        ov.multipart,
+        ov.cid_id as simple_cid_id,
         b.is_public,
-        c.cid as simple_cid
+        c.cid as simple_cid,
+        ov.object_version as object_version
     FROM objects o
+    JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
     JOIN buckets b ON o.bucket_id = b.bucket_id
-    LEFT JOIN cids c ON o.cid_id = c.id
+    LEFT JOIN cids c ON ov.cid_id = c.id
     WHERE o.object_id = $1
 ),
 multipart_chunks AS (
@@ -19,7 +21,7 @@ multipart_chunks AS (
         p.size_bytes,
         oi.object_id
     FROM object_info oi
-    JOIN parts p ON p.object_id = oi.object_id
+    JOIN parts p ON p.object_id = oi.object_id AND p.object_version = oi.object_version
     JOIN cids c ON p.cid_id = c.id
     WHERE oi.multipart = TRUE
     ORDER BY p.part_number ASC
@@ -27,6 +29,7 @@ multipart_chunks AS (
 SELECT
     oi.object_id,
     oi.multipart,
+    oi.object_version,
     NOT oi.is_public as needs_decryption,
     CASE
         WHEN oi.multipart = FALSE THEN

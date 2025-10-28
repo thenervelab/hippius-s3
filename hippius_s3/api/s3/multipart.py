@@ -1,6 +1,5 @@
 """S3-compatible multipart upload implementation for handling large file uploads."""
 
-import asyncio
 import contextlib
 import hashlib
 import json
@@ -17,6 +16,7 @@ from fastapi import Depends
 from fastapi import Request
 from fastapi import Response
 from lxml import etree as ET
+from opentelemetry import trace
 from redis.asyncio import Redis
 from starlette.requests import ClientDisconnect
 
@@ -26,42 +26,20 @@ from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import get_object_reader
-from hippius_s3.metadata.meta_writer import write_cache_meta
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
-from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.object_reader import ObjectReader
-from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.utils import get_query
+from hippius_s3.writer.object_writer import ObjectWriter
 
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["s3-multipart"])
 
 config = get_config()
-
-
-async def get_all_chunk_ids(
-    upload_id: str,
-    db: dependencies.DBConnection,
-) -> list[Chunk]:
-    """Get all chunk IDs and Redis keys for a multipart upload."""
-    parts = await db.fetch(
-        get_query("list_parts"),
-        upload_id,
-    )
-
-    chunks = []
-    for part in parts:
-        chunk = Chunk(
-            id=part["part_id"],
-            redis_key=f"obj:{upload_id}:part:{part['part_number']}",
-        )
-        chunks.append(chunk)
-
-    return chunks
+tracer = trace.get_tracer(__name__)
 
 
 async def get_request_body(request: Request) -> bytes:
@@ -96,24 +74,29 @@ async def handle_post_object(
 
     # Check for uploads parameter (Initiate Multipart Upload)
     if "uploads" in request.query_params:
-        return await initiate_multipart_upload(
-            bucket_name,
-            object_key,
-            request,
-            db,
-        )
+        with tracer.start_as_current_span("multipart.route_initiate"):
+            return await initiate_multipart_upload(
+                bucket_name,
+                object_key,
+                request,
+                db,
+            )
 
     # Check for uploadId parameter (Complete Multipart Upload)
     if "uploadId" in request.query_params:
         upload_id = request.query_params.get("uploadId")
         if upload_id is not None:
-            return await complete_multipart_upload(
-                bucket_name,
-                object_key,
-                upload_id,
-                request,
-                db,
-            )
+            with tracer.start_as_current_span(
+                "multipart.route_complete",
+                attributes={"upload_id": upload_id, "has_upload_id": True},
+            ):
+                return await complete_multipart_upload(
+                    bucket_name,
+                    object_key,
+                    upload_id,
+                    request,
+                    db,
+                )
 
     # Not a multipart operation we handle
     return None
@@ -164,7 +147,11 @@ async def list_parts_internal(
         part_marker = 0
 
     # Fetch all parts and then apply simple pagination (DB already orders)
-    all_parts = await db.fetch(get_query("list_parts"), object_id)
+    all_parts = await db.fetch(
+        get_query("list_parts_for_version"),
+        object_id,
+        int(mpu.get("current_object_version") or 1),
+    )
     visible_parts = [p for p in all_parts if p["part_number"] > part_marker][:max_parts]
 
     is_truncated = len(visible_parts) < len([p for p in all_parts if p["part_number"] > part_marker])
@@ -361,7 +348,6 @@ async def get_all_cached_chunks(
 async def upload_part(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    ipfs_service=Depends(dependencies.get_ipfs_service),
     object_reader: ObjectReader = Depends(get_object_reader),
 ) -> Response:
     """Upload a part for a multipart upload (PUT with partNumber & uploadId)."""
@@ -412,8 +398,9 @@ async def upload_part(
             status_code=400,
         )
 
-    # Get object_id from multipart upload
+    # Get object_id and current_object_version from multipart upload
     object_id = ongoing_multipart_upload["object_id"]
+    current_object_version = ongoing_multipart_upload["current_object_version"]
 
     start_time = time.time()
     logger.info(f"Starting part {part_number} upload for upload {upload_id} (object_id={object_id})")
@@ -462,8 +449,8 @@ async def upload_part(
         if source_bytes is None:
             # Read plaintext via reader pipeline (manifest → plan → stream decrypt)
             try:
-                from hippius_s3.queue import ChunkToDownload  # local import
                 from hippius_s3.queue import DownloadChainRequest  # local import
+                from hippius_s3.queue import PartToDownload  # local import
                 from hippius_s3.queue import enqueue_download_request  # local import
                 from hippius_s3.reader.db_meta import read_parts_manifest  # local import to avoid cycles
                 from hippius_s3.reader.planner import build_chunk_plan  # local import
@@ -472,30 +459,53 @@ async def upload_part(
                 return s3_error_response("InternalError", "Reader pipeline unavailable", status_code=500)
 
             object_id_str = str(source_obj["object_id"])  # type: ignore[index]
-            manifest = await read_parts_manifest(db, object_id_str)
-            plan = await build_chunk_plan(db, object_id_str, manifest, None)
+            src_ver = int(source_obj.get("object_version") or 1)
+            manifest = await read_parts_manifest(db, object_id_str, src_ver)
+            plan = await build_chunk_plan(db, object_id_str, manifest, None, object_version=src_ver)
 
             # Enqueue downloader for any missing chunk indices in cache
             obj_cache = RedisObjectPartsCache(request.app.state.redis_client)
             indices_by_part: dict[int, list[int]] = {}
             for it in plan:
-                exists = await obj_cache.chunk_exists(object_id_str, int(it.part_number), int(it.chunk_index))  # type: ignore[attr-defined]
+                exists = await obj_cache.chunk_exists(object_id_str, src_ver, int(it.part_number), int(it.chunk_index))
                 if not exists:
                     arr = indices_by_part.setdefault(int(it.part_number), [])
                     arr.append(int(it.chunk_index))
             if indices_by_part:
-                dl_parts = [
-                    ChunkToDownload(
-                        cid=str(next((c["cid"] for c in manifest if int(c.get("part_number", 0)) == pn), "")),
-                        part_id=int(pn),
-                        redis_key=None,
-                        chunk_indices=sorted(set(idxs)),
-                    )
-                    for pn, idxs in indices_by_part.items()
-                ]
+                dl_parts: list[PartToDownload] = []
+                for pn, idxs in indices_by_part.items():
+                    try:
+                        rows = await db.fetch(
+                            get_query("get_part_chunks_by_object_and_number"),
+                            object_id_str,
+                            src_ver,
+                            int(pn),
+                        )
+                        all_entries = [
+                            (int(r[0]), str(r[1]), int(r[2]) if r[2] is not None else None) for r in rows or []
+                        ]
+                        chunk_specs = []
+                        include = {int(i) for i in idxs}
+                        for ci, cid, clen in all_entries:
+                            if int(ci) in include:
+                                chunk_specs.append(
+                                    {
+                                        "index": int(ci),
+                                        "cid": str(cid),
+                                        "cipher_size_bytes": int(clen) if clen is not None else None,
+                                    }
+                                )
+                        if not chunk_specs:
+                            continue
+                        dl_parts.append(
+                            PartToDownload(part_number=int(pn), chunks=chunk_specs)  # type: ignore[arg-type]
+                        )
+                    except Exception:
+                        continue
                 req = DownloadChainRequest(
                     request_id=f"{object_id_str}::upload_part_copy",
                     object_id=object_id_str,
+                    object_version=src_ver,
                     object_key=source_object_key,
                     bucket_name=source_bucket_name,
                     address=request.state.account.main_account,
@@ -514,9 +524,9 @@ async def upload_part(
             chunks_iter = stream_plan(
                 obj_cache=obj_cache,
                 object_id=object_id_str,
+                object_version=src_ver,
                 plan=plan,
                 should_decrypt=True,
-                seed_phrase=request.state.seed_phrase,
                 sleep_seconds=float(config.http_download_sleep_loop),
                 address=request.state.account.main_account,
                 bucket_name=source_bucket_name,
@@ -593,7 +603,7 @@ async def upload_part(
             status_code=400,
         )
 
-    # Cache part data in chunked layout (no IPFS upload for parts)
+    # Cache part data in chunked layout via ObjectWriter (no IPFS upload for parts)
     redis_client = request.app.state.redis_client
     obj_cache = RedisObjectPartsCache(redis_client)
 
@@ -643,53 +653,25 @@ async def upload_part(
 
         # Store in Redis via chunked cache API (encrypt for private, meta-first for readiness)
         redis_start = time.time()
-        chunk_size = int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-        # Always encrypt chunks before caching
-        from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
-
-        try:
-            key_bytes = await get_or_create_encryption_key_bytes(
-                subaccount_id=request.state.account.main_account,
-                bucket_name=str(dest_bucket_name or ""),
-            )
-        except Exception:
-            return s3_error_response("InternalError", "Failed to resolve encryption key", status_code=500)
-        chunks_bytes = CryptoService.encrypt_part_to_chunks(
-            file_data,
+        # Route through ObjectWriter for standardized behavior
+        writer = ObjectWriter(db=db, redis_client=redis_client)
+        part_res = await writer.mpu_upload_part(
+            upload_id=str(upload_id),
             object_id=str(object_id),
-            part_number=int(part_number),
+            object_version=int(current_object_version),
+            bucket_name=str(dest_bucket_name or ""),
+            account_address=request.state.account.main_account,
             seed_phrase=request.state.seed_phrase,
-            chunk_size=chunk_size,
-            key=key_bytes,
+            part_number=int(part_number),
+            body_bytes=file_data,
         )
-
-        # Write meta first for readiness (store plaintext size)
-        await write_cache_meta(
-            obj_cache,
-            str(object_id),
-            int(part_number),
-            chunk_size=chunk_size,
-            num_chunks=len(chunks_bytes),
-            plain_size=len(file_data),
-            ttl=1800,
-        )
-        # Then write chunk data
-        for i, piece in enumerate(chunks_bytes):
-            await obj_cache.set_chunk(str(object_id), int(part_number), i, piece, ttl=1800)
         redis_time = time.time() - redis_start
         logger.debug(
             f"Part {part_number}: Cached via RedisObjectPartsCache in {redis_time:.3f}s (object_id={object_id}, encrypted=True)"
         )
 
         # Create mock part result (no IPFS upload needed for individual parts)
-        md5_start = time.time()
-        # Move MD5 calculation to thread pool to avoid blocking event loop
-        loop = asyncio.get_event_loop()
-        md5_hash = await loop.run_in_executor(None, lambda: hashlib.md5(file_data).hexdigest())
-        md5_time = time.time() - md5_start
-        logger.debug(f"Part {part_number}: MD5 calculation took {md5_time:.3f}s (threaded) md5={md5_hash}")
-
-        etag = f"{md5_hash}-{part_number}" if not copy_source else md5_hash
+        etag = part_res.etag
 
         part_result = {
             "size_bytes": file_size,
@@ -699,16 +681,7 @@ async def upload_part(
 
         # Save the part information in the database
         db_start = time.time()
-        await upsert_part_placeholder(
-            db,
-            object_id=str(object_id),
-            upload_id=str(upload_id),
-            part_number=int(part_number),
-            size_bytes=int(file_size),
-            etag=str(etag),
-            # Treat plaintext and ciphertext identically for chunking
-            chunk_size_bytes=int(getattr(config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
-        )
+        # (placeholder upsert already handled by writer)
         db_time = time.time() - db_start
         logger.debug(f"Part {part_number}: Database insert took {db_time:.3f}s")
 
@@ -747,13 +720,13 @@ async def upload_part(
         try:
             # Delete meta and any chunk keys
             try:
-                meta_key = f"obj:{object_id}:part:{part_number}:meta"
+                # Delete versioned meta and chunk keys using cache helpers
+                object_version = int(ongoing_multipart_upload.get("current_object_version") or 1)
+                delegate = RedisObjectPartsCache(redis_client)
+                meta_key = delegate.build_meta_key(str(object_id), object_version, int(part_number))
                 await redis_client.delete(meta_key)
-            except Exception:
-                pass
-            try:
-                # Best-effort wildcard delete for chunk keys (non-blocking SCAN)
-                async for k in redis_client.scan_iter(f"obj:{object_id}:part:{part_number}:chunk:*", count=1000):
+                base_key = delegate.build_key(str(object_id), object_version, int(part_number))
+                async for k in redis_client.scan_iter(f"{base_key}:chunk:*", count=1000):
                     await redis_client.delete(k)
             except Exception:
                 pass
@@ -769,7 +742,6 @@ async def abort_multipart_upload(
     __: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    ___=Depends(dependencies.get_ipfs_service),
 ) -> Response:
     """Abort a multipart upload (DELETE with uploadId)."""
     upload_id = request.query_params.get("uploadId")
@@ -796,18 +768,21 @@ async def abort_multipart_upload(
         object_id = multipart_upload["object_id"]
 
         # Clean up Redis keys for cached parts (meta + chunks)
+        object_version = int(multipart_upload.get("current_object_version") or 1)
         parts = await db.fetch(
-            get_query("list_parts"),
+            get_query("list_parts_for_version"),
             object_id,
+            object_version,
         )
         if parts:
             redis_client = request.app.state.redis_client
+            delegate = RedisObjectPartsCache(redis_client)
             for part in parts:
                 part_num = int(part["part_number"])
-                # Delete meta key
-                await redis_client.delete(f"obj:{object_id}:part:{part_num}:meta")
-                # Delete all chunk keys for this part using SCAN (non-blocking)
-                async for key in redis_client.scan_iter(f"obj:{object_id}:part:{part_num}:chunk:*"):
+                meta_key = delegate.build_meta_key(str(object_id), object_version, part_num)
+                await redis_client.delete(meta_key)
+                base_key = delegate.build_key(str(object_id), object_version, part_num)
+                async for key in redis_client.scan_iter(f"{base_key}:chunk:*"):
                     await redis_client.delete(key)
 
         # Fully remove the multipart upload (and cascade parts) so it disappears from listings immediately
@@ -931,11 +906,13 @@ async def list_multipart_uploads(
 
 async def hash_all_etags(
     object_id: str,
+    object_version: int,
     db: dependencies.DBConnection,
 ) -> str:
     parts = await db.fetch(
-        get_query("get_parts_etags"),
+        get_query("get_parts_etags_for_version"),
         object_id,
+        object_version,
     )
 
     etags = [part["etag"].split("-")[0] for part in parts]
@@ -991,7 +968,8 @@ async def complete_multipart_upload(
             else:
                 # Fallback: recompute combined ETag from parts by object_id
                 try:
-                    final_etag = await hash_all_etags(object_id, db)
+                    object_version = int(multipart_upload.get("current_object_version") or 1)
+                    final_etag = await hash_all_etags(object_id, object_version, db)
                 except Exception:
                     final_etag = "completed"
             xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -1040,10 +1018,12 @@ async def complete_multipart_upload(
             )
         part_info.sort(key=lambda x: x[0])
 
-        # Get the parts from the database
+        # Get the parts from the database for the version captured on MPU initiation
+        object_version = int(multipart_upload.get("current_object_version") or 1)
         db_parts = await db.fetch(
-            get_query("list_parts"),
+            get_query("list_parts_for_version"),
             object_id,
+            object_version,
         )
         logger.info(f"Found {len(db_parts)} parts for upload {upload_id} (object_id={object_id})")
         db_parts_dict = {p["part_number"]: p for p in db_parts}
@@ -1065,84 +1045,23 @@ async def complete_multipart_upload(
                 status_code=400,
             )
 
-        final_md5_hash = await hash_all_etags(
-            object_id,
-            db,
+        writer = ObjectWriter(db=db, redis_client=request.app.state.redis_client)
+        complete_res = await writer.mpu_complete(
+            bucket_name=bucket_name,
+            object_id=str(object_id),
+            object_key=object_key,
+            upload_id=str(upload_id),
+            object_version=int(object_version),
+            address=request.state.account.main_account,
+            seed_phrase=request.state.seed_phrase,
         )
-        logger.info(f"MPU complete: upload_id={upload_id} key={object_key} final_etag={final_md5_hash}")
-
-        # Upload concatenated file to IPFS
-        # Re-enable encryption for multipart uploads based on bucket privacy
-        should_encrypt = not bucket["is_public"]
-
-        # Prepare metadata
-        metadata = multipart_upload["metadata"] if multipart_upload["metadata"] else {}
-        if isinstance(metadata, str):
-            metadata = json.loads(metadata)
-
-        # Add metadata for final concatenated file
-        metadata.update(
-            {
-                "multipart": True,
-                "encrypted": should_encrypt,
-            }
-        )
-
-        # Mark the upload as completed
-        await db.fetchrow(
-            get_query("complete_multipart_upload"),
-            upload_id,
-        )
-
-        # Do not delete the object row; it was created at initiation. Update it below.
-
-        # Calculate total size from all parts
-        parts = await db.fetch(
-            get_query("list_parts"),
-            object_id,
-        )
-        total_size = sum(part["size_bytes"] for part in parts)
-        logger.info(
-            f"MPU sizes: upload_id={upload_id} total_size={total_size} parts={[p['size_bytes'] for p in parts]}"
-        )
-        # Also log each part's ETag and size for debugging
-        try:
-            part_rows = await db.fetch(get_query("list_parts"), object_id)
-            dbg = [
-                {
-                    "part": r["part_number"],
-                    "size": r["size_bytes"],
-                    "etag": r["etag"],
-                }
-                for r in part_rows
-            ]
-            logger.info(f"MPU parts detail: upload_id={upload_id} parts={dbg}")
-        except Exception:
-            logger.debug("Failed to log parts detail after MPU", exc_info=True)
-
-        # Update the existing object with final metadata and touch last_modified
-        await db.execute(
-            """
-            UPDATE objects
-            SET md5_hash = $1,
-                size_bytes = $2,
-                last_modified = NOW(),
-                status = 'publishing'
-            WHERE object_id = $3
-            """,
-            final_md5_hash,
-            total_size,
-            object_id,
-        )
-
-        # Mark multipart upload as completed and only enqueue after DB commit
-        async with db.transaction():
-            await db.execute(
-                "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
-                upload_id,
-            )
 
         # After commit, enqueue background publish
+        parts = await db.fetch(
+            get_query("list_parts_for_version"),
+            object_id,
+            object_version,
+        )
         await enqueue_upload_request(
             UploadChainRequest(
                 object_key=object_key,
@@ -1162,6 +1081,7 @@ async def complete_multipart_upload(
                 subaccount=request.state.account.main_account,
                 subaccount_seed_phrase=request.state.seed_phrase,
                 object_id=str(object_id),
+                object_version=int(object_version),
             ),
             request.app.state.redis_client,
         )
@@ -1172,7 +1092,7 @@ async def complete_multipart_upload(
   <Location>http://{request.headers.get("Host", "")}/{bucket_name}/{object_key}</Location>
   <Bucket>{bucket_name}</Bucket>
   <Key>{object_key}</Key>
-  <ETag>"{final_md5_hash}"</ETag>
+  <ETag>"{complete_res.etag}"</ETag>
 </CompleteMultipartUploadResult>
 """.encode("utf-8")
 
@@ -1189,7 +1109,7 @@ async def complete_multipart_upload(
         )
         get_metrics_collector().record_data_transfer(
             operation="complete_multipart_upload",
-            bytes_transferred=total_size,
+            bytes_transferred=int(complete_res.size_bytes),
             bucket_name=bucket_name,
             main_account=request.state.account.main_account,
             subaccount_id=request.state.account.id,

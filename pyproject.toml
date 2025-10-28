@@ -15,7 +15,6 @@ authors = [
 dependencies = [
     "fastapi>=0.115.12",
     "uvicorn[standard]>=0.23.0",
-    "gunicorn>=21.2.0",
     "asyncpg>=0.28.0",
     "pydantic>=2.3.0",
     "python-dotenv>=1.0.0",
@@ -182,6 +181,11 @@ disable_error_code = ["no-untyped-def"]
 module = "hippius_s3.api.middlewares.credit_check"
 disallow_untyped_defs = false
 disable_error_code = ["no-untyped-def", "no-any-return"]
+
+[[tool.mypy.overrides]]
+module = "hippius_s3.workers.uploader"
+disallow_untyped_defs = false
+disable_error_code = ["no-untyped-def", "abstract"]
 
 [[tool.mypy.overrides]]
 module = "hippius_s3.main"

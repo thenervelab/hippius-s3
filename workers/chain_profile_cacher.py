@@ -154,27 +154,33 @@ async def run_chain_profile_cacher_loop():
 
     try:
         while True:
-            # Get all unique users
+            # Get all unique users from S3 database
             users = await get_all_unique_users(db)
-            logger.info(f"Caching chain profiles for {len(users)} users")
+            logger.info(f"Found {len(users)} unique S3 users")
+            users_set = set(users)
 
-            # Pre-fetch all user profiles once (more efficient than per-user calls)
+            # Pre-fetch all user profiles from chain
             logger.info("Fetching all user profiles from chain...")
             substrate_client = SubstrateClient(config.substrate_url)
             try:
                 substrate_client.connect()
-                all_profiles = substrate_client.fetch_user_profiles()
-                logger.info(f"Fetched profiles for {len(all_profiles)} users")
+                all_profiles_raw = substrate_client.fetch_user_profiles()
+                logger.info(f"Fetched profiles for {len(all_profiles_raw)} total substrate users")
+
+                # Filter to only S3 users
+                all_profiles = {user: cids for user, cids in all_profiles_raw.items() if user in users_set}
+                logger.info(f"Filtered to {len(all_profiles)} S3 users with profiles")
             finally:
                 substrate_client.close()
 
-            # Pre-fetch all storage requests once (more efficient than per-user calls)
-            logger.info("Fetching all storage requests from chain...")
+            # Pre-fetch storage requests from chain (filtered to S3 users only)
+            logger.info(f"Fetching storage requests from chain for {len(users_set)} S3 users...")
             storage_requests_dict = await get_all_storage_requests(
                 config.substrate_url,
                 http_client,
+                filter_users=users_set,
             )
-            logger.info(f"Fetched storage requests for {len(storage_requests_dict)} users")
+            logger.info(f"Fetched storage requests for {len(storage_requests_dict)} S3 users")
 
             # Process each user
             for user in users:
@@ -194,7 +200,7 @@ async def run_chain_profile_cacher_loop():
 
     finally:
         await http_client.aclose()
-        await redis_chain.aclose()
+        await redis_chain.close()
         await db.close()
 
 

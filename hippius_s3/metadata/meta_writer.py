@@ -6,6 +6,7 @@ from typing import Any
 async def write_cache_meta(
     obj_cache: Any,
     object_id: str,
+    object_version: int,
     part_number: int,
     *,
     chunk_size: int,
@@ -31,6 +32,6 @@ async def write_cache_meta(
         "size_bytes": int(plain_size),
     }
     if ttl is not None:
-        await obj_cache.set_meta(object_id, int(part_number), **kwargs, ttl=int(ttl))  # type: ignore[arg-type]
+        await obj_cache.set_meta(object_id, int(object_version), int(part_number), **kwargs, ttl=int(ttl))  # type: ignore[arg-type]
     else:
-        await obj_cache.set_meta(object_id, int(part_number), **kwargs)  # type: ignore[arg-type]
+        await obj_cache.set_meta(object_id, int(object_version), int(part_number), **kwargs)  # type: ignore[arg-type]
