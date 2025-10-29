@@ -320,6 +320,29 @@ services:
     networks:
       - hippius_net
 
+  janitor:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    env_file:
+      - .env.defaults
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - WORKER_SCRIPT=workers/run_janitor_in_loop.py
+      - ENABLE_WATCHFILES=true
+    volumes:
+      - .:/app
+      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
+    networks:
+      - hippius_net
+
   chain-pin-checker:
     build:
       context: .
