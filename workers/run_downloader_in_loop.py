@@ -256,11 +256,6 @@ async def run_downloader_loop():
                 continue
             except Exception as e:
                 logger.error(f"Failed to dequeue/parse download request, skipping: {e}", exc_info=True)
-                # Skip bad item (already removed by BRPOP) and continue loop
-                continue
-            except Exception as e:
-                logger.error(f"Failed to dequeue/parse download request, skipping: {e}", exc_info=True)
-                # Skip bad item (already removed by BRPOP) and continue loop
                 continue
 
             if download_request:
