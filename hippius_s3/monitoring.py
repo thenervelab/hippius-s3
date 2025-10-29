@@ -33,6 +33,7 @@ class MetricsCollector:
         self._max_mem = 0
         self._pin_checker_missing_cids: dict[str, int] = {}
         self._object_status_counts: dict[str, int] = {}
+        self._backup_last_success_timestamp = 0.0
         self._setup_metrics()
 
     def _setup_metrics(self) -> None:
@@ -182,6 +183,42 @@ class MetricsCollector:
             unit="s",
         )
 
+        self.backup_cycles_total = self.meter.create_counter(
+            name="backup_cycles_total",
+            description="Total backup cycles completed",
+            unit="1",
+        )
+
+        self.backup_database_duration = self.meter.create_histogram(
+            name="backup_database_duration_seconds",
+            description="Duration to backup each database",
+            unit="s",
+        )
+
+        self.backup_database_size = self.meter.create_histogram(
+            name="backup_database_size_bytes",
+            description="Backup file size per database",
+            unit="bytes",
+        )
+
+        self.backup_upload_duration = self.meter.create_histogram(
+            name="backup_upload_duration_seconds",
+            description="S3 upload duration per database backup",
+            unit="s",
+        )
+
+        self.backup_databases_count = self.meter.create_counter(
+            name="backup_databases_count",
+            description="Count of databases backed up per cycle",
+            unit="1",
+        )
+
+        self.backup_cleanup_deleted_count = self.meter.create_counter(
+            name="backup_cleanup_deleted_count",
+            description="Old backups deleted during retention cleanup",
+            unit="1",
+        )
+
         self.meter.create_observable_gauge(
             name="redis_memory_used_bytes", callbacks=[self._obs_redis_used_mem], description="Redis used memory bytes"
         )
@@ -210,6 +247,12 @@ class MetricsCollector:
             name="object_status_counts",
             callbacks=[self._obs_object_status_counts],
             description="Total count of objects by status across all users",
+        )
+
+        self.meter.create_observable_gauge(
+            name="backup_last_success_timestamp",
+            callbacks=[self._obs_backup_last_success],
+            description="Unix timestamp of last successful backup cycle",
         )
 
     def _obs_redis_used_mem(self, _: object) -> list[metrics.Observation]:
@@ -241,6 +284,9 @@ class MetricsCollector:
 
     def _obs_object_status_counts(self, _: object) -> list[metrics.Observation]:
         return [metrics.Observation(count, {"status": status}) for status, count in self._object_status_counts.items()]
+
+    def _obs_backup_last_success(self, _: object) -> list[metrics.Observation]:
+        return [metrics.Observation(self._backup_last_success_timestamp, {})]
 
     def record_http_request(
         self,
@@ -500,6 +546,44 @@ class MetricsCollector:
     def set_object_status_counts(self, status_counts: dict[str, int]) -> None:
         self._object_status_counts = status_counts
 
+    def record_backup_operation(
+        self,
+        database_name: str,
+        success: bool,
+        backup_duration: Optional[float] = None,
+        backup_size_bytes: Optional[int] = None,
+        upload_duration: Optional[float] = None,
+    ) -> None:
+        attributes = {
+            "database": database_name,
+            "success": str(success).lower(),
+        }
+
+        if backup_duration is not None:
+            self.backup_database_duration.record(backup_duration, attributes=attributes)
+
+        if backup_size_bytes is not None:
+            self.backup_database_size.record(backup_size_bytes, attributes=attributes)
+
+        if upload_duration is not None:
+            self.backup_upload_duration.record(upload_duration, attributes=attributes)
+
+        if success:
+            self.backup_databases_count.add(1, attributes=attributes)
+
+    def record_backup_cycle(self, success: bool, num_databases: int = 0) -> None:
+        attributes = {"success": str(success).lower()}
+        self.backup_cycles_total.add(1, attributes=attributes)
+
+        if success:
+            import time
+
+            self._backup_last_success_timestamp = time.time()
+
+    def record_backup_cleanup(self, database_name: str, deleted_count: int) -> None:
+        attributes = {"database": database_name}
+        self.backup_cleanup_deleted_count.add(deleted_count, attributes=attributes)
+
 
 class NullMetricsCollector:
     def __init__(self) -> None:
@@ -545,6 +629,15 @@ class NullMetricsCollector:
     def set_object_status_counts(self, *args: object, **kwargs: object) -> None:
         pass
 
+    def record_backup_operation(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_backup_cycle(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_backup_cleanup(self, *args: object, **kwargs: object) -> None:
+        pass
+
 
 _metrics_collector: MetricsCollector | NullMetricsCollector = NullMetricsCollector()
 
@@ -575,6 +668,113 @@ def initialize_metrics_collector(redis_client: async_redis.Redis) -> MetricsColl
     collector = MetricsCollector(redis_client)
     set_metrics_collector(collector)
     return collector
+
+
+class SimpleMetricsCollector:
+    def __init__(self) -> None:
+        self.meter = metrics.get_meter(__name__)
+        self._backup_last_success_timestamp = 0.0
+        self._setup_backup_metrics()
+
+    def _setup_backup_metrics(self) -> None:
+        self.backup_cycles_total = self.meter.create_counter(
+            name="backup_cycles_total",
+            description="Total backup cycles completed",
+            unit="1",
+        )
+
+        self.backup_database_duration = self.meter.create_histogram(
+            name="backup_database_duration_seconds",
+            description="Duration to backup each database",
+            unit="s",
+        )
+
+        self.backup_database_size = self.meter.create_histogram(
+            name="backup_database_size_bytes",
+            description="Backup file size per database",
+            unit="bytes",
+        )
+
+        self.backup_upload_duration = self.meter.create_histogram(
+            name="backup_upload_duration_seconds",
+            description="S3 upload duration per database backup",
+            unit="s",
+        )
+
+        self.backup_databases_count = self.meter.create_counter(
+            name="backup_databases_count",
+            description="Count of databases backed up per cycle",
+            unit="1",
+        )
+
+        self.backup_cleanup_deleted_count = self.meter.create_counter(
+            name="backup_cleanup_deleted_count",
+            description="Old backups deleted during retention cleanup",
+            unit="1",
+        )
+
+        self.meter.create_observable_gauge(
+            name="backup_last_success_timestamp",
+            callbacks=[self._obs_backup_last_success],
+            description="Unix timestamp of last successful backup cycle",
+        )
+
+    def _obs_backup_last_success(self, _: object) -> list[metrics.Observation]:
+        return [metrics.Observation(self._backup_last_success_timestamp, {})]
+
+    def record_backup_operation(
+        self,
+        database_name: str,
+        success: bool,
+        backup_duration: Optional[float] = None,
+        backup_size_bytes: Optional[int] = None,
+        upload_duration: Optional[float] = None,
+    ) -> None:
+        attributes = {
+            "database": database_name,
+            "success": str(success).lower(),
+        }
+
+        if backup_duration is not None:
+            self.backup_database_duration.record(backup_duration, attributes=attributes)
+
+        if backup_size_bytes is not None:
+            self.backup_database_size.record(backup_size_bytes, attributes=attributes)
+
+        if upload_duration is not None:
+            self.backup_upload_duration.record(upload_duration, attributes=attributes)
+
+        if success:
+            self.backup_databases_count.add(1, attributes=attributes)
+
+    def record_backup_cycle(self, success: bool, num_databases: int = 0) -> None:
+        attributes = {"success": str(success).lower()}
+        self.backup_cycles_total.add(1, attributes=attributes)
+
+        if success:
+            import time
+
+            self._backup_last_success_timestamp = time.time()
+
+    def record_backup_cleanup(self, database_name: str, deleted_count: int) -> None:
+        attributes = {"database": database_name}
+        self.backup_cleanup_deleted_count.add(deleted_count, attributes=attributes)
+
+
+def initialize_metrics_simple(service_name: str = "hippius-s3-backup") -> SimpleMetricsCollector:
+    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
+
+    resource = Resource.create({"service.name": service_name})
+
+    metric_reader = PeriodicExportingMetricReader(
+        OTLPMetricExporter(endpoint=endpoint, insecure=True),
+        export_interval_millis=10000,
+    )
+
+    provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+    metrics.set_meter_provider(provider)
+
+    return SimpleMetricsCollector()
 
 
 def enrich_span_with_account_info(
