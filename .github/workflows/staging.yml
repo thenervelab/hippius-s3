@@ -58,10 +58,11 @@ jobs:
               git clone -b staging ${REPO_URL} .
             else
               echo "Updating git repository..."
-              # Try to pull latest changes
-              git fetch origin staging
-              git checkout staging || git checkout -b staging origin/staging
-              git pull origin staging
+              # Sync to remote even after force-pushes
+              git fetch origin --prune
+              git checkout -B staging origin/staging
+              git reset --hard origin/staging
+              git clean -ffd
             fi
 
             # Ensure external Docker network exists

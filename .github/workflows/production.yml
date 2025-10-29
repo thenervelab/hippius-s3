@@ -58,12 +58,11 @@ jobs:
               git clone -b production ${REPO_URL} .
             else
               echo "Updating git repository..."
-              # Stash any local changes before pulling
-              git stash
-              # Try to pull latest changes
-              git fetch origin production
-              git checkout production || git checkout -b production origin/production
-              git pull origin production
+              # Sync to remote even after force-pushes
+              git fetch origin --prune
+              git checkout -B production origin/production
+              git reset --hard origin/production
+              git clean -ffd
             fi
 
             # Ensure external Docker network exists
