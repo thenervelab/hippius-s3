@@ -52,20 +52,20 @@ Derivation rule
   - rep-v1 (< threshold): re-encrypts chunks with replica-specific nonces and streams replicas directly to IPFS (no Redis duplication), then persists replica CIDs in DB.
 - Separate DLQs and retry policies for isolation.
 
-### Redis layout
+### Storage layout (Redis + Filesystem)
 
 - Data (existing):
-  - meta: `obj:{oid}:v:{ov}:part:{pn}:meta`
-  - chunk bytes: `obj:{oid}:v:{ov}:part:{pn}:chunk:{i}`
+  - Redis meta: `obj:{oid}:v:{ov}:part:{pn}:meta`
+  - Redis chunks: `obj:{oid}:v:{ov}:part:{pn}:chunk:{i}`
+  - Filesystem store (durable): `<root>/<oid>/v<ov>/part_<pn>/{chunk_<i>.bin, meta.json}`
 - EC meta (new; versioned, follows :meta pattern):
   - `obj:{oid}:v:{ov}:part:{pn}:pv:{pv}:meta`
   - JSON: `{ scheme, k, m, shard_size, stripes, policy_version: pv, enqueue_info, progress (optional) }`
   - Note: authoritative EC state lives in DB; Redis meta is for fast coordination only.
-- Parity bytes (new; versioned):
-  - `obj:{oid}:v:{ov}:part:{pn}:pv:{pv}:stripe:{s}:parity:{pi}`
-  - Value: ciphertext parity bytes of length equal to the symbol size used for RS.
-  - TTL: same as data chunks by default; delete/shorten after successful upload.
-- Replication: no replica bytes are stored in Redis; replicas are streamed worker→IPFS directly.
+- Parity/replica staging: use filesystem, not Redis
+  - Parity (rs-v1): stage files under FS store in a pv-aware path, e.g., `<root>/<oid>/v<ov>/part_<pn>/pv_<pv>/stripe_<s>.parity_<pi>.bin`
+  - Replicas (rep-v1): stage files under FS store, e.g., `<root>/<oid>/v<ov>/part_<pn>/rep_<r>.chunk_<i>.bin`
+  - Uploader reads staged files, uploads to IPFS, persists CIDs, and removes staged files.
 
 ### Database layout
 
@@ -179,11 +179,11 @@ flowchart LR
         Q2[redundancy_requests]
     end
 
-    subgraph Redis
+    subgraph Redis+FS
         RD_meta[Redis: obj:OID:v:OV:part:PN:meta]
         RD_chunks[Redis: obj:OID:v:OV:part:PN:chunk:I]
         RD_ec_meta[Redis: obj:OID:v:OV:part:PN:pv:PV:meta]
-        RD_parity[Redis: obj:OID:v:OV:part:PN:pv:PV:stripe:S:parity:PI]
+        FS_staging[FS: <root>/OID/vOV/part_PN/(pv|rep)_... .bin]
     end
 
     subgraph Workers
@@ -205,12 +205,12 @@ flowchart LR
     Q2 --> WEC
     RD_chunks --> WEC
     WEC --> RD_ec_meta
-    WEC --> RD_parity
+    WEC --> FS_staging
     WEC --> Q1
 
     Q1 --> WU
     RD_chunks --> WU
-    RD_parity --> WU
+    FS_staging --> WU
     WU --> IPFS
     WU --> DB
 ```
