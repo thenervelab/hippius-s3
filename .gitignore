@@ -64,3 +64,4 @@ coverage.xml
 **/.claude/settings.local.json
 backup.git/
 artifacts/
+profiler_runs/
