@@ -20,8 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
-from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.monitoring import get_metrics_collector
+from hippius_s3.monitoring import initialize_metrics_collector
 
 
 config = get_config()
@@ -180,10 +180,7 @@ async def cleanup_old_parts_by_mtime(fs_store: FileSystemPartsStore) -> int:
     # Record metrics
     try:
         collector = get_metrics_collector()
-        if oldest_mtime is not None:
-            age_seconds = max(0.0, time.time() - float(oldest_mtime))
-        else:
-            age_seconds = 0.0
+        age_seconds = max(0.0, time.time() - float(oldest_mtime)) if oldest_mtime is not None else 0.0
         collector.set_fs_store_oldest_age_seconds(age_seconds)  # type: ignore[attr-defined]
         collector.set_fs_store_parts_on_disk(parts_seen)  # type: ignore[attr-defined]
         if parts_cleaned > 0:
