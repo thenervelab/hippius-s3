@@ -23,12 +23,12 @@
 Suggested config keys
 
 - ec.enabled (bool), ec.scheme (e.g. rs-v1), ec.policy_version (int)
-- ec.threshold_bytes (e.g., 1 MiB), replication_factor (e.g., 2)
+- ec.threshold_bytes (computed = k \* min_chunk_size_bytes), replication_factor (e.g., 2)
 - ec.k (int), ec.m (int)
 - ec.min_chunk_size_bytes (derived from threshold/k by default; clamp 16–4096 KiB)
 - ec.max_chunk_size_bytes (e.g., 4–10 MiB)
 - ec.worker.concurrency
-- ec.queue_name (default: ec_encode_requests)
+- ec.queue_name (default: redundancy_requests)
 
 Derivation rule
 
@@ -42,15 +42,14 @@ Derivation rule
 3. Store per-part meta and ciphertext chunks in Redis (unchanged keyspace for data).
 4. After multipart complete:
    - enqueue upload_requests for data parts (existing behavior)
-   - enqueue ec_encode_requests for each part (new)
+   - enqueue redundancy_requests for each part (new)
 
 ### Queues
 
-- upload_requests: I/O-bound uploader (existing). Handles both data and later, parity uploads.
-- ec_encode_requests: CPU-bound EC worker.
-  - rs-v1 (≥ threshold): produces parity bytes, stores them in Redis, then enqueues parity-upload jobs to upload_requests.
-  - rep-v1 (< threshold): re-encrypts chunks with replica-specific nonces and streams replicas directly to IPFS (no Redis duplication), then persists replica CIDs in DB.
-- Separate DLQs and retry policies for isolation.
+- redundancy_requests: CPU-bound redundancy worker (EC and replication) wake-ups only.
+- upload_requests: reuse existing primary queue for all uploads (data | replica | parity). No new upload queue.
+- substrate_requests: reuse existing queue for pinning. No new pin queue.
+- DLQ remains `upload_requests:dlq` with existing retry/backoff logic.
 
 ### Storage layout (Redis + Filesystem)
 
@@ -75,9 +74,178 @@ Derivation rule
   - PRIMARY KEY `(part_id, policy_version)`
 - part_parity_chunks (new; versioned):
   - rs-v1: parity CIDs per stripe/index ⇒ `(part_id, policy_version, stripe_index, parity_index, cid, created_at)`
-  - rep-v1: replica CIDs with `stripe_index=0` and `parity_index=replica_index-1` (for replicas 1..R-1)
+  - rep-v1: replica CIDs with `stripe_index=chunk_index` and `parity_index=replica_index` (per-chunk replicas)
   - UNIQUE `(part_id, policy_version, stripe_index, parity_index)`
   - Reader picks the highest complete `policy_version` for decode/fallback (replicas only used when primaries unavailable).
+- blobs (new; unified CID work ledger in DB)
+  - Represents any blob that will become a CID: data | replica | parity | manifest
+  - Columns (essential):
+    - `id`, `kind`, `object_id`, `object_version`, `part_id NULL`, `policy_version NULL`
+    - `chunk_index NULL`, `stripe_index NULL`, `parity_index NULL`
+    - `fs_path`, `size_bytes`, `cid NULL`, `status` ('staged'|'uploading'|'uploaded'|'pinning'|'pinned'|'failed')
+    - `last_error NULL`, `last_error_at NULL`, `created_at`, `updated_at`
+  - Uniqueness enforced per kind (e.g., parity by (part_id, policy_version, stripe_index, parity_index))
+  - Status is single-field; attempts live only in queue payload (Redis)
+
+#### Blobs DDL (ready-to-run)
+
+```sql
+-- blobs: unified CID work ledger
+CREATE TABLE IF NOT EXISTS blobs (
+  id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  kind             TEXT        NOT NULL CHECK (kind IN ('data','replica','parity','manifest')),
+  object_id        UUID        NOT NULL,
+  object_version   INT         NOT NULL CHECK (object_version > 0),
+  part_id          UUID        NULL REFERENCES parts(part_id) ON DELETE CASCADE,
+  policy_version   INT         NULL CHECK (policy_version IS NULL OR policy_version >= 0),
+  chunk_index      INT         NULL CHECK (chunk_index IS NULL OR chunk_index >= 0),
+  stripe_index     INT         NULL CHECK (stripe_index IS NULL OR stripe_index >= 0),
+  parity_index     INT         NULL CHECK (parity_index IS NULL OR parity_index >= 0),
+  fs_path          TEXT        NOT NULL,
+  size_bytes       BIGINT      NOT NULL CHECK (size_bytes >= 0),
+  cid              TEXT        NULL,
+  status           TEXT        NOT NULL CHECK (status IN ('staged','uploading','uploaded','pinning','pinned','failed')) DEFAULT 'staged',
+  last_error       TEXT        NULL,
+  last_error_at    TIMESTAMPTZ NULL,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Uniqueness by kind
+CREATE UNIQUE INDEX IF NOT EXISTS blobs_parity_uq
+ON blobs (part_id, policy_version, kind, stripe_index, parity_index)
+WHERE kind = 'parity';
+
+CREATE UNIQUE INDEX IF NOT EXISTS blobs_replica_uq
+ON blobs (part_id, kind, chunk_index, parity_index)
+WHERE kind = 'replica';
+
+CREATE UNIQUE INDEX IF NOT EXISTS blobs_data_uq
+ON blobs (part_id, kind, chunk_index)
+WHERE kind = 'data';
+
+CREATE UNIQUE INDEX IF NOT EXISTS blobs_manifest_uq
+ON blobs (object_id, object_version, kind)
+WHERE kind = 'manifest';
+
+-- Lookups
+CREATE INDEX IF NOT EXISTS blobs_status_idx ON blobs (status);
+CREATE INDEX IF NOT EXISTS blobs_part_kind_idx ON blobs (part_id, policy_version, kind);
+CREATE INDEX IF NOT EXISTS blobs_object_idx ON blobs (object_id, object_version);
+
+-- Touch updated_at
+CREATE OR REPLACE FUNCTION touch_updated_at()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN NEW.updated_at = now(); RETURN NEW; END $$;
+
+DROP TRIGGER IF EXISTS trg_touch_blobs ON blobs;
+CREATE TRIGGER trg_touch_blobs
+BEFORE UPDATE ON blobs
+FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+```
+
+#### Repository (no ORM in this PR)
+
+- No ORM introduction in this phase. All DB access goes through a small repository layer using plain SQL for:
+  - `blobs`: insert/upsert, state transitions (CAS), lookups by keys/indices
+  - `part_ec`: upsert state and completion marking
+  - `part_parity_chunks`: insert/upsert CIDs
+- Workers and API call repository methods; direct SQL is isolated and centralized. ORM can be added later behind the same repository interfaces.
+
+Repository API (signatures & CAS semantics)
+
+- blobs
+
+  - insert_many(rows: [{kind, object_id, object_version, part_id?, policy_version?, indices?, fs_path, size_bytes}]) -> [id]
+  - claim_staged_by_id(id) -> row | None
+    - SQL: `UPDATE blobs SET status='uploading' WHERE id=:id AND status='staged' RETURNING *`
+  - mark_uploaded(id, cid)
+    - SQL: `UPDATE blobs SET cid=:cid, status='uploaded' WHERE id=:id`
+  - claim_uploaded_by_id(id) -> row | None
+    - SQL: `UPDATE blobs SET status='pinning' WHERE id=:id AND status='uploaded' RETURNING *`
+  - mark_pinned(id)
+    - SQL: `UPDATE blobs SET status='pinned' WHERE id=:id`
+  - mark_failed(id, error, phase)
+    - Single status model: set `status='failed'`, `last_error`, `last_error_at=now()`; producer may requeue
+  - expected_counts(part_id, policy_version, kind) -> int
+    - parity: stripes × m (from part_ec)
+    - replica: num_chunks × replicas_per_chunk (from parts + replication factor)
+  - pinned_count(part_id, policy_version, kind) -> int
+
+- part_ec
+  - upsert(part_id, policy_version, scheme, k, m, shard_size_bytes, stripes, state)
+  - maybe_mark_complete(part_id, policy_version)
+    - Compare expected vs pinned_count for kind in {'parity','replica'}; UPDATE state='complete' when satisfied
+
+Queue contracts (reuse existing queues)
+
+- upload_requests (producer → uploader)
+
+  - Data: existing payloads
+  - Replica/Parity: includes fs_path(s) and indices; repository attaches/creates blobs rows when processing
+  - Queue message carries `attempts` for backoff; DB stores status only
+
+- substrate_requests (uploader → substrate)
+  - CIDs to pin (existing). On success, repository sets blobs.status='pinned' and removes fs_path
+
+State machine & retries
+
+- staged → uploading → uploaded → pinning → pinned
+- On upload error: uploading → staged; set last_error; requeue with attempts+1 and backoff
+- On pin error: pinning → uploaded; set last_error; requeue with attempts+1 and backoff
+
+CAS examples (atomic claim)
+
+```sql
+-- claim staged for upload
+UPDATE blobs
+SET status = 'uploading'
+WHERE id = $1 AND status = 'staged'
+RETURNING *;
+
+-- claim uploaded for pin
+UPDATE blobs
+SET status = 'pinning'
+WHERE id = $1 AND status = 'uploaded'
+RETURNING *;
+```
+
+Deterministic replica nonces
+
+- Replicas use a deterministic XSalsa20 nonce derived via blake2b over `object_id:part_number:chunk_index:replica_index:upload_id`
+- Ensures distinct ciphertext → distinct CIDs for each replica
+
+Filesystem layout (authoritative staging)
+
+- Data: `<root>/<oid>/v<ov>/part_<pn>/chunk_<i>.bin`, `meta.json`
+- Replicas: `<root>/<oid>/v<ov>/part_<pn>/rep_<r>.chunk_<i>.bin`
+- Parity: `<root>/<oid>/v<ov>/part_<pn>/pv_<pv>/stripe_<s>.parity_<pi>.bin`
+
+Completion rules
+
+- Replication: `pinned_count(part_id, policy_version,'replica') >= num_chunks × (R-1)` → `part_ec.state='complete'`
+- Parity: `pinned_count(part_id, policy_version,'parity') == stripes × m` → `part_ec.state='complete'`
+
+Metrics & observability
+
+- Counters: blobs.staged/uploaded/pinned, uploader.items_uploaded_total, substrate.items_pinned_total
+- Timers: upload_seconds, pin_seconds, ec.encode.seconds
+- Errors: last_error sampling, DLQ volume
+
+Rollout & migration
+
+1. Add blobs table + repository (no ORM yet)
+2. Redundancy worker: stage to FS and enqueue existing upload_requests (replica/parity). Optionally pre-insert blobs rows
+3. Uploader: on redundancy kinds, use repository to attach/create blobs rows, upload, set cid & status='uploaded', enqueue substrate
+4. Substrate: pin, set status='pinned', remove fs_path, call maybe_mark_complete
+5. Optional later: add blob_id to part_chunks/part_parity_chunks and move read joins
+
+Testing checklist
+
+- Replication < threshold: replicas staged, uploaded, pinned; part_ec complete; distinct CIDs
+- EC ≥ threshold (m=1): parity staged, uploaded, pinned; part_ec complete
+- Retry paths: upload/pin transient errors revert status and requeue with backoff
+- Janitor: cleans stale staged/failed files; no data loss on happy path
 
 ### EC worker (encode/replicate)
 
@@ -85,47 +253,57 @@ Derivation rule
 - Steps:
   - rs-v1 (≥ threshold):
     1. Fetch ciphertext data chunks from Redis.
-    2. For each stripe of up to k data chunks, zero-extend ciphertext symbols to shard_size for RS math and compute m parity chunks.
-    3. Write parity bytes to Redis keys `...:pv:{pv}:stripe:{s}:parity:{pi}`.
-    4. Write/refresh per-part EC meta `...:pv:{pv}:meta` (parameters and enqueue info).
-    5. Enqueue parity uploads to upload_requests (payload includes pv and stripe/parity indices).
+    2. For each stripe of up to k data chunks, zero-extend ciphertext symbols to shard_size for RS math and compute m parity chunks (m=1 placeholder XOR for now).
+    3. Stage parity bytes to filesystem under pv-aware path.
+    4. Insert one row per parity into `blobs` with kind='parity', indices, fs_path, status='staged'.
+    5. Upsert `part_ec` (state='pending_upload').
+    6. Enqueue `upload_requests` with a parity UploadRequest that references the staged files (repository will create/update `blobs` rows on the worker side if needed).
   - rep-v1 (< threshold):
     1. Stream plaintext by decrypting the primary ciphertext chunks (Redis first, IPFS fallback via existing migration streaming path).
     2. Re-encrypt each chunk with a replica-specific nonce (derived from object_id, part_number, chunk_index, replica_index).
-    3. Stream replica ciphertext directly to IPFS, obtain CIDs (no Redis writes for replicas).
-    4. Persist replica CIDs into `part_parity_chunks` with `stripe_index=0`, `parity_index=replica_index-1`; update `part_ec` state to complete when all replicas present.
+    3. Stage replica ciphertext to filesystem (one file per (chunk, replica)).
+    4. Insert one row per replica into `blobs` with kind='replica', indices, fs_path, status='staged' (optional in this phase; repository can attach rows at upload time).
+    5. Upsert `part_ec` (state='pending_upload').
+    6. Enqueue `upload_requests` with a replica UploadRequest that references the staged files (repository will create/update `blobs` rows on the worker side if needed).
 
-### Uploader / Substrate (redundancy)
+### Uploader / Substrate (reuse existing queues)
 
-- rs-v1 (parity):
-  - Uploader reads staged parity files from FS, uploads to IPFS, persists CIDs in `part_parity_chunks` using `(part_id, policy_version, stripe_index, parity_index)`, and enqueues substrate publish/pin.
-  - Substrate worker: on successful pin/publish, removes staged parity files from FS.
-  - Janitor: fallback GC for orphaned staged files older than a TTL.
-- rep-v1 (replicas):
-  - Redundancy worker writes staged replica files to FS (one per replica per chunk) and enqueues uploader with kind='replica'.
-  - Uploader uploads staged replicas, persists CIDs to `part_parity_chunks` with `(part_id, policy_version, stripe_index=chunk_index, parity_index=replica_index)`, and enqueues substrate.
-  - Substrate worker removes staged replica files on pin success; Janitor provides fallback GC.
+- Uploader:
+  - BRPOP `upload_requests` → request (kind='data'|'replica'|'parity'). For redundancy kinds, use repository to insert/update `blobs`, then perform upload; set `blobs.status` to 'uploaded' and persist CID. Enqueue pinning via `substrate_requests`.
+- Substrate:
+  - BRPOP `substrate_requests` → pin CIDs; on success set `blobs.status='pinned'`, remove staged file via repository; run completion check for EC/replicas to mark `part_ec` complete when expected rows exist.
+- Janitor:
+  - GC orphaned staged/failed files older than TTL; optionally unstick long-running 'uploading' back to 'staged'.
 
 #### Uploader job payload (parity)
 
-- kind: `parity`
-- object_id, object_version, part_number
-- policy_version
-- indices: `stripe_index`, `parity_index`
-- redis_key: `obj:{oid}:v:{ov}:part:{pn}:pv:{pv}:stripe:{s}:parity:{pi}`
-- Optional: scheme/k/m/shard_size for metrics/validation
+- LPUSH `upload_requests` with a parity UploadRequest (includes staged file paths and indices). Repository attaches/creates `blobs` rows on the worker side as needed.
 
 #### Uploader job payload (data)
 
-- kind: `data`
-- object_id, object_version, part_number
-- chunk_index
-- redis_key: `obj:OID:v:OV:part:PN:chunk:I`
+- Unchanged. Existing producers LPUSH to `upload_requests`. Over time, producers may optionally pre-insert `blobs` rows via the repository, but this is not required for the initial rollout.
 
 ### Reader behavior
 
-- v4: prefer data chunks. If a needed data chunk is missing and `part_ec` exists, reconstruct only the affected stripe using parity (Redis first if available; otherwise IPFS parity), then decrypt only the needed chunks for the byte range.
+- v4: prefer data chunks. Recovery using parity is supported in test-only for now; runtime read-path decode is deferred until ISA-L integration lands.
+
+### Implementation status note
+
+- Current EC encode path ships with an m=1 XOR placeholder via `encode_rs_systematic`; ISA-L integration is pending. Configure `ec_m=1` until the backend is wired.
 - v2/v3: unchanged.
+
+### Idempotency & retries (queue-driven)
+
+- Workers are woken by Redis; no DB polling. Queue payloads carry `{blob_id, attempts}` only.
+- Claims use CAS-style updates in DB:
+  - staged→uploading for upload; uploaded→pinning for pin
+  - on failure: revert to previous ready status (uploading→staged, pinning→uploaded), set `last_error`, and requeue with backoff (attempts incremented in the queue message only).
+
+### Worker simplification and layering
+
+- Redundancy worker produces bytes and enqueues existing `upload_requests` with `kind`='replica'|'parity'; it may insert `blobs` rows via repository but does not handle IPFS/pinning.
+- Uploader and Substrate remain unchanged operationally (queues and concurrency); they rely on the repository to mutate `blobs`/`part_ec`/`part_parity_chunks` where applicable, so they do not need additional EC/replica context.
+- Completion check marks `part_ec` complete when pinned rows meet expected counts.
 
 ### EC policy versioning and changing k/m
 
@@ -176,13 +354,14 @@ flowchart LR
     subgraph API
         A1[Chunk plaintext -> Encrypt per-chunk]
         A2[Write data meta+chunks to Redis]
-        A3[Enqueue data uploads]
+        A3[Insert data rows into blobs]
         A4[Enqueue redundancy job]
     end
 
     subgraph Queues
-        Q1[upload_requests]
         Q2[redundancy_requests]
+        Q3[upload_requests]
+        Q4[substrate_requests]
     end
 
     subgraph Redis+FS
@@ -194,7 +373,8 @@ flowchart LR
 
     subgraph Workers
         WEC[Redundancy Worker]
-        WU[Upload Worker - data and parity]
+        WU[Uploader]
+        WS[Substrate]
     end
 
     subgraph Storage
@@ -205,18 +385,23 @@ flowchart LR
     CPUT --> A1 --> A2
     A2 --> RD_meta
     A2 --> RD_chunks
-    A2 --> A3 --> Q1
+    A2 --> A3 --> Q3
     A2 --> A4 --> Q2
 
     Q2 --> WEC
     RD_chunks --> WEC
     WEC --> RD_ec_meta
     WEC --> FS_staging
-    WEC --> Q1
+    WEC --> Q3
 
-    Q1 --> WU
+    Q3 --> WU
     RD_chunks --> WU
     FS_staging --> WU
     WU --> IPFS
     WU --> DB
+    WU --> Q4
+
+    Q4 --> WS
+    WS --> IPFS
+    WS --> DB
 ```

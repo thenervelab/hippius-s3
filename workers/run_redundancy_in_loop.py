@@ -5,6 +5,7 @@ import logging
 import sys
 from pathlib import Path
 from typing import Any
+import math
 
 import asyncpg
 import redis.asyncio as async_redis
@@ -24,7 +25,7 @@ from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import PartChunkSpec
 from hippius_s3.queue import PartToDownload
 from hippius_s3.queue import RedundancyRequest
-from hippius_s3.queue import ReplicaUploadRequest
+from hippius_s3.queue import ReplicaStagedItem, ParityStagedItem, ReplicaUploadRequest, ParityUploadRequest
 from hippius_s3.queue import dequeue_ec_request
 from hippius_s3.queue import enqueue_download_request
 from hippius_s3.queue import enqueue_upload_request
@@ -199,7 +200,7 @@ async def process_redundancy_request(
                 bucket_name=req.bucket_name,
             )
 
-            staged: list[dict] = []
+            rep_staged: list[ReplicaStagedItem] = []
             # Stage replica files under FS and enqueue uploader
             for ci, _cid, _clen in sorted(chunk_plan, key=lambda x: int(x[0])):
                 ct = await obj_cache.get_chunk(req.object_id, int(req.object_version), int(req.part_number), int(ci))
@@ -237,12 +238,12 @@ async def process_redundancy_request(
                             f.flush()
 
                     await asyncio.to_thread(_write)
-                    staged.append(
-                        {
-                            "file_path": str(file_path),
-                            "chunk_index": int(ci),
-                            "replica_index": int(r - 1),
-                        }
+                    rep_staged.append(
+                        ReplicaStagedItem(
+                            file_path=str(file_path),
+                            chunk_index=int(ci),
+                            replica_index=int(r - 1),
+                        )
                     )
 
             await enqueue_upload_request(
@@ -255,13 +256,108 @@ async def process_redundancy_request(
                     part_number=int(req.part_number),
                     kind="replica",
                     policy_version=int(req.policy_version),
-                    staged=staged,
+                    staged=rep_staged,
                 )
             )
             return True
 
-        # TODO: EC mode to stage parity and enqueue uploader
-        logger.info(f"redundancy: EC path pending implementation object_id={req.object_id} part={req.part_number}")
+        # EC mode (rs-v1) placeholder with m=1 using XOR across up to k chunks per stripe
+        k = max(1, int(getattr(config, "ec_k", 8)))
+        m = max(0, int(getattr(config, "ec_m", 1)))
+        if m <= 0:
+            logger.info("redundancy: EC m<=0; skipping parity generation")
+            return True
+
+        # Determine shard size: use max cipher chunk length observed (fallback to min_chunk_size)
+        shard_size = int(getattr(config, "ec_min_chunk_size_bytes", 128 * 1024))
+        # Attempt to use cipher_size from meta if available
+        if isinstance(meta, dict):
+            shard_size = max(int(meta.get("chunk_size_bytes", shard_size)), shard_size)
+
+        stripes = int(math.ceil(len(chunk_plan) / float(k))) if chunk_plan else 0
+        if stripes <= 0:
+            logger.info("redundancy: EC found no stripes; skipping")
+            return True
+
+        # Upsert part_ec to 'pending_upload'
+        await conn.execute(
+            """
+            INSERT INTO part_ec (part_id, policy_version, scheme, k, m, shard_size_bytes, stripes, state)
+            VALUES ($1, $2, 'rs-v1', $3, $4, $5, $6, 'pending_upload')
+            ON CONFLICT (part_id, policy_version)
+            DO UPDATE SET scheme='rs-v1', k=EXCLUDED.k, m=EXCLUDED.m, shard_size_bytes=EXCLUDED.shard_size_bytes,
+                          stripes=EXCLUDED.stripes, state='pending_upload', updated_at=now()
+            """,
+            part_id,
+            int(req.policy_version),
+            int(k),
+            int(1),  # m=1 placeholder
+            int(shard_size),
+            int(stripes),
+        )
+
+        part_dir = Path(fs_store.part_path(req.object_id, int(req.object_version), int(req.part_number)))
+        pv_dir = part_dir / f"pv_{int(req.policy_version)}"
+        pv_dir.mkdir(parents=True, exist_ok=True)
+
+        par_staged: list[ParityStagedItem] = []
+        # Process stripes
+        for s in range(stripes):
+            start = s * k
+            end = min(start + k, len(chunk_plan))
+            stripe_items = chunk_plan[start:end]
+            if not stripe_items:
+                continue
+            # Load ciphertext for this stripe
+            blocks: list[bytes] = []
+            max_len = 0
+            for ci, _cid, _clen in stripe_items:
+                ct = await obj_cache.get_chunk(req.object_id, int(req.object_version), int(req.part_number), int(ci))
+                if not isinstance(ct, (bytes, bytearray)):
+                    ct = b""
+                b = bytes(ct)
+                blocks.append(b)
+                max_len = max(max_len, len(b))
+            # Zero-extend and XOR
+            if not blocks:
+                continue
+            max_len = max(max_len, shard_size)
+            parity = bytearray(max_len)
+            for b in blocks:
+                if len(b) < max_len:
+                    # zero-extend
+                    for i in range(len(b)):
+                        parity[i] ^= b[i]
+                else:
+                    for i in range(max_len):
+                        parity[i] ^= b[i]
+
+            # Write staged parity file
+            file_path = pv_dir / f"stripe_{s}.parity_0.bin"
+
+            def _write() -> None:
+                with file_path.open("wb") as f:
+                    f.write(parity)
+                    f.flush()
+
+            await asyncio.to_thread(_write)
+
+            par_staged.append(ParityStagedItem(file_path=str(file_path), stripe_index=int(s), parity_index=0))
+
+        if par_staged:
+            await enqueue_upload_request(
+                ParityUploadRequest(
+                    address=req.address,
+                    bucket_name=req.bucket_name,
+                    object_key="",
+                    object_id=req.object_id,
+                    object_version=int(req.object_version),
+                    part_number=int(req.part_number),
+                    kind="parity",
+                    policy_version=int(req.policy_version),
+                    staged=par_staged,
+                )
+            )
         return True
 
 

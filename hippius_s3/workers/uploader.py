@@ -19,6 +19,8 @@ from hippius_s3.queue import Chunk
 from hippius_s3.queue import DataUploadRequest
 from hippius_s3.queue import SubstratePinningRequest
 from hippius_s3.queue import enqueue_substrate_request
+from hippius_s3.repositories.blobs import BlobRow
+from hippius_s3.repositories.blobs import BlobsRepository
 from hippius_s3.utils import get_query
 
 
@@ -77,6 +79,7 @@ class Uploader:
         self.config = config
         self.obj_cache = RedisObjectPartsCache(redis_client)
         self.fs_store = FileSystemPartsStore(getattr(config, "object_cache_dir", "/var/lib/hippius/object_cache"))
+        self.blobs_repo = BlobsRepository(self.db)
 
     class _ConnCtx:
         def __init__(self, conn: Any):
@@ -227,6 +230,32 @@ class Uploader:
                 logger.warning("uploader: staged item missing data; skipping")
                 continue
 
+            # Insert blob ledger row (staged) prior to upload
+            try:
+                blob_rows = [
+                    BlobRow(
+                        kind=("replica" if kind == "replica" else "parity"),
+                        object_id=payload.object_id,
+                        object_version=int(getattr(payload, "object_version", 1) or 1),
+                        part_id=part_id,
+                        policy_version=policy_version,
+                        chunk_index=(int(item.get("chunk_index", 0)) if kind == "replica" else None),
+                        stripe_index=(int(item.get("stripe_index", 0)) if kind != "replica" else None),
+                        parity_index=(
+                            int(item.get("replica_index", 0)) if kind == "replica" else int(item.get("parity_index", 0))
+                        ),
+                        fs_path=(str(file_path) if isinstance(file_path, str) and file_path else ""),
+                        size_bytes=int(len(data)),
+                    )
+                ]
+                blob_ids = await self.blobs_repo.insert_many(blob_rows)
+                blob_id = blob_ids[0] if blob_ids else None
+                if blob_id:
+                    await self.blobs_repo.claim_staged_by_id(blob_id)
+            except Exception:
+                # Non-fatal: continue upload path without ledger row
+                blob_id = None
+
             res = await self.ipfs_service.upload_file(
                 file_data=bytes(data),
                 file_name=(Path(file_path).name if isinstance(file_path, str) and file_path else "redundancy.bin"),
@@ -235,6 +264,13 @@ class Uploader:
             )
             cid = str(res["cid"]) if isinstance(res, dict) else str(res)
             uploaded_cids.append(cid)
+
+            # Mark uploaded in ledger and continue
+            try:
+                if blob_id:
+                    await self.blobs_repo.mark_uploaded(blob_id, cid)
+            except Exception:
+                pass
 
             # Persist into part_parity_chunks
             async with self._acquire_conn() as conn:
