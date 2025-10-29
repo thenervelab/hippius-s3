@@ -9,8 +9,8 @@ from typing import Optional
 
 from pydantic import BaseModel
 
+from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
-from hippius_s3.dlq.storage import DLQStorage
 from hippius_s3.ipfs_service import IPFSService
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
@@ -74,7 +74,8 @@ class Uploader:
         self.redis_client = redis_client
         self.config = config
         self.obj_cache = RedisObjectPartsCache(redis_client)
-        self.dlq_storage = DLQStorage()
+        # Primary source: filesystem store (authoritative, survives Redis eviction)
+        self.fs_store = FileSystemPartsStore(config.object_cache_dir)
 
     class _ConnCtx:
         def __init__(self, conn: Any):
@@ -202,7 +203,8 @@ class Uploader:
     ) -> ChunkUploadResult:
         part_number = int(chunk.id)
         logger.debug(f"Uploading chunk object_id={object_id} part={part_number}")
-        meta = await self.obj_cache.get_meta(object_id, int(object_version), part_number)
+        # Read from FS store (authoritative source that survives Redis eviction)
+        meta = await self.fs_store.get_meta(object_id, int(object_version), part_number)
         num_chunks_meta = int(meta.get("num_chunks", 0)) if isinstance(meta, dict) else 0
 
         # Ensure we have a non-null upload_id for parts table operations
@@ -253,7 +255,8 @@ class Uploader:
         if num_chunks_meta > 0 and part_id:
             all_chunk_cids: list[str] = []
             for ci in range(num_chunks_meta):
-                piece = await self.obj_cache.get_chunk(object_id, int(object_version), part_number, ci)
+                # Read from FS store (authoritative source)
+                piece = await self.fs_store.get_chunk(object_id, int(object_version), part_number, ci)
                 if not isinstance(piece, (bytes, bytearray)):
                     raise RuntimeError("missing_cipher_chunk")
                 up_res = await self.ipfs_service.upload_file(
@@ -308,75 +311,7 @@ class Uploader:
             )
             return ChunkUploadResult(cids=all_chunk_cids, part_number=part_number)
 
-        # Fallback: whole-part upload (legacy)
-        chunk_data = await self.obj_cache.get(object_id, int(object_version), part_number)
-        if chunk_data is None:
-            raise ValueError(f"Chunk data missing for object_id={object_id} part={part_number}")
-
-        upload_result = await self.ipfs_service.upload_file(
-            file_data=chunk_data,
-            file_name=f"{object_key}.part{part_number}",
-            content_type="application/octet-stream",
-            encrypt=False,
-        )
-
-        chunk_cid = str(upload_result["cid"])
-        logger.debug(f"Chunk uploaded object_id={object_id} part={part_number} cid={chunk_cid}")
-
-        try:
-            async with self._acquire_conn() as conn:
-                cid_row2 = await conn.fetchrow(get_query("upsert_cid"), chunk_cid)
-                cid_id = cid_row2["id"] if cid_row2 else None
-        except Exception:
-            cid_id = None
-
-        try:
-            async with self._acquire_conn() as conn:
-                updated = await conn.execute(
-                    """
-                    UPDATE parts p
-                    SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
-                    WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = $5
-                    """,
-                    object_id,
-                    part_number,
-                    chunk_cid,
-                    cid_id,
-                    int(object_version),
-                )
-            updated_str = str(updated or "")
-            rows_affected = 0
-            if updated_str.upper().startswith("UPDATE"):
-                rows_affected = int(updated_str.split(" ")[-1])
-            else:
-                rows_affected = int(updated_str) if updated_str else 0
-
-            if rows_affected == 0:
-                async with self._acquire_conn() as conn:
-                    updated2 = await conn.execute(
-                        """
-                        UPDATE parts
-                        SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
-                        WHERE upload_id = $1 AND part_number = $2
-                        """,
-                        resolved_upload_id,
-                        part_number,
-                        chunk_cid,
-                        cid_id,
-                    )
-                updated2_str = str(updated2 or "")
-                rows_affected2 = 0
-                if updated2_str.upper().startswith("UPDATE"):
-                    rows_affected2 = int(updated2_str.split(" ")[-1])
-                else:
-                    rows_affected2 = int(updated2_str) if updated2_str else 0
-                if rows_affected2 == 0:
-                    raise RuntimeError("parts_row_missing_for_update")
-        except Exception:
-            logger.debug("Uploader update failed; will requeue (no synthesize)", exc_info=True)
-            raise
-
-        return ChunkUploadResult(cids=[chunk_cid], part_number=part_number)
+        raise RuntimeError("part_meta_not_ready")
 
     async def _build_and_upload_manifest(
         self,
@@ -468,8 +403,7 @@ class Uploader:
             return manifest_cid
 
     async def _push_to_dlq(self, payload: UploadChainRequest, last_error: str, error_type: str) -> None:
-        """Push a failed request to the Dead-Letter Queue and persist chunks to disk."""
-        await self._persist_chunks_to_dlq(payload)
+        """Push a failed request to the Dead-Letter Queue."""
 
         etype = error_type
         if isinstance(etype, bool):
@@ -496,51 +430,3 @@ class Uploader:
             success=False,
             error_type=etype,
         )
-
-    async def _persist_chunks_to_dlq(self, payload: UploadChainRequest) -> None:
-        """Persist all available chunks + metadata from cache to DLQ filesystem."""
-        object_id = payload.object_id
-
-        try:
-            for chunk in payload.chunks:
-                part_number = int(chunk.id)
-
-                meta = await self.obj_cache.get_meta(object_id, int(payload.object_version), part_number)
-                if not meta:
-                    logger.warning(
-                        f"No cached meta for object {object_id} part {part_number}, skipping DLQ persistence"
-                    )
-                    continue
-
-                try:
-                    self.dlq_storage.save_meta(object_id, part_number, meta)
-                    logger.debug(f"Persisted meta for part {part_number} of object {object_id} to DLQ")
-                except Exception as e:
-                    logger.error(f"Failed to persist meta for part {part_number} of object {object_id} to DLQ: {e}")
-                    continue
-
-                num_chunks = int(meta.get("num_chunks", 0))
-                if num_chunks == 0:
-                    logger.warning(f"Meta has num_chunks=0 for object {object_id} part {part_number}")
-                    continue
-
-                pieces_saved = 0
-                for ci in range(num_chunks):
-                    piece = await self.obj_cache.get_chunk(object_id, int(payload.object_version), part_number, ci)
-                    if isinstance(piece, (bytes, bytearray)) and len(piece) > 0:
-                        try:
-                            self.dlq_storage.save_chunk_piece(object_id, part_number, ci, bytes(piece))
-                            pieces_saved += 1
-                        except Exception as e:
-                            logger.error(
-                                f"Failed to persist chunk piece {ci} for object {object_id} part {part_number}: {e}"
-                            )
-                    else:
-                        logger.warning(f"Missing chunk piece {ci} for object {object_id} part {part_number} in Redis")
-
-                logger.debug(
-                    f"Persisted {pieces_saved}/{num_chunks} pieces for part {part_number} of object {object_id} to DLQ"
-                )
-
-        except Exception as e:
-            logger.error(f"Failed to persist chunks for object {object_id} to DLQ: {e}")

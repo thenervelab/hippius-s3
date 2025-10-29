@@ -10,13 +10,13 @@ from typing import AsyncIterator
 from opentelemetry import trace  # type: ignore[import-not-found]
 
 from hippius_s3.api.middlewares.tracing import set_span_attributes
+from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
 from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.utils import get_query
-from hippius_s3.writer.cache_writer import CacheWriter
 from hippius_s3.writer.db import ensure_upload_row
 from hippius_s3.writer.db import upsert_object_basic
 from hippius_s3.writer.types import AppendPreconditionFailed
@@ -25,17 +25,20 @@ from hippius_s3.writer.types import EmptyAppendError
 from hippius_s3.writer.types import ObjectNotFound
 from hippius_s3.writer.types import PartResult
 from hippius_s3.writer.types import PutResult
+from hippius_s3.writer.write_through_writer import WriteThroughPartsWriter
 
 
 tracer = trace.get_tracer(__name__)
 
 
 class ObjectWriter:
-    def __init__(self, *, db: Any, redis_client: Any) -> None:
+    def __init__(self, *, db: Any, redis_client: Any, fs_store: FileSystemPartsStore | None = None) -> None:
         self.db = db
         self.redis_client = redis_client
         self.config = get_config()
         self.obj_cache = RedisObjectPartsCache(redis_client)
+        # Initialize FS store for write-through (optional for backward compat during rollout)
+        self.fs_store = fs_store or FileSystemPartsStore(self.config.object_cache_dir)
 
     async def create_version_for_migration(
         self,
@@ -105,8 +108,9 @@ class ObjectWriter:
         )
 
         ttl = int(getattr(self.config, "cache_ttl_seconds", 1800))
-        cw = CacheWriter(self.obj_cache, ttl_seconds=ttl)
-        await cw.write_meta(
+        writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
+        await writer.write_chunks(object_id, int(object_version), 1, ct_chunks)
+        await writer.write_meta(
             object_id,
             int(object_version),
             1,
@@ -114,7 +118,6 @@ class ObjectWriter:
             num_chunks=len(ct_chunks),
             plain_size=len(body_bytes),
         )
-        await cw.write_chunks(object_id, int(object_version), 1, ct_chunks)
 
         md5_hash = hashlib.md5(body_bytes).hexdigest()
 
@@ -187,7 +190,7 @@ class ObjectWriter:
 
         hasher = hashlib.md5()
         total_size = 0
-        cw = CacheWriter(self.obj_cache, ttl_seconds=ttl)
+        writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
 
         pt_buf = bytearray()
         next_chunk_index = 0
@@ -208,14 +211,29 @@ class ObjectWriter:
             )
             # Write each produced ciphertext chunk immediately with increasing indices
             for ct in ct_list:
-                await self.obj_cache.set_chunk(
+                # Write-through: FS first (fatal), then Redis (best-effort)
+                await self.fs_store.set_chunk(
                     object_id,
                     int(object_version),
                     int(part_number),
                     int(next_chunk_index),
                     ct,
-                    ttl=ttl,
                 )
+                try:
+                    await self.obj_cache.set_chunk(
+                        object_id,
+                        int(object_version),
+                        int(part_number),
+                        int(next_chunk_index),
+                        ct,
+                        ttl=ttl,
+                    )
+                except Exception as e:
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        f"Redis chunk write failed (best-effort) in streaming: object_id={object_id} v={object_version} part={part_number} chunk={next_chunk_index}: {e}"
+                    )
                 next_chunk_index += 1
 
         with tracer.start_as_current_span("put_simple_stream_full.encrypt_and_cache") as span:
@@ -270,7 +288,7 @@ class ObjectWriter:
 
         # Now that we know counts and sizes, write meta last using exact chunk count
         num_chunks = int(next_chunk_index)
-        await cw.write_meta(
+        await writer.write_meta(
             object_id,
             int(object_version),
             int(part_number),
@@ -337,8 +355,9 @@ class ObjectWriter:
         )
 
         ttl = int(getattr(self.config, "cache_ttl_seconds", 1800))
-        cw = CacheWriter(self.obj_cache, ttl_seconds=ttl)
-        await cw.write_meta(
+        writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
+        await writer.write_chunks(str(object_id), int(object_version), int(part_number), ct_chunks)
+        await writer.write_meta(
             str(object_id),
             int(object_version),
             int(part_number),
@@ -346,7 +365,6 @@ class ObjectWriter:
             num_chunks=len(ct_chunks),
             plain_size=len(body_bytes),
         )
-        await cw.write_chunks(str(object_id), int(object_version), int(part_number), ct_chunks)
 
         # AWS parity: md5 of the part only
         loop = asyncio.get_event_loop()
@@ -588,8 +606,9 @@ class ObjectWriter:
             key=key_bytes,
         )
         ttl = int(getattr(self.config, "cache_ttl_seconds", 1800))
-        cw = CacheWriter(self.obj_cache, ttl_seconds=ttl)
-        await cw.write_meta(
+        writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
+        await writer.write_chunks(object_id, int(cov), int(next_part), ct_chunks)
+        await writer.write_meta(
             object_id,
             int(cov),
             int(next_part),
@@ -597,7 +616,6 @@ class ObjectWriter:
             num_chunks=len(ct_chunks),
             plain_size=int(delta_size),
         )
-        await cw.write_chunks(object_id, int(cov), int(next_part), ct_chunks)
 
         return {
             "object_id": object_id,

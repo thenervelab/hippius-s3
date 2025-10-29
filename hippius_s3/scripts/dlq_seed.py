@@ -13,14 +13,13 @@ import argparse
 import asyncio
 import json
 import logging
+from typing import Any
 from typing import List
 
 import asyncpg  # type: ignore[import-untyped]
 import redis.asyncio as async_redis
 
-from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
-from hippius_s3.dlq.storage import DLQStorage
 
 
 logger = logging.getLogger(__name__)
@@ -41,8 +40,7 @@ async def _list_part_numbers_by_object_id(conn: asyncpg.Connection, object_id: s
 
 async def seed_object_to_dlq(object_id: str) -> bool:
     config = get_config()
-    redis = async_redis.from_url(config.redis_url)
-    storage = DLQStorage()
+    redis: Any = async_redis.from_url(config.redis_url)
 
     try:
         # Determine parts from DB
@@ -56,21 +54,7 @@ async def seed_object_to_dlq(object_id: str) -> bool:
             logger.error(f"No parts found for object_id={object_id}")
             return False
 
-        # Copy each part from Redis cache to DLQ filesystem (use current object_version)
-        cache = RedisObjectPartsCache(redis)
-        # Resolve current object version from DB for safety
-        conn2 = await asyncpg.connect(config.database_url)  # type: ignore[arg-type]
-        try:
-            row = await conn2.fetchrow("SELECT current_object_version FROM objects WHERE object_id = $1", object_id)
-            current_version = int(row[0]) if row and row[0] is not None else 1
-        finally:
-            await conn2.close()
-        for pn in part_numbers:
-            data = await cache.get(object_id, current_version, pn)
-            if data is None:
-                logger.warning(f"No cache bytes for object {object_id} part {pn}; skipping")
-                continue
-            storage.save_chunk(object_id, pn, data)
+        # No longer persist bytes to DLQ filesystem; just create a DLQ entry for testing
 
         # Push a minimal DLQ entry
         dlq_entry = {

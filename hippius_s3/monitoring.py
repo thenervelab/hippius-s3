@@ -34,6 +34,9 @@ class MetricsCollector:
         self._pin_checker_missing_cids: dict[str, int] = {}
         self._object_status_counts: dict[str, int] = {}
         self._backup_last_success_timestamp = 0.0
+        # FS store metrics
+        self._fs_store_oldest_age_seconds = 0.0
+        self._fs_store_parts_on_disk = 0
         self._setup_metrics()
 
     def _setup_metrics(self) -> None:
@@ -249,6 +252,25 @@ class MetricsCollector:
             description="Total count of objects by status across all users",
         )
 
+        # FS store gauges
+        self.meter.create_observable_gauge(
+            name="fs_store_oldest_age_seconds",
+            callbacks=[self._obs_fs_store_oldest_age],
+            description="Age in seconds of the oldest part directory in the FS store",
+        )
+        self.meter.create_observable_gauge(
+            name="fs_store_parts_on_disk",
+            callbacks=[self._obs_fs_store_parts_on_disk],
+            description="Approximate count of part directories on disk in the FS store",
+        )
+
+        # FS janitor deletions counter
+        self.fs_janitor_deleted_total = self.meter.create_counter(
+            name="fs_janitor_deleted_total",
+            description="Total number of FS parts deleted by the janitor",
+            unit="1",
+        )
+
         self.meter.create_observable_gauge(
             name="backup_last_success_timestamp",
             callbacks=[self._obs_backup_last_success],
@@ -287,6 +309,19 @@ class MetricsCollector:
 
     def _obs_backup_last_success(self, _: object) -> list[metrics.Observation]:
         return [metrics.Observation(self._backup_last_success_timestamp, {})]
+
+    def _obs_fs_store_oldest_age(self, _: object) -> list[metrics.Observation]:
+        return [metrics.Observation(float(self._fs_store_oldest_age_seconds), {})]
+
+    def _obs_fs_store_parts_on_disk(self, _: object) -> list[metrics.Observation]:
+        return [metrics.Observation(int(self._fs_store_parts_on_disk), {})]
+
+    # Public setters for FS metrics
+    def set_fs_store_oldest_age_seconds(self, age_seconds: float) -> None:
+        self._fs_store_oldest_age_seconds = float(max(0.0, age_seconds))
+
+    def set_fs_store_parts_on_disk(self, count: int) -> None:
+        self._fs_store_parts_on_disk = int(max(0, count))
 
     def record_http_request(
         self,

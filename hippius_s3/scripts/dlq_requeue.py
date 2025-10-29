@@ -32,9 +32,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import redis.asyncio as async_redis
 
 from hippius_s3.config import get_config
-from hippius_s3.dlq.logic import DLQLogic
-from hippius_s3.dlq.storage import DLQStorage
 from hippius_s3.queue import UploadChainRequest
+from hippius_s3.queue import enqueue_upload_request
 
 
 logger = logging.getLogger(__name__)
@@ -142,17 +141,10 @@ class DLQManager:
             if not force:
                 payload.attempts = 0
 
-            # Use DLQLogic for hydration and requeue
-            dlq_logic = DLQLogic(redis_client=self.redis_client)
-            success = await dlq_logic.requeue_with_hydration(payload, force=force, redis_client=self.redis_client)
-
-            if success:
-                logger.info(f"Successfully requeued object_id: {object_id}")
-                return True
-            logger.error(f"Failed to requeue object_id: {object_id}")
-            # Put it back on failure
-            await self.redis_client.lpush(self.dlq_key, json.dumps(entry))
-            return False
+            # Directly requeue the payload (no DLQ filesystem hydration)
+            await enqueue_upload_request(payload)
+            logger.info(f"Successfully requeued object_id: {object_id}")
+            return True
 
         except Exception as e:
             logger.error(f"Failed to requeue object_id: {object_id}, error: {e}")
@@ -165,6 +157,23 @@ class DLQManager:
             # Always release the lock
             with contextlib.suppress(Exception):
                 await self._release_lock(object_id, token)
+
+    async def requeue_all(self, force: bool = False) -> int:
+        """Requeue all DLQ entries (best-effort). Returns count successfully requeued."""
+        all_entries = await self.redis_client.lrange(self.dlq_key, 0, -1)
+        count = 0
+        for entry_json in all_entries:
+            try:
+                entry = json.loads(entry_json)
+                oid = entry.get("object_id")
+                if not oid:
+                    continue
+                ok = await self.requeue(str(oid), force)
+                if ok:
+                    count += 1
+            except Exception:
+                continue
+        return count
 
     async def purge(self, object_id: Optional[str] = None) -> int:
         """Purge entries from DLQ. If object_id is specified, only that entry."""
@@ -228,8 +237,8 @@ async def main() -> None:
     peek_parser.add_argument("--limit", type=int, default=10, help="Number of entries to show")
 
     # requeue command
-    requeue_parser = subparsers.add_parser("requeue", help="Requeue a specific entry")
-    requeue_parser.add_argument("--object-id", required=True, help="Object ID to requeue")
+    requeue_parser = subparsers.add_parser("requeue", help="Requeue entries")
+    requeue_parser.add_argument("--object-id", help="Specific object ID to requeue (omit to requeue all)")
     requeue_parser.add_argument("--force", action="store_true", help="Force requeue of permanent errors")
 
     # purge command
@@ -243,24 +252,7 @@ async def main() -> None:
     import_parser = subparsers.add_parser("import", help="Import DLQ from JSON file")
     import_parser.add_argument("--file", required=True, help="Input file path")
 
-    # cleanup command
-    cleanup_parser = subparsers.add_parser("cleanup", help="Clean up archived DLQ data")
-    cleanup_parser.add_argument("--object-id", help="Specific object ID to cleanup (omit to cleanup all archived)")
-
-    # dlq-parts: list available DLQ part numbers for an object (for testing)
-    dlq_parts_parser = subparsers.add_parser("dlq-parts", help="List DLQ parts for an object")
-    dlq_parts_parser.add_argument("--object-id", required=True, help="Object ID to inspect")
-
-    # dlq-part-size: get size of a DLQ part (for testing)
-    dlq_part_size_parser = subparsers.add_parser("dlq-part-size", help="Get DLQ part size for an object")
-    dlq_part_size_parser.add_argument("--object-id", required=True, help="Object ID")
-    dlq_part_size_parser.add_argument("--part", type=int, required=True, help="Part number")
-
-    # archived-exists: check if archived directory exists for object (for testing)
-    archived_exists_parser = subparsers.add_parser(
-        "archived-exists", help="Check if archived directory exists for object"
-    )
-    archived_exists_parser.add_argument("--object-id", required=True, help="Object ID")
+    # remove DLQ filesystem-related commands (no longer applicable)
 
     args = parser.parse_args()
 
@@ -312,12 +304,16 @@ async def main() -> None:
                 print(f"    {error_type}: {count}")
 
         elif args.command == "requeue":
-            success = await dlq_manager.requeue(args.object_id, args.force)
-            if success:
-                print(f"Successfully requeued object_id: {args.object_id}")
+            if args.object_id:
+                success = await dlq_manager.requeue(args.object_id, args.force)
+                if success:
+                    print(f"Successfully requeued object_id: {args.object_id}")
+                else:
+                    print(f"Failed to requeue object_id: {args.object_id}")
+                    sys.exit(1)
             else:
-                print(f"Failed to requeue object_id: {args.object_id}")
-                sys.exit(1)
+                count = await dlq_manager.requeue_all(args.force)
+                print(f"Requeued {count} DLQ entries")
 
         elif args.command == "purge":
             count = await dlq_manager.purge(args.object_id)
@@ -339,66 +335,7 @@ async def main() -> None:
             if not success:
                 sys.exit(1)
 
-        elif args.command == "cleanup":
-            storage = DLQStorage()
-
-            if args.object_id:
-                try:
-                    storage.delete_archived_object(args.object_id)
-                    print(f"Cleaned up archived DLQ data for object_id: {args.object_id}")
-                except Exception as e:
-                    print(f"Failed to cleanup archived data for object_id: {args.object_id}: {e}")
-                    sys.exit(1)
-            else:
-                # This would be dangerous - require explicit confirmation
-                print("Cleanup of all archived data requires manual intervention.")
-                print("Please specify --object-id or delete manually from DLQ_ARCHIVE_DIR.")
-                sys.exit(1)
-
-        elif args.command == "dlq-parts":
-            storage = DLQStorage()
-            # Prefer DLQ meta first (stored sidecars)
-            parts = storage.list_chunks(args.object_id)
-            if not parts:
-                # Fallback: derive parts from Redis cache keys when DLQ files not yet persisted
-                try:
-                    keys_pattern = f"obj:{args.object_id}:part:*:meta"
-                    keys = [key async for key in redis_client.scan_iter(keys_pattern, count=1000)]
-                    found_parts: list[int] = []
-                    for k in keys:
-                        try:
-                            key_str = k.decode() if isinstance(k, (bytes, bytearray)) else str(k)
-                            # Expect ...:part:{n}:meta
-                            idx = key_str.rfind(":part:")
-                            if idx != -1:
-                                tail = key_str[idx + len(":part:") :]
-                                num_str = tail.split(":", 1)[0]
-                                pn = int(num_str)
-                                found_parts.append(pn)
-                        except Exception:
-                            continue
-                    parts = sorted(set(found_parts))
-                except Exception:
-                    parts = []
-            print(json.dumps(parts))
-
-        elif args.command == "dlq-part-size":
-            storage = DLQStorage()
-            try:
-                size = storage.part_size(args.object_id, args.part)
-                print(size)
-            except Exception:
-                # Consistent with previous behavior; don't crash the CLI
-                print("0")
-
-        elif args.command == "archived-exists":
-            storage = DLQStorage()
-            target = storage.archive_dir / args.object_id
-            if target.exists():
-                print("FOUND")
-                return
-            print("MISSING")
-            sys.exit(1)
+        # removed DLQ filesystem-related command handlers
 
     finally:
         if redis_client:
