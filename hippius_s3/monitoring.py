@@ -27,7 +27,7 @@ class MetricsCollector:
         self._main_db_size = 0
         self._accounts_db_size = 0
         self._chain_db_size = 0
-        self._substrate_db_size = 0
+        self._queues_db_size = 0
         self._rate_limiting_db_size = 0
         self._used_mem = 0
         self._max_mem = 0
@@ -295,7 +295,7 @@ class MetricsCollector:
             metrics.Observation(self._main_db_size, {"redis_instance": "main"}),
             metrics.Observation(self._accounts_db_size, {"redis_instance": "accounts"}),
             metrics.Observation(self._chain_db_size, {"redis_instance": "chain"}),
-            metrics.Observation(self._substrate_db_size, {"redis_instance": "substrate"}),
+            metrics.Observation(self._queues_db_size, {"redis_instance": "queues"}),
             metrics.Observation(self._rate_limiting_db_size, {"redis_instance": "rate_limiting"}),
         ]
 

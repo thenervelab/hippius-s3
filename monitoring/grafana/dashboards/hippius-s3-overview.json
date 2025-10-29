@@ -430,6 +430,26 @@
           "interval": "",
           "legendFormat": "User Profile Cache",
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "hippius_redis_db_size{redis_instance=\"queues\"}",
+          "interval": "",
+          "legendFormat": "Worker Queues",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "hippius_redis_db_size{redis_instance=\"rate_limiting\"}",
+          "interval": "",
+          "legendFormat": "Rate Limiting",
+          "refId": "E"
         }
       ],
       "title": "Redis Key Counts by Instance",

@@ -65,6 +65,7 @@ class BackgroundMetricsCollector:
     async def _collect_redis_metrics(self) -> None:
         try:
             if self.redis_queues_client:
+                self.metrics_collector._queues_db_size = int(await self.redis_queues_client.dbsize() or 0)
                 self.metrics_collector._upload_len = int(await self.redis_queues_client.llen("upload_requests") or 0)
                 self.metrics_collector._unpin_len = int(await self.redis_queues_client.llen("unpin_requests") or 0)
                 self.metrics_collector._substrate_len = int(
