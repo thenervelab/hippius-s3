@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 import random
@@ -99,7 +100,22 @@ class Uploader:
 
     async def process_upload(self, payload: UploadChainRequest) -> List[str]:
         start_time = time.time()
-        logger.info(f"Processing upload object_id={payload.object_id} chunks={len(payload.chunks)}")
+        logger.info(
+            f"Processing upload object_id={payload.object_id} chunks={len(payload.chunks)} kind={getattr(payload, 'kind', 'data')}"
+        )
+
+        # Handle redundancy staged uploads
+        kind = str(getattr(payload, "kind", "data") or "data").lower()
+        if kind in ("replica", "parity"):
+            cids = await self._process_redundancy_upload(payload)
+            total_duration = time.time() - start_time
+            get_metrics_collector().record_uploader_operation(
+                main_account=payload.address,
+                success=True,
+                num_chunks=len(payload.chunks or []),
+                duration=total_duration,
+            )
+            return cids
 
         chunk_start = time.time()
         chunk_cids = await self._upload_chunks(
@@ -145,6 +161,98 @@ class Uploader:
         )
 
         return valid_cids
+
+    async def _process_redundancy_upload(self, payload: UploadChainRequest) -> List[str]:
+        """Process staged redundancy uploads (replica/parity)."""
+        kind = str(getattr(payload, "kind", "data") or "data").lower()
+        staged = list(getattr(payload, "staged", []) or [])
+        if not staged:
+            return []
+
+        # Resolve part_id once
+        async with self._acquire_conn() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT p.part_id
+                  FROM parts p
+                 WHERE p.object_id = $1 AND p.object_version = $2 AND p.part_number = $3
+                 LIMIT 1
+                """,
+                payload.object_id,
+                int(payload.object_version or 1),
+                # For redundancy, we assume one part per request; derive from staged keys
+                int(self._infer_part_number_from_staged(staged) or 1),
+            )
+        if not row:
+            logger.warning("uploader: redundancy part_id not found; skipping")
+            return []
+        part_id = str(row[0])
+        policy_version = int(getattr(payload, "policy_version", 1) or 1)
+
+        uploaded_cids: list[str] = []
+        for item in staged:
+            redis_key = str(item.get("redis_key", ""))
+            if not redis_key:
+                continue
+            data = await self.redis_client.get(redis_key)
+            if not isinstance(data, (bytes, bytearray)):
+                logger.warning(f"uploader: staged key missing {redis_key}")
+                continue
+            res = await self.ipfs_service.upload_file(
+                file_data=bytes(data),
+                file_name=redis_key.rsplit(":", 1)[-1],
+                content_type="application/octet-stream",
+                encrypt=False,
+            )
+            cid = str(res["cid"]) if isinstance(res, dict) else str(res)
+            uploaded_cids.append(cid)
+            # Persist into part_parity_chunks
+            async with self._acquire_conn() as conn:
+                if kind == "replica":
+                    await conn.execute(
+                        """
+                        INSERT INTO part_parity_chunks (part_id, policy_version, stripe_index, parity_index, cid)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (part_id, policy_version, stripe_index, parity_index)
+                        DO UPDATE SET cid=EXCLUDED.cid
+                        """,
+                        part_id,
+                        policy_version,
+                        int(item.get("chunk_index", 0)),
+                        int(item.get("replica_index", 0)),
+                        cid,
+                    )
+                else:  # parity path (future)
+                    await conn.execute(
+                        """
+                        INSERT INTO part_parity_chunks (part_id, policy_version, stripe_index, parity_index, cid)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (part_id, policy_version, stripe_index, parity_index)
+                        DO UPDATE SET cid=EXCLUDED.cid
+                        """,
+                        part_id,
+                        policy_version,
+                        int(item.get("stripe_index", 0)),
+                        int(item.get("parity_index", 0)),
+                        cid,
+                    )
+            # Cleanup staged key
+            with contextlib.suppress(Exception):
+                await self.redis_client.delete(redis_key)
+
+        return uploaded_cids
+
+    def _infer_part_number_from_staged(self, staged: List[dict]) -> Optional[int]:
+        # Extract part number from redis_key like obj:OID:v:OV:part:PN:rep:R:chunk:I
+        for item in staged:
+            key = str(item.get("redis_key", ""))
+            parts = key.split(":")
+            try:
+                i = parts.index("part")
+                return int(parts[i + 1])
+            except Exception:
+                continue
+        return None
 
     async def _upload_chunks(
         self,

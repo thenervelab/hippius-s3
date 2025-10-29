@@ -64,6 +64,10 @@ class UploadChainRequest(RetryableRequest):
     object_version: int
     chunks: list[Chunk]
     upload_id: str | None = None
+    # New fields for redundancy uploads (parity/replica)
+    kind: str = "data"  # data | parity | replica
+    policy_version: int | None = None
+    staged: list[dict] | None = None  # list of staged items with redis_key/indices
 
     @property
     def name(self):
@@ -112,6 +116,23 @@ class SubstratePinningRequest(RetryableRequest):
     @property
     def name(self):
         return f"substrate::{self.object_id}::{self.address}"
+
+
+class RedundancyRequest(RetryableRequest):
+    """Request to add redundancy for a part using EC (rs-v1) or replication (rep-v1)."""
+
+    object_id: str
+    object_version: int
+    part_number: int
+    policy_version: int
+    bucket_name: str
+    address: str
+    num_chunks: int  # number of ciphertext data chunks to fetch
+    part_size_bytes: int  # total ciphertext size (sum of all chunk bytes)
+
+    @property
+    def name(self):
+        return f"redundancy::{self.object_id}::v{self.object_version}::part{self.part_number}::pv{self.policy_version}"
 
 
 async def enqueue_upload_request(payload: UploadChainRequest) -> None:
@@ -257,4 +278,30 @@ async def dequeue_substrate_request() -> SubstratePinningRequest | None:
     if result:
         _, queue_data = result
         return SubstratePinningRequest.model_validate_json(queue_data)
+    return None
+
+
+EC_QUEUE = "redundancy_requests"
+
+
+async def enqueue_ec_request(payload: RedundancyRequest, redis_client: async_redis.Redis | None = None) -> None:
+    """Add a redundancy request (EC or replication) to the Redis queue."""
+    client = redis_client if redis_client is not None else get_queue_client()
+    if payload.request_id is None:
+        payload.request_id = uuid.uuid4().hex
+    if payload.first_enqueued_at is None:
+        payload.first_enqueued_at = time.time()
+    if payload.attempts is None:
+        payload.attempts = 0
+    await client.lpush(EC_QUEUE, payload.model_dump_json())
+    logger.info(f"Enqueued EC encode request {payload.name=}")
+
+
+async def dequeue_ec_request() -> RedundancyRequest | None:
+    """Get the next redundancy request from the Redis queue."""
+    client = get_queue_client()
+    result = await client.brpop(EC_QUEUE, timeout=5)
+    if result:
+        _, queue_data = result
+        return RedundancyRequest.model_validate_json(queue_data)
     return None

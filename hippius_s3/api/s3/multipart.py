@@ -28,7 +28,9 @@ from hippius_s3.config import get_config
 from hippius_s3.dependencies import get_object_reader
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
+from hippius_s3.queue import RedundancyRequest
 from hippius_s3.queue import UploadChainRequest
+from hippius_s3.queue import enqueue_ec_request
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.services.object_reader import ObjectReader
 from hippius_s3.utils import get_query
@@ -1078,6 +1080,36 @@ async def complete_multipart_upload(
                 upload_id=upload_id,
             ),
         )
+
+        # Enqueue redundancy work per part (worker will decide strategy based on threshold)
+        cfg = get_config()
+        if bool(getattr(cfg, "ec_enabled", False)) and int(getattr(cfg, "target_storage_version", 3)) >= 4:
+            obj_cache = RedisObjectPartsCache(request.app.state.redis_client)
+            for p in parts:
+                try:
+                    pn = int(p["part_number"])  # DB returns part_number
+                    meta = await obj_cache.get_meta(str(object_id), int(object_version), pn)  # type: ignore[arg-type]
+                    if not isinstance(meta, dict):
+                        continue
+                    num_chunks = int(meta.get("num_chunks", 0))
+                    if num_chunks <= 0:
+                        continue
+                    await enqueue_ec_request(
+                        RedundancyRequest(
+                            object_id=str(object_id),
+                            object_version=int(object_version),
+                            part_number=int(pn),
+                            policy_version=int(getattr(cfg, "ec_policy_version", 1)),
+                            bucket_name=bucket_name,
+                            address=request.state.account.main_account,
+                            num_chunks=int(num_chunks),
+                            part_size_bytes=0,
+                        ),
+                        request.app.state.redis_client,
+                    )
+                except Exception:
+                    # Best-effort; skip EC enqueue on errors
+                    continue
 
         # Create XML response
         xml_bytes = f"""<?xml version="1.0" encoding="UTF-8"?>

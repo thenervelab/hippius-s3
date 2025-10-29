@@ -109,6 +109,21 @@ class Config:
     # Upload queue configuration
     upload_queue_names: str = env("HIPPIUS_UPLOAD_QUEUE_NAMES:upload_requests", convert=str)
 
+    # EC configuration
+    ec_enabled: bool = env("HIPPIUS_EC_ENABLED:false", convert=lambda x: x.lower() == "true")
+    ec_scheme: str = env("HIPPIUS_EC_SCHEME:rs-v1", convert=str)
+    ec_policy_version: int = env("HIPPIUS_EC_POLICY_VERSION:1", convert=int)
+    ec_k: int = env("HIPPIUS_EC_K:8", convert=int)
+    ec_m: int = env("HIPPIUS_EC_M:4", convert=int)
+    # Threshold-based policy: replicate below threshold, EC at or above
+    ec_replication_factor: int = env("HIPPIUS_REPLICATION_FACTOR:2", convert=int)
+    # Shard sizing bounds
+    ec_min_chunk_size_bytes: int = env("HIPPIUS_EC_MIN_CHUNK_SIZE_BYTES:131072", convert=int)  # 128 KiB default
+    ec_max_chunk_size_bytes: int = env("HIPPIUS_EC_MAX_CHUNK_SIZE_BYTES:4194304", convert=int)  # 4 MiB
+    # Worker limits
+    ec_worker_concurrency: int = env("HIPPIUS_EC_WORKER_CONCURRENCY:2", convert=int)
+    ec_queue_name: str = env("HIPPIUS_EC_QUEUE_NAME:ec_encode_requests", convert=str)
+
     # Cache TTL (shared across components)
     cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:259200", convert=int)
     # Unified object part chunk size (bytes) for cache and range math
@@ -182,11 +197,20 @@ def get_config() -> Config:
         # Last resort: ensure a usable value
         object.__setattr__(cfg, "encryption_database_url", cfg.database_url)
 
+
     # Enforce environment constraints:
     # - Only in 'test' can enable_bypass_credit_check be True
     # - Only in 'test' can publish_to_chain be False
     if env_value.lower() != "test":
         object.__setattr__(cfg, "enable_bypass_credit_check", False)
         object.__setattr__(cfg, "publish_to_chain", True)
+
+    # Deterministic relationship: threshold = k * min_chunk_size (no separate env)
+    try:
+        computed_threshold = int(cfg.ec_k) * int(cfg.ec_min_chunk_size_bytes)
+        object.__setattr__(cfg, "ec_threshold_bytes", computed_threshold)
+    except Exception:
+        pass
+
 
     return cfg
