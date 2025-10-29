@@ -80,8 +80,9 @@ async def run_uploader_loop():
             continue
 
         if upload_request:
+            num_items = upload_request.get_items_count()
             logger.info(
-                f"Processing upload request object_id={upload_request.object_id} chunks={len(upload_request.chunks)} attempts={upload_request.attempts or 0}"
+                f"Processing upload request object_id={upload_request.object_id} kind={getattr(upload_request, 'kind', 'data')} items={num_items} attempts={upload_request.attempts or 0}"
             )
 
             try:

@@ -14,7 +14,7 @@ import redis.asyncio as async_redis  # type: ignore[import-untyped]
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.queue import Chunk
-from hippius_s3.queue import UploadChainRequest
+from hippius_s3.queue import DataUploadRequest
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.reader.streamer import stream_plan
 from hippius_s3.services.object_reader import build_stream_context
@@ -211,7 +211,7 @@ async def migrate_one(
             int(new_version),
         )
         if parts:
-            req = UploadChainRequest(
+            req = DataUploadRequest(
                 address=address,
                 bucket_name=bucket_name,
                 object_key=object_key,
@@ -219,6 +219,7 @@ async def migrate_one(
                 object_version=int(new_version),
                 chunks=[Chunk(id=int(p["part_number"])) for p in parts],
                 upload_id=str(upload_id),
+                kind="data",
             )
             await enqueue_upload_request(req)
     except Exception:

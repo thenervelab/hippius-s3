@@ -7,7 +7,7 @@ import pytest
 from fakeredis.aioredis import FakeRedis
 
 from hippius_s3.queue import Chunk
-from hippius_s3.queue import UploadChainRequest
+from hippius_s3.queue import DataUploadRequest
 from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.queue import initialize_queue_client
 from hippius_s3.queue import move_due_retries_to_primary
@@ -18,7 +18,7 @@ async def test_enqueue_retry_request_sets_attempts_and_schedules() -> None:
     """Test that enqueue_retry_request increments attempts and schedules with delay."""
     redis = FakeRedis()
     initialize_queue_client(redis)
-    payload = UploadChainRequest(
+    payload = DataUploadRequest(
         substrate_url="http://test",
         ipfs_node="http://test",
         address="user1",
@@ -31,6 +31,7 @@ async def test_enqueue_retry_request_sets_attempts_and_schedules() -> None:
         object_version=1,
         chunks=[Chunk(id=1)],
         upload_id=None,
+        kind="data",
         attempts=1,
         first_enqueued_at=time.time(),
         request_id="req-456",

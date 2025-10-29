@@ -1,9 +1,9 @@
 import asyncio
-import contextlib
 import json
 import logging
 import random
 import time
+from pathlib import Path
 from typing import Any
 from typing import List
 from typing import Optional
@@ -14,9 +14,10 @@ from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.ipfs_service import IPFSService
 from hippius_s3.monitoring import get_metrics_collector
+from hippius_s3.queue import BaseUploadRequest
 from hippius_s3.queue import Chunk
+from hippius_s3.queue import DataUploadRequest
 from hippius_s3.queue import SubstratePinningRequest
-from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_substrate_request
 from hippius_s3.utils import get_query
 
@@ -75,8 +76,7 @@ class Uploader:
         self.redis_client = redis_client
         self.config = config
         self.obj_cache = RedisObjectPartsCache(redis_client)
-        # Primary source: filesystem store (authoritative, survives Redis eviction)
-        self.fs_store = FileSystemPartsStore(config.object_cache_dir)
+        self.fs_store = FileSystemPartsStore(getattr(config, "object_cache_dir", "/var/lib/hippius/object_cache"))
 
     class _ConnCtx:
         def __init__(self, conn: Any):
@@ -98,10 +98,11 @@ class Uploader:
             return acquire()
         return Uploader._ConnCtx(self.db)
 
-    async def process_upload(self, payload: UploadChainRequest) -> List[str]:
+    async def process_upload(self, payload: BaseUploadRequest) -> List[str]:
         start_time = time.time()
+        num_items = payload.get_items_count()
         logger.info(
-            f"Processing upload object_id={payload.object_id} chunks={len(payload.chunks)} kind={getattr(payload, 'kind', 'data')}"
+            f"Processing upload object_id={payload.object_id} items={num_items} kind={getattr(payload, 'kind', 'data')}"
         )
 
         # Handle redundancy staged uploads
@@ -112,17 +113,22 @@ class Uploader:
             get_metrics_collector().record_uploader_operation(
                 main_account=payload.address,
                 success=True,
-                num_chunks=len(payload.chunks or []),
+                num_chunks=payload.get_items_count(),
                 duration=total_duration,
             )
             return cids
 
         chunk_start = time.time()
+        data_payload: DataUploadRequest = (
+            payload
+            if isinstance(payload, DataUploadRequest)
+            else DataUploadRequest.model_validate(payload.model_dump())
+        )
         chunk_cids = await self._upload_chunks(
             object_id=payload.object_id,
             object_key=payload.object_key,
-            chunks=payload.chunks,
-            upload_id=payload.upload_id,
+            chunks=data_payload.chunks,
+            upload_id=data_payload.upload_id,
             object_version=int(payload.object_version or 1),
         )
         chunk_duration = time.time() - chunk_start
@@ -156,13 +162,13 @@ class Uploader:
         get_metrics_collector().record_uploader_operation(
             main_account=payload.address,
             success=True,
-            num_chunks=len(payload.chunks),
+            num_chunks=len(data_payload.chunks),
             duration=total_duration,
         )
 
         return valid_cids
 
-    async def _process_redundancy_upload(self, payload: UploadChainRequest) -> List[str]:
+    async def _process_redundancy_upload(self, payload: BaseUploadRequest) -> List[str]:
         """Process staged redundancy uploads (replica/parity)."""
         kind = str(getattr(payload, "kind", "data") or "data").lower()
         staged = list(getattr(payload, "staged", []) or [])
@@ -180,8 +186,7 @@ class Uploader:
                 """,
                 payload.object_id,
                 int(payload.object_version or 1),
-                # For redundancy, we assume one part per request; derive from staged keys
-                int(self._infer_part_number_from_staged(staged) or 1),
+                int(getattr(payload, "part_number", 0) or 1),
             )
         if not row:
             logger.warning("uploader: redundancy part_id not found; skipping")
@@ -189,26 +194,52 @@ class Uploader:
         part_id = str(row[0])
         policy_version = int(getattr(payload, "policy_version", 1) or 1)
 
+        # Ensure part_ec row exists for FK safety (rep-v1 pending_upload)
+        async with self._acquire_conn() as conn:
+            await conn.execute(
+                """
+                INSERT INTO part_ec (part_id, policy_version, scheme, k, m, shard_size_bytes, stripes, state)
+                VALUES ($1, $2, 'rep-v1', 1, 0, 0, 1, 'pending_upload')
+                ON CONFLICT (part_id, policy_version)
+                DO NOTHING
+                """,
+                part_id,
+                policy_version,
+            )
+
         uploaded_cids: list[str] = []
+        max_replica_index = -1
         for item in staged:
-            redis_key = str(item.get("redis_key", ""))
-            if not redis_key:
-                continue
-            data = await self.redis_client.get(redis_key)
+            data: Optional[bytes] = None
+            file_path = item.get("file_path")
+            if isinstance(file_path, str) and file_path:
+                try:
+                    p = Path(file_path)
+                    if p.exists():
+                        data = p.read_bytes()
+                except Exception:
+                    logger.warning(f"uploader: failed to read staged file {file_path}")
+            if data is None:
+                redis_key = str(item.get("redis_key", ""))
+                if redis_key:
+                    data = await self.redis_client.get(redis_key)
             if not isinstance(data, (bytes, bytearray)):
-                logger.warning(f"uploader: staged key missing {redis_key}")
+                logger.warning("uploader: staged item missing data; skipping")
                 continue
+
             res = await self.ipfs_service.upload_file(
                 file_data=bytes(data),
-                file_name=redis_key.rsplit(":", 1)[-1],
+                file_name=(Path(file_path).name if isinstance(file_path, str) and file_path else "redundancy.bin"),
                 content_type="application/octet-stream",
                 encrypt=False,
             )
             cid = str(res["cid"]) if isinstance(res, dict) else str(res)
             uploaded_cids.append(cid)
+
             # Persist into part_parity_chunks
             async with self._acquire_conn() as conn:
                 if kind == "replica":
+                    max_replica_index = max(max_replica_index, int(item.get("replica_index", 0)))
                     await conn.execute(
                         """
                         INSERT INTO part_parity_chunks (part_id, policy_version, stripe_index, parity_index, cid)
@@ -236,23 +267,36 @@ class Uploader:
                         int(item.get("parity_index", 0)),
                         cid,
                     )
-            # Cleanup staged key
-            with contextlib.suppress(Exception):
-                await self.redis_client.delete(redis_key)
+
+        # Mark part_ec complete for replication and set m to at least max_replica_index+1
+        if kind == "replica":
+            async with self._acquire_conn() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO part_ec (part_id, policy_version, scheme, k, m, shard_size_bytes, stripes, state)
+                    VALUES ($1, $2, 'rep-v1', 1, $3, 0, 1, 'complete')
+                    ON CONFLICT (part_id, policy_version)
+                    DO UPDATE SET state='complete', m=GREATEST(part_ec.m, $3), updated_at=now()
+                    """,
+                    part_id,
+                    policy_version,
+                    int(max_replica_index + 1 if max_replica_index >= 0 else 0),
+                )
+
+        # Enqueue substrate pinning for redundancy CIDs
+        if uploaded_cids:
+            await enqueue_substrate_request(
+                SubstratePinningRequest(
+                    cids=uploaded_cids,
+                    address=payload.address,
+                    object_id=payload.object_id,
+                    object_version=int(payload.object_version or 1),
+                )
+            )
 
         return uploaded_cids
 
-    def _infer_part_number_from_staged(self, staged: List[dict]) -> Optional[int]:
-        # Extract part number from redis_key like obj:OID:v:OV:part:PN:rep:R:chunk:I
-        for item in staged:
-            key = str(item.get("redis_key", ""))
-            parts = key.split(":")
-            try:
-                i = parts.index("part")
-                return int(parts[i + 1])
-            except Exception:
-                continue
-        return None
+    # part_number is explicitly supplied in UploadChainRequest for redundancy
 
     async def _upload_chunks(
         self,
@@ -510,7 +554,7 @@ class Uploader:
             logger.info(f"Manifest uploaded object_id={object_id} cid={manifest_cid}")
             return manifest_cid
 
-    async def _push_to_dlq(self, payload: UploadChainRequest, last_error: str, error_type: str) -> None:
+    async def _push_to_dlq(self, payload: BaseUploadRequest, last_error: str, error_type: str) -> None:
         """Push a failed request to the Dead-Letter Queue."""
 
         etype = error_type
@@ -520,7 +564,7 @@ class Uploader:
         dlq_entry = {
             "payload": payload.model_dump(),
             "object_id": payload.object_id,
-            "upload_id": payload.upload_id,
+            "upload_id": getattr(payload, "upload_id", None),
             "bucket_name": payload.bucket_name,
             "object_key": payload.object_key,
             "attempts": payload.attempts or 0,

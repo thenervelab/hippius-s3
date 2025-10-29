@@ -3,6 +3,7 @@ import logging
 import time
 import uuid
 from typing import List
+from typing import Literal
 from typing import Optional
 from typing import Union
 
@@ -56,24 +57,65 @@ class RetryableRequest(BaseModel):
     last_error: str | None = None
 
 
-class UploadChainRequest(RetryableRequest):
+class BaseUploadRequest(RetryableRequest):
     address: str
     bucket_name: str
     object_key: str
     object_id: str
     object_version: int
-    chunks: list[Chunk]
-    upload_id: str | None = None
-    # New fields for redundancy uploads (parity/replica)
-    kind: str = "data"  # data | parity | replica
-    policy_version: int | None = None
-    staged: list[dict] | None = None  # list of staged items with redis_key/indices
+    kind: Literal["data", "parity", "replica"]
+
+    def get_items_count(self) -> int:  # unified sizing across variants
+        return 0
 
     @property
-    def name(self):
-        if self.upload_id is not None:
-            return f"multipart::{self.object_id}::{self.upload_id}::{self.address}"
-        return f"simple::{self.object_id}::{self.address}"
+    def name(self) -> str:
+        # Unified human-readable identifier for logs
+        return f"{self.kind}::{self.object_id}::{self.address}"
+
+
+class DataUploadRequest(BaseUploadRequest):
+    kind: Literal["data"] = "data"
+    chunks: list[Chunk]
+    upload_id: str | None = None
+
+    def get_items_count(self) -> int:
+        return len(self.chunks or [])
+
+
+class ParityStagedItem(BaseModel):
+    file_path: str
+    stripe_index: int
+    parity_index: int
+
+
+class ReplicaStagedItem(BaseModel):
+    file_path: str
+    chunk_index: int
+    replica_index: int
+
+
+class ParityUploadRequest(BaseUploadRequest):
+    kind: Literal["parity"] = "parity"
+    part_number: int
+    policy_version: int
+    staged: list[ParityStagedItem]
+
+    def get_items_count(self) -> int:
+        return len(self.staged or [])
+
+
+class ReplicaUploadRequest(BaseUploadRequest):
+    kind: Literal["replica"] = "replica"
+    part_number: int
+    policy_version: int
+    staged: list[ReplicaStagedItem]
+
+    def get_items_count(self) -> int:
+        return len(self.staged or [])
+
+
+# Removed legacy UploadChainRequest; use DataUploadRequest/ReplicaUploadRequest/ParityUploadRequest
 
 
 class UnpinChainRequest(RetryableRequest):
@@ -135,7 +177,7 @@ class RedundancyRequest(RetryableRequest):
         return f"redundancy::{self.object_id}::v{self.object_version}::part{self.part_number}::pv{self.policy_version}"
 
 
-async def enqueue_upload_request(payload: UploadChainRequest) -> None:
+async def enqueue_upload_request(payload: BaseUploadRequest) -> None:
     """Add an upload request to the Redis queue for processing by workers."""
     client = get_queue_client()
     if payload.request_id is None:
@@ -158,7 +200,7 @@ async def enqueue_upload_request(payload: UploadChainRequest) -> None:
     logger.info(f"Enqueued upload request {payload.name=} queues={queue_names}")
 
 
-async def dequeue_upload_request() -> UploadChainRequest | None:
+async def dequeue_upload_request() -> BaseUploadRequest | None:
     """Get the next upload request from the Redis queue."""
     client = get_queue_client()
     config = get_config()
@@ -167,8 +209,13 @@ async def dequeue_upload_request() -> UploadChainRequest | None:
     result = await client.brpop(queue_name, timeout=0.5)
     if result:
         _, queue_data = result
-        queue_data = json.loads(queue_data)
-        return UploadChainRequest.model_validate(queue_data)
+        data = json.loads(queue_data)
+        kind = str(data.get("kind") or "data").lower()
+        if kind == "replica":
+            return ReplicaUploadRequest.model_validate(data)
+        if kind == "parity":
+            return ParityUploadRequest.model_validate(data)
+        return DataUploadRequest.model_validate(data)
     return None
 
 
@@ -177,7 +224,7 @@ RETRY_ZSET = "upload_retries"
 
 
 async def enqueue_retry_request(
-    payload: UploadChainRequest,
+    payload: BaseUploadRequest,
     *,
     delay_seconds: float,
     last_error: str | None = None,
@@ -281,7 +328,9 @@ async def dequeue_substrate_request() -> SubstratePinningRequest | None:
     return None
 
 
-EC_QUEUE = "redundancy_requests"
+def _redundancy_queue_name() -> str:
+    # Config enforces presence and normalization; no local fallback
+    return get_config().ec_queue_name
 
 
 async def enqueue_ec_request(payload: RedundancyRequest, redis_client: async_redis.Redis | None = None) -> None:
@@ -293,14 +342,14 @@ async def enqueue_ec_request(payload: RedundancyRequest, redis_client: async_red
         payload.first_enqueued_at = time.time()
     if payload.attempts is None:
         payload.attempts = 0
-    await client.lpush(EC_QUEUE, payload.model_dump_json())
+    await client.lpush(_redundancy_queue_name(), payload.model_dump_json())
     logger.info(f"Enqueued EC encode request {payload.name=}")
 
 
 async def dequeue_ec_request() -> RedundancyRequest | None:
     """Get the next redundancy request from the Redis queue."""
     client = get_queue_client()
-    result = await client.brpop(EC_QUEUE, timeout=5)
+    result = await client.brpop(_redundancy_queue_name(), timeout=5)
     if result:
         _, queue_data = result
         return RedundancyRequest.model_validate_json(queue_data)

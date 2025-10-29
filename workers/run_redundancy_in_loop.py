@@ -15,6 +15,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 # Add parent directory to path to import hippius_s3 modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
@@ -23,7 +24,7 @@ from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import PartChunkSpec
 from hippius_s3.queue import PartToDownload
 from hippius_s3.queue import RedundancyRequest
-from hippius_s3.queue import UploadChainRequest
+from hippius_s3.queue import ReplicaUploadRequest
 from hippius_s3.queue import dequeue_ec_request
 from hippius_s3.queue import enqueue_download_request
 from hippius_s3.queue import enqueue_upload_request
@@ -62,9 +63,9 @@ async def _upsert_part_ec_replication(
     await conn.execute(
         """
         INSERT INTO part_ec (part_id, policy_version, scheme, k, m, shard_size_bytes, stripes, state)
-        VALUES ($1, $2, 'rep-v1', 1, $3, $4, 1, 'complete')
+        VALUES ($1, $2, 'rep-v1', 1, $3, $4, 1, 'pending_upload')
         ON CONFLICT (part_id, policy_version)
-        DO UPDATE SET scheme='rep-v1', k=1, m=EXCLUDED.m, shard_size_bytes=EXCLUDED.shard_size_bytes, stripes=1, state='complete', updated_at=now()
+        DO UPDATE SET scheme='rep-v1', k=1, m=EXCLUDED.m, shard_size_bytes=EXCLUDED.shard_size_bytes, stripes=1, state='pending_upload', updated_at=now()
         """,
         part_id,
         int(policy_version),
@@ -149,6 +150,7 @@ async def process_redundancy_request(
     redis_client: async_redis.Redis,
 ) -> bool:
     obj_cache = RedisObjectPartsCache(redis_client)
+    fs_store = FileSystemPartsStore(getattr(config, "object_cache_dir", "/var/lib/hippius/object_cache"))
 
     async with db.acquire() as conn:
         part_row = await _get_part_row(conn, req.object_id, int(req.object_version), int(req.part_number))
@@ -183,12 +185,22 @@ async def process_redundancy_request(
                 logger.info("redundancy: replication factor <=1; nothing to do")
                 return True
 
+            # Ensure part_ec exists to satisfy FK
+            await _upsert_part_ec_replication(
+                conn,
+                part_id=part_id,
+                policy_version=int(req.policy_version),
+                replication_factor=R,
+                shard_size_bytes=int(cipher_size),
+            )
+
             key_bytes = await get_or_create_encryption_key_bytes(
                 main_account_id=req.address,
                 bucket_name=req.bucket_name,
             )
 
             staged: list[dict] = []
+            # Stage replica files under FS and enqueue uploader
             for ci, _cid, _clen in sorted(chunk_plan, key=lambda x: int(x[0])):
                 ct = await obj_cache.get_chunk(req.object_id, int(req.object_version), int(req.part_number), int(ci))
                 if not isinstance(ct, (bytes, bytearray)):
@@ -213,27 +225,34 @@ async def process_redundancy_request(
                     replica_ct = replica_chunks[0] if replica_chunks else b""
                     if not replica_ct:
                         continue
-                    # Stage replica bytes in Redis with short TTL
-                    redis_key = f"obj:{req.object_id}:v:{int(req.object_version)}:part:{int(req.part_number)}:rep:{int(r)}:chunk:{int(ci)}"
-                    await redis_client.setex(redis_key, int(getattr(config, "cache_ttl_seconds", 300)), replica_ct)
+                    # Write staged file
+                    part_dir = Path(fs_store.part_path(req.object_id, int(req.object_version), int(req.part_number)))
+                    rep_dir = part_dir / f"rep_{int(r)}"
+                    rep_dir.mkdir(parents=True, exist_ok=True)
+                    file_path = rep_dir / f"chunk_{int(ci)}.bin"
+
+                    def _write() -> None:
+                        with file_path.open("wb") as f:
+                            f.write(replica_ct)
+                            f.flush()
+
+                    await asyncio.to_thread(_write)
                     staged.append(
                         {
-                            "redis_key": redis_key,
+                            "file_path": str(file_path),
                             "chunk_index": int(ci),
                             "replica_index": int(r - 1),
                         }
                     )
 
-            # Enqueue uploader to upload replicas and persist CIDs
             await enqueue_upload_request(
-                UploadChainRequest(
+                ReplicaUploadRequest(
                     address=req.address,
                     bucket_name=req.bucket_name,
                     object_key="",
                     object_id=req.object_id,
                     object_version=int(req.object_version),
-                    chunks=[],
-                    upload_id=None,
+                    part_number=int(req.part_number),
                     kind="replica",
                     policy_version=int(req.policy_version),
                     staged=staged,

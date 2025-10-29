@@ -32,7 +32,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import redis.asyncio as async_redis
 
 from hippius_s3.config import get_config
-from hippius_s3.queue import UploadChainRequest
+from hippius_s3.queue import BaseUploadRequest
+from hippius_s3.queue import DataUploadRequest
+from hippius_s3.queue import ParityUploadRequest
+from hippius_s3.queue import ReplicaUploadRequest
 from hippius_s3.queue import enqueue_upload_request
 
 
@@ -135,7 +138,14 @@ class DLQManager:
 
             # Reconstruct the payload
             payload_data = entry["payload"]
-            payload = UploadChainRequest.model_validate(payload_data)
+            kind = str((payload_data or {}).get("kind") or "data").lower()
+            payload: BaseUploadRequest
+            if kind == "replica":
+                payload = ReplicaUploadRequest.model_validate(payload_data)
+            elif kind == "parity":
+                payload = ParityUploadRequest.model_validate(payload_data)
+            else:
+                payload = DataUploadRequest.model_validate(payload_data)
 
             # Reset attempts if not forcing
             if not force:

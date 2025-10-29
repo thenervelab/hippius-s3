@@ -28,8 +28,8 @@ from hippius_s3.config import get_config
 from hippius_s3.dependencies import get_object_reader
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
+from hippius_s3.queue import DataUploadRequest
 from hippius_s3.queue import RedundancyRequest
-from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_ec_request
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.services.object_reader import ObjectReader
@@ -1065,7 +1065,7 @@ async def complete_multipart_upload(
             object_version,
         )
         await enqueue_upload_request(
-            UploadChainRequest(
+            DataUploadRequest(
                 address=request.state.account.id,
                 bucket_name=bucket_name,
                 object_key=object_key,
@@ -1078,6 +1078,7 @@ async def complete_multipart_upload(
                     for part in parts
                 ],
                 upload_id=upload_id,
+                kind="data",
             ),
         )
 

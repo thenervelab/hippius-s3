@@ -212,5 +212,8 @@ def get_config() -> Config:
     except Exception:
         pass
 
+    # Normalize queue names (strip quotes/whitespace)
+    q = (getattr(cfg, "ec_queue_name", "redundancy_requests") or "redundancy_requests").strip().strip("\"'")
+    object.__setattr__(cfg, "ec_queue_name", q or "redundancy_requests")
 
     return cfg
