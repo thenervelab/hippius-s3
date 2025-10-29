@@ -95,10 +95,16 @@ Derivation rule
     3. Stream replica ciphertext directly to IPFS, obtain CIDs (no Redis writes for replicas).
     4. Persist replica CIDs into `part_parity_chunks` with `stripe_index=0`, `parity_index=replica_index-1`; update `part_ec` state to complete when all replicas present.
 
-### Uploader (parity)
+### Uploader / Substrate (redundancy)
 
-- rs-v1: Reads parity bytes from Redis by key, uploads to IPFS, persists CIDs in `part_parity_chunks` using `(part_id, policy_version, stripe_index, parity_index)`, updates `part_ec.state` for that `policy_version` to 'complete' when all parity present (in DB), and trims parity Redis keys (delete or short TTL). The uploader does not update Redis EC meta.
-- rep-v1: Not used; replicas are uploaded directly by the EC worker to avoid Redis duplication.
+- rs-v1 (parity):
+  - Uploader reads staged parity files from FS, uploads to IPFS, persists CIDs in `part_parity_chunks` using `(part_id, policy_version, stripe_index, parity_index)`, and enqueues substrate publish/pin.
+  - Substrate worker: on successful pin/publish, removes staged parity files from FS.
+  - Janitor: fallback GC for orphaned staged files older than a TTL.
+- rep-v1 (replicas):
+  - Redundancy worker writes staged replica files to FS (one per replica per chunk) and enqueues uploader with kind='replica'.
+  - Uploader uploads staged replicas, persists CIDs to `part_parity_chunks` with `(part_id, policy_version, stripe_index=chunk_index, parity_index=replica_index)`, and enqueues substrate.
+  - Substrate worker removes staged replica files on pin success; Janitor provides fallback GC.
 
 #### Uploader job payload (parity)
 
