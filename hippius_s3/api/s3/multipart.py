@@ -654,7 +654,7 @@ async def upload_part(
         # Store in Redis via chunked cache API (encrypt for private, meta-first for readiness)
         redis_start = time.time()
         # Route through ObjectWriter for standardized behavior
-        writer = ObjectWriter(db=db, redis_client=redis_client)
+        writer = ObjectWriter(db=db, redis_client=redis_client, fs_store=request.app.state.fs_store)
         part_res = await writer.mpu_upload_part(
             upload_id=str(upload_id),
             object_id=str(object_id),
@@ -1045,7 +1045,7 @@ async def complete_multipart_upload(
                 status_code=400,
             )
 
-        writer = ObjectWriter(db=db, redis_client=request.app.state.redis_client)
+        writer = ObjectWriter(db=db, redis_client=request.app.state.redis_client, fs_store=request.app.state.fs_store)
         complete_res = await writer.mpu_complete(
             bucket_name=bucket_name,
             object_id=str(object_id),

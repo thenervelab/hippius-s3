@@ -211,6 +211,20 @@ class SubstrateWorker:
                 )
                 logger.info(f"Ensured object status is 'uploaded' object_id={req.object_id}")
 
+                # Clean up FS parts after successful pin submission
+                try:
+                    from hippius_s3.cache import FileSystemPartsStore  # local import
+                    from hippius_s3.workers.fs_cleanup import cleanup_pinned_object_parts  # local import
+
+                    fs_store = FileSystemPartsStore(self.config.object_cache_dir)
+                    await cleanup_pinned_object_parts(
+                        fs_store, self.db, req.object_id, int(getattr(req, "object_version", 1) or 1)
+                    )
+                except Exception as cleanup_err:
+                    logger.warning(
+                        f"FS cleanup failed for object_id={req.object_id}, continuing: {cleanup_err}", exc_info=True
+                    )
+
             for user_addr, user_requests in user_request_map.items():
                 total_cids = sum(len(r.cids) for r in user_requests)
                 get_metrics_collector().record_substrate_operation(

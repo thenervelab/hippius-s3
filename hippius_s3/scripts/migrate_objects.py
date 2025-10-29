@@ -72,7 +72,10 @@ async def migrate_one(
 
     # Do not delete prior migration versions here; cleanup tool handles unpin + delete safely
 
-    writer = ObjectWriter(db=db, redis_client=redis_client)
+    from hippius_s3.cache import FileSystemPartsStore  # local import
+
+    fs_store = FileSystemPartsStore(config.object_cache_dir)
+    writer = ObjectWriter(db=db, redis_client=redis_client, fs_store=fs_store)
     new_version = await writer.create_version_for_migration(
         object_id=object_id,
         content_type=content_type,

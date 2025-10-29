@@ -88,7 +88,7 @@ def test_dlq_requeue_multipart_upload(
         r = _redis.Redis.from_url("redis://localhost:6379/0")
         found = False
         for _ in range(130):
-            entries = r.lrange("upload_requests:dlq", 0, -1)
+            entries = list(r.lrange("upload_requests:dlq", 0, -1))  # type: ignore[arg-type]
             for entry_json in entries:
                 import json as _json
 
@@ -103,7 +103,7 @@ def test_dlq_requeue_multipart_upload(
 
         # Verify DLQ entry exists
         r = redis.Redis.from_url("redis://localhost:6379/0")
-        dlq_entries = r.lrange("upload_requests:dlq", 0, -1)
+        dlq_entries = list(r.lrange("upload_requests:dlq", 0, -1))  # type: ignore[arg-type]
 
         assert len(dlq_entries) > 0, "No DLQ entries found"
 
@@ -118,30 +118,8 @@ def test_dlq_requeue_multipart_upload(
         assert dlq_entry is not None, f"DLQ entry not found for object_id {object_id}"
         # error_type varies across versions (bool or string). Any value is acceptable for DLQ presence.
 
-        # Verify chunks persisted via in-container CLI to avoid host FS assumptions
-        code, out, err = exec_python_module(
-            "api", "hippius_s3.scripts.dlq_requeue", ["dlq-parts", "--object-id", object_id]
-        )
-        assert code == 0, f"dlq-parts failed: {err}\n{out}"
-        parts_list = json.loads(out.strip() or "[]")
-        assert parts_list == [1, 2] or set(parts_list) == {1, 2}, f"Unexpected parts list: {parts_list}"
-
-        # Verify sizes for both parts from inside the container
-        code1, out1, err1 = exec_python_module(
-            "api", "hippius_s3.scripts.dlq_requeue", ["dlq-part-size", "--object-id", object_id, "--part", "1"]
-        )
-        code2, out2, err2 = exec_python_module(
-            "api", "hippius_s3.scripts.dlq_requeue", ["dlq-part-size", "--object-id", object_id, "--part", "2"]
-        )
-        assert code1 == 0 and code2 == 0, f"dlq-part-size failed: {err1} {err2}"
-        size1 = int(out1.strip())
-        size2 = int(out2.strip())
-        assert size1 == len(part1_data) or (size1 > len(part1_data) and (size1 - len(part1_data)) % 40 == 0), (
-            "Part 1 size mismatch"
-        )
-        assert size2 == len(part2_data) or (size2 > len(part2_data) and (size2 - len(part2_data)) % 40 == 0), (
-            "Part 2 size mismatch"
-        )
+        # Note: We no longer persist DLQ bytes to a separate filesystem area.
+        # The uploader reads chunks from the FS store written during upload, so no dlq-fs checks are needed here.
 
         # Clear Redis cache to simulate cache eviction
         clear_object_cache(object_id, parts=[0, 1])
@@ -171,23 +149,7 @@ def test_dlq_requeue_multipart_upload(
         expected_data = part1_data + part2_data
         assert retrieved_data == expected_data, "Retrieved data doesn't match expected"
 
-        # Verify DLQ directory was archived via in-container CLI
-        code, out, err = exec_python_module(
-            "api", "hippius_s3.scripts.dlq_requeue", ["archived-exists", "--object-id", object_id]
-        )
-        assert code == 0 and out.strip() == "FOUND", f"Archived directory not found: {out} {err}"
-
-        # Optionally verify original DLQ directory removal via parts listing
-        code, out, err = exec_python_module(
-            "api", "hippius_s3.scripts.dlq_requeue", ["dlq-parts", "--object-id", object_id]
-        )
-        # After archive, listing should return empty or error; tolerate either
-        if code == 0:
-            try:
-                remaining = json.loads(out.strip() or "[]")
-                assert remaining == []
-            except Exception:
-                pass
+        # No DLQ archive concept anymore; uploader sources from FS store; nothing further to assert here.
 
         # We don't manipulate host fs; cleanup can be performed via CLI if needed
 

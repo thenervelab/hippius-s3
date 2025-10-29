@@ -138,7 +138,7 @@ async def handle_copy_object(
     content_type = str(source_object["content_type"])  # type: ignore[index]
     metadata: dict[str, Any] = {}
 
-    ow = ObjectWriter(db=db, redis_client=redis_client)
+    ow = ObjectWriter(db=db, redis_client=redis_client, fs_store=request.app.state.fs_store)
     put_res = await ow.put_simple_stream_full(
         bucket_id=str(dest_bucket["bucket_id"]),
         bucket_name=dest_bucket["bucket_name"],

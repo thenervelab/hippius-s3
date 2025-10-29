@@ -32,8 +32,8 @@ services:
         condition: service_healthy
     volumes:
       - .:/app
-      - /var/lib/hippius/dlq:/tmp/hippius_dlq
-      - /var/lib/hippius/dlq_archive:/tmp/hippius_dlq_archive
+      # Shared object parts FS store (write-through cache)
+      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
@@ -85,7 +85,15 @@ services:
       - "127.0.0.1:6379:6379"
     volumes:
       - ./redis.conf:/usr/local/etc/redis/redis.conf
-    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--appendonly", "no", "--save", ""]
+    command:
+      [
+        "redis-server",
+        "/usr/local/etc/redis/redis.conf",
+        "--appendonly",
+        "no",
+        "--save",
+        "",
+      ]
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
@@ -103,7 +111,21 @@ services:
     volumes:
       - redis_accounts_data:/data
       - ./redis.conf:/usr/local/etc/redis/redis.conf
-    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--save", "60 1", "--save", "300 10", "--save", "900 100", "--appendonly", "yes", "--appendfsync", "everysec"]
+    command:
+      [
+        "redis-server",
+        "/usr/local/etc/redis/redis.conf",
+        "--save",
+        "60 1",
+        "--save",
+        "300 10",
+        "--save",
+        "900 100",
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+      ]
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
@@ -121,7 +143,21 @@ services:
     volumes:
       - redis_chain_data:/data
       - ./redis.conf:/usr/local/etc/redis/redis.conf
-    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--save", "60 1", "--save", "300 10", "--save", "900 100", "--appendonly", "yes", "--appendfsync", "everysec"]
+    command:
+      [
+        "redis-server",
+        "/usr/local/etc/redis/redis.conf",
+        "--save",
+        "60 1",
+        "--save",
+        "300 10",
+        "--save",
+        "900 100",
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+      ]
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
@@ -139,7 +175,8 @@ services:
     volumes:
       - redis_rate_limiting_data:/data
       - ./redis.conf:/usr/local/etc/redis/redis.conf
-    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--maxmemory", "1gb"]
+    command:
+      ["redis-server", "/usr/local/etc/redis/redis.conf", "--maxmemory", "1gb"]
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
@@ -156,13 +193,18 @@ services:
       - "127.0.0.1:6382:6379"
     volumes:
       - redis_queues_data:/data
-    command: [
-      "redis-server",
-      "--maxmemory", "2gb",
-      "--maxmemory-policy", "allkeys-lru",
-      "--appendonly", "yes",
-      "--appendfsync", "everysec"
-    ]
+    command:
+      [
+        "redis-server",
+        "--maxmemory",
+        "2gb",
+        "--maxmemory-policy",
+        "allkeys-lru",
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+      ]
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
@@ -194,8 +236,8 @@ services:
       - ENABLE_WATCHFILES=true
     volumes:
       - .:/app
-      - /var/lib/hippius/dlq:/tmp/hippius_dlq
-      - /var/lib/hippius/dlq_archive:/tmp/hippius_dlq_archive
+      # Shared object parts FS store (authoritative for uploader reads)
+      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
     networks:
       - hippius_net
 
@@ -222,6 +264,8 @@ services:
       - ENABLE_WATCHFILES=true
     volumes:
       - .:/app
+      # Shared object parts FS store (cleanup after pin confirmation)
+      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
     networks:
       - hippius_net
 
@@ -270,6 +314,32 @@ services:
       - PYTHONUNBUFFERED=1
       - WORKER_SCRIPT=workers/run_downloader_in_loop.py
       - ENABLE_WATCHFILES=true
+    volumes:
+      # Shared object parts FS store (not required for downloader, but harmless)
+      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
+    networks:
+      - hippius_net
+
+  janitor:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    env_file:
+      - .env.defaults
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - WORKER_SCRIPT=workers/run_janitor_in_loop.py
+      - ENABLE_WATCHFILES=true
+    volumes:
+      - .:/app
+      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
     networks:
       - hippius_net
 

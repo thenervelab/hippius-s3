@@ -127,7 +127,7 @@ async def handle_put_object(
                     "storage_version": int(getattr(config, "target_storage_version", 3)),
                 },
             ) as span:
-                writer = ObjectWriter(db=db, redis_client=redis_client)
+                writer = ObjectWriter(db=db, redis_client=redis_client, fs_store=request.app.state.fs_store)
 
                 async def _iter_once() -> AsyncIterator[bytes]:
                     yield file_data
