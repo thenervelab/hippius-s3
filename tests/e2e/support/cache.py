@@ -40,6 +40,76 @@ def get_object_id(
     return oid
 
 
+def get_object_cids(
+    bucket_name: str,
+    object_key: str,
+    *,
+    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+) -> tuple[str, int, str, list[str], Optional[str]]:
+    """Get all CIDs for an object including parts, chunks, and manifest.
+
+    Returns: (object_id, object_version, main_account_id, part_cids, manifest_cid)
+    """
+    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT o.object_id, o.current_object_version, b.main_account_id
+            FROM objects o
+            JOIN buckets b ON b.bucket_id = o.bucket_id
+            WHERE b.bucket_name = %s AND o.object_key = %s
+            """,
+            (bucket_name, object_key),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise RuntimeError("object_not_found")
+        object_id, object_version, main_account_id = str(row[0]), int(row[1] or 1), str(row[2])
+
+        cur.execute(
+            """
+            SELECT COALESCE(c.cid, p.ipfs_cid) as cid
+            FROM parts p
+            LEFT JOIN cids c ON p.cid_id = c.id
+            WHERE p.object_id = %s AND p.object_version = %s
+            AND COALESCE(c.cid, p.ipfs_cid) IS NOT NULL
+            AND COALESCE(c.cid, p.ipfs_cid) != 'pending'
+            ORDER BY p.part_number
+            """,
+            (object_id, object_version),
+        )
+        part_cids = [str(row[0]) for row in cur.fetchall()]
+
+        cur.execute(
+            """
+            SELECT pc.cid
+            FROM parts p
+            JOIN part_chunks pc ON pc.part_id = p.part_id
+            WHERE p.object_id = %s AND p.object_version = %s
+            AND pc.cid IS NOT NULL
+            AND pc.cid != 'pending'
+            ORDER BY p.part_number, pc.chunk_index
+            """,
+            (object_id, object_version),
+        )
+        chunk_cids = [str(row[0]) for row in cur.fetchall()]
+
+        cur.execute(
+            """
+            SELECT COALESCE(c.cid, ov.ipfs_cid) as cid
+            FROM object_versions ov
+            LEFT JOIN cids c ON ov.cid_id = c.id
+            WHERE ov.object_id = %s AND ov.object_version = %s
+            AND COALESCE(c.cid, ov.ipfs_cid) IS NOT NULL
+            AND COALESCE(c.cid, ov.ipfs_cid) != 'pending'
+            """,
+            (object_id, object_version),
+        )
+        manifest_row = cur.fetchone()
+        manifest_cid = str(manifest_row[0]) if manifest_row else None
+
+        return object_id, object_version, main_account_id, part_cids + chunk_cids, manifest_cid
+
+
 essentially_all_parts = range(0, 256)
 
 

@@ -14,6 +14,11 @@ from hippius_s3.queue import enqueue_unpin_request
 async def main_async(args: argparse.Namespace) -> int:
     config = get_config()
     db = await asyncpg.connect(config.database_url)  # type: ignore[arg-type]
+    redis_queues_client = async_redis.from_url(config.redis_queues_url)
+
+    from hippius_s3.queue import initialize_queue_client
+
+    initialize_queue_client(redis_queues_client)
     try:
         rows = await db.fetch(
             """
@@ -50,19 +55,11 @@ async def main_async(args: argparse.Namespace) -> int:
                     with suppress(Exception):
                         await enqueue_unpin_request(
                             payload=UnpinChainRequest(
-                                substrate_url=config.substrate_url,
-                                ipfs_node=config.ipfs_store_url,
                                 address=r["main_account_id"],
-                                subaccount=r["main_account_id"],
-                                subaccount_seed_phrase="",
-                                bucket_name=r["bucket_name"],
-                                object_key=r["object_key"],
-                                should_encrypt=False,
                                 object_id=str(r["object_id"]),
                                 cid=str(cid),
                                 object_version=int(r["object_version"]),
                             ),
-                            redis_client=redis_client,
                         )
                 await db.execute(
                     """

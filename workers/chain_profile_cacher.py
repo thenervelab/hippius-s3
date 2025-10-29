@@ -86,7 +86,6 @@ def extract_file_cids_from_profile(profile_data: dict) -> List[str]:
 
 
 async def cache_user_chain_profile(
-    redis_chain: async_redis.Redis,
     user: str,
     all_profiles: dict,
     storage_requests_dict: dict,
@@ -94,6 +93,8 @@ async def cache_user_chain_profile(
     gateway_url: str,
 ) -> None:
     """Download and cache chain profile data for a single user."""
+    from hippius_s3.redis_chain import get_chain_client
+
     logger.debug(f"Caching chain profile for user {user}")
 
     # Get profile CIDs from pre-fetched profiles dict
@@ -128,7 +129,7 @@ async def cache_user_chain_profile(
     cache_key = f"pinned_cids:{user}"
 
     # Set with TTL of 1 hour (3600 seconds)
-    await redis_chain.setex(
+    await get_chain_client().setex(
         cache_key,
         600,  # 1 hour TTL
         json.dumps(cache_data),
@@ -141,12 +142,15 @@ async def cache_user_chain_profile(
 
 async def run_chain_profile_cacher_loop():
     """Main loop that downloads and caches substrate chain profiles for all users."""
-    # Connect to database
     db = await asyncpg.connect(config.database_url)
 
     redis_chain_url = config.redis_chain_url
     redis_chain = async_redis.from_url(redis_chain_url)
     http_client = httpx.AsyncClient(timeout=30.0)
+
+    from hippius_s3.redis_chain import initialize_chain_client
+
+    initialize_chain_client(redis_chain)
 
     logger.info("Starting chain profile cacher service...")
     logger.info(f"Database: {config.database_url}")
@@ -185,7 +189,6 @@ async def run_chain_profile_cacher_loop():
             # Process each user
             for user in users:
                 await cache_user_chain_profile(
-                    redis_chain,
                     user,
                     all_profiles,
                     storage_requests_dict,

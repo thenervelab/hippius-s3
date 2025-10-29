@@ -213,6 +213,19 @@ async def verify_hmac_middleware(
         return await call_next(request)
 
     path = request.url.path
+
+    if path == "/health":
+        client_host = request.client.host if request.client else None
+        if not client_host or not (
+            client_host.startswith("172.") or client_host.startswith("10.") or client_host == "127.0.0.1"
+        ):
+            return s3_error_response(
+                code="AccessDenied",
+                message="Unavailable",
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+        return await call_next(request)
+
     if any(path.startswith(exempt_path) for exempt_path in exempt_paths):
         return await call_next(request)
 

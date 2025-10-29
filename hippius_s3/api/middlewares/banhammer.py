@@ -147,25 +147,20 @@ async def _post_request_checks(
 ) -> None:
     """Run post-request checks to detect suspicious behavior."""
 
-    # Check 1: Too many 4xx errors (client errors)
-    if 400 <= response.status_code < 500:
-        await banhammer_service.add_infringement(
-            client_ip,
-            f"client_error_{response.status_code}_{request.method}_{request.url.path}",
-        )
-
-    # Check 2: Malformed requests (specific S3 errors that indicate scanning/probing)
     if response.status_code == 400:
         await banhammer_service.add_infringement(
             client_ip,
             f"malformed_request_{request.method}_{request.url.path}",
         )
-
-    # Check 3: Authentication failures
-    if response.status_code == 403:
+    elif response.status_code == 403:
         await banhammer_service.add_infringement(
             client_ip,
             f"auth_failure_{request.method}_{request.url.path}",
+        )
+    elif 400 <= response.status_code < 500:
+        await banhammer_service.add_infringement(
+            client_ip,
+            f"client_error_{response.status_code}_{request.method}_{request.url.path}",
         )
 
 

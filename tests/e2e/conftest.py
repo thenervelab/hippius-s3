@@ -1,4 +1,12 @@
-"""E2E test configuration and fixtures for Hippius S3."""
+"""E2E test configuration and fixtures for Hippius S3.
+
+Environment configuration:
+- E2E tests run via docker-compose which loads:
+  - .env.defaults (common test configuration)
+  - .env.test-docker (Docker service DNS names)
+- Integration tests and pytest conftest use .env.defaults + .env.test-local (base + localhost URLs)
+- See .env.defaults, .env.test-local, and .env.test-docker for configuration
+"""
 
 import base64
 import os
@@ -153,6 +161,13 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
         ]
         result = subprocess.run(up_cmd, env=env, cwd=project_root, capture_output=True, text=True)
         if result.returncode != 0:
+            print("DOCKER COMPOSE UP FAILED")
+            print("=" * 80)
+            print("\nSTDOUT:")
+            print(result.stdout or "(empty)")
+            print("\nSTDERR:")
+            print(result.stderr or "(empty)")
+
             # Capture diagnostics to artifacts for CI visibility
             try:
                 artifacts_dir = Path(project_root) / "artifacts"
@@ -161,9 +176,12 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
                 (artifacts_dir / "compose_up.stderr.txt").write_text(result.stderr or "")
                 ps_out = compose_cmd(["ps"]).stdout
                 (artifacts_dir / "ps.txt").write_bytes(ps_out or b"")
+                print(f"\nDiagnostics saved to: {artifacts_dir}")
             except Exception as e:  # noqa: PERF203
                 print(f"Warning: failed to write compose diagnostics: {e}")
-            raise RuntimeError("docker compose up failed; see artifacts/compose_up.stderr.txt for details")
+            raise RuntimeError(
+                "docker compose up failed; see output above and artifacts/compose_up.stderr.txt for details"
+            )
         print("Waiting for services to be ready...")
         time.sleep(10)
 
@@ -181,6 +199,23 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
             print(f"API not ready yet, attempt {attempt + 1}/{max_retries}")
             time.sleep(5)
     else:
+        print("\nAPI HEALTH CHECK FAILED")
+        print("=" * 80)
+
+        ps_result = compose_cmd(["ps"])
+        print("\nContainer status:")
+        print(ps_result.stdout.decode() if ps_result.stdout else "(empty)")
+
+        logs_result = compose_cmd(["logs", "--tail=100"])
+        print("\nRecent logs:")
+        print(logs_result.stdout.decode() if logs_result.stdout else "(empty)")
+
+        artifacts_dir = Path(project_root) / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (artifacts_dir / "health_check_ps.txt").write_bytes(ps_result.stdout or b"")
+        (artifacts_dir / "health_check_logs.txt").write_bytes(logs_result.stdout or b"")
+        print(f"\nDiagnostics saved to: {artifacts_dir}")
+
         raise RuntimeError("API service failed to start within timeout")
 
     yield

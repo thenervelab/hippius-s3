@@ -63,13 +63,16 @@ class Config:
     redis_url: str = env("REDIS_URL")
 
     # Redis for account caching (persistent)
-    redis_accounts_url: str = env("REDIS_ACCOUNTS_URL")
+    redis_accounts_url: str = env("REDIS_ACCOUNTS_URL:redis://127.0.0.1:6380/0")
 
     # Redis for chain operations
     redis_chain_url: str = env("REDIS_CHAIN_URL:redis://127.0.0.1:6381/0")
 
     # Redis for rate limiting and banhammer
     redis_rate_limiting_url: str = env("REDIS_RATE_LIMITING_URL:redis://127.0.0.1:6383/0")
+
+    # Redis for queues (persistent)
+    redis_queues_url: str = env("REDIS_QUEUES_URL:redis://127.0.0.1:6382/0")
 
     # API signing key for pre-signed URLs
     # Generated on first run if not provided
@@ -152,6 +155,11 @@ class Config:
     # Storage version to assign for newly created/overwritten objects
     # Defaults to 3 (latest layout)
     target_storage_version: int = env("HIPPIUS_TARGET_STORAGE_VERSION:3", convert=int)
+
+    # Cachet health monitoring
+    cachet_api_url: str = env("CACHET_API_URL", convert=str)
+    cachet_api_key: str = env("CACHET_API_KEY", convert=str)
+    cachet_component_id: int = env("CACHET_COMPONENT_ID", convert=int)
 
 
 def get_config() -> Config:

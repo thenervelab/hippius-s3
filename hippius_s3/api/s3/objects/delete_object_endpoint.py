@@ -89,39 +89,29 @@ async def handle_delete_object(
             except Exception:
                 logger.debug("Failed to cleanup provisional multipart uploads on object delete", exc_info=True)
 
-        # Enqueue unpin if CID exists
-        cid = deleted_object.get("ipfs_cid") or ""
-        if cid and cid.strip():
+        # Enqueue unpin requests (one per CID)
+        all_cids = deleted_object.get("all_cids") or []
+        if all_cids:
+            obj_version = deleted_object.get("object_version") or deleted_object.get("current_object_version") or 1
             with tracer.start_as_current_span(
                 "delete_object.enqueue_unpin",
                 attributes={
-                    "cid": cid,
-                    "has_cid": True,
+                    "num_cids": len(all_cids),
+                    "has_cids": True,
                     "object_id": str(deleted_object["object_id"]),
                     "has_object_id": True,
-                    "object_version": int(
-                        deleted_object.get("object_version") or deleted_object.get("current_object_version") or 1
-                    ),
+                    "object_version": int(obj_version),
                 },
             ):
-                await enqueue_unpin_request(
-                    payload=UnpinChainRequest(
-                        substrate_url=config.substrate_url,
-                        ipfs_node=config.ipfs_store_url,
-                        address=request.state.account.main_account,
-                        subaccount=request.state.account.main_account,
-                        subaccount_seed_phrase=request.state.seed_phrase,
-                        bucket_name=bucket_name,
-                        object_key=object_key,
-                        should_encrypt=not bucket["is_public"],
-                        cid=cid,
-                        object_id=str(deleted_object["object_id"]),
-                        object_version=int(
-                            deleted_object.get("object_version") or deleted_object.get("current_object_version") or 1
+                for cid in all_cids:
+                    await enqueue_unpin_request(
+                        payload=UnpinChainRequest(
+                            address=request.state.account.main_account,
+                            object_id=str(deleted_object["object_id"]),
+                            object_version=int(obj_version),
+                            cid=cid,
                         ),
-                    ),
-                    redis_client=redis_client,
-                )
+                    )
         return Response(status_code=204)
 
     except Exception:
