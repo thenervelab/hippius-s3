@@ -318,26 +318,20 @@ async def process_redundancy_request(
                 b = bytes(ct)
                 blocks.append(b)
                 max_len = max(max_len, len(b))
-            # Zero-extend and XOR
+            # Compute XOR parity with codec to keep logic centralized
             if not blocks:
                 continue
             max_len = max(max_len, shard_size)
-            parity = bytearray(max_len)
-            for b in blocks:
-                if len(b) < max_len:
-                    # zero-extend
-                    for i in range(len(b)):
-                        parity[i] ^= b[i]
-                else:
-                    for i in range(max_len):
-                        parity[i] ^= b[i]
+            from hippius_s3.ec.codec import encode_rs_systematic
+
+            parity_block = encode_rs_systematic(blocks, k=min(k, len(blocks)), m=1, symbol_size=max_len)[0]
 
             # Write staged parity file
             file_path = pv_dir / f"stripe_{s}.parity_0.bin"
 
             def _write() -> None:
                 with file_path.open("wb") as f:
-                    f.write(parity)
+                    f.write(parity_block)
                     f.flush()
 
             await asyncio.to_thread(_write)
@@ -373,6 +367,14 @@ async def run_redundancy_loop() -> None:
     initialize_metrics_collector(redis_client)
 
     logger.info("Starting redundancy service...")
+    try:
+        logger.info(
+            f"EC config: enabled={getattr(config, 'ec_enabled', False)} scheme={getattr(config, 'ec_scheme', '')} "
+            f"k={getattr(config, 'ec_k', 0)} m={getattr(config, 'ec_m', 0)} threshold_bytes={getattr(config, 'ec_threshold_bytes', 0)} "
+            f"queue={getattr(config, 'ec_queue_name', '')}"
+        )
+    except Exception:
+        pass
 
     try:
         while True:

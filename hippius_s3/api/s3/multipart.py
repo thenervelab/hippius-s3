@@ -1104,7 +1104,7 @@ async def complete_multipart_upload(
                             bucket_name=bucket_name,
                             address=request.state.account.main_account,
                             num_chunks=int(num_chunks),
-                            part_size_bytes=0,
+                            part_size_bytes=int(meta.get("size_bytes", 0)),
                         ),
                         request.app.state.redis_client,
                     )

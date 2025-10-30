@@ -7,7 +7,7 @@ from typing import Optional
 import asyncpg
 import redis.asyncio as async_redis
 
-from hippius_s3.cache.object_parts import ObjectPartsCache
+from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.ec.codec import encode_rs_systematic
 from hippius_s3.ipfs_service import IPFSService
@@ -70,7 +70,7 @@ async def try_recover_missing_chunks(
     *,
     db: asyncpg.Connection,
     redis_client: async_redis.Redis,
-    obj_cache: ObjectPartsCache,
+    obj_cache: RedisObjectPartsCache,
     object_id: str,
     object_version: int,
     part_number: int,
@@ -134,7 +134,7 @@ async def try_recover_missing_chunks(
         symbol_size = max([len(parity_symbol)] + [len(b) for b in other_bytes])
         # XOR parity with other data to reconstruct the missing data
         blocks = other_bytes  # Missing block is derived from parity ^ XOR(other)
-        xor_parity = encode_rs_systematic(blocks, k=max(1, k - 1), m=1, symbol_size=symbol_size)[0]
+        xor_parity = encode_rs_systematic(blocks, k=len(blocks), m=1, symbol_size=symbol_size)[0]
         out = bytearray(symbol_size)
         for i in range(symbol_size):
             pv = parity_symbol[i] if i < len(parity_symbol) else 0

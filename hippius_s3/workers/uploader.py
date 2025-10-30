@@ -214,7 +214,7 @@ class Uploader:
         max_replica_index = -1
         for item in staged:
             data: Optional[bytes] = None
-            file_path = item.get("file_path")
+            file_path = getattr(item, "file_path", None)
             if isinstance(file_path, str) and file_path:
                 try:
                     p = Path(file_path)
@@ -223,7 +223,7 @@ class Uploader:
                 except Exception:
                     logger.warning(f"uploader: failed to read staged file {file_path}")
             if data is None:
-                redis_key = str(item.get("redis_key", ""))
+                redis_key = str(getattr(item, "redis_key", ""))
                 if redis_key:
                     data = await self.redis_client.get(redis_key)
             if not isinstance(data, (bytes, bytearray)):
@@ -239,10 +239,12 @@ class Uploader:
                         object_version=int(getattr(payload, "object_version", 1) or 1),
                         part_id=part_id,
                         policy_version=policy_version,
-                        chunk_index=(int(item.get("chunk_index", 0)) if kind == "replica" else None),
-                        stripe_index=(int(item.get("stripe_index", 0)) if kind != "replica" else None),
+                        chunk_index=(int(getattr(item, "chunk_index", 0)) if kind == "replica" else None),
+                        stripe_index=(int(getattr(item, "stripe_index", 0)) if kind != "replica" else None),
                         parity_index=(
-                            int(item.get("replica_index", 0)) if kind == "replica" else int(item.get("parity_index", 0))
+                            int(getattr(item, "replica_index", 0))
+                            if kind == "replica"
+                            else int(getattr(item, "parity_index", 0))
                         ),
                         fs_path=(str(file_path) if isinstance(file_path, str) and file_path else ""),
                         size_bytes=int(len(data)),
@@ -275,7 +277,7 @@ class Uploader:
             # Persist into part_parity_chunks
             async with self._acquire_conn() as conn:
                 if kind == "replica":
-                    max_replica_index = max(max_replica_index, int(item.get("replica_index", 0)))
+                    max_replica_index = max(max_replica_index, int(getattr(item, "replica_index", 0)))
                     await conn.execute(
                         """
                         INSERT INTO part_parity_chunks (part_id, policy_version, stripe_index, parity_index, cid)
@@ -285,8 +287,8 @@ class Uploader:
                         """,
                         part_id,
                         policy_version,
-                        int(item.get("chunk_index", 0)),
-                        int(item.get("replica_index", 0)),
+                        int(getattr(item, "chunk_index", 0)),
+                        int(getattr(item, "replica_index", 0)),
                         cid,
                     )
                 else:  # parity path (future)
@@ -299,8 +301,8 @@ class Uploader:
                         """,
                         part_id,
                         policy_version,
-                        int(item.get("stripe_index", 0)),
-                        int(item.get("parity_index", 0)),
+                        int(getattr(item, "stripe_index", 0)),
+                        int(getattr(item, "parity_index", 0)),
                         cid,
                     )
 

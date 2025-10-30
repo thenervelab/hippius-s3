@@ -1,5 +1,8 @@
 -- migrate:up
 
+-- Ensure pgcrypto is available for gen_random_uuid()
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- blobs: unified CID work ledger
 CREATE TABLE IF NOT EXISTS blobs (
   id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
