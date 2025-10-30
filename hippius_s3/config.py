@@ -41,7 +41,6 @@ class Config:
 
     # Feature Flags
     enable_audit_logging: bool = env("ENABLE_AUDIT_LOGGING", convert=lambda x: x.lower() == "true")
-    enable_strict_validation: bool = env("ENABLE_STRICT_VALIDATION", convert=lambda x: x.lower() == "true")
     enable_api_docs: bool = env("ENABLE_API_DOCS", convert=lambda x: x.lower() == "true")
     enable_request_profiling: bool = env("ENABLE_REQUEST_PROFILING:false", convert=lambda x: x.lower() == "true")
     enable_banhammer: bool = env("ENABLE_BANHAMMER:true", convert=lambda x: x.lower() == "true")
@@ -170,10 +169,24 @@ class Config:
 def get_config() -> Config:
     """Get application configuration."""
     cfg = Config()
+
+    # Validate required ENVIRONMENT variable
+    env_value = getattr(cfg, "environment", None)
+    if not env_value or not env_value.strip():
+        raise ValueError("ENVIRONMENT variable is required but not set or empty")
+
     try:
         if not getattr(cfg, "encryption_database_url", None):
             object.__setattr__(cfg, "encryption_database_url", cfg.database_url)
     except Exception:
         # Last resort: ensure a usable value
         object.__setattr__(cfg, "encryption_database_url", cfg.database_url)
+
+    # Enforce environment constraints:
+    # - Only in 'test' can enable_bypass_credit_check be True
+    # - Only in 'test' can publish_to_chain be False
+    if env_value.lower() != "test":
+        object.__setattr__(cfg, "enable_bypass_credit_check", False)
+        object.__setattr__(cfg, "publish_to_chain", True)
+
     return cfg

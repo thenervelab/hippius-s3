@@ -7,12 +7,6 @@ services:
       context: .
       dockerfile: Dockerfile.base
 
-  api:
-    environment:
-      - HIPPIUS_ENVIRONMENT=staging
-      - DEBUG=false
-      - UVICORN_LOG_LEVEL=info
-
   db:
     environment:
       - POSTGRES_USER=postgres
