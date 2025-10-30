@@ -34,7 +34,7 @@ async def list_buckets(
     """
     try:
         buckets = await db.fetch(
-            get_query("list_user_buckets"),
+            get_query("console_list_buckets"),
             main_account_id,
         )
 
@@ -45,14 +45,21 @@ async def list_buckets(
                 "created_at": bucket["created_at"].isoformat(),
                 "is_public": bucket["is_public"],
                 "tags": bucket["tags"] or {},
+                "total_objects": bucket["total_objects"],
+                "total_size_bytes": bucket["total_size_bytes"],
             }
             for bucket in buckets
         ]
+
+        total_objects = sum(bucket["total_objects"] for bucket in buckets)
+        total_size_bytes = sum(bucket["total_size_bytes"] for bucket in buckets)
 
         return JSONResponse(
             {
                 "buckets": bucket_list,
                 "count": len(bucket_list),
+                "total_objects": total_objects,
+                "total_size_bytes": total_size_bytes,
                 "main_account_id": main_account_id,
             }
         )
@@ -155,16 +162,16 @@ async def list_objects(
     bucket_name: str = Query(..., description="Bucket name to list objects from"),
     main_account_id: str = Query(..., description="Main account ID that owns the bucket"),
     prefix: Optional[str] = Query(None, description="Object key prefix filter"),
-    max_keys: int = Query(1000, description="Maximum number of objects to return"),
+    limit: int = Query(100, ge=1, le=1000, description="Number of objects to return per page"),
+    offset: int = Query(0, ge=0, description="Number of objects to skip"),
     db=Depends(get_postgres),
 ) -> JSONResponse:
     """
-    List objects in a bucket owned by a specific main account.
+    List objects in a bucket owned by a specific main account with pagination.
 
-    Returns JSON response with object information.
+    Returns JSON response with object information and pagination metadata.
     """
     try:
-        # First verify the bucket exists and is owned by the main account
         bucket = await db.fetchrow(
             get_query("get_bucket_by_name_and_owner"),
             bucket_name,
@@ -177,19 +184,17 @@ async def list_objects(
                 detail=f"Bucket '{bucket_name}' not found for account '{main_account_id}'",
             )
 
-        # List objects in the bucket
         objects = await db.fetch(
-            get_query("list_objects"),
+            get_query("console_list_objects"),
             bucket["bucket_id"],
             prefix,
+            limit + 1,
+            offset,
         )
 
-        # Limit results to max_keys
-        if len(objects) > max_keys:
-            objects = objects[:max_keys]
-            truncated = True
-        else:
-            truncated = False
+        has_more = len(objects) > limit
+        if has_more:
+            objects = objects[:limit]
 
         object_list = [
             {
@@ -203,18 +208,22 @@ async def list_objects(
             for obj in objects
         ]
 
-        return JSONResponse(
-            {
-                "bucket_name": bucket_name,
-                "bucket_id": str(bucket["bucket_id"]),
-                "main_account_id": main_account_id,
-                "objects": object_list,
-                "count": len(object_list),
-                "truncated": truncated,
-                "prefix": prefix,
-                "max_keys": max_keys,
-            }
-        )
+        response_data = {
+            "bucket_name": bucket_name,
+            "bucket_id": str(bucket["bucket_id"]),
+            "main_account_id": main_account_id,
+            "objects": object_list,
+            "count": len(object_list),
+            "prefix": prefix,
+            "limit": limit,
+            "offset": offset,
+            "has_more": has_more,
+        }
+
+        if has_more:
+            response_data["next_offset"] = offset + limit
+
+        return JSONResponse(response_data)
 
     except HTTPException:
         raise
