@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import List
 from typing import Optional
@@ -20,7 +21,7 @@ def get_part_chunks(
     object_key: str,
     part_number: int = 1,
     *,
-    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+    dsn: Optional[str] = None,
 ) -> List[ChunkRow]:
     """Return chunk rows for a given object's part, ordered by chunk_index."""
     sql = (
@@ -32,7 +33,8 @@ def get_part_chunks(
         "WHERE b.bucket_name = %s AND o.object_key = %s\n"
         "ORDER BY pc.chunk_index ASC"
     )
-    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         cur.execute(sql, (int(part_number), bucket_name, object_key))
         rows = cur.fetchall()
         result: List[ChunkRow] = [
@@ -51,7 +53,7 @@ def get_first_chunk_cid(
     bucket_name: str,
     object_key: str,
     *,
-    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+    dsn: Optional[str] = None,
 ) -> Optional[str]:
     """Return the first chunk CID for part 1, or None if not available."""
     rows = get_part_chunks(bucket_name, object_key, part_number=1, dsn=dsn)

@@ -2,16 +2,16 @@
 import asyncio
 import contextlib
 import logging
+import math
 import sys
 from pathlib import Path
-from typing import Any
-import math
 
 import asyncpg
 import redis.asyncio as async_redis
 from redis.exceptions import BusyLoadingError
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
+
 
 # Add parent directory to path to import hippius_s3 modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -21,18 +21,19 @@ from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.monitoring import initialize_metrics_collector
-from hippius_s3.queue import DownloadChainRequest
-from hippius_s3.queue import PartChunkSpec
-from hippius_s3.queue import PartToDownload
+from hippius_s3.queue import ParityStagedItem
+from hippius_s3.queue import ParityUploadRequest
 from hippius_s3.queue import RedundancyRequest
-from hippius_s3.queue import ReplicaStagedItem, ParityStagedItem, ReplicaUploadRequest, ParityUploadRequest
+from hippius_s3.queue import ReplicaStagedItem
+from hippius_s3.queue import ReplicaUploadRequest
 from hippius_s3.queue import dequeue_ec_request
-from hippius_s3.queue import enqueue_download_request
+from hippius_s3.queue import enqueue_ec_request
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.redis_cache import initialize_cache_client
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
-from hippius_s3.utils import get_query
+from hippius_s3.services.object_reader import build_chunk_index_plan_for_object
+
 
 config = get_config()
 setup_loki_logging(config, "redundancy")
@@ -84,65 +85,10 @@ async def _ensure_ciphertext_in_cache(
     part_number: int,
     address: str,
     bucket_name: str,
-) -> list[tuple[int, str, int | None]]:
-    rows = await db.fetch(
-        get_query("get_part_chunks_by_object_and_number"),
-        object_id,
-        int(object_version),
-        int(part_number),
-    )
-    plan: list[tuple[int, str, int | None]] = [
-        (int(r[0]), str(r[1]), int(r[2]) if r[2] is not None else None) for r in rows or []
-    ]
-    if not plan:
-        return []
-
-    missing: list[tuple[int, str, int | None]] = []
-    for ci, cid, clen in plan:
-        if not await obj_cache.chunk_exists(object_id, int(object_version), int(part_number), int(ci)):
-            missing.append((ci, cid, clen))
-
-    if missing:
-        req = DownloadChainRequest(
-            request_id=f"{object_id}::redundancy",
-            object_id=object_id,
-            object_version=int(object_version),
-            object_key="",
-            bucket_name=bucket_name,
-            address=address,
-            subaccount=address,
-            subaccount_seed_phrase="",
-            substrate_url=config.substrate_url,
-            ipfs_node=config.ipfs_get_url,
-            should_decrypt=False,
-            size=0,
-            multipart=True,
-            chunks=[
-                PartToDownload(
-                    part_number=int(part_number),
-                    chunks=[
-                        PartChunkSpec(index=int(ci), cid=str(cid), cipher_size_bytes=int(clen) if clen else None)
-                        for (ci, cid, clen) in missing
-                    ],
-                )
-            ],
-        )
-        await enqueue_download_request(req)
-
-        sleep_s = float(getattr(config, "http_download_sleep_loop", 0.1))
-        retries = int(getattr(config, "http_redis_get_retries", 60))
-        for _ in range(max(1, retries)):
-            all_ready = True
-            for ci, _, _ in missing:
-                ok = await obj_cache.chunk_exists(object_id, int(object_version), int(part_number), int(ci))
-                if not ok:
-                    all_ready = False
-                    break
-            if all_ready:
-                break
-            await asyncio.sleep(sleep_s)
-
-    return plan
+) -> list[tuple[int, str | None, int | None]]:
+    # Build an index-only plan using the reader planner (independent of DB part_chunks CIDs)
+    items = await build_chunk_index_plan_for_object(db, object_id, int(object_version))
+    return [(int(it.chunk_index), None, None) for it in items if int(getattr(it, "part_number", 1)) == int(part_number)]
 
 
 async def process_redundancy_request(
@@ -154,11 +100,25 @@ async def process_redundancy_request(
     fs_store = FileSystemPartsStore(getattr(config, "object_cache_dir", "/var/lib/hippius/object_cache"))
 
     async with db.acquire() as conn:
-        part_row = await _get_part_row(conn, req.object_id, int(req.object_version), int(req.part_number))
+        # Bounded wait for parts placeholder to appear (producer may have just enqueued)
+        part_row = None
+        for _ in range(50):  # ~5s max
+            part_row = await _get_part_row(conn, req.object_id, int(req.object_version), int(req.part_number))
+            if part_row:
+                break
+            await asyncio.sleep(0.1)
         if not part_row:
-            logger.error(
+            # Defer: part not yet visible; re-enqueue a few times before giving up
+            logger.warning(
                 f"redundancy: part row missing object_id={req.object_id} v={req.object_version} part={req.part_number}"
             )
+            try:
+                if int(getattr(req, "attempts", 0)) < 5:
+                    req.attempts = int(getattr(req, "attempts", 0)) + 1
+                    await enqueue_ec_request(req)
+                    return True
+            except Exception:
+                pass
             return False
         part_id = str(part_row[0])
 
@@ -177,6 +137,11 @@ async def process_redundancy_request(
 
         meta = await obj_cache.get_meta(req.object_id, int(req.object_version), int(req.part_number))
         cipher_size = int((meta or {}).get("size_bytes", 0))
+        if cipher_size <= 0:
+            try:
+                cipher_size = int(getattr(req, "part_size_bytes", 0) or 0)
+            except Exception:
+                cipher_size = 0
         threshold = int(getattr(config, "ec_k", 8)) * int(getattr(config, "ec_min_chunk_size_bytes", 128 * 1024))
         replication = cipher_size < threshold
 
@@ -204,7 +169,18 @@ async def process_redundancy_request(
             # Stage replica files under FS and enqueue uploader
             for ci, _cid, _clen in sorted(chunk_plan, key=lambda x: int(x[0])):
                 ct = await obj_cache.get_chunk(req.object_id, int(req.object_version), int(req.part_number), int(ci))
-                if not isinstance(ct, (bytes, bytearray)):
+                if not isinstance(ct, (bytes, bytearray)) or len(ct) == 0:
+                    # Fallback to FS if cache miss
+                    try:
+                        chunk_path = (
+                            Path(fs_store.part_path(req.object_id, int(req.object_version), int(req.part_number)))
+                            / f"chunk_{int(ci)}.bin"
+                        )
+                        if chunk_path.exists():
+                            ct = chunk_path.read_bytes()
+                    except Exception:
+                        ct = b""
+                if not isinstance(ct, (bytes, bytearray)) or len(ct) == 0:
                     continue
                 pt = CryptoService.decrypt_chunk(
                     bytes(ct),
@@ -232,9 +208,9 @@ async def process_redundancy_request(
                     rep_dir.mkdir(parents=True, exist_ok=True)
                     file_path = rep_dir / f"chunk_{int(ci)}.bin"
 
-                    def _write() -> None:
-                        with file_path.open("wb") as f:
-                            f.write(replica_ct)
+                    def _write(fp=file_path, rc=replica_ct) -> None:
+                        with fp.open("wb") as f:
+                            f.write(rc)
                             f.flush()
 
                     await asyncio.to_thread(_write)
@@ -313,9 +289,17 @@ async def process_redundancy_request(
             max_len = 0
             for ci, _cid, _clen in stripe_items:
                 ct = await obj_cache.get_chunk(req.object_id, int(req.object_version), int(req.part_number), int(ci))
-                if not isinstance(ct, (bytes, bytearray)):
-                    ct = b""
-                b = bytes(ct)
+                if not isinstance(ct, (bytes, bytearray)) or len(ct) == 0:
+                    try:
+                        chunk_path = (
+                            Path(fs_store.part_path(req.object_id, int(req.object_version), int(req.part_number)))
+                            / f"chunk_{int(ci)}.bin"
+                        )
+                        if chunk_path.exists():
+                            ct = chunk_path.read_bytes()
+                    except Exception:
+                        ct = b""
+                b = bytes(ct or b"")
                 blocks.append(b)
                 max_len = max(max_len, len(b))
             # Compute XOR parity with codec to keep logic centralized
@@ -329,9 +313,9 @@ async def process_redundancy_request(
             # Write staged parity file
             file_path = pv_dir / f"stripe_{s}.parity_0.bin"
 
-            def _write() -> None:
-                with file_path.open("wb") as f:
-                    f.write(parity_block)
+            def _write(fp=file_path, pb=parity_block) -> None:
+                with fp.open("wb") as f:
+                    f.write(pb)
                     f.flush()
 
             await asyncio.to_thread(_write)
@@ -367,14 +351,12 @@ async def run_redundancy_loop() -> None:
     initialize_metrics_collector(redis_client)
 
     logger.info("Starting redundancy service...")
-    try:
+    with contextlib.suppress(Exception):
         logger.info(
             f"EC config: enabled={getattr(config, 'ec_enabled', False)} scheme={getattr(config, 'ec_scheme', '')} "
             f"k={getattr(config, 'ec_k', 0)} m={getattr(config, 'ec_m', 0)} threshold_bytes={getattr(config, 'ec_threshold_bytes', 0)} "
             f"queue={getattr(config, 'ec_queue_name', '')}"
         )
-    except Exception:
-        pass
 
     try:
         while True:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from typing import Iterable
 from typing import Optional
@@ -10,11 +11,10 @@ import redis  # type: ignore[import-untyped]
 from hippius_s3.cache import RedisObjectPartsCache
 
 
-def get_object_id_and_version(
-    bucket_name: str, object_key: str, *, dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius"
-) -> tuple[str, int]:
+def get_object_id_and_version(bucket_name: str, object_key: str, *, dsn: Optional[str] = None) -> tuple[str, int]:
     """Fetch (object_id, current_object_version) for a (bucket_name, object_key)."""
-    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         cur.execute(
             """
                 SELECT o.object_id, o.current_object_version
@@ -32,9 +32,7 @@ def get_object_id_and_version(
         return str(row[0]), int(row[1] or 1)
 
 
-def get_object_id(
-    bucket_name: str, object_key: str, *, dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius"
-) -> str:
+def get_object_id(bucket_name: str, object_key: str, *, dsn: Optional[str] = None) -> str:
     """Back-compat helper: return only object_id."""
     oid, _ver = get_object_id_and_version(bucket_name, object_key, dsn=dsn)
     return oid
@@ -44,13 +42,14 @@ def get_object_cids(
     bucket_name: str,
     object_key: str,
     *,
-    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+    dsn: Optional[str] = None,
 ) -> tuple[str, int, str, list[str], Optional[str]]:
     """Get all CIDs for an object including parts, chunks, and manifest.
 
     Returns: (object_id, object_version, main_account_id, part_cids, manifest_cid)
     """
-    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         cur.execute(
             """
             SELECT o.object_id, o.current_object_version, b.main_account_id
@@ -118,7 +117,7 @@ def clear_object_cache(
     parts: Iterable[int] | None = None,
     *,
     redis_url: str = "redis://localhost:6379/0",
-    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+    dsn: Optional[str] = None,
 ) -> None:
     """Delete chunked obj:{object_id}:part:{n}:chunk:* and meta keys in Redis for the given parts.
 
@@ -129,8 +128,9 @@ def clear_object_cache(
     r = redis.Redis.from_url(redis_url)
 
     # If no parts specified, query DB for actual part numbers to avoid scanning 256 empty parts
+    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
     if parts is None:
-        with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT DISTINCT part_number
@@ -147,7 +147,7 @@ def clear_object_cache(
             parts = parts_list
 
     # Determine current object_version for namespacing
-    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+    with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         cur.execute(
             """
             SELECT o.current_object_version
@@ -180,12 +180,13 @@ def read_part_from_cache(
     part_number: int,
     *,
     redis_url: str = "redis://localhost:6379/0",
-    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+    dsn: Optional[str] = None,
 ) -> Optional[bytes]:
     """Assemble part bytes from chunked cache if present; returns None if missing."""
     r = redis.Redis.from_url(redis_url)
     # Fetch current object_version
-    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         cur.execute(
             """
             SELECT o.current_object_version
@@ -206,7 +207,7 @@ def read_part_from_cache(
     import json as _json
 
     try:
-        m = _json.loads(meta)
+        m = _json.loads(meta.decode("utf-8") if isinstance(meta, (bytes, bytearray)) else str(meta))
     except Exception:
         return None
     num_chunks = int(m.get("num_chunks", 0))
@@ -228,7 +229,7 @@ def wait_for_parts_cids(
     *,
     min_count: int,
     timeout_seconds: float = 20.0,
-    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+    dsn: Optional[str] = None,
 ) -> bool:
     """Wait until at least min_count parts for the object have non-pending ipfs_cid values.
 
@@ -238,7 +239,8 @@ def wait_for_parts_cids(
     """
     print(f"DEBUG: wait_for_parts_cids called for {bucket_name}/{object_key}, expecting min_count={min_count}")
     deadline = time.time() + timeout_seconds
-    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         while time.time() < deadline:
             # First, get object_id for debugging
             cur.execute(
@@ -312,13 +314,14 @@ def make_all_object_parts_pending(
     bucket_name: str,
     object_key: str,
     *,
-    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+    dsn: Optional[str] = None,
 ) -> str:
     """Set all parts for an object to pending state (both base and appended parts).
 
     Returns the object_id of the affected object.
     """
-    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         # First get the object_id
         cur.execute(
             """

@@ -197,21 +197,53 @@ class Uploader:
         part_id = str(row[0])
         policy_version = int(getattr(payload, "policy_version", 1) or 1)
 
-        # Ensure part_ec row exists for FK safety (rep-v1 pending_upload)
-        async with self._acquire_conn() as conn:
-            await conn.execute(
-                """
-                INSERT INTO part_ec (part_id, policy_version, scheme, k, m, shard_size_bytes, stripes, state)
-                VALUES ($1, $2, 'rep-v1', 1, 0, 0, 1, 'pending_upload')
-                ON CONFLICT (part_id, policy_version)
-                DO NOTHING
-                """,
-                part_id,
-                policy_version,
-            )
-
         uploaded_cids: list[str] = []
         max_replica_index = -1
+        replica_chunk_size: int | None = None
+
+        # Ensure part_ec exists for parity path to satisfy FK (rs-v1)
+        if kind == "parity":
+            # Derive stripes from staged items; shard size from first file if available
+            try:
+                stripes = 1
+                max_stripe = -1
+                shard_size_guess = None
+                for si in staged:
+                    try:
+                        max_stripe = max(max_stripe, int(getattr(si, "stripe_index", 0)))
+                        fp = getattr(si, "file_path", None)
+                        if shard_size_guess is None and isinstance(fp, str) and fp:
+                            p = Path(fp)
+                            if p.exists():
+                                shard_size_guess = p.stat().st_size
+                    except Exception:
+                        continue
+                stripes = int(max_stripe + 1) if max_stripe >= 0 else 1
+                shard_size = int(
+                    shard_size_guess
+                    if shard_size_guess
+                    else getattr(self.config, "ec_min_chunk_size_bytes", 128 * 1024)
+                )
+                async with self._acquire_conn() as conn:
+                    await conn.execute(
+                        """
+                        INSERT INTO part_ec (part_id, policy_version, scheme, k, m, shard_size_bytes, stripes, state)
+                        VALUES ($1, $2, 'rs-v1', $3, $4, $5, $6, 'pending_upload')
+                        ON CONFLICT (part_id, policy_version)
+                        DO UPDATE SET scheme='rs-v1', k=EXCLUDED.k, m=EXCLUDED.m,
+                                      shard_size_bytes=EXCLUDED.shard_size_bytes, stripes=EXCLUDED.stripes,
+                                      state='pending_upload', updated_at=now()
+                        """,
+                        part_id,
+                        policy_version,
+                        int(getattr(self.config, "ec_k", 8)),
+                        int(1),
+                        int(shard_size),
+                        int(stripes),
+                    )
+            except Exception:
+                # Non-fatal: continue; FK may still be satisfied if worker created row
+                pass
         for item in staged:
             data: Optional[bytes] = None
             file_path = getattr(item, "file_path", None)
@@ -229,6 +261,11 @@ class Uploader:
             if not isinstance(data, (bytes, bytearray)):
                 logger.warning("uploader: staged item missing data; skipping")
                 continue
+            if kind == "replica" and replica_chunk_size is None:
+                try:
+                    replica_chunk_size = int(len(data))
+                except Exception:
+                    replica_chunk_size = None
 
             # Insert blob ledger row (staged) prior to upload
             try:
@@ -306,19 +343,24 @@ class Uploader:
                         cid,
                     )
 
-        # Mark part_ec complete for replication and set m to at least max_replica_index+1
+        # Update m to at least max_replica_index+1 for replication (completion handled by SubstrateWorker after pins)
         if kind == "replica":
             async with self._acquire_conn() as conn:
                 await conn.execute(
                     """
                     INSERT INTO part_ec (part_id, policy_version, scheme, k, m, shard_size_bytes, stripes, state)
-                    VALUES ($1, $2, 'rep-v1', 1, $3, 0, 1, 'complete')
+                    VALUES ($1, $2, 'rep-v1', 1, $3, $4, 1, 'pending_upload')
                     ON CONFLICT (part_id, policy_version)
-                    DO UPDATE SET state='complete', m=GREATEST(part_ec.m, $3), updated_at=now()
+                    DO UPDATE SET m=GREATEST(part_ec.m, $3),
+                                  shard_size_bytes=COALESCE(part_ec.shard_size_bytes, EXCLUDED.shard_size_bytes),
+                                  updated_at=now()
                     """,
                     part_id,
                     policy_version,
                     int(max_replica_index + 1 if max_replica_index >= 0 else 0),
+                    replica_chunk_size
+                    if replica_chunk_size is not None
+                    else int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
                 )
 
         # Enqueue substrate pinning for redundancy CIDs

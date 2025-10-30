@@ -2,7 +2,7 @@ import dataclasses
 import uuid
 
 import dotenv
-import httpx
+import httpx  # type: ignore[import-not-found]
 
 from hippius_s3.utils import env
 
@@ -110,7 +110,7 @@ class Config:
     upload_queue_names: str = env("HIPPIUS_UPLOAD_QUEUE_NAMES:upload_requests", convert=str)
 
     # EC configuration
-    ec_enabled: bool = env("HIPPIUS_EC_ENABLED:false", convert=lambda x: x.lower() == "true")
+    ec_enabled: bool = env("HIPPIUS_EC_ENABLED:true", convert=lambda x: x.lower() == "true")
     ec_scheme: str = env("HIPPIUS_EC_SCHEME:rs-v1", convert=str)
     ec_policy_version: int = env("HIPPIUS_EC_POLICY_VERSION:1", convert=int)
     ec_k: int = env("HIPPIUS_EC_K:8", convert=int)
@@ -122,7 +122,7 @@ class Config:
     ec_max_chunk_size_bytes: int = env("HIPPIUS_EC_MAX_CHUNK_SIZE_BYTES:4194304", convert=int)  # 4 MiB
     # Worker limits
     ec_worker_concurrency: int = env("HIPPIUS_EC_WORKER_CONCURRENCY:2", convert=int)
-    ec_queue_name: str = env("HIPPIUS_EC_QUEUE_NAME:ec_encode_requests", convert=str)
+    ec_queue_name: str = env("HIPPIUS_EC_QUEUE_NAME:redundancy_requests", convert=str)
 
     # Cache TTL (shared across components)
     cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:259200", convert=int)
@@ -173,7 +173,7 @@ class Config:
 
     # Storage version to assign for newly created/overwritten objects
     # Defaults to 3 (latest layout)
-    target_storage_version: int = env("HIPPIUS_TARGET_STORAGE_VERSION:3", convert=int)
+    target_storage_version: int = env("HIPPIUS_TARGET_STORAGE_VERSION:4", convert=int)
 
     # Cachet health monitoring
     cachet_api_url: str = env("CACHET_API_URL", convert=str)
@@ -196,7 +196,6 @@ def get_config() -> Config:
     except Exception:
         # Last resort: ensure a usable value
         object.__setattr__(cfg, "encryption_database_url", cfg.database_url)
-
 
     # Enforce environment constraints:
     # - Only in 'test' can enable_bypass_credit_check be True

@@ -210,10 +210,10 @@ WHERE id = $1 AND status = 'uploaded'
 RETURNING *;
 ```
 
-Deterministic replica nonces
+Replica nonces
 
-- Replicas use a deterministic XSalsa20 nonce derived via blake2b over `object_id:part_number:chunk_index:replica_index:upload_id`
-- Ensures distinct ciphertext → distinct CIDs for each replica
+- Implementation note (Oct 2025): replicas currently use SecretBox random nonces (per-encrypt), which already yields distinct ciphertext → distinct CIDs per replica.
+- Future plan: optionally add a deterministic KDF for replica nonces (without `upload_id`) under a new `policy_version` to improve reproducibility across retries.
 
 Filesystem layout (authoritative staging)
 

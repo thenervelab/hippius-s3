@@ -13,6 +13,8 @@ from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
+from hippius_s3.queue import RedundancyRequest
+from hippius_s3.queue import enqueue_ec_request
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
 from hippius_s3.services.parts_service import upsert_part_placeholder
@@ -308,9 +310,8 @@ class ObjectWriter:
         )
 
         # Ensure parts table has placeholder for base part (part 1) so append/read paths see it
-        import contextlib
-
-        with contextlib.suppress(Exception):
+        placeholder_ok = False
+        try:
             await upsert_part_placeholder(
                 self.db,
                 object_id=object_id,
@@ -321,6 +322,72 @@ class ObjectWriter:
                 chunk_size_bytes=int(chunk_size),
                 object_version=int(object_version),
             )
+            placeholder_ok = True
+        except Exception:
+            placeholder_ok = False
+
+        # Best-effort: enqueue redundancy for simple PUT when EC is enabled and v4+
+        try:
+            if (
+                placeholder_ok
+                and bool(getattr(self.config, "ec_enabled", False))
+                and int(getattr(self.config, "target_storage_version", 3)) >= 4
+                and int(num_chunks) > 0
+            ):
+                # Pre-create part_ec row for EC path to avoid races in tests/workers
+                try:
+                    k = max(1, int(getattr(self.config, "ec_k", 8)))
+                    min_size = int(getattr(self.config, "ec_min_chunk_size_bytes", 128 * 1024))
+                    threshold = int(k) * int(min_size)
+                    if int(total_size) >= int(threshold):
+                        row = await self.db.fetchrow(
+                            """
+                                SELECT p.part_id
+                                  FROM parts p
+                                 WHERE p.object_id = $1 AND p.object_version = $2 AND p.part_number = $3
+                                 LIMIT 1
+                                """,
+                            object_id,
+                            int(object_version),
+                            int(part_number),
+                        )
+                        if row:
+                            part_id = str(row[0])
+                            stripes = int((int(num_chunks) + k - 1) // k)
+                            await self.db.execute(
+                                """
+                                    INSERT INTO part_ec (part_id, policy_version, scheme, k, m, shard_size_bytes, stripes, state)
+                                    VALUES ($1, $2, 'rs-v1', $3, $4, $5, $6, 'pending_upload')
+                                    ON CONFLICT (part_id, policy_version)
+                                    DO UPDATE SET scheme='rs-v1', k=EXCLUDED.k, m=EXCLUDED.m,
+                                                  shard_size_bytes=EXCLUDED.shard_size_bytes, stripes=EXCLUDED.stripes,
+                                                  state='pending_upload', updated_at=now()
+                                    """,
+                                part_id,
+                                int(getattr(self.config, "ec_policy_version", 1)),
+                                int(k),
+                                int(1),
+                                int(chunk_size),
+                                int(stripes),
+                            )
+                except Exception:
+                    pass
+                await enqueue_ec_request(
+                    RedundancyRequest(
+                        object_id=str(object_id),
+                        object_version=int(object_version),
+                        part_number=int(part_number),
+                        policy_version=int(getattr(self.config, "ec_policy_version", 1)),
+                        bucket_name=bucket_name,
+                        address=account_address,
+                        num_chunks=int(num_chunks),
+                        part_size_bytes=int(total_size),
+                    ),
+                    None,
+                )
+        except Exception:
+            # Do not fail PUT if redundancy enqueue fails
+            pass
 
         return PutResult(etag=md5_hash, size_bytes=int(total_size), upload_id=str(upload_id))
 

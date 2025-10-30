@@ -1086,6 +1086,7 @@ async def complete_multipart_upload(
         cfg = get_config()
         if bool(getattr(cfg, "ec_enabled", False)) and int(getattr(cfg, "target_storage_version", 3)) >= 4:
             obj_cache = RedisObjectPartsCache(request.app.state.redis_client)
+            ec_enqueue_failures = 0
             for p in parts:
                 try:
                     pn = int(p["part_number"])  # DB returns part_number
@@ -1106,11 +1107,21 @@ async def complete_multipart_upload(
                             num_chunks=int(num_chunks),
                             part_size_bytes=int(meta.get("size_bytes", 0)),
                         ),
-                        request.app.state.redis_client,
+                        None,
                     )
-                except Exception:
-                    # Best-effort; skip EC enqueue on errors
-                    continue
+                except Exception as e:
+                    # Best-effort; log per-part failures but continue
+                    ec_enqueue_failures += 1
+                    logger.debug(
+                        f"Failed to enqueue EC request for part part_number={p.get('part_number')} "
+                        f"object_id={object_id} object_version={object_version}: {e}",
+                        exc_info=True,
+                    )
+            if ec_enqueue_failures > 0:
+                logger.warning(
+                    f"EC enqueue failures: {ec_enqueue_failures}/{len(parts)} parts "
+                    f"object_id={object_id} object_version={object_version}"
+                )
 
         # Create XML response
         xml_bytes = f"""<?xml version="1.0" encoding="UTF-8"?>

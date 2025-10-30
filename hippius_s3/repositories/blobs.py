@@ -64,40 +64,113 @@ class BlobsRepository:
     async def insert_many(self, rows: Sequence[BlobRow]) -> List[str]:
         if not rows:
             return []
-        sql = """
-            INSERT INTO blobs (
-              kind, object_id, object_version,
-              part_id, policy_version,
-              chunk_index, stripe_index, parity_index,
-              fs_path, size_bytes
-            ) VALUES (
-              $1, $2, $3,
-              $4, $5,
-              $6, $7, $8,
-              $9, $10
-            )
-            RETURNING id
-            """
-        values = [
-            (
-                r.kind,
-                r.object_id,
-                int(r.object_version),
-                r.part_id,
-                r.policy_version,
-                r.chunk_index,
-                r.stripe_index,
-                r.parity_index,
-                r.fs_path,
-                int(r.size_bytes),
-            )
-            for r in rows
-        ]
+        # Use per-kind UPSERTs to avoid unique constraint violations on retries
+        #
+        # Unique indexes:
+        #  - blobs_parity_uq:  (part_id, policy_version, kind, stripe_index, parity_index) WHERE kind='parity'
+        #  - blobs_replica_uq: (part_id, kind, chunk_index, parity_index) WHERE kind='replica'
+        #
+        # For other kinds (data, manifest), perform simple inserts for now.
         ids: List[str] = []
         async with _acquire(self.db) as conn:
-            for v in values:
-                row = await conn.fetchrow(sql, *v)
-                ids.append(str(row[0]))
+            for r in rows:
+                if r.kind == "parity":
+                    sql_parity = """
+                        INSERT INTO blobs (
+                          kind, object_id, object_version,
+                          part_id, policy_version,
+                          chunk_index, stripe_index, parity_index,
+                          fs_path, size_bytes
+                        ) VALUES (
+                          $1, $2, $3,
+                          $4, $5,
+                          NULL, $6, $7,
+                          $8, $9
+                        )
+                        ON CONFLICT (part_id, policy_version, kind, stripe_index, parity_index)
+                        WHERE kind = 'parity'
+                        DO UPDATE SET
+                          fs_path = EXCLUDED.fs_path,
+                          size_bytes = EXCLUDED.size_bytes,
+                          updated_at = now()
+                        RETURNING id
+                    """
+                    row = await conn.fetchrow(
+                        sql_parity,
+                        r.kind,
+                        r.object_id,
+                        int(r.object_version),
+                        r.part_id,
+                        r.policy_version,
+                        int(r.stripe_index) if r.stripe_index is not None else None,
+                        int(r.parity_index) if r.parity_index is not None else None,
+                        r.fs_path,
+                        int(r.size_bytes),
+                    )
+                    ids.append(str(row[0]))
+                elif r.kind == "replica":
+                    sql_replica = """
+                        INSERT INTO blobs (
+                          kind, object_id, object_version,
+                          part_id, policy_version,
+                          chunk_index, stripe_index, parity_index,
+                          fs_path, size_bytes
+                        ) VALUES (
+                          $1, $2, $3,
+                          $4, $5,
+                          $6, NULL, $7,
+                          $8, $9
+                        )
+                        ON CONFLICT (part_id, kind, chunk_index, parity_index)
+                        WHERE kind = 'replica'
+                        DO UPDATE SET
+                          fs_path = EXCLUDED.fs_path,
+                          size_bytes = EXCLUDED.size_bytes,
+                          updated_at = now()
+                        RETURNING id
+                    """
+                    row = await conn.fetchrow(
+                        sql_replica,
+                        r.kind,
+                        r.object_id,
+                        int(r.object_version),
+                        r.part_id,
+                        r.policy_version,
+                        int(r.chunk_index) if r.chunk_index is not None else None,
+                        int(r.parity_index) if r.parity_index is not None else None,
+                        r.fs_path,
+                        int(r.size_bytes),
+                    )
+                    ids.append(str(row[0]))
+                else:
+                    sql_other = """
+                        INSERT INTO blobs (
+                          kind, object_id, object_version,
+                          part_id, policy_version,
+                          chunk_index, stripe_index, parity_index,
+                          fs_path, size_bytes
+                        ) VALUES (
+                          $1, $2, $3,
+                          $4, $5,
+                          $6, $7, $8,
+                          $9, $10
+                        )
+                        RETURNING id
+                    """
+                    row = await conn.fetchrow(
+                        sql_other,
+                        r.kind,
+                        r.object_id,
+                        int(r.object_version),
+                        r.part_id,
+                        r.policy_version,
+                        r.chunk_index,
+                        r.stripe_index,
+                        r.parity_index,
+                        r.fs_path,
+                        int(r.size_bytes),
+                    )
+                    ids.append(str(row[0]))
         return ids
 
     async def claim_staged_by_id(self, blob_id: str) -> Mapping[str, Any] | None:
