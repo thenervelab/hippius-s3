@@ -94,8 +94,23 @@ class ObjectWriter:
 
         This method assumes the object row/version already exists in DB.
         """
-        # Encrypt into chunks
-        chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+
+        # Encrypt into chunks (always dynamic EC-aware sizing)
+        def _compute_dynamic_chunk_size(total_size: int) -> int:
+            k = max(1, int(self.config.ec_k))
+            min_cs = int(self.config.ec_min_chunk_size_bytes)
+            max_cs = int(self.config.ec_max_chunk_size_bytes)
+            # For small objects below EC threshold, prefer a single exact-size chunk
+            if int(total_size) < int(k) * int(min_cs):
+                return int(total_size)
+            # Aim for ~k chunks
+            target = (int(total_size) + k - 1) // k
+            # Clamp within EC bounds
+            target = max(min_cs, min(max_cs, target))
+            return int(target)
+
+        # Prefer EC-aware chunk size for parity-friendly striping
+        chunk_size = _compute_dynamic_chunk_size(len(body_bytes))
         key_bytes = await get_or_create_encryption_key_bytes(
             main_account_id=account_address,
             bucket_name=bucket_name,
@@ -164,7 +179,14 @@ class ObjectWriter:
         - Keeps peak memory bounded to configured chunk size.
         - Uses server-side keys; seed phrases are not required.
         """
-        chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+        # Defaults; may be overridden if we can buffer to compute EC-aligned size
+        default_chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+        ec_enabled = bool(getattr(self.config, "ec_enabled", False))
+        k = max(1, int(getattr(self.config, "ec_k", 8)))
+        min_cs = int(getattr(self.config, "ec_min_chunk_size_bytes", 128 * 1024))
+        max_cs = int(getattr(self.config, "ec_max_chunk_size_bytes", 4 * 1024 * 1024))
+        dynamic_buffer_cap = k * max_cs
+        chunk_size = default_chunk_size
         ttl = int(getattr(self.config, "cache_ttl_seconds", 1800))
 
         with tracer.start_as_current_span(
@@ -239,18 +261,71 @@ class ObjectWriter:
                 next_chunk_index += 1
 
         with tracer.start_as_current_span("put_simple_stream_full.encrypt_and_cache") as span:
-            async for piece in body_iter:
-                if not piece:
-                    continue
-                pt_buf.extend(piece)
-                while len(pt_buf) >= chunk_size:
-                    to_write = bytes(pt_buf[:chunk_size])
-                    del pt_buf[:chunk_size]
-                    await _encrypt_and_write(to_write)
-
-            if pt_buf:
-                await _encrypt_and_write(bytes(pt_buf))
-                pt_buf.clear()
+            total_collected = 0
+            if ec_enabled:
+                # Try to fully buffer up to cap to compute EC-aligned chunk size
+                fallback_streaming = False
+                full_body = bytearray()
+                async for piece in body_iter:
+                    if not piece:
+                        continue
+                    if not fallback_streaming and len(full_body) + len(piece) <= dynamic_buffer_cap:
+                        full_body.extend(piece)
+                        total_collected += len(piece)
+                    else:
+                        # Switch to streaming mode with default chunk size
+                        fallback_streaming = True
+                        chunk_size = default_chunk_size
+                        # seed pt_buf with any buffered content
+                        if full_body:
+                            pt_buf.extend(full_body)
+                            full_body.clear()
+                        # process current and remaining pieces
+                        pt_buf.extend(piece)
+                        while len(pt_buf) >= chunk_size:
+                            to_write = bytes(pt_buf[:chunk_size])
+                            del pt_buf[:chunk_size]
+                            await _encrypt_and_write(to_write)
+                        async for rest in body_iter:
+                            if not rest:
+                                continue
+                            pt_buf.extend(rest)
+                            while len(pt_buf) >= chunk_size:
+                                to_write = bytes(pt_buf[:chunk_size])
+                                del pt_buf[:chunk_size]
+                                await _encrypt_and_write(to_write)
+                        break
+                if not fallback_streaming and total_collected > 0:
+                    # Compute EC-friendly chunk size from total
+                    threshold = int(k) * int(min_cs)
+                    if int(total_collected) < threshold:
+                        # Below EC threshold: use exact-size single chunk
+                        chunk_size = int(total_collected)
+                    else:
+                        target = (int(total_collected) + k - 1) // k
+                        chunk_size = max(min_cs, min(max_cs, target))
+                    # Encrypt full buffered content in EC-aligned chunks
+                    pt_buf.extend(full_body)
+                    while len(pt_buf) >= chunk_size:
+                        to_write = bytes(pt_buf[:chunk_size])
+                        del pt_buf[:chunk_size]
+                        await _encrypt_and_write(to_write)
+                    if pt_buf:
+                        await _encrypt_and_write(bytes(pt_buf))
+                        pt_buf.clear()
+            else:
+                # Original streaming path with default chunk size
+                async for piece in body_iter:
+                    if not piece:
+                        continue
+                    pt_buf.extend(piece)
+                    while len(pt_buf) >= chunk_size:
+                        to_write = bytes(pt_buf[:chunk_size])
+                        del pt_buf[:chunk_size]
+                        await _encrypt_and_write(to_write)
+                if pt_buf:
+                    await _encrypt_and_write(bytes(pt_buf))
+                    pt_buf.clear()
 
             md5_hash = hasher.hexdigest()
             set_span_attributes(
@@ -264,7 +339,7 @@ class ObjectWriter:
 
         # Upsert DB row with final md5/size and storage version
         resolved_storage_version = int(
-            storage_version if storage_version is not None else getattr(self.config, "target_storage_version", 3)
+            storage_version if storage_version is not None else self.config.target_storage_version
         )
         with tracer.start_as_current_span(
             "put_simple_stream_full.upsert_metadata",
@@ -326,58 +401,16 @@ class ObjectWriter:
         except Exception:
             placeholder_ok = False
 
-        # Best-effort: enqueue redundancy for simple PUT when EC is enabled and v4+
         try:
-            if (
-                placeholder_ok
-                and bool(getattr(self.config, "ec_enabled", False))
-                and int(getattr(self.config, "target_storage_version", 3)) >= 4
-                and int(num_chunks) > 0
-            ):
+            if placeholder_ok and self.config.ec_enabled and int(num_chunks) > 0:
                 # Pre-create part_ec row for EC path to avoid races in tests/workers
-                try:
-                    k = max(1, int(getattr(self.config, "ec_k", 8)))
-                    min_size = int(getattr(self.config, "ec_min_chunk_size_bytes", 128 * 1024))
-                    threshold = int(k) * int(min_size)
-                    if int(total_size) >= int(threshold):
-                        row = await self.db.fetchrow(
-                            """
-                                SELECT p.part_id
-                                  FROM parts p
-                                 WHERE p.object_id = $1 AND p.object_version = $2 AND p.part_number = $3
-                                 LIMIT 1
-                                """,
-                            object_id,
-                            int(object_version),
-                            int(part_number),
-                        )
-                        if row:
-                            part_id = str(row[0])
-                            stripes = int((int(num_chunks) + k - 1) // k)
-                            await self.db.execute(
-                                """
-                                    INSERT INTO part_ec (part_id, policy_version, scheme, k, m, shard_size_bytes, stripes, state)
-                                    VALUES ($1, $2, 'rs-v1', $3, $4, $5, $6, 'pending_upload')
-                                    ON CONFLICT (part_id, policy_version)
-                                    DO UPDATE SET scheme='rs-v1', k=EXCLUDED.k, m=EXCLUDED.m,
-                                                  shard_size_bytes=EXCLUDED.shard_size_bytes, stripes=EXCLUDED.stripes,
-                                                  state='pending_upload', updated_at=now()
-                                    """,
-                                part_id,
-                                int(getattr(self.config, "ec_policy_version", 1)),
-                                int(k),
-                                int(1),
-                                int(chunk_size),
-                                int(stripes),
-                            )
-                except Exception:
-                    pass
+
                 await enqueue_ec_request(
                     RedundancyRequest(
                         object_id=str(object_id),
                         object_version=int(object_version),
                         part_number=int(part_number),
-                        policy_version=int(getattr(self.config, "ec_policy_version", 1)),
+                        policy_version=int(self.config.ec_policy_version),
                         bucket_name=bucket_name,
                         address=account_address,
                         num_chunks=int(num_chunks),
@@ -407,7 +440,16 @@ class ObjectWriter:
         if file_size == 0:
             raise ValueError("Zero-length part not allowed")
 
-        chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+        # Dynamic chunk size for single MPU part
+        k = max(1, int(self.config.ec_k))
+        min_cs = int(self.config.ec_min_chunk_size_bytes)
+        max_cs = int(self.config.ec_max_chunk_size_bytes)
+        threshold = int(k) * int(min_cs)
+        if int(file_size) < threshold:
+            chunk_size = int(file_size)
+        else:
+            target = (int(file_size) + k - 1) // k
+            chunk_size = max(min_cs, min(max_cs, target))
         key_bytes = await get_or_create_encryption_key_bytes(
             main_account_id=account_address,
             bucket_name=bucket_name,
@@ -598,7 +640,20 @@ class ObjectWriter:
                 part_number=int(next_part),
                 size_bytes=int(delta_size),
                 etag=delta_md5,
-                chunk_size_bytes=int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
+                # Use EC-driven chunk size so planner sees correct size
+                chunk_size_bytes=int(
+                    (
+                        int(delta_size)
+                        if int(delta_size) < int(self.config.ec_k) * int(self.config.ec_min_chunk_size_bytes)
+                        else max(
+                            int(self.config.ec_min_chunk_size_bytes),
+                            min(
+                                int(self.config.ec_max_chunk_size_bytes),
+                                (int(delta_size) + int(self.config.ec_k) - 1) // int(self.config.ec_k),
+                            ),
+                        )
+                    )
+                ),
                 object_version=int(cov),
             )
 
@@ -658,8 +713,16 @@ class ObjectWriter:
                 raise AppendPreconditionFailed(int(fresh or 0))
             new_append_version_val = int(updated["append_version"])  # type: ignore
 
-        # Cache write-through
-        chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+        # Cache write-through: use the same chunk size logic as placeholder
+        k = max(1, int(self.config.ec_k))
+        min_cs = int(self.config.ec_min_chunk_size_bytes)
+        max_cs = int(self.config.ec_max_chunk_size_bytes)
+        threshold = int(k) * int(min_cs)
+        if int(delta_size) < threshold:
+            chunk_size = int(delta_size)
+        else:
+            target = (int(delta_size) + k - 1) // k
+            chunk_size = max(min_cs, min(max_cs, target))
         key_bytes = await get_or_create_encryption_key_bytes(
             main_account_id=account_address,
             bucket_name=bucket_name,

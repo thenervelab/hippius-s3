@@ -16,7 +16,7 @@ from .support.recovery import get_key_bytes_async
 from .support.recovery import get_parity_cid
 from .support.recovery import get_part_ec
 from .support.recovery import get_part_id
-from .support.recovery import reconstruct_single_miss_xor
+from .support.recovery import reconstruct_single_miss
 
 
 @pytest.mark.local
@@ -26,7 +26,7 @@ def test_parity_created_and_single_miss_recovery_works(
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
 ) -> None:
-    """End-to-end: upload a large object (≥ threshold) and assert parity creation and XOR single-miss recovery."""
+    """End-to-end: upload a large object (≥ threshold) and assert parity creation and RS single-miss recovery."""
     bucket = unique_bucket_name("parity")
     cleanup_buckets(bucket)
     boto3_client.create_bucket(Bucket=bucket)
@@ -55,16 +55,16 @@ def test_parity_created_and_single_miss_recovery_works(
     assert k >= 1
     # m may be >=1; parity staging currently at least index 0
 
-    # Determine data chunk CIDs (wait for uploader to persist DB rows if needed)
+    # Determine data chunk CIDs; wait until at least first stripe's k CIDs are persisted
     chunk_rows = []
-    deadline = time.time() + 30.0
+    deadline = time.time() + 60.0
     while time.time() < deadline:
         chunk_rows = get_part_chunks(bucket, key, part_number=1)
-        if chunk_rows:
+        if len(chunk_rows) >= int(k):
             break
         time.sleep(0.3)
     num_chunks = len(chunk_rows)
-    assert num_chunks >= 1, "expected at least one data chunk persisted by uploader"
+    assert num_chunks >= int(k), f"expected at least k={k} data chunks persisted by uploader, got {num_chunks}"
 
     # Choose stripe 0 (first stripe) and attempt single-miss reconstruction for ci=0 within that stripe
     stripe_index = 0
@@ -98,9 +98,15 @@ def test_parity_created_and_single_miss_recovery_works(
             others.append(b)
     assert isinstance(original_missing_bytes, (bytes, bytearray))
 
-    # Reconstruct and compare
-    reconstructed = reconstruct_single_miss_xor(bytes(parity_bytes), others)
-    assert reconstructed == bytes(original_missing_bytes), "XOR single-miss reconstruction should match"
+    # Reconstruct and compare (RS if available, else XOR)
+    reconstructed = reconstruct_single_miss(
+        bytes(parity_bytes),
+        others,
+        k=int(k),
+        missing_index=missing_ci,
+        expected_payload_size=len(bytes(original_missing_bytes)),
+    )
+    assert reconstructed == bytes(original_missing_bytes), "Single-miss reconstruction should match"
 
     # Additionally, decrypt both ciphertexts and assert plaintext equality
     _, _, main_account_id, _, _ = get_object_cids(bucket, key)

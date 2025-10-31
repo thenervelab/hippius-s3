@@ -67,6 +67,10 @@ def test_dlq_requeue_multipart_upload(
     # Verify IPFS is truly down from inside the uploader container before proceeding
     assert wait_for_ipfs_state(False, service="uploader"), "IPFS still reachable after break"
 
+    r = redis.Redis.from_url("redis://localhost:6382/0")
+    dlq_entries = list(r.lrange("upload_requests:dlq", 0, -1))
+    assert len(dlq_entries) == 0, "DLQ entries found before upload"
+
     try:
         # Attempt to complete multipart upload - API should return 200 even if uploader later fails
         boto3_client.complete_multipart_upload(
@@ -85,7 +89,8 @@ def test_dlq_requeue_multipart_upload(
         # Poll DLQ up to a short timeout
         import redis as _redis  # type: ignore[import-untyped]
 
-        r = _redis.Redis.from_url("redis://localhost:6379/0")
+        # DLQ is stored in the queues Redis used by workers
+        r = _redis.Redis.from_url("redis://localhost:6382/0")
         found = False
         for _ in range(130):
             entries = list(r.lrange("upload_requests:dlq", 0, -1))  # type: ignore[arg-type]
@@ -102,7 +107,8 @@ def test_dlq_requeue_multipart_upload(
         assert found, "DLQ entry not found after waiting for uploader to fail"
 
         # Verify DLQ entry exists
-        r = redis.Redis.from_url("redis://localhost:6379/0")
+        # DLQ is stored in the queues Redis used by workers
+        r = redis.Redis.from_url("redis://localhost:6382/0")
         dlq_entries = list(r.lrange("upload_requests:dlq", 0, -1))  # type: ignore[arg-type]
 
         assert len(dlq_entries) > 0, "No DLQ entries found"

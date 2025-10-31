@@ -7,7 +7,11 @@ RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     make \
+    pkg-config \
     postgresql-client \
+    liberasurecode-dev \
+    libisal-dev \
+    libisal2 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -17,7 +21,7 @@ RUN mkdir -p hippius_s3 && touch hippius_s3/__init__.py
 
 # Install Python dependencies (this layer will be cached)
 RUN pip install -e . \
-    && apt-get remove -y gcc g++ make \
+    && apt-get remove -y gcc g++ make pkg-config libisal-dev liberasurecode-dev \
     && apt-get autoremove -y
 
 # Set Python path

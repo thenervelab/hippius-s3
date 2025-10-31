@@ -67,7 +67,7 @@ def test_range_downloads_only_needed_chunks(
     cleanup_buckets(bucket)
     boto3_client.create_bucket(Bucket=bucket)
 
-    # Create a single large part (>= 2 chunks with default 4MiB chunk_size)
+    # Create a single large part (>= 2 chunks under configured chunking)
     part_size = 4 * 1024 * 1024
     key = "large/single-part.bin"
     body = b"A" * (part_size * 2 + 123)  # a bit over 2 chunks
@@ -111,7 +111,23 @@ def test_range_downloads_only_needed_chunks(
     r2 = signed_http_get(bucket, key, {"Range": f"bytes={start}-{end}"})
     assert r2.status_code == 206
     keys2 = sorted([k.decode() for k in rcli.scan_iter(match=f"obj:{object_id}:v:{ov}:part:1:chunk:*", count=1000)])
-    expected_chunk2 = f"obj:{object_id}:v:{ov}:part:1:chunk:1"
+    # Determine actual chunk size from DB and compute expected index for the start offset
+    import psycopg  # type: ignore
+
+    with psycopg.connect("postgresql://postgres:postgres@localhost:5432/hippius") as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT p.chunk_size_bytes
+            FROM parts p
+            WHERE p.object_id = %s AND p.object_version = %s AND p.part_number = 1
+            LIMIT 1
+            """,
+            (object_id, ov),
+        )
+        row = cur.fetchone()
+        cs = int(row[0]) if row and row[0] is not None else 4 * 1024 * 1024
+    exp_index = start // cs
+    expected_chunk2 = f"obj:{object_id}:v:{ov}:part:1:chunk:{int(exp_index)}"
     assert expected_chunk2 in keys2, f"expected chunk {expected_chunk2} not found in {keys2}"
     # Verify minimal hydration: should not have fetched all chunks
     assert len(keys2) <= 3, f"too many chunks hydrated: {keys2}"

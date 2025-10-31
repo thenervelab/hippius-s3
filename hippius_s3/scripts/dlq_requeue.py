@@ -114,7 +114,12 @@ class DLQManager:
         return target_entry
 
     async def requeue(self, object_id: str, force: bool = False) -> bool:
-        """Requeue a specific entry by object_id with DLQ hydration."""
+        """Requeue all entries for a specific object_id with DLQ hydration.
+
+        Loops until no more DLQ entries remain for the object_id, making this
+        operation idempotent and robust to duplicates (e.g., data, parity).
+        Returns True if at least one entry was requeued, False otherwise.
+        """
         # Acquire per-object lock to serialize requeues
         token = await self._acquire_lock(object_id)
         if not token:
@@ -122,39 +127,45 @@ class DLQManager:
             return False
 
         try:
-            entry = await self._find_and_remove_entry(object_id)
-            if not entry:
-                logger.error(f"No DLQ entry found for object_id: {object_id}")
-                return False
+            requeued_count = 0
+            while True:
+                entry = await self._find_and_remove_entry(object_id)
+                if not entry:
+                    break
 
-            # Check if it's a permanent error and force is not set
-            if entry.get("error_type") == "permanent" and not force:
-                logger.error(
-                    f"Refusing to requeue permanent error for object_id: {object_id}. Use --force to override."
-                )
-                # Put it back
-                await self.redis_client.lpush(self.dlq_key, json.dumps(entry))
-                return False
+                # Skip permanent errors unless forced; put back unchanged
+                if entry.get("error_type") == "permanent" and not force:
+                    logger.error(
+                        f"Refusing to requeue permanent error for object_id: {object_id}. Use --force to override."
+                    )
+                    await self.redis_client.lpush(self.dlq_key, json.dumps(entry))
+                    # Continue looping in case there are other (transient) entries
+                    continue
 
-            # Reconstruct the payload
-            payload_data = entry["payload"]
-            kind = str((payload_data or {}).get("kind") or "data").lower()
-            payload: BaseUploadRequest
-            if kind == "replica":
-                payload = ReplicaUploadRequest.model_validate(payload_data)
-            elif kind == "parity":
-                payload = ParityUploadRequest.model_validate(payload_data)
-            else:
-                payload = DataUploadRequest.model_validate(payload_data)
+                # Reconstruct the payload
+                payload_data = entry["payload"]
+                kind = str((payload_data or {}).get("kind") or "data").lower()
+                payload: BaseUploadRequest
+                if kind == "replica":
+                    payload = ReplicaUploadRequest.model_validate(payload_data)
+                elif kind == "parity":
+                    payload = ParityUploadRequest.model_validate(payload_data)
+                else:
+                    payload = DataUploadRequest.model_validate(payload_data)
 
-            # Reset attempts if not forcing
-            if not force:
-                payload.attempts = 0
+                # Reset attempts if not forcing
+                if not force:
+                    payload.attempts = 0
 
-            # Directly requeue the payload (no DLQ filesystem hydration)
-            await enqueue_upload_request(payload)
-            logger.info(f"Successfully requeued object_id: {object_id}")
-            return True
+                # Directly requeue the payload (no DLQ filesystem hydration)
+                await enqueue_upload_request(payload)
+                requeued_count += 1
+
+            if requeued_count > 0:
+                logger.info(f"Successfully requeued {requeued_count} entries for object_id: {object_id}")
+                return True
+            logger.error(f"No DLQ entry found for object_id: {object_id}")
+            return False
 
         except Exception as e:
             logger.error(f"Failed to requeue object_id: {object_id}, error: {e}")
@@ -276,6 +287,7 @@ async def main() -> None:
     # Get Redis clients
     config = get_config()
 
+    # Use queues Redis for DLQ operations to align with worker queues and test isolation
     redis_client = async_redis.from_url(config.redis_url)
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
 
@@ -284,7 +296,7 @@ async def main() -> None:
     initialize_queue_client(redis_queues_client)
 
     try:
-        dlq_manager = DLQManager(redis_client)
+        dlq_manager = DLQManager(redis_queues_client)
 
         if args.command == "peek":
             entries = await dlq_manager.peek(args.limit)

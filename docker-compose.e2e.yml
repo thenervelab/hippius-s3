@@ -123,6 +123,8 @@ services:
     env_file:
       - .env.defaults
       - .env.test-docker
+    environment:
+      - HIPPIUS_EC_TEST_HTTP_PORT=8001
     depends_on:
       db:
         condition: service_healthy
@@ -132,6 +134,8 @@ services:
         condition: service_healthy
     volumes:
       - .:/app
+    ports:
+      - "127.0.0.1:18088:8001"
     networks:
       - hippius_net
 
@@ -257,13 +261,18 @@ services:
     image: redis:7-alpine
     ports:
       - "127.0.0.1:6382:6379"
-    command: [
-      "redis-server",
-      "--maxmemory", "2gb",
-      "--maxmemory-policy", "allkeys-lru",
-      "--appendonly", "yes",
-      "--appendfsync", "everysec"
-    ]
+    command:
+      [
+        "redis-server",
+        "--maxmemory",
+        "2gb",
+        "--maxmemory-policy",
+        "allkeys-lru",
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+      ]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

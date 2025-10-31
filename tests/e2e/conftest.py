@@ -1,14 +1,5 @@
-"""E2E test configuration and fixtures for Hippius S3.
-
-Environment configuration:
-- E2E tests run via docker-compose which loads:
-  - .env.defaults (common test configuration)
-  - .env.test-docker (Docker service DNS names)
-- Integration tests and pytest conftest use .env.defaults + .env.test-local (base + localhost URLs)
-- See .env.defaults, .env.test-local, and .env.test-docker for configuration
-"""
-
 import base64
+import contextlib
 import os
 import secrets
 import subprocess
@@ -26,6 +17,42 @@ from dotenv import load_dotenv  # type: ignore[import-untyped]
 
 from .support.compose import enable_ipfs_proxy
 from .support.compose import wait_for_toxiproxy
+
+
+@pytest.fixture(autouse=True)
+def clear_redis_queues_between_tests() -> None:
+    """Clear Redis queue keys between e2e tests.
+
+    Uses docker exec to run `redis-cli FLUSHDB` in the queues Redis
+    container to clear all keys and ensure test isolation.
+    """
+    container = os.getenv("E2E_REDIS_QUEUES_CONTAINER", "hippius-e2e-redis-queues-1")
+    cmd = [
+        "docker",
+        "exec",
+        container,
+        "redis-cli",
+        "FLUSHDB",
+    ]
+    with contextlib.suppress(Exception):
+        subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+
+"""E2E test configuration and fixtures for Hippius S3.
+
+Environment configuration:
+- E2E tests run via docker-compose which loads:
+  - .env.defaults (common test configuration)
+  - .env.test-docker (Docker service DNS names)
+- Integration tests and pytest conftest use .env.defaults + .env.test-local (base + localhost URLs)
+- See .env.defaults, .env.test-local, and .env.test-docker for configuration
+"""
 
 
 # type: ignore[import-untyped]

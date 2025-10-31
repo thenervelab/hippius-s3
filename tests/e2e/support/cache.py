@@ -310,6 +310,75 @@ def wait_for_parts_cids(
     return False
 
 
+def wait_for_chunk_cids(
+    bucket_name: str,
+    object_key: str,
+    *,
+    timeout_seconds: float = 30.0,
+    dsn: Optional[str] = None,
+) -> bool:
+    """Wait until all expected chunk CIDs (in part_chunks) are non-pending for the object.
+
+    Computes expected total chunks as ceil(size_bytes / chunk_size_bytes) per part
+    and polls part_chunks until that many non-pending CIDs exist.
+    """
+    import math as _math
+
+    print(f"DEBUG: wait_for_chunk_cids called for {bucket_name}/{object_key}")
+    deadline = time.time() + timeout_seconds
+    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
+        expected_total = 0
+        while time.time() < deadline:
+            # Load per-part sizes and chunk sizes
+            cur.execute(
+                """
+                SELECT p.part_id, p.part_number, p.size_bytes, p.chunk_size_bytes
+                FROM parts p
+                JOIN objects o ON o.object_id = p.object_id
+                JOIN buckets b ON b.bucket_id = o.bucket_id
+                WHERE b.bucket_name = %s AND o.object_key = %s
+                ORDER BY p.part_number
+                """,
+                (bucket_name, object_key),
+            )
+            parts = cur.fetchall() or []
+            expected_total = 0
+            for _part_id, _pn, size_bytes, chunk_size_bytes in parts:
+                try:
+                    sb = int(size_bytes or 0)
+                    cs = int(chunk_size_bytes or 0)
+                    if sb > 0 and cs > 0:
+                        expected_total += int(_math.ceil(sb / float(cs)))
+                except Exception:
+                    continue
+
+            # Count realized chunk CIDs
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM part_chunks pc
+                JOIN parts p ON p.part_id = pc.part_id
+                JOIN objects o ON o.object_id = p.object_id
+                JOIN buckets b ON b.bucket_id = o.bucket_id
+                WHERE b.bucket_name = %s AND o.object_key = %s
+                  AND pc.cid IS NOT NULL AND pc.cid <> 'pending'
+                """,
+                (bucket_name, object_key),
+            )
+            row = cur.fetchone()
+            have = int(row[0]) if row else 0
+            print(f"DEBUG: non-pending chunk_cids: {have} / expected {expected_total}")
+            if expected_total > 0 and have >= expected_total:
+                print("DEBUG: wait_for_chunk_cids SUCCESS")
+                return True
+            time.sleep(0.3)
+    print(
+        f"DEBUG: wait_for_chunk_cids TIMEOUT - only found {have} of {expected_total} non-pending chunks after {timeout_seconds}s"
+    )
+    return False
+
+
 def make_all_object_parts_pending(
     bucket_name: str,
     object_key: str,

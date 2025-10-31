@@ -35,6 +35,16 @@ def get_queue_client() -> async_redis.Redis:
     return _queue_client
 
 
+# DLQ key colocated with worker queues in the queues Redis
+DLQ_LIST_KEY = "upload_requests:dlq"
+
+
+async def enqueue_dlq_entry(entry_json: str) -> None:
+    """Push a DLQ entry JSON string to the queues Redis."""
+    client = get_queue_client()
+    await client.lpush(DLQ_LIST_KEY, entry_json)  # type: ignore[func-returns-value]
+
+
 class Chunk(BaseModel):
     id: int
 

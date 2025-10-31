@@ -64,7 +64,7 @@ async def run_uploader_loop():
                 logger.info(f"Moved {moved} due retry requests back to primary queue")
         except Exception as e:
             logger.error(f"Error moving retry requests: {e}")
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
             continue
 
         try:
@@ -80,9 +80,15 @@ async def run_uploader_loop():
             continue
 
         if upload_request:
-            num_items = upload_request.get_items_count()
+            kind = getattr(upload_request, "kind", "data") or "data"
+            try:
+                items = upload_request.get_items_count()  # parity/replica supported via BaseUploadRequest
+            except Exception:
+                items = None
             logger.info(
-                f"Processing upload request object_id={upload_request.object_id} kind={getattr(upload_request, 'kind', 'data')} items={num_items} attempts={upload_request.attempts or 0}"
+                f"Processing upload request object_id={upload_request.object_id} kind={kind}"
+                + (f" items={items}" if items is not None else "")
+                + f" attempts={upload_request.attempts or 0}"
             )
 
             try:
@@ -112,7 +118,7 @@ async def run_uploader_loop():
                             int(getattr(upload_request, "object_version", 1) or 1),
                         )
         else:
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.01)
 
 
 if __name__ == "__main__":
