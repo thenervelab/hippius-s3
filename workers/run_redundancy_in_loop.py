@@ -536,6 +536,7 @@ async def process_redundancy_request(
 
         k = max(1, int(config.ec_k))
         m = max(0, int(config.ec_m))
+
         if m <= 0:
             logger.info("redundancy: EC m<=0; skipping parity generation")
             return True
@@ -570,7 +571,7 @@ async def process_redundancy_request(
             part_id,
             int(req.policy_version),
             int(k),
-            int(1),  # m=1 placeholder
+            int(m),
             int(shard_size),
             int(stripes),
         )

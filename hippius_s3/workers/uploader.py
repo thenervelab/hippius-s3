@@ -300,21 +300,6 @@ class Uploader:
                         cid,
                     )
 
-        # Update m to at least max_replica_index+1 for replication (completion handled by SubstrateWorker after pins)
-        if kind == "replica":
-            async with self._acquire_conn() as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO part_ec (part_id, policy_version, scheme, k, m, shard_size_bytes, stripes, state)
-                    VALUES ($1, $2, 'rep-v1', 1, $3, 0, 1, 'pending_upload')
-                    ON CONFLICT (part_id, policy_version)
-                    DO UPDATE SET m=GREATEST(part_ec.m, $3), updated_at=now()
-                    """,
-                    part_id,
-                    policy_version,
-                    int(max_replica_index + 1 if max_replica_index >= 0 else 0),
-                )
-
         # Enqueue substrate pinning for redundancy CIDs
         if uploaded_cids:
             await enqueue_substrate_request(
@@ -606,7 +591,6 @@ class Uploader:
             "error_type": etype,
         }
 
-        # DLQ lives in the queues Redis (same as other worker queues)
         await enqueue_dlq_entry(json.dumps(dlq_entry))
         logger.warning(f"Pushed to DLQ: object_id={payload.object_id}, error_type={error_type}, error={last_error}")
 

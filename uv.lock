@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.14' and platform_python_implementation != 'PyPy'",
@@ -830,7 +830,7 @@ wheels = [
 
 [[package]]
 name = "hippius"
-version = "0.2.67"
+version = "0.2.68"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "base58" },
@@ -847,9 +847,9 @@ dependencies = [
     { name = "substrate-interface" },
     { name = "zfec" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/0e/9e/6542eeb2b94d261cf68c3890cc55d7fe8832d59f7e1782b80f5d80b7a1e5/hippius-0.2.67.tar.gz", hash = "sha256:46be1b626c190b0b58d81b41c7f8c9d660e680a88ad1f68e83a632228df03aaf", size = 108517, upload-time = "2025-10-14T09:49:00.763Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d4/3b/c454c6f9ec4564cd8c31f326935012169dafcc2399064c0bb09452eaca78/hippius-0.2.68.tar.gz", hash = "sha256:5546f3ed53b7f439e46a6163037ee108690874974b8f24c4ce013b007a03a021", size = 108549, upload-time = "2025-10-31T09:24:22.586Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b6/14/e1fd6037f646b0bed7b26f1856051ab4d68a01fd6afee8c5050937fbe46f/hippius-0.2.67-py3-none-any.whl", hash = "sha256:9e301496f842e4d07c460fdf5ef40f0a1eb615ea999c56b657bd424445944596", size = 110596, upload-time = "2025-10-14T09:48:59.216Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/43/8d1697290631bdc86dfa16dc3dcce80f7ab1566b11cd301ebbafa23027bb/hippius-0.2.68-py3-none-any.whl", hash = "sha256:43e445c04bd699f42f59a783d05fd8ae425ea9518b946cd2fb2bf47f110ad41e", size = 110604, upload-time = "2025-10-31T09:24:21.377Z" },
 ]
 
 [package.optional-dependencies]
@@ -913,6 +913,9 @@ dev = [
     { name = "types-redis" },
     { name = "types-requests" },
 ]
+ec = [
+    { name = "pyeclib" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -925,7 +928,7 @@ requires-dist = [
     { name = "fakeredis", marker = "extra == 'dev'", specifier = ">=2.23.0" },
     { name = "fastapi", specifier = ">=0.115.12" },
     { name = "hippius" },
-    { name = "hippius", extras = ["key-storage"], specifier = ">=0.2.67" },
+    { name = "hippius", extras = ["key-storage"], specifier = ">=0.2.68" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "loki-logger-handler", specifier = ">=1.1.2" },
     { name = "lxml", specifier = ">=4.9.3" },
@@ -947,6 +950,7 @@ requires-dist = [
     { name = "psycopg", extras = ["binary"], marker = "extra == 'dev'", specifier = ">=3.1" },
     { name = "pyarrow", specifier = ">=18.0.0" },
     { name = "pydantic", specifier = ">=2.3.0" },
+    { name = "pyeclib", marker = "extra == 'ec'", specifier = ">=1.7.0" },
     { name = "pyinstrument", specifier = ">=4.0.0" },
     { name = "pynacl", specifier = ">=1.6.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
@@ -964,7 +968,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.23.0" },
     { name = "watchfiles", specifier = ">=1.1.0" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["dev", "ec"]
 
 [[package]]
 name = "httpcore"
@@ -2310,6 +2314,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/b8/e9/1f7efbe20d0b2b10f6718944b5d8ece9152390904f29a78e68d4e7961159/pydantic_core-2.33.2-pp311-pypy311_pp73-musllinux_1_1_armv7l.whl", hash = "sha256:de4b83bb311557e439b9e186f733f6c645b9417c84e2eb8203f3f820a4b988bf", size = 2239013, upload-time = "2025-04-23T18:33:26.621Z" },
     { url = "https://files.pythonhosted.org/packages/3c/b2/5309c905a93811524a49b4e031e9851a6b00ff0fb668794472ea7746b448/pydantic_core-2.33.2-pp311-pypy311_pp73-musllinux_1_1_x86_64.whl", hash = "sha256:82f68293f055f51b51ea42fafc74b6aad03e70e191799430b90c13d643059ebb", size = 2238715, upload-time = "2025-04-23T18:33:28.656Z" },
     { url = "https://files.pythonhosted.org/packages/32/56/8a7ca5d2cd2cda1d245d34b1c9a942920a718082ae8e54e5f3e5a58b7add/pydantic_core-2.33.2-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:329467cecfb529c925cf2bbd4d60d2c509bc2fb52a20c1045bf09bb70971a9c1", size = 2066757, upload-time = "2025-04-23T18:33:30.645Z" },
+]
+
+[[package]]
+name = "pyeclib"
+version = "1.7.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ea/68/606532ec534f5a30beaec13eba142aa3832d47b1765f3f72a212034dd613/pyeclib-1.7.0.tar.gz", hash = "sha256:1025e283bf9ee157706ef656920cb31a6b7986e21bfcb190288c8d8cde2c0ae5", size = 45842, upload-time = "2025-09-04T20:41:07.462Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0c/2b/d67fef8942f3635352fa2cc010404541507d4c38bcb1aa7800dc59462aed/pyeclib-1.7.0-cp310-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:f39d5212f7eebb155ead02b78bd881473eab93100c28f7e77bd577bf3f630576", size = 482379, upload-time = "2025-09-04T20:41:04.639Z" },
+    { url = "https://files.pythonhosted.org/packages/41/47/7713be5abaf9648a6751300a614cdfd63249c5a16c6daeb151382184da9e/pyeclib-1.7.0-cp310-abi3-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl", hash = "sha256:af89b9dd196d7e64f5b0ae5c0bed87a0ab482377ff48e4a80b3b991763f6c756", size = 533719, upload-time = "2025-09-04T20:41:05.971Z" },
+    { url = "https://files.pythonhosted.org/packages/71/25/d6ab9951cc179515b9fc933905f6080f224605465de6c065710ceeadc8a1/pyeclib-1.7.0-cp310-abi3-musllinux_1_1_aarch64.whl", hash = "sha256:105f3556476dc020f77314ff943ea36a2890a9fb401b4e1610e86c38746bedb0", size = 473348, upload-time = "2025-09-04T20:41:01.242Z" },
+    { url = "https://files.pythonhosted.org/packages/61/a3/d053c5536802115c147579546d2a56cd97c83141e2c7264b9929ce47c09d/pyeclib-1.7.0-cp310-abi3-musllinux_1_1_x86_64.whl", hash = "sha256:f8c1eeaf090c6faece2c9974795f94c542b11c07cd875759ffbab1e19228cef8", size = 511777, upload-time = "2025-09-04T20:41:03.089Z" },
 ]
 
 [[package]]
