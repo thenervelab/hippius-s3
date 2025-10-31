@@ -109,11 +109,14 @@ async def create_and_upload_manifest(user_address: str, batch_requests: List[Unp
         for req in batch_requests:
             if not req.cid:
                 continue
-            unpin_url = f"{base_url}/api/v0/pin/rm?arg={req.cid}"
-            logger.debug(f"Unpinning CID from IPFS store: {req.cid}")
-            unpin_response = await client.post(unpin_url)
-            unpin_response.raise_for_status()
-            logger.debug(f"Successfully unpinned CID from IPFS store: {req.cid}")
+            try:
+                unpin_url = f"{base_url}/api/v0/pin/rm?arg={req.cid}"
+                logger.debug(f"Unpinning CID from IPFS store: {req.cid}")
+                unpin_response = await client.post(unpin_url)
+                unpin_response.raise_for_status()
+                logger.debug(f"Successfully unpinned CID from IPFS store: {req.cid}")
+            except Exception as e:
+                logger.warning(f"Failed to unpin CID {req.cid} from IPFS store: {e}")
 
     Path(temp_path).unlink(missing_ok=True)
 
@@ -192,9 +195,7 @@ async def run_unpinner_loop() -> None:
                 for req in user_request_map[user_addr]:
                     await enqueue_unpin_request(req)
 
-        successful_requests = [
-            req for req in requests if req.address not in failed_users
-        ]
+        successful_requests = [req for req in requests if req.address not in failed_users]
 
         try:
             await unpinner_worker.process_batch(successful_requests, manifest_cids)
