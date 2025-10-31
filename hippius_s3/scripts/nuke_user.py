@@ -10,7 +10,6 @@ from typing import Any
 
 import aiofiles
 import asyncpg
-import httpx
 import redis.asyncio as async_redis
 
 
@@ -69,31 +68,19 @@ async def unpin_cids(cids: list[str], config: Any, address: str) -> dict[str, in
 
     log.info(f"Starting unpin operations for {len(cids)} CIDs")
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        for idx, cid in enumerate(cids, 1):
-            ipfs_unpin_url = f"{config.ipfs_store_url.rstrip('/')}/api/v0/pin/rm?arg={cid}"
-
-            try:
-                response = await client.post(ipfs_unpin_url)
-                response.raise_for_status()
-                log.info(f"[{idx}/{len(cids)}] Successfully unpinned CID from IPFS: {cid}")
-                success_count += 1
-            except Exception as e:
-                log.warning(f"[{idx}/{len(cids)}] Failed to unpin CID from IPFS: {cid} - {e}")
-                failed_count += 1
-
-            try:
-                await enqueue_unpin_request(
-                    payload=UnpinChainRequest(
-                        address=address,
-                        object_id="nuke_user_cleanup",
-                        object_version=1,
-                        cid=cid,
-                    ),
-                )
-                enqueued_count += 1
-            except Exception as e:
-                log.warning(f"[{idx}/{len(cids)}] Failed to enqueue unpin request: {cid} - {e}")
+    for idx, cid in enumerate(cids, 1):
+        try:
+            await enqueue_unpin_request(
+                payload=UnpinChainRequest(
+                    address=address,
+                    object_id="nuke_user_cleanup",
+                    object_version=1,
+                    cid=cid,
+                ),
+            )
+            enqueued_count += 1
+        except Exception as e:
+            log.warning(f"[{idx}/{len(cids)}] Failed to enqueue unpin request: {cid} - {e}")
 
     log.info(f"Unpin summary: {success_count} IPFS unpins, {failed_count} IPFS failures, {enqueued_count} enqueued")
     return {
