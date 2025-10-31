@@ -32,6 +32,7 @@ setup_loki_logging(config, "unpinner")
 logger = logging.getLogger(__name__)
 
 EPOCH_SLEEP_SECONDS = 60
+BATCH_SIZE = 10000
 
 
 async def create_and_upload_manifest(user_address: str, batch_requests: List[UnpinChainRequest]) -> str:
@@ -143,7 +144,7 @@ async def run_unpinner_loop() -> None:
     while True:
         requests = []
 
-        while True:
+        while len(requests) < BATCH_SIZE:
             unpin_request, redis_queues_client = await with_redis_retry(
                 lambda rc: dequeue_unpin_request(),
                 redis_queues_client,
@@ -161,7 +162,7 @@ async def run_unpinner_loop() -> None:
             await asyncio.sleep(10)
             continue
 
-        logger.info(f"Collected {len(requests)} unpin requests from queue")
+        logger.info(f"Collected {len(requests)} unpin requests from queue (max batch size: {BATCH_SIZE})")
 
         user_request_map: Dict[str, List[UnpinChainRequest]] = {}
         for req in requests:
@@ -205,8 +206,7 @@ async def run_unpinner_loop() -> None:
             for req in successful_requests:
                 await enqueue_unpin_request(req)
             logger.info(f"Requeued {len(successful_requests)} failed requests")
-        finally:
-            logger.info(f"Sleeping {EPOCH_SLEEP_SECONDS}s until next epoch...")
+            logger.info(f"Sleeping {EPOCH_SLEEP_SECONDS}s after failure before retry...")
             await asyncio.sleep(EPOCH_SLEEP_SECONDS)
 
 
