@@ -193,7 +193,7 @@ async def run_unpinner_loop() -> None:
     logger.info(f"Redis URL: {config.redis_url}")
     logger.info(f"Redis Queues URL: {config.redis_queues_url}")
 
-    batch_size = 1000
+    batch_size = 10000
     user_unpin_requests: dict[str, list[UnpinChainRequest]] = {}
 
     try:
@@ -217,10 +217,12 @@ async def run_unpinner_loop() -> None:
                         user_unpin_requests[user] = user_unpin_requests[user][batch_size:]
 
                         logger.info(f"Processing batch of {len(batch_to_process)} CIDs for user {user}")
-                        success = await process_unpin_batch(batch_to_process, 1, 1)
-
-                        if not success:
-                            logger.warning(f"Batch processing failed for user {user}")
+                        try:
+                            success = await process_unpin_batch(batch_to_process, 1, 1)
+                            if not success:
+                                logger.warning(f"Batch processing failed for user {user}")
+                        except Exception as e:
+                            logger.error(f"Exception processing batch for user {user}: {e}", exc_info=True)
 
                         if not user_unpin_requests[user]:
                             user_unpin_requests.pop(user)
@@ -229,25 +231,35 @@ async def run_unpinner_loop() -> None:
                 for user in list(user_unpin_requests.keys()):
                     if user_unpin_requests[user]:
                         logger.info(f"Processing remaining {len(user_unpin_requests[user])} CIDs for user {user}")
-                        success = await process_unpin_batch(user_unpin_requests[user], 1, 1)
-
-                        if success:
-                            logger.info(f"SUCCESSFULLY processed remaining requests for user {user}")
-                            user_unpin_requests.pop(user)
-                        else:
-                            logger.warning(f"Some unpins failed for user {user}, will retry later")
+                        try:
+                            success = await process_unpin_batch(user_unpin_requests[user], 1, 1)
+                            if success:
+                                logger.info(f"SUCCESSFULLY processed remaining requests for user {user}")
+                                user_unpin_requests.pop(user)
+                            else:
+                                logger.warning(f"Some unpins failed for user {user}, will retry later")
+                        except Exception as e:
+                            logger.error(f"Exception processing remaining batch for user {user}: {e}", exc_info=True)
 
                 await asyncio.sleep(config.unpinner_sleep_loop)
 
     except KeyboardInterrupt:
         logger.info("Unpinner service stopping...")
     except Exception as e:
-        logger.error(f"Error in unpinner loop: {e}")
-        raise
+        logger.error(f"Fatal error in unpinner loop: {e}", exc_info=True)
+        logger.info("Unpinner will restart...")
     finally:
         await redis_client.aclose()  # type: ignore[attr-defined]
         await redis_queues_client.aclose()  # type: ignore[attr-defined]
 
 
 if __name__ == "__main__":
-    asyncio.run(run_unpinner_loop())
+    while True:
+        try:
+            asyncio.run(run_unpinner_loop())
+        except KeyboardInterrupt:
+            logger.info("Unpinner service stopped by user")
+            break
+        except Exception as e:
+            logger.error(f"Unpinner crashed, restarting in 5 seconds: {e}", exc_info=True)
+            time.sleep(5)
