@@ -351,7 +351,12 @@ def wait_for_chunk_cids(
 
     print(f"DEBUG: wait_for_chunk_cids called for {bucket_name}/{object_key}")
     deadline = time.time() + timeout_seconds
-    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    env = os.environ.get("DATABASE_URL")
+    resolved_dsn: str = (
+        dsn
+        if dsn is not None
+        else (env if env is not None else "postgresql://postgres:postgres@localhost:5432/hippius")
+    )
     with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         expected_total = 0
         while time.time() < deadline:
@@ -414,7 +419,12 @@ def make_all_object_parts_pending(
 
     Returns the object_id of the affected object.
     """
-    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    env = os.environ.get("DATABASE_URL")
+    resolved_dsn: str = (
+        dsn
+        if dsn is not None
+        else (env if env is not None else "postgresql://postgres:postgres@localhost:5432/hippius")
+    )
     with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         # First get the object_id
         cur.execute(

@@ -205,8 +205,6 @@ def reconstruct_single_miss_rs(
     - k: number of data fragments in this stripe
     - missing_index: 0-based index of the missing data fragment within the stripe
     """
-    from pyeclib.ec_iface import ECDriver  # type: ignore
-
     if k <= 0:
         return b""
     m = max(1, len(parity_frags))
@@ -301,9 +299,6 @@ def reconstruct_single_miss_rs(
                     data_frags.append(data_headers[i] + pad(b""))
                 else:
                     data_frags.append(pad(b""))
-    parity_padded = [pad(p) for p in parity_frags]
-    frags = data_frags + parity_padded
-    erasures = [int(missing_index)]
     # Prefer sidecar ISA-L service if configured via EC_HTTP_URL
     sidecar = os.environ.get("EC_HTTP_URL")
     if sidecar:
@@ -351,30 +346,8 @@ def reconstruct_single_miss_rs(
         except Exception as e:
             print("DEBUG sidecar reconstruct error:", {"type": type(e).__name__, "msg": str(e)})
             # fall back to local ISA-L below
-    # Local fallback: prefer ISA-L, then liberasurecode
-    # Strict ISA-L only: fail fast if unavailable
-    driver = ECDriver(k=int(k), m=int(m), ec_type="isa_l_rs_vand", chksum_type="none")
-    rec = driver.reconstruct(frags, erasures)
-    if not rec:
-        print("DEBUG RS reconstruct: rec=None")
-        return b""
-    frag = bytes(rec[0])
-    payload_size = int(expected_payload_size) if expected_payload_size is not None else 0
-    if payload_size == 0:
-        for b in others:
-            payload_size = max(payload_size, len(b))
-    header_len = max(0, len(frag) - payload_size)
-    print(
-        "DEBUG RS reconstruct result:",
-        {
-            "rec_len": len(frag),
-            "rec_md5": _md5(frag),
-            "rec_head": _hex_sample(frag),
-            "payload_size": payload_size,
-            "computed_header_len": header_len,
-        },
-    )
-    return frag[header_len:] if header_len > 0 else frag
+    # Tests require the sidecar; no local fallback
+    raise RuntimeError("ec_sidecar_required: set EC_HTTP_URL to the redundancy sidecar endpoint for tests")
 
 
 def reconstruct_single_miss(

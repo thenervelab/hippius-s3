@@ -60,6 +60,7 @@ def _start_ec_test_http_server() -> None:
         return
 
     from http.server import BaseHTTPRequestHandler, HTTPServer  # lazy import
+
     from pyeclib.ec_iface import ECDriver  # type: ignore
 
     class Handler(BaseHTTPRequestHandler):
@@ -300,8 +301,7 @@ def _start_ec_test_http_server() -> None:
                         {"backend": "isa_l_rs_vand", "parity": [base64.b64encode(p).decode("ascii") for p in parity]},
                     )
                     return
-                else:
-                    self._json(404, {"error": "not found"})
+                self._json(404, {"error": "not found"})
             except Exception as e:
                 try:
                     logger.error(
