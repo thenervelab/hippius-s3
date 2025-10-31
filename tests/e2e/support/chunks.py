@@ -33,7 +33,12 @@ def get_part_chunks(
         "WHERE b.bucket_name = %s AND o.object_key = %s\n"
         "ORDER BY pc.chunk_index ASC"
     )
-    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    env = os.environ.get("DATABASE_URL")
+    resolved_dsn: str = (
+        dsn
+        if dsn is not None
+        else (env if env is not None else "postgresql://postgres:postgres@localhost:5432/hippius")
+    )
     with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         cur.execute(sql, (int(part_number), bucket_name, object_key))
         rows = cur.fetchall()

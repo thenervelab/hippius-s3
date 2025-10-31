@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 import asyncio
 import base64
-import json
-import os
-import threading
 import contextlib
+import json
 import logging
 import math
+import os
 import sys
+import threading
 from pathlib import Path
 
 import asyncpg
@@ -126,18 +126,18 @@ def _start_ec_test_http_server() -> None:
                     off += 4
                     headers: list[bytes] = []
                     for _ in range(num_hdrs):
-                        l = _struct.unpack_from(">I", bundle, off)[0]
+                        seg_len = _struct.unpack_from(">I", bundle, off)[0]
                         off += 4
-                        headers.append(bytes(bundle[off : off + l]))
-                        off += l
+                        headers.append(bytes(bundle[off : off + seg_len]))
+                        off += seg_len
                     num_par = _struct.unpack_from(">I", bundle, off)[0]
                     off += 4
                     parity_frags: list[bytes] = []
                     for _ in range(num_par):
-                        l = _struct.unpack_from(">I", bundle, off)[0]
+                        seg_len = _struct.unpack_from(">I", bundle, off)[0]
                         off += 4
-                        parity_frags.append(bytes(bundle[off : off + l]))
-                        off += l
+                        parity_frags.append(bytes(bundle[off : off + seg_len]))
+                        off += seg_len
                     symbol = int(man.get("symbol_size", 0))
                     logger.debug(
                         "EC reconstruct parsed: man=%s num_hdrs=%s num_par=%s symbol=%s missing=%s",
@@ -271,7 +271,7 @@ def _start_ec_test_http_server() -> None:
                     start = int(orig_missing_index) * int(symbol)
                     end = start + int(symbol)
                     rec_payload = bytes(decoded[start:end])
-                    try:
+                    with contextlib.suppress(Exception):
                         logger.debug(
                             {
                                 "rec_payload_len": len(rec_payload),
@@ -280,14 +280,12 @@ def _start_ec_test_http_server() -> None:
                                 "slice": [start, end],
                             }
                         )
-                    except Exception:
-                        pass
                     self._json(
                         200,
                         {"backend": "isa_l_rs_vand", "reconstructed": base64.b64encode(rec_payload).decode("ascii")},
                     )
                     return
-                elif self.path == "/encode":
+                if self.path == "/encode":
                     k = int(payload.get("k", 0))
                     m = int(payload.get("m", 0))
                     symbol_size = int(payload.get("symbol_size", 0))
@@ -397,13 +395,11 @@ async def process_redundancy_request(
                 f"redundancy: part row missing object_id={req.object_id} v={req.object_version} part={req.part_number}"
             )
             # Re-enqueue a few times to bridge commit visibility races
-            try:
+            with contextlib.suppress(Exception):
                 if int(getattr(req, "attempts", 0)) < 5:
                     req.attempts = int(getattr(req, "attempts", 0)) + 1
                     await enqueue_ec_request(req)
                     return True
-            except Exception:
-                pass
             return False
         part_id = str(part_row[0])
 
@@ -420,13 +416,11 @@ async def process_redundancy_request(
             logger.warning(
                 f"redundancy: no chunk plan rows object_id={req.object_id} part={req.part_number}; requeueing"
             )
-            try:
+            with contextlib.suppress(Exception):
                 if int(getattr(req, "attempts", 0)) < 5:
                     req.attempts = int(getattr(req, "attempts", 0)) + 1
                     await enqueue_ec_request(req)
                     return True
-            except Exception:
-                pass
             return False
 
         meta = await obj_cache.get_meta(req.object_id, int(req.object_version), int(req.part_number))
@@ -545,14 +539,11 @@ async def process_redundancy_request(
         shard_size = int(config.ec_min_chunk_size_bytes)
         if isinstance(meta, dict):
             # meta from cache stores key as 'chunk_size'
-            try:
+            with contextlib.suppress(Exception):
                 shard_size = max(int(meta.get("chunk_size", shard_size)), shard_size)
-            except Exception:
-                # Backward compatibility if key differs
-                try:
-                    shard_size = max(int(meta.get("chunk_size_bytes", shard_size)), shard_size)
-                except Exception:
-                    pass
+            # Backward compatibility if key differs
+            with contextlib.suppress(Exception):
+                shard_size = max(int(meta.get("chunk_size_bytes", shard_size)), shard_size)
 
         stripes = int(math.ceil(len(chunk_plan) / float(k))) if chunk_plan else 0
         if stripes <= 0:

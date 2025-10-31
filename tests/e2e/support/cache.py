@@ -13,7 +13,12 @@ from hippius_s3.cache import RedisObjectPartsCache
 
 def get_object_id_and_version(bucket_name: str, object_key: str, *, dsn: Optional[str] = None) -> tuple[str, int]:
     """Fetch (object_id, current_object_version) for a (bucket_name, object_key)."""
-    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    env = os.environ.get("DATABASE_URL")
+    resolved_dsn: str = (
+        dsn
+        if dsn is not None
+        else (env if env is not None else "postgresql://postgres:postgres@localhost:5432/hippius")
+    )
     with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -48,7 +53,12 @@ def get_object_cids(
 
     Returns: (object_id, object_version, main_account_id, part_cids, manifest_cid)
     """
-    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    env = os.environ.get("DATABASE_URL")
+    resolved_dsn: str = (
+        dsn
+        if dsn is not None
+        else (env if env is not None else "postgresql://postgres:postgres@localhost:5432/hippius")
+    )
     with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -128,7 +138,12 @@ def clear_object_cache(
     r = redis.Redis.from_url(redis_url)
 
     # If no parts specified, query DB for actual part numbers to avoid scanning 256 empty parts
-    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    env = os.environ.get("DATABASE_URL")
+    resolved_dsn: str = (
+        dsn
+        if dsn is not None
+        else (env if env is not None else "postgresql://postgres:postgres@localhost:5432/hippius")
+    )
     if parts is None:
         with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
             cur.execute(
@@ -185,7 +200,12 @@ def read_part_from_cache(
     """Assemble part bytes from chunked cache if present; returns None if missing."""
     r = redis.Redis.from_url(redis_url)
     # Fetch current object_version
-    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    env = os.environ.get("DATABASE_URL")
+    resolved_dsn: str = (
+        dsn
+        if dsn is not None
+        else (env if env is not None else "postgresql://postgres:postgres@localhost:5432/hippius")
+    )
     with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -239,7 +259,12 @@ def wait_for_parts_cids(
     """
     print(f"DEBUG: wait_for_parts_cids called for {bucket_name}/{object_key}, expecting min_count={min_count}")
     deadline = time.time() + timeout_seconds
-    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    env = os.environ.get("DATABASE_URL")
+    resolved_dsn: str = (
+        dsn
+        if dsn is not None
+        else (env if env is not None else "postgresql://postgres:postgres@localhost:5432/hippius")
+    )
     with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         while time.time() < deadline:
             # First, get object_id for debugging

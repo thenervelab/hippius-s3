@@ -56,7 +56,12 @@ def get_part_id(
         "WHERE b.bucket_name = %s AND o.object_key = %s AND p.part_number = %s "
         "LIMIT 1"
     )
-    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    env = os.environ.get("DATABASE_URL")
+    resolved_dsn: str = (
+        dsn
+        if dsn is not None
+        else (env if env is not None else "postgresql://postgres:postgres@localhost:5432/hippius")
+    )
     with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         cur.execute(sql, (bucket_name, object_key, int(part_number)))
         row = cur.fetchone()
@@ -74,7 +79,12 @@ def get_part_ec(
     sql = (
         "SELECT policy_version, scheme, k, m, stripes FROM part_ec WHERE part_id = %s ORDER BY updated_at DESC LIMIT 1"
     )
-    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    env = os.environ.get("DATABASE_URL")
+    resolved_dsn: str = (
+        dsn
+        if dsn is not None
+        else (env if env is not None else "postgresql://postgres:postgres@localhost:5432/hippius")
+    )
     with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         cur.execute(sql, (part_id,))
         row = cur.fetchone()
@@ -92,7 +102,12 @@ def count_blobs_by_kind(
 ) -> int:
     status_list = tuple(statuses)
     sql = "SELECT COUNT(*) FROM blobs WHERE part_id = %s AND kind = %s AND status = ANY(%s)"
-    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    env = os.environ.get("DATABASE_URL")
+    resolved_dsn: str = (
+        dsn
+        if dsn is not None
+        else (env if env is not None else "postgresql://postgres:postgres@localhost:5432/hippius")
+    )
     with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         cur.execute(sql, (part_id, kind, list(status_list)))
         row = cur.fetchone()
@@ -106,7 +121,12 @@ def get_replica_cids_for_chunk(
     dsn: Optional[str] = None,
 ) -> list[str]:
     sql = "SELECT cid FROM part_parity_chunks WHERE part_id = %s AND stripe_index = %s ORDER BY parity_index"
-    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    env = os.environ.get("DATABASE_URL")
+    resolved_dsn: str = (
+        dsn
+        if dsn is not None
+        else (env if env is not None else "postgresql://postgres:postgres@localhost:5432/hippius")
+    )
     with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         cur.execute(sql, (part_id, int(chunk_index)))
         return [str(r[0]) for r in cur.fetchall()]
@@ -124,7 +144,12 @@ def get_parity_cid(
         "SELECT cid FROM part_parity_chunks WHERE part_id = %s AND policy_version = %s "
         "AND stripe_index = %s AND parity_index = %s ORDER BY created_at DESC LIMIT 1"
     )
-    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    env = os.environ.get("DATABASE_URL")
+    resolved_dsn: str = (
+        dsn
+        if dsn is not None
+        else (env if env is not None else "postgresql://postgres:postgres@localhost:5432/hippius")
+    )
     with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         cur.execute(sql, (part_id, int(policy_version), int(stripe_index), int(parity_index)))
         row = cur.fetchone()
@@ -149,7 +174,12 @@ def get_data_chunk_cids(
     dsn: Optional[str] = None,
 ) -> list[str]:
     sql = "SELECT cid FROM part_chunks WHERE part_id = %s ORDER BY chunk_index"
-    resolved_dsn = dsn or os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    env = os.environ.get("DATABASE_URL")
+    resolved_dsn: str = (
+        dsn
+        if dsn is not None
+        else (env if env is not None else "postgresql://postgres:postgres@localhost:5432/hippius")
+    )
     with psycopg.connect(resolved_dsn) as conn, conn.cursor() as cur:
         cur.execute(sql, (part_id,))
         return [str(r[0]) for r in cur.fetchall()]
