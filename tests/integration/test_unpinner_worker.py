@@ -43,6 +43,8 @@ async def test_unpinner_worker_manifest_structure() -> None:
             mock_response.text = '{"Hash":"bafymanifest123456789"}\n'
         elif "/api/v0/pin/add" in url:
             mock_response.text = '{"Pins":["bafymanifest123456789"]}'
+        elif "/api/v0/pin/rm" in url:
+            mock_response.text = '{"Pins":["removed_cid"]}'
         else:
             mock_response.text = "{}"
 

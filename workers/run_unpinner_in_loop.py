@@ -119,9 +119,21 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
         pin_response.raise_for_status()
         logger.info(f"Pinned manifest to local IPFS node: {manifest_cid}")
 
-    manifest = {"cid": manifest_cid}
+    # Unpin the original CIDs from the IPFS store node
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for req in unpin_requests:
+            if not req.cid:
+                continue
+            try:
+                unpin_url = f"{base_url}/api/v0/pin/rm?arg={req.cid}"
+                logger.debug(f"Unpinning CID from IPFS store: {req.cid}")
+                unpin_response = await client.post(unpin_url)
+                unpin_response.raise_for_status()
+                logger.info(f"Successfully unpinned CID from IPFS store: {req.cid}")
+            except Exception as e:
+                logger.warning(f"Failed to unpin CID {req.cid} from IPFS store: {e}")
 
-    logger.info(f"Created unpin manifest with CID: {manifest['cid']}")
+    logger.info(f"Created unpin manifest with CID: {manifest_cid}")
 
     # Clean up temp file
     Path(temp_path).unlink(missing_ok=True)
@@ -139,18 +151,18 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
     )
 
     tx_hash = await substrate_client.cancel_storage_request(
-        cid=manifest["cid"],
+        cid=manifest_cid,
         seed_phrase=seed_phrase,
     )
 
-    logger.debug(f"Substrate call result for manifest {manifest['cid']}: {tx_hash}")
+    logger.debug(f"Substrate call result for manifest {manifest_cid}: {tx_hash}")
 
     # Check if we got a valid transaction hash
     if not tx_hash or tx_hash == "0x" or len(tx_hash) < 10:
-        logger.error(f"Invalid transaction hash received for manifest {manifest['cid']}: {tx_hash}")
+        logger.error(f"Invalid transaction hash received for manifest {manifest_cid}: {tx_hash}")
         return False
 
-    logger.info(f"Successfully submitted unpin manifest {manifest['cid']} with transaction: {tx_hash}")
+    logger.info(f"Successfully submitted unpin manifest {manifest_cid} with transaction: {tx_hash}")
     logger.info(f"Unpinned {len(manifest_objects)} files in batch")
 
     if user_address:
