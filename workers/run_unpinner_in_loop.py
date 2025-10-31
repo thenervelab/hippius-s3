@@ -31,13 +31,13 @@ setup_loki_logging(config, "unpinner")
 logger = logging.getLogger(__name__)
 
 
-async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool:
-    """Process unpin requests by creating a manifest and canceling storage request using the Hippius SDK."""
+async def process_unpin_batch(batch_requests: list[UnpinChainRequest], batch_num: int, total_batches: int) -> bool:
+    """Process a single batch of unpin requests (up to 1000 CIDs)."""
     start_time = time.time()
     manifest_objects = []
     user_address = None
 
-    for req in unpin_requests:
+    for req in batch_requests:
         if not req.cid:
             continue
         user_address = req.address
@@ -49,12 +49,14 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
                 "filename": file_name,
             },
         )
-        logger.info(f"Added to unpin manifest: {req.address=} {file_name=} {req.cid=}")
+        logger.debug(f"Added to unpin manifest batch {batch_num}/{total_batches}: {req.address=} {file_name=} {req.cid=}")
 
     # Check if we have any objects to unpin
     if not manifest_objects:
-        logger.info("No objects to unpin (all requests had empty CIDs)")
+        logger.info(f"Batch {batch_num}/{total_batches}: No objects to unpin (all requests had empty CIDs)")
         return True
+
+    logger.info(f"Processing batch {batch_num}/{total_batches} with {len(manifest_objects)} CIDs")
 
     # Create manifest JSON file
     manifest_data = json.dumps(
@@ -73,7 +75,7 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
 
     # Upload manifest to IPFS using httpx with proper redirect handling
     async with httpx.AsyncClient(
-        timeout=30.0,
+        timeout=300.0,
         follow_redirects=True,
     ) as client:
         # Read manifest data
@@ -109,7 +111,7 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
         else:
             raise Exception(f"No valid CID found in IPFS response: {response_text}")
 
-    logger.info(f"Uploaded manifest directly to IPFS with CID: {manifest_cid}")
+    logger.info(f"Batch {batch_num}/{total_batches}: Uploaded manifest to IPFS with CID: {manifest_cid}")
 
     # Pin the manifest to local IPFS node
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -117,11 +119,11 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
         logger.debug(f"Pinning manifest to local IPFS: {pin_url}")
         pin_response = await client.post(pin_url)
         pin_response.raise_for_status()
-        logger.info(f"Pinned manifest to local IPFS node: {manifest_cid}")
+        logger.info(f"Batch {batch_num}/{total_batches}: Pinned manifest to local IPFS node: {manifest_cid}")
 
     # Unpin the original CIDs from the IPFS store node
     async with httpx.AsyncClient(timeout=30.0) as client:
-        for req in unpin_requests:
+        for req in batch_requests:
             if not req.cid:
                 continue
             try:
@@ -129,11 +131,9 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
                 logger.debug(f"Unpinning CID from IPFS store: {req.cid}")
                 unpin_response = await client.post(unpin_url)
                 unpin_response.raise_for_status()
-                logger.info(f"Successfully unpinned CID from IPFS store: {req.cid}")
+                logger.debug(f"Successfully unpinned CID from IPFS store: {req.cid}")
             except Exception as e:
                 logger.warning(f"Failed to unpin CID {req.cid} from IPFS store: {e}")
-
-    logger.info(f"Created unpin manifest with CID: {manifest_cid}")
 
     # Clean up temp file
     Path(temp_path).unlink(missing_ok=True)
@@ -159,11 +159,11 @@ async def process_unpin_request(unpin_requests: list[UnpinChainRequest]) -> bool
 
     # Check if we got a valid transaction hash
     if not tx_hash or tx_hash == "0x" or len(tx_hash) < 10:
-        logger.error(f"Invalid transaction hash received for manifest {manifest_cid}: {tx_hash}")
+        logger.error(f"Batch {batch_num}/{total_batches}: Invalid transaction hash received for manifest {manifest_cid}: {tx_hash}")
         return False
 
-    logger.info(f"Successfully submitted unpin manifest {manifest_cid} with transaction: {tx_hash}")
-    logger.info(f"Unpinned {len(manifest_objects)} files in batch")
+    logger.info(f"Batch {batch_num}/{total_batches}: Successfully submitted unpin manifest {manifest_cid} with transaction: {tx_hash}")
+    logger.info(f"Batch {batch_num}/{total_batches}: Unpinned {len(manifest_objects)} files")
 
     if user_address:
         duration = time.time() - start_time
@@ -192,6 +192,8 @@ async def run_unpinner_loop() -> None:
     logger.info("Starting unpinner service...")
     logger.info(f"Redis URL: {config.redis_url}")
     logger.info(f"Redis Queues URL: {config.redis_queues_url}")
+
+    batch_size = 1000
     user_unpin_requests: dict[str, list[UnpinChainRequest]] = {}
 
     try:
@@ -209,14 +211,31 @@ async def run_unpinner_loop() -> None:
                 except KeyError:
                     user_unpin_requests[unpin_request.address] = [unpin_request]
 
+                for user in list(user_unpin_requests.keys()):
+                    if len(user_unpin_requests[user]) >= batch_size:
+                        batch_to_process = user_unpin_requests[user][:batch_size]
+                        user_unpin_requests[user] = user_unpin_requests[user][batch_size:]
+
+                        logger.info(f"Processing batch of {len(batch_to_process)} CIDs for user {user}")
+                        success = await process_unpin_batch(batch_to_process, 1, 1)
+
+                        if not success:
+                            logger.warning(f"Batch processing failed for user {user}")
+
+                        if not user_unpin_requests[user]:
+                            user_unpin_requests.pop(user)
+
             else:
                 for user in list(user_unpin_requests.keys()):
-                    success = await process_unpin_request(user_unpin_requests[user])
-                    if success:
-                        logger.info(f"SUCCESSFULLY processed user's {user} with {len(user_unpin_requests[user])} files")
-                        user_unpin_requests.pop(user)
-                    else:
-                        logger.warning(f"Some unpins failed for user {user}, will retry later")
+                    if user_unpin_requests[user]:
+                        logger.info(f"Processing remaining {len(user_unpin_requests[user])} CIDs for user {user}")
+                        success = await process_unpin_batch(user_unpin_requests[user], 1, 1)
+
+                        if success:
+                            logger.info(f"SUCCESSFULLY processed remaining requests for user {user}")
+                            user_unpin_requests.pop(user)
+                        else:
+                            logger.warning(f"Some unpins failed for user {user}, will retry later")
 
                 await asyncio.sleep(config.unpinner_sleep_loop)
 
@@ -226,7 +245,8 @@ async def run_unpinner_loop() -> None:
         logger.error(f"Error in unpinner loop: {e}")
         raise
     finally:
-        await redis_client.close()
+        await redis_client.aclose()  # type: ignore[attr-defined]
+        await redis_queues_client.aclose()  # type: ignore[attr-defined]
 
 
 if __name__ == "__main__":

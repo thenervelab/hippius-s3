@@ -67,10 +67,10 @@ async def test_unpinner_worker_manifest_structure() -> None:
         mock_client_class.return_value = mock_client_instance
 
         with patch("workers.run_unpinner_in_loop.SubstrateClient", return_value=mock_substrate_client):
-            from workers.run_unpinner_in_loop import process_unpin_request
+            from workers.run_unpinner_in_loop import process_unpin_batch
 
-            success = await process_unpin_request(unpin_requests)
-            assert success, "process_unpin_request should return True"
+            success = await process_unpin_batch(unpin_requests, 1, 1)
+            assert success, "process_unpin_batch should return True"
 
     assert captured_manifest is not None, "Manifest was not captured"
     assert len(captured_manifest) == len(fake_cids), f"Manifest should have {len(fake_cids)} entries"
@@ -101,7 +101,7 @@ async def test_unpinner_worker_handles_empty_cids() -> None:
     ]
 
     with patch("workers.run_unpinner_in_loop.SubstrateClient"):
-        from workers.run_unpinner_in_loop import process_unpin_request
+        from workers.run_unpinner_in_loop import process_unpin_batch
 
-        success = await process_unpin_request(unpin_requests)
+        success = await process_unpin_batch(unpin_requests, 1, 1)
         assert success, "Should handle empty CIDs gracefully and return True"
