@@ -214,9 +214,40 @@ async def main_async(args: argparse.Namespace) -> int:
     from hippius_s3.config import get_config
 
     config = get_config()
+    redis_queues_client: async_redis.Redis[Any] | None = None
+
+    if args.from_json:
+        log.info(f"Loading CIDs from JSON file: {args.from_json}")
+        async with aiofiles.open(args.from_json, "r") as f:
+            content = await f.read()
+            data = json.loads(content)
+
+        if not data:
+            log.error("JSON file is empty or invalid")
+            return 1
+
+        address = list(data.keys())[0]
+        cids = data[address]
+
+        log.info(f"Loaded {len(cids)} CIDs for address: {address}")
+
+        redis_queues_client = async_redis.from_url(config.redis_queues_url)
+        from hippius_s3.queue import initialize_queue_client
+
+        initialize_queue_client(redis_queues_client)
+
+        try:
+            log.info(f"Enqueueing unpin requests for {len(cids)} CIDs...")
+            unpin_results = await unpin_cids(cids, config, address)
+            log.info(
+                f"Enqueue complete: {unpin_results['enqueued']}/{len(cids)} successfully enqueued, {unpin_results['ipfs_failed']} failed"
+            )
+            return 0
+        finally:
+            await redis_queues_client.close()
+
     db = await asyncpg.connect(config.database_url)
 
-    redis_queues_client = None
     if args.unpin and not args.dry_run:
         redis_queues_client = async_redis.from_url(config.redis_queues_url)
         from hippius_s3.queue import initialize_queue_client
@@ -288,7 +319,7 @@ async def main_async(args: argparse.Namespace) -> int:
         output_data = {args.address: cids}
 
         async with aiofiles.open(output_file, "w") as f:
-            json.dump(output_data, f, indent=2)
+            await f.write(json.dumps(output_data, indent=2))
 
         log.info(f"CID list written to: {output_file}")
         log.info(f"Total CIDs: {len(cids)}")
@@ -302,12 +333,22 @@ async def main_async(args: argparse.Namespace) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Delete all data for a user from the database")
-    ap.add_argument("--address", required=True, help="User address (main_account_id) to delete")
+    ap.add_argument("--address", help="User address (main_account_id) to delete")
     ap.add_argument("--dry-run", action="store_true", help="Preview deletions without executing")
     ap.add_argument(
         "--unpin", action="store_true", help="Unpin CIDs from IPFS and enqueue unpin requests (ignored in dry-run)"
     )
+    ap.add_argument(
+        "--from-json",
+        help="Load CIDs from a JSON file and enqueue unpin requests (use alone, without --address or --dry-run)",
+    )
     args = ap.parse_args()
+
+    if args.from_json:
+        if args.address or args.dry_run or args.unpin:
+            ap.error("--from-json must be used alone (without --address, --dry-run, or --unpin)")
+    elif not args.address:
+        ap.error("--address is required when not using --from-json")
 
     rc = asyncio.run(main_async(args))
     raise SystemExit(rc)
