@@ -271,3 +271,18 @@ async def stream_object(
         bucket_name=str(info.get("bucket_name", "")),
         storage_version=ctx.storage_version,
     )
+
+
+async def build_chunk_index_plan_for_object(
+    db: Any,
+    object_id: str,
+    object_version: int,
+    rng: RangeRequest | None = None,
+) -> list[ChunkPlanItem]:
+    """Return the standard chunk index plan for an object_version.
+
+    This mirrors the reader planning (parts manifest + planner) without any cache/download logic.
+    Consumers can attach bytes/CIDs separately.
+    """
+    parts = await read_parts_manifest(db, object_id, int(object_version))
+    return await build_chunk_plan(db, object_id, parts, rng, object_version=int(object_version))

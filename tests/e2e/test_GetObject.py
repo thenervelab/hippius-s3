@@ -118,8 +118,10 @@ def test_get_object_eventual_consistency(
     head_resp = boto3_client.head_object(Bucket=bucket_name, Key=key)
     assert head_resp["ContentLength"] == 2 * 1024 * 1024
 
-    # Wait for object to be processed and cached
-    assert wait_for_parts_cids(bucket_name, key, min_count=2, timeout_seconds=20.0)
+    # Wait for all chunk CIDs to materialize (across both parts)
+    from .support.cache import wait_for_chunk_cids
+
+    assert wait_for_chunk_cids(bucket_name, key, timeout_seconds=30.0)
 
     # Step 3: Get object_id and verify cache exists
     from .support.cache import get_object_id_and_version

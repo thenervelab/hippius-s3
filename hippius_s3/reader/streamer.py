@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any
 from typing import AsyncGenerator
@@ -59,4 +60,17 @@ async def stream_plan(
             bucket_name=bucket_name,
             storage_version=int(storage_version),
         )
+        try:
+            md5 = hashlib.md5(pt).hexdigest() if isinstance(pt, (bytes, bytearray)) else None
+            head = pt[:8].hex() if isinstance(pt, (bytes, bytearray)) else None
+            logger.debug(
+                "STREAM decrypted part=%s chunk=%s pt_len=%s pt_head8=%s pt_md5=%s",
+                int(item.part_number),
+                int(item.chunk_index),
+                len(pt) if isinstance(pt, (bytes, bytearray)) else None,
+                head,
+                md5,
+            )
+        except Exception:
+            pass
         yield maybe_slice(pt, item.slice_start, item.slice_end_excl)

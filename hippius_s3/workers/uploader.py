@@ -3,6 +3,7 @@ import json
 import logging
 import random
 import time
+from pathlib import Path
 from typing import Any
 from typing import List
 from typing import Optional
@@ -13,10 +14,14 @@ from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.ipfs_service import IPFSService
 from hippius_s3.monitoring import get_metrics_collector
+from hippius_s3.queue import BaseUploadRequest
 from hippius_s3.queue import Chunk
+from hippius_s3.queue import DataUploadRequest
 from hippius_s3.queue import SubstratePinningRequest
-from hippius_s3.queue import UploadChainRequest
+from hippius_s3.queue import enqueue_dlq_entry
 from hippius_s3.queue import enqueue_substrate_request
+from hippius_s3.repositories.blobs import BlobRow
+from hippius_s3.repositories.blobs import BlobsRepository
 from hippius_s3.utils import get_query
 
 
@@ -74,8 +79,8 @@ class Uploader:
         self.redis_client = redis_client
         self.config = config
         self.obj_cache = RedisObjectPartsCache(redis_client)
-        # Primary source: filesystem store (authoritative, survives Redis eviction)
-        self.fs_store = FileSystemPartsStore(config.object_cache_dir)
+        self.fs_store = FileSystemPartsStore(getattr(config, "object_cache_dir", "/var/lib/hippius/object_cache"))
+        self.blobs_repo = BlobsRepository(self.db)
 
     class _ConnCtx:
         def __init__(self, conn: Any):
@@ -97,16 +102,37 @@ class Uploader:
             return acquire()
         return Uploader._ConnCtx(self.db)
 
-    async def process_upload(self, payload: UploadChainRequest) -> List[str]:
+    async def process_upload(self, payload: BaseUploadRequest) -> List[str]:
         start_time = time.time()
-        logger.info(f"Processing upload object_id={payload.object_id} chunks={len(payload.chunks)}")
+        num_items = payload.get_items_count()
+        logger.info(
+            f"Processing upload object_id={payload.object_id} items={num_items} kind={getattr(payload, 'kind', 'data')}"
+        )
+
+        # Handle redundancy staged uploads
+        kind = str(getattr(payload, "kind", "data") or "data").lower()
+        if kind in ("replica", "parity"):
+            cids = await self._process_redundancy_upload(payload)
+            total_duration = time.time() - start_time
+            get_metrics_collector().record_uploader_operation(
+                main_account=payload.address,
+                success=True,
+                num_chunks=payload.get_items_count(),
+                duration=total_duration,
+            )
+            return cids
 
         chunk_start = time.time()
+        data_payload: DataUploadRequest = (
+            payload
+            if isinstance(payload, DataUploadRequest)
+            else DataUploadRequest.model_validate(payload.model_dump())
+        )
         chunk_cids = await self._upload_chunks(
             object_id=payload.object_id,
             object_key=payload.object_key,
-            chunks=payload.chunks,
-            upload_id=payload.upload_id,
+            chunks=data_payload.chunks,
+            upload_id=data_payload.upload_id,
             object_version=int(payload.object_version or 1),
         )
         chunk_duration = time.time() - chunk_start
@@ -140,11 +166,154 @@ class Uploader:
         get_metrics_collector().record_uploader_operation(
             main_account=payload.address,
             success=True,
-            num_chunks=len(payload.chunks),
+            num_chunks=len(data_payload.chunks),
             duration=total_duration,
         )
 
         return valid_cids
+
+    async def _process_redundancy_upload(self, payload: BaseUploadRequest) -> List[str]:
+        """Process staged redundancy uploads (replica/parity)."""
+        kind = str(getattr(payload, "kind", "data") or "data").lower()
+        staged = list(getattr(payload, "staged", []) or [])
+        if not staged:
+            return []
+
+        # Resolve part_id once
+        async with self._acquire_conn() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT p.part_id
+                  FROM parts p
+                 WHERE p.object_id = $1 AND p.object_version = $2 AND p.part_number = $3
+                 LIMIT 1
+                """,
+                payload.object_id,
+                int(payload.object_version or 1),
+                int(getattr(payload, "part_number", 0) or 1),
+            )
+        if not row:
+            logger.warning("uploader: redundancy part_id not found; skipping")
+            return []
+        part_id = str(row[0])
+        policy_version = int(getattr(payload, "policy_version", 1) or 1)
+
+        uploaded_cids: list[str] = []
+        max_replica_index = -1
+        replica_chunk_size: int | None = None
+        for item in staged:
+            data: Optional[bytes] = None
+            file_path = getattr(item, "file_path", None)
+            if isinstance(file_path, str) and file_path:
+                try:
+                    p = Path(file_path)
+                    if p.exists():
+                        data = p.read_bytes()
+                except Exception:
+                    logger.warning(f"uploader: failed to read staged file {file_path}")
+            if data is None:
+                redis_key = str(getattr(item, "redis_key", ""))
+                if redis_key:
+                    data = await self.redis_client.get(redis_key)
+            if not isinstance(data, (bytes, bytearray)):
+                logger.warning("uploader: staged item missing data; skipping")
+                continue
+            if kind == "replica" and replica_chunk_size is None:
+                try:
+                    replica_chunk_size = int(len(data))
+                except Exception:
+                    replica_chunk_size = None
+
+            # Insert blob ledger row (staged) prior to upload
+            try:
+                blob_rows = [
+                    BlobRow(
+                        kind=("replica" if kind == "replica" else "parity"),
+                        object_id=payload.object_id,
+                        object_version=int(getattr(payload, "object_version", 1) or 1),
+                        part_id=part_id,
+                        policy_version=policy_version,
+                        chunk_index=(int(getattr(item, "chunk_index", 0)) if kind == "replica" else None),
+                        stripe_index=(int(getattr(item, "stripe_index", 0)) if kind != "replica" else None),
+                        parity_index=(
+                            int(getattr(item, "replica_index", 0))
+                            if kind == "replica"
+                            else int(getattr(item, "parity_index", 0))
+                        ),
+                        fs_path=(str(file_path) if isinstance(file_path, str) and file_path else ""),
+                        size_bytes=int(len(data)),
+                    )
+                ]
+                blob_ids = await self.blobs_repo.insert_many(blob_rows)
+                blob_id = blob_ids[0] if blob_ids else None
+                if blob_id:
+                    await self.blobs_repo.claim_staged_by_id(blob_id)
+            except Exception:
+                # Non-fatal: continue upload path without ledger row
+                blob_id = None
+
+            res = await self.ipfs_service.upload_file(
+                file_data=bytes(data),
+                file_name=(Path(file_path).name if isinstance(file_path, str) and file_path else "redundancy.bin"),
+                content_type="application/octet-stream",
+                encrypt=False,
+            )
+            cid = str(res["cid"]) if isinstance(res, dict) else str(res)
+            uploaded_cids.append(cid)
+
+            # Mark uploaded in ledger and continue
+            try:
+                if blob_id:
+                    await self.blobs_repo.mark_uploaded(blob_id, cid)
+            except Exception:
+                pass
+
+            # Persist into part_parity_chunks
+            async with self._acquire_conn() as conn:
+                if kind == "replica":
+                    max_replica_index = max(max_replica_index, int(getattr(item, "replica_index", 0)))
+                    await conn.execute(
+                        """
+                        INSERT INTO part_parity_chunks (part_id, policy_version, stripe_index, parity_index, cid)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (part_id, policy_version, stripe_index, parity_index)
+                        DO UPDATE SET cid=EXCLUDED.cid
+                        """,
+                        part_id,
+                        policy_version,
+                        int(getattr(item, "chunk_index", 0)),
+                        int(getattr(item, "replica_index", 0)),
+                        cid,
+                    )
+                else:  # parity path (future)
+                    await conn.execute(
+                        """
+                        INSERT INTO part_parity_chunks (part_id, policy_version, stripe_index, parity_index, cid)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (part_id, policy_version, stripe_index, parity_index)
+                        DO UPDATE SET cid=EXCLUDED.cid
+                        """,
+                        part_id,
+                        policy_version,
+                        int(getattr(item, "stripe_index", 0)),
+                        int(getattr(item, "parity_index", 0)),
+                        cid,
+                    )
+
+        # Enqueue substrate pinning for redundancy CIDs
+        if uploaded_cids:
+            await enqueue_substrate_request(
+                SubstratePinningRequest(
+                    cids=uploaded_cids,
+                    address=payload.address,
+                    object_id=payload.object_id,
+                    object_version=int(payload.object_version or 1),
+                )
+            )
+
+        return uploaded_cids
+
+    # part_number is explicitly supplied in UploadChainRequest for redundancy
 
     async def _upload_chunks(
         self,
@@ -402,7 +571,7 @@ class Uploader:
             logger.info(f"Manifest uploaded object_id={object_id} cid={manifest_cid}")
             return manifest_cid
 
-    async def _push_to_dlq(self, payload: UploadChainRequest, last_error: str, error_type: str) -> None:
+    async def _push_to_dlq(self, payload: BaseUploadRequest, last_error: str, error_type: str) -> None:
         """Push a failed request to the Dead-Letter Queue."""
 
         etype = error_type
@@ -412,7 +581,7 @@ class Uploader:
         dlq_entry = {
             "payload": payload.model_dump(),
             "object_id": payload.object_id,
-            "upload_id": payload.upload_id,
+            "upload_id": getattr(payload, "upload_id", None),
             "bucket_name": payload.bucket_name,
             "object_key": payload.object_key,
             "attempts": payload.attempts or 0,
@@ -422,7 +591,7 @@ class Uploader:
             "error_type": etype,
         }
 
-        await self.redis_client.lpush("upload_requests:dlq", json.dumps(dlq_entry))
+        await enqueue_dlq_entry(json.dumps(dlq_entry))
         logger.warning(f"Pushed to DLQ: object_id={payload.object_id}, error_type={error_type}, error={last_error}")
 
         get_metrics_collector().record_uploader_operation(

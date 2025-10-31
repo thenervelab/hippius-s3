@@ -28,7 +28,9 @@ from hippius_s3.config import get_config
 from hippius_s3.dependencies import get_object_reader
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
-from hippius_s3.queue import UploadChainRequest
+from hippius_s3.queue import DataUploadRequest
+from hippius_s3.queue import RedundancyRequest
+from hippius_s3.queue import enqueue_ec_request
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.services.object_reader import ObjectReader
 from hippius_s3.utils import get_query
@@ -1063,7 +1065,7 @@ async def complete_multipart_upload(
             object_version,
         )
         await enqueue_upload_request(
-            UploadChainRequest(
+            DataUploadRequest(
                 address=request.state.account.id,
                 bucket_name=bucket_name,
                 object_key=object_key,
@@ -1076,8 +1078,50 @@ async def complete_multipart_upload(
                     for part in parts
                 ],
                 upload_id=upload_id,
+                kind="data",
             ),
         )
+
+        # Enqueue redundancy work per part (worker will decide strategy based on threshold)
+        cfg = get_config()
+        if bool(getattr(cfg, "ec_enabled", False)) and int(getattr(cfg, "target_storage_version", 3)) >= 4:
+            obj_cache = RedisObjectPartsCache(request.app.state.redis_client)
+            ec_enqueue_failures = 0
+            for p in parts:
+                try:
+                    pn = int(p["part_number"])  # DB returns part_number
+                    meta = await obj_cache.get_meta(str(object_id), int(object_version), pn)  # type: ignore[arg-type]
+                    if not isinstance(meta, dict):
+                        continue
+                    num_chunks = int(meta.get("num_chunks", 0))
+                    if num_chunks <= 0:
+                        continue
+                    await enqueue_ec_request(
+                        RedundancyRequest(
+                            object_id=str(object_id),
+                            object_version=int(object_version),
+                            part_number=int(pn),
+                            policy_version=int(getattr(cfg, "ec_policy_version", 1)),
+                            bucket_name=bucket_name,
+                            address=request.state.account.main_account,
+                            num_chunks=int(num_chunks),
+                            part_size_bytes=int(meta.get("size_bytes", 0)),
+                        ),
+                        None,
+                    )
+                except Exception as e:
+                    # Best-effort; log per-part failures but continue
+                    ec_enqueue_failures += 1
+                    logger.debug(
+                        f"Failed to enqueue EC request for part part_number={p.get('part_number')} "
+                        f"object_id={object_id} object_version={object_version}: {e}",
+                        exc_info=True,
+                    )
+            if ec_enqueue_failures > 0:
+                logger.warning(
+                    f"EC enqueue failures: {ec_enqueue_failures}/{len(parts)} parts "
+                    f"object_id={object_id} object_version={object_version}"
+                )
 
         # Create XML response
         xml_bytes = f"""<?xml version="1.0" encoding="UTF-8"?>

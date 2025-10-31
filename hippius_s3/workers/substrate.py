@@ -17,6 +17,7 @@ from substrateinterface.exceptions import SubstrateRequestException
 
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import SubstratePinningRequest
+from hippius_s3.repositories.blobs import BlobsRepository
 
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ class SubstrateWorker:
         self.config = config
         self.substrate: Any = None
         self.keypair: Any = None
+        self.blobs_repo = BlobsRepository(self.db)
 
     def connect(self) -> None:
         if self.substrate:
@@ -210,6 +212,18 @@ class SubstrateWorker:
                     int(getattr(req, "object_version", 1) or 1),
                 )
                 logger.info(f"Ensured object status is 'uploaded' object_id={req.object_id}")
+
+                # Mark blobs pinned for these cids and maybe complete EC/replication
+                try:
+                    await self.blobs_repo.mark_pinned_by_cids(req.cids)
+                    refs = await self.blobs_repo.get_part_refs_for_cids(req.cids)
+                    for part_id, policy_version, kind in refs:
+                        if kind in ("replica", "parity"):
+                            with contextlib.suppress(Exception):
+                                await self.blobs_repo.maybe_mark_complete(part_id, int(policy_version), kind)
+                except Exception:
+                    # Best-effort; substrate publishing should not fail due to ledger updates
+                    pass
 
                 # Clean up FS parts after successful pin submission
                 try:

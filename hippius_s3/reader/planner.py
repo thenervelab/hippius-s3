@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import logging
 from typing import Any
 from typing import Iterable
 from typing import List
@@ -7,6 +9,9 @@ from typing import List
 from .db_meta import read_part_plain_and_chunk_size
 from .types import ChunkPlanItem
 from .types import RangeRequest
+
+
+logger = logging.getLogger(__name__)
 
 
 async def build_chunk_plan(
@@ -26,6 +31,8 @@ async def build_chunk_plan(
         pn = int(p.get("part_number", 0))
         ps, cs = await read_part_plain_and_chunk_size(db, object_id, pn, int(object_version))
         sizes.append((pn, ps, cs))
+    with contextlib.suppress(Exception):
+        logger.debug("PLAN sizes: %s", sizes)
 
     offsets: dict[int, int] = {}
     acc = 0

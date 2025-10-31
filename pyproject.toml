@@ -65,6 +65,9 @@ dev = [
     "psycopg[binary]>=3.1",
     "fakeredis>=2.23.0",
 ]
+ec = [
+    "pyeclib>=1.7.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["hippius_s3"]
