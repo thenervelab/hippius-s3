@@ -59,7 +59,8 @@ def _start_ec_test_http_server() -> None:
         logger.warning("Invalid HIPPIUS_EC_TEST_HTTP_PORT: %s", port_val)
         return
 
-    from http.server import BaseHTTPRequestHandler, HTTPServer  # lazy import
+    from http.server import BaseHTTPRequestHandler  # lazy import
+    from http.server import HTTPServer  # lazy import
 
     from pyeclib.ec_iface import ECDriver  # type: ignore
 
