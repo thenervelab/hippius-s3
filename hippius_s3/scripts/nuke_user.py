@@ -252,8 +252,8 @@ async def main_async(args: argparse.Namespace) -> int:
             output_file = f"{args.address}_cids.json"
             output_data = {args.address: cids}
 
-            with aiofiles.open(output_file, "w") as f:
-                json.dump(output_data, f, indent=2)
+            async with aiofiles.open(output_file, "w") as f:
+                await f.write(json.dumps(output_data, indent=2))
 
             log.info(f"CID list written to: {output_file}")
             return 0
