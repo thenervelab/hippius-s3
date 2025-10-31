@@ -1,18 +1,26 @@
-import json
 from typing import Any
-from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
 
 from hippius_s3.queue import UnpinChainRequest
+from hippius_s3.workers.unpinner import UnpinnerWorker
+
+
+class MockConfig:
+    substrate_url = "ws://localhost:9944"
+    resubmission_seed_phrase = "test seed phrase here"
+    ipfs_store_url = "http://ipfs:5001"
+    substrate_retry_base_ms = 500
+    substrate_retry_max_ms = 5000
+    substrate_max_retries = 3
+    substrate_call_timeout_seconds = 20.0
 
 
 @pytest.mark.asyncio
-async def test_unpinner_worker_manifest_structure() -> None:
-    """Test that unpinner creates correct manifest structure for IPFS."""
-    fake_cids = ["bafytest111", "bafytest222", "bafytest333"]
+async def test_unpinner_worker_batch_call_params() -> None:
+    fake_cids = ["bafytest111", "bafytest222"]
     user_address = "5TestUserAddress789"
 
     unpin_requests = [
@@ -25,83 +33,131 @@ async def test_unpinner_worker_manifest_structure() -> None:
         for cid in fake_cids
     ]
 
-    captured_manifest: list[dict[str, str]] | None = None
-    captured_cancel_cid: str | None = None
+    manifest_cid = "bafymanifest999"
+    manifest_cids = {user_address: manifest_cid}
 
-    async def mock_httpx_post(url: str, files: dict[str, Any] | None = None, **_: Any) -> AsyncMock:
-        nonlocal captured_manifest
+    captured_compose_calls: list[dict[str, Any]] = []
 
-        mock_response = AsyncMock()
-        mock_response.status_code = 200
-        mock_response.url = url
+    def capturing_compose_call(call_module: str, call_function: str, call_params: dict[str, Any]) -> Any:
+        captured_compose_calls.append(
+            {
+                "module": call_module,
+                "function": call_function,
+                "params": call_params,
+            }
+        )
+        return MagicMock()
 
-        if "/api/v0/add" in url and files:
-            file_tuple = files["file"]
-            file_data = file_tuple[1]
-            manifest_json = file_data.decode("utf-8") if isinstance(file_data, bytes) else file_data
-            captured_manifest = json.loads(manifest_json)
-            mock_response.text = '{"Hash":"bafymanifest123456789"}\n'
-        elif "/api/v0/pin/add" in url:
-            mock_response.text = '{"Pins":["bafymanifest123456789"]}'
-        elif "/api/v0/pin/rm" in url:
-            mock_response.text = '{"Pins":["removed_cid"]}'
-        else:
-            mock_response.text = "{}"
+    config = MockConfig()
 
-        mock_response.raise_for_status = lambda: None
-        return mock_response
+    worker = UnpinnerWorker(config)
 
-    async def mock_cancel_storage_request(cid: str, seed_phrase: str) -> str:
-        nonlocal captured_cancel_cid
-        captured_cancel_cid = cid
-        return "0xtest_transaction_hash"
+    def mock_connect() -> None:
+        mock_substrate = MagicMock()
+        mock_substrate.compose_call = capturing_compose_call
+        mock_substrate.create_signed_extrinsic = MagicMock(return_value=MagicMock())
+        worker.substrate = mock_substrate
+        worker.keypair = MagicMock()
 
-    mock_substrate_client = MagicMock()
-    mock_substrate_client.cancel_storage_request = mock_cancel_storage_request
+    async def mock_submit_extrinsic(
+        extrinsic: Any,
+        max_retries: int = 3,
+        timeout_seconds: float = 20.0,
+    ) -> Any:
+        mock_receipt = MagicMock()
+        mock_receipt.is_success = True
+        mock_receipt.extrinsic_hash = "0xtest789"
+        return mock_receipt
 
-    with patch("httpx.AsyncClient") as mock_client_class:
-        mock_client_instance = AsyncMock()
-        mock_client_instance.post = mock_httpx_post
-        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
-        mock_client_instance.__aexit__ = AsyncMock(return_value=None)
-        mock_client_class.return_value = mock_client_instance
+    with patch.object(worker, "_submit_extrinsic_with_retry", side_effect=mock_submit_extrinsic):  # noqa: SIM117
+        with patch.object(worker, "connect", side_effect=mock_connect):
+            await worker.process_batch(unpin_requests, manifest_cids)
 
-        with patch("workers.run_unpinner_in_loop.SubstrateClient", return_value=mock_substrate_client):
-            from workers.run_unpinner_in_loop import process_unpin_batch
+    unpin_calls = [c for c in captured_compose_calls if c["function"] == "storage_unpin_request"]
+    batch_calls = [c for c in captured_compose_calls if c["function"] == "batch"]
 
-            success = await process_unpin_batch(unpin_requests, 1, 1)
-            assert success, "process_unpin_batch should return True"
+    assert len(unpin_calls) >= 1, "Should have at least one unpin request call"
+    assert len(batch_calls) == 1, "Should have exactly one batch call"
 
-    assert captured_manifest is not None, "Manifest was not captured"
-    assert len(captured_manifest) == len(fake_cids), f"Manifest should have {len(fake_cids)} entries"
+    unpin_call = unpin_calls[0]
+    assert unpin_call["module"] == "Marketplace"
 
-    for i, entry in enumerate(captured_manifest):
-        assert "cid" in entry, "Manifest entry must have 'cid' field"
-        assert "filename" in entry, "Manifest entry must have 'filename' field"
+    params = unpin_call["params"]
+    assert "file_hash" in params, "Unpin request must have 'file_hash' param"
+    assert params["file_hash"] == manifest_cid, f"file_hash should be {manifest_cid}"
 
-        cid = entry["cid"]
-        filename = entry["filename"]
-
-        assert cid == fake_cids[i], f"CID should match: expected {fake_cids[i]}, got {cid}"
-        assert filename == f"s3-{cid}", f"Filename should be 's3-{{cid}}', got {filename}"
-
-    assert captured_cancel_cid == "bafymanifest123456789", "cancel_storage_request should be called with manifest CID"
+    batch_call = batch_calls[0]
+    assert batch_call["module"] == "Utility"
+    assert "calls" in batch_call["params"], "Batch call must have 'calls' param"
 
 
 @pytest.mark.asyncio
-async def test_unpinner_worker_handles_empty_cids() -> None:
-    """Test that unpinner handles requests with empty CIDs gracefully."""
+async def test_unpinner_worker_multiple_users_batching() -> None:
+    user1_address = "5TestUser1"
+    user2_address = "5TestUser2"
+
     unpin_requests = [
         UnpinChainRequest(
-            address="5TestUser",
-            object_id="test-obj-empty",
+            address=user1_address,
+            object_id="obj1",
             object_version=1,
-            cid="",
-        )
+            cid="bafytest1",
+        ),
+        UnpinChainRequest(
+            address=user2_address,
+            object_id="obj2",
+            object_version=1,
+            cid="bafytest2",
+        ),
     ]
 
-    with patch("workers.run_unpinner_in_loop.SubstrateClient"):
-        from workers.run_unpinner_in_loop import process_unpin_batch
+    manifest_cids = {
+        user1_address: "bafymanifest111",
+        user2_address: "bafymanifest222",
+    }
 
-        success = await process_unpin_batch(unpin_requests, 1, 1)
-        assert success, "Should handle empty CIDs gracefully and return True"
+    captured_compose_calls: list[dict[str, Any]] = []
+
+    def capturing_compose_call(call_module: str, call_function: str, call_params: dict[str, Any]) -> Any:
+        captured_compose_calls.append(
+            {
+                "module": call_module,
+                "function": call_function,
+                "params": call_params,
+            }
+        )
+        return MagicMock()
+
+    config = MockConfig()
+    worker = UnpinnerWorker(config)
+
+    def mock_connect() -> None:
+        mock_substrate = MagicMock()
+        mock_substrate.compose_call = capturing_compose_call
+        mock_substrate.create_signed_extrinsic = MagicMock(return_value=MagicMock())
+        worker.substrate = mock_substrate
+        worker.keypair = MagicMock()
+
+    async def mock_submit_extrinsic(
+        extrinsic: Any,
+        max_retries: int = 3,
+        timeout_seconds: float = 20.0,
+    ) -> Any:
+        mock_receipt = MagicMock()
+        mock_receipt.is_success = True
+        mock_receipt.extrinsic_hash = "0xtest_multi"
+        return mock_receipt
+
+    with patch.object(worker, "_submit_extrinsic_with_retry", side_effect=mock_submit_extrinsic):  # noqa: SIM117
+        with patch.object(worker, "connect", side_effect=mock_connect):
+            await worker.process_batch(unpin_requests, manifest_cids)
+
+    unpin_calls = [c for c in captured_compose_calls if c["function"] == "storage_unpin_request"]
+    batch_calls = [c for c in captured_compose_calls if c["function"] == "batch"]
+
+    assert len(unpin_calls) == 2, "Should have two unpin calls (one per user)"
+    assert len(batch_calls) == 1, "Should have exactly one batch call"
+
+    manifest_hashes = [call["params"]["file_hash"] for call in unpin_calls]
+    assert "bafymanifest111" in manifest_hashes, "Should include manifest for user1"
+    assert "bafymanifest222" in manifest_hashes, "Should include manifest for user2"

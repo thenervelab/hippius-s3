@@ -6,23 +6,24 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Dict
+from typing import List
 
 import aiofiles
 import httpx
 import redis.asyncio as async_redis
-from hippius_sdk.substrate import SubstrateClient
 
 
-# Add parent directory to path to import hippius_s3 modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
-from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import dequeue_unpin_request
+from hippius_s3.queue import enqueue_unpin_request
 from hippius_s3.redis_utils import with_redis_retry
+from hippius_s3.workers.unpinner import UnpinnerWorker
 
 
 config = get_config()
@@ -30,41 +31,34 @@ config = get_config()
 setup_loki_logging(config, "unpinner")
 logger = logging.getLogger(__name__)
 
+EPOCH_SLEEP_SECONDS = 60
 
-async def process_unpin_batch(batch_requests: list[UnpinChainRequest], batch_num: int, total_batches: int) -> bool:
-    """Process a single batch of unpin requests (up to 1000 CIDs)."""
-    start_time = time.time()
+
+async def create_and_upload_manifest(user_address: str, batch_requests: List[UnpinChainRequest]) -> str:
     manifest_objects = []
-    user_address = None
 
     for req in batch_requests:
         if not req.cid:
             continue
-        user_address = req.address
         file_name = f"s3-{req.cid}"
-
         manifest_objects.append(
             {
                 "cid": req.cid,
                 "filename": file_name,
             },
         )
-        logger.debug(f"Added to unpin manifest batch {batch_num}/{total_batches}: {req.address=} {file_name=} {req.cid=}")
 
-    # Check if we have any objects to unpin
     if not manifest_objects:
-        logger.info(f"Batch {batch_num}/{total_batches}: No objects to unpin (all requests had empty CIDs)")
-        return True
+        logger.warning(f"No objects to unpin for user {user_address} (all requests had empty CIDs)")
+        raise ValueError("No valid CIDs in batch")
 
-    logger.info(f"Processing batch {batch_num}/{total_batches} with {len(manifest_objects)} CIDs")
+    logger.info(f"Creating manifest for user {user_address} with {len(manifest_objects)} CIDs")
 
-    # Create manifest JSON file
     manifest_data = json.dumps(
         manifest_objects,
         indent=2,
     )
 
-    # Create temporary file with manifest
     with tempfile.NamedTemporaryFile(
         mode="w",
         suffix=".json",
@@ -73,35 +67,26 @@ async def process_unpin_batch(batch_requests: list[UnpinChainRequest], batch_num
         temp_file.write(manifest_data)
         temp_path = temp_file.name
 
-    # Upload manifest to IPFS using httpx with proper redirect handling
     async with httpx.AsyncClient(
         timeout=300.0,
         follow_redirects=True,
     ) as client:
-        # Read manifest data
         async with aiofiles.open(temp_path, "rb") as f:
             file_data = await f.read()
 
-        # Ensure we're using HTTPS and the correct endpoint
         base_url = config.ipfs_store_url.rstrip("/")
-
         upload_url = f"{base_url}/api/v0/add?wrap-with-directory=false&cid-version=1"
         logger.info(f"Uploading manifest to: {upload_url}")
 
-        # Prepare multipart form data
         files = {"file": ("manifest.json", file_data, "application/json")}
-
-        # Use POST with proper redirect handling that maintains method
         response = await client.post(upload_url, files=files)
 
         logger.info(f"Upload response: {response.status_code} from {response.url}")
         response.raise_for_status()
 
-        # Parse IPFS response (newline-delimited JSON)
         response_text = response.text
         logger.debug(f"IPFS response: {response_text}")
 
-        # Handle newline-delimited JSON response from IPFS
         for line in response_text.strip().split("\n"):
             if line.strip():
                 result = json.loads(line)
@@ -111,74 +96,31 @@ async def process_unpin_batch(batch_requests: list[UnpinChainRequest], batch_num
         else:
             raise Exception(f"No valid CID found in IPFS response: {response_text}")
 
-    logger.info(f"Batch {batch_num}/{total_batches}: Uploaded manifest to IPFS with CID: {manifest_cid}")
+    logger.info(f"Uploaded manifest for user {user_address} to IPFS with CID: {manifest_cid}")
 
-    # Pin the manifest to local IPFS node
     async with httpx.AsyncClient(timeout=30.0) as client:
         pin_url = f"{base_url}/api/v0/pin/add?arg={manifest_cid}"
         logger.debug(f"Pinning manifest to local IPFS: {pin_url}")
         pin_response = await client.post(pin_url)
         pin_response.raise_for_status()
-        logger.info(f"Batch {batch_num}/{total_batches}: Pinned manifest to local IPFS node: {manifest_cid}")
+        logger.info(f"Pinned manifest to local IPFS node: {manifest_cid}")
 
-    # Unpin the original CIDs from the IPFS store node
     async with httpx.AsyncClient(timeout=30.0) as client:
         for req in batch_requests:
             if not req.cid:
                 continue
-            try:
-                unpin_url = f"{base_url}/api/v0/pin/rm?arg={req.cid}"
-                logger.debug(f"Unpinning CID from IPFS store: {req.cid}")
-                unpin_response = await client.post(unpin_url)
-                unpin_response.raise_for_status()
-                logger.debug(f"Successfully unpinned CID from IPFS store: {req.cid}")
-            except Exception as e:
-                logger.warning(f"Failed to unpin CID {req.cid} from IPFS store: {e}")
+            unpin_url = f"{base_url}/api/v0/pin/rm?arg={req.cid}"
+            logger.debug(f"Unpinning CID from IPFS store: {req.cid}")
+            unpin_response = await client.post(unpin_url)
+            unpin_response.raise_for_status()
+            logger.debug(f"Successfully unpinned CID from IPFS store: {req.cid}")
 
-    # Clean up temp file
     Path(temp_path).unlink(missing_ok=True)
 
-    # Submit manifest CID to substrate for cancellation
-    seed_phrase = config.resubmission_seed_phrase
-    logger.info(f"Initializing SubstrateClient with seed_phrase: {'[PRESENT]' if seed_phrase else '[MISSING]'}")
-    if not seed_phrase:
-        logger.error("No seed phrase available for SubstrateClient initialization")
-        return False
-
-    substrate_client = SubstrateClient(
-        seed_phrase=seed_phrase,
-        url=config.substrate_url,
-    )
-
-    tx_hash = await substrate_client.cancel_storage_request(
-        cid=manifest_cid,
-        seed_phrase=seed_phrase,
-    )
-
-    logger.debug(f"Substrate call result for manifest {manifest_cid}: {tx_hash}")
-
-    # Check if we got a valid transaction hash
-    if not tx_hash or tx_hash == "0x" or len(tx_hash) < 10:
-        logger.error(f"Batch {batch_num}/{total_batches}: Invalid transaction hash received for manifest {manifest_cid}: {tx_hash}")
-        return False
-
-    logger.info(f"Batch {batch_num}/{total_batches}: Successfully submitted unpin manifest {manifest_cid} with transaction: {tx_hash}")
-    logger.info(f"Batch {batch_num}/{total_batches}: Unpinned {len(manifest_objects)} files")
-
-    if user_address:
-        duration = time.time() - start_time
-        get_metrics_collector().record_unpinner_operation(
-            main_account=user_address,
-            success=True,
-            num_files=len(manifest_objects),
-            duration=duration,
-        )
-
-    return True
+    return manifest_cid
 
 
 async def run_unpinner_loop() -> None:
-    """Main loop that monitors the Redis queue and processes unpin requests."""
     redis_client = async_redis.from_url(config.redis_url)
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
 
@@ -193,10 +135,11 @@ async def run_unpinner_loop() -> None:
     logger.info(f"Redis URL: {config.redis_url}")
     logger.info(f"Redis Queues URL: {config.redis_queues_url}")
 
-    batch_size = 10000
-    user_unpin_requests: dict[str, list[UnpinChainRequest]] = {}
+    unpinner_worker = UnpinnerWorker(config)
 
-    try:
+    while True:
+        requests = []
+
         while True:
             unpin_request, redis_queues_client = await with_redis_retry(
                 lambda rc: dequeue_unpin_request(),
@@ -206,51 +149,64 @@ async def run_unpinner_loop() -> None:
             )
 
             if unpin_request:
-                try:
-                    user_unpin_requests[unpin_request.address].append(unpin_request)
-                except KeyError:
-                    user_unpin_requests[unpin_request.address] = [unpin_request]
-
-                for user in list(user_unpin_requests.keys()):
-                    if len(user_unpin_requests[user]) >= batch_size:
-                        batch_to_process = user_unpin_requests[user][:batch_size]
-                        user_unpin_requests[user] = user_unpin_requests[user][batch_size:]
-
-                        logger.info(f"Processing batch of {len(batch_to_process)} CIDs for user {user}")
-                        try:
-                            success = await process_unpin_batch(batch_to_process, 1, 1)
-                            if not success:
-                                logger.warning(f"Batch processing failed for user {user}")
-                        except Exception as e:
-                            logger.error(f"Exception processing batch for user {user}: {e}", exc_info=True)
-
-                        if not user_unpin_requests[user]:
-                            user_unpin_requests.pop(user)
-
+                requests.append(unpin_request)
             else:
-                for user in list(user_unpin_requests.keys()):
-                    if user_unpin_requests[user]:
-                        logger.info(f"Processing remaining {len(user_unpin_requests[user])} CIDs for user {user}")
-                        try:
-                            success = await process_unpin_batch(user_unpin_requests[user], 1, 1)
-                            if success:
-                                logger.info(f"SUCCESSFULLY processed remaining requests for user {user}")
-                                user_unpin_requests.pop(user)
-                            else:
-                                logger.warning(f"Some unpins failed for user {user}, will retry later")
-                        except Exception as e:
-                            logger.error(f"Exception processing remaining batch for user {user}: {e}", exc_info=True)
+                break
 
-                await asyncio.sleep(config.unpinner_sleep_loop)
+        if not requests:
+            logger.info("No unpin requests in queue, sleeping 10s...")
+            await asyncio.sleep(10)
+            continue
 
-    except KeyboardInterrupt:
-        logger.info("Unpinner service stopping...")
-    except Exception as e:
-        logger.error(f"Fatal error in unpinner loop: {e}", exc_info=True)
-        logger.info("Unpinner will restart...")
-    finally:
-        await redis_client.aclose()  # type: ignore[attr-defined]
-        await redis_queues_client.aclose()  # type: ignore[attr-defined]
+        logger.info(f"Collected {len(requests)} unpin requests from queue")
+
+        user_request_map: Dict[str, List[UnpinChainRequest]] = {}
+        for req in requests:
+            if req.address not in user_request_map:
+                user_request_map[req.address] = []
+            user_request_map[req.address].append(req)
+
+        manifest_cids: Dict[str, str] = {}
+        failed_users = []
+
+        for user_addr, user_requests in user_request_map.items():
+            try:
+                manifest_cid = await create_and_upload_manifest(user_addr, user_requests)
+                manifest_cids[user_addr] = manifest_cid
+                logger.info(f"Created manifest for user {user_addr}: {manifest_cid}")
+            except Exception as e:
+                logger.error(f"Failed to create manifest for user {user_addr}: {e}", exc_info=True)
+                failed_users.append(user_addr)
+
+        if not manifest_cids:
+            logger.warning("No manifests created, requeuing all requests")
+            for req in requests:
+                await enqueue_unpin_request(req)
+            logger.info(f"Sleeping {EPOCH_SLEEP_SECONDS}s until next epoch...")
+            await asyncio.sleep(EPOCH_SLEEP_SECONDS)
+            continue
+
+        if failed_users:
+            logger.warning(f"Failed to create manifests for {len(failed_users)} users, requeuing their requests")
+            for user_addr in failed_users:
+                for req in user_request_map[user_addr]:
+                    await enqueue_unpin_request(req)
+
+        successful_requests = [
+            req for req in requests if req.address not in failed_users
+        ]
+
+        try:
+            await unpinner_worker.process_batch(successful_requests, manifest_cids)
+            logger.info(f"Successfully submitted batch of {len(manifest_cids)} unpin manifests")
+        except Exception:
+            logger.exception(f"Unpinner batch submission failed for {len(manifest_cids)} manifests")
+            for req in successful_requests:
+                await enqueue_unpin_request(req)
+            logger.info(f"Requeued {len(successful_requests)} failed requests")
+        finally:
+            logger.info(f"Sleeping {EPOCH_SLEEP_SECONDS}s until next epoch...")
+            await asyncio.sleep(EPOCH_SLEEP_SECONDS)
 
 
 if __name__ == "__main__":
