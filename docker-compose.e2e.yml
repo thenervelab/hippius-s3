@@ -178,7 +178,13 @@ services:
 
   ipfs:
     image: ipfs/kubo:latest
-    # No host port bindings needed for CI; services use internal DNS
+    ports:
+      - "4001:4001" # IPFS swarm port
+      - "5001:5001" # IPFS API port
+      - "8080:8080" # IPFS gateway port
+    volumes:
+      - ipfs_data:/data/ipfs
+    restart: unless-stopped
     environment:
       - IPFS_PROFILE=server
     healthcheck:
@@ -250,6 +256,9 @@ services:
       timeout: 3s
     networks:
       - hippius_net
+
+volumes:
+  ipfs_data:
 
 networks:
   hippius_net:
