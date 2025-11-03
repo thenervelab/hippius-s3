@@ -43,7 +43,7 @@ groups:
                     type: gt
                   type: query
               refId: C
-        noDataState: NoData
+        noDataState: OK
         execErrState: Error
         for: 3m
         annotations:
@@ -52,8 +52,8 @@ groups:
         labels:
           severity: critical
 
-      - uid: response-time-degradation
-        title: Response Time Degradation
+      - uid: queue-backup-critical
+        title: Queue Backup Critical
         condition: C
         data:
           - refId: A
@@ -62,53 +62,7 @@ groups:
               to: 0
             datasourceUid: PBFA97CFB590B2093
             model:
-              expr: 'histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job="otel-collector"}[5m]))'
-              refId: A
-          - refId: B
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: __expr__
-            model:
-              type: reduce
-              expression: A
-              reducer: last
-              refId: B
-          - refId: C
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: __expr__
-            model:
-              type: threshold
-              expression: B
-              conditions:
-                - evaluator:
-                    params:
-                      - 5
-                    type: gt
-                  type: query
-              refId: C
-        noDataState: NoData
-        execErrState: Error
-        for: 5m
-        annotations:
-          description: 'P95 response time is {{ if $values.B }}{{ printf "%.2f" $values.B.Value }}{{ else }}N/A{{ end }}s (threshold: 5s)'
-          summary: API response times are degraded
-        labels:
-          severity: critical
-
-      - uid: data-transfer-anomaly
-        title: Data Transfer Rate Collapse
-        condition: C
-        data:
-          - refId: A
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: PBFA97CFB590B2093
-            model:
-              expr: 'rate(s3_bytes_uploaded_total{job="otel-collector"}[5m]) + rate(s3_bytes_downloaded_total{job="otel-collector"}[5m])'
+              expr: 'max(hippius_queue_length{queue_name=~"upload_requests|substrate_requests"})'
               refId: A
           - refId: B
             relativeTimeRange:
@@ -132,241 +86,6 @@ groups:
                 - evaluator:
                     params:
                       - 1000
-                    type: lt
-                  type: query
-              refId: C
-        noDataState: NoData
-        execErrState: Error
-        for: 10m
-        annotations:
-          description: 'Data transfer rate dropped to {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} bytes/sec'
-          summary: Data transfer rate has collapsed
-        labels:
-          severity: critical
-
-      - uid: backup-missing
-        title: Database Backup Missing
-        condition: C
-        data:
-          - refId: A
-            relativeTimeRange:
-              from: 93600
-              to: 0
-            datasourceUid: PBFA97CFB590B2093
-            model:
-              expr: 'time() - backup_last_success_timestamp{job="otel-collector"}'
-              refId: A
-          - refId: B
-            relativeTimeRange:
-              from: 93600
-              to: 0
-            datasourceUid: __expr__
-            model:
-              type: reduce
-              expression: A
-              reducer: last
-              refId: B
-          - refId: C
-            relativeTimeRange:
-              from: 93600
-              to: 0
-            datasourceUid: __expr__
-            model:
-              type: threshold
-              expression: B
-              conditions:
-                - evaluator:
-                    params:
-                      - 93600
-                    type: gt
-                  type: query
-              refId: C
-        noDataState: Alerting
-        execErrState: Error
-        for: 10m
-        annotations:
-          description: 'Last successful backup was {{ if $values.B }}{{ printf "%.1f" (div $values.B.Value 3600) }}{{ else }}N/A{{ end }} hours ago (threshold: 26 hours)'
-          summary: Database backup has not run successfully in over 26 hours
-        labels:
-          severity: critical
-
-      - uid: backup-failure
-        title: Database Backup Failure
-        condition: C
-        data:
-          - refId: A
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: PBFA97CFB590B2093
-            model:
-              expr: 'sum(rate(backup_cycles_total{job="otel-collector",success="false"}[5m])) * 300'
-              refId: A
-          - refId: B
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: __expr__
-            model:
-              type: reduce
-              expression: A
-              reducer: last
-              refId: B
-          - refId: C
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: __expr__
-            model:
-              type: threshold
-              expression: B
-              conditions:
-                - evaluator:
-                    params:
-                      - 0
-                    type: gt
-                  type: query
-              refId: C
-        noDataState: NoData
-        execErrState: Error
-        for: 5m
-        annotations:
-          description: 'Database backup cycle failed'
-          summary: One or more database backups have failed
-        labels:
-          severity: critical
-
-  - orgId: 1
-    name: hippius-s3-high-priority
-    folder: Hippius S3 Alerts
-    interval: 1m
-    rules:
-      - uid: upload-queue-backup
-        title: Upload Queue Backup
-        condition: C
-        data:
-          - refId: A
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: PBFA97CFB590B2093
-            model:
-              expr: 'hippius_queue_length{queue_name="upload_requests"}'
-              refId: A
-          - refId: B
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: __expr__
-            model:
-              type: reduce
-              expression: A
-              reducer: last
-              refId: B
-          - refId: C
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: __expr__
-            model:
-              type: threshold
-              expression: B
-              conditions:
-                - evaluator:
-                    params:
-                      - 1000
-                    type: gt
-                  type: query
-              refId: C
-        noDataState: NoData
-        execErrState: Error
-        for: 5m
-        annotations:
-          description: 'Upload queue has {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} items (threshold: 1000)'
-          summary: Upload processing is falling behind
-        labels:
-          severity: critical
-
-      - uid: substrate-queue-backup
-        title: Substrate Queue Backup
-        condition: C
-        data:
-          - refId: A
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: PBFA97CFB590B2093
-            model:
-              expr: 'hippius_queue_length{queue_name="substrate_requests"}'
-              refId: A
-          - refId: B
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: __expr__
-            model:
-              type: reduce
-              expression: A
-              reducer: last
-              refId: B
-          - refId: C
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: __expr__
-            model:
-              type: threshold
-              expression: B
-              conditions:
-                - evaluator:
-                    params:
-                      - 500
-                    type: gt
-                  type: query
-              refId: C
-        noDataState: NoData
-        execErrState: Error
-        for: 5m
-        annotations:
-          description: 'Substrate queue has {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} items (threshold: 500)'
-          summary: Blockchain publishing is falling behind
-        labels:
-          severity: critical
-
-      - uid: high-error-rate
-        title: High Error Rate
-        condition: C
-        data:
-          - refId: A
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: PBFA97CFB590B2093
-            model:
-              expr: '(sum(rate(http_requests_total{job="otel-collector"}[5m])) * 60 > 10) and ((sum(rate(s3_errors_total{job="otel-collector"}[5m])) or vector(0)) / (sum(rate(http_requests_total{job="otel-collector"}[5m])) + 0.0001) * 100)'
-              refId: A
-          - refId: B
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: __expr__
-            model:
-              type: reduce
-              expression: A
-              reducer: last
-              refId: B
-          - refId: C
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: __expr__
-            model:
-              type: threshold
-              expression: B
-              conditions:
-                - evaluator:
-                    params:
-                      - 10
                     type: gt
                   type: query
               refId: C
@@ -374,8 +93,8 @@ groups:
         execErrState: Error
         for: 5m
         annotations:
-          description: 'Error rate is {{ if $values.B }}{{ printf "%.2f" $values.B.Value }}{{ else }}N/A{{ end }}% during active traffic (threshold: 10%)'
-          summary: S3 API error rate exceeds 10% during traffic
+          description: 'Queue has {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} items (threshold: 1000)'
+          summary: Upload or substrate queue is backing up
         labels:
           severity: critical
 
@@ -391,7 +110,7 @@ groups:
             model:
               expr: 'absent(up{job="otel-collector"})'
               refId: A
-        noDataState: Alerting
+        noDataState: OK
         execErrState: Error
         for: 5m
         annotations:
@@ -400,13 +119,8 @@ groups:
         labels:
           severity: critical
 
-  - orgId: 1
-    name: hippius-s3-high-priority
-    folder: Hippius S3 Alerts
-    interval: 1m
-    rules:
-      - uid: response-time-degradation
-        title: Response Time Degradation
+      - uid: consecutive-upload-failures
+        title: Consecutive Upload Failures
         condition: C
         data:
           - refId: A
@@ -415,7 +129,58 @@ groups:
               to: 0
             datasourceUid: PBFA97CFB590B2093
             model:
-              expr: '(sum(rate(http_requests_total{job="otel-collector"}[5m])) * 60 > 10) and (histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job="otel-collector"}[5m])))'
+              expr: 'increase(s3_errors_total{job="otel-collector",operation="put_object"}[5m])'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 3
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        annotations:
+          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} upload failures in last 5 minutes'
+          summary: Multiple upload failures detected - users impacted
+        labels:
+          severity: critical
+
+  - orgId: 1
+    name: hippius-s3-high-priority
+    folder: Hippius S3 Alerts
+    interval: 1m
+    rules:
+      - uid: high-error-rate-during-activity
+        title: High Error Rate During Activity
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: '((sum(increase(http_requests_total{job="otel-collector"}[5m])) or vector(0)) >= 5) and ((sum(increase(s3_errors_total{job="otel-collector"}[5m])) or vector(0)) / (sum(increase(http_requests_total{job="otel-collector"}[5m])) + 0.0001) * 100)'
               refId: A
           - refId: B
             relativeTimeRange:
@@ -446,13 +211,13 @@ groups:
         execErrState: Error
         for: 5m
         annotations:
-          description: 'P95 response time is {{ if $values.B }}{{ printf "%.2f" $values.B.Value }}{{ else }}N/A{{ end }}s during active traffic (threshold: 15s)'
-          summary: API response times are degraded
+          description: 'Error rate is {{ if $values.B }}{{ printf "%.2f" $values.B.Value }}{{ else }}N/A{{ end }}% during active traffic (threshold: 15%)'
+          summary: S3 API experiencing elevated errors during user activity
         labels:
           severity: high
 
-      - uid: substrate-submission-failures
-        title: Substrate Submission Failures
+      - uid: slow-response-time-during-activity
+        title: Slow Response Time During Activity
         condition: C
         data:
           - refId: A
@@ -461,7 +226,7 @@ groups:
               to: 0
             datasourceUid: PBFA97CFB590B2093
             model:
-              expr: '(sum(rate(substrate_requests_total{job="otel-collector"}[5m])) * 60 > 10) and ((sum(rate(substrate_requests_total{job="otel-collector",success="false"}[5m])) or vector(0)) / (sum(rate(substrate_requests_total{job="otel-collector"}[5m])) + 0.0001) * 100)'
+              expr: '((sum(increase(http_requests_total{job="otel-collector"}[5m])) or vector(0)) >= 5) and (histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job="otel-collector"}[5m])))'
               refId: A
           - refId: B
             relativeTimeRange:
@@ -484,7 +249,7 @@ groups:
               conditions:
                 - evaluator:
                     params:
-                      - 10
+                      - 30
                     type: gt
                   type: query
               refId: C
@@ -492,7 +257,7 @@ groups:
         execErrState: Error
         for: 5m
         annotations:
-          description: 'Substrate failure rate is {{ if $values.B }}{{ printf "%.2f" $values.B.Value }}{{ else }}N/A{{ end }}% during active traffic (threshold: 10%)'
-          summary: Blockchain integration experiencing failures
+          description: 'P95 response time is {{ if $values.B }}{{ printf "%.2f" $values.B.Value }}{{ else }}N/A{{ end }}s during active traffic (threshold: 30s)'
+          summary: API response times severely degraded during user activity
         labels:
           severity: high

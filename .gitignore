@@ -65,3 +65,6 @@ coverage.xml
 backup.git/
 artifacts/
 profiler_runs/
+
+# sql
+schema.sql
