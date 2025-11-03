@@ -7,56 +7,65 @@ services:
       context: .
       dockerfile: Dockerfile.base
 
-  api:
-    environment:
-      - HIPPIUS_ENVIRONMENT=production
-      - DEBUG=false
-      - UVICORN_LOG_LEVEL=info
-      - HIPPIUS_IPFS_GET_URL=http://192.168.1.173:8080
-      - HIPPIUS_IPFS_STORE_URL=http://192.168.1.173:5001
-
   db:
     shm_size: 2g
-    command: [
-      "postgres",
-      "-c", "max_connections=1000",
-      "-c", "shared_buffers=8GB",
-      "-c", "effective_cache_size=24GB",
-      "-c", "work_mem=64MB",
-      "-c", "maintenance_work_mem=2GB",
-      "-c", "checkpoint_completion_target=0.9",
-      "-c", "wal_buffers=64MB",
-      "-c", "default_statistics_target=500",
-      "-c", "random_page_cost=1.1",
-      "-c", "effective_io_concurrency=200",
-      "-c", "max_worker_processes=48",
-      "-c", "max_parallel_workers_per_gather=8",
-      "-c", "max_parallel_workers=24",
-      "-c", "max_parallel_maintenance_workers=8",
-      "-c", "wal_level=replica",
-      "-c", "max_wal_size=4GB",
-      "-c", "min_wal_size=1GB",
-      "-c", "checkpoint_timeout=15min"
-    ]
+    command:
+      [
+        "postgres",
+        "-c",
+        "max_connections=1000",
+        "-c",
+        "shared_buffers=8GB",
+        "-c",
+        "effective_cache_size=24GB",
+        "-c",
+        "work_mem=64MB",
+        "-c",
+        "maintenance_work_mem=2GB",
+        "-c",
+        "checkpoint_completion_target=0.9",
+        "-c",
+        "wal_buffers=64MB",
+        "-c",
+        "default_statistics_target=500",
+        "-c",
+        "random_page_cost=1.1",
+        "-c",
+        "effective_io_concurrency=200",
+        "-c",
+        "max_worker_processes=48",
+        "-c",
+        "max_parallel_workers_per_gather=8",
+        "-c",
+        "max_parallel_workers=24",
+        "-c",
+        "max_parallel_maintenance_workers=8",
+        "-c",
+        "wal_level=replica",
+        "-c",
+        "max_wal_size=4GB",
+        "-c",
+        "min_wal_size=1GB",
+        "-c",
+        "checkpoint_timeout=15min",
+      ]
 
   redis:
-    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--maxmemory", "200gb"]
+    command:
+      [
+        "redis-server",
+        "/usr/local/etc/redis/redis.conf",
+        "--maxmemory",
+        "200gb",
+      ]
     deploy:
       resources:
         limits:
-          cpus: '4'
+          cpus: "4"
 
   downloader:
     deploy:
       replicas: 1
-
-  ipfs:
-    volumes:
-      - /ipfs:/data/ipfs
-    environment:
-      - IPFS_PROFILE=server
-      - IPFS_FD_MAX=8192
-    user: "1000:1000"
 
 # Remove the ipfs_data volume since we're using host mount
 volumes:
