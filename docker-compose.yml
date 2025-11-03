@@ -18,8 +18,6 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      ipfs:
-        condition: service_started
       redis:
         condition: service_healthy
       redis-accounts:
@@ -57,25 +55,6 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
-    networks:
-      - hippius_net
-
-  ipfs:
-    image: ipfs/kubo:latest
-    ports:
-      - "4001:4001" # IPFS swarm port
-      - "5001:5001" # IPFS API port
-      - "8080:8080" # IPFS gateway port
-    volumes:
-      - ipfs_data:/data/ipfs
-    restart: unless-stopped
-    environment:
-      - IPFS_PROFILE=server
-    healthcheck:
-      test: ["CMD-SHELL", "ipfs id"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
     networks:
       - hippius_net
 
@@ -432,7 +411,6 @@ services:
 
 volumes:
   postgres_data:
-  ipfs_data:
   redis_data:
   redis_accounts_data:
   redis_chain_data:
