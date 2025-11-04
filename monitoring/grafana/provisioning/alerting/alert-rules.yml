@@ -129,7 +129,7 @@ groups:
               to: 0
             datasourceUid: PBFA97CFB590B2093
             model:
-              expr: 'increase(s3_errors_total{job="otel-collector",operation="put_object"}[5m])'
+              expr: 'increase(s3_errors_total{job="otel-collector",operation="put_object",error_type=~"http_5.*|internal_error|http_408"}[5m])'
               refId: A
           - refId: B
             relativeTimeRange:
@@ -160,8 +160,8 @@ groups:
         execErrState: Error
         for: 2m
         annotations:
-          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} upload failures in last 5 minutes'
-          summary: Multiple upload failures detected - users impacted
+          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} server errors during uploads in last 5 minutes (excludes auth failures)'
+          summary: Multiple upload server errors detected - users impacted
         labels:
           severity: critical
 
