@@ -76,6 +76,17 @@ jobs:
             docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.monitoring.yml down || true
             docker compose --profile build-base -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.monitoring.yml build --no-cache base
             docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.monitoring.yml build --no-cache
+
+            echo "Enabling alerting for production..."
+            if [ -d "monitoring/grafana/provisioning/alerting.disabled" ]; then
+              mv monitoring/grafana/provisioning/alerting.disabled monitoring/grafana/provisioning/alerting
+              echo "Alerting enabled"
+            elif [ -d "monitoring/grafana/provisioning/alerting" ]; then
+              echo "Alerting already enabled"
+            else
+              echo "Warning: No alerting directory found"
+            fi
+
             docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.monitoring.yml up -d
 
             echo "Waiting for database to be ready..."
