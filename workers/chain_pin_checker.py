@@ -44,11 +44,14 @@ async def get_user_cids_from_db(
 ) -> List[UserCidRecord]:
     """Get all CIDs for a user with their object metadata (object_id, object_version, cid).
 
+    Returns CIDs from all objects that have CIDs in the database, regardless of status.
+    This ensures objects stuck in intermediate states (publishing, pinning) can self-heal.
+
     Performance note: This query uses a 3-way UNION across object_versions, parts, and part_chunks.
     For optimal performance, ensure indexes exist on:
     - buckets(main_account_id)
     - objects(bucket_id, created_at)
-    - object_versions(object_id, object_version, status)
+    - object_versions(object_id, object_version)
     - parts(object_id)
     - part_chunks(part_id)
     """
@@ -61,7 +64,6 @@ async def get_user_cids_from_db(
         WHERE b.main_account_id = $1
         AND ov.ipfs_cid IS NOT NULL
         AND ov.ipfs_cid != ''
-        AND ov.status = 'uploaded'
         AND o.created_at < NOW() - INTERVAL '1 hour'
 
         UNION
@@ -131,7 +133,13 @@ async def check_user_cids(
     db: asyncpg.Connection,
     user: str,
 ) -> None:
-    """Check a single user's CIDs against their chain profile."""
+    """Check a single user's CIDs against their chain profile.
+
+    This function performs two key operations:
+    1. Re-queues missing CIDs (CIDs in DB but not on chain) to substrate worker
+    2. Updates status to 'uploaded' for objects whose CIDs are all on chain
+       (handles cases where substrate published but crashed before updating status)
+    """
     from hippius_s3.redis_chain import get_chain_client
 
     logger.debug(f"Checking CIDs for user {user}")
@@ -150,38 +158,59 @@ async def check_user_cids(
     if not chain_cids:
         return
 
-    db_cids_set = set(cid_to_record.keys())
     chain_cids_set = set(chain_cids)
-    missing_cids = list(db_cids_set - chain_cids_set)
+
+    cids_by_object: Dict[tuple[str, int], List[str]] = {}
+    for record in db_cid_records:
+        obj_key = (record.object_id, record.object_version)
+        if obj_key not in cids_by_object:
+            cids_by_object[obj_key] = []
+        cids_by_object[obj_key].append(record.cid)
+
+    total_missing_cids = 0
+    objects_to_enqueue = []
+    objects_to_mark_uploaded = []
+
+    for (object_id, object_version), object_cids in cids_by_object.items():
+        missing_cids_for_object = [cid for cid in object_cids if cid not in chain_cids_set]
+
+        if not missing_cids_for_object:
+            objects_to_mark_uploaded.append((object_id, object_version))
+        else:
+            total_missing_cids += len(missing_cids_for_object)
+            objects_to_enqueue.append((object_id, object_version, missing_cids_for_object))
 
     logger.info(
-        f"User {user}: S3={len(db_cids_set)} CIDs, Chain={len(chain_cids)} CIDs, Missing={len(missing_cids)} CIDs"
+        f"User {user}: S3={len(cid_to_record)} CIDs, Chain={len(chain_cids)} CIDs, "
+        f"Missing={total_missing_cids} CIDs across {len(objects_to_enqueue)} objects"
     )
 
-    get_metrics_collector().set_pin_checker_missing_cids(user, len(missing_cids))
+    get_metrics_collector().set_pin_checker_missing_cids(user, total_missing_cids)
 
-    if missing_cids:
-        logger.info(f"Resubmitting {len(missing_cids)} missing CIDs for user {user}")
-
-        missing_by_object: Dict[tuple[str, int], List[str]] = {}
-        for cid in missing_cids:
-            record = cid_to_record[cid]
-            obj_key = (record.object_id, record.object_version)
-            if obj_key not in missing_by_object:
-                missing_by_object[obj_key] = []
-            missing_by_object[obj_key].append(cid)
-
-        for (object_id, object_version), cids in missing_by_object.items():
+    if objects_to_enqueue:
+        logger.info(f"Enqueuing {len(objects_to_enqueue)} objects with missing CIDs for user {user}")
+        for object_id, object_version, missing_cids in objects_to_enqueue:
             request = SubstratePinningRequest(
-                cids=cids,
+                cids=missing_cids,
                 address=user,
                 object_id=str(object_id),
                 object_version=object_version,
             )
             await enqueue_substrate_request(request)
-            logger.info(f"Enqueued substrate request object_id={object_id} version={object_version} cids={len(cids)}")
-    else:
-        logger.info(f"All S3 CIDs for user {user} are present on chain")
+            logger.info(
+                f"Enqueued substrate request object_id={object_id} version={object_version} missing_cids={len(missing_cids)}"
+            )
+
+    if objects_to_mark_uploaded:
+        logger.info(f"Marking {len(objects_to_mark_uploaded)} objects as 'uploaded' (all CIDs already on chain)")
+        for object_id, object_version in objects_to_mark_uploaded:
+            result = await db.execute(
+                "UPDATE object_versions SET status = 'uploaded' WHERE object_id = $1 AND object_version = $2 AND status != 'uploaded'",
+                object_id,
+                object_version,
+            )
+            if result and result != "UPDATE 0":
+                logger.info(f"Updated status to 'uploaded' for object_id={object_id}")
 
 
 async def get_all_users(

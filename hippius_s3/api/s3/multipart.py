@@ -1056,28 +1056,50 @@ async def complete_multipart_upload(
             seed_phrase=request.state.seed_phrase,
         )
 
-        # After commit, enqueue background publish
-        parts = await db.fetch(
-            get_query("list_parts_for_version"),
-            object_id,
-            object_version,
-        )
-        await enqueue_upload_request(
-            UploadChainRequest(
-                address=request.state.account.id,
-                bucket_name=bucket_name,
-                object_key=object_key,
-                object_id=str(object_id),
-                object_version=int(object_version),
-                chunks=[
-                    Chunk(
-                        id=part["part_number"],
-                    )
-                    for part in parts
-                ],
-                upload_id=upload_id,
-            ),
-        )
+        try:
+            parts = await db.fetch(
+                get_query("list_parts_for_version"),
+                object_id,
+                object_version,
+            )
+
+            if not parts:
+                logger.error(
+                    f"No parts found after mpu_complete object_id={object_id} upload_id={upload_id} - marking as failed"
+                )
+                await db.execute(
+                    "UPDATE object_versions SET status = 'failed' WHERE object_id = $1 AND object_version = $2",
+                    object_id,
+                    object_version,
+                )
+                return s3_error_response(
+                    "InternalError",
+                    "No parts found for completed upload",
+                    status_code=500,
+                )
+
+            await enqueue_upload_request(
+                UploadChainRequest(
+                    address=request.state.account.id,
+                    bucket_name=bucket_name,
+                    object_key=object_key,
+                    object_id=str(object_id),
+                    object_version=int(object_version),
+                    chunks=[
+                        Chunk(
+                            id=part["part_number"],
+                        )
+                        for part in parts
+                    ],
+                    upload_id=upload_id,
+                ),
+            )
+            logger.info(f"Successfully enqueued upload request object_id={object_id} upload_id={upload_id}")
+
+        except Exception as enqueue_error:
+            logger.error(
+                f"Failed to enqueue upload after completion object_id={object_id} upload_id={upload_id}: {enqueue_error}"
+            )
 
         # Create XML response
         xml_bytes = f"""<?xml version="1.0" encoding="UTF-8"?>
