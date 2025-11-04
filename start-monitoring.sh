@@ -32,6 +32,22 @@ fi
 # Create monitoring directories if they don't exist
 mkdir -p monitoring/{prometheus,grafana/{provisioning/{datasources,dashboards},dashboards},otel}
 
+# Handle alerting configuration based on environment
+ALERTING_DIR="monitoring/grafana/provisioning/alerting"
+ALERTING_DISABLED_DIR="monitoring/grafana/provisioning/alerting.disabled"
+
+if [ "${ENVIRONMENT}" = "production" ]; then
+    echo "🔔 Enabling alerting for production environment"
+    if [ -d "$ALERTING_DISABLED_DIR" ]; then
+        mv "$ALERTING_DISABLED_DIR" "$ALERTING_DIR"
+    fi
+else
+    echo "🔕 Disabling alerting for non-production environment (ENVIRONMENT=${ENVIRONMENT:-not set})"
+    if [ -d "$ALERTING_DIR" ]; then
+        mv "$ALERTING_DIR" "$ALERTING_DISABLED_DIR"
+    fi
+fi
+
 # Start the monitoring stack
 echo "🐳 Starting Docker containers..."
 docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
