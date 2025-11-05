@@ -13,7 +13,14 @@ import dotenv
 import pytest
 from botocore.config import Config
 
+from tests.e2e.conftest import compose_project_name
+from tests.e2e.conftest import docker_services
 from tests.e2e.conftest import is_real_aws
+from tests.e2e.conftest import test_run_id
+from tests.e2e.conftest import test_seed_phrase
+
+
+__all__ = ["compose_project_name", "docker_services", "test_run_id", "test_seed_phrase"]
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -168,6 +168,12 @@ class MetricsCollector:
             unit="1",
         )
 
+        self.pinner_dlq_total = self.meter.create_counter(
+            name="pinner_dlq_total",
+            description="Total CIDs moved to pin checker DLQ",
+            unit="1",
+        )
+
         self.unpinner_requests_total = self.meter.create_counter(
             name="unpinner_requests_total",
             description="Total unpinner requests processed",
@@ -555,6 +561,12 @@ class MetricsCollector:
             if duration is not None:
                 self.uploader_duration.record(duration, attributes=attributes)
 
+    def increment_pinner_dlq_total(self, main_account: str) -> None:
+        attributes = {
+            "main_account": main_account,
+        }
+        self.pinner_dlq_total.add(1, attributes=attributes)
+
     def record_unpinner_operation(
         self,
         main_account: str,
@@ -653,6 +665,9 @@ class NullMetricsCollector:
         pass
 
     def record_uploader_operation(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def increment_pinner_dlq_total(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_unpinner_operation(self, *args: object, **kwargs: object) -> None:

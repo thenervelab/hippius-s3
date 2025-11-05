@@ -86,6 +86,7 @@ class Config:
     downloader_sleep_loop = 0.01
     cacher_loop_sleep = 60  # 1 minute
     pin_checker_loop_sleep = 7200  # 2 hours
+    pin_checker_max_attempts: int = env("HIPPIUS_PIN_CHECKER_MAX_ATTEMPTS:3", convert=int)
 
     # Resubmission settings
     resubmission_seed_phrase: str = env("RESUBMISSION_SEED_PHRASE")

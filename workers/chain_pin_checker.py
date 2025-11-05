@@ -127,6 +127,117 @@ async def get_cached_chain_cids(
     return cids
 
 
+async def should_move_to_dlq(
+    db: asyncpg.Connection,
+    cid: str,
+    max_attempts: int,
+) -> bool:
+    """Check if a CID has reached max attempts and should move to DLQ.
+
+    Returns True if we've already attempted max_attempts times.
+    """
+    row = await db.fetchrow(
+        """
+        SELECT pin_attempts
+        FROM part_chunks
+        WHERE cid = $1
+        ORDER BY pin_attempts DESC
+        LIMIT 1
+        """,
+        cid,
+    )
+    attempts = int(row["pin_attempts"]) if row else 0
+    return attempts >= max_attempts
+
+
+async def record_pin_attempt(
+    db: asyncpg.Connection,
+    cid: str,
+) -> None:
+    """Increment pin_attempts and update last_pinned_at for a CID."""
+    await db.execute(
+        """
+        UPDATE part_chunks
+        SET pin_attempts = pin_attempts + 1,
+            last_pinned_at = NOW()
+        WHERE cid = $1
+        """,
+        cid,
+    )
+
+
+async def reset_pin_attempts(
+    db: asyncpg.Connection,
+    cids: List[str],
+) -> None:
+    """Reset pin tracking for CIDs confirmed on chain."""
+    if not cids:
+        return
+    await db.execute(
+        """
+        UPDATE part_chunks
+        SET pin_attempts = 0,
+            last_pinned_at = NULL
+        WHERE cid = ANY($1::text[])
+        """,
+        cids,
+    )
+
+
+async def is_cid_in_dlq(cid: str) -> bool:
+    """Check if CID is already in pinner DLQ."""
+    from hippius_s3.redis_cache import get_cache_client
+
+    redis_client = get_cache_client()
+    all_entries_data = await redis_client.lrange("pinner:dlq", 0, -1)  # type: ignore[misc]
+    all_entries: List[bytes] = list(all_entries_data) if all_entries_data else []
+    for entry_json in all_entries:
+        try:
+            data = json.loads(entry_json)
+            if data.get("cid") == cid:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def push_cid_to_dlq(
+    db: asyncpg.Connection,
+    cid: str,
+    user: str,
+    object_id: str,
+    object_version: int,
+    reason: str,
+) -> None:
+    """Push a CID to the pin checker DLQ."""
+    from hippius_s3.dlq.pinner_dlq import PinnerDLQEntry
+    from hippius_s3.dlq.pinner_dlq import PinnerDLQManager
+    from hippius_s3.redis_cache import get_cache_client
+
+    row = await db.fetchrow(
+        "SELECT pin_attempts, last_pinned_at FROM part_chunks WHERE cid = $1 LIMIT 1",
+        cid,
+    )
+
+    pin_attempts = int(row["pin_attempts"]) if row else 0
+    last_pinned_at = float(row["last_pinned_at"].timestamp()) if row and row["last_pinned_at"] else None
+
+    entry = PinnerDLQEntry(
+        cid=cid,
+        user=user,
+        object_id=object_id,
+        object_version=object_version,
+        reason=reason,
+        pin_attempts=pin_attempts,
+        last_pinned_at=last_pinned_at,
+    )
+
+    dlq_manager = PinnerDLQManager(get_cache_client())
+    await dlq_manager.push(entry)
+
+    get_metrics_collector().increment_pinner_dlq_total(user)
+
+
 async def check_user_cids(
     db: asyncpg.Connection,
     user: str,
@@ -152,6 +263,28 @@ async def check_user_cids(
 
     db_cids_set = set(cid_to_record.keys())
     chain_cids_set = set(chain_cids)
+
+    confirmed_cids = list(db_cids_set & chain_cids_set)
+    if confirmed_cids:
+        await reset_pin_attempts(db, confirmed_cids)
+
+        from hippius_s3.dlq.pinner_dlq import PinnerDLQManager
+        from hippius_s3.redis_cache import get_cache_client
+
+        dlq_manager = PinnerDLQManager(get_cache_client())
+        cleaned_count = 0
+        for cid in confirmed_cids:
+            removed = await dlq_manager._find_and_remove_unlocked(cid)
+            if removed:
+                cleaned_count += 1
+
+        if cleaned_count > 0:
+            logger.info(
+                f"Reset pin attempts for {len(confirmed_cids)} confirmed CIDs + cleaned {cleaned_count} from DLQ (user={user})"
+            )
+        else:
+            logger.info(f"Reset pin attempts for {len(confirmed_cids)} confirmed CIDs (user={user})")
+
     missing_cids = list(db_cids_set - chain_cids_set)
 
     logger.info(
@@ -160,11 +293,41 @@ async def check_user_cids(
 
     get_metrics_collector().set_pin_checker_missing_cids(user, len(missing_cids))
 
-    if missing_cids:
-        logger.info(f"Resubmitting {len(missing_cids)} missing CIDs for user {user}")
+    if not missing_cids:
+        logger.info(f"All S3 CIDs for user {user} are present on chain")
+        return
+
+    eligible_cids = []
+    dlq_cids = []
+
+    for cid in missing_cids:
+        if await should_move_to_dlq(db, cid, config.pin_checker_max_attempts):
+            dlq_cids.append(cid)
+        else:
+            eligible_cids.append(cid)
+
+    if dlq_cids:
+        logger.warning(f"Moving {len(dlq_cids)} CIDs to DLQ (max attempts reached, user={user})")
+        for cid in dlq_cids:
+            if await is_cid_in_dlq(cid):
+                logger.debug(f"CID {cid} already in DLQ, skipping")
+                continue
+
+            record = cid_to_record[cid]
+            await push_cid_to_dlq(
+                db=db,
+                cid=cid,
+                user=user,
+                object_id=record.object_id,
+                object_version=record.object_version,
+                reason="max_pin_attempts_exceeded",
+            )
+
+    if eligible_cids:
+        logger.info(f"Enqueuing {len(eligible_cids)} eligible CIDs for user {user}")
 
         missing_by_object: Dict[tuple[str, int], List[str]] = {}
-        for cid in missing_cids:
+        for cid in eligible_cids:
             record = cid_to_record[cid]
             obj_key = (record.object_id, record.object_version)
             if obj_key not in missing_by_object:
@@ -172,6 +335,9 @@ async def check_user_cids(
             missing_by_object[obj_key].append(cid)
 
         for (object_id, object_version), cids in missing_by_object.items():
+            for cid in cids:
+                await record_pin_attempt(db, cid)
+
             request = SubstratePinningRequest(
                 cids=cids,
                 address=user,
@@ -180,8 +346,6 @@ async def check_user_cids(
             )
             await enqueue_substrate_request(request)
             logger.info(f"Enqueued substrate request object_id={object_id} version={object_version} cids={len(cids)}")
-    else:
-        logger.info(f"All S3 CIDs for user {user} are present on chain")
 
 
 async def get_all_users(
