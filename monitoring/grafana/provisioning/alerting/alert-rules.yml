@@ -180,7 +180,7 @@ groups:
               to: 0
             datasourceUid: PBFA97CFB590B2093
             model:
-              expr: '((sum(increase(http_requests_total{job="otel-collector"}[5m])) or vector(0)) >= 5) and ((sum(increase(s3_errors_total{job="otel-collector"}[5m])) or vector(0)) / (sum(increase(http_requests_total{job="otel-collector"}[5m])) + 0.0001) * 100)'
+              expr: '((sum(increase(s3_errors_total{job="otel-collector"}[5m])) or vector(0)) / (sum(increase(http_requests_total{job="otel-collector"}[5m])) + 0.0001) * 100) and ((sum(increase(http_requests_total{job="otel-collector"}[5m])) or vector(0)) >= 5)'
               refId: A
           - refId: B
             relativeTimeRange:
