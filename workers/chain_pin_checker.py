@@ -185,20 +185,12 @@ async def reset_pin_attempts(
 
 
 async def is_cid_in_dlq(cid: str) -> bool:
-    """Check if CID is already in pinner DLQ."""
-    from hippius_s3.redis_cache import get_cache_client
+    """Check if CID is in pinner DLQ - O(1) filesystem check."""
+    from hippius_s3.dlq.pinner_dlq import PinnerDLQManager
 
-    redis_client = get_cache_client()
-    all_entries_data = await redis_client.lrange("pinner:dlq", 0, -1)  # type: ignore[misc]
-    all_entries: List[bytes] = list(all_entries_data) if all_entries_data else []
-    for entry_json in all_entries:
-        try:
-            data = json.loads(entry_json)
-            if data.get("cid") == cid:
-                return True
-        except Exception:
-            continue
-    return False
+    dlq_dir = f"{config.dlq_dir}/pinner"
+    dlq_manager = PinnerDLQManager(dlq_dir)
+    return await dlq_manager.is_in_dlq(cid)
 
 
 async def push_cid_to_dlq(
@@ -212,7 +204,6 @@ async def push_cid_to_dlq(
     """Push a CID to the pin checker DLQ."""
     from hippius_s3.dlq.pinner_dlq import PinnerDLQEntry
     from hippius_s3.dlq.pinner_dlq import PinnerDLQManager
-    from hippius_s3.redis_cache import get_cache_client
 
     row = await db.fetchrow(
         "SELECT pin_attempts, last_pinned_at FROM part_chunks WHERE cid = $1 LIMIT 1",
@@ -232,7 +223,8 @@ async def push_cid_to_dlq(
         last_pinned_at=last_pinned_at,
     )
 
-    dlq_manager = PinnerDLQManager(get_cache_client())
+    dlq_dir = f"{config.dlq_dir}/pinner"
+    dlq_manager = PinnerDLQManager(dlq_dir)
     await dlq_manager.push(entry)
 
     get_metrics_collector().increment_pinner_dlq_total(user)
@@ -269,12 +261,12 @@ async def check_user_cids(
         await reset_pin_attempts(db, confirmed_cids)
 
         from hippius_s3.dlq.pinner_dlq import PinnerDLQManager
-        from hippius_s3.redis_cache import get_cache_client
 
-        dlq_manager = PinnerDLQManager(get_cache_client())
+        dlq_dir = f"{config.dlq_dir}/pinner"
+        dlq_manager = PinnerDLQManager(dlq_dir)
         cleaned_count = 0
         for cid in confirmed_cids:
-            removed = await dlq_manager._find_and_remove_unlocked(cid)
+            removed = await dlq_manager.find_and_remove(cid)
             if removed:
                 cleaned_count += 1
 

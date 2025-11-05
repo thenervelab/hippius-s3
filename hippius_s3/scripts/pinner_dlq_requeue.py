@@ -10,7 +10,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import asyncpg
-import redis.asyncio as async_redis
 
 from hippius_s3.config import get_config
 from hippius_s3.dlq.pinner_dlq import PinnerDLQManager
@@ -65,11 +64,11 @@ async def main() -> None:
 
     config = get_config()
 
-    redis_client = async_redis.from_url(config.redis_url)
     db = await asyncpg.connect(config.database_url)
+    dlq_dir = f"{config.dlq_dir}/pinner"
 
     try:
-        dlq_manager = PinnerDLQManager(redis_client)
+        dlq_manager = PinnerDLQManager(dlq_dir)
 
         if args.command == "peek":
             entries = await dlq_manager.peek(args.limit)
@@ -107,6 +106,8 @@ async def main() -> None:
                 print(f"Reset pin attempts for CID: {args.cid}")
 
                 if args.force:
+                    import redis.asyncio as async_redis
+
                     from hippius_s3.queue import SubstratePinningRequest
                     from hippius_s3.queue import enqueue_substrate_request
                     from hippius_s3.queue import initialize_queue_client
@@ -142,6 +143,8 @@ async def main() -> None:
                 print(f"Reset pin attempts for {count} CIDs")
 
                 if args.force:
+                    import redis.asyncio as async_redis
+
                     from hippius_s3.queue import SubstratePinningRequest
                     from hippius_s3.queue import enqueue_substrate_request
                     from hippius_s3.queue import initialize_queue_client
@@ -187,8 +190,6 @@ async def main() -> None:
             print(f"Exported {len(entries)} entries to {args.file}")
 
     finally:
-        if redis_client:
-            await redis_client.close()
         if db:
             await db.close()
 

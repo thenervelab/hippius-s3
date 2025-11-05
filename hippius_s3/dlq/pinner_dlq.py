@@ -1,14 +1,13 @@
+import asyncio
 import contextlib
 import json
 import logging
 import time
-import uuid
+from pathlib import Path
 from typing import Any
 from typing import Dict
 from typing import List
 from typing import Optional
-
-import redis.asyncio as async_redis
 
 
 logger = logging.getLogger(__name__)
@@ -64,104 +63,124 @@ class PinnerDLQEntry:
 
 
 class PinnerDLQManager:
-    """Manages Dead-Letter Queue for pin checker CIDs."""
+    """Filesystem-backed DLQ for pin checker CIDs."""
 
-    DLQ_KEY = "pinner:dlq"
+    def __init__(self, dlq_dir: str):
+        self.dlq_dir = Path(dlq_dir)
+        self.dlq_dir.mkdir(parents=True, exist_ok=True)
 
-    def __init__(self, redis_client: async_redis.Redis):
-        self.redis_client = redis_client
-        self.lock_prefix = "pinner:dlq:lock:"
+    def _cid_path(self, cid: str) -> Path:
+        """Get filesystem path for a CID entry."""
+        subdir = self.dlq_dir / "xx" if len(cid) < 2 else self.dlq_dir / cid[:2]
+        subdir.mkdir(exist_ok=True)
+        return subdir / f"{cid}.json"
 
-    def _lock_key(self, cid: str) -> str:
-        return f"{self.lock_prefix}{cid}"
-
-    async def _acquire_lock(self, cid: str, ttl_ms: int = 60000) -> Optional[str]:
-        """Acquire a per-CID lock using Redis SET NX PX. Returns token or None."""
-        token = uuid.uuid4().hex
-        ok = await self.redis_client.set(self._lock_key(cid), token, nx=True, px=ttl_ms)  # type: ignore[misc]
-        return token if ok else None
-
-    async def _release_lock(self, cid: str, token: str) -> None:
-        """Release lock only if token matches (atomic compare-and-delete)."""
-        script = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
-        with contextlib.suppress(Exception):
-            await self.redis_client.eval(script, 1, self._lock_key(cid), token)  # type: ignore[misc]
+    async def is_in_dlq(self, cid: str) -> bool:
+        """Check if CID exists in DLQ - O(1) filesystem check."""
+        path = self._cid_path(cid)
+        return await asyncio.to_thread(path.exists)
 
     async def push(self, entry: PinnerDLQEntry) -> None:
-        """Push a CID entry to the DLQ."""
-        await self.redis_client.lpush(self.DLQ_KEY, json.dumps(entry.to_dict()))  # type: ignore[misc]
+        """Push a CID entry to the DLQ (filesystem)."""
+        path = self._cid_path(entry.cid)
+
+        def _write() -> None:
+            with path.open("w") as f:
+                json.dump(entry.to_dict(), f, indent=2, default=str)
+
+        await asyncio.to_thread(_write)
         logger.warning(f"Pushed to pinner DLQ: cid={entry.cid} user={entry.user} attempts={entry.pin_attempts}")
 
     async def peek(self, limit: int = 10) -> List[PinnerDLQEntry]:
-        """Peek at DLQ entries without removing them."""
-        raw_data = await self.redis_client.lrange(self.DLQ_KEY, -limit, -1)  # type: ignore[misc]
-        raw: List[bytes] = list(raw_data) if raw_data else []
-        entries = []
-        for entry_json in raw:
-            try:
-                data = json.loads(entry_json)
-                entries.append(PinnerDLQEntry.from_dict(data))
-            except Exception as e:
-                logger.warning(f"Invalid DLQ entry: {e}")
-        return entries
+        """Peek at DLQ entries."""
+
+        def _scan() -> List[PinnerDLQEntry]:
+            entries = []
+            for subdir in sorted(self.dlq_dir.iterdir()):
+                if not subdir.is_dir():
+                    continue
+                for path in sorted(subdir.glob("*.json")):
+                    try:
+                        with path.open() as f:
+                            data = json.load(f)
+                            entries.append(PinnerDLQEntry.from_dict(data))
+                        if len(entries) >= limit:
+                            return entries
+                    except Exception as e:
+                        logger.warning(f"Invalid DLQ file {path}: {e}")
+            return entries
+
+        return await asyncio.to_thread(_scan)
 
     async def stats(self) -> Dict[str, Any]:
         """Get DLQ statistics."""
-        count_result = await self.redis_client.llen(self.DLQ_KEY)  # type: ignore[misc]
-        count: int = int(count_result) if count_result is not None else 0
+
+        def _count() -> int:
+            count = 0
+            for subdir in self.dlq_dir.iterdir():
+                if subdir.is_dir():
+                    count += len(list(subdir.glob("*.json")))
+            return count
+
+        count = await asyncio.to_thread(_count)
         return {
             "total_entries": count,
-            "queue_key": self.DLQ_KEY,
+            "dlq_path": str(self.dlq_dir),
         }
 
-    async def _find_and_remove_unlocked(self, cid: str) -> Optional[PinnerDLQEntry]:
-        """Find and remove a specific CID entry without locking."""
-        all_entries_data = await self.redis_client.lrange(self.DLQ_KEY, 0, -1)  # type: ignore[misc]
-        all_entries: List[bytes] = list(all_entries_data) if all_entries_data else []
-        for entry_json in all_entries:
-            try:
-                data = json.loads(entry_json)
-                if data.get("cid") == cid:
-                    entry_str = entry_json.decode("utf-8") if isinstance(entry_json, bytes) else entry_json
-                    removed = await self.redis_client.lrem(self.DLQ_KEY, 1, entry_str)  # type: ignore[misc]
-                    if removed:
-                        return PinnerDLQEntry.from_dict(data)
-            except Exception:
-                continue
-        return None
-
     async def find_and_remove(self, cid: str) -> Optional[PinnerDLQEntry]:
-        """Find and remove a specific CID entry with distributed locking."""
-        token = await self._acquire_lock(cid)
-        if not token:
-            logger.error(f"Requeue already in progress for CID: {cid}")
-            return None
+        """Find and remove a specific CID entry."""
+        path = self._cid_path(cid)
 
-        try:
-            return await self._find_and_remove_unlocked(cid)
-        finally:
-            with contextlib.suppress(Exception):
-                await self._release_lock(cid, token)
+        def _remove() -> Optional[PinnerDLQEntry]:
+            if not path.exists():
+                return None
+            try:
+                with path.open() as f:
+                    data = json.load(f)
+                entry = PinnerDLQEntry.from_dict(data)
+                path.unlink()
+                return entry
+            except Exception as e:
+                logger.error(f"Failed to remove DLQ entry {cid}: {e}")
+                return None
+
+        return await asyncio.to_thread(_remove)
 
     async def purge(self, cid: Optional[str] = None) -> int:
-        """Purge entries from DLQ. If cid is specified, only that entry."""
+        """Purge entries from DLQ."""
         if cid:
             entry = await self.find_and_remove(cid)
             return 1 if entry else 0
-        count_result = await self.redis_client.llen(self.DLQ_KEY)  # type: ignore[misc]
-        count: int = int(count_result) if count_result is not None else 0
-        await self.redis_client.delete(self.DLQ_KEY)  # type: ignore[misc]
-        return count
+
+        def _purge_all() -> int:
+            count = 0
+            for subdir in self.dlq_dir.iterdir():
+                if subdir.is_dir():
+                    for path in subdir.glob("*.json"):
+                        path.unlink()
+                        count += 1
+                    with contextlib.suppress(OSError):
+                        subdir.rmdir()
+            return count
+
+        return await asyncio.to_thread(_purge_all)
 
     async def export_all(self) -> List[PinnerDLQEntry]:
         """Export all DLQ entries."""
-        raw_data = await self.redis_client.lrange(self.DLQ_KEY, 0, -1)  # type: ignore[misc]
-        raw: List[bytes] = list(raw_data) if raw_data else []
-        entries = []
-        for entry_json in raw:
-            try:
-                data = json.loads(entry_json)
-                entries.append(PinnerDLQEntry.from_dict(data))
-            except Exception as e:
-                logger.warning(f"Invalid DLQ entry during export: {e}")
-        return entries
+
+        def _scan_all() -> List[PinnerDLQEntry]:
+            entries = []
+            for subdir in sorted(self.dlq_dir.iterdir()):
+                if not subdir.is_dir():
+                    continue
+                for path in sorted(subdir.glob("*.json")):
+                    try:
+                        with path.open() as f:
+                            data = json.load(f)
+                            entries.append(PinnerDLQEntry.from_dict(data))
+                    except Exception as e:
+                        logger.warning(f"Invalid DLQ file during export {path}: {e}")
+            return entries
+
+        return await asyncio.to_thread(_scan_all)

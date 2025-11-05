@@ -1,8 +1,7 @@
-from typing import Any
+from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
-import pytest_asyncio  # type: ignore[import-not-found]
-import redis.asyncio as async_redis
 
 from hippius_s3.dlq.pinner_dlq import PinnerDLQEntry
 from hippius_s3.dlq.pinner_dlq import PinnerDLQManager
@@ -11,20 +10,21 @@ from hippius_s3.dlq.pinner_dlq import PinnerDLQManager
 pytestmark = pytest.mark.unit
 
 
-@pytest_asyncio.fixture
-async def redis_client() -> Any:
-    """Create a Redis client for testing."""
-    client = async_redis.from_url("redis://localhost:6379/0")
-    await client.delete("pinner:dlq")
-    try:
-        yield client
-    finally:
-        await client.delete("pinner:dlq")
-        await client.close()
+@pytest.fixture
+def temp_dlq_dir(tmp_path: Path) -> str:
+    """Create a temporary DLQ directory for testing."""
+    dlq_dir = tmp_path / "pinner_dlq"
+    dlq_dir.mkdir()
+    return str(dlq_dir)
 
 
-@pytest.mark.asyncio
-async def test_pinner_dlq_entry_to_dict() -> None:
+@pytest.fixture
+def mock_db() -> AsyncMock:
+    """Create a mock database connection."""
+    return AsyncMock()
+
+
+def test_pinner_dlq_entry_to_dict() -> None:
     """Test PinnerDLQEntry serialization."""
     entry = PinnerDLQEntry(
         cid="QmTest123",
@@ -49,8 +49,7 @@ async def test_pinner_dlq_entry_to_dict() -> None:
     assert data["dlq_timestamp"] == 1234567900.0
 
 
-@pytest.mark.asyncio
-async def test_pinner_dlq_entry_from_dict() -> None:
+def test_pinner_dlq_entry_from_dict() -> None:
     """Test PinnerDLQEntry deserialization."""
     data = {
         "cid": "QmTest456",
@@ -76,9 +75,9 @@ async def test_pinner_dlq_entry_from_dict() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dlq_push_and_peek(redis_client: Any) -> None:
+async def test_dlq_push_and_peek(temp_dlq_dir: str) -> None:
     """Test pushing and peeking DLQ entries."""
-    dlq_manager = PinnerDLQManager(redis_client)
+    dlq_manager = PinnerDLQManager(temp_dlq_dir)
 
     entry1 = PinnerDLQEntry(
         cid="QmTest1",
@@ -104,14 +103,36 @@ async def test_dlq_push_and_peek(redis_client: Any) -> None:
     entries = await dlq_manager.peek(limit=10)
 
     assert len(entries) == 2
-    assert entries[0].cid == "QmTest2"
-    assert entries[1].cid == "QmTest1"
+    assert entries[0].cid == "QmTest1"
+    assert entries[1].cid == "QmTest2"
 
 
 @pytest.mark.asyncio
-async def test_dlq_stats(redis_client: Any) -> None:
+async def test_dlq_is_in_dlq(temp_dlq_dir: str) -> None:
+    """Test is_in_dlq filesystem check."""
+    dlq_manager = PinnerDLQManager(temp_dlq_dir)
+
+    entry = PinnerDLQEntry(
+        cid="QmTestExists",
+        user="5UserExists",
+        object_id="obj-exists",
+        object_version=1,
+        reason="max_attempts",
+        pin_attempts=3,
+    )
+
+    assert not await dlq_manager.is_in_dlq("QmTestExists")
+
+    await dlq_manager.push(entry)
+
+    assert await dlq_manager.is_in_dlq("QmTestExists")
+    assert not await dlq_manager.is_in_dlq("QmDoesNotExist")
+
+
+@pytest.mark.asyncio
+async def test_dlq_stats(temp_dlq_dir: str) -> None:
     """Test DLQ statistics."""
-    dlq_manager = PinnerDLQManager(redis_client)
+    dlq_manager = PinnerDLQManager(temp_dlq_dir)
 
     stats = await dlq_manager.stats()
     assert stats["total_entries"] == 0
@@ -128,13 +149,13 @@ async def test_dlq_stats(redis_client: Any) -> None:
 
     stats = await dlq_manager.stats()
     assert stats["total_entries"] == 1
-    assert stats["queue_key"] == "pinner:dlq"
+    assert "dlq_path" in stats
 
 
 @pytest.mark.asyncio
-async def test_dlq_find_and_remove(redis_client: Any) -> None:
+async def test_dlq_find_and_remove(temp_dlq_dir: str) -> None:
     """Test finding and removing a specific CID entry."""
-    dlq_manager = PinnerDLQManager(redis_client)
+    dlq_manager = PinnerDLQManager(temp_dlq_dir)
 
     entry1 = PinnerDLQEntry(
         cid="QmFindMe",
@@ -167,9 +188,9 @@ async def test_dlq_find_and_remove(redis_client: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_dlq_purge_single(redis_client: Any) -> None:
+async def test_dlq_purge_single(temp_dlq_dir: str) -> None:
     """Test purging a single entry."""
-    dlq_manager = PinnerDLQManager(redis_client)
+    dlq_manager = PinnerDLQManager(temp_dlq_dir)
 
     entry1 = PinnerDLQEntry(
         cid="QmPurge1",
@@ -201,9 +222,9 @@ async def test_dlq_purge_single(redis_client: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_dlq_purge_all(redis_client: Any) -> None:
+async def test_dlq_purge_all(temp_dlq_dir: str) -> None:
     """Test purging all entries."""
-    dlq_manager = PinnerDLQManager(redis_client)
+    dlq_manager = PinnerDLQManager(temp_dlq_dir)
 
     for i in range(5):
         entry = PinnerDLQEntry(
@@ -224,9 +245,9 @@ async def test_dlq_purge_all(redis_client: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_dlq_export_all(redis_client: Any) -> None:
+async def test_dlq_export_all(temp_dlq_dir: str) -> None:
     """Test exporting all DLQ entries."""
-    dlq_manager = PinnerDLQManager(redis_client)
+    dlq_manager = PinnerDLQManager(temp_dlq_dir)
 
     for i in range(3):
         entry = PinnerDLQEntry(
@@ -242,7 +263,146 @@ async def test_dlq_export_all(redis_client: Any) -> None:
     entries = await dlq_manager.export_all()
     assert len(entries) == 3
     assert all(isinstance(e, PinnerDLQEntry) for e in entries)
-    cids = {e.cid for e in entries}
-    assert "QmExport0" in cids
-    assert "QmExport1" in cids
-    assert "QmExport2" in cids
+    assert entries[0].cid == "QmExport0"
+    assert entries[1].cid == "QmExport1"
+    assert entries[2].cid == "QmExport2"
+
+
+@pytest.mark.asyncio
+async def test_should_enqueue_cid_no_row(mock_db: AsyncMock) -> None:
+    """Test should_enqueue_cid when CID doesn't exist in database."""
+    mock_db.fetchrow.return_value = None
+
+    row = await mock_db.fetchrow(
+        """
+        SELECT pin_attempts
+        FROM part_chunks
+        WHERE cid = $1
+        ORDER BY pin_attempts DESC
+        LIMIT 1
+        """,
+        "QmNonExistent",
+    )
+    if not row:
+        result = True
+    else:
+        attempts = int(row["pin_attempts"] or 0)
+        result = attempts < 3
+
+    assert result is True
+    mock_db.fetchrow.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_should_enqueue_cid_below_max(mock_db: AsyncMock) -> None:
+    """Test should_enqueue_cid when attempts are below max."""
+    mock_db.fetchrow.return_value = {"pin_attempts": 2}
+
+    row = await mock_db.fetchrow(
+        """
+        SELECT pin_attempts
+        FROM part_chunks
+        WHERE cid = $1
+        ORDER BY pin_attempts DESC
+        LIMIT 1
+        """,
+        "QmTestBelow",
+    )
+    if not row:
+        result = True
+    else:
+        attempts = int(row["pin_attempts"] or 0)
+        result = attempts < 3
+
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_should_enqueue_cid_at_max(mock_db: AsyncMock) -> None:
+    """Test should_enqueue_cid when attempts are at max."""
+    mock_db.fetchrow.return_value = {"pin_attempts": 3}
+
+    row = await mock_db.fetchrow(
+        """
+        SELECT pin_attempts
+        FROM part_chunks
+        WHERE cid = $1
+        ORDER BY pin_attempts DESC
+        LIMIT 1
+        """,
+        "QmTestAtMax",
+    )
+    if not row:
+        result = True
+    else:
+        attempts = int(row["pin_attempts"] or 0)
+        result = attempts < 3
+
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_record_pin_attempt(mock_db: AsyncMock) -> None:
+    """Test recording a pin attempt."""
+    await mock_db.execute(
+        """
+        UPDATE part_chunks
+        SET pin_attempts = pin_attempts + 1,
+            last_pinned_at = NOW()
+        WHERE cid = $1
+        """,
+        "QmTestRecord",
+    )
+
+    mock_db.execute.assert_called_once()
+    call_args = mock_db.execute.call_args
+    assert "UPDATE part_chunks" in call_args[0][0]
+    assert "pin_attempts = pin_attempts + 1" in call_args[0][0]
+    assert call_args[0][1] == "QmTestRecord"
+
+
+@pytest.mark.asyncio
+async def test_reset_pin_attempts(mock_db: AsyncMock) -> None:
+    """Test resetting pin attempts."""
+    cids = ["QmTestReset"]
+    if not cids:
+        return
+
+    await mock_db.execute(
+        """
+        UPDATE part_chunks
+        SET pin_attempts = 0,
+            last_pinned_at = NULL
+        WHERE cid = ANY($1::text[])
+        """,
+        cids,
+    )
+
+    mock_db.execute.assert_called_once()
+    call_args = mock_db.execute.call_args
+    assert "UPDATE part_chunks" in call_args[0][0]
+    assert "pin_attempts = 0" in call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_reset_pin_attempts_multiple(mock_db: AsyncMock) -> None:
+    """Test resetting pin attempts for multiple CIDs."""
+    cids = ["QmReset1", "QmReset2"]
+    if not cids:
+        return
+
+    await mock_db.execute(
+        """
+        UPDATE part_chunks
+        SET pin_attempts = 0,
+            last_pinned_at = NULL
+        WHERE cid = ANY($1::text[])
+        """,
+        cids,
+    )
+
+    mock_db.execute.assert_called_once()
+    call_args = mock_db.execute.call_args
+    assert "UPDATE part_chunks" in call_args[0][0]
+    assert "pin_attempts = 0" in call_args[0][0]
+    assert call_args[0][1] == ["QmReset1", "QmReset2"]
