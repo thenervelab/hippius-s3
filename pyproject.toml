@@ -48,6 +48,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+proxy = [
+    "fastapi>=0.115.12",
+    "uvicorn[standard]>=0.23.0",
+    "httpx>=0.27.0",
+    "asyncpg>=0.28.0",
+    "redis",
+    "python-dotenv>=1.0.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
@@ -64,6 +72,7 @@ dev = [
     "requests>=2.31.0",
     "psycopg[binary]>=3.1",
     "fakeredis>=2.23.0",
+    "respx>=0.21.0",
 ]
 
 [tool.hatch.build.targets.wheel]

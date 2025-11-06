@@ -7,11 +7,40 @@ services:
       context: .
       dockerfile: Dockerfile.base
 
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    ports:
+      - "${HOST_BIND_IP:-127.0.0.1}:8080:8080"
+    env_file:
+      - .env.defaults
+      - .env
+    depends_on:
+      api:
+        condition: service_started
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-accounts:
+        condition: service_healthy
+      redis-chain:
+        condition: service_healthy
+      redis-rate-limiting:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - GATEWAY_BACKEND_URL=http://api:8000
+      - GATEWAY_PORT=8080
+    networks:
+      - hippius_net
+
   api:
     build:
       context: .
-    ports:
-      - "${HOST_BIND_IP:-127.0.0.1}:8000:8000"
+    # No external ports - only accessible via proxy on internal network
     env_file:
       - .env.defaults
       - .env

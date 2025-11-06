@@ -4,14 +4,19 @@ import secrets
 import subprocess
 from pathlib import Path
 from typing import Any
+from typing import AsyncGenerator
 from typing import Callable
 from typing import Generator
 from typing import Iterator
 
+import asyncpg
 import boto3
 import dotenv
 import pytest
+import redis.asyncio as redis
 from botocore.config import Config
+from httpx import ASGITransport
+from httpx import AsyncClient
 
 from tests.e2e.conftest import is_real_aws
 
@@ -150,3 +155,67 @@ def stopped_worker(
             check=False,
             capture_output=True,
         )
+
+
+@pytest.fixture
+async def proxy_db_pool() -> AsyncGenerator[asyncpg.Pool, None]:
+    """Create a PostgreSQL connection pool for proxy tests."""
+    pool = await asyncpg.create_pool(os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius"))
+    yield pool
+    await pool.close()
+
+
+@pytest.fixture
+async def proxy_redis_clients() -> AsyncGenerator[dict[str, Any], None]:
+    """Create Redis clients for proxy tests."""
+    redis_client = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=False)
+    redis_accounts = redis.from_url(os.getenv("REDIS_ACCOUNTS_URL", "redis://localhost:6380/0"), decode_responses=False)
+    redis_chain = redis.from_url(os.getenv("REDIS_CHAIN_URL", "redis://localhost:6381/0"), decode_responses=False)
+    redis_rate_limiting = redis.from_url(
+        os.getenv("REDIS_RATE_LIMITING_URL", "redis://localhost:6383/0"), decode_responses=False
+    )
+
+    yield {
+        "redis": redis_client,
+        "redis_accounts": redis_accounts,
+        "redis_chain": redis_chain,
+        "redis_rate_limiting": redis_rate_limiting,
+    }
+
+    await redis_client.close()
+    await redis_accounts.close()
+    await redis_chain.close()
+    await redis_rate_limiting.close()
+
+
+@pytest.fixture
+async def proxy_app(proxy_db_pool: asyncpg.Pool, proxy_redis_clients: dict[str, Any]) -> AsyncGenerator[Any, None]:
+    """Create a proxy app instance for testing."""
+    from proxy_gateway.main import factory  # type: ignore[import-not-found]
+
+    app = factory()
+
+    app.state.postgres_pool = proxy_db_pool
+    app.state.redis_client = proxy_redis_clients["redis"]
+    app.state.redis_accounts = proxy_redis_clients["redis_accounts"]
+    app.state.redis_chain = proxy_redis_clients["redis_chain"]
+    app.state.redis_rate_limiting = proxy_redis_clients["redis_rate_limiting"]
+
+    from proxy_gateway.config import get_config  # type: ignore[import-not-found]
+    from proxy_gateway.services.forward_service import ForwardService  # type: ignore[import-not-found]
+
+    config = get_config()
+    app.state.forward_service = ForwardService(config.backend_url)
+
+    yield app
+
+    if hasattr(app.state, "forward_service"):
+        await app.state.forward_service.close()
+
+
+@pytest.fixture
+async def proxy_client(proxy_app: Any) -> AsyncGenerator[AsyncClient, None]:
+    """Create an async test client for the proxy."""
+    transport = ASGITransport(app=proxy_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client
