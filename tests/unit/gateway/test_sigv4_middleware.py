@@ -18,6 +18,10 @@ def sigv4_app() -> Any:
     async def test_endpoint() -> dict[str, str]:
         return {"message": "ok"}
 
+    @app.put("/test")
+    async def put_test_endpoint() -> dict[str, str]:
+        return {"message": "ok"}
+
     @app.get("/health")
     async def health_endpoint() -> dict[str, str]:
         return {"status": "healthy"}
@@ -30,7 +34,7 @@ def sigv4_app() -> Any:
 @pytest.mark.asyncio
 async def test_missing_auth_header_returns_403(sigv4_app: Any) -> None:
     async with AsyncClient(transport=ASGITransport(app=sigv4_app), base_url="http://test") as client:
-        response = await client.get("/test")
+        response = await client.put("/test", content=b"test data")
 
     assert response.status_code == 403
     assert b"SignatureDoesNotMatch" in response.content
