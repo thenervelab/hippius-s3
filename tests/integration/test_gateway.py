@@ -38,7 +38,7 @@ async def test_forward_simple_get_request(gateway_client: AsyncClient) -> None:
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_forward_post_request_with_body(gateway_client: AsyncClient) -> None:
+async def test_forward_post_request_with_body(gateway_client_no_auth: AsyncClient, gateway_app_no_auth: Any) -> None:
     """Test that gateway forwards POST request with body correctly."""
     test_payload = {"key": "value", "data": "test" * 1000}
 
@@ -49,7 +49,21 @@ async def test_forward_post_request_with_body(gateway_client: AsyncClient) -> No
 
     respx.post("http://api:8000/api/upload").mock(side_effect=check_request)
 
-    response = await gateway_client.post("/api/upload", json=test_payload)
+    async def inject_state_middleware(request: Any, call_next: Any) -> Any:
+        request.state.account_id = "test-account"
+        request.state.seed_phrase = "test seed"
+        request.state.account = HippiusAccount(
+            id="test-account",
+            main_account="test-account",
+            has_credits=True,
+            upload=True,
+            delete=False,
+        )
+        return await call_next(request)
+
+    gateway_app_no_auth.middleware("http")(inject_state_middleware)
+
+    response = await gateway_client_no_auth.post("/api/upload", json=test_payload)
 
     assert response.status_code == 201
     assert response.json() == {"received": True}
@@ -77,16 +91,15 @@ async def test_forward_request_with_query_parameters(gateway_client: AsyncClient
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_header_injection_for_auth(gateway_client: AsyncClient, gateway_app: Any) -> None:
+async def test_header_injection_for_auth(gateway_client_no_auth: AsyncClient, gateway_app_no_auth: Any) -> None:
     """Test that X-Hippius-* headers are injected from request.state."""
 
     def check_headers(request: httpx.Request) -> httpx.Response:
-        assert "X-Hippius-Account-Id" in request.headers
-        assert request.headers["X-Hippius-Account-Id"] == "test-account-123"
+        assert "X-Hippius-Request-User" in request.headers
+        assert request.headers["X-Hippius-Request-User"] == "test-account-123"
         assert "X-Hippius-Seed" in request.headers
         assert request.headers["X-Hippius-Seed"] == "test seed phrase"
-        assert "X-Hippius-Main-Account" in request.headers
-        assert request.headers["X-Hippius-Main-Account"] == "main-account-456"
+        assert "X-Hippius-Bucket-Owner" in request.headers
         assert "X-Hippius-Has-Credits" in request.headers
         assert request.headers["X-Hippius-Has-Credits"] == "True"
         return httpx.Response(200, json={"auth_ok": True})
@@ -105,9 +118,9 @@ async def test_header_injection_for_auth(gateway_client: AsyncClient, gateway_ap
         )
         return await call_next(request)
 
-    gateway_app.middleware("http")(inject_state_middleware)
+    gateway_app_no_auth.middleware("http")(inject_state_middleware)
 
-    response = await gateway_client.get("/authenticated")
+    response = await gateway_client_no_auth.get("/authenticated")
 
     assert response.status_code == 200
     assert response.json() == {"auth_ok": True}

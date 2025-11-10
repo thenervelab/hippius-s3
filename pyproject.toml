@@ -165,6 +165,14 @@ disallow_untyped_defs = false
 disable_error_code = ["no-untyped-def"]
 
 [[tool.mypy.overrides]]
+module = "uvicorn"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "pytest_asyncio"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "loki_logger_handler.*"
 ignore_missing_imports = true
 
