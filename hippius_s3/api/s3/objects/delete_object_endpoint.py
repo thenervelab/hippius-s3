@@ -55,11 +55,9 @@ async def handle_delete_object(
             if not result:
                 return Response(status_code=204)
 
-        # Permission-aware delete
+        # Permission-aware delete (gateway handles permissions)
         with tracer.start_as_current_span("delete_object.permission_aware_delete") as span:
-            deleted_object = await db.fetchrow(
-                get_query("delete_object"), bucket_id, object_key, user["main_account_id"]
-            )
+            deleted_object = await db.fetchrow(get_query("delete_object"), bucket_id, object_key)
             if not deleted_object:
                 return errors.s3_error_response(
                     "AccessDenied",

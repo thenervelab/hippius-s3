@@ -1,5 +1,4 @@
 import base64
-import contextlib
 import hashlib
 import hmac
 import logging
@@ -14,10 +13,8 @@ from fastapi import Request
 from fastapi import Response
 from starlette import status
 
-from hippius_s3.api.middlewares.credit_check import HippiusAccount
-from hippius_s3.api.s3.errors import s3_error_response
-from hippius_s3.config import get_config
-from hippius_s3.utils import is_public_bucket
+from gateway.config import get_config
+from gateway.utils.errors import s3_error_response
 
 
 config = get_config()
@@ -203,36 +200,33 @@ class SigV4Verifier:
         return signature_valid
 
 
-async def verify_hmac_middleware(
+async def sigv4_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
-    exempt_paths = ["/docs", "/openapi.json", "/user/", "/robots.txt", "/metrics"]
+    """
+    AWS Signature V4 verification middleware for the gateway.
+
+    Verifies the SigV4 signature and extracts the seed phrase from the request.
+    Public read access is handled by ACL middleware, not here.
+    """
+    exempt_paths = ["/docs", "/openapi.json", "/user/", "/robots.txt", "/metrics", "/health"]
 
     if request.method == "OPTIONS":
         return await call_next(request)
 
     path = request.url.path
 
-    if path == "/health":
-        client_host = request.client.host if request.client else None
-        if not client_host or not (
-            client_host.startswith("172.") or client_host.startswith("10.") or client_host == "127.0.0.1"
-        ):
-            return s3_error_response(
-                code="AccessDenied",
-                message="Unavailable",
-                status_code=status.HTTP_403_FORBIDDEN,
-            )
+    if any(path.startswith(exempt_path) or path == exempt_path for exempt_path in exempt_paths):
         return await call_next(request)
 
-    if any(path.startswith(exempt_path) for exempt_path in exempt_paths):
-        return await call_next(request)
-
-    # Check for anonymous public read bypass (GET/HEAD on public bucket objects)
-    if config.enable_public_read and request.method in ["GET", "HEAD"]:
-        anon_bypass = await _check_public_read_bypass(request)
-        if anon_bypass:
+    # Allow anonymous GET/HEAD requests for public bucket access
+    # ACL middleware will handle authorization
+    if request.method in ["GET", "HEAD"]:
+        auth_header = request.headers.get("authorization")
+        if not auth_header:
+            # No authentication provided - continue as anonymous
+            # request.state.seed_phrase will not be set
             return await call_next(request)
 
     verifier = SigV4Verifier(request)
@@ -247,55 +241,6 @@ async def verify_hmac_middleware(
 
     request.state.seed_phrase = verifier.seed_phrase
     return await call_next(request)
-
-
-async def _check_public_read_bypass(request: Request) -> bool:
-    """Check if this is a valid anonymous public read that should bypass signature verification.
-
-    Returns True if the request should proceed anonymously, False otherwise.
-    """
-    path = request.url.path
-
-    # Reject if any auth markers are present (headers or presigned query params)
-    if request.headers.get("authorization") or any(
-        k in request.query_params for k in ["X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Signature"]
-    ):
-        return False
-
-    # Parse path: /{bucket}/{object_key:path}
-    # Must have at least /{bucket}/{object_key} - no bare bucket paths
-    path_parts = path.strip("/").split("/")
-    if len(path_parts) < 2 or not path_parts[0] or not path_parts[1]:
-        return False
-
-    bucket_name = path_parts[0]
-
-    # Query param policy is enforced in public_router (whitelist). Middleware does not block by params.
-
-    # Use helper to check public flag (cached)
-    if not await is_public_bucket(request, bucket_name):
-        return False
-
-    # Set up anonymous access state
-    request.state.access_mode = "anon"
-    request.state.account = HippiusAccount(
-        seed="",  # No seed phrase for anonymous access
-        id="anon",
-        main_account="public",  # Use "public" as main account placeholder
-        has_credits=True,  # Bypass credit checks for public reads
-        upload=False,
-        delete=False,
-    )
-    # Do NOT set request.state.seed_phrase - this signals to credit middleware to skip checks
-
-    # Rewrite path to /public/{bucket}/{object_key}
-    original_path = request.scope["path"]
-    new_path = f"/public{original_path}"
-    request.scope["path"] = new_path
-    with contextlib.suppress(Exception):
-        request.scope["raw_path"] = new_path.encode("utf-8")
-
-    return True
 
 
 def canonicalize_query_string(query_string: str) -> str:

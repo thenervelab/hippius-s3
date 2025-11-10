@@ -1,0 +1,389 @@
+import logging
+import xml.etree.ElementTree as ET
+from typing import cast
+
+from fastapi import APIRouter
+from fastapi import Header
+from fastapi import Query
+from fastapi import Request
+from fastapi.responses import Response
+
+from gateway.services.acl_service import ACLService
+from gateway.utils.errors import s3_error_response
+from hippius_s3.models.acl import ACL
+from hippius_s3.models.acl import Grant
+from hippius_s3.models.acl import Grantee
+from hippius_s3.models.acl import GranteeType
+from hippius_s3.models.acl import Owner
+from hippius_s3.models.acl import Permission
+
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+def _find_element(parent: ET.Element, tag: str, ns: dict) -> ET.Element | None:
+    """Find element with S3 namespace fallback."""
+    elem = parent.find(f"s3:{tag}", ns)
+    return elem if elem is not None else parent.find(tag)
+
+
+def acl_to_xml(acl: ACL) -> str:
+    """Convert ACL model to S3-compatible XML format."""
+    root = ET.Element("AccessControlPolicy")
+    root.set("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/")
+
+    owner_elem = ET.SubElement(root, "Owner")
+    ET.SubElement(owner_elem, "ID").text = acl.owner.id
+    if acl.owner.display_name:
+        ET.SubElement(owner_elem, "DisplayName").text = acl.owner.display_name
+
+    acl_list = ET.SubElement(root, "AccessControlList")
+
+    for grant in acl.grants:
+        grant_elem = ET.SubElement(acl_list, "Grant")
+
+        grantee_elem = ET.SubElement(grant_elem, "Grantee")
+        grantee_elem.set("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance")
+
+        if grant.grantee.type == GranteeType.CANONICAL_USER:
+            grantee_elem.set("xsi:type", "CanonicalUser")
+            ET.SubElement(grantee_elem, "ID").text = grant.grantee.id
+            if grant.grantee.display_name:
+                ET.SubElement(grantee_elem, "DisplayName").text = grant.grantee.display_name
+        elif grant.grantee.type == GranteeType.GROUP:
+            grantee_elem.set("xsi:type", "Group")
+            ET.SubElement(grantee_elem, "URI").text = grant.grantee.uri
+        elif grant.grantee.type == GranteeType.AMAZON_CUSTOMER_BY_EMAIL:
+            grantee_elem.set("xsi:type", "AmazonCustomerByEmail")
+            ET.SubElement(grantee_elem, "EmailAddress").text = grant.grantee.email_address
+
+        ET.SubElement(grant_elem, "Permission").text = grant.permission.value
+
+    xml_str = ET.tostring(root, encoding="unicode")
+    return f'<?xml version="1.0" encoding="UTF-8"?>\n{xml_str}'
+
+
+def xml_to_acl(xml_content: str) -> ACL:
+    """Parse S3 ACL XML to ACL model."""
+    root = ET.fromstring(xml_content)
+
+    ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+
+    owner_elem = _find_element(root, "Owner", ns)
+    if owner_elem is None:
+        raise ValueError("Missing Owner element in ACL XML")
+
+    owner_id_elem = _find_element(owner_elem, "ID", ns)
+    if owner_id_elem is None or not (owner_id_elem.text and owner_id_elem.text.strip()):
+        raise ValueError("Missing Owner ID in ACL XML")
+
+    display_name_elem = _find_element(owner_elem, "DisplayName", ns)
+
+    owner = Owner(
+        id=owner_id_elem.text.strip(),
+        display_name=display_name_elem.text.strip()
+        if display_name_elem is not None and display_name_elem.text
+        else None,
+    )
+
+    grants = []
+    acl_list = _find_element(root, "AccessControlList", ns)
+
+    if acl_list is not None:
+        grant_list = acl_list.findall("s3:Grant", ns)
+        if not grant_list:
+            grant_list = acl_list.findall("Grant")
+
+        for grant_elem in grant_list:
+            grantee_elem = _find_element(grant_elem, "Grantee", ns)
+            if grantee_elem is None:
+                continue
+
+            grantee_type = grantee_elem.get("{http://www.w3.org/2001/XMLSchema-instance}type")
+
+            if grantee_type == "CanonicalUser":
+                id_elem = _find_element(grantee_elem, "ID", ns)
+                if id_elem is None or not id_elem.text:
+                    continue
+
+                display_elem = _find_element(grantee_elem, "DisplayName", ns)
+
+                grantee = Grantee(
+                    type=GranteeType.CANONICAL_USER,
+                    id=id_elem.text.strip(),
+                    display_name=display_elem.text.strip() if display_elem is not None and display_elem.text else None,
+                )
+            elif grantee_type == "Group":
+                uri_elem = _find_element(grantee_elem, "URI", ns)
+                if uri_elem is None or not uri_elem.text:
+                    continue
+                grantee = Grantee(
+                    type=GranteeType.GROUP,
+                    uri=uri_elem.text.strip(),
+                )
+            elif grantee_type == "AmazonCustomerByEmail":
+                email_elem = _find_element(grantee_elem, "EmailAddress", ns)
+                if email_elem is None or not email_elem.text:
+                    continue
+                grantee = Grantee(
+                    type=GranteeType.AMAZON_CUSTOMER_BY_EMAIL,
+                    email_address=email_elem.text.strip(),
+                )
+            else:
+                continue
+
+            permission_elem = _find_element(grant_elem, "Permission", ns)
+            if permission_elem is None or not permission_elem.text:
+                continue
+
+            permission = Permission(permission_elem.text.strip())
+
+            grants.append(Grant(grantee=grantee, permission=permission))
+
+    return ACL(owner=owner, grants=grants)
+
+
+@router.get("/{bucket}", include_in_schema=False)
+async def get_bucket_acl(
+    bucket: str,
+    request: Request,
+    acl: str | None = Query(default=None),
+) -> Response:
+    """Get bucket ACL - S3 API compatible. Only matches when ?acl query param is present."""
+    if acl is None:
+        forward_service = request.app.state.forward_service
+        return await forward_service.forward_request(request)  # type: ignore[no-any-return]
+
+    acl_service: ACLService = request.app.state.acl_service
+
+    effective_acl = await acl_service.get_effective_acl(bucket, None)
+
+    xml_content = acl_to_xml(effective_acl)
+
+    return Response(
+        content=xml_content,
+        media_type="application/xml",
+        status_code=200,
+    )
+
+
+@router.get("/{bucket}/{key:path}", include_in_schema=False)
+async def get_object_acl(
+    bucket: str,
+    key: str,
+    request: Request,
+    acl: str | None = Query(default=None),
+) -> Response:
+    """Get object ACL - S3 API compatible. Only matches when ?acl query param is present."""
+    if acl is None:
+        forward_service = request.app.state.forward_service
+        return await forward_service.forward_request(request)  # type: ignore[no-any-return]
+
+    acl_service: ACLService = request.app.state.acl_service
+
+    effective_acl = await acl_service.get_effective_acl(bucket, key)
+
+    xml_content = acl_to_xml(effective_acl)
+
+    return Response(
+        content=xml_content,
+        media_type="application/xml",
+        status_code=200,
+    )
+
+
+@router.put("/{bucket}", include_in_schema=False)
+async def put_bucket_acl(
+    bucket: str,
+    request: Request,
+    acl: str | None = Query(default=None),
+    x_amz_acl: str | None = Header(None),
+) -> Response:
+    """Set bucket ACL - S3 API compatible. Handles both ?acl and x-amz-acl header."""
+    if acl is None:
+        # Validate canned ACL BEFORE forwarding to backend to prevent orphan buckets
+        if x_amz_acl:
+            VALID_CANNED_ACLS = {"private", "public-read", "public-read-write", "authenticated-read"}
+            if x_amz_acl not in VALID_CANNED_ACLS:
+                return s3_error_response(
+                    code="InvalidArgument",
+                    message=f"Invalid canned ACL: {x_amz_acl}",
+                    status_code=400,
+                )
+
+        forward_service = request.app.state.forward_service
+        response = cast(Response, await forward_service.forward_request(request))
+
+        # If CreateBucket succeeded and x-amz-acl header present, create ACL
+        if response.status_code == 200 and x_amz_acl:
+            account_id = getattr(request.state, "account_id", None)
+            if account_id:
+                try:
+                    acl_svc: ACLService = request.app.state.acl_service
+                    new_acl = acl_svc.canned_acl_to_acl(x_amz_acl, account_id)
+                    logger.info(f"DEBUG_ACL: Creating {x_amz_acl} ACL for bucket {bucket} with owner_id={account_id}")
+                    await acl_svc.acl_repo.set_bucket_acl(bucket, account_id, new_acl)
+                    await acl_svc.invalidate_cache(bucket)
+                    logger.info(f"Created {x_amz_acl} ACL for bucket {bucket}")
+                except Exception as e:
+                    logger.error(f"Failed to create ACL for bucket {bucket}, defaulting to private: {e}")
+
+        return response
+
+    account_id = getattr(request.state, "account_id", None)
+    if not account_id:
+        return s3_error_response(
+            code="AccessDenied",
+            message="Access Denied",
+            status_code=403,
+        )
+
+    acl_service: ACLService = request.app.state.acl_service
+
+    if x_amz_acl:
+        new_acl = acl_service.canned_acl_to_acl(x_amz_acl, account_id)
+    else:
+        body = await request.body()
+        if not body:
+            return s3_error_response(
+                code="MalformedACLError",
+                message="ACL XML body or x-amz-acl header required",
+                status_code=400,
+            )
+
+        try:
+            new_acl = xml_to_acl(body.decode("utf-8"))
+        except ET.ParseError:
+            return s3_error_response(
+                code="MalformedACLError",
+                message="The XML you provided was not well-formed",
+                status_code=400,
+            )
+        except ValueError as e:
+            return s3_error_response(
+                code="MalformedACLError",
+                message=str(e),
+                status_code=400,
+            )
+
+        if len(new_acl.grants) > 100:
+            return s3_error_response(
+                code="InvalidArgument",
+                message="ACL cannot have more than 100 grants",
+                status_code=400,
+            )
+
+        # Use request account_id as authoritative owner
+        # This prevents owner changes and ensures consistency
+        if new_acl.owner.id != account_id:
+            logger.warning(
+                f"ACL owner mismatch for bucket {bucket}: XML has {new_acl.owner.id}, using request account {account_id}"
+            )
+            new_acl.owner.id = account_id
+
+    await acl_service.acl_repo.set_bucket_acl(bucket, account_id, new_acl)
+
+    await acl_service.invalidate_cache(bucket)
+
+    return Response(status_code=200)
+
+
+@router.put("/{bucket}/{key:path}", include_in_schema=False)
+async def put_object_acl(
+    bucket: str,
+    key: str,
+    request: Request,
+    acl: str | None = Query(default=None),
+    x_amz_acl: str | None = Header(None),
+) -> Response:
+    """Set object ACL - S3 API compatible. Handles both ?acl and x-amz-acl header."""
+    if acl is None:
+        # Validate canned ACL BEFORE forwarding to backend to prevent orphan objects
+        if x_amz_acl:
+            VALID_CANNED_ACLS = {"private", "public-read", "public-read-write", "authenticated-read"}
+            if x_amz_acl not in VALID_CANNED_ACLS:
+                return s3_error_response(
+                    code="InvalidArgument",
+                    message=f"Invalid canned ACL: {x_amz_acl}",
+                    status_code=400,
+                )
+
+        forward_service = request.app.state.forward_service
+        response = cast(Response, await forward_service.forward_request(request))
+
+        # If PutObject succeeded and x-amz-acl header present, create ACL
+        if response.status_code == 200 and x_amz_acl:
+            account_id = getattr(request.state, "account_id", None)
+            if account_id:
+                try:
+                    acl_svc: ACLService = request.app.state.acl_service
+                    new_acl = acl_svc.canned_acl_to_acl(x_amz_acl, account_id)
+                    logger.info(
+                        f"DEBUG_ACL: Creating {x_amz_acl} ACL for object {bucket}/{key} with owner_id={account_id}"
+                    )
+                    await acl_svc.acl_repo.set_object_acl(bucket, key, account_id, new_acl)
+                    await acl_svc.invalidate_cache(bucket, key)
+                    logger.info(f"Created {x_amz_acl} ACL for object {bucket}/{key}")
+                except Exception as e:
+                    logger.error(f"Failed to create ACL for object {bucket}/{key}, defaulting to private: {e}")
+
+        return response
+
+    account_id = getattr(request.state, "account_id", None)
+    if not account_id:
+        return s3_error_response(
+            code="AccessDenied",
+            message="Access Denied",
+            status_code=403,
+        )
+
+    acl_service: ACLService = request.app.state.acl_service
+
+    if x_amz_acl:
+        new_acl = acl_service.canned_acl_to_acl(x_amz_acl, account_id)
+    else:
+        body = await request.body()
+        if not body:
+            return s3_error_response(
+                code="MalformedACLError",
+                message="ACL XML body or x-amz-acl header required",
+                status_code=400,
+            )
+
+        try:
+            new_acl = xml_to_acl(body.decode("utf-8"))
+        except ET.ParseError:
+            return s3_error_response(
+                code="MalformedACLError",
+                message="The XML you provided was not well-formed",
+                status_code=400,
+            )
+        except ValueError as e:
+            return s3_error_response(
+                code="MalformedACLError",
+                message=str(e),
+                status_code=400,
+            )
+
+        if len(new_acl.grants) > 100:
+            return s3_error_response(
+                code="InvalidArgument",
+                message="ACL cannot have more than 100 grants",
+                status_code=400,
+            )
+
+        # Use request account_id as authoritative owner
+        # This prevents owner changes and ensures consistency
+        if new_acl.owner.id != account_id:
+            logger.warning(
+                f"ACL owner mismatch for object {bucket}/{key}: XML has {new_acl.owner.id}, using request account {account_id}"
+            )
+            new_acl.owner.id = account_id
+
+    await acl_service.acl_repo.set_object_acl(bucket, key, account_id, new_acl)
+
+    await acl_service.invalidate_cache(bucket, key)
+
+    return Response(status_code=200)

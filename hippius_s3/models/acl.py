@@ -2,6 +2,14 @@ from dataclasses import dataclass
 from enum import Enum
 
 
+class WellKnownGroups:
+    """AWS S3 predefined group URIs for ACL grants."""
+
+    ALL_USERS = "http://acs.amazonaws.com/groups/global/AllUsers"
+    AUTHENTICATED_USERS = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
+    LOG_DELIVERY = "http://acs.amazonaws.com/groups/s3/LogDelivery"
+
+
 class Permission(str, Enum):
     READ = "READ"
     WRITE = "WRITE"

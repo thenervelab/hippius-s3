@@ -24,13 +24,15 @@ class ACLRepository:
         if not row:
             return None
 
-        acl_dict = row["acl_json"]
-        return ACL.from_dict(acl_dict)
+        acl_data = row["acl_json"]
+        if isinstance(acl_data, str):
+            acl_data = json.loads(acl_data)
+        return ACL.from_dict(acl_data)
 
     async def set_bucket_acl(self, bucket_name: str, owner_id: str, acl: ACL) -> None:
         query = """
         INSERT INTO bucket_acls (bucket_name, owner_id, acl_json)
-        VALUES ($1, $2, $3)
+        VALUES ($1, $2, $3::jsonb)
         ON CONFLICT (bucket_name)
         DO UPDATE SET
             owner_id = EXCLUDED.owner_id,
@@ -56,13 +58,15 @@ class ACLRepository:
         if not row:
             return None
 
-        acl_dict = row["acl_json"]
-        return ACL.from_dict(acl_dict)
+        acl_data = row["acl_json"]
+        if isinstance(acl_data, str):
+            acl_data = json.loads(acl_data)
+        return ACL.from_dict(acl_data)
 
     async def set_object_acl(self, bucket_name: str, object_key: str, owner_id: str, acl: ACL) -> None:
         query = """
         INSERT INTO object_acls (bucket_name, object_key, owner_id, acl_json)
-        VALUES ($1, $2, $3, $4)
+        VALUES ($1, $2, $3, $4::jsonb)
         ON CONFLICT (bucket_name, object_key)
         DO UPDATE SET
             owner_id = EXCLUDED.owner_id,
@@ -88,7 +92,10 @@ class ACLRepository:
         rows = await self.db.fetch(query, owner_id)
         result = []
         for row in rows:
-            acl = ACL.from_dict(row["acl_json"])
+            acl_data = row["acl_json"]
+            if isinstance(acl_data, str):
+                acl_data = json.loads(acl_data)
+            acl = ACL.from_dict(acl_data)
             result.append((row["bucket_name"], acl))
         return result
 
@@ -102,6 +109,9 @@ class ACLRepository:
         rows = await self.db.fetch(query, bucket_name)
         result = []
         for row in rows:
-            acl = ACL.from_dict(row["acl_json"])
+            acl_data = row["acl_json"]
+            if isinstance(acl_data, str):
+                acl_data = json.loads(acl_data)
+            acl = ACL.from_dict(acl_data)
             result.append((row["object_key"], acl))
         return result

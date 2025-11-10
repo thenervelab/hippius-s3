@@ -1,4 +1,5 @@
 import logging
+import typing
 
 import httpx
 from fastapi import Request
@@ -21,16 +22,29 @@ class ForwardService:
     async def forward_request(self, request: Request) -> StreamingResponse:
         headers = dict(request.headers)
 
+        # SECURITY: Strip any client-provided X-Hippius-* headers to prevent header injection attacks
+        for key in list(headers.keys()):
+            if key.lower().startswith("x-hippius-"):
+                del headers[key]
+                logger.warning(f"Stripped client-provided header: {key}")
+
+        # Add authenticated context headers from gateway
         if hasattr(request.state, "account_id"):
-            headers["X-Hippius-Account-Id"] = request.state.account_id
+            headers["X-Hippius-Request-User"] = request.state.account_id
+
+        bucket_owner = getattr(request.state, "bucket_owner_id", None) or getattr(request.state, "account_id", "")
+        if bucket_owner:
+            headers["X-Hippius-Bucket-Owner"] = bucket_owner
+            headers["X-Hippius-Main-Account"] = bucket_owner
+
         if hasattr(request.state, "seed_phrase"):
             headers["X-Hippius-Seed"] = request.state.seed_phrase
         if hasattr(request.state, "account"):
-            headers["X-Hippius-Main-Account"] = request.state.account.main_account
             headers["X-Hippius-Has-Credits"] = str(request.state.account.has_credits)
             headers["X-Hippius-Can-Upload"] = str(request.state.account.upload)
             headers["X-Hippius-Can-Delete"] = str(request.state.account.delete)
 
+        # Remove proxy-related headers that shouldn't be forwarded
         for key in list(headers.keys()):
             if key.lower() in ["host", "x-forwarded-for", "x-forwarded-host"]:
                 del headers[key]
@@ -39,9 +53,7 @@ class ForwardService:
         if request.url.query:
             target_url += f"?{request.url.query}"
 
-        logger.debug(
-            f"Forwarding {request.method} {target_url} (original: {request.url.path}?{request.url.query})"
-        )
+        logger.debug(f"Forwarding {request.method} {target_url} (original: {request.url.path}?{request.url.query})")
 
         if request.method in ["GET", "HEAD", "DELETE"]:
             response = await self.client.request(
@@ -50,7 +62,8 @@ class ForwardService:
                 headers=headers,
             )
         else:
-            async def generate():
+
+            async def generate() -> typing.AsyncGenerator[bytes, None]:
                 async for chunk in request.stream():
                     yield chunk
 
@@ -72,6 +85,6 @@ class ForwardService:
             media_type=response.headers.get("content-type"),
         )
 
-    async def close(self):
+    async def close(self) -> None:
         await self.client.aclose()
         logger.info("ForwardService client closed")

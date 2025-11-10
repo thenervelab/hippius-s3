@@ -1,17 +1,30 @@
 import logging
+from typing import Any
+from typing import Callable
+from typing import Dict
 
 import asyncpg
 import redis.asyncio as redis
 from fastapi import FastAPI
 from fastapi import Request
+from fastapi import Response
 
 from gateway.config import get_config
+from gateway.middlewares.account import account_middleware
+from gateway.middlewares.acl import acl_middleware
+from gateway.middlewares.banhammer import BanHammerService
+from gateway.middlewares.banhammer import banhammer_middleware
+from gateway.middlewares.cors import cors_middleware
+from gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
+from gateway.middlewares.rate_limit import RateLimitService
+from gateway.middlewares.rate_limit import rate_limit_middleware
+from gateway.middlewares.sigv4 import sigv4_middleware
+from gateway.routers.acl import router as acl_router
+from gateway.services.acl_service import ACLService
 from gateway.services.forward_service import ForwardService
 
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +35,7 @@ def factory() -> FastAPI:
     app = FastAPI(title="Hippius S3 Gateway", version="1.0.0")
 
     @app.on_event("startup")
-    async def startup():
+    async def startup() -> None:
         logger.info("Starting Hippius S3 Gateway...")
 
         app.state.postgres_pool = await asyncpg.create_pool(config.database_url)
@@ -31,26 +44,33 @@ def factory() -> FastAPI:
         app.state.redis_client = redis.from_url(config.redis_url, decode_responses=False)
         logger.info("Connected to Redis")
 
-        app.state.redis_accounts = redis.from_url(
-            config.redis_accounts_url, decode_responses=False
-        )
+        app.state.redis_accounts = redis.from_url(config.redis_accounts_url, decode_responses=False)
         logger.info("Connected to Redis (accounts)")
 
         app.state.redis_chain = redis.from_url(config.redis_chain_url, decode_responses=False)
         logger.info("Connected to Redis (chain)")
 
-        app.state.redis_rate_limiting = redis.from_url(
-            config.redis_rate_limiting_url, decode_responses=False
-        )
+        app.state.redis_rate_limiting = redis.from_url(config.redis_rate_limiting_url, decode_responses=False)
         logger.info("Connected to Redis (rate limiting)")
 
         app.state.forward_service = ForwardService(config.backend_url)
         logger.info(f"ForwardService initialized with backend: {config.backend_url}")
 
+        app.state.rate_limit_service = RateLimitService(app.state.redis_rate_limiting)
+        logger.info("RateLimitService initialized")
+
+        app.state.banhammer_service = BanHammerService(app.state.redis_rate_limiting)
+        logger.info("BanHammerService initialized")
+
+        app.state.acl_service = ACLService(
+            db_pool=app.state.postgres_pool,
+        )
+        logger.info("ACLService initialized")
+
         logger.info("Gateway startup complete")
 
     @app.on_event("shutdown")
-    async def shutdown():
+    async def shutdown() -> None:
         logger.info("Shutting down Hippius S3 Gateway...")
 
         if hasattr(app.state, "forward_service"):
@@ -79,13 +99,42 @@ def factory() -> FastAPI:
         logger.info("Gateway shutdown complete")
 
     @app.get("/health")
-    async def health():
+    async def health() -> Dict[str, str]:
         return {"status": "healthy", "service": "gateway"}
 
+    app.include_router(acl_router)
+
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD", "PATCH"])
-    async def forward_all(request: Request, path: str):
+    async def forward_all(request: Request, path: str) -> Response:
         forward_service = request.app.state.forward_service
-        return await forward_service.forward_request(request)
+        return await forward_service.forward_request(request)  # type: ignore[no-any-return]
+
+    async def rate_limit_wrapper(request: Request, call_next: Callable) -> Response:
+        return await rate_limit_middleware(
+            request,
+            call_next,
+            request.app.state.rate_limit_service,
+            max_requests=config.rate_limit_per_minute,
+            window_seconds=60,
+        )
+
+    async def banhammer_wrapper(request: Request, call_next: Callable) -> Response:
+        return await banhammer_middleware(
+            request,
+            call_next,
+            request.app.state.banhammer_service,
+        )
+
+    # Register middleware in REVERSE order (outermost first)
+    # IMPORTANT: sigv4 must execute BEFORE account (so register AFTER)
+    app.middleware("http")(cors_middleware)
+    if config.enable_banhammer:
+        app.middleware("http")(banhammer_wrapper)
+    app.middleware("http")(verify_frontend_hmac_middleware)
+    app.middleware("http")(rate_limit_wrapper)
+    app.middleware("http")(acl_middleware)
+    app.middleware("http")(account_middleware)
+    app.middleware("http")(sigv4_middleware)
 
     return app
 
@@ -94,8 +143,8 @@ app = factory()
 
 
 if __name__ == "__main__":
+    import os
     import uvicorn
 
-    uvicorn.run(
-        "gateway.main:app", host="0.0.0.0", port=config.port, reload=False, access_log=True
-    )
+    debug_mode = os.getenv("DEBUG", "false").lower() == "true"
+    uvicorn.run("gateway.main:app", host="0.0.0.0", port=config.port, reload=debug_mode, access_log=True)

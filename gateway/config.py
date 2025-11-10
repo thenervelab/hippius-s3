@@ -8,14 +8,10 @@ logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class GatewayConfig:
-    backend_url: str = dataclasses.field(
-        default_factory=lambda: os.getenv("GATEWAY_BACKEND_URL", "http://api:8000")
-    )
+    backend_url: str = dataclasses.field(default_factory=lambda: os.getenv("GATEWAY_BACKEND_URL", "http://api:8000"))
     port: int = dataclasses.field(default_factory=lambda: int(os.getenv("GATEWAY_PORT", "8080")))
     database_url: str = dataclasses.field(default_factory=lambda: os.getenv("DATABASE_URL", ""))
-    redis_url: str = dataclasses.field(
-        default_factory=lambda: os.getenv("REDIS_URL", "redis://redis:6379/0")
-    )
+    redis_url: str = dataclasses.field(default_factory=lambda: os.getenv("REDIS_URL", "redis://redis:6379/0"))
     redis_accounts_url: str = dataclasses.field(
         default_factory=lambda: os.getenv("REDIS_ACCOUNTS_URL", "redis://redis-accounts:6379/0")
     )
@@ -23,13 +19,10 @@ class GatewayConfig:
         default_factory=lambda: os.getenv("REDIS_CHAIN_URL", "redis://redis-chain:6379/0")
     )
     redis_rate_limiting_url: str = dataclasses.field(
-        default_factory=lambda: os.getenv(
-            "REDIS_RATE_LIMITING_URL", "redis://redis-rate-limiting:6379/0"
-        )
+        default_factory=lambda: os.getenv("REDIS_RATE_LIMITING_URL", "redis://redis-rate-limiting:6379/0")
     )
-    hippius_chain_url: str = dataclasses.field(
-        default_factory=lambda: os.getenv("HIPPIUS_CHAIN_URL", "")
-    )
+    hippius_chain_url: str = dataclasses.field(default_factory=lambda: os.getenv("HIPPIUS_CHAIN_URL", ""))
+    substrate_url: str = dataclasses.field(default_factory=lambda: os.getenv("HIPPIUS_SUBSTRATE_URL", ""))
     enable_public_read: bool = dataclasses.field(
         default_factory=lambda: os.getenv("ENABLE_PUBLIC_READ", "false").lower() == "true"
     )
@@ -39,12 +32,11 @@ class GatewayConfig:
     bypass_credit_check: bool = dataclasses.field(
         default_factory=lambda: os.getenv("HIPPIUS_BYPASS_CREDIT_CHECK", "false").lower() == "true"
     )
-    frontend_hmac_secret: str = dataclasses.field(
-        default_factory=lambda: os.getenv("FRONTEND_HMAC_SECRET", "")
+    rate_limit_per_minute: int = dataclasses.field(
+        default_factory=lambda: int(os.getenv("HIPPIUS_RATE_LIMIT_PER_MINUTE", "7200"))
     )
-    validator_region: str = dataclasses.field(
-        default_factory=lambda: os.getenv("VALIDATOR_REGION", "decentralized")
-    )
+    frontend_hmac_secret: str = dataclasses.field(default_factory=lambda: os.getenv("FRONTEND_HMAC_SECRET", ""))
+    validator_region: str = dataclasses.field(default_factory=lambda: os.getenv("VALIDATOR_REGION", "decentralized"))
     acl_cache_ttl_seconds: int = dataclasses.field(
         default_factory=lambda: int(os.getenv("ACL_CACHE_TTL_SECONDS", "300"))
     )

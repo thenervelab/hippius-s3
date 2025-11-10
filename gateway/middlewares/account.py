@@ -1,0 +1,136 @@
+"""Account verification and credit checking middleware for the gateway."""
+
+import hashlib
+import logging
+import re
+from typing import Callable
+
+from fastapi import Request
+from fastapi import Response
+from starlette import status
+
+from gateway.config import get_config
+from gateway.services.account_service import BadAccount
+from gateway.services.account_service import InvalidSeedPhraseError
+from gateway.services.account_service import MainAccountError
+from gateway.services.account_service import fetch_account
+from gateway.utils.errors import s3_error_response
+from hippius_s3.models.account import HippiusAccount
+
+
+config = get_config()
+logger = logging.getLogger(__name__)
+
+
+async def account_middleware(request: Request, call_next: Callable) -> Response:
+    """
+    Middleware to check if the account has enough credit for any S3 operation.
+
+    This middleware intercepts all requests and creates the account object.
+    For operations that modify state (PUT, POST, DELETE), it also checks if
+    the account has enough credit. If not, it returns a 402 Payment Required response.
+
+    Read operations (GET, HEAD) get the account object but skip credit checks.
+    """
+    path = request.url.path
+
+    # Test bypass: short-circuit credit and substrate/redis access entirely
+    if config.bypass_credit_check:
+        # Derive unique account ID from seed phrase if available
+        if hasattr(request.state, "seed_phrase"):
+            seed_phrase = request.state.seed_phrase
+            # Use SHA256 hash to derive deterministic account ID (like AWS canonical ID)
+            seed_hash = hashlib.sha256(seed_phrase.encode()).digest()
+            # Format as SS58-like address (5 prefix + 46 hex chars)
+            account_id = f"5{seed_hash.hex()[:46]}"
+            logger.info(
+                f"DEBUG_ACL: Derived account_id from seed phrase: account_id={account_id}, seed_preview={seed_phrase[:20]}..."
+            )
+        else:
+            # No authentication provided - anonymous access
+            account_id = "anonymous"
+            logger.info(f"DEBUG_ACL: No seed phrase, using anonymous account_id")
+
+        request.state.account_id = account_id
+        request.state.account = HippiusAccount(
+            id=account_id,
+            main_account=account_id,
+            has_credits=True,
+            upload=True,
+            delete=True,
+        )
+        response: Response = await call_next(request)
+        return response
+
+    # Skip credit checks for frontend user endpoints, docs, and metrics
+    if (
+        path.startswith("/user/")
+        or path in ["/docs", "/openapi.json", "/redoc", "/metrics"]
+        or path.startswith("/docs/")
+    ):
+        resp: Response = await call_next(request)
+        return resp
+
+    # Check if we have a seed phrase in request.state (set by SigV4 middleware)
+    if hasattr(request.state, "seed_phrase"):
+        seed_phrase = request.state.seed_phrase
+
+        try:
+            redis_accounts_client = request.app.state.redis_accounts
+            request.state.account = await fetch_account(
+                seed_phrase,
+                redis_accounts_client,
+                config.substrate_url,
+            )
+
+            request.state.account_id = request.state.account.main_account
+
+            # Only check permissions and credits for operations that modify state
+            if request.method in ["PUT", "POST", "DELETE"]:
+                logger.debug(f"Checking credit for {request.method} operation: {path}")
+
+                if not request.state.account.delete and request.method == "DELETE":
+                    raise BadAccount("This account does not have DELETE permissions")
+
+                if not request.state.account.has_credits:
+                    logger.warning(f"Account does not have credit for {request.method} operation: {path}")
+                    # Extract bucket name for better error response
+                    bucket_name = None
+                    bucket_match = re.match(r"^/([^/]+)", path)
+                    if bucket_match:
+                        bucket_name = bucket_match.group(1)
+
+                    return s3_error_response(
+                        code="InsufficientAccountCredit",
+                        message="The account does not have sufficient credit to perform this operation",
+                        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                        BucketName=bucket_name if bucket_name else "",
+                    )
+        except MainAccountError as e:
+            return s3_error_response(
+                code="InvalidAccessKeyId",
+                message=str(e),
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+        except InvalidSeedPhraseError:
+            return s3_error_response(
+                code="InvalidAccessKeyId",
+                message="The AWS Access Key Id you provided does not exist in our records.",
+                status_code=403,
+            )
+        except BadAccount as e:
+            return s3_error_response(
+                code="AccountVerificationError",
+                message=str(e),
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except Exception as e:
+            logger.exception(f"Error in account verification for {request.method} {path}: {e}")
+
+            return s3_error_response(
+                code="AccountVerificationError",
+                message="Something went wrong when verifying your account. Please try again later.",
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+    # Continue with the request
+    return await call_next(request)  # type: ignore[no-any-return]

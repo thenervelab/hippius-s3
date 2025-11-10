@@ -34,16 +34,15 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
     if "lifecycle" in request.query_params:
         try:
             # Get user for user-scoped bucket lookup
-            user = await db.fetchrow(
+            _ = await db.fetchrow(
                 get_query("get_or_create_user_by_main_account"),
                 request.state.account.main_account,
                 datetime.now(timezone.utc),
             )
 
             bucket = await db.fetchrow(
-                get_query("get_bucket_by_name_and_owner"),
+                get_query("get_bucket_by_name"),
                 bucket_name,
-                user["main_account_id"],
             )
 
             if not bucket:
@@ -101,7 +100,7 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
     elif "tagging" in request.query_params:
         try:
             # Get user for user-scoped bucket lookup
-            user = await db.fetchrow(
+            _ = await db.fetchrow(
                 get_query("get_or_create_user_by_main_account"),
                 request.state.account.main_account,
                 datetime.now(timezone.utc),
@@ -109,9 +108,8 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
 
             # First check if the bucket exists
             bucket = await db.fetchrow(
-                get_query("get_bucket_by_name_and_owner"),
+                get_query("get_bucket_by_name"),
                 bucket_name,
-                user["main_account_id"],
             )
 
             if not bucket:
@@ -177,19 +175,13 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
     # Handle standard bucket creation if not a tagging, lifecycle, or policy request
     else:
         try:
-            # Reject ACLs to match AWS when ObjectOwnership is BucketOwnerEnforced
-            acl_header = request.headers.get("x-amz-acl")
-            if acl_header:
-                return errors.s3_error_response(
-                    "InvalidBucketAclWithObjectOwnership",
-                    "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting",
-                    status_code=400,
-                )
+            # ACL headers are now handled by the gateway, backend just ignores them
+            # Gateway creates appropriate ACL entries in database after bucket creation
 
             bucket_id = str(uuid.uuid4())
             created_at = datetime.now(timezone.utc)
 
-            # Bucket public/private is managed via policy, not ACL
+            # Legacy field for backward compatibility - always false (ACLs handle access control)
             is_public = False
 
             # Get or create user record for the main account

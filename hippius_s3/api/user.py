@@ -85,9 +85,8 @@ async def get_bucket_location(
     """
     try:
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
+            get_query("get_bucket_by_name"),
             bucket_name,
-            main_account_id,
         )
 
         if not bucket:
@@ -173,9 +172,8 @@ async def list_objects(
     """
     try:
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
+            get_query("get_bucket_by_name"),
             bucket_name,
-            main_account_id,
         )
 
         if not bucket:

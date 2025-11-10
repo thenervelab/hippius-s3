@@ -181,7 +181,7 @@ services:
     ports:
       - "4001:4001" # IPFS swarm port
       - "5001:5001" # IPFS API port
-      - "8080:8080" # IPFS gateway port
+      - "8081:8080" # IPFS gateway port (moved from 8080 to avoid conflict with gateway)
     volumes:
       - ipfs_data:/data/ipfs
     restart: unless-stopped

@@ -33,9 +33,8 @@ async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redi
 
             # Get bucket for this main account
             bucket = await db.fetchrow(
-                get_query("get_bucket_by_name_and_owner"),
+                get_query("get_bucket_by_name"),
                 bucket_name,
-                main_account_id,
             )
 
             if not bucket:
@@ -69,9 +68,8 @@ async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redi
         # Get bucket for this main account
         main_account_id = request.state.account.main_account
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
+            get_query("get_bucket_by_name"),
             bucket_name,
-            main_account_id,
         )
 
         if not bucket:
@@ -109,11 +107,7 @@ async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redi
             )
 
         # Delete bucket (permission is checked via main_account_id ownership)
-        deleted_bucket = await db.fetchrow(
-            get_query("delete_bucket"),
-            bucket["bucket_id"],
-            main_account_id,
-        )
+        deleted_bucket = await db.fetchrow(get_query("delete_bucket"), bucket["bucket_id"])
 
         if not deleted_bucket:
             logger.warning(f"Account {main_account_id} tried to delete bucket {bucket_name} without permission")
