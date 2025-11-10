@@ -214,7 +214,7 @@ async def proxy_app(proxy_db_pool: asyncpg.Pool, proxy_redis_clients: dict[str, 
 
 
 @pytest.fixture
-async def proxy_client(proxy_app: Any) -> AsyncGenerator[AsyncClient, None]:
+async def gateway_client(proxy_app: Any) -> AsyncGenerator[AsyncClient, None]:
     """Create an async test client for the proxy."""
     transport = ASGITransport(app=proxy_app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
