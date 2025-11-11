@@ -49,7 +49,7 @@ async def account_middleware(request: Request, call_next: Callable) -> Response:
         else:
             # No authentication provided - anonymous access
             account_id = "anonymous"
-            logger.info(f"DEBUG_ACL: No seed phrase, using anonymous account_id")
+            logger.info("DEBUG_ACL: No seed phrase, using anonymous account_id")
 
         request.state.account_id = account_id
         request.state.account = HippiusAccount(

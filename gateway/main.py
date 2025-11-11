@@ -1,5 +1,4 @@
 import logging
-from typing import Any
 from typing import Callable
 from typing import Dict
 
@@ -144,6 +143,7 @@ app = factory()
 
 if __name__ == "__main__":
     import os
+
     import uvicorn
 
     debug_mode = os.getenv("DEBUG", "false").lower() == "true"

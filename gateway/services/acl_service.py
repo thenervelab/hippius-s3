@@ -124,15 +124,15 @@ class ACLService:
             )
 
         if account_id and acl.owner.id == account_id:
-            logger.info(f"DEBUG_ACL: Access GRANTED (owner match): account_id matches owner_id")
+            logger.info("DEBUG_ACL: Access GRANTED (owner match): account_id matches owner_id")
             return True
 
         for grant in acl.grants:
             if self._grant_matches(grant, account_id) and self._permission_implies(grant.permission, permission):
-                logger.info(f"DEBUG_ACL: Access GRANTED (grant match): grant matches account")
+                logger.info("DEBUG_ACL: Access GRANTED (grant match): grant matches account")
                 return True
 
-        logger.info(f"DEBUG_ACL: Access DENIED: no matching owner or grant")
+        logger.info("DEBUG_ACL: Access DENIED: no matching owner or grant")
         return False
 
     async def get_effective_acl(self, bucket: str, key: str | None) -> ACL:

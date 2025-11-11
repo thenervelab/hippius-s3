@@ -2,8 +2,6 @@
 
 from typing import Optional
 
-from mnemonic import Mnemonic
-
 
 class SubstrateClient:
     """
@@ -49,7 +47,6 @@ class SubstrateClient:
         """
         from substrateinterface import SubstrateInterface
 
-        print(f"Connecting to Substrate node at {self.url}...")
         self._substrate = SubstrateInterface(
             url=self.url,
             ss58_format=42,
@@ -58,13 +55,10 @@ class SubstrateClient:
 
         if self._ensure_keypair(seed_phrase):
             assert self._keypair is not None
-            print(f"Connected successfully. Account address: {self._keypair.ss58_address}")
             self._read_only = False
         elif self._account_address:
-            print(f"Connected successfully in read-only mode. Account address: {self._account_address}")
             self._read_only = True
         else:
-            print("Connected successfully (read-only mode, no account)")
             self._read_only = True
 
     def _ensure_keypair(self, seed_phrase: Optional[str] = None) -> bool:
@@ -115,8 +109,6 @@ class SubstrateClient:
 
         assert self._substrate is not None
         result = self._substrate.query(module="SubAccount", storage_function="SubAccount", params=[account_id])
-
-        print(f"Got SubAccount result {result=}")
 
         if result and hasattr(result, "value") and result.value:
             return str(result.value)
