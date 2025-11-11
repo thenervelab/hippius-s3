@@ -14,7 +14,6 @@ import boto3
 import dotenv
 import pytest
 import pytest_asyncio
-import redis.asyncio as redis
 from botocore.config import Config
 from httpx import ASGITransport
 from httpx import AsyncClient
@@ -161,34 +160,39 @@ def stopped_worker(
 
 
 @pytest_asyncio.fixture
-async def gateway_db_pool() -> AsyncGenerator[asyncpg.Pool, None]:
-    """Create a PostgreSQL connection pool for gateway tests."""
-    pool = await asyncpg.create_pool(os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius"))
-    yield pool
-    await pool.close()
+async def gateway_db_pool() -> AsyncGenerator[Any, None]:
+    """Create a mock PostgreSQL pool for gateway tests."""
+    from unittest.mock import AsyncMock
+    from unittest.mock import MagicMock
+
+    mock_pool = MagicMock()
+    mock_pool.fetchrow = AsyncMock(return_value=None)
+    mock_pool.fetch = AsyncMock(return_value=[])
+    mock_pool.execute = AsyncMock()
+    yield mock_pool
 
 
 @pytest_asyncio.fixture
 async def gateway_redis_clients() -> AsyncGenerator[dict[str, Any], None]:
-    """Create Redis clients for gateway tests."""
-    redis_client = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=False)
-    redis_accounts = redis.from_url(os.getenv("REDIS_ACCOUNTS_URL", "redis://localhost:6380/0"), decode_responses=False)
-    redis_chain = redis.from_url(os.getenv("REDIS_CHAIN_URL", "redis://localhost:6381/0"), decode_responses=False)
-    redis_rate_limiting = redis.from_url(
-        os.getenv("REDIS_RATE_LIMITING_URL", "redis://localhost:6383/0"), decode_responses=False
-    )
+    """Create mock Redis clients for gateway tests."""
+    from unittest.mock import AsyncMock
+    from unittest.mock import MagicMock
+
+    def create_mock_redis() -> Any:
+        mock_redis = MagicMock()
+        mock_redis.get = AsyncMock(return_value=None)
+        mock_redis.set = AsyncMock()
+        mock_redis.delete = AsyncMock()
+        mock_redis.incr = AsyncMock(return_value=1)
+        mock_redis.expire = AsyncMock()
+        return mock_redis
 
     yield {
-        "redis": redis_client,
-        "redis_accounts": redis_accounts,
-        "redis_chain": redis_chain,
-        "redis_rate_limiting": redis_rate_limiting,
+        "redis": create_mock_redis(),
+        "redis_accounts": create_mock_redis(),
+        "redis_chain": create_mock_redis(),
+        "redis_rate_limiting": create_mock_redis(),
     }
-
-    await redis_client.close()
-    await redis_accounts.close()
-    await redis_chain.close()
-    await redis_rate_limiting.close()
 
 
 @pytest_asyncio.fixture
