@@ -18,7 +18,7 @@ services:
       - .env
     depends_on:
       api:
-        condition: service_started
+        condition: service_healthy
       db:
         condition: service_healthy
       redis:
@@ -66,6 +66,12 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - DEBUG=true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/ || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     networks:
       - hippius_net
 
