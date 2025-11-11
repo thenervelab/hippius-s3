@@ -106,12 +106,18 @@ async def acl_middleware(
 
     check_key = key if permission in [Permission.READ, Permission.READ_ACP] else None
 
-    has_permission = await acl_service.check_permission(
-        account_id=account_id,
-        bucket=bucket,
-        key=check_key,
-        permission=permission,
-    )
+    try:
+        has_permission = await acl_service.check_permission(
+            account_id=account_id,
+            bucket=bucket,
+            key=check_key,
+            permission=permission,
+        )
+    except ValueError as e:
+        if "Bucket not found" in str(e):
+            logger.info(f"Bucket not found in ACL check: {bucket}, passing through to backend for proper S3 error")
+            return await call_next(request)
+        raise
 
     if not has_permission:
         logger.info(f"Access denied: account={account_id}, bucket={bucket}, key={key}, permission={permission.value}")
@@ -122,6 +128,10 @@ async def acl_middleware(
         )
 
     bucket_owner_id = await acl_service.get_bucket_owner(bucket)
-    request.state.bucket_owner_id = bucket_owner_id or account_id
+    if bucket_owner_id is None:
+        logger.info(f"Bucket not found in ACL check: {bucket}, passing through to backend for proper S3 error")
+        return await call_next(request)
+
+    request.state.bucket_owner_id = bucket_owner_id
 
     return await call_next(request)
