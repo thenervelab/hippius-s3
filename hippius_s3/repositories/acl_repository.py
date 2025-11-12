@@ -115,3 +115,14 @@ class ACLRepository:
             acl = ACL.from_dict(acl_data)
             result.append((row["object_key"], acl))
         return result
+
+    async def object_exists(self, bucket_name: str, object_key: str) -> bool:
+        """Check if an object exists in the database."""
+        query = """
+        SELECT 1 FROM objects o
+        JOIN buckets b ON o.bucket_id = b.bucket_id
+        WHERE b.bucket_name = $1 AND o.object_key = $2
+        LIMIT 1
+        """
+        row = await self.db.fetchrow(query, bucket_name, object_key)
+        return row is not None

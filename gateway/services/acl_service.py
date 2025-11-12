@@ -20,7 +20,7 @@ class ACLService:
         self.acl_repo = ACLRepository(db_pool)
         logger.info("ACLService initialized (direct DB queries, no caching)")
 
-    def canned_acl_to_acl(self, canned_acl: str, owner_id: str) -> ACL:
+    async def canned_acl_to_acl(self, canned_acl: str, owner_id: str, bucket: str | None = None) -> ACL:
         """Convert canned ACL name to ACL object with grants."""
         if canned_acl == "private":
             return ACL(
@@ -78,6 +78,82 @@ class ACLService:
                     ),
                 ],
             )
+        if canned_acl == "log-delivery-write":
+            return ACL(
+                owner=Owner(id=owner_id),
+                grants=[
+                    Grant(
+                        grantee=Grantee(type=GranteeType.CANONICAL_USER, id=owner_id),
+                        permission=Permission.FULL_CONTROL,
+                    ),
+                    Grant(
+                        grantee=Grantee(type=GranteeType.GROUP, uri=WellKnownGroups.LOG_DELIVERY),
+                        permission=Permission.WRITE,
+                    ),
+                    Grant(
+                        grantee=Grantee(type=GranteeType.GROUP, uri=WellKnownGroups.LOG_DELIVERY),
+                        permission=Permission.READ_ACP,
+                    ),
+                ],
+            )
+        if canned_acl == "aws-exec-read":
+            return ACL(
+                owner=Owner(id=owner_id),
+                grants=[
+                    Grant(
+                        grantee=Grantee(type=GranteeType.CANONICAL_USER, id=owner_id),
+                        permission=Permission.FULL_CONTROL,
+                    ),
+                    Grant(
+                        grantee=Grantee(type=GranteeType.GROUP, uri=WellKnownGroups.AWS_EC2),
+                        permission=Permission.READ,
+                    ),
+                ],
+            )
+        if canned_acl == "bucket-owner-read":
+            if not bucket:
+                raise ValueError("bucket-owner-read requires bucket parameter")
+
+            bucket_owner_id = await self.get_bucket_owner(bucket)
+
+            grants = [
+                Grant(
+                    grantee=Grantee(type=GranteeType.CANONICAL_USER, id=owner_id),
+                    permission=Permission.FULL_CONTROL,
+                ),
+            ]
+
+            if bucket_owner_id and bucket_owner_id != owner_id:
+                grants.append(
+                    Grant(
+                        grantee=Grantee(type=GranteeType.CANONICAL_USER, id=bucket_owner_id),
+                        permission=Permission.READ,
+                    )
+                )
+
+            return ACL(owner=Owner(id=owner_id), grants=grants)
+        if canned_acl == "bucket-owner-full-control":
+            if not bucket:
+                raise ValueError("bucket-owner-full-control requires bucket parameter")
+
+            bucket_owner_id = await self.get_bucket_owner(bucket)
+
+            grants = [
+                Grant(
+                    grantee=Grantee(type=GranteeType.CANONICAL_USER, id=owner_id),
+                    permission=Permission.FULL_CONTROL,
+                ),
+            ]
+
+            if bucket_owner_id and bucket_owner_id != owner_id:
+                grants.append(
+                    Grant(
+                        grantee=Grantee(type=GranteeType.CANONICAL_USER, id=bucket_owner_id),
+                        permission=Permission.FULL_CONTROL,
+                    )
+                )
+
+            return ACL(owner=Owner(id=owner_id), grants=grants)
         raise ValueError(f"Unknown canned ACL: {canned_acl}")
 
     def _grant_matches(self, grant: Grant, account_id: str | None) -> bool:
@@ -154,7 +230,7 @@ class ACLService:
         if not owner_id:
             raise ValueError(f"Bucket not found: {bucket}")
 
-        return self.canned_acl_to_acl("private", owner_id)
+        return await self.canned_acl_to_acl("private", owner_id, bucket)
 
     async def invalidate_cache(self, bucket: str, key: str | None = None) -> None:
         """No-op: caching removed for simplicity and consistency."""

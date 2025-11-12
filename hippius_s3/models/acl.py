@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 from enum import Enum
 
@@ -8,6 +9,7 @@ class WellKnownGroups:
     ALL_USERS = "http://acs.amazonaws.com/groups/global/AllUsers"
     AUTHENTICATED_USERS = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
     LOG_DELIVERY = "http://acs.amazonaws.com/groups/s3/LogDelivery"
+    AWS_EC2 = "http://acs.amazonaws.com/groups/ec2/AmazonEC2"
 
 
 class Permission(str, Enum):
@@ -101,3 +103,32 @@ class ACL:
             )
             grants.append(grant)
         return cls(owner=owner, grants=grants)
+
+
+def validate_grant_grantees(acl: ACL) -> None:
+    """Validate that all grantees in an ACL have valid IDs and URIs.
+
+    Raises ValueError if any grantee has invalid data.
+    """
+    canonical_id_pattern = re.compile(r"^[a-f0-9]{64}$")
+    valid_group_uris = {
+        WellKnownGroups.ALL_USERS,
+        WellKnownGroups.AUTHENTICATED_USERS,
+        WellKnownGroups.LOG_DELIVERY,
+        WellKnownGroups.AWS_EC2,
+    }
+
+    for grant in acl.grants:
+        grantee = grant.grantee
+
+        if grantee.type == GranteeType.CANONICAL_USER:
+            if not grantee.id:
+                raise ValueError("CanonicalUser grantee must have id")
+            if not canonical_id_pattern.match(grantee.id):
+                raise ValueError(f"Invalid canonical user ID: {grantee.id}. Must be 64-character hex string.")
+
+        elif grantee.type == GranteeType.GROUP:
+            if not grantee.uri:
+                raise ValueError("Group grantee must have uri")
+            if grantee.uri not in valid_group_uris:
+                raise ValueError(f"Invalid group URI: {grantee.uri}. Must be one of: {', '.join(valid_group_uris)}")

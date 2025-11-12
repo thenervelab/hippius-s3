@@ -29,12 +29,14 @@ services:
         condition: service_healthy
       redis-rate-limiting:
         condition: service_healthy
+    volumes:
+      - .:/app
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
       - GATEWAY_BACKEND_URL=http://api:8000
       - GATEWAY_PORT=8080
-      - HIPPIUS_BYPASS_CREDIT_CHECK=true
+      - HIPPIUS_BYPASS_CREDIT_CHECK=false
     networks:
       - hippius_net
 
@@ -65,7 +67,6 @@ services:
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
-      - DEBUG=true
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/ || exit 1"]
       interval: 5s
@@ -401,6 +402,26 @@ services:
       - PYTHONUNBUFFERED=1
       - WORKER_SCRIPT=workers/chain_profile_cacher.py
       - ENABLE_WATCHFILES=true
+    networks:
+      - hippius_net
+
+  account-cacher:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    depends_on:
+      redis-accounts:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - WORKER_SCRIPT=workers/run_account_cacher_in_loop.py
+      - ENABLE_WATCHFILES=true
+    env_file:
+      - .env.defaults
+      - .env
+    volumes:
+      - .:/app
     networks:
       - hippius_net
 
