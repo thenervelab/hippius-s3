@@ -467,6 +467,7 @@ class TestPutBucketAcl:
         mock_db_pool = MagicMock()
         mock_service = ACLService(mock_db_pool)
         mock_service.acl_repo = AsyncMock()
+        mock_service.acl_repo.bucket_exists = AsyncMock(return_value=True)
         mock_service.invalidate_cache = AsyncMock()  # type: ignore[method-assign]
 
         app = FastAPI()

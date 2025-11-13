@@ -102,9 +102,7 @@ def _should_trace(path: str) -> bool:
         return False
     if path.startswith("/openapi.json"):
         return False
-    if path == "/robots.txt":
-        return False
-    return True
+    return path != "/robots.txt"
 
 
 def _get_operation_name(request: Request) -> str:
