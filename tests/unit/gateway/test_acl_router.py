@@ -464,11 +464,41 @@ class TestGetObjectAcl:
 @pytest.mark.asyncio
 class TestPutBucketAcl:
     async def test_put_bucket_acl_with_canned_acl_header(self) -> None:
+        from hippius_s3.models.acl import ACL
+        from hippius_s3.models.acl import Owner
+
         mock_db_pool = MagicMock()
         mock_service = ACLService(mock_db_pool)
         mock_service.acl_repo = AsyncMock()
         mock_service.acl_repo.bucket_exists = AsyncMock(return_value=True)
         mock_service.invalidate_cache = AsyncMock()  # type: ignore[method-assign]
+        mock_service.get_bucket_owner = AsyncMock(return_value="5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty")  # type: ignore[method-assign]
+
+        from hippius_s3.models.acl import Grant
+        from hippius_s3.models.acl import Grantee
+        from hippius_s3.models.acl import GranteeType
+        from hippius_s3.models.acl import Permission
+
+        mock_existing_acl = ACL(owner=Owner(id="5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"), grants=[])
+
+        mock_public_read_acl = ACL(
+            owner=Owner(id="5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"),
+            grants=[
+                Grant(
+                    grantee=Grantee(
+                        type=GranteeType.CANONICAL_USER, id="5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+                    ),
+                    permission=Permission.FULL_CONTROL,
+                ),
+                Grant(
+                    grantee=Grantee(type=GranteeType.GROUP, uri="http://acs.amazonaws.com/groups/global/AllUsers"),
+                    permission=Permission.READ,
+                ),
+            ],
+        )
+
+        mock_service.get_effective_acl = AsyncMock(return_value=mock_existing_acl)  # type: ignore[method-assign]
+        mock_service.canned_acl_to_acl = AsyncMock(return_value=mock_public_read_acl)  # type: ignore[method-assign]
 
         app = FastAPI()
         app.state.acl_service = mock_service
@@ -604,9 +634,16 @@ class TestPutBucketAcl:
 @pytest.mark.asyncio
 class TestPutObjectAcl:
     async def test_put_object_acl_with_canned_acl_header(self) -> None:
+        from hippius_s3.models.acl import ACL
+        from hippius_s3.models.acl import Owner
+
         mock_service = AsyncMock()
         mock_repo = AsyncMock()
         mock_service.acl_repo = mock_repo
+        mock_repo.object_exists = AsyncMock(return_value=True)
+
+        mock_existing_acl = ACL(owner=Owner(id="5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"), grants=[])
+        mock_service.get_effective_acl = AsyncMock(return_value=mock_existing_acl)  # type: ignore[method-assign]
 
         app = FastAPI()
         app.state.acl_service = mock_service
