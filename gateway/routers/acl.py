@@ -79,24 +79,30 @@ def parse_grant_header(header_value: str, permission: Permission) -> list[Grant]
 
         if part.startswith('id="'):
             grantee_id = part[4:-1]
-            grants.append(Grant(
-                grantee=Grantee(type=GranteeType.CANONICAL_USER, id=grantee_id),
-                permission=permission,
-            ))
+            grants.append(
+                Grant(
+                    grantee=Grantee(type=GranteeType.CANONICAL_USER, id=grantee_id),
+                    permission=permission,
+                )
+            )
 
         elif part.startswith('uri="'):
             uri = part[5:-1]
-            grants.append(Grant(
-                grantee=Grantee(type=GranteeType.GROUP, uri=uri),
-                permission=permission,
-            ))
+            grants.append(
+                Grant(
+                    grantee=Grantee(type=GranteeType.GROUP, uri=uri),
+                    permission=permission,
+                )
+            )
 
         elif part.startswith('emailAddress="'):
             email = part[14:-1]
-            grants.append(Grant(
-                grantee=Grantee(type=GranteeType.AMAZON_CUSTOMER_BY_EMAIL, email_address=email),
-                permission=permission,
-            ))
+            grants.append(
+                Grant(
+                    grantee=Grantee(type=GranteeType.AMAZON_CUSTOMER_BY_EMAIL, email_address=email),
+                    permission=permission,
+                )
+            )
 
     return grants
 
@@ -251,12 +257,25 @@ async def put_bucket_acl(
     x_amz_grant_full_control: str | None = Header(None, alias="x-amz-grant-full-control"),
 ) -> Response:
     """Set bucket ACL - S3 API compatible. Handles both ?acl and x-amz-acl header."""
-    logger.info(f"DEBUG_ACL_ROUTE: PUT bucket ACL - bucket={bucket}, acl_query={repr(acl)}, x_amz_acl_header={repr(x_amz_acl)}")
-    logger.info(f"DEBUG_ACL_ROUTE: Grant headers - read={repr(x_amz_grant_read)}, write={repr(x_amz_grant_write)}, read_acp={repr(x_amz_grant_read_acp)}, write_acp={repr(x_amz_grant_write_acp)}, full_control={repr(x_amz_grant_full_control)}")
+    logger.info(
+        f"DEBUG_ACL_ROUTE: PUT bucket ACL - bucket={bucket}, acl_query={repr(acl)}, x_amz_acl_header={repr(x_amz_acl)}"
+    )
+    logger.info(
+        f"DEBUG_ACL_ROUTE: Grant headers - read={repr(x_amz_grant_read)}, write={repr(x_amz_grant_write)}, read_acp={repr(x_amz_grant_read_acp)}, write_acp={repr(x_amz_grant_write_acp)}, full_control={repr(x_amz_grant_full_control)}"
+    )
     if acl is None:
         # Validate canned ACL BEFORE forwarding to backend to prevent orphan buckets
         if x_amz_acl:
-            VALID_CANNED_ACLS = {"private", "public-read", "public-read-write", "authenticated-read", "log-delivery-write", "aws-exec-read", "bucket-owner-read", "bucket-owner-full-control"}
+            VALID_CANNED_ACLS = {
+                "private",
+                "public-read",
+                "public-read-write",
+                "authenticated-read",
+                "log-delivery-write",
+                "aws-exec-read",
+                "bucket-owner-read",
+                "bucket-owner-full-control",
+            }
             if x_amz_acl not in VALID_CANNED_ACLS:
                 return s3_error_response(
                     code="InvalidArgument",
@@ -301,8 +320,9 @@ async def put_bucket_acl(
 
     acl_service: ACLService = request.app.state.acl_service
 
-    has_grant_headers = any([x_amz_grant_read, x_amz_grant_write, x_amz_grant_read_acp,
-                              x_amz_grant_write_acp, x_amz_grant_full_control])
+    has_grant_headers = any(
+        [x_amz_grant_read, x_amz_grant_write, x_amz_grant_read_acp, x_amz_grant_write_acp, x_amz_grant_full_control]
+    )
 
     if x_amz_acl and has_grant_headers:
         return s3_error_response(
@@ -314,10 +334,12 @@ async def put_bucket_acl(
     if x_amz_acl:
         new_acl = await acl_service.canned_acl_to_acl(x_amz_acl, account_id, bucket)
     elif has_grant_headers:
-        grants = [Grant(
-            grantee=Grantee(type=GranteeType.CANONICAL_USER, id=account_id),
-            permission=Permission.FULL_CONTROL,
-        )]
+        grants = [
+            Grant(
+                grantee=Grantee(type=GranteeType.CANONICAL_USER, id=account_id),
+                permission=Permission.FULL_CONTROL,
+            )
+        ]
 
         if x_amz_grant_read:
             grants.extend(parse_grant_header(x_amz_grant_read, Permission.READ))
@@ -400,11 +422,22 @@ async def put_object_acl(
     x_amz_grant_full_control: str | None = Header(None, alias="x-amz-grant-full-control"),
 ) -> Response:
     """Set object ACL - S3 API compatible. Handles both ?acl and x-amz-acl header."""
-    logger.info(f"DEBUG_ACL_ROUTE: PUT object ACL - bucket={bucket}, key={key}, acl_query={repr(acl)}, x_amz_acl_header={repr(x_amz_acl)}")
+    logger.info(
+        f"DEBUG_ACL_ROUTE: PUT object ACL - bucket={bucket}, key={key}, acl_query={repr(acl)}, x_amz_acl_header={repr(x_amz_acl)}"
+    )
     if acl is None:
         # Validate canned ACL BEFORE forwarding to backend to prevent orphan objects
         if x_amz_acl:
-            VALID_CANNED_ACLS = {"private", "public-read", "public-read-write", "authenticated-read", "log-delivery-write", "aws-exec-read", "bucket-owner-read", "bucket-owner-full-control"}
+            VALID_CANNED_ACLS = {
+                "private",
+                "public-read",
+                "public-read-write",
+                "authenticated-read",
+                "log-delivery-write",
+                "aws-exec-read",
+                "bucket-owner-read",
+                "bucket-owner-full-control",
+            }
             if x_amz_acl not in VALID_CANNED_ACLS:
                 return s3_error_response(
                     code="InvalidArgument",
@@ -459,8 +492,9 @@ async def put_object_acl(
             status_code=404,
         )
 
-    has_grant_headers = any([x_amz_grant_read, x_amz_grant_write, x_amz_grant_read_acp,
-                              x_amz_grant_write_acp, x_amz_grant_full_control])
+    has_grant_headers = any(
+        [x_amz_grant_read, x_amz_grant_write, x_amz_grant_read_acp, x_amz_grant_write_acp, x_amz_grant_full_control]
+    )
 
     if x_amz_acl and has_grant_headers:
         return s3_error_response(
@@ -472,10 +506,12 @@ async def put_object_acl(
     if x_amz_acl:
         new_acl = await acl_service.canned_acl_to_acl(x_amz_acl, account_id, bucket)
     elif has_grant_headers:
-        grants = [Grant(
-            grantee=Grantee(type=GranteeType.CANONICAL_USER, id=account_id),
-            permission=Permission.FULL_CONTROL,
-        )]
+        grants = [
+            Grant(
+                grantee=Grantee(type=GranteeType.CANONICAL_USER, id=account_id),
+                permission=Permission.FULL_CONTROL,
+            )
+        ]
 
         if x_amz_grant_read:
             grants.extend(parse_grant_header(x_amz_grant_read, Permission.READ))
