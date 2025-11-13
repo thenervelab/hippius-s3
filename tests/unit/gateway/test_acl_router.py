@@ -261,45 +261,54 @@ class TestParseCannedAclHeader:
         mock_db_pool = MagicMock()
         return ACLService(mock_db_pool)
 
-    def test_parse_private(self, acl_service: Any) -> None:
-        acl = acl_service.canned_acl_to_acl("private", "owner-123")
+    @pytest.mark.asyncio
+    async def test_parse_private(self, acl_service: Any) -> None:
+        acl = await acl_service.canned_acl_to_acl("private", "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty")
 
-        assert acl.owner.id == "owner-123"
+        assert acl.owner.id == "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
         assert len(acl.grants) == 1
         assert acl.grants[0].grantee.type == GranteeType.CANONICAL_USER
-        assert acl.grants[0].grantee.id == "owner-123"
+        assert acl.grants[0].grantee.id == "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
         assert acl.grants[0].permission == Permission.FULL_CONTROL
 
-    def test_parse_public_read(self, acl_service: Any) -> None:
-        acl = acl_service.canned_acl_to_acl("public-read", "owner-123")
+    @pytest.mark.asyncio
+    async def test_parse_public_read(self, acl_service: Any) -> None:
+        acl = await acl_service.canned_acl_to_acl("public-read", "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty")
 
-        assert acl.owner.id == "owner-123"
+        assert acl.owner.id == "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
         assert len(acl.grants) == 2
         assert acl.grants[0].permission == Permission.FULL_CONTROL
         assert acl.grants[1].grantee.type == GranteeType.GROUP
         assert acl.grants[1].grantee.uri == WellKnownGroups.ALL_USERS
         assert acl.grants[1].permission == Permission.READ
 
-    def test_parse_public_read_write(self, acl_service: Any) -> None:
-        acl = acl_service.canned_acl_to_acl("public-read-write", "owner-123")
+    @pytest.mark.asyncio
+    async def test_parse_public_read_write(self, acl_service: Any) -> None:
+        acl = await acl_service.canned_acl_to_acl(
+            "public-read-write", "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        )
 
-        assert acl.owner.id == "owner-123"
+        assert acl.owner.id == "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
         assert len(acl.grants) == 3
         assert acl.grants[0].permission == Permission.FULL_CONTROL
         assert acl.grants[1].permission == Permission.READ
         assert acl.grants[2].permission == Permission.WRITE
 
-    def test_parse_authenticated_read(self, acl_service: Any) -> None:
-        acl = acl_service.canned_acl_to_acl("authenticated-read", "owner-123")
+    @pytest.mark.asyncio
+    async def test_parse_authenticated_read(self, acl_service: Any) -> None:
+        acl = await acl_service.canned_acl_to_acl(
+            "authenticated-read", "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        )
 
-        assert acl.owner.id == "owner-123"
+        assert acl.owner.id == "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
         assert len(acl.grants) == 2
         assert acl.grants[1].grantee.uri == WellKnownGroups.AUTHENTICATED_USERS
         assert acl.grants[1].permission == Permission.READ
 
-    def test_parse_invalid_canned_acl(self, acl_service: Any) -> None:
+    @pytest.mark.asyncio
+    async def test_parse_invalid_canned_acl(self, acl_service: Any) -> None:
         with pytest.raises(ValueError, match="Unknown canned ACL"):
-            acl_service.canned_acl_to_acl("invalid-acl", "owner-123")
+            await acl_service.canned_acl_to_acl("invalid-acl", "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty")
 
 
 @pytest.mark.asyncio
@@ -465,7 +474,7 @@ class TestPutBucketAcl:
 
         @app.middleware("http")
         async def mock_auth_middleware(request: Any, call_next: Any) -> Any:
-            request.state.account_id = "owner-123"
+            request.state.account_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
             return await call_next(request)
 
         app.include_router(router)
@@ -480,7 +489,7 @@ class TestPutBucketAcl:
         mock_service.acl_repo.set_bucket_acl.assert_called_once()
         args = mock_service.acl_repo.set_bucket_acl.call_args[0]
         assert args[0] == "my-bucket"
-        assert args[1] == "owner-123"
+        assert args[1] == "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
         assert len(args[2].grants) == 2
 
         mock_service.invalidate_cache.assert_called_once_with("my-bucket")
@@ -495,7 +504,7 @@ class TestPutBucketAcl:
 
         @app.middleware("http")
         async def mock_auth_middleware(request: Any, call_next: Any) -> Any:
-            request.state.account_id = "owner-123"
+            request.state.account_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
             return await call_next(request)
 
         app.include_router(router)
@@ -503,12 +512,12 @@ class TestPutBucketAcl:
         xml_body = """<?xml version="1.0" encoding="UTF-8"?>
         <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
           <Owner>
-            <ID>owner-123</ID>
+            <ID>5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty</ID>
           </Owner>
           <AccessControlList>
             <Grant>
               <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser">
-                <ID>owner-123</ID>
+                <ID>5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty</ID>
               </Grantee>
               <Permission>FULL_CONTROL</Permission>
             </Grant>
@@ -603,7 +612,7 @@ class TestPutObjectAcl:
 
         @app.middleware("http")
         async def mock_auth_middleware(request: Any, call_next: Any) -> Any:
-            request.state.account_id = "owner-123"
+            request.state.account_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
             return await call_next(request)
 
         app.include_router(router)
@@ -619,7 +628,7 @@ class TestPutObjectAcl:
         args = mock_repo.set_object_acl.call_args[0]
         assert args[0] == "my-bucket"
         assert args[1] == "my-key"
-        assert args[2] == "owner-123"
+        assert args[2] == "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 
         mock_service.invalidate_cache.assert_called_once_with("my-bucket", "my-key")
 
@@ -633,7 +642,7 @@ class TestPutObjectAcl:
 
         @app.middleware("http")
         async def mock_auth_middleware(request: Any, call_next: Any) -> Any:
-            request.state.account_id = "owner-123"
+            request.state.account_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
             return await call_next(request)
 
         app.include_router(router)
@@ -641,12 +650,12 @@ class TestPutObjectAcl:
         xml_body = """<?xml version="1.0" encoding="UTF-8"?>
         <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
           <Owner>
-            <ID>owner-123</ID>
+            <ID>5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty</ID>
           </Owner>
           <AccessControlList>
             <Grant>
               <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser">
-                <ID>owner-123</ID>
+                <ID>5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty</ID>
               </Grantee>
               <Permission>READ</Permission>
             </Grant>

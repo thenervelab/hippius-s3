@@ -25,9 +25,10 @@ def acl_service(mock_db_pool: Any) -> Any:
 
 
 class TestCannedACLConversion:
-    def test_private_acl_grants_owner_only(self, acl_service: Any) -> None:
-        owner_id = "5FbiUU9cUUCZ"
-        acl = acl_service.canned_acl_to_acl("private", owner_id)
+    @pytest.mark.asyncio
+    async def test_private_acl_grants_owner_only(self, acl_service: Any) -> None:
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        acl = await acl_service.canned_acl_to_acl("private", owner_id)
 
         assert acl.owner.id == owner_id
         assert len(acl.grants) == 1
@@ -35,9 +36,10 @@ class TestCannedACLConversion:
         assert acl.grants[0].grantee.id == owner_id
         assert acl.grants[0].permission == Permission.FULL_CONTROL
 
-    def test_public_read_acl_grants_owner_and_all_users(self, acl_service: Any) -> None:
-        owner_id = "5FbiUU9cUUCZ"
-        acl = acl_service.canned_acl_to_acl("public-read", owner_id)
+    @pytest.mark.asyncio
+    async def test_public_read_acl_grants_owner_and_all_users(self, acl_service: Any) -> None:
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        acl = await acl_service.canned_acl_to_acl("public-read", owner_id)
 
         assert acl.owner.id == owner_id
         assert len(acl.grants) == 2
@@ -52,9 +54,10 @@ class TestCannedACLConversion:
         assert public_grant.grantee.uri == WellKnownGroups.ALL_USERS
         assert public_grant.permission == Permission.READ
 
-    def test_public_read_write_acl_grants_read_and_write(self, acl_service: Any) -> None:
-        owner_id = "5FbiUU9cUUCZ"
-        acl = acl_service.canned_acl_to_acl("public-read-write", owner_id)
+    @pytest.mark.asyncio
+    async def test_public_read_write_acl_grants_read_and_write(self, acl_service: Any) -> None:
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        acl = await acl_service.canned_acl_to_acl("public-read-write", owner_id)
 
         assert acl.owner.id == owner_id
         assert len(acl.grants) == 3
@@ -70,9 +73,10 @@ class TestCannedACLConversion:
         assert write_grant.grantee.uri == WellKnownGroups.ALL_USERS
         assert write_grant.permission == Permission.WRITE
 
-    def test_authenticated_read_acl_grants_authenticated_users(self, acl_service: Any) -> None:
-        owner_id = "5FbiUU9cUUCZ"
-        acl = acl_service.canned_acl_to_acl("authenticated-read", owner_id)
+    @pytest.mark.asyncio
+    async def test_authenticated_read_acl_grants_authenticated_users(self, acl_service: Any) -> None:
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        acl = await acl_service.canned_acl_to_acl("authenticated-read", owner_id)
 
         assert acl.owner.id == owner_id
         assert len(acl.grants) == 2
@@ -85,9 +89,10 @@ class TestCannedACLConversion:
         assert auth_grant.grantee.uri == WellKnownGroups.AUTHENTICATED_USERS
         assert auth_grant.permission == Permission.READ
 
-    def test_invalid_canned_acl_raises_error(self, acl_service: Any) -> None:
+    @pytest.mark.asyncio
+    async def test_invalid_canned_acl_raises_error(self, acl_service: Any) -> None:
         with pytest.raises(ValueError, match="Unknown canned ACL"):
-            acl_service.canned_acl_to_acl("invalid-acl", "5FbiUU9cUUCZ")
+            await acl_service.canned_acl_to_acl("invalid-acl", "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty")
 
 
 class TestHelperFunctions:
@@ -134,8 +139,8 @@ class TestHelperFunctions:
 class TestPermissionEvaluation:
     @pytest.mark.asyncio
     async def test_owner_has_all_permissions(self, acl_service: Any, mock_db_pool: Any) -> None:
-        owner_id = "5FbiUU9cUUCZ"
-        acl = acl_service.canned_acl_to_acl("private", owner_id)
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        acl = await acl_service.canned_acl_to_acl("private", owner_id)
 
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
@@ -145,9 +150,9 @@ class TestPermissionEvaluation:
 
     @pytest.mark.asyncio
     async def test_non_owner_denied_for_private_acl(self, acl_service: Any, mock_db_pool: Any) -> None:
-        owner_id = "5FbiUU9cUUCZ"
-        other_id = "5HoreGVb17XhY"
-        acl = acl_service.canned_acl_to_acl("private", owner_id)
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        other_id = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+        acl = await acl_service.canned_acl_to_acl("private", owner_id)
 
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
@@ -155,8 +160,8 @@ class TestPermissionEvaluation:
 
     @pytest.mark.asyncio
     async def test_anonymous_can_read_public_read_acl(self, acl_service: Any, mock_db_pool: Any) -> None:
-        owner_id = "5FbiUU9cUUCZ"
-        acl = acl_service.canned_acl_to_acl("public-read", owner_id)
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        acl = await acl_service.canned_acl_to_acl("public-read", owner_id)
 
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
@@ -164,9 +169,9 @@ class TestPermissionEvaluation:
 
     @pytest.mark.asyncio
     async def test_authenticated_user_can_read_public_read_acl(self, acl_service: Any, mock_db_pool: Any) -> None:
-        owner_id = "5FbiUU9cUUCZ"
-        user_id = "5HoreGVb17XhY"
-        acl = acl_service.canned_acl_to_acl("public-read", owner_id)
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        user_id = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+        acl = await acl_service.canned_acl_to_acl("public-read", owner_id)
 
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
@@ -176,9 +181,9 @@ class TestPermissionEvaluation:
     async def test_authenticated_user_can_read_authenticated_read_acl(
         self, acl_service: Any, mock_db_pool: Any
     ) -> None:
-        owner_id = "5FbiUU9cUUCZ"
-        user_id = "5HoreGVb17XhY"
-        acl = acl_service.canned_acl_to_acl("authenticated-read", owner_id)
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        user_id = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+        acl = await acl_service.canned_acl_to_acl("authenticated-read", owner_id)
 
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
@@ -186,8 +191,8 @@ class TestPermissionEvaluation:
 
     @pytest.mark.asyncio
     async def test_anonymous_denied_for_authenticated_read_acl(self, acl_service: Any, mock_db_pool: Any) -> None:
-        owner_id = "5FbiUU9cUUCZ"
-        acl = acl_service.canned_acl_to_acl("authenticated-read", owner_id)
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        acl = await acl_service.canned_acl_to_acl("authenticated-read", owner_id)
 
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
@@ -195,8 +200,8 @@ class TestPermissionEvaluation:
 
     @pytest.mark.asyncio
     async def test_anonymous_cannot_write_public_read_acl(self, acl_service: Any, mock_db_pool: Any) -> None:
-        owner_id = "5FbiUU9cUUCZ"
-        acl = acl_service.canned_acl_to_acl("public-read", owner_id)
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        acl = await acl_service.canned_acl_to_acl("public-read", owner_id)
 
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
@@ -204,8 +209,8 @@ class TestPermissionEvaluation:
 
     @pytest.mark.asyncio
     async def test_public_read_write_allows_write(self, acl_service: Any, mock_db_pool: Any) -> None:
-        owner_id = "5FbiUU9cUUCZ"
-        acl = acl_service.canned_acl_to_acl("public-read-write", owner_id)
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        acl = await acl_service.canned_acl_to_acl("public-read-write", owner_id)
 
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
@@ -215,8 +220,8 @@ class TestPermissionEvaluation:
 class TestACLRetrieval:
     @pytest.mark.asyncio
     async def test_get_object_acl_returns_object_acl(self, acl_service: Any, mock_db_pool: Any) -> None:
-        owner_id = "5FbiUU9cUUCZ"
-        object_acl = acl_service.canned_acl_to_acl("private", owner_id)
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        object_acl = await acl_service.canned_acl_to_acl("private", owner_id)
 
         acl_service.acl_repo.get_object_acl = AsyncMock(return_value=object_acl)
 
@@ -227,8 +232,8 @@ class TestACLRetrieval:
 
     @pytest.mark.asyncio
     async def test_object_inherits_bucket_acl(self, acl_service: Any, mock_db_pool: Any) -> None:
-        owner_id = "5FbiUU9cUUCZ"
-        bucket_acl = acl_service.canned_acl_to_acl("public-read", owner_id)
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        bucket_acl = await acl_service.canned_acl_to_acl("public-read", owner_id)
 
         acl_service.acl_repo.get_object_acl = AsyncMock(return_value=None)
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=bucket_acl)
@@ -240,8 +245,8 @@ class TestACLRetrieval:
 
     @pytest.mark.asyncio
     async def test_get_bucket_acl_returns_bucket_acl(self, acl_service: Any, mock_db_pool: Any) -> None:
-        owner_id = "5FbiUU9cUUCZ"
-        bucket_acl = acl_service.canned_acl_to_acl("public-read", owner_id)
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        bucket_acl = await acl_service.canned_acl_to_acl("public-read", owner_id)
 
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=bucket_acl)
 
@@ -251,7 +256,7 @@ class TestACLRetrieval:
 
     @pytest.mark.asyncio
     async def test_no_acl_returns_default_private(self, acl_service: Any, mock_db_pool: Any) -> None:
-        owner_id = "5FbiUU9cUUCZ"
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=None)
         mock_db_pool.fetchrow = AsyncMock(return_value={"main_account_id": owner_id})
