@@ -320,6 +320,14 @@ async def put_bucket_acl(
 
     acl_service: ACLService = request.app.state.acl_service
 
+    bucket_owner_id = await acl_service.get_bucket_owner(bucket)
+    if not bucket_owner_id:
+        return s3_error_response(
+            code="NoSuchBucket",
+            message="The specified bucket does not exist",
+            status_code=404,
+        )
+
     has_grant_headers = any(
         [x_amz_grant_read, x_amz_grant_write, x_amz_grant_read_acp, x_amz_grant_write_acp, x_amz_grant_full_control]
     )
@@ -332,11 +340,11 @@ async def put_bucket_acl(
         )
 
     if x_amz_acl:
-        new_acl = await acl_service.canned_acl_to_acl(x_amz_acl, account_id, bucket)
+        new_acl = await acl_service.canned_acl_to_acl(x_amz_acl, bucket_owner_id, bucket)
     elif has_grant_headers:
         grants = [
             Grant(
-                grantee=Grantee(type=GranteeType.CANONICAL_USER, id=account_id),
+                grantee=Grantee(type=GranteeType.CANONICAL_USER, id=bucket_owner_id),
                 permission=Permission.FULL_CONTROL,
             )
         ]
@@ -352,7 +360,7 @@ async def put_bucket_acl(
         if x_amz_grant_full_control:
             grants.extend(parse_grant_header(x_amz_grant_full_control, Permission.FULL_CONTROL))
 
-        new_acl = ACL(owner=Owner(id=account_id), grants=grants)
+        new_acl = ACL(owner=Owner(id=bucket_owner_id), grants=grants)
     else:
         body = await request.body()
         if not body:
@@ -384,13 +392,12 @@ async def put_bucket_acl(
                 status_code=400,
             )
 
-        # Use request account_id as authoritative owner
-        # This prevents owner changes and ensures consistency
-        if new_acl.owner.id != account_id:
+        # Preserve original owner - ownership is immutable in S3
+        if new_acl.owner.id != bucket_owner_id:
             logger.warning(
-                f"ACL owner mismatch for bucket {bucket}: XML has {new_acl.owner.id}, using request account {account_id}"
+                f"ACL owner mismatch for bucket {bucket}: XML has {new_acl.owner.id}, preserving original owner {bucket_owner_id}"
             )
-            new_acl.owner.id = account_id
+            new_acl.owner.id = bucket_owner_id
 
     try:
         validate_grant_grantees(new_acl)
@@ -401,7 +408,7 @@ async def put_bucket_acl(
             status_code=400,
         )
 
-    await acl_service.acl_repo.set_bucket_acl(bucket, account_id, new_acl)
+    await acl_service.acl_repo.set_bucket_acl(bucket, bucket_owner_id, new_acl)
 
     await acl_service.invalidate_cache(bucket)
 
@@ -492,6 +499,9 @@ async def put_object_acl(
             status_code=404,
         )
 
+    current_acl = await acl_service.get_effective_acl(bucket, key)
+    original_owner_id = current_acl.owner.id
+
     has_grant_headers = any(
         [x_amz_grant_read, x_amz_grant_write, x_amz_grant_read_acp, x_amz_grant_write_acp, x_amz_grant_full_control]
     )
@@ -504,11 +514,11 @@ async def put_object_acl(
         )
 
     if x_amz_acl:
-        new_acl = await acl_service.canned_acl_to_acl(x_amz_acl, account_id, bucket)
+        new_acl = await acl_service.canned_acl_to_acl(x_amz_acl, original_owner_id, bucket)
     elif has_grant_headers:
         grants = [
             Grant(
-                grantee=Grantee(type=GranteeType.CANONICAL_USER, id=account_id),
+                grantee=Grantee(type=GranteeType.CANONICAL_USER, id=original_owner_id),
                 permission=Permission.FULL_CONTROL,
             )
         ]
@@ -524,7 +534,7 @@ async def put_object_acl(
         if x_amz_grant_full_control:
             grants.extend(parse_grant_header(x_amz_grant_full_control, Permission.FULL_CONTROL))
 
-        new_acl = ACL(owner=Owner(id=account_id), grants=grants)
+        new_acl = ACL(owner=Owner(id=original_owner_id), grants=grants)
     else:
         body = await request.body()
         if not body:
@@ -556,13 +566,12 @@ async def put_object_acl(
                 status_code=400,
             )
 
-        # Use request account_id as authoritative owner
-        # This prevents owner changes and ensures consistency
-        if new_acl.owner.id != account_id:
+        # Preserve original owner - ownership is immutable in S3
+        if new_acl.owner.id != original_owner_id:
             logger.warning(
-                f"ACL owner mismatch for object {bucket}/{key}: XML has {new_acl.owner.id}, using request account {account_id}"
+                f"ACL owner mismatch for object {bucket}/{key}: XML has {new_acl.owner.id}, preserving original owner {original_owner_id}"
             )
-            new_acl.owner.id = account_id
+            new_acl.owner.id = original_owner_id
 
     try:
         validate_grant_grantees(new_acl)
@@ -573,7 +582,7 @@ async def put_object_acl(
             status_code=400,
         )
 
-    await acl_service.acl_repo.set_object_acl(bucket, key, account_id, new_acl)
+    await acl_service.acl_repo.set_object_acl(bucket, key, original_owner_id, new_acl)
 
     await acl_service.invalidate_cache(bucket, key)
 

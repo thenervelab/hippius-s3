@@ -342,45 +342,154 @@ fi
 
 print_section "Category 11: Permission Enforcement - Bucket READ (3 tests)"
 
-skip_test "test_bucket_read_allows_list_objects" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_bucket_read_allows_list_objects" \
+        bash -c "aws s3api put-bucket-acl --bucket '$TEST_BUCKET' --grant-read 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        aws s3api list-objects --bucket '$TEST_BUCKET' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE'"
+else
+    skip_test "test_bucket_read_allows_list_objects" "ACC2 canonical ID unavailable"
+fi
 
-skip_test "test_bucket_read_allows_list_objects_v2" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_bucket_read_allows_list_objects_v2" \
+        bash -c "aws s3api put-bucket-acl --bucket '$TEST_BUCKET' --grant-read 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        aws s3api list-objects-v2 --bucket '$TEST_BUCKET' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE'"
+else
+    skip_test "test_bucket_read_allows_list_objects_v2" "ACC2 canonical ID unavailable"
+fi
 
-skip_test "test_bucket_read_denies_other_operations" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_bucket_read_denies_other_operations" \
+        bash -c "aws s3api put-bucket-acl --bucket '$TEST_BUCKET' --grant-read 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        echo 'test content' > /tmp/perm-test-deny.txt && \
+        ! aws s3api put-object --bucket '$TEST_BUCKET' --key 'deny-test.txt' --body /tmp/perm-test-deny.txt --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' 2>/dev/null && \
+        ! aws s3api put-bucket-acl --bucket '$TEST_BUCKET' --acl private --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' 2>/dev/null && \
+        rm -f /tmp/perm-test-deny.txt"
+else
+    skip_test "test_bucket_read_denies_other_operations" "ACC2 canonical ID unavailable"
+fi
 
 print_section "Category 12: Permission Enforcement - Bucket WRITE (4 tests)"
 
-skip_test "test_bucket_write_allows_put_object" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_bucket_write_allows_put_object" \
+        bash -c "aws s3api put-bucket-acl --bucket '$TEST_BUCKET' --grant-write 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        echo 'write test' > /tmp/write-test.txt && \
+        aws s3api put-object --bucket '$TEST_BUCKET' --key 'write-test.txt' --body /tmp/write-test.txt --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' && \
+        rm -f /tmp/write-test.txt"
+else
+    skip_test "test_bucket_write_allows_put_object" "ACC2 canonical ID unavailable"
+fi
 
-skip_test "test_bucket_write_allows_delete_object" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_bucket_write_allows_delete_object" \
+        bash -c "aws s3api put-bucket-acl --bucket '$TEST_BUCKET' --grant-write 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        echo 'delete test' > /tmp/delete-test.txt && \
+        aws s3api put-object --bucket '$TEST_BUCKET' --key 'delete-test.txt' --body /tmp/delete-test.txt --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        aws s3api delete-object --bucket '$TEST_BUCKET' --key 'delete-test.txt' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' && \
+        rm -f /tmp/delete-test.txt"
+else
+    skip_test "test_bucket_write_allows_delete_object" "ACC2 canonical ID unavailable"
+fi
 
-skip_test "test_bucket_write_allows_initiate_multipart" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_bucket_write_allows_initiate_multipart" \
+        bash -c "aws s3api put-bucket-acl --bucket '$TEST_BUCKET' --grant-write 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        UPLOAD_ID=\$(aws s3api create-multipart-upload --bucket '$TEST_BUCKET' --key 'multipart-test.txt' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' | jq -r '.UploadId') && \
+        aws s3api abort-multipart-upload --bucket '$TEST_BUCKET' --key 'multipart-test.txt' --upload-id \$UPLOAD_ID --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE'"
+else
+    skip_test "test_bucket_write_allows_initiate_multipart" "ACC2 canonical ID unavailable"
+fi
 
-skip_test "test_bucket_write_denies_list" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_bucket_write_denies_list" \
+        bash -c "aws s3api put-bucket-acl --bucket '$TEST_BUCKET' --grant-write 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        ! aws s3api list-objects-v2 --bucket '$TEST_BUCKET' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' 2>/dev/null"
+else
+    skip_test "test_bucket_write_denies_list" "ACC2 canonical ID unavailable"
+fi
 
 print_section "Category 13: Permission Enforcement - Bucket READ_ACP (2 tests)"
 
-skip_test "test_bucket_read_acp_allows_get_bucket_acl" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_bucket_read_acp_allows_get_bucket_acl" \
+        bash -c "aws s3api put-bucket-acl --bucket '$TEST_BUCKET' --grant-read-acp 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        aws s3api get-bucket-acl --bucket '$TEST_BUCKET' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE'"
+else
+    skip_test "test_bucket_read_acp_allows_get_bucket_acl" "ACC2 canonical ID unavailable"
+fi
 
-skip_test "test_bucket_read_acp_denies_put_bucket_acl" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_bucket_read_acp_denies_put_bucket_acl" \
+        bash -c "aws s3api put-bucket-acl --bucket '$TEST_BUCKET' --grant-read-acp 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        ! aws s3api put-bucket-acl --bucket '$TEST_BUCKET' --acl private --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' 2>/dev/null"
+else
+    skip_test "test_bucket_read_acp_denies_put_bucket_acl" "ACC2 canonical ID unavailable"
+fi
 
 print_section "Category 14: Permission Enforcement - Bucket WRITE_ACP (2 tests)"
 
-skip_test "test_bucket_write_acp_allows_put_bucket_acl" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_bucket_write_acp_allows_put_bucket_acl" \
+        bash -c "aws s3api put-bucket-acl --bucket '$TEST_BUCKET' --grant-write-acp 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        aws s3api put-bucket-acl --bucket '$TEST_BUCKET' --grant-write-acp 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE'"
+else
+    skip_test "test_bucket_write_acp_allows_put_bucket_acl" "ACC2 canonical ID unavailable"
+fi
 
-skip_test "test_bucket_write_acp_allows_get_bucket_acl" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_bucket_write_acp_allows_get_bucket_acl" \
+        bash -c "aws s3api put-bucket-acl --bucket '$TEST_BUCKET' --grant-write-acp 'id=\"$ACC2_CANONICAL_ID\"' --grant-read-acp 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        aws s3api get-bucket-acl --bucket '$TEST_BUCKET' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE'"
+else
+    skip_test "test_bucket_write_acp_allows_get_bucket_acl" "ACC2 canonical ID unavailable"
+fi
 
 print_section "Category 15: Permission Enforcement - Bucket FULL_CONTROL (1 test)"
 
-skip_test "test_bucket_full_control_allows_all_operations" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_bucket_full_control_allows_all_operations" \
+        bash -c "aws s3api put-bucket-acl --bucket '$TEST_BUCKET' --grant-full-control 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        aws s3api list-objects-v2 --bucket '$TEST_BUCKET' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' && \
+        echo 'test content' > /tmp/perm-test-object.txt && \
+        aws s3api put-object --bucket '$TEST_BUCKET' --key 'perm-test.txt' --body /tmp/perm-test-object.txt --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' && \
+        aws s3api get-bucket-acl --bucket '$TEST_BUCKET' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' && \
+        aws s3api put-bucket-acl --bucket '$TEST_BUCKET' --grant-full-control 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' && \
+        aws s3api delete-object --bucket '$TEST_BUCKET' --key 'perm-test.txt' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' && \
+        rm -f /tmp/perm-test-object.txt"
+else
+    skip_test "test_bucket_full_control_allows_all_operations" "ACC2 canonical ID unavailable"
+fi
 
 print_section "Category 16: Permission Enforcement - Object READ (3 tests)"
 
-skip_test "test_object_read_allows_get_object" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_object_read_allows_get_object" \
+        bash -c "aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --grant-read 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        aws s3api get-object --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' /tmp/read-test.txt --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' && \
+        aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --acl private --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        rm -f /tmp/read-test.txt"
+else
+    skip_test "test_object_read_allows_get_object" "ACC2 canonical ID unavailable"
+fi
 
-skip_test "test_object_read_allows_head_object" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_object_read_allows_head_object" \
+        bash -c "aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --grant-read 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        aws s3api head-object --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' && \
+        aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --acl private --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE'"
+else
+    skip_test "test_object_read_allows_head_object" "ACC2 canonical ID unavailable"
+fi
 
-skip_test "test_object_read_denies_delete" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_object_read_denies_delete" \
+        bash -c "aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --grant-read 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        ! aws s3api delete-object --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' 2>/dev/null && \
+        aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --acl private --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE'"
+else
+    skip_test "test_object_read_denies_delete" "ACC2 canonical ID unavailable"
+fi
 
 print_section "Category 17: Permission Enforcement - Object WRITE (1 test)"
 
@@ -388,19 +497,58 @@ skip_test "test_object_write_not_applicable" "WRITE doesn't apply to objects per
 
 print_section "Category 18: Permission Enforcement - Object READ_ACP (2 tests)"
 
-skip_test "test_object_read_acp_allows_get_object_acl" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_object_read_acp_allows_get_object_acl" \
+        bash -c "aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --grant-read-acp 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        aws s3api get-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' && \
+        aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --acl private --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE'"
+else
+    skip_test "test_object_read_acp_allows_get_object_acl" "ACC2 canonical ID unavailable"
+fi
 
-skip_test "test_object_read_acp_denies_put_object_acl" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_object_read_acp_denies_put_object_acl" \
+        bash -c "aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --grant-read-acp 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        ! aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --acl private --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' 2>/dev/null && \
+        aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --acl private --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE'"
+else
+    skip_test "test_object_read_acp_denies_put_object_acl" "ACC2 canonical ID unavailable"
+fi
 
 print_section "Category 19: Permission Enforcement - Object WRITE_ACP (2 tests)"
 
-skip_test "test_object_write_acp_allows_put_object_acl" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_object_write_acp_allows_put_object_acl" \
+        bash -c "aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --grant-write-acp 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --grant-write-acp 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' && \
+        aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --acl private --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE'"
+else
+    skip_test "test_object_write_acp_allows_put_object_acl" "ACC2 canonical ID unavailable"
+fi
 
-skip_test "test_object_write_acp_denies_get_object" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_object_write_acp_denies_get_object" \
+        bash -c "aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --grant-write-acp 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        ! aws s3api get-object --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' /tmp/write-acp-deny.txt --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' 2>/dev/null && \
+        aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --acl private --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE'"
+else
+    skip_test "test_object_write_acp_denies_get_object" "ACC2 canonical ID unavailable"
+fi
 
 print_section "Category 20: Permission Enforcement - Object FULL_CONTROL (1 test)"
 
-skip_test "test_object_full_control_allows_all_operations" "requires permission enforcement verification"
+if [ -n "$ACC2_CANONICAL_ID" ]; then
+    assert_success "test_object_full_control_allows_all_operations" \
+        bash -c "aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --grant-full-control 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        aws s3api get-object --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' /tmp/fullctrl-test.txt --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' && \
+        aws s3api head-object --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' && \
+        aws s3api get-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' && \
+        aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --grant-full-control 'id=\"$ACC2_CANONICAL_ID\"' --endpoint-url '$ENDPOINT_URL' --profile '$ACC2_UPLOADDELETE_PROFILE' && \
+        aws s3api put-object-acl --bucket '$TEST_BUCKET' --key '$TEST_OBJECT' --acl private --endpoint-url '$ENDPOINT_URL' --profile '$ACC1_UPLOADDELETE_PROFILE' && \
+        rm -f /tmp/fullctrl-test.txt"
+else
+    skip_test "test_object_full_control_allows_all_operations" "ACC2 canonical ID unavailable"
+fi
 
 print_section "Category 21: Cross-Account Scenarios (6 tests)"
 

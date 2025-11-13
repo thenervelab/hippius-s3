@@ -15,19 +15,21 @@ from gateway.middlewares.banhammer import BanHammerService
 from gateway.middlewares.banhammer import banhammer_middleware
 from gateway.middlewares.cors import cors_middleware
 from gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
+from gateway.middlewares.metrics import metrics_middleware
 from gateway.middlewares.rate_limit import RateLimitService
 from gateway.middlewares.rate_limit import rate_limit_middleware
 from gateway.middlewares.sigv4 import sigv4_middleware
+from gateway.middlewares.tracing import tracing_middleware
 from gateway.routers.acl import router as acl_router
 from gateway.services.acl_service import ACLService
 from gateway.services.forward_service import ForwardService
+from hippius_s3.logging_config import setup_loki_logging
+from hippius_s3.monitoring import MetricsCollector
+from hippius_s3.monitoring import set_metrics_collector
 
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-
-logger = logging.getLogger(__name__)
 
 config = get_config()
+logger = setup_loki_logging(config, "hippius-s3-gateway")
 
 
 def factory() -> FastAPI:
@@ -51,6 +53,11 @@ def factory() -> FastAPI:
 
         app.state.redis_rate_limiting = redis.from_url(config.redis_rate_limiting_url, decode_responses=False)
         logger.info("Connected to Redis (rate limiting)")
+
+        app.state.metrics_collector = MetricsCollector(app.state.redis_client)
+        set_metrics_collector(app.state.metrics_collector)
+        logger.info("Metrics collector initialized")
+        logger.info("Tracing and metrics handled by opentelemetry-instrument wrapper")
 
         app.state.forward_service = ForwardService(config.backend_url)
         logger.info(f"ForwardService initialized with backend: {config.backend_url}")
@@ -126,6 +133,8 @@ def factory() -> FastAPI:
 
     # Register middleware in REVERSE order (outermost first)
     # IMPORTANT: sigv4 must execute BEFORE account (so register AFTER)
+    app.middleware("http")(metrics_middleware)
+    app.middleware("http")(tracing_middleware)
     app.middleware("http")(cors_middleware)
     if config.enable_banhammer:
         app.middleware("http")(banhammer_wrapper)

@@ -43,6 +43,14 @@ class GatewayConfig:
     public_bucket_cache_ttl_seconds: int = dataclasses.field(
         default_factory=lambda: int(os.getenv("PUBLIC_BUCKET_CACHE_TTL_SECONDS", "300"))
     )
+    log_level: str = dataclasses.field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
+    loki_url: str = dataclasses.field(
+        default_factory=lambda: os.getenv("LOKI_URL", "http://localhost:3100/loki/api/v1/push")
+    )
+    loki_enabled: bool = dataclasses.field(
+        default_factory=lambda: os.getenv("LOKI_ENABLED", "false").lower() == "true"
+    )
+    environment: str = dataclasses.field(default_factory=lambda: os.getenv("ENVIRONMENT", "development"))
 
 
 _config: GatewayConfig | None = None

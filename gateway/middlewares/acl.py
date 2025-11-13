@@ -104,7 +104,7 @@ async def acl_middleware(
 
     acl_service = request.app.state.acl_service
 
-    check_key = key if permission in [Permission.READ, Permission.READ_ACP] else None
+    check_key = key if permission in [Permission.READ, Permission.READ_ACP, Permission.WRITE_ACP] else None
 
     try:
         has_permission = await acl_service.check_permission(
