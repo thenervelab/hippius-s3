@@ -47,9 +47,7 @@ class GatewayConfig:
     loki_url: str = dataclasses.field(
         default_factory=lambda: os.getenv("LOKI_URL", "http://localhost:3100/loki/api/v1/push")
     )
-    loki_enabled: bool = dataclasses.field(
-        default_factory=lambda: os.getenv("LOKI_ENABLED", "false").lower() == "true"
-    )
+    loki_enabled: bool = dataclasses.field(default_factory=lambda: os.getenv("LOKI_ENABLED", "false").lower() == "true")
     environment: str = dataclasses.field(default_factory=lambda: os.getenv("ENVIRONMENT", "development"))
 
 
