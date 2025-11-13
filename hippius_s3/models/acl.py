@@ -110,7 +110,8 @@ def validate_grant_grantees(acl: ACL) -> None:
 
     Raises ValueError if any grantee has invalid data.
     """
-    canonical_id_pattern = re.compile(r"^[a-f0-9]{64}$")
+    aws_canonical_id_pattern = re.compile(r"^[a-f0-9]{64}$")
+    substrate_account_id_pattern = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{47,48}$")
     valid_group_uris = {
         WellKnownGroups.ALL_USERS,
         WellKnownGroups.AUTHENTICATED_USERS,
@@ -124,8 +125,10 @@ def validate_grant_grantees(acl: ACL) -> None:
         if grantee.type == GranteeType.CANONICAL_USER:
             if not grantee.id:
                 raise ValueError("CanonicalUser grantee must have id")
-            if not canonical_id_pattern.match(grantee.id):
-                raise ValueError(f"Invalid canonical user ID: {grantee.id}. Must be 64-character hex string.")
+            if not (aws_canonical_id_pattern.match(grantee.id) or substrate_account_id_pattern.match(grantee.id)):
+                raise ValueError(
+                    f"Invalid canonical user ID: {grantee.id}. Must be 64-character hex string or Substrate account ID."
+                )
 
         elif grantee.type == GranteeType.GROUP:
             if not grantee.uri:
