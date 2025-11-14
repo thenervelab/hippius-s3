@@ -8,6 +8,9 @@ services:
       - build-base
 
   gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
     env_file:
       - .env.defaults
       - .env.test-docker
