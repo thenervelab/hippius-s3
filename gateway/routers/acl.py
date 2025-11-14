@@ -340,7 +340,14 @@ async def put_bucket_acl(
         )
 
     if x_amz_acl:
-        new_acl = await acl_service.canned_acl_to_acl(x_amz_acl, bucket_owner_id, bucket)
+        try:
+            new_acl = await acl_service.canned_acl_to_acl(x_amz_acl, bucket_owner_id, bucket)
+        except ValueError as e:
+            return s3_error_response(
+                code="InvalidArgument",
+                message=str(e),
+                status_code=400,
+            )
     elif has_grant_headers:
         grants = [
             Grant(
@@ -514,7 +521,14 @@ async def put_object_acl(
         )
 
     if x_amz_acl:
-        new_acl = await acl_service.canned_acl_to_acl(x_amz_acl, original_owner_id, bucket)
+        try:
+            new_acl = await acl_service.canned_acl_to_acl(x_amz_acl, original_owner_id, bucket)
+        except ValueError as e:
+            return s3_error_response(
+                code="InvalidArgument",
+                message=str(e),
+                status_code=400,
+            )
     elif has_grant_headers:
         grants = [
             Grant(

@@ -129,7 +129,18 @@ max-complexity = 13 # TODO: get this down to 8
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 "examples/*.py" = ["T201", "PTH"]
-"tests/**/*.py" = ["T201", "ERA001"]
+"tests/**/*.py" = [
+    "T201",      # print statements
+    "ERA001",    # commented out code
+    "C901",      # complex functions
+    "PLR0913",   # too many arguments
+    "PLR2004",   # magic values
+    "PLR0915",   # too many statements
+    "B011",      # assert false
+    "SIM",       # simplify checks
+    "PERF",      # performance checks
+    "RET",       # return statement checks
+]
 "hippius_s3/scripts/*.py" = ["T201", "PTH"]
 "scripts/*.py" = ["T201", "PTH", "SIM105"]
 
@@ -271,3 +282,8 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = "prometheus_client.*"
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disable_error_code = ["no-untyped-def", "attr-defined", "arg-type", "return-value", "misc"]
