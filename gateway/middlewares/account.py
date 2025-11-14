@@ -41,8 +41,8 @@ async def account_middleware(request: Request, call_next: Callable) -> Response:
             seed_phrase = request.state.seed_phrase
             # Use SHA256 hash to derive deterministic account ID (like AWS canonical ID)
             seed_hash = hashlib.sha256(seed_phrase.encode()).digest()
-            # Format as SS58-like address (5 prefix + 46 hex chars)
-            account_id = f"5{seed_hash.hex()[:46]}"
+            # Use full 64-char hex string to match AWS canonical ID pattern
+            account_id = seed_hash.hex()
             logger.info(
                 f"DEBUG_ACL: Derived account_id from seed phrase: account_id={account_id}, seed_preview={seed_phrase[:20]}..."
             )
