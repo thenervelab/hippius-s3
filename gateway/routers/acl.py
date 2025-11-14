@@ -257,13 +257,22 @@ async def put_bucket_acl(
     x_amz_grant_full_control: str | None = Header(None, alias="x-amz-grant-full-control"),
 ) -> Response:
     """Set bucket ACL - S3 API compatible. Handles both ?acl and x-amz-acl header."""
-    logger.info(
-        f"DEBUG_ACL_ROUTE: PUT bucket ACL - bucket={bucket}, acl_query={repr(acl)}, x_amz_acl_header={repr(x_amz_acl)}"
-    )
-    logger.info(
-        f"DEBUG_ACL_ROUTE: Grant headers - read={repr(x_amz_grant_read)}, write={repr(x_amz_grant_write)}, read_acp={repr(x_amz_grant_read_acp)}, write_acp={repr(x_amz_grant_write_acp)}, full_control={repr(x_amz_grant_full_control)}"
-    )
     if acl is None:
+        # Check if this is a CreateBucket operation (bucket doesn't exist yet)
+        # AWS S3 with BucketOwnerEnforced rejects ACLs during bucket creation
+        if x_amz_acl:
+            acl_svc = request.app.state.acl_service
+            bucket_owner_id = await acl_svc.get_bucket_owner(bucket)
+
+            if not bucket_owner_id:
+                # Bucket doesn't exist - this is CreateBucket with ACL header
+                # Reject per AWS S3 BucketOwnerEnforced behavior
+                return s3_error_response(
+                    code="InvalidBucketAclWithObjectOwnership",
+                    message="Bucket cannot be created with ACLs. Object Ownership is set to BucketOwnerEnforced.",
+                    status_code=400,
+                )
+
         # Validate canned ACL BEFORE forwarding to backend to prevent orphan buckets
         if x_amz_acl:
             VALID_CANNED_ACLS = {
@@ -291,9 +300,8 @@ async def put_bucket_acl(
             account_id = getattr(request.state, "account_id", None)
             if account_id:
                 try:
-                    acl_svc: ACLService = request.app.state.acl_service
+                    acl_svc = request.app.state.acl_service
                     new_acl = await acl_svc.canned_acl_to_acl(x_amz_acl, account_id, bucket)
-                    logger.info(f"DEBUG_ACL: Creating {x_amz_acl} ACL for bucket {bucket} with owner_id={account_id}")
                     await acl_svc.acl_repo.set_bucket_acl(bucket, account_id, new_acl)
                     await acl_svc.invalidate_cache(bucket)
                     logger.info(f"Created {x_amz_acl} ACL for bucket {bucket}")
@@ -436,9 +444,6 @@ async def put_object_acl(
     x_amz_grant_full_control: str | None = Header(None, alias="x-amz-grant-full-control"),
 ) -> Response:
     """Set object ACL - S3 API compatible. Handles both ?acl and x-amz-acl header."""
-    logger.info(
-        f"DEBUG_ACL_ROUTE: PUT object ACL - bucket={bucket}, key={key}, acl_query={repr(acl)}, x_amz_acl_header={repr(x_amz_acl)}"
-    )
     if acl is None:
         # Validate canned ACL BEFORE forwarding to backend to prevent orphan objects
         if x_amz_acl:
@@ -469,9 +474,6 @@ async def put_object_acl(
                 try:
                     acl_svc: ACLService = request.app.state.acl_service
                     new_acl = await acl_svc.canned_acl_to_acl(x_amz_acl, account_id, bucket)
-                    logger.info(
-                        f"DEBUG_ACL: Creating {x_amz_acl} ACL for object {bucket}/{key} with owner_id={account_id}"
-                    )
                     await acl_svc.acl_repo.set_object_acl(bucket, key, account_id, new_acl)
                     await acl_svc.invalidate_cache(bucket, key)
                     logger.info(f"Created {x_amz_acl} ACL for object {bucket}/{key}")

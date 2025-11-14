@@ -91,6 +91,15 @@ async def acl_middleware(
 
     is_create_bucket = request.method == "PUT" and key is None and len(query_params) == 0
     if is_create_bucket:
+        # AWS S3 with BucketOwnerEnforced rejects ACL headers during bucket creation
+        x_amz_acl = request.headers.get("x-amz-acl")
+        if x_amz_acl:
+            logger.info(f"Rejecting CreateBucket with ACL header for bucket: {bucket}")
+            return s3_error_response(
+                code="InvalidBucketAclWithObjectOwnership",
+                message="Bucket cannot be created with ACLs. Object Ownership is set to BucketOwnerEnforced.",
+                status_code=400,
+            )
         logger.info(f"Bypassing ACL check for CreateBucket: {bucket}")
         return await call_next(request)
 
