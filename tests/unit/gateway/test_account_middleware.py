@@ -58,8 +58,8 @@ async def test_bypass_mode_derives_unique_id_from_seed_phrase(mock_config_bypass
     seed_phrase_a = "about acid actor absent action able actual abandon abstract above ability achieve"
     seed_phrase_b = "dream letter onion wreck return glove canal easy letter render wear bright"
 
-    expected_id_a = f"5{hashlib.sha256(seed_phrase_a.encode()).digest().hex()[:46]}"
-    expected_id_b = f"5{hashlib.sha256(seed_phrase_b.encode()).digest().hex()[:46]}"
+    expected_id_a = hashlib.sha256(seed_phrase_a.encode()).digest().hex()
+    expected_id_b = hashlib.sha256(seed_phrase_b.encode()).digest().hex()
 
     # Test with seed phrase A
     app_a = FastAPI()
@@ -136,7 +136,7 @@ async def test_bypass_mode_no_seed_phrase_returns_anonymous(mock_config_bypass: 
 
 @pytest.mark.asyncio
 async def test_account_id_format_matches_ss58_pattern(mock_config_bypass: Any, monkeypatch: Any) -> None:
-    """Test that derived account IDs match SS58-like format (starts with 5, 47 chars)."""
+    """Test that derived account IDs match AWS canonical ID format (64 hex chars)."""
     from gateway.middlewares.account import account_middleware
 
     monkeypatch.setattr("gateway.middlewares.account.config", mock_config_bypass)
@@ -163,6 +163,5 @@ async def test_account_id_format_matches_ss58_pattern(mock_config_bypass: Any, m
     data = response.json()
     account_id = data["account_id"]
 
-    assert account_id.startswith("5")
-    assert len(account_id) == 47  # 5 + 46 hex chars
-    assert all(c in "0123456789abcdef5" for c in account_id)
+    assert len(account_id) == 64  # Full SHA256 hex
+    assert all(c in "0123456789abcdef" for c in account_id)

@@ -78,7 +78,7 @@ def anonymous_http_client(s3_base_url: str) -> Callable:
 
 @pytest.fixture
 def get_account_id() -> Callable[[Any], str]:
-    """Extract account ID (fake SS58 from hash) from boto3 client seed phrase."""
+    """Extract account ID from boto3 client seed phrase (AWS canonical ID format)."""
 
     def _get_id(client: Any) -> str:
         import base64
@@ -87,11 +87,9 @@ def get_account_id() -> Callable[[Any], str]:
         access_key = client._request_signer._credentials.access_key
         seed_phrase = base64.b64decode(access_key).decode("utf-8")
 
-        # Derive same fake SS58 address as middleware uses
-        # (test seeds have invalid checksums, can't use real Keypair)
+        # Derive same account ID as middleware uses (AWS canonical ID format)
         seed_hash = hashlib.sha256(seed_phrase.encode()).digest()
-        hash_hex = seed_hash.hex()[:46]
-        return f"5{hash_hex}"
+        return seed_hash.hex()
 
     return _get_id
 
