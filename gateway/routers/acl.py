@@ -258,21 +258,6 @@ async def put_bucket_acl(
 ) -> Response:
     """Set bucket ACL - S3 API compatible. Handles both ?acl and x-amz-acl header."""
     if acl is None:
-        # Check if this is a CreateBucket operation (bucket doesn't exist yet)
-        # AWS S3 with BucketOwnerEnforced rejects ACLs during bucket creation
-        if x_amz_acl:
-            acl_svc = request.app.state.acl_service
-            bucket_owner_id = await acl_svc.get_bucket_owner(bucket)
-
-            if not bucket_owner_id:
-                # Bucket doesn't exist - this is CreateBucket with ACL header
-                # Reject per AWS S3 BucketOwnerEnforced behavior
-                return s3_error_response(
-                    code="InvalidBucketAclWithObjectOwnership",
-                    message="Bucket cannot be created with ACLs. Object Ownership is set to BucketOwnerEnforced.",
-                    status_code=400,
-                )
-
         # Validate canned ACL BEFORE forwarding to backend to prevent orphan buckets
         if x_amz_acl:
             VALID_CANNED_ACLS = {

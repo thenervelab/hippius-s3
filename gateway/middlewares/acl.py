@@ -91,7 +91,7 @@ async def acl_middleware(
 
     is_create_bucket = request.method == "PUT" and key is None and len(query_params) == 0
     if is_create_bucket:
-        # AWS S3 with BucketOwnerEnforced rejects ACL headers during bucket creation
+        # AWS S3 default: BucketOwnerEnforced enabled, ACLs disabled (since April 2023)
         x_amz_acl = request.headers.get("x-amz-acl")
         if x_amz_acl:
             logger.info(f"Rejecting CreateBucket with ACL header for bucket: {bucket}")
