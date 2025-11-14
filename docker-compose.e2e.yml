@@ -6,6 +6,19 @@ services:
       dockerfile: Dockerfile.base
     profiles:
       - build-base
+
+  gateway:
+    env_file:
+      - .env.defaults
+      - .env.test-docker
+    environment:
+      - PYTHONUNBUFFERED=1
+      - GATEWAY_BACKEND_URL=http://api:8000
+      - GATEWAY_PORT=8080
+      - HIPPIUS_BYPASS_CREDIT_CHECK=true
+    networks:
+      - hippius_net
+
   api:
     build: .
     env_file:
