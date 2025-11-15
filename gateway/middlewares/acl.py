@@ -55,6 +55,9 @@ def get_required_permission(
     if "acl" in query_params:
         return Permission.READ_ACP if method == "GET" else Permission.WRITE_ACP
 
+    if "tagging" in query_params:
+        return Permission.READ_ACP if method in ["GET", "HEAD"] else Permission.WRITE_ACP
+
     if method in ["GET", "HEAD"]:
         return Permission.READ
 
@@ -143,4 +146,12 @@ async def acl_middleware(
 
     request.state.bucket_owner_id = bucket_owner_id
 
-    return await call_next(request)
+    is_anonymous = account_id is None or account_id == "anonymous"
+    request.state.is_anonymous_access = is_anonymous
+
+    response = await call_next(request)
+
+    if is_anonymous:
+        response.headers["x-hippius-access-mode"] = "anon"
+
+    return response

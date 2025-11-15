@@ -20,8 +20,8 @@ def s3_base_url(boto3_client: Any) -> str:
             return str(endpoint)
     except Exception:
         pass
-    # Default local API port used in e2e compose
-    return "http://localhost:8000"
+    # Default local gateway port (8080) for ACL enforcement
+    return "http://localhost:8080"
 
 
 def test_public_get_object_anonymous(
@@ -138,7 +138,7 @@ def test_private_get_object_anonymous_fails(
     response = requests.get(url, timeout=10)
 
     assert response.status_code == 403
-    assert "SignatureDoesNotMatch" in response.text
+    assert "AccessDenied" in response.text
 
 
 def test_signed_get_object_still_works(
@@ -197,7 +197,7 @@ def test_public_bucket_list_anonymous_fails(
     response = requests.get(url, timeout=10)
 
     assert response.status_code == 403
-    assert "SignatureDoesNotMatch" in response.text
+    assert "AccessDenied" in response.text
 
 
 def test_public_get_object_with_query_params_anonymous_fails(
@@ -236,4 +236,4 @@ def test_public_get_object_with_query_params_anonymous_fails(
     response = requests.get(url)
 
     assert response.status_code == 403
-    assert "SignatureDoesNotMatch" in response.text
+    assert "AccessDenied" in response.text
