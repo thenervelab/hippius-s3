@@ -9,7 +9,7 @@ from fastapi import Request
 from fastapi import Response
 from starlette import status
 
-from hippius_s3.config import get_config
+from gateway.config import get_config
 
 
 config = get_config()

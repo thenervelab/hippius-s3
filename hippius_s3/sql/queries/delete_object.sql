@@ -7,7 +7,7 @@ WITH target AS (
         ov.cid_id,
         COALESCE(c.cid, ov.ipfs_cid) AS ipfs_cid
     FROM objects o
-    JOIN buckets b ON b.bucket_id = o.bucket_id AND b.main_account_id = $3
+    JOIN buckets b ON b.bucket_id = o.bucket_id
     JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
     LEFT JOIN cids c ON ov.cid_id = c.id
     WHERE o.bucket_id = $1

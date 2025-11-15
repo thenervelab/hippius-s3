@@ -191,9 +191,9 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
     max_retries = 10
     for attempt in range(max_retries):
         try:
-            response = requests.get("http://localhost:8000/", timeout=5)
-            if response.status_code in [200, 400, 403]:  # API is responding
-                print("API service is ready")
+            response = requests.get("http://localhost:8080/", timeout=5)
+            if response.status_code in [200, 400, 403]:  # Gateway is responding
+                print("Gateway service is ready")
                 break
         except requests.exceptions.RequestException:
             print(f"API not ready yet, attempt {attempt + 1}/{max_retries}")
@@ -291,7 +291,7 @@ def boto3_client(test_seed_phrase: str) -> Any:
 
     return boto3.client(
         "s3",
-        endpoint_url="http://localhost:8000",
+        endpoint_url="http://localhost:8080",
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
         region_name="us-east-1",

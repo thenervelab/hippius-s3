@@ -127,10 +127,10 @@ async def list_parts_internal(
     if mpu["object_key"] != object_key:
         return s3_error_response("InvalidRequest", "Object key does not match upload", status_code=400)
 
-    user = await db.fetchrow(
+    _ = await db.fetchrow(
         get_query("get_or_create_user_by_main_account"), request.state.account.main_account, datetime.now(UTC)
     )
-    bucket = await db.fetchrow(get_query("get_bucket_by_name_and_owner"), bucket_name, user["main_account_id"])
+    bucket = await db.fetchrow(get_query("get_bucket_by_name"), bucket_name)
     if not bucket or bucket["bucket_id"] != mpu["bucket_id"]:
         return s3_error_response("NoSuchBucket", f"Bucket {bucket_name} does not exist", status_code=404)
 
@@ -198,7 +198,7 @@ async def initiate_multipart_upload(
     """Initiate a multipart upload (POST /{bucket_name}/{object_key}?uploads)."""
     try:
         # Get user for user-scoped bucket lookup
-        user = await db.fetchrow(
+        _ = await db.fetchrow(
             get_query("get_or_create_user_by_main_account"),
             request.state.account.main_account,
             datetime.now(UTC),
@@ -206,9 +206,8 @@ async def initiate_multipart_upload(
 
         # Check if bucket exists
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
+            get_query("get_bucket_by_name"),
             bucket_name,
-            user["main_account_id"],
         )
         if not bucket:
             return s3_error_response(
@@ -430,12 +429,10 @@ async def upload_part(
             range_end = int(m.group(2))
 
         # Resolve source object and fetch bytes from IPFS (require CID available)
-        user = await db.fetchrow(
+        _ = await db.fetchrow(
             get_query("get_or_create_user_by_main_account"), request.state.account.main_account, datetime.now(UTC)
         )
-        source_bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"), source_bucket_name, user["main_account_id"]
-        )
+        source_bucket = await db.fetchrow(get_query("get_bucket_by_name"), source_bucket_name)
         if not source_bucket:
             return s3_error_response("NoSuchBucket", f"Bucket {source_bucket_name} does not exist", status_code=404)
 
@@ -818,16 +815,15 @@ async def list_multipart_uploads(
 
     try:
         # Get user for user-scoped bucket lookup
-        user = await db.fetchrow(
+        _ = await db.fetchrow(
             get_query("get_or_create_user_by_main_account"),
             request.state.account.main_account,
             datetime.now(UTC),
         )
 
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
+            get_query("get_bucket_by_name"),
             bucket_name,
-            user["main_account_id"],
         )
         if not bucket:
             return s3_error_response(
@@ -946,9 +942,8 @@ async def complete_multipart_upload(
 
         # Get bucket info
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
+            get_query("get_bucket_by_name"),
             bucket_name,
-            request.state.account.main_account,
         )
         if not bucket:
             return s3_error_response("NoSuchBucket", f"Bucket {bucket_name} does not exist", status_code=404)

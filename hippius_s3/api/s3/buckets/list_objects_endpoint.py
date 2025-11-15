@@ -19,13 +19,17 @@ def _format_s3_timestamp(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-async def handle_list_objects(bucket_name: str, ctx: RequestContext, db: Any, prefix: str | None) -> Response:
+async def handle_list_objects(
+    bucket_name: str,
+    ctx: RequestContext,
+    db: Any,
+    prefix: str | None,
+) -> Response:
     try:
-        # Get bucket for this main account
+        logger.error(f"bucket name {bucket_name}")
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
+            get_query("get_bucket_by_name"),
             bucket_name,
-            ctx.main_account_id,
         )
         if not bucket:
             return errors.s3_error_response(
@@ -78,7 +82,12 @@ async def handle_list_objects(bucket_name: str, ctx: RequestContext, db: Any, pr
             "x-hippius-status-counts": ",".join(f"{k}:{v}" for k, v in status_counts.items()),
         }
 
-        return Response(content=xml_content, media_type="application/xml", status_code=200, headers=headers)
+        return Response(
+            content=xml_content,
+            media_type="application/xml",
+            status_code=200,
+            headers=headers,
+        )
     except Exception:
         logger.exception("Error listing objects")
         return errors.s3_error_response(

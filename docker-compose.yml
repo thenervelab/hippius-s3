@@ -7,11 +7,41 @@ services:
       context: .
       dockerfile: Dockerfile.base
 
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    ports:
+      - "${HOST_BIND_IP:-127.0.0.1}:8080:8080"
+    env_file:
+      - .env.defaults
+      - .env
+    depends_on:
+      api:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-accounts:
+        condition: service_healthy
+      redis-chain:
+        condition: service_healthy
+      redis-rate-limiting:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - GATEWAY_BACKEND_URL=http://api:8000
+      - GATEWAY_PORT=8080
+      - HIPPIUS_BYPASS_CREDIT_CHECK=false
+    networks:
+      - hippius_net
+
   api:
     build:
       context: .
-    ports:
-      - "${HOST_BIND_IP:-127.0.0.1}:8000:8000"
+    # No external ports - only accessible via proxy on internal network
     env_file:
       - .env.defaults
       - .env
@@ -35,7 +65,12 @@ services:
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
-      - DEBUG=true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/ || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     networks:
       - hippius_net
 
@@ -365,6 +400,26 @@ services:
       - PYTHONUNBUFFERED=1
       - WORKER_SCRIPT=workers/chain_profile_cacher.py
       - ENABLE_WATCHFILES=true
+    networks:
+      - hippius_net
+
+  account-cacher:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    depends_on:
+      redis-accounts:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - WORKER_SCRIPT=workers/run_account_cacher_in_loop.py
+      - ENABLE_WATCHFILES=true
+    env_file:
+      - .env.defaults
+      - .env
+    volumes:
+      - .:/app
     networks:
       - hippius_net
 

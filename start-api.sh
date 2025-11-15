@@ -18,6 +18,12 @@ python -m hippius_s3.scripts.migrate
 
 echo "Starting hippius-s3-api via uvicorn with OpenTelemetry instrumentation"
 
+RELOAD_FLAG=""
+if [ "${DEBUG:-false}" = "true" ]; then
+    RELOAD_FLAG="--reload"
+    echo "DEBUG mode enabled - auto-reload is ON"
+fi
+
 opentelemetry-instrument \
     --logs_exporter none \
     --traces_exporter otlp \
@@ -31,4 +37,5 @@ opentelemetry-instrument \
         --log-level=$UVICORN_LOG_LEVEL \
         --access-log \
         --factory \
+        $RELOAD_FLAG \
         hippius_s3.main:factory

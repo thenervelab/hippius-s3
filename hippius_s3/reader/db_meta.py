@@ -7,7 +7,7 @@ from typing import Optional
 async def read_object_info(db: Any, bucket_name: str, object_key: str, account_id: str | None) -> dict | None:
     from hippius_s3.utils import get_query
 
-    row = await db.fetchrow(get_query("get_object_for_download_with_permissions"), bucket_name, object_key, account_id)
+    row = await db.fetchrow(get_query("get_object_for_download_with_permissions"), bucket_name, object_key)
     return dict(row) if row else None
 
 

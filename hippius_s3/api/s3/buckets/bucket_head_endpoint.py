@@ -25,9 +25,8 @@ async def handle_head_bucket(bucket_name: str, request: Request, db: Any) -> Res
         )
 
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
+            get_query("get_bucket_by_name"),
             bucket_name,
-            main_account_id,
         )
 
         if not bucket:

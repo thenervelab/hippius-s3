@@ -4,14 +4,19 @@ import secrets
 import subprocess
 from pathlib import Path
 from typing import Any
+from typing import AsyncGenerator
 from typing import Callable
 from typing import Generator
 from typing import Iterator
 
+import asyncpg
 import boto3
 import dotenv
 import pytest
+import pytest_asyncio
 from botocore.config import Config
+from httpx import ASGITransport
+from httpx import AsyncClient
 
 from tests.e2e.conftest import is_real_aws
 
@@ -22,6 +27,8 @@ def _load_test_env() -> Generator[None, None, None]:
     project_root = Path(__file__).parents[2]
     dotenv.load_dotenv(project_root / ".env.defaults", override=True)
     dotenv.load_dotenv(project_root / ".env.test-local", override=True)
+    os.environ["HIPPIUS_BYPASS_CREDIT_CHECK"] = "true"
+    os.environ["ENABLE_BANHAMMER"] = "false"
     yield
 
 
@@ -150,3 +157,151 @@ def stopped_worker(
             check=False,
             capture_output=True,
         )
+
+
+@pytest_asyncio.fixture
+async def gateway_db_pool() -> AsyncGenerator[Any, None]:
+    """Create a mock PostgreSQL pool for gateway tests."""
+    from unittest.mock import AsyncMock
+    from unittest.mock import MagicMock
+
+    mock_pool = MagicMock()
+    mock_pool.fetchrow = AsyncMock(return_value=None)
+    mock_pool.fetch = AsyncMock(return_value=[])
+    mock_pool.execute = AsyncMock()
+    yield mock_pool
+
+
+@pytest_asyncio.fixture
+async def gateway_redis_clients() -> AsyncGenerator[dict[str, Any], None]:
+    """Create mock Redis clients for gateway tests."""
+    from unittest.mock import AsyncMock
+    from unittest.mock import MagicMock
+
+    def create_mock_redis() -> Any:
+        mock_redis = MagicMock()
+        mock_redis.get = AsyncMock(return_value=None)
+        mock_redis.set = AsyncMock()
+        mock_redis.delete = AsyncMock()
+        mock_redis.incr = AsyncMock(return_value=1)
+        mock_redis.expire = AsyncMock()
+        return mock_redis
+
+    yield {
+        "redis": create_mock_redis(),
+        "redis_accounts": create_mock_redis(),
+        "redis_chain": create_mock_redis(),
+        "redis_rate_limiting": create_mock_redis(),
+    }
+
+
+@pytest_asyncio.fixture
+async def gateway_app(
+    gateway_db_pool: asyncpg.Pool, gateway_redis_clients: dict[str, Any]
+) -> AsyncGenerator[Any, None]:
+    """Create a gateway app instance for testing."""
+    from unittest.mock import AsyncMock
+    from unittest.mock import MagicMock
+
+    from gateway.main import factory
+
+    app = factory()
+
+    app.state.postgres_pool = gateway_db_pool
+    app.state.redis_client = gateway_redis_clients["redis"]
+    app.state.redis_accounts = gateway_redis_clients["redis_accounts"]
+    app.state.redis_chain = gateway_redis_clients["redis_chain"]
+    app.state.redis_rate_limiting = gateway_redis_clients["redis_rate_limiting"]
+
+    from gateway.config import get_config
+    from gateway.services.forward_service import ForwardService
+
+    config = get_config()
+    app.state.forward_service = ForwardService(config.backend_url)
+
+    mock_rate_limit_service = MagicMock()
+    mock_rate_limit_service.check_rate_limit = AsyncMock(return_value=True)
+    app.state.rate_limit_service = mock_rate_limit_service
+
+    mock_banhammer_service = MagicMock()
+    mock_banhammer_service.is_banned = AsyncMock(return_value=False)
+    app.state.banhammer_service = mock_banhammer_service
+
+    mock_acl_service = MagicMock()
+    mock_acl_service.check_permission = AsyncMock(return_value=True)
+    mock_acl_service.get_bucket_owner = AsyncMock(return_value="test-owner-id")
+    app.state.acl_service = mock_acl_service
+
+    yield app
+
+    if hasattr(app.state, "forward_service"):
+        await app.state.forward_service.close()
+
+
+@pytest_asyncio.fixture
+async def gateway_client(gateway_app: Any) -> AsyncGenerator[AsyncClient, None]:
+    """Create an async test client for the gateway."""
+    transport = ASGITransport(app=gateway_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client
+
+
+@pytest_asyncio.fixture
+async def gateway_app_no_auth(
+    gateway_db_pool: asyncpg.Pool, gateway_redis_clients: dict[str, Any]
+) -> AsyncGenerator[Any, None]:
+    """Create a gateway app without authentication for forwarding tests."""
+    from unittest.mock import AsyncMock
+    from unittest.mock import MagicMock
+
+    from fastapi import FastAPI
+    from fastapi import Request
+
+    app = FastAPI()
+
+    app.state.postgres_pool = gateway_db_pool
+    app.state.redis_client = gateway_redis_clients["redis"]
+    app.state.redis_accounts = gateway_redis_clients["redis_accounts"]
+    app.state.redis_chain = gateway_redis_clients["redis_chain"]
+    app.state.redis_rate_limiting = gateway_redis_clients["redis_rate_limiting"]
+
+    from gateway.config import get_config
+    from gateway.services.forward_service import ForwardService
+
+    config = get_config()
+    app.state.forward_service = ForwardService(config.backend_url)
+
+    mock_rate_limit_service = MagicMock()
+    mock_rate_limit_service.check_rate_limit = AsyncMock(return_value=True)
+    app.state.rate_limit_service = mock_rate_limit_service
+
+    mock_banhammer_service = MagicMock()
+    mock_banhammer_service.is_banned = AsyncMock(return_value=False)
+    app.state.banhammer_service = mock_banhammer_service
+
+    mock_acl_service = MagicMock()
+    mock_acl_service.check_permission = AsyncMock(return_value=True)
+    mock_acl_service.get_bucket_owner = AsyncMock(return_value="test-owner-id")
+    app.state.acl_service = mock_acl_service
+
+    @app.get("/health")
+    async def health() -> dict:
+        return {"status": "healthy", "service": "gateway"}
+
+    @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD", "PATCH"])
+    async def forward_all(request: Request, path: str) -> Any:
+        forward_service = request.app.state.forward_service
+        return await forward_service.forward_request(request)
+
+    yield app
+
+    if hasattr(app.state, "forward_service"):
+        await app.state.forward_service.close()
+
+
+@pytest_asyncio.fixture
+async def gateway_client_no_auth(gateway_app_no_auth: Any) -> AsyncGenerator[AsyncClient, None]:
+    """Create an async test client without authentication."""
+    transport = ASGITransport(app=gateway_app_no_auth)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client

@@ -7,7 +7,7 @@ import requests
 
 
 def test_trailing_slash_normalizer_for_public_path(docker_services: Any) -> None:
-    base_url = os.environ.get("HIPPIUS_E2E_BASE_URL", "http://localhost:8000")
+    base_url = os.environ.get("HIPPIUS_E2E_BASE_URL", "http://localhost:8080")
 
     # Without trailing slash
     r1 = requests.get(f"{base_url}/robots.txt", timeout=5)

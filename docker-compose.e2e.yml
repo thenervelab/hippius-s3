@@ -6,6 +6,22 @@ services:
       dockerfile: Dockerfile.base
     profiles:
       - build-base
+
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    env_file:
+      - .env.defaults
+      - .env.test-docker
+    environment:
+      - PYTHONUNBUFFERED=1
+      - GATEWAY_BACKEND_URL=http://api:8000
+      - GATEWAY_PORT=8080
+      - HIPPIUS_BYPASS_CREDIT_CHECK=true
+    networks:
+      - hippius_net
+
   api:
     build: .
     env_file:
@@ -181,7 +197,7 @@ services:
     ports:
       - "4001:4001" # IPFS swarm port
       - "5001:5001" # IPFS API port
-      - "8080:8080" # IPFS gateway port
+      - "8081:8080" # IPFS gateway port (moved from 8080 to avoid conflict with gateway)
     volumes:
       - ipfs_data:/data/ipfs
     restart: unless-stopped
