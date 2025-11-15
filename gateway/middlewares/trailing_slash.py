@@ -2,15 +2,15 @@ from __future__ import annotations
 
 from typing import Awaitable
 from typing import Callable
-from typing import MutableMapping
 
-from starlette.requests import Request
+from fastapi import Request
+from fastapi import Response
 
 
 async def trailing_slash_normalizer(
     request: Request,
-    call_next: Callable[[Request], Awaitable[MutableMapping[str, object]]],
-) -> MutableMapping[str, object]:
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
     """Normalize trailing slashes without redirecting.
 
     Removes a trailing slash from the URL path (except for "/") so both

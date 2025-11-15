@@ -18,7 +18,6 @@ from hippius_s3.api.middlewares.metrics import metrics_middleware
 from hippius_s3.api.middlewares.parse_internal_headers import parse_internal_headers_middleware
 from hippius_s3.api.middlewares.profiler import SpeedscopeProfilerMiddleware
 from hippius_s3.api.middlewares.tracing import tracing_middleware
-from hippius_s3.api.middlewares.trailing_slash import trailing_slash_normalizer
 from hippius_s3.api.s3 import errors as s3_errors
 from hippius_s3.api.s3.multipart import router as multipart_router
 from hippius_s3.api.s3.public_router import router as public_router
@@ -212,7 +211,6 @@ def factory() -> FastAPI:
     app.middleware("http")(metrics_middleware)
     app.middleware("http")(tracing_middleware)
     app.middleware("http")(audit_log_middleware)
-    app.middleware("http")(trailing_slash_normalizer)
     app.middleware("http")(parse_internal_headers_middleware)
     app.middleware("http")(ip_whitelist_middleware)
     if config.enable_request_profiling:

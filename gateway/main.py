@@ -19,6 +19,7 @@ from gateway.middlewares.rate_limit import RateLimitService
 from gateway.middlewares.rate_limit import rate_limit_middleware
 from gateway.middlewares.sigv4 import sigv4_middleware
 from gateway.middlewares.tracing import tracing_middleware
+from gateway.middlewares.trailing_slash import trailing_slash_normalizer
 from gateway.routers.acl import router as acl_router
 from gateway.services.acl_service import ACLService
 from gateway.services.forward_service import ForwardService
@@ -142,6 +143,7 @@ def factory() -> FastAPI:
     app.middleware("http")(acl_middleware)
     app.middleware("http")(account_middleware)
     app.middleware("http")(sigv4_middleware)
+    app.middleware("http")(trailing_slash_normalizer)
 
     return app
 
