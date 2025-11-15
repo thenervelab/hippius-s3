@@ -179,6 +179,12 @@ class ACLService:
         row = await self.acl_repo.db.fetchrow(query, bucket)
         return str(row["main_account_id"]) if row else None
 
+    async def get_object_owner(self, bucket: str, key: str) -> str | None:
+        """Get object owner from objects table."""
+        query = "SELECT main_account_id FROM objects WHERE bucket_name = $1 AND object_key = $2"
+        row = await self.acl_repo.db.fetchrow(query, bucket, key)
+        return str(row["main_account_id"]) if row else None
+
     async def check_permission(
         self,
         account_id: str | None,
@@ -212,6 +218,21 @@ class ACLService:
 
         for grant in acl.grants:
             if self._grant_matches(grant, account_id) and self._permission_implies(grant.permission, permission):
+                if permission == Permission.WRITE and key is not None:
+                    bucket_owner = await self.get_bucket_owner(bucket)
+                    object_owner = await self.get_object_owner(bucket, key)
+
+                    if account_id == bucket_owner:
+                        logger.info("DEBUG_ACL: Access GRANTED (grant match + bucket owner): user is bucket owner")
+                        return True
+
+                    if account_id == object_owner:
+                        logger.info("DEBUG_ACL: Access GRANTED (grant match + object owner): user is object owner")
+                        return True
+
+                    logger.info("DEBUG_ACL: Access DENIED: WRITE grant but user is not bucket/object owner")
+                    return False
+
                 logger.info("DEBUG_ACL: Access GRANTED (grant match): grant matches account")
                 return True
 

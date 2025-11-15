@@ -77,6 +77,18 @@ class TestPermissionMapping:
         with pytest.raises(ValueError, match="Unknown HTTP method"):
             get_required_permission("PATCH", {}, has_key=True)
 
+    def test_initiate_multipart_maps_to_write(self) -> None:
+        permission = get_required_permission("POST", {"uploads": ""}, has_key=True)
+        assert permission == Permission.WRITE
+
+    def test_upload_part_maps_to_write(self) -> None:
+        permission = get_required_permission("PUT", {"uploadId": "abc123", "partNumber": "1"}, has_key=True)
+        assert permission == Permission.WRITE
+
+    def test_complete_multipart_maps_to_write(self) -> None:
+        permission = get_required_permission("POST", {"uploadId": "abc123"}, has_key=True)
+        assert permission == Permission.WRITE
+
 
 class TestACLMiddleware:
     @pytest.fixture
@@ -191,7 +203,7 @@ class TestACLMiddleware:
         assert b"AccessDenied" in response.content
 
     @pytest.mark.asyncio
-    async def test_write_operation_checks_bucket_level_permission(self, acl_app: Any, mock_acl_service: Any) -> None:
+    async def test_write_operation_checks_object_level_permission(self, acl_app: Any, mock_acl_service: Any) -> None:
         mock_acl_service.check_permission.return_value = True
 
         async with AsyncClient(transport=ASGITransport(app=acl_app), base_url="http://test") as client:
@@ -201,7 +213,7 @@ class TestACLMiddleware:
         mock_acl_service.check_permission.assert_called_once()
         call_args = mock_acl_service.check_permission.call_args
         assert call_args.kwargs["bucket"] == "my-bucket"
-        assert call_args.kwargs["key"] is None
+        assert call_args.kwargs["key"] == "my-key"
         assert call_args.kwargs["permission"] == Permission.WRITE
 
     @pytest.mark.asyncio
@@ -255,7 +267,7 @@ class TestACLMiddleware:
         assert call_args.kwargs["permission"] == Permission.READ
 
     @pytest.mark.asyncio
-    async def test_delete_operation_checks_bucket_level_permission(self, acl_app: Any, mock_acl_service: Any) -> None:
+    async def test_delete_operation_checks_object_level_permission(self, acl_app: Any, mock_acl_service: Any) -> None:
         mock_acl_service.check_permission.return_value = True
 
         async with AsyncClient(transport=ASGITransport(app=acl_app), base_url="http://test") as client:
@@ -264,11 +276,13 @@ class TestACLMiddleware:
         mock_acl_service.check_permission.assert_called_once()
         call_args = mock_acl_service.check_permission.call_args
         assert call_args.kwargs["bucket"] == "my-bucket"
-        assert call_args.kwargs["key"] is None
+        assert call_args.kwargs["key"] == "my-key"
         assert call_args.kwargs["permission"] == Permission.WRITE
 
     @pytest.mark.asyncio
-    async def test_post_operation_checks_bucket_level_permission(self, acl_app: Any, mock_acl_service: Any) -> None:
+    async def test_post_multipart_operation_checks_object_level_permission(
+        self, acl_app: Any, mock_acl_service: Any
+    ) -> None:
         mock_acl_service.check_permission.return_value = True
 
         async with AsyncClient(transport=ASGITransport(app=acl_app), base_url="http://test") as client:
@@ -277,7 +291,7 @@ class TestACLMiddleware:
         mock_acl_service.check_permission.assert_called_once()
         call_args = mock_acl_service.check_permission.call_args
         assert call_args.kwargs["bucket"] == "my-bucket"
-        assert call_args.kwargs["key"] is None
+        assert call_args.kwargs["key"] == "my-key"
         assert call_args.kwargs["permission"] == Permission.WRITE
 
     @pytest.mark.asyncio

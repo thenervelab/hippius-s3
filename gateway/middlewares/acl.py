@@ -58,6 +58,9 @@ def get_required_permission(
     if "tagging" in query_params:
         return Permission.READ_ACP if method in ["GET", "HEAD"] else Permission.WRITE_ACP
 
+    if "uploads" in query_params or "uploadId" in query_params:
+        return Permission.WRITE
+
     if method in ["GET", "HEAD"]:
         return Permission.READ
 
@@ -116,7 +119,7 @@ async def acl_middleware(
 
     acl_service = request.app.state.acl_service
 
-    check_key = key if permission in [Permission.READ, Permission.READ_ACP, Permission.WRITE_ACP] else None
+    check_key = key
 
     try:
         has_permission = await acl_service.check_permission(

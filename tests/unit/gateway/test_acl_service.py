@@ -274,3 +274,119 @@ class TestACLRetrieval:
 
         with pytest.raises(ValueError, match="Bucket not found"):
             await acl_service.get_effective_acl("nonexistent", None)
+
+
+class TestWritePermissionOwnership:
+    @pytest.mark.asyncio
+    async def test_write_permission_denied_for_non_owner_object(self, mock_db_pool: Any) -> None:
+        alice_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        bob_id = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+
+        acl_service = ACLService(mock_db_pool)
+
+        from hippius_s3.models.acl import ACL
+        from hippius_s3.models.acl import Owner
+
+        bucket_acl = ACL(
+            owner=Owner(id=alice_id),
+            grants=[
+                Grant(
+                    grantee=Grantee(type=GranteeType.CANONICAL_USER, id=alice_id),
+                    permission=Permission.FULL_CONTROL,
+                ),
+                Grant(
+                    grantee=Grantee(type=GranteeType.CANONICAL_USER, id=bob_id),
+                    permission=Permission.WRITE,
+                ),
+            ],
+        )
+
+        acl_service.acl_repo = MagicMock()
+        acl_service.acl_repo.db = mock_db_pool
+        acl_service.acl_repo.get_object_acl = AsyncMock(return_value=None)
+        acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=bucket_acl)
+
+        mock_db_pool.fetchrow = AsyncMock(
+            side_effect=lambda query, *args: (
+                {"main_account_id": alice_id} if "buckets" in query else {"main_account_id": alice_id}
+            )
+        )
+
+        has_permission = await acl_service.check_permission(
+            account_id=bob_id, bucket="alice-bucket", key="alice-file.txt", permission=Permission.WRITE
+        )
+
+        assert not has_permission
+
+    @pytest.mark.asyncio
+    async def test_write_permission_granted_for_bucket_owner(self, mock_db_pool: Any) -> None:
+        alice_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        bob_id = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+
+        acl_service = ACLService(mock_db_pool)
+
+        from hippius_s3.models.acl import ACL
+        from hippius_s3.models.acl import Owner
+
+        bucket_acl = ACL(
+            owner=Owner(id=bob_id),
+            grants=[
+                Grant(
+                    grantee=Grantee(type=GranteeType.CANONICAL_USER, id=bob_id),
+                    permission=Permission.FULL_CONTROL,
+                ),
+                Grant(
+                    grantee=Grantee(type=GranteeType.CANONICAL_USER, id=alice_id),
+                    permission=Permission.WRITE,
+                ),
+            ],
+        )
+
+        acl_service.acl_repo = MagicMock()
+        acl_service.acl_repo.db = mock_db_pool
+        acl_service.acl_repo.get_object_acl = AsyncMock(return_value=None)
+        acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=bucket_acl)
+
+        mock_db_pool.fetchrow = AsyncMock(
+            side_effect=lambda query, *args: (
+                {"main_account_id": bob_id} if "buckets" in query else {"main_account_id": alice_id}
+            )
+        )
+
+        has_permission = await acl_service.check_permission(
+            account_id=alice_id, bucket="bob-bucket", key="alice-file.txt", permission=Permission.WRITE
+        )
+
+        assert has_permission
+
+    @pytest.mark.asyncio
+    async def test_write_permission_granted_for_object_owner(self, mock_db_pool: Any) -> None:
+        alice_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+
+        acl_service = ACLService(mock_db_pool)
+
+        from hippius_s3.models.acl import ACL
+        from hippius_s3.models.acl import Owner
+
+        bucket_acl = ACL(
+            owner=Owner(id=alice_id),
+            grants=[
+                Grant(
+                    grantee=Grantee(type=GranteeType.CANONICAL_USER, id=alice_id),
+                    permission=Permission.FULL_CONTROL,
+                ),
+            ],
+        )
+
+        acl_service.acl_repo = MagicMock()
+        acl_service.acl_repo.db = mock_db_pool
+        acl_service.acl_repo.get_object_acl = AsyncMock(return_value=None)
+        acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=bucket_acl)
+
+        mock_db_pool.fetchrow = AsyncMock(side_effect=lambda query, *args: {"main_account_id": alice_id})
+
+        has_permission = await acl_service.check_permission(
+            account_id=alice_id, bucket="alice-bucket", key="alice-file.txt", permission=Permission.WRITE
+        )
+
+        assert has_permission
