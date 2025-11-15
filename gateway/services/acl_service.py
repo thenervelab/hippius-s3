@@ -192,7 +192,6 @@ class ACLService:
             query = "SELECT is_public FROM buckets WHERE bucket_name = $1"
             row = await self.acl_repo.db.fetchrow(query, bucket)
             if row and row["is_public"]:
-                logger.info(f"DEBUG_ACL: Access GRANTED (bucket policy): bucket is_public=True for anonymous READ")
                 return True
 
         acl = await self.get_effective_acl(bucket, key)
