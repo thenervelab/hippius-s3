@@ -277,21 +277,10 @@ async def put_bucket_acl(
                     status_code=400,
                 )
 
+        # Forward bucket creation to backend
+        # Backend handles ACL creation atomically with bucket creation
         forward_service = request.app.state.forward_service
         response = cast(Response, await forward_service.forward_request(request))
-
-        # If CreateBucket succeeded and x-amz-acl header present, create ACL
-        if response.status_code == 200 and x_amz_acl:
-            account_id = getattr(request.state, "account_id", None)
-            if account_id:
-                try:
-                    acl_svc = request.app.state.acl_service
-                    new_acl = await acl_svc.canned_acl_to_acl(x_amz_acl, account_id, bucket)
-                    await acl_svc.acl_repo.set_bucket_acl(bucket, account_id, new_acl)
-                    await acl_svc.invalidate_cache(bucket)
-                    logger.info(f"Created {x_amz_acl} ACL for bucket {bucket}")
-                except Exception as e:
-                    logger.error(f"Failed to create ACL for bucket {bucket}, defaulting to private: {e}")
 
         return response
 

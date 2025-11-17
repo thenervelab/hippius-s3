@@ -231,17 +231,24 @@ class TestACLRetrieval:
         acl_service.acl_repo.get_object_acl.assert_called_once_with("bucket1", "key1")
 
     @pytest.mark.asyncio
-    async def test_object_inherits_bucket_acl(self, acl_service: Any, mock_db_pool: Any) -> None:
-        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
-        bucket_acl = await acl_service.canned_acl_to_acl("public-read", owner_id)
+    async def test_object_without_explicit_acl_gets_private_acl_with_object_owner(
+        self, acl_service: Any, mock_db_pool: Any
+    ) -> None:
+        bucket_owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        object_owner_id = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+        bucket_acl = await acl_service.canned_acl_to_acl("public-read", bucket_owner_id)
 
         acl_service.acl_repo.get_object_acl = AsyncMock(return_value=None)
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=bucket_acl)
 
+        mock_db_pool.fetchrow = AsyncMock(return_value={"main_account_id": object_owner_id})
+
         result = await acl_service.get_effective_acl("bucket1", "key1")
 
-        assert result == bucket_acl
-        acl_service.acl_repo.get_bucket_acl.assert_called_once_with("bucket1")
+        assert result.owner.id == object_owner_id
+        assert len(result.grants) == 1
+        assert result.grants[0].grantee.id == object_owner_id
+        assert result.grants[0].permission == Permission.FULL_CONTROL
 
     @pytest.mark.asyncio
     async def test_get_bucket_acl_returns_bucket_acl(self, acl_service: Any, mock_db_pool: Any) -> None:
@@ -390,3 +397,111 @@ class TestWritePermissionOwnership:
         )
 
         assert has_permission
+
+
+class TestIsPublicBypass:
+    @pytest.mark.asyncio
+    async def test_is_public_bypass_allows_anonymous_read_despite_private_acl(self, mock_db_pool: Any) -> None:
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+
+        acl_service = ACLService(mock_db_pool)
+
+        from hippius_s3.models.acl import ACL
+        from hippius_s3.models.acl import Owner
+
+        object_acl = ACL(
+            owner=Owner(id=owner_id),
+            grants=[
+                Grant(
+                    grantee=Grantee(type=GranteeType.CANONICAL_USER, id=owner_id),
+                    permission=Permission.FULL_CONTROL,
+                ),
+            ],
+        )
+
+        acl_service.acl_repo = MagicMock()
+        acl_service.acl_repo.db = mock_db_pool
+        acl_service.acl_repo.get_object_acl = AsyncMock(return_value=object_acl)
+        acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=None)
+
+        mock_db_pool.fetchrow = AsyncMock(return_value={"is_public": True})
+
+        has_permission = await acl_service.check_permission(
+            account_id=None, bucket="public-bucket", key="private-object.txt", permission=Permission.READ
+        )
+
+        assert has_permission
+
+
+class TestObjectACLInheritance:
+    @pytest.mark.asyncio
+    async def test_object_without_acl_uses_object_owner_not_bucket_owner(self, mock_db_pool: Any) -> None:
+        alice_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        bob_id = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+
+        acl_service = ACLService(mock_db_pool)
+
+        from hippius_s3.models.acl import ACL
+        from hippius_s3.models.acl import Owner
+
+        bucket_acl = ACL(
+            owner=Owner(id=alice_id),
+            grants=[
+                Grant(
+                    grantee=Grantee(type=GranteeType.CANONICAL_USER, id=alice_id),
+                    permission=Permission.FULL_CONTROL,
+                ),
+            ],
+        )
+
+        acl_service.acl_repo = MagicMock()
+        acl_service.acl_repo.db = mock_db_pool
+        acl_service.acl_repo.get_object_acl = AsyncMock(return_value=None)
+        acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=bucket_acl)
+
+        mock_db_pool.fetchrow = AsyncMock(
+            side_effect=lambda query, *args: (
+                {"main_account_id": bob_id} if "objects" in query else {"main_account_id": alice_id}
+            )
+        )
+
+        effective_acl = await acl_service.get_effective_acl("alice-bucket", "bob-file.txt")
+
+        assert effective_acl.owner.id == bob_id
+        assert len(effective_acl.grants) == 1
+        assert effective_acl.grants[0].grantee.id == bob_id
+        assert effective_acl.grants[0].permission == Permission.FULL_CONTROL
+
+    @pytest.mark.asyncio
+    async def test_object_with_explicit_acl_uses_that_acl(self, mock_db_pool: Any) -> None:
+        alice_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        bob_id = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+
+        acl_service = ACLService(mock_db_pool)
+
+        from hippius_s3.models.acl import ACL
+        from hippius_s3.models.acl import Owner
+
+        object_acl = ACL(
+            owner=Owner(id=bob_id),
+            grants=[
+                Grant(
+                    grantee=Grantee(type=GranteeType.CANONICAL_USER, id=bob_id),
+                    permission=Permission.FULL_CONTROL,
+                ),
+                Grant(
+                    grantee=Grantee(type=GranteeType.CANONICAL_USER, id=alice_id),
+                    permission=Permission.READ,
+                ),
+            ],
+        )
+
+        acl_service.acl_repo = MagicMock()
+        acl_service.acl_repo.db = mock_db_pool
+        acl_service.acl_repo.get_object_acl = AsyncMock(return_value=object_acl)
+
+        effective_acl = await acl_service.get_effective_acl("alice-bucket", "bob-file.txt")
+
+        assert effective_acl.owner.id == bob_id
+        assert len(effective_acl.grants) == 2
+        assert effective_acl == object_acl
