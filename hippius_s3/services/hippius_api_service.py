@@ -172,7 +172,7 @@ class HippiusApiClient:
             Dict[str, str]: Headers with authentication token
         """
         return {
-            "Authorization": f"Token {config.hippius_service_key}",
+            "Authorization": f"ServiceToken {config.hippius_service_key}",
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
