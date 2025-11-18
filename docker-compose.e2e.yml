@@ -55,26 +55,6 @@ services:
     networks:
       - hippius_net
 
-  substrate:
-    build:
-      context: .
-      dockerfile: workers/Dockerfile
-    command: ["python", "workers/run_substrate_in_loop.py"]
-    env_file:
-      - .env.defaults
-      - .env.test-docker
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      redis-queues:
-        condition: service_healthy
-    volumes:
-      - .:/app
-    networks:
-      - hippius_net
-
   unpinner:
     build:
       context: .

@@ -220,34 +220,6 @@ services:
     networks:
       - hippius_net
 
-  substrate:
-    build:
-      context: .
-      dockerfile: workers/Dockerfile
-    env_file:
-      - .env.defaults
-      - .env
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      redis-queues:
-        condition: service_healthy
-    deploy:
-      replicas: 1
-    restart: unless-stopped
-    environment:
-      - PYTHONUNBUFFERED=1
-      - WORKER_SCRIPT=workers/run_substrate_in_loop.py
-      - ENABLE_WATCHFILES=true
-    volumes:
-      - .:/app
-      # Shared object parts FS store (cleanup after pin confirmation)
-      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
-    networks:
-      - hippius_net
-
   unpinner:
     build:
       context: .

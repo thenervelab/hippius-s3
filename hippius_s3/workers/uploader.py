@@ -14,9 +14,9 @@ from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.ipfs_service import IPFSService
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
-from hippius_s3.queue import SubstratePinningRequest
 from hippius_s3.queue import UploadChainRequest
-from hippius_s3.queue import enqueue_substrate_request
+from hippius_s3.services.hippius_api_service import HippiusApiClient
+from hippius_s3.services.hippius_api_service import PinResponse
 from hippius_s3.utils import get_query
 
 
@@ -37,6 +37,9 @@ def classify_error(error: Exception) -> str:
         keyword in err_str
         for keyword in ["malformed", "invalid", "negative size", "missing part", "validation error", "integrity"]
     ):
+        return "permanent"
+
+    if any(keyword in err_str for keyword in ["pin", "unpin", "hippius api", "hippiusapi"]) or "hippiusapi" in err_type:
         return "permanent"
 
     if any(
@@ -97,6 +100,19 @@ class Uploader:
             return acquire()
         return Uploader._ConnCtx(self.db)
 
+    async def pin_on_api(self, cids) -> list[PinResponse]:
+        if not cids:
+            return []
+
+        semaphore = asyncio.Semaphore(self.config.uploader_pin_parallelism)
+
+        async def pin_with_limit(api_client: HippiusApiClient, cid: str) -> PinResponse:
+            async with semaphore:
+                return await api_client.pin_file(cid)
+
+        async with HippiusApiClient() as api_client:
+            return await asyncio.gather(*[pin_with_limit(api_client, cid) for cid in cids])
+
     async def process_upload(self, payload: UploadChainRequest) -> List[str]:
         start_time = time.time()
         logger.info(f"Processing upload object_id={payload.object_id} chunks={len(payload.chunks)}")
@@ -122,14 +138,14 @@ class Uploader:
         valid_cids = [c for c in (chunk_cids + [manifest_cid]) if c and c != "pending"]
 
         if valid_cids:
-            await enqueue_substrate_request(
-                SubstratePinningRequest(
-                    cids=valid_cids,
-                    address=payload.address,
-                    object_id=payload.object_id,
-                    object_version=int(payload.object_version or 1),
-                ),
-            )
+            try:
+                await self.pin_on_api(valid_cids)
+            except Exception as e:
+                logger.error(
+                    f"Pin failure for object_id={payload.object_id}: {e}. "
+                    f"Failed to pin {len(valid_cids)} CIDs. Will move to DLQ."
+                )
+                raise
 
         total_duration = time.time() - start_time
         logger.info(
@@ -224,7 +240,6 @@ class Uploader:
             logger.warning(
                 f"uploader: missing upload_id; using object_id as fallback (object_id={object_id} part={part_number})"
             )
-            resolved_upload_id = object_id
 
         # Look up part_id and sizing metadata for part_chunks upsert
         async with self._acquire_conn() as conn:

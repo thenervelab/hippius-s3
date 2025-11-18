@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 import asyncio
-import json
 import logging
 import sys
-import tempfile
 import time
 from pathlib import Path
-from typing import Dict
-from typing import List
 
-import aiofiles
 import httpx
 import redis.asyncio as async_redis
 
@@ -21,9 +16,13 @@ from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import dequeue_unpin_request
-from hippius_s3.queue import enqueue_unpin_request
+from hippius_s3.queue import enqueue_unpin_retry_request
+from hippius_s3.queue import move_due_unpin_retries_to_primary
 from hippius_s3.redis_utils import with_redis_retry
-from hippius_s3.workers.unpinner import UnpinnerWorker
+from hippius_s3.services.hippius_api_service import HippiusApiClient
+from hippius_s3.services.hippius_api_service import UnpinResponse
+from hippius_s3.workers.uploader import classify_error
+from hippius_s3.workers.uploader import compute_backoff_ms
 
 
 config = get_config()
@@ -31,97 +30,71 @@ config = get_config()
 setup_loki_logging(config, "unpinner")
 logger = logging.getLogger(__name__)
 
-EPOCH_SLEEP_SECONDS = 60
-BATCH_SIZE = 10000
+
+async def unpin_on_api(cids: list[str]) -> list[UnpinResponse]:
+    if not cids:
+        return []
+
+    semaphore = asyncio.Semaphore(config.unpinner_parallelism)
+
+    async def unpin_with_limit(api_client: HippiusApiClient, cid: str) -> UnpinResponse:
+        async with semaphore:
+            return await api_client.unpin_file(cid)
+
+    async with HippiusApiClient() as api_client:
+        return await asyncio.gather(*[unpin_with_limit(api_client, cid) for cid in cids])
 
 
-async def create_and_upload_manifest(user_address: str, batch_requests: List[UnpinChainRequest]) -> str:
-    manifest_objects = []
+async def unpin_from_local_ipfs(cid: str) -> None:
+    """Unpin a CID from the local IPFS node."""
+    base_url = config.ipfs_store_url.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            unpin_url = f"{base_url}/api/v0/pin/rm?arg={cid}"
+            logger.debug(f"Unpinning CID from local IPFS: {cid}")
+            unpin_response = await client.post(unpin_url)
+            unpin_response.raise_for_status()
+            logger.debug(f"Successfully unpinned CID from local IPFS: {cid}")
+    except Exception as e:
+        logger.warning(f"Failed to unpin CID {cid} from local IPFS: {e}")
 
-    for req in batch_requests:
-        if not req.cid:
-            continue
-        file_name = f"s3-{req.cid}"
-        manifest_objects.append(
-            {
-                "cid": req.cid,
-                "filename": file_name,
-            },
-        )
 
-    if not manifest_objects:
-        logger.warning(f"No objects to unpin for user {user_address} (all requests had empty CIDs)")
-        raise ValueError("No valid CIDs in batch")
+async def process_unpin_request(request: UnpinChainRequest) -> None:
+    """Process a single unpin request."""
+    try:
+        logger.info(f"Processing unpin request: {request.name}")
 
-    logger.info(f"Creating manifest for user {user_address} with {len(manifest_objects)} CIDs")
+        await unpin_on_api([request.cid])
+        logger.info(f"Successfully unpinned CID via API: {request.cid}")
 
-    manifest_data = json.dumps(
-        manifest_objects,
-        indent=2,
-    )
+        await unpin_from_local_ipfs(request.cid)
 
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".json",
-        delete=False,
-    ) as temp_file:
-        temp_file.write(manifest_data)
-        temp_path = temp_file.name
+    except Exception as e:
+        logger.error(f"Failed to process unpin request {request.name}: {e}")
+        error_class = classify_error(e)
 
-    async with httpx.AsyncClient(
-        timeout=300.0,
-        follow_redirects=True,
-    ) as client:
-        async with aiofiles.open(temp_path, "rb") as f:
-            file_data = await f.read()
+        attempts_next = (request.attempts or 0) + 1
+        max_attempts = 5
 
-        base_url = config.ipfs_store_url.rstrip("/")
-        upload_url = f"{base_url}/api/v0/add?wrap-with-directory=false&cid-version=1"
-        logger.info(f"Uploading manifest to: {upload_url}")
+        if error_class == "transient" and attempts_next <= max_attempts:
+            delay_ms = compute_backoff_ms(attempts_next, base_ms=1000, max_ms=60000)
+            delay_sec = delay_ms / 1000.0
 
-        files = {"file": ("manifest.json", file_data, "application/json")}
-        response = await client.post(upload_url, files=files)
+            logger.info(
+                f"Scheduling retry for {request.name} "
+                f"(attempt {attempts_next}/{max_attempts}, delay {delay_sec:.1f}s, error_class={error_class})"
+            )
 
-        logger.info(f"Upload response: {response.status_code} from {response.url}")
-        response.raise_for_status()
-
-        response_text = response.text
-        logger.debug(f"IPFS response: {response_text}")
-
-        for line in response_text.strip().split("\n"):
-            if line.strip():
-                result = json.loads(line)
-                if "Hash" in result:
-                    manifest_cid = result["Hash"]
-                    break
+            await enqueue_unpin_retry_request(
+                request,
+                delay_seconds=delay_sec,
+                last_error=str(e),
+            )
         else:
-            raise Exception(f"No valid CID found in IPFS response: {response_text}")
-
-    logger.info(f"Uploaded manifest for user {user_address} to IPFS with CID: {manifest_cid}")
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        pin_url = f"{base_url}/api/v0/pin/add?arg={manifest_cid}"
-        logger.debug(f"Pinning manifest to local IPFS: {pin_url}")
-        pin_response = await client.post(pin_url)
-        pin_response.raise_for_status()
-        logger.info(f"Pinned manifest to local IPFS node: {manifest_cid}")
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        for req in batch_requests:
-            if not req.cid:
-                continue
-            try:
-                unpin_url = f"{base_url}/api/v0/pin/rm?arg={req.cid}"
-                logger.debug(f"Unpinning CID from IPFS store: {req.cid}")
-                unpin_response = await client.post(unpin_url)
-                unpin_response.raise_for_status()
-                logger.debug(f"Successfully unpinned CID from IPFS store: {req.cid}")
-            except Exception as e:
-                logger.warning(f"Failed to unpin CID {req.cid} from IPFS store: {e}")
-
-    Path(temp_path).unlink(missing_ok=True)
-
-    return manifest_cid
+            logger.warning(
+                f"Unpin request {request.name} failed permanently or exhausted retries "
+                f"(attempts={attempts_next}, error_class={error_class}, error={e})"
+            )
 
 
 async def run_unpinner_loop() -> None:
@@ -139,75 +112,21 @@ async def run_unpinner_loop() -> None:
     logger.info(f"Redis URL: {config.redis_url}")
     logger.info(f"Redis Queues URL: {config.redis_queues_url}")
 
-    unpinner_worker = UnpinnerWorker(config)
-
     while True:
-        requests = []
+        await move_due_unpin_retries_to_primary()
 
-        while len(requests) < BATCH_SIZE:
-            unpin_request, redis_queues_client = await with_redis_retry(
-                lambda rc: dequeue_unpin_request(),
-                redis_queues_client,
-                config.redis_queues_url,
-                "dequeue unpin request",
-            )
+        unpin_request, redis_queues_client = await with_redis_retry(
+            lambda rc: dequeue_unpin_request(),
+            redis_queues_client,
+            config.redis_queues_url,
+            "dequeue unpin request",
+        )
 
-            if unpin_request:
-                requests.append(unpin_request)
-            else:
-                break
-
-        if not requests:
-            logger.info("No unpin requests in queue, sleeping 10s...")
-            await asyncio.sleep(10)
+        if not unpin_request:
+            await asyncio.sleep(1)
             continue
 
-        logger.info(f"Collected {len(requests)} unpin requests from queue (max batch size: {BATCH_SIZE})")
-
-        user_request_map: Dict[str, List[UnpinChainRequest]] = {}
-        for req in requests:
-            if req.address not in user_request_map:
-                user_request_map[req.address] = []
-            user_request_map[req.address].append(req)
-
-        manifest_cids: Dict[str, str] = {}
-        failed_users = []
-
-        for user_addr, user_requests in user_request_map.items():
-            try:
-                manifest_cid = await create_and_upload_manifest(user_addr, user_requests)
-                manifest_cids[user_addr] = manifest_cid
-                logger.info(f"Created manifest for user {user_addr}: {manifest_cid}")
-            except Exception as e:
-                logger.error(f"Failed to create manifest for user {user_addr}: {e}", exc_info=True)
-                failed_users.append(user_addr)
-
-        if not manifest_cids:
-            logger.warning("No manifests created, requeuing all requests")
-            for req in requests:
-                await enqueue_unpin_request(req)
-            logger.info(f"Sleeping {EPOCH_SLEEP_SECONDS}s until next epoch...")
-            await asyncio.sleep(EPOCH_SLEEP_SECONDS)
-            continue
-
-        if failed_users:
-            logger.warning(f"Failed to create manifests for {len(failed_users)} users, requeuing their requests")
-            for user_addr in failed_users:
-                for req in user_request_map[user_addr]:
-                    await enqueue_unpin_request(req)
-
-        successful_requests = [req for req in requests if req.address not in failed_users]
-
-        try:
-            await unpinner_worker.process_batch(successful_requests, manifest_cids)
-            logger.info(f"Successfully submitted batch of {len(manifest_cids)} unpin manifests")
-        except Exception:
-            logger.exception(f"Unpinner batch submission failed for {len(manifest_cids)} manifests")
-            for req in successful_requests:
-                await enqueue_unpin_request(req)
-            logger.info(f"Requeued {len(successful_requests)} failed requests")
-            logger.info(f"Sleeping {EPOCH_SLEEP_SECONDS}s after failure before retry...")
-            await asyncio.sleep(EPOCH_SLEEP_SECONDS)
+        await process_unpin_request(unpin_request)
 
 
 if __name__ == "__main__":
