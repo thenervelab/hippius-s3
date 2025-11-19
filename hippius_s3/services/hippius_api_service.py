@@ -181,6 +181,8 @@ class HippiusApiClient:
     async def pin_file(
         self,
         cid: str,
+        size_bytes: int,
+        account_ss58: str,
         filename: str | None = None,
     ) -> PinResponse:
         """
@@ -190,6 +192,8 @@ class HippiusApiClient:
 
         Args:
             cid: Content Identifier (CID) of the file to pin
+            account_ss58: Account SS58 hash
+            size_bytes: Size of file in bytes
             filename: Optional original filename
 
         Returns:
@@ -203,6 +207,8 @@ class HippiusApiClient:
         payload = {
             "cid": cid,
             "original_name": filename,
+            "size_bytes": size_bytes,
+            "account_ss58": account_ss58,
             "request_type": "Pin",
         }
 

@@ -40,7 +40,7 @@ async def process_download_request(
     hippius_client = HippiusClient(
         ipfs_gateway=config.ipfs_get_url,
         ipfs_api_url=config.ipfs_store_url,
-        substrate_url=config.substrate_url,
+        substrate_url=config.hippius_api_base_url,
         encrypt_by_default=False,
     )
 

@@ -56,7 +56,7 @@ class Config:
 
     # Blockchain
     substrate_url: str = env("HIPPIUS_SUBSTRATE_URL")
-    hippius_service_key: str = env("HIPPIUS_SERVICE_KEY")
+    hippius_service_key: str = env("HIPPIUS_KEY")
     validator_region: str = env("HIPPIUS_VALIDATOR_REGION")
     hippius_api_base_url: str = env("HIPPIUS_API_BASE_URL:https://api.hippius.com/api")
 

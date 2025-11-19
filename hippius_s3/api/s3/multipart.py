@@ -256,7 +256,7 @@ async def initiate_multipart_upload(
             )
 
         # Create initial objects row for this multipart upload
-        await db.execute(
+        upsert_result = await db.fetchrow(
             get_query("upsert_object_multipart"),
             object_id,
             bucket["bucket_id"],
@@ -268,6 +268,9 @@ async def initiate_multipart_upload(
             initiated_at,  # created_at
             int(getattr(config, "target_storage_version", 3)),
         )
+
+        # Use the returned object_id (will be existing one if conflict occurred)
+        object_id = str(upsert_result["object_id"])
 
         # Create the multipart upload in the database with object_id
         await db.fetchrow(
