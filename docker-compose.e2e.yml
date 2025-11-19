@@ -159,9 +159,9 @@ services:
   ipfs:
     image: ipfs/kubo:latest
     ports:
-      - "4001:4001" # IPFS swarm port
-      - "5001:5001" # IPFS API port
-      - "8080:8080" # IPFS gateway port
+      - "127.0.0.1:4001:4001"
+      - "127.0.0.1:5001:5001"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ipfs_data:/data/ipfs
     restart: unless-stopped
