@@ -150,7 +150,7 @@ class Uploader:
         cids_and_sizes = {part["cid"]: part["size_bytes"] for part in manifest_data["parts"]}  # noqa: C416
         cids_and_sizes[manifest_data["manifest_cid"]] = manifest_data["manifest_size_bytes"]
 
-        if cids_and_sizes:
+        if cids_and_sizes and self.config.publish_to_chain:
             try:
                 await self.pin_on_api(cids_and_sizes, payload.address)
             except Exception as e:
@@ -159,6 +159,8 @@ class Uploader:
                     f"Failed to pin {len(cids_and_sizes)} CIDs. Will move to DLQ."
                 )
                 raise
+        elif cids_and_sizes:
+            logger.debug(f"Skipping API pin for object_id={payload.object_id} (publish_to_chain=false)")
 
         total_duration = time.time() - start_time
         logger.info(
@@ -253,6 +255,7 @@ class Uploader:
             logger.warning(
                 f"uploader: missing upload_id; using object_id as fallback (object_id={object_id} part={part_number})"
             )
+            resolved_upload_id = object_id
 
         # Look up part_id and sizing metadata for part_chunks upsert
         async with self._acquire_conn() as conn:
