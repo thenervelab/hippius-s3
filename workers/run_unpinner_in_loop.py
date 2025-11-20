@@ -20,7 +20,6 @@ from hippius_s3.queue import enqueue_unpin_retry_request
 from hippius_s3.queue import move_due_unpin_retries_to_primary
 from hippius_s3.redis_utils import with_redis_retry
 from hippius_s3.services.hippius_api_service import HippiusApiClient
-from hippius_s3.services.hippius_api_service import UnpinResponse
 from hippius_s3.workers.uploader import classify_error
 from hippius_s3.workers.uploader import compute_backoff_ms
 
@@ -29,20 +28,6 @@ config = get_config()
 
 setup_loki_logging(config, "unpinner")
 logger = logging.getLogger(__name__)
-
-
-async def unpin_on_api(cids: list[str]) -> list[UnpinResponse]:
-    if not cids:
-        return []
-
-    semaphore = asyncio.Semaphore(config.unpinner_parallelism)
-
-    async def unpin_with_limit(api_client: HippiusApiClient, cid: str) -> UnpinResponse:
-        async with semaphore:
-            return await api_client.unpin_file(cid)
-
-    async with HippiusApiClient() as api_client:
-        return await asyncio.gather(*[unpin_with_limit(api_client, cid) for cid in cids])
 
 
 async def unpin_from_local_ipfs(cid: str) -> None:
@@ -63,9 +48,12 @@ async def process_unpin_request(request: UnpinChainRequest) -> None:
     """Process a single unpin request."""
     try:
         logger.info(f"Processing unpin request: {request.name}")
-
-        await unpin_on_api([request.cid])
-        logger.info(f"Successfully unpinned CID via API: {request.cid}")
+        async with HippiusApiClient() as api_client:
+            unpin_result = await api_client.unpin_file(
+                request.cid,
+                account_ss58=request.address,
+            )
+        logger.info(f"Successfully unpinned CID via API: {unpin_result=}")
 
         await unpin_from_local_ipfs(request.cid)
 

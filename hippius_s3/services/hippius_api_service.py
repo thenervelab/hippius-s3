@@ -228,6 +228,7 @@ class HippiusApiClient:
     async def unpin_file(
         self,
         cid: str,
+        account_ss58: str,
     ) -> UnpinResponse:
         """
         Unpin a file from IPFS and cancel storage on blockchain.
@@ -236,6 +237,7 @@ class HippiusApiClient:
 
         Args:
             cid: Content Identifier (CID) of the file to unpin
+            account_ss58: Account SS58 hash
 
         Returns:
             UnpinResponse: Response with request_id and status
@@ -247,6 +249,7 @@ class HippiusApiClient:
         payload = {
             "cid": cid,
             "request_type": "Unpin",
+            "account_ss58": account_ss58,
         }
 
         logger.info(f"Unpinning with {payload=}")
