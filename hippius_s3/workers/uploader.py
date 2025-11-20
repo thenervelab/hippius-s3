@@ -55,6 +55,9 @@ def classify_error(error: Exception) -> str:
             "unavailable",
             "throttled",
             "rate limit",
+            "manifest_pending",
+            "part_meta_not_ready",
+            "part_row_missing",
         ]
     ) or any(keyword in err_type for keyword in ["connectionerror", "timeouterror", "httperror"]):
         return "transient"
@@ -144,8 +147,8 @@ class Uploader:
         manifest_duration = time.time() - manifest_start
 
         if manifest_data.get("status") == "pending":
-            logger.debug(f"Manifest pending for object_id={payload.object_id}, will retry later")
-            return []
+            logger.warning(f"Manifest pending for object_id={payload.object_id}, parts missing CIDs - will retry")
+            raise RuntimeError(f"manifest_pending_missing_cids: object_id={payload.object_id}")
 
         cids_and_sizes = {part["cid"]: part["size_bytes"] for part in manifest_data["parts"]}  # noqa: C416
         cids_and_sizes[manifest_data["manifest_cid"]] = manifest_data["manifest_size_bytes"]
@@ -153,6 +156,7 @@ class Uploader:
         if cids_and_sizes and self.config.publish_to_chain:
             try:
                 await self.pin_on_api(cids_and_sizes, payload.address)
+                logger.info(f"Successfully pinned {len(cids_and_sizes)} CIDs for object_id={payload.object_id}")
             except Exception as e:
                 logger.error(
                     f"Pin failure for object_id={payload.object_id}: {e}. "
@@ -161,6 +165,14 @@ class Uploader:
                 raise
         elif cids_and_sizes:
             logger.debug(f"Skipping API pin for object_id={payload.object_id} (publish_to_chain=false)")
+
+        async with self._acquire_conn() as conn:
+            await conn.execute(
+                "UPDATE object_versions SET status = 'uploaded' WHERE object_id = $1 AND object_version = $2",
+                payload.object_id,
+                int(payload.object_version or 1),
+            )
+        logger.info(f"Updated object status to 'uploaded' object_id={payload.object_id}")
 
         total_duration = time.time() - start_time
         logger.info(

@@ -110,8 +110,15 @@ def retry_on_error(
                     if attempt == retries:
                         break
 
-                    # Log retry attempt with response body if available
+                    # Log retry attempt with response body and function arguments
+                    func_name = func.__name__
+                    args_repr = f"args={args}" if args else ""
+                    kwargs_repr = f"kwargs={kwargs}" if kwargs else ""
+                    args_str = ", ".join(filter(None, [args_repr, kwargs_repr]))
+
                     error_msg = f"Request failed (attempt {attempt + 1}/{retries + 1}): {e}"
+                    if args_str:
+                        error_msg += f" | Function: {func_name}({args_str})"
                     if hasattr(e, "response"):
                         error_msg += f" | Response body: {e.response.text}"
                     logger.error(error_msg)
