@@ -170,6 +170,7 @@ services:
 
   ipfs:
     image: ipfs/kubo:latest
+    user: "0:0"
     ports:
       - "127.0.0.1:4001:4001"
       - "127.0.0.1:5001:5001"

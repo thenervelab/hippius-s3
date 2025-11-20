@@ -110,8 +110,11 @@ def retry_on_error(
                     if attempt == retries:
                         break
 
-                    # Log retry attempt
-                    logger.error(f"Request failed (attempt {attempt + 1}/{retries + 1}): {e}")
+                    # Log retry attempt with response body if available
+                    error_msg = f"Request failed (attempt {attempt + 1}/{retries + 1}): {e}"
+                    if hasattr(e, "response"):
+                        error_msg += f" | Response body: {e.response.text}"
+                    logger.error(error_msg)
                     await asyncio.sleep(backoff)
                 except Exception:
                     # Don't retry on unexpected errors
@@ -245,6 +248,8 @@ class HippiusApiClient:
             "cid": cid,
             "request_type": "Unpin",
         }
+
+        logger.info(f"Unpinning with {payload=}")
 
         response = await self._client.post(
             "/storage-control/requests/",
