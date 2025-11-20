@@ -6,7 +6,6 @@ import sys
 from pathlib import Path
 
 import redis.asyncio as async_redis
-from hippius_sdk.client import HippiusClient
 from redis.exceptions import BusyLoadingError
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
@@ -38,11 +37,6 @@ async def process_download_request(
     """Process a download request by downloading each chunk and storing in Redis."""
 
     obj_cache = RedisObjectPartsCache(redis_client)
-    hippius_client = HippiusClient(
-        ipfs_api_url=config.ipfs_store_url,
-        api_url=config.hippius_api_base_url,
-        encrypt_by_default=False,
-    )
 
     # Use shorter identifier for logging
     short_id = f"{download_request.bucket_name}/{download_request.object_key}"
