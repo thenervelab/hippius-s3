@@ -214,6 +214,50 @@ async def dequeue_unpin_request() -> Union[UnpinChainRequest, None]:
     return None
 
 
+UNPIN_RETRY_ZSET = "unpin_retries"
+
+
+async def enqueue_unpin_retry_request(
+    payload: UnpinChainRequest,
+    *,
+    delay_seconds: float,
+    last_error: str | None = None,
+) -> None:
+    client = get_queue_client()
+    if payload.request_id is None:
+        payload.request_id = uuid.uuid4().hex
+    payload.attempts = int((payload.attempts or 0) + 1)
+    payload.last_error = last_error
+    if payload.first_enqueued_at is None:
+        payload.first_enqueued_at = time.time()
+    next_ts = time.time() + max(0.0, float(delay_seconds))
+    member = payload.model_dump_json()
+    await client.zadd(UNPIN_RETRY_ZSET, {member: next_ts})
+    logger.info(f"Scheduled unpin retry for {payload.name=} attempts={payload.attempts} next_at={int(next_ts)}")
+
+
+async def move_due_unpin_retries_to_primary(
+    *,
+    now_ts: float | None = None,
+    max_items: int = 64,
+) -> int:
+    """Move due unpin retry items back to the primary queue. Returns number moved."""
+    client = get_queue_client()
+    now_ts = time.time() if now_ts is None else now_ts
+    members = await client.zrangebyscore(UNPIN_RETRY_ZSET, min="-inf", max=now_ts, start=0, num=max_items)
+    moved = 0
+    for m in members:
+        try:
+            async with client.pipeline(transaction=True) as pipe:
+                pipe.zrem(UNPIN_RETRY_ZSET, m)
+                pipe.lpush("unpin_requests", m)
+                await pipe.execute()
+            moved += 1
+        except Exception:
+            logger.exception("Failed to move unpin retry item back to primary queue")
+    return moved
+
+
 DOWNLOAD_QUEUE = "download_requests"
 
 
@@ -248,13 +292,3 @@ async def enqueue_substrate_request(payload: SubstratePinningRequest) -> None:
         payload.attempts = 0
     await client.lpush(SUBSTRATE_QUEUE, payload.model_dump_json())
     logger.info(f"Enqueued substrate request {payload.name=}")
-
-
-async def dequeue_substrate_request() -> SubstratePinningRequest | None:
-    """Get the next substrate pinning request from the Redis queue."""
-    client = get_queue_client()
-    result = await client.brpop(SUBSTRATE_QUEUE, timeout=5)
-    if result:
-        _, queue_data = result
-        return SubstratePinningRequest.model_validate_json(queue_data)
-    return None

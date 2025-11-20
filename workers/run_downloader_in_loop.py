@@ -6,7 +6,6 @@ import sys
 from pathlib import Path
 
 import redis.asyncio as async_redis
-from hippius_sdk.client import HippiusClient
 from redis.exceptions import BusyLoadingError
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
@@ -18,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
+from hippius_s3.ipfs_service import s3_download
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import dequeue_download_request
@@ -37,12 +37,6 @@ async def process_download_request(
     """Process a download request by downloading each chunk and storing in Redis."""
 
     obj_cache = RedisObjectPartsCache(redis_client)
-    hippius_client = HippiusClient(
-        ipfs_gateway=config.ipfs_get_url,
-        ipfs_api_url=config.ipfs_store_url,
-        substrate_url=config.substrate_url,
-        encrypt_by_default=False,
-    )
 
     # Use shorter identifier for logging
     short_id = f"{download_request.bucket_name}/{download_request.object_key}"
@@ -108,14 +102,13 @@ async def process_download_request(
                             data_i = cid_cache[cid_for_ci]
                             chunk_logger.debug(f"Using cached CID data for ci={ci}")
                         else:
-                            data_i = await hippius_client.s3_download(
+                            download_result = await s3_download(
                                 cid=cid_for_ci,
-                                subaccount_id=download_request.subaccount,
+                                account_address=download_request.subaccount,
                                 bucket_name=download_request.bucket_name,
-                                auto_decrypt=False,
-                                download_node=download_request.ipfs_node,
-                                return_bytes=True,
+                                decrypt=False,
                             )
+                            data_i = download_result.data
                             cid_cache[cid_for_ci] = data_i
                         with contextlib.suppress(Exception):
                             head8 = data_i[:8].hex()

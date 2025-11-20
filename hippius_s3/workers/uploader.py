@@ -14,9 +14,9 @@ from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.ipfs_service import IPFSService
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
-from hippius_s3.queue import SubstratePinningRequest
 from hippius_s3.queue import UploadChainRequest
-from hippius_s3.queue import enqueue_substrate_request
+from hippius_s3.services.hippius_api_service import HippiusApiClient
+from hippius_s3.services.hippius_api_service import PinResponse
 from hippius_s3.utils import get_query
 
 
@@ -37,6 +37,9 @@ def classify_error(error: Exception) -> str:
         keyword in err_str
         for keyword in ["malformed", "invalid", "negative size", "missing part", "validation error", "integrity"]
     ):
+        return "permanent"
+
+    if any(keyword in err_str for keyword in ["pin", "unpin", "hippius api", "hippiusapi"]) or "hippiusapi" in err_type:
         return "permanent"
 
     if any(
@@ -97,12 +100,33 @@ class Uploader:
             return acquire()
         return Uploader._ConnCtx(self.db)
 
+    async def pin_on_api(self, cids, account_ss58) -> list[PinResponse]:
+        if not cids:
+            return []
+
+        semaphore = asyncio.Semaphore(self.config.uploader_pin_parallelism)
+
+        async def pin_with_limit(
+            api_client: HippiusApiClient,
+            cid: str,
+            size_bytes: int,
+        ) -> PinResponse:
+            async with semaphore:
+                return await api_client.pin_file(
+                    cid,
+                    size_bytes,
+                    account_ss58,
+                )
+
+        async with HippiusApiClient() as api_client:
+            return await asyncio.gather(*[pin_with_limit(api_client, cid, size) for cid, size in cids.items()])
+
     async def process_upload(self, payload: UploadChainRequest) -> List[str]:
         start_time = time.time()
         logger.info(f"Processing upload object_id={payload.object_id} chunks={len(payload.chunks)}")
 
         chunk_start = time.time()
-        chunk_cids = await self._upload_chunks(
+        _ = await self._upload_chunks(
             object_id=payload.object_id,
             object_key=payload.object_key,
             chunks=payload.chunks,
@@ -112,28 +136,35 @@ class Uploader:
         chunk_duration = time.time() - chunk_start
 
         manifest_start = time.time()
-        manifest_cid = await self._build_and_upload_manifest(
+        manifest_data = await self._build_and_upload_manifest(
             object_id=payload.object_id,
             object_key=payload.object_key,
             object_version=int(payload.object_version or 1),
         )
         manifest_duration = time.time() - manifest_start
 
-        valid_cids = [c for c in (chunk_cids + [manifest_cid]) if c and c != "pending"]
+        if manifest_data.get("status") == "pending":
+            logger.debug(f"Manifest pending for object_id={payload.object_id}, will retry later")
+            return []
 
-        if valid_cids:
-            await enqueue_substrate_request(
-                SubstratePinningRequest(
-                    cids=valid_cids,
-                    address=payload.address,
-                    object_id=payload.object_id,
-                    object_version=int(payload.object_version or 1),
-                ),
-            )
+        cids_and_sizes = {part["cid"]: part["size_bytes"] for part in manifest_data["parts"]}  # noqa: C416
+        cids_and_sizes[manifest_data["manifest_cid"]] = manifest_data["manifest_size_bytes"]
+
+        if cids_and_sizes and self.config.publish_to_chain:
+            try:
+                await self.pin_on_api(cids_and_sizes, payload.address)
+            except Exception as e:
+                logger.error(
+                    f"Pin failure for object_id={payload.object_id}: {e}. "
+                    f"Failed to pin {len(cids_and_sizes)} CIDs. Will move to DLQ."
+                )
+                raise
+        elif cids_and_sizes:
+            logger.debug(f"Skipping API pin for object_id={payload.object_id} (publish_to_chain=false)")
 
         total_duration = time.time() - start_time
         logger.info(
-            f"Upload complete object_id={payload.object_id} cids={len(valid_cids)} "
+            f"Upload complete object_id={payload.object_id} cids={len(cids_and_sizes)} "
             f"chunks={chunk_duration:.2f}s manifest={manifest_duration:.2f}s total={total_duration:.2f}s"
         )
 
@@ -144,7 +175,7 @@ class Uploader:
             duration=total_duration,
         )
 
-        return valid_cids
+        return list(cids_and_sizes.keys())
 
     async def _upload_chunks(
         self,
@@ -318,7 +349,7 @@ class Uploader:
         object_id: str,
         object_key: str,
         object_version: int,
-    ) -> str:
+    ) -> dict:
         async with self._acquire_conn() as conn:
             logger.debug(f"Building manifest for object_id={object_id}")
 
@@ -343,7 +374,7 @@ class Uploader:
                 size = int(r[2] or 0)
                 if not cid or cid.lower() in {"", "none", "pending"}:
                     logger.debug(f"Manifest deferred: missing CID for part {part_number} (object_id={object_id})")
-                    return "pending"
+                    return {"status": "pending"}
                 parts_data.append({"part_number": part_number, "cid": cid, "size_bytes": size})
 
             obj_row = await conn.fetchrow(
@@ -374,15 +405,10 @@ class Uploader:
                 content_type="application/json",
                 encrypt=False,
             )
-            manifest_cid = str(
-                manifest_result.get("cid")
-                if isinstance(manifest_result, dict)
-                else getattr(manifest_result, "cid", None)
-            )
-            if not manifest_cid:
+            if not manifest_result["cid"]:
                 raise ValueError("manifest_publish_missing_cid")
 
-            cid_row = await conn.fetchrow(get_query("upsert_cid"), manifest_cid)
+            cid_row = await conn.fetchrow(get_query("upsert_cid"), manifest_result["cid"])
             cid_id = cid_row["id"] if cid_row else None
 
             await conn.execute(
@@ -395,12 +421,16 @@ class Uploader:
                 """,
                 object_id,
                 object_version,
-                manifest_cid,
+                manifest_result["cid"],
                 cid_id,
             )
 
-            logger.info(f"Manifest uploaded object_id={object_id} cid={manifest_cid}")
-            return manifest_cid
+            logger.info(f"Manifest uploaded object_id={object_id} cid={manifest_result['cid']}")
+
+            manifest_data["manifest_cid"] = manifest_result["cid"]
+            manifest_data["manifest_size_bytes"] = manifest_result["size_bytes"]
+
+            return manifest_data
 
     async def _push_to_dlq(self, payload: UploadChainRequest, last_error: str, error_type: str) -> None:
         """Push a failed request to the Dead-Letter Queue."""

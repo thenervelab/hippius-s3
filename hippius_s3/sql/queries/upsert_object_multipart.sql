@@ -3,7 +3,6 @@ WITH upsert_object AS (
   VALUES ($1, $2, $3, $8, 1)
   ON CONFLICT (bucket_id, object_key)
   DO UPDATE SET
-    object_id = EXCLUDED.object_id,
     current_object_version = COALESCE(objects.current_object_version, 1)
   RETURNING object_id, bucket_id, object_key, created_at, current_object_version
 ), ins_version AS (

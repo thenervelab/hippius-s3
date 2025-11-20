@@ -16,6 +16,8 @@ services:
       - .env.defaults
       - .env
     depends_on:
+      ipfs:
+        condition: service_started
       db:
         condition: service_healthy
       redis:
@@ -55,6 +57,25 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - hippius_net
+
+  ipfs:
+    image: ipfs/kubo:latest
+    ports:
+      - "127.0.0.1:4001:4001"
+      - "127.0.0.1:5001:5001"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ipfs_data:/data/ipfs
+    restart: unless-stopped
+    environment:
+      - IPFS_PROFILE=server
+    healthcheck:
+      test: ["CMD-SHELL", "ipfs id"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
     networks:
       - hippius_net
 
@@ -202,6 +223,8 @@ services:
       - .env.defaults
       - .env
     depends_on:
+      ipfs:
+        condition: service_started
       db:
         condition: service_healthy
       redis:
@@ -216,34 +239,6 @@ services:
     volumes:
       - .:/app
       # Shared object parts FS store (authoritative for uploader reads)
-      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
-    networks:
-      - hippius_net
-
-  substrate:
-    build:
-      context: .
-      dockerfile: workers/Dockerfile
-    env_file:
-      - .env.defaults
-      - .env
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      redis-queues:
-        condition: service_healthy
-    deploy:
-      replicas: 1
-    restart: unless-stopped
-    environment:
-      - PYTHONUNBUFFERED=1
-      - WORKER_SCRIPT=workers/run_substrate_in_loop.py
-      - ENABLE_WATCHFILES=true
-    volumes:
-      - .:/app
-      # Shared object parts FS store (cleanup after pin confirmation)
       - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
     networks:
       - hippius_net
@@ -373,6 +368,7 @@ services:
       context: .
       dockerfile: workers/Dockerfile
     env_file:
+      - .env.defaults
       - .env
     depends_on:
       api:
@@ -394,6 +390,7 @@ services:
       context: .
       dockerfile: workers/Dockerfile
     env_file:
+      - .env.defaults
       - .env
     depends_on:
       db:
@@ -411,6 +408,7 @@ services:
 
 volumes:
   postgres_data:
+  ipfs_data:
   redis_data:
   redis_accounts_data:
   redis_chain_data:

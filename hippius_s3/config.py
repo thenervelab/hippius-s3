@@ -56,7 +56,9 @@ class Config:
 
     # Blockchain
     substrate_url: str = env("HIPPIUS_SUBSTRATE_URL")
+    hippius_service_key: str = env("HIPPIUS_KEY")
     validator_region: str = env("HIPPIUS_VALIDATOR_REGION")
+    hippius_api_base_url: str = env("HIPPIUS_API_BASE_URL:https://api.hippius.com/api")
 
     # Redis for caching/rate limiting
     redis_url: str = env("REDIS_URL")
@@ -95,8 +97,12 @@ class Config:
     uploader_backoff_base_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_BASE_MS:500", convert=int)
     uploader_backoff_max_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_MAX_MS:60000", convert=int)
     uploader_multipart_max_concurrency: int = env("HIPPIUS_UPLOADER_MULTIPART_MAX_CONCURRENCY:5", convert=int)
+    uploader_pin_parallelism: int = env("HIPPIUS_UPLOADER_PIN_PARALLELISM:5", convert=int)
     # Heavy validation gating (legacy PINNER_VALIDATE_COVERAGE supported for compat)
     uploader_validate_coverage: bool = env("UPLOADER_VALIDATE_COVERAGE:false", convert=lambda x: x.lower() == "true")
+
+    # Unpinner configuration
+    unpinner_parallelism: int = env("HIPPIUS_UNPINNER_PARALLELISM:5", convert=int)
 
     # Substrate worker configuration
     substrate_batch_size: int = env("HIPPIUS_SUBSTRATE_BATCH_SIZE:5000", convert=int)

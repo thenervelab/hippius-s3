@@ -148,9 +148,8 @@ class IPFSService:
         """Initialize the IPFS service."""
         self.config = config
         self.client = HippiusClient(
-            ipfs_gateway=config.ipfs_get_url,
             ipfs_api_url=config.ipfs_store_url,
-            substrate_url=config.substrate_url,
+            api_url=config.hippius_api_base_url,
             encrypt_by_default=False,
         )
         self.redis_client = redis_client
@@ -223,7 +222,7 @@ class IPFSService:
                             if not cid:
                                 raise RuntimeError("ipfs_add_missing_cid")
                     # Pin the root CID
-                    await self.client.pin(cid, seed_phrase=seed_phrase)
+                    await self.client.pin(cid)
                     return IPFSService.PinnedFile(file_hash=cid, cid=cid)
                 finally:
                     try:
@@ -299,22 +298,23 @@ class IPFSService:
                     if encrypt and seed_phrase:
                         key_material = hashlib.sha256(seed_phrase.encode("utf-8")).digest()
                         client = HippiusClient(
-                            ipfs_gateway=self.config.ipfs_get_url,
                             ipfs_api_url=self.config.ipfs_store_url,
-                            substrate_url=self.config.substrate_url,
+                            api_url=self.config.hippius_api_base_url,
                             encrypt_by_default=False,
                             encryption_key=key_material,
                         )
                         result = await client.upload_file(
                             temp_path,
                             encrypt=encrypt,
-                            seed_phrase=seed_phrase,
+                            hippius_key=config.hippius_service_key,
+                            pin=False,
                         )
                     else:
                         result = await self.client.upload_file(
                             temp_path,
                             encrypt=encrypt,
-                            seed_phrase=seed_phrase,
+                            hippius_key=config.hippius_service_key,
+                            pin=False,
                         )
                     break
                 except Exception as e:
@@ -325,29 +325,12 @@ class IPFSService:
                     logger.warning(f"IPFS upload failed (attempt {attempt}), retrying in {backoff_ms:.0f}ms: {e}")
                     await asyncio.sleep(backoff_ms / 1000.0)
 
-            # Pin with retries
-            for attempt in range(1, int(getattr(self.config, "ipfs_max_retries", 3)) + 1):
-                try:
-                    pinning_status = await self.client.pin(
-                        result["cid"],
-                        seed_phrase=seed_phrase,
-                    )
-                    break
-                except Exception as e:
-                    if attempt >= int(getattr(self.config, "ipfs_max_retries", 3)):
-                        logger.exception(f"IPFS pin failed after {attempt} attempts: {e}")
-                        raise
-                    backoff_ms = _compute_backoff_ms(attempt)
-                    logger.warning(f"IPFS pin failed (attempt {attempt}), retrying in {backoff_ms:.0f}ms: {e}")
-                    await asyncio.sleep(backoff_ms / 1000.0)
-
             return {
                 "cid": result["cid"],
                 "file_name": file_name,
                 "content_type": content_type,
                 "size_bytes": result["size_bytes"],
                 "encrypted": result.get("encrypted", False),
-                "pinning_status": pinning_status,
             }
         finally:
             if Path(temp_path).exists():
@@ -518,9 +501,8 @@ class IPFSService:
                         # Derive encryption key from seed phrase
                         key_material = hashlib.sha256(seed_phrase.encode("utf-8")).digest()
                         client = HippiusClient(
-                            ipfs_gateway=self.config.ipfs_get_url,
                             ipfs_api_url=self.config.ipfs_store_url,
-                            substrate_url=self.config.substrate_url,
+                            api_url=self.config.hippius_api_base_url,
                             encrypt_by_default=False,
                             encryption_key=key_material,
                         )
@@ -528,14 +510,14 @@ class IPFSService:
                         result = await client.upload_file(
                             temp_path,
                             encrypt=encrypt,
-                            seed_phrase=seed_phrase,
+                            hippius_key=config.hippius_service_key,
                         )
                     else:
                         # Upload the part to IPFS without encryption
                         result = await self.client.upload_file(
                             temp_path,
                             encrypt=encrypt,
-                            seed_phrase=seed_phrase,
+                            hippius_key=config.hippius_service_key,
                         )
                     break
                 except Exception as e:
@@ -556,7 +538,6 @@ class IPFSService:
                     # Pin the CID to ensure it stays available
                     await self.client.pin(
                         result["cid"],
-                        seed_phrase=seed_phrase,
                     )
                     break
                 except Exception as e:
