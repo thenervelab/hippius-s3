@@ -15,6 +15,10 @@ pytestmark = pytest.mark.acl
 class TestBucketReadPermission:
     """Test READ permission on buckets."""
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_read_allows_list_objects(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
     ):
@@ -28,6 +32,10 @@ class TestBucketReadPermission:
         response = s3_acc2_uploaddelete.list_objects_v2(Bucket=bucket)
         assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_read_allows_list_objects_v2(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
     ):
@@ -39,6 +47,10 @@ class TestBucketReadPermission:
         response = s3_acc2_uploaddelete.list_objects_v2(Bucket=bucket)
         assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_read_denies_other_operations(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
     ):
@@ -54,6 +66,10 @@ class TestBucketReadPermission:
 class TestBucketWritePermission:
     """Test WRITE permission on buckets."""
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     @pytest.mark.xfail(reason="Bucket WRITE permission may not grant PutObject access - needs investigation")
     def test_bucket_write_allows_put_object(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
@@ -65,6 +81,10 @@ class TestBucketWritePermission:
 
         s3_acc2_uploaddelete.put_object(Bucket=bucket, Key="test.txt", Body=b"test content")
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_write_allows_delete_object(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
     ):
@@ -78,6 +98,10 @@ class TestBucketWritePermission:
 
         s3_acc2_uploaddelete.delete_object(Bucket=bucket, Key=key)
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_write_allows_initiate_multipart(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
     ):
@@ -91,6 +115,10 @@ class TestBucketWritePermission:
 
         s3_acc2_uploaddelete.abort_multipart_upload(Bucket=bucket, Key="multipart.txt", UploadId=response["UploadId"])
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_write_denies_list(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
     ) -> None:
@@ -106,6 +134,10 @@ class TestBucketWritePermission:
 class TestBucketReadACPPermission:
     """Test READ_ACP permission on buckets."""
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_read_acp_allows_get_bucket_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
     ):
@@ -119,6 +151,10 @@ class TestBucketReadACPPermission:
         assert "Owner" in response
         assert "Grants" in response
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_read_acp_denies_put_bucket_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
     ):
@@ -134,6 +170,10 @@ class TestBucketReadACPPermission:
 class TestBucketWriteACPPermission:
     """Test WRITE_ACP permission on buckets."""
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_write_acp_allows_put_bucket_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
     ):
@@ -144,6 +184,10 @@ class TestBucketWriteACPPermission:
 
         s3_acc2_uploaddelete.put_bucket_acl(Bucket=bucket, GrantWriteACP=f'id="{canonical_ids["acc2"]}"')
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     @pytest.mark.xfail(reason="WRITE_ACP may not implicitly grant READ_ACP - needs spec verification")
     def test_bucket_write_acp_allows_get_bucket_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
@@ -160,6 +204,10 @@ class TestBucketWriteACPPermission:
 class TestBucketFullControlPermission:
     """Test FULL_CONTROL permission on buckets."""
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_full_control_allows_all_operations(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
     ):

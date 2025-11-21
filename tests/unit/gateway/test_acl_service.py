@@ -399,40 +399,6 @@ class TestWritePermissionOwnership:
         assert has_permission
 
 
-class TestIsPublicBypass:
-    @pytest.mark.asyncio
-    async def test_is_public_bypass_allows_anonymous_read_despite_private_acl(self, mock_db_pool: Any) -> None:
-        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
-
-        acl_service = ACLService(mock_db_pool)
-
-        from hippius_s3.models.acl import ACL
-        from hippius_s3.models.acl import Owner
-
-        object_acl = ACL(
-            owner=Owner(id=owner_id),
-            grants=[
-                Grant(
-                    grantee=Grantee(type=GranteeType.CANONICAL_USER, id=owner_id),
-                    permission=Permission.FULL_CONTROL,
-                ),
-            ],
-        )
-
-        acl_service.acl_repo = MagicMock()
-        acl_service.acl_repo.db = mock_db_pool
-        acl_service.acl_repo.get_object_acl = AsyncMock(return_value=object_acl)
-        acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=None)
-
-        mock_db_pool.fetchrow = AsyncMock(return_value={"is_public": True})
-
-        has_permission = await acl_service.check_permission(
-            account_id=None, bucket="public-bucket", key="private-object.txt", permission=Permission.READ
-        )
-
-        assert has_permission
-
-
 class TestObjectACLInheritance:
     @pytest.mark.asyncio
     async def test_object_without_acl_uses_object_owner_not_bucket_owner(self, mock_db_pool: Any) -> None:

@@ -19,6 +19,10 @@ pytestmark = pytest.mark.acl
 class TestBucketGrantHeaders:
     """Test bucket ACL grant header functionality."""
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_grant_read(self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids) -> None:
         """Test granting READ permission via header."""
         bucket = clean_bucket
@@ -33,6 +37,10 @@ class TestBucketGrantHeaders:
         response = s3_acc2_uploaddelete.list_objects_v2(Bucket=bucket)
         assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_grant_write(self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids) -> None:
         """Test granting WRITE permission via header."""
         bucket = clean_bucket
@@ -46,6 +54,10 @@ class TestBucketGrantHeaders:
 
         s3_acc2_uploaddelete.put_object(Bucket=bucket, Key="test-write.txt", Body=b"test")
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_grant_read_acp(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
     ) -> None:
@@ -62,6 +74,10 @@ class TestBucketGrantHeaders:
         response = s3_acc2_uploaddelete.get_bucket_acl(Bucket=bucket)
         assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_grant_write_acp(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
     ) -> None:
@@ -77,6 +93,10 @@ class TestBucketGrantHeaders:
 
         s3_acc2_uploaddelete.put_bucket_acl(Bucket=bucket, GrantWriteACP=f'id="{canonical_ids["acc2"]}"')
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_grant_full_control(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
     ) -> None:
@@ -100,6 +120,10 @@ class TestBucketGrantHeaders:
 
         s3_acc2_uploaddelete.put_bucket_acl(Bucket=bucket, GrantFullControl=f'id="{canonical_ids["acc2"]}"')
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_multiple_grants(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
     ) -> None:
@@ -121,6 +145,10 @@ class TestBucketGrantHeaders:
 
         s3_acc2_uploaddelete.put_object(Bucket=bucket, Key="test.txt", Body=b"test")
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_grant_overwrites_previous(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
     ):
@@ -141,6 +169,10 @@ class TestBucketGrantHeaders:
 class TestObjectGrantHeaders:
     """Test object ACL grant header functionality."""
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_grant_read(self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids) -> None:
         """Test granting READ permission via header."""
         bucket, key = test_object
@@ -155,6 +187,10 @@ class TestObjectGrantHeaders:
         response = s3_acc2_uploaddelete.get_object(Bucket=bucket, Key=key)
         assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_grant_read_acp(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
     ) -> None:
@@ -171,6 +207,10 @@ class TestObjectGrantHeaders:
         response = s3_acc2_uploaddelete.get_object_acl(Bucket=bucket, Key=key)
         assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_grant_write_acp(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
     ) -> None:
@@ -186,6 +226,10 @@ class TestObjectGrantHeaders:
 
         s3_acc2_uploaddelete.put_object_acl(Bucket=bucket, Key=key, GrantWriteACP=f'id="{canonical_ids["acc2"]}"')
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_grant_full_control(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
     ) -> None:
@@ -210,6 +254,10 @@ class TestObjectGrantHeaders:
 
         s3_acc2_uploaddelete.put_object_acl(Bucket=bucket, Key=key, GrantFullControl=f'id="{canonical_ids["acc2"]}"')
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_multiple_grants(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
     ) -> None:
@@ -235,6 +283,10 @@ class TestObjectGrantHeaders:
         response = s3_acc2_uploaddelete.get_object_acl(Bucket=bucket, Key=key)
         assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_grant_overwrites_previous(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
     ):

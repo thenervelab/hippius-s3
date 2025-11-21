@@ -16,6 +16,10 @@ pytestmark = pytest.mark.acl
 class TestObjectReadPermission:
     """Test READ permission on objects."""
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_read_allows_get_object(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
     ):
@@ -28,6 +32,10 @@ class TestObjectReadPermission:
         assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
         assert response["Body"].read() == b"This is test content for ACL testing"
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_read_allows_head_object(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
     ):
@@ -39,6 +47,10 @@ class TestObjectReadPermission:
         response = s3_acc2_uploaddelete.head_object(Bucket=bucket, Key=key)
         assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_read_denies_delete(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
     ) -> None:
@@ -62,6 +74,10 @@ class TestObjectWritePermission:
 class TestObjectReadACPPermission:
     """Test READ_ACP permission on objects."""
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_read_acp_allows_get_object_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
     ):
@@ -75,6 +91,10 @@ class TestObjectReadACPPermission:
         assert "Owner" in response
         assert "Grants" in response
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_read_acp_denies_put_object_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
     ):
@@ -90,6 +110,10 @@ class TestObjectReadACPPermission:
 class TestObjectWriteACPPermission:
     """Test WRITE_ACP permission on objects."""
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_write_acp_allows_put_object_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
     ):
@@ -100,6 +124,10 @@ class TestObjectWriteACPPermission:
 
         s3_acc2_uploaddelete.put_object_acl(Bucket=bucket, Key=key, GrantWriteACP=f'id="{canonical_ids["acc2"]}"')
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_write_acp_denies_get_object(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
     ):
@@ -115,6 +143,10 @@ class TestObjectWriteACPPermission:
 class TestObjectFullControlPermission:
     """Test FULL_CONTROL permission on objects."""
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_full_control_allows_all_operations(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
     ):

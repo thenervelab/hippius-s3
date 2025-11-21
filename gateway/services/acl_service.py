@@ -4,9 +4,7 @@ import asyncpg
 
 from hippius_s3.models.acl import ACL
 from hippius_s3.models.acl import Grant
-from hippius_s3.models.acl import Grantee
 from hippius_s3.models.acl import GranteeType
-from hippius_s3.models.acl import Owner
 from hippius_s3.models.acl import Permission
 from hippius_s3.models.acl import WellKnownGroups
 from hippius_s3.repositories.acl_repository import ACLRepository
@@ -63,12 +61,7 @@ class ACLService:
         permission: Permission,
     ) -> bool:
         """Check if account has permission for bucket/object."""
-        is_anonymous = account_id is None or account_id == "anonymous"
-        if is_anonymous and key is not None and permission == Permission.READ:
-            query = "SELECT is_public FROM buckets WHERE bucket_name = $1"
-            row = await self.acl_repo.db.fetchrow(query, bucket)
-            if row and row["is_public"]:
-                return True
+
 
         acl = await self.get_effective_acl(bucket, key)
 

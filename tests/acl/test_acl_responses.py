@@ -25,6 +25,10 @@ class TestACLResponseStructure:
         assert isinstance(acl["Owner"]["ID"], str), "Owner ID must be string"
         assert len(acl["Owner"]["ID"]) > 0, "Owner ID must not be empty"
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_acl_has_owner_field(self, s3_acc1_uploaddelete, test_object) -> None:
         """Test that get_object_acl response contains Owner field."""
         bucket, key = test_object
@@ -46,6 +50,10 @@ class TestACLResponseStructure:
         assert isinstance(acl["Grants"], list), "Grants must be an array"
         assert len(acl["Grants"]) >= 1, "Default ACL must have at least owner grant"
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_acl_has_grants_array(self, s3_acc1_uploaddelete, test_object) -> None:
         """Test that get_object_acl response contains Grants array."""
         bucket, key = test_object
@@ -89,6 +97,10 @@ class TestGrantStructure:
             assert isinstance(grantee["ID"], str), "Grantee ID must be string"
             assert len(grantee["ID"]) > 0, "Grantee ID must not be empty"
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_group_grantee_structure(self, s3_acc1_uploaddelete, clean_bucket) -> None:
         """Test that Group grantee has correct structure."""
         bucket = clean_bucket
@@ -112,6 +124,10 @@ class TestGrantStructure:
 class TestPermissionValues:
     """Test that permission values are correct."""
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_valid_permission_values(self, s3_acc1_uploaddelete, clean_bucket, canonical_ids) -> None:
         """Test that all permissions use valid values."""
         bucket = clean_bucket
@@ -132,6 +148,10 @@ class TestPermissionValues:
         for grant in grants:
             assert grant["Permission"] in valid_permissions, f"Invalid permission value: {grant['Permission']}"
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_owner_always_has_full_control(self, s3_acc1_uploaddelete, clean_bucket, canonical_ids) -> None:
         """Test that owner always has FULL_CONTROL grant."""
         bucket = clean_bucket
@@ -169,6 +189,10 @@ class TestCanonicalIDFormat:
         assert len(canonical_id) > 0
         assert canonical_id[0].isalnum(), "Canonical ID should start with alphanumeric character"
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_get_canonical_user_id_from_object_acl(self, s3_acc1_uploaddelete, test_object) -> None:
         """Test that canonical user ID can be extracted from object ACL."""
         bucket, key = test_object
@@ -180,6 +204,10 @@ class TestCanonicalIDFormat:
         assert len(canonical_id) > 0
         assert canonical_id[0].isalnum(), "Canonical ID should start with alphanumeric character"
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_canonical_id_consistent_across_requests(self, s3_acc1_uploaddelete, clean_bucket, test_object) -> None:
         """Test that canonical ID is consistent across different ACL requests."""
         bucket = clean_bucket

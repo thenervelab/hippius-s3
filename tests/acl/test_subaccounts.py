@@ -25,6 +25,10 @@ class TestSubaccountBucketACL:
         assert "Owner" in response
         assert "Grants" in response
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2') or config.getoption('--aws')",
+        reason="Subaccounts are a Hippius-specific concept. PutBucketAcl not implemented in R2."
+    )
     def test_upload_subaccount_cannot_write_bucket_acl(self, s3_acc1_upload, clean_bucket) -> None:
         """Test that upload-only subaccount cannot write bucket ACL."""
         bucket = clean_bucket
@@ -32,6 +36,10 @@ class TestSubaccountBucketACL:
         with pytest.raises(ClientError, match="AccessDenied"):
             s3_acc1_upload.put_bucket_acl(Bucket=bucket, ACL="public-read")
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_uploaddelete_subaccount_can_write_bucket_acl(self, s3_acc1_uploaddelete, clean_bucket) -> None:
         """Test that upload/delete subaccount can write bucket ACL."""
         bucket = clean_bucket
@@ -45,6 +53,10 @@ class TestSubaccountBucketACL:
 class TestSubaccountObjectACL:
     """Test subaccount access to object ACLs."""
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_upload_subaccount_can_read_object_acl(self, s3_acc1_upload, s3_acc1_uploaddelete, test_object) -> None:
         """Test that upload-only subaccount can read object ACL."""
         bucket, key = test_object
@@ -52,6 +64,10 @@ class TestSubaccountObjectACL:
         response = s3_acc1_uploaddelete.get_object_acl(Bucket=bucket, Key=key)
         assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2') or config.getoption('--aws')",
+        reason="Subaccounts are a Hippius-specific concept. PutObjectAcl/GetObjectAcl not implemented in R2."
+    )
     def test_upload_subaccount_cannot_write_object_acl(self, s3_acc1_upload, test_object) -> None:
         """Test that upload-only subaccount cannot write object ACL."""
         bucket, key = test_object
@@ -59,6 +75,10 @@ class TestSubaccountObjectACL:
         with pytest.raises(ClientError, match="AccessDenied"):
             s3_acc1_upload.put_object_acl(Bucket=bucket, Key=key, ACL="public-read")
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_uploaddelete_subaccount_can_write_object_acl(self, s3_acc1_uploaddelete, test_object) -> None:
         """Test that upload/delete subaccount can write object ACL."""
         bucket, key = test_object

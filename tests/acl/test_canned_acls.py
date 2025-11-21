@@ -17,6 +17,10 @@ pytestmark = pytest.mark.acl
 class TestBucketCannedACLs:
     """Test bucket canned ACL functionality."""
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_private_acl(self, s3_acc1_uploaddelete, clean_bucket, canonical_ids) -> None:
         """Test that private (default) bucket ACL only grants owner FULL_CONTROL."""
         bucket = clean_bucket
@@ -29,6 +33,10 @@ class TestBucketCannedACLs:
         assert len(grants) == 1, f"Expected 1 grant for private ACL, got {len(grants)}"
         assert_has_permission(grants, canonical_ids["acc1"], "FULL_CONTROL")
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_public_read_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
     ) -> None:
@@ -46,6 +54,10 @@ class TestBucketCannedACLs:
         response = s3_acc2_uploaddelete.list_objects_v2(Bucket=bucket)
         assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_public_read_write_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
     ):
@@ -66,6 +78,10 @@ class TestBucketCannedACLs:
 
         s3_acc2_uploaddelete.put_object(Bucket=bucket, Key="test-write.txt", Body=b"test")
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_authenticated_read_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
     ):
@@ -83,6 +99,10 @@ class TestBucketCannedACLs:
         response = s3_acc2_uploaddelete.list_objects_v2(Bucket=bucket)
         assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_log_delivery_write_acl(self, s3_acc1_uploaddelete, clean_bucket, canonical_ids) -> None:
         """Test that log-delivery-write bucket ACL grants LogDelivery group permissions."""
         bucket = clean_bucket
@@ -96,13 +116,37 @@ class TestBucketCannedACLs:
         assert_has_group_permission(grants, "http://acs.amazonaws.com/groups/s3/LogDelivery", "WRITE")
         assert_has_group_permission(grants, "http://acs.amazonaws.com/groups/s3/LogDelivery", "READ_ACP")
 
-    def test_bucket_acl_set_during_creation(self, s3_acc1_uploaddelete) -> None:
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
+    def test_bucket_acl_set_during_creation(self, s3_acc1_uploaddelete, config) -> None:
         """Test that canned ACL can be set during bucket creation."""
+        import os
         import uuid
 
         bucket = f"acl-test-create-{uuid.uuid4().hex[:8]}"
 
-        s3_acc1_uploaddelete.create_bucket(Bucket=bucket, ACL="public-read")
+        is_aws = config.get("use_aws") == "true"
+        aws_region = os.getenv("AWS_REGION", "us-east-1") if is_aws else None
+
+        if is_aws:
+            create_kwargs = {"Bucket": bucket}
+            if aws_region and aws_region != "us-east-1":
+                create_kwargs["CreateBucketConfiguration"] = {"LocationConstraint": aws_region}
+
+            s3_acc1_uploaddelete.create_bucket(**create_kwargs)
+
+            s3_acc1_uploaddelete.put_bucket_ownership_controls(
+                Bucket=bucket,
+                OwnershipControls={"Rules": [{"ObjectOwnership": "BucketOwnerPreferred"}]},
+            )
+            s3_acc1_uploaddelete.delete_public_access_block(Bucket=bucket)
+
+            s3_acc1_uploaddelete.put_bucket_acl(Bucket=bucket, ACL="public-read")
+        else:
+            create_kwargs = {"Bucket": bucket, "ACL": "public-read"}
+            s3_acc1_uploaddelete.create_bucket(**create_kwargs)
 
         acl = s3_acc1_uploaddelete.get_bucket_acl(Bucket=bucket)
         grants = acl["Grants"]
@@ -111,6 +155,10 @@ class TestBucketCannedACLs:
 
         s3_acc1_uploaddelete.delete_bucket(Bucket=bucket)
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_bucket_acl_overwrite_previous(self, s3_acc1_uploaddelete, clean_bucket, canonical_ids) -> None:
         """Test that setting new ACL overwrites previous ACL."""
         bucket = clean_bucket
@@ -142,6 +190,10 @@ class TestBucketCannedACLs:
 class TestObjectCannedACLs:
     """Test object canned ACL functionality."""
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_private_acl(self, s3_acc1_uploaddelete, test_object, canonical_ids) -> None:
         """Test that private (default) object ACL only grants owner FULL_CONTROL."""
         bucket, key = test_object
@@ -154,6 +206,10 @@ class TestObjectCannedACLs:
         assert len(grants) == 1, f"Expected 1 grant for private ACL, got {len(grants)}"
         assert_has_permission(grants, canonical_ids["acc1"], "FULL_CONTROL")
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_public_read_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
     ) -> None:
@@ -171,6 +227,10 @@ class TestObjectCannedACLs:
         response = s3_acc2_uploaddelete.get_object(Bucket=bucket, Key=key)
         assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_public_read_write_acl(self, s3_acc1_uploaddelete, test_object, canonical_ids) -> None:
         """Test that public-read-write object ACL grants AllUsers READ."""
         bucket, key = test_object
@@ -183,6 +243,10 @@ class TestObjectCannedACLs:
         assert_has_permission(grants, canonical_ids["acc1"], "FULL_CONTROL")
         assert_has_group_permission(grants, "http://acs.amazonaws.com/groups/global/AllUsers", "READ")
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_authenticated_read_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
     ):
@@ -200,6 +264,10 @@ class TestObjectCannedACLs:
         response = s3_acc2_uploaddelete.get_object(Bucket=bucket, Key=key)
         assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_bucket_owner_read_acl(self, s3_acc1_uploaddelete, test_object, canonical_ids) -> None:
         """Test that bucket-owner-read ACL works (single account scenario)."""
         bucket, key = test_object
@@ -211,6 +279,10 @@ class TestObjectCannedACLs:
 
         assert_has_permission(grants, canonical_ids["acc1"], "FULL_CONTROL")
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_bucket_owner_full_control_acl(self, s3_acc1_uploaddelete, test_object, canonical_ids) -> None:
         """Test that bucket-owner-full-control ACL works (single account scenario)."""
         bucket, key = test_object
@@ -222,6 +294,10 @@ class TestObjectCannedACLs:
 
         assert_has_permission(grants, canonical_ids["acc1"], "FULL_CONTROL")
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_acl_set_during_upload(self, s3_acc1_uploaddelete, clean_bucket) -> None:
         """Test that canned ACL can be set during object upload."""
         bucket = clean_bucket
@@ -234,6 +310,10 @@ class TestObjectCannedACLs:
 
         assert_has_group_permission(grants, "http://acs.amazonaws.com/groups/global/AllUsers", "READ")
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_acl_overwrite_previous(self, s3_acc1_uploaddelete, test_object, canonical_ids) -> None:
         """Test that setting new object ACL overwrites previous ACL."""
         bucket, key = test_object
@@ -250,6 +330,10 @@ class TestObjectCannedACLs:
         assert len(grants) == 1, "Expected only owner grant after setting private ACL"
         assert_has_permission(grants, canonical_ids["acc1"], "FULL_CONTROL")
 
+    @pytest.mark.skipif(
+        "config.getoption('--r2')",
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+    )
     def test_object_get_acl_returns_correct_structure(self, s3_acc1_uploaddelete, test_object) -> None:
         """Test that get_object_acl returns correctly structured response."""
         bucket, key = test_object

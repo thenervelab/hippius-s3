@@ -49,7 +49,7 @@ class ForwardService:
             if key.lower() in ["host", "x-forwarded-for", "x-forwarded-host"]:
                 del headers[key]
 
-        target_url = f"{self.backend_url}{request.url.path}"
+        target_url = f"{self.backend_url}{request.scope['path']}"
         if request.url.query:
             target_url += f"?{request.url.query}"
 

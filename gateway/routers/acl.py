@@ -71,14 +71,21 @@ def parse_grant_header(header_value: str, permission: Permission) -> list[Grant]
     Parse grant header like: id="abc", uri="http://...", id="def"
 
     Returns list of Grant objects with the specified permission.
+    Raises ValueError if format is invalid.
     """
     grants = []
 
+    # Split by comma, but be careful about potential commas in values (though unlikely for IDs/URIs)
+    # For now simple split is fine as per spec
     for part in header_value.split(","):
         part = part.strip()
+        if not part:
+            continue
 
-        if part.startswith('id="'):
+        if part.startswith('id="') and part.endswith('"'):
             grantee_id = part[4:-1]
+            if not grantee_id:
+                raise ValueError("Grantee ID cannot be empty")
             grants.append(
                 Grant(
                     grantee=Grantee(type=GranteeType.CANONICAL_USER, id=grantee_id),
@@ -86,8 +93,10 @@ def parse_grant_header(header_value: str, permission: Permission) -> list[Grant]
                 )
             )
 
-        elif part.startswith('uri="'):
+        elif part.startswith('uri="') and part.endswith('"'):
             uri = part[5:-1]
+            if not uri:
+                raise ValueError("Grantee URI cannot be empty")
             grants.append(
                 Grant(
                     grantee=Grantee(type=GranteeType.GROUP, uri=uri),
@@ -95,14 +104,18 @@ def parse_grant_header(header_value: str, permission: Permission) -> list[Grant]
                 )
             )
 
-        elif part.startswith('emailAddress="'):
+        elif part.startswith('emailAddress="') and part.endswith('"'):
             email = part[14:-1]
+            if not email:
+                raise ValueError("Grantee Email cannot be empty")
             grants.append(
                 Grant(
                     grantee=Grantee(type=GranteeType.AMAZON_CUSTOMER_BY_EMAIL, email_address=email),
                     permission=permission,
                 )
             )
+        else:
+            raise ValueError(f"Invalid grant header format: {part}")
 
     return grants
 
@@ -280,9 +293,7 @@ async def put_bucket_acl(
         # Forward bucket creation to backend
         # Backend handles ACL creation atomically with bucket creation
         forward_service = request.app.state.forward_service
-        response = cast(Response, await forward_service.forward_request(request))
-
-        return response
+        return cast(Response, await forward_service.forward_request(request))
 
     account_id = getattr(request.state, "account_id", None)
     if not account_id:
@@ -338,18 +349,32 @@ async def put_bucket_acl(
             )
         ]
 
-        if x_amz_grant_read:
-            grants.extend(parse_grant_header(x_amz_grant_read, Permission.READ))
-        if x_amz_grant_write:
-            grants.extend(parse_grant_header(x_amz_grant_write, Permission.WRITE))
-        if x_amz_grant_read_acp:
-            grants.extend(parse_grant_header(x_amz_grant_read_acp, Permission.READ_ACP))
-        if x_amz_grant_write_acp:
-            grants.extend(parse_grant_header(x_amz_grant_write_acp, Permission.WRITE_ACP))
-        if x_amz_grant_full_control:
-            grants.extend(parse_grant_header(x_amz_grant_full_control, Permission.FULL_CONTROL))
+        try:
+            if x_amz_grant_read:
+                grants.extend(parse_grant_header(x_amz_grant_read, Permission.READ))
+            if x_amz_grant_write:
+                grants.extend(parse_grant_header(x_amz_grant_write, Permission.WRITE))
+            if x_amz_grant_read_acp:
+                grants.extend(parse_grant_header(x_amz_grant_read_acp, Permission.READ_ACP))
+            if x_amz_grant_write_acp:
+                grants.extend(parse_grant_header(x_amz_grant_write_acp, Permission.WRITE_ACP))
+            if x_amz_grant_full_control:
+                grants.extend(parse_grant_header(x_amz_grant_full_control, Permission.FULL_CONTROL))
+        except ValueError as e:
+            return s3_error_response(
+                code="InvalidArgument",
+                message=str(e),
+                status_code=400,
+            )
 
         new_acl = ACL(owner=Owner(id=bucket_owner_id), grants=grants)
+
+        if len(new_acl.grants) > 100:
+            return s3_error_response(
+                code="InvalidArgument",
+                message="ACL cannot have more than 100 grants",
+                status_code=400,
+            )
     else:
         body = await request.body()
         if not body:
@@ -513,18 +538,32 @@ async def put_object_acl(
             )
         ]
 
-        if x_amz_grant_read:
-            grants.extend(parse_grant_header(x_amz_grant_read, Permission.READ))
-        if x_amz_grant_write:
-            grants.extend(parse_grant_header(x_amz_grant_write, Permission.WRITE))
-        if x_amz_grant_read_acp:
-            grants.extend(parse_grant_header(x_amz_grant_read_acp, Permission.READ_ACP))
-        if x_amz_grant_write_acp:
-            grants.extend(parse_grant_header(x_amz_grant_write_acp, Permission.WRITE_ACP))
-        if x_amz_grant_full_control:
-            grants.extend(parse_grant_header(x_amz_grant_full_control, Permission.FULL_CONTROL))
+        try:
+            if x_amz_grant_read:
+                grants.extend(parse_grant_header(x_amz_grant_read, Permission.READ))
+            if x_amz_grant_write:
+                grants.extend(parse_grant_header(x_amz_grant_write, Permission.WRITE))
+            if x_amz_grant_read_acp:
+                grants.extend(parse_grant_header(x_amz_grant_read_acp, Permission.READ_ACP))
+            if x_amz_grant_write_acp:
+                grants.extend(parse_grant_header(x_amz_grant_write_acp, Permission.WRITE_ACP))
+            if x_amz_grant_full_control:
+                grants.extend(parse_grant_header(x_amz_grant_full_control, Permission.FULL_CONTROL))
+        except ValueError as e:
+            return s3_error_response(
+                code="InvalidArgument",
+                message=str(e),
+                status_code=400,
+            )
 
         new_acl = ACL(owner=Owner(id=original_owner_id), grants=grants)
+
+        if len(new_acl.grants) > 100:
+            return s3_error_response(
+                code="InvalidArgument",
+                message="ACL cannot have more than 100 grants",
+                status_code=400,
+            )
     else:
         body = await request.body()
         if not body:
