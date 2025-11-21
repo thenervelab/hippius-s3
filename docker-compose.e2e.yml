@@ -27,6 +27,8 @@ services:
     env_file:
       - .env.defaults
       - .env.test-docker
+    environment:
+      - HIPPIUS_KEY=${HIPPIUS_KEY}
     depends_on:
       db:
         condition: service_healthy
@@ -57,6 +59,8 @@ services:
     env_file:
       - .env.defaults
       - .env.test-docker
+    environment:
+      - HIPPIUS_KEY=${HIPPIUS_KEY}
     depends_on:
       db:
         condition: service_healthy
@@ -71,26 +75,6 @@ services:
     networks:
       - hippius_net
 
-  substrate:
-    build:
-      context: .
-      dockerfile: workers/Dockerfile
-    command: ["python", "workers/run_substrate_in_loop.py"]
-    env_file:
-      - .env.defaults
-      - .env.test-docker
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      redis-queues:
-        condition: service_healthy
-    volumes:
-      - .:/app
-    networks:
-      - hippius_net
-
   unpinner:
     build:
       context: .
@@ -99,6 +83,8 @@ services:
     env_file:
       - .env.defaults
       - .env.test-docker
+    environment:
+      - HIPPIUS_KEY=${HIPPIUS_KEY}
     depends_on:
       db:
         condition: service_healthy
@@ -119,6 +105,8 @@ services:
     env_file:
       - .env.defaults
       - .env.test-docker
+    environment:
+      - HIPPIUS_KEY=${HIPPIUS_KEY}
     depends_on:
       db:
         condition: service_healthy
@@ -139,6 +127,8 @@ services:
     env_file:
       - .env.defaults
       - .env.test-docker
+    environment:
+      - HIPPIUS_KEY=${HIPPIUS_KEY}
     depends_on:
       db:
         condition: service_healthy
@@ -168,6 +158,8 @@ services:
     env_file:
       - .env.defaults
       - .env.test-docker
+    environment:
+      - HIPPIUS_KEY=${HIPPIUS_KEY}
     depends_on:
       db:
         condition: service_healthy
@@ -194,10 +186,11 @@ services:
 
   ipfs:
     image: ipfs/kubo:latest
+    user: "0:0"
     ports:
-      - "4001:4001" # IPFS swarm port
-      - "5001:5001" # IPFS API port
-      - "8081:8080" # IPFS gateway port (moved from 8080 to avoid conflict with gateway)
+      - "127.0.0.1:4001:4001"
+      - "127.0.0.1:5001:5001"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ipfs_data:/data/ipfs
     restart: unless-stopped

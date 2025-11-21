@@ -124,11 +124,13 @@ class ResilientPublishAdapter:
             result = await self.client.upload_file(
                 tmp_path,
                 encrypt=should_encrypt,
-                seed_phrase=seed_phrase,
+                hippius_key=self.config.hippius_service_key,
             )
             cid = str(result["cid"])
             # Pin
-            await self.client.pin(cid, seed_phrase=seed_phrase)
+            await self.client.pin(
+                cid,
+            )
             return ResolvedPublish(cid=cid, path="fallback", tx_hash=None)
         finally:
             if tmp_path and Path(tmp_path).exists():

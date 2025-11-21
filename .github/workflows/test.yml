@@ -129,6 +129,7 @@ jobs:
     env:
       DOCKER_BUILDKIT: "1"
       COMPOSE_DOCKER_CLI_BUILD: "1"
+      HIPPIUS_KEY: ${{ secrets.HIPPIUS_KEY }}
     steps:
       - uses: actions/checkout@v4
 

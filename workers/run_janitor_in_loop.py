@@ -38,7 +38,7 @@ async def cleanup_stale_parts(db: asyncpg.Connection, fs_store: FileSystemPartsS
     configured stale threshold and which have no recent DB part activity.
     """
     stale_threshold_seconds = config.mpu_stale_seconds
-    cutoff_sql = "NOW() - INTERVAL '1 second' * $1"
+    cutoff_sql = "NOW() - INTERVAL '1 second' * $4"
 
     parts_cleaned = 0
     root = fs_store.root
