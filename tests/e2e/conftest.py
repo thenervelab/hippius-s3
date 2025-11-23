@@ -183,7 +183,7 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
                 "docker compose up failed; see output above and artifacts/compose_up.stderr.txt for details"
             )
         print("Waiting for services to be ready...")
-        time.sleep(10)
+        time.sleep(60)
 
     # Health check for API service
     import requests  # type: ignore[import-untyped]
