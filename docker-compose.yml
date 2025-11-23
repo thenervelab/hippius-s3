@@ -19,6 +19,10 @@ services:
     depends_on:
       api:
         condition: service_healthy
+      uploader:
+        condition: service_healthy
+      downloader:
+        condition: service_healthy
       db:
         condition: service_healthy
       redis:
@@ -274,6 +278,12 @@ services:
       - .:/app
       # Shared object parts FS store (authoritative for uploader reads)
       - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f run_uploader_in_loop.py || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
     networks:
       - hippius_net
 
@@ -325,6 +335,12 @@ services:
     volumes:
       # Shared object parts FS store (not required for downloader, but harmless)
       - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f run_downloader_in_loop.py || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
     networks:
       - hippius_net
 

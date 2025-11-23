@@ -21,6 +21,13 @@ services:
       - GATEWAY_BACKEND_URL=http://api:8000
       - GATEWAY_PORT=8080
       - HIPPIUS_BYPASS_CREDIT_CHECK=true
+    depends_on:
+      api:
+        condition: service_healthy
+      uploader:
+        condition: service_healthy
+      downloader:
+        condition: service_healthy
     networks:
       - hippius_net
 
