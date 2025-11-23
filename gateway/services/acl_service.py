@@ -62,7 +62,6 @@ class ACLService:
     ) -> bool:
         """Check if account has permission for bucket/object."""
 
-
         acl = await self.get_effective_acl(bucket, key)
 
         logger.info(
