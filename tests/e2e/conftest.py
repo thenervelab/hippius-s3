@@ -182,13 +182,11 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
             raise RuntimeError(
                 "docker compose up failed; see output above and artifacts/compose_up.stderr.txt for details"
             )
-        print("Waiting for services to be ready...")
-        time.sleep(60)
 
     # Health check for API service
     import requests  # type: ignore[import-untyped]
 
-    max_retries = 10
+    max_retries = 60
     for attempt in range(max_retries):
         try:
             response = requests.get("http://localhost:8080/", timeout=5)

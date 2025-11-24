@@ -402,7 +402,7 @@ async def upload_part(
 
     # Get object_id and current_object_version from multipart upload
     object_id = ongoing_multipart_upload["object_id"]
-    current_object_version = ongoing_multipart_upload["current_object_version"]
+    current_object_version = int(ongoing_multipart_upload.get("current_object_version") or 1)
 
     start_time = time.time()
     logger.info(f"Starting part {part_number} upload for upload {upload_id} (object_id={object_id})")

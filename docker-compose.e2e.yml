@@ -8,28 +8,18 @@ services:
       - build-base
 
   gateway:
-    build:
-      context: .
-      dockerfile: gateway/Dockerfile
-    ports:
-      - "127.0.0.1:8080:8080"
     env_file:
       - .env.defaults
       - .env.test-docker
     environment:
-      - PYTHONUNBUFFERED=1
-      - GATEWAY_BACKEND_URL=http://api:8000
-      - GATEWAY_PORT=8080
       - HIPPIUS_BYPASS_CREDIT_CHECK=true
     depends_on:
       api:
-        condition: service_healthy
+        condition: service_started
       uploader:
-        condition: service_healthy
+        condition: service_started
       downloader:
-        condition: service_healthy
-    networks:
-      - hippius_net
+        condition: service_started
 
   api:
     build: .
@@ -61,28 +51,17 @@ services:
       - hippius_net
 
   uploader:
-    build:
-      context: .
-      dockerfile: workers/Dockerfile
-    command: ["python", "workers/run_uploader_in_loop.py"]
     env_file:
       - .env.defaults
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      redis-queues:
-        condition: service_healthy
     volumes:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
       - ./.e2e/dlq_archive:/tmp/hippius_dlq_archive
-    networks:
-      - hippius_net
+    healthcheck:
+      disable: true
 
   unpinner:
     build:
@@ -107,26 +86,13 @@ services:
       - hippius_net
 
   downloader:
-    build:
-      context: .
-      dockerfile: workers/Dockerfile
-    command: ["python", "workers/run_downloader_in_loop.py"]
     env_file:
       - .env.defaults
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      redis-queues:
-        condition: service_healthy
-    volumes:
-      - .:/app
-    networks:
-      - hippius_net
+    healthcheck:
+      disable: true
 
   chain-pin-checker:
     build:
@@ -196,8 +162,6 @@ services:
   ipfs:
     image: ipfs/kubo:latest
     user: "0:0"
-    ports:
-      - "127.0.0.1:8081:8080"
     expose:
       - "4001"
       - "5001"
