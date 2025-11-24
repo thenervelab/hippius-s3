@@ -141,8 +141,9 @@ services:
 
 
   ipfs:
-    image: ipfs/kubo:latest
     user: "0:0"
+    ports:
+      - "127.0.0.1:8081:8080"
     expose:
       - "4001"
       - "5001"
