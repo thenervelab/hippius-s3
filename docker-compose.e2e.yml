@@ -1,12 +1,4 @@
 services:
-  base:
-    image: hippius-s3-base:latest
-    build:
-      context: .
-      dockerfile: Dockerfile.base
-    profiles:
-      - build-base
-
   gateway:
     env_file:
       - .env.defaults
@@ -62,26 +54,13 @@ services:
       - ./.e2e/dlq_archive:/tmp/hippius_dlq_archive
 
   unpinner:
-    build:
-      context: .
-      dockerfile: workers/Dockerfile
-    command: ["python", "workers/run_unpinner_in_loop.py"]
     env_file:
       - .env.defaults
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      redis-queues:
-        condition: service_healthy
     volumes:
       - .:/app
-    networks:
-      - hippius_net
 
   downloader:
     env_file:
@@ -91,26 +70,13 @@ services:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
 
   chain-pin-checker:
-    build:
-      context: .
-      dockerfile: workers/Dockerfile
-    command: ["python", "workers/chain_pin_checker.py"]
     env_file:
       - .env.defaults
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      redis-queues:
-        condition: service_healthy
     volumes:
       - .:/app
-    networks:
-      - hippius_net
 
   toxiproxy:
     image: shopify/toxiproxy:latest
@@ -122,20 +88,11 @@ services:
       - hippius_net
 
   chain-profile-cacher:
-    build:
-      context: .
-      dockerfile: workers/Dockerfile
-    command: ["python", "workers/chain_profile_cacher.py"]
     env_file:
       - .env.defaults
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
     volumes:
       - .:/app
 

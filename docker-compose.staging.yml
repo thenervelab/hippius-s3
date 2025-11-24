@@ -1,17 +1,2 @@
-services:
-  base:
-    image: hippius-s3-base:latest
-    profiles:
-      - build-base
-    build:
-      context: .
-      dockerfile: Dockerfile.base
-
-  db:
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=hippius
-
-volumes:
-  postgres_data:
+# Staging-specific overrides
+# Add staging configurations here when needed

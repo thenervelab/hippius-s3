@@ -1,12 +1,4 @@
 services:
-  base:
-    image: hippius-s3-base:latest
-    profiles:
-      - build-base
-    build:
-      context: .
-      dockerfile: Dockerfile.base
-
   db:
     shm_size: 2g
     command:
@@ -66,7 +58,3 @@ services:
   downloader:
     deploy:
       replicas: 1
-
-# Remove the ipfs_data volume since we're using host mount
-volumes:
-  postgres_data:
