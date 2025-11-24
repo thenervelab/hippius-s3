@@ -98,17 +98,9 @@ class ACLService:
             if acl:
                 return acl
 
-            object_owner = await self.get_object_owner(bucket, key)
-            if object_owner:
-                return await self.canned_acl_to_acl("private", object_owner, bucket)
-
-            acl = await self.acl_repo.get_bucket_acl(bucket)
-            if acl:
-                return acl
-        else:
-            acl = await self.acl_repo.get_bucket_acl(bucket)
-            if acl:
-                return acl
+        acl = await self.acl_repo.get_bucket_acl(bucket)
+        if acl:
+            return acl
 
         owner_id = await self.get_bucket_owner(bucket)
         if not owner_id:

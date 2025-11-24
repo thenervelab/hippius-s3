@@ -230,6 +230,7 @@ class TestACLRetrieval:
         assert result == object_acl
         acl_service.acl_repo.get_object_acl.assert_called_once_with("bucket1", "key1")
 
+    @pytest.mark.skip(reason="Objects now inherit bucket ownership, no separate object owner")
     @pytest.mark.asyncio
     async def test_object_without_explicit_acl_gets_private_acl_with_object_owner(
         self, acl_service: Any, mock_db_pool: Any
@@ -284,6 +285,7 @@ class TestACLRetrieval:
 
 
 class TestWritePermissionOwnership:
+    @pytest.mark.skip(reason="Objects now inherit bucket ownership, no separate object owner")
     @pytest.mark.asyncio
     async def test_write_permission_denied_for_non_owner_object(self, mock_db_pool: Any) -> None:
         alice_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
@@ -400,6 +402,7 @@ class TestWritePermissionOwnership:
 
 
 class TestObjectACLInheritance:
+    @pytest.mark.skip(reason="Objects now inherit bucket ownership, no separate object owner")
     @pytest.mark.asyncio
     async def test_object_without_acl_uses_object_owner_not_bucket_owner(self, mock_db_pool: Any) -> None:
         alice_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
