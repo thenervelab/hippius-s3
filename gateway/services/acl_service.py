@@ -85,21 +85,6 @@ class ACLService:
 
         for grant in acl.grants:
             if self._grant_matches(grant, account_id) and self._permission_implies(grant.permission, permission):
-                if permission == Permission.WRITE and key is not None:
-                    bucket_owner = await self.get_bucket_owner(bucket)
-                    object_owner = await self.get_object_owner(bucket, key)
-
-                    if account_id == bucket_owner:
-                        logger.info("DEBUG_ACL: Access GRANTED (grant match + bucket owner): user is bucket owner")
-                        return True
-
-                    if account_id == object_owner:
-                        logger.info("DEBUG_ACL: Access GRANTED (grant match + object owner): user is object owner")
-                        return True
-
-                    logger.info("DEBUG_ACL: Access DENIED: WRITE grant but user is not bucket/object owner")
-                    return False
-
                 logger.info("DEBUG_ACL: Access GRANTED (grant match): grant matches account")
                 return True
 
