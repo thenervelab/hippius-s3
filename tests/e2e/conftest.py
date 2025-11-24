@@ -232,7 +232,7 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
             (artifacts_dir / "ps.txt").write_bytes(ps_out or b"")
 
             # service logs (best-effort)
-            for svc in ["api", "downloader", "uploader", "substrate", "unpinner"]:
+            for svc in ["api", "gateway", "downloader", "uploader", "substrate", "unpinner"]:
                 log_result = compose_cmd(["logs", svc])
                 (artifacts_dir / f"{svc}.log").write_bytes(log_result.stdout or b"")
     except Exception as e:  # noqa: PERF203
