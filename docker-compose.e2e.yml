@@ -60,8 +60,6 @@ services:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
       - ./.e2e/dlq_archive:/tmp/hippius_dlq_archive
-    healthcheck:
-      disable: true
 
   unpinner:
     build:
@@ -91,8 +89,6 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
-    healthcheck:
-      disable: true
 
   chain-pin-checker:
     build:
@@ -143,21 +139,6 @@ services:
     volumes:
       - .:/app
 
-  db:
-    image: postgres:15
-    ports:
-      - "127.0.0.1:5432:5432"
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=hippius
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    networks:
-      - hippius_net
 
   ipfs:
     image: ipfs/kubo:latest
