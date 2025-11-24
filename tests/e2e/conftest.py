@@ -182,18 +182,16 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
             raise RuntimeError(
                 "docker compose up failed; see output above and artifacts/compose_up.stderr.txt for details"
             )
-        print("Waiting for services to be ready...")
-        time.sleep(10)
 
     # Health check for API service
     import requests  # type: ignore[import-untyped]
 
-    max_retries = 10
+    max_retries = 60
     for attempt in range(max_retries):
         try:
-            response = requests.get("http://localhost:8000/", timeout=5)
-            if response.status_code in [200, 400, 403]:  # API is responding
-                print("API service is ready")
+            response = requests.get("http://localhost:8080/", timeout=5)
+            if response.status_code in [200, 400, 403]:  # Gateway is responding
+                print("Gateway service is ready")
                 break
         except requests.exceptions.RequestException:
             print(f"API not ready yet, attempt {attempt + 1}/{max_retries}")
@@ -234,7 +232,7 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
             (artifacts_dir / "ps.txt").write_bytes(ps_out or b"")
 
             # service logs (best-effort)
-            for svc in ["api", "downloader", "uploader", "substrate", "unpinner"]:
+            for svc in ["api", "gateway", "downloader", "uploader", "unpinner"]:
                 log_result = compose_cmd(["logs", svc])
                 (artifacts_dir / f"{svc}.log").write_bytes(log_result.stdout or b"")
     except Exception as e:  # noqa: PERF203
@@ -291,7 +289,7 @@ def boto3_client(test_seed_phrase: str) -> Any:
 
     return boto3.client(
         "s3",
-        endpoint_url="http://localhost:8000",
+        endpoint_url="http://localhost:8080",
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
         region_name="us-east-1",

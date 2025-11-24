@@ -8,8 +8,8 @@ from starlette import status
 from starlette.requests import Request
 from starlette.responses import Response
 
-from hippius_s3.api.s3.errors import s3_error_response
-from hippius_s3.config import get_config
+from gateway.config import get_config
+from gateway.utils.errors import s3_error_response
 
 
 config = get_config()
@@ -72,6 +72,9 @@ async def rate_limit_middleware(
 
     # Ensure account is available from authentication
     if not hasattr(request.state, "account") or not request.state.account:
+        if config.bypass_credit_check:
+            logger.warning(f"Rate limiting skipped (bypass enabled): no account found for {request.url.path}")
+            return await call_next(request)
         logger.error(f"Rate limiting failed: no account found for {request.url.path}")
         return s3_error_response(
             code="AccessDenied",

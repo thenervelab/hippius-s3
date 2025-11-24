@@ -13,18 +13,11 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 
 from hippius_s3.api.middlewares.audit_log import audit_log_middleware
-from hippius_s3.api.middlewares.backend_hmac import verify_hmac_middleware
-from hippius_s3.api.middlewares.banhammer import BanHammerService
-from hippius_s3.api.middlewares.banhammer import banhammer_wrapper
-from hippius_s3.api.middlewares.cors import cors_middleware
-from hippius_s3.api.middlewares.credit_check import check_credit_for_all_operations
-from hippius_s3.api.middlewares.frontend_hmac import verify_frontend_hmac_middleware
+from hippius_s3.api.middlewares.ip_whitelist import ip_whitelist_middleware
 from hippius_s3.api.middlewares.metrics import metrics_middleware
+from hippius_s3.api.middlewares.parse_internal_headers import parse_internal_headers_middleware
 from hippius_s3.api.middlewares.profiler import SpeedscopeProfilerMiddleware
-from hippius_s3.api.middlewares.rate_limit import RateLimitService
-from hippius_s3.api.middlewares.rate_limit import rate_limit_wrapper
 from hippius_s3.api.middlewares.tracing import tracing_middleware
-from hippius_s3.api.middlewares.trailing_slash import trailing_slash_normalizer
 from hippius_s3.api.s3 import errors as s3_errors
 from hippius_s3.api.s3.multipart import router as multipart_router
 from hippius_s3.api.s3.public_router import router as public_router
@@ -96,12 +89,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
         initialize_cache_client(app.state.redis_client)
         logger.info("Cache Redis client initialized")
-
-        app.state.rate_limit_service = RateLimitService(app.state.redis_rate_limiting_client)
-        logger.info("Rate limiting service initialized")
-
-        app.state.banhammer_service = BanHammerService(app.state.redis_rate_limiting_client)
-        logger.info("Banhammer service initialized")
 
         # IPFS service not needed in API container; workers own IPFS interactions
 
@@ -219,17 +206,13 @@ def factory() -> FastAPI:
     app.openapi = custom_openapi  # type: ignore[method-assign]
 
     # Custom middlewares - middleware("http") executes in REVERSE order
-    app.middleware("http")(rate_limit_wrapper)
+    # Backend now relies on gateway for authentication/authorization
+    # All middleware here assume X-Hippius-* headers are already set by gateway
     app.middleware("http")(metrics_middleware)
     app.middleware("http")(tracing_middleware)
     app.middleware("http")(audit_log_middleware)
-    app.middleware("http")(check_credit_for_all_operations)
-    app.middleware("http")(trailing_slash_normalizer)
-    app.middleware("http")(verify_frontend_hmac_middleware)
-    app.middleware("http")(verify_hmac_middleware)
-    if config.enable_banhammer:
-        app.middleware("http")(banhammer_wrapper)
-    app.middleware("http")(cors_middleware)
+    app.middleware("http")(parse_internal_headers_middleware)
+    app.middleware("http")(ip_whitelist_middleware)
     if config.enable_request_profiling:
         app.add_middleware(SpeedscopeProfilerMiddleware)
 

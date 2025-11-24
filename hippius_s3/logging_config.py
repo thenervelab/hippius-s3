@@ -1,13 +1,19 @@
 import logging
 import os
 import sys
+from typing import Protocol
 
 from loki_logger_handler.loki_logger_handler import LokiLoggerHandler
 
-from hippius_s3.config import Config
+
+class LoggingConfig(Protocol):
+    log_level: str
+    loki_enabled: bool
+    loki_url: str
+    environment: str
 
 
-def setup_loki_logging(config: Config, service_name: str) -> logging.Logger:
+def setup_loki_logging(config: LoggingConfig, service_name: str) -> logging.Logger:
     """
     Configure logging with optional Loki handler.
 

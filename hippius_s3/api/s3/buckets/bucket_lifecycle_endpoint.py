@@ -22,16 +22,15 @@ async def handle_get_bucket_lifecycle(bucket_name: str, db: Any, main_account_id
     """
     try:
         # Get user for user-scoped bucket lookup
-        user = await db.fetchrow(
+        _ = await db.fetchrow(
             get_query("get_or_create_user_by_main_account"),
             main_account_id,
             datetime.now(timezone.utc),
         )
 
         bucket = await db.fetchrow(
-            get_query("get_bucket_by_name_and_owner"),
+            get_query("get_bucket_by_name"),
             bucket_name,
-            user["main_account_id"],
         )
 
         if not bucket:

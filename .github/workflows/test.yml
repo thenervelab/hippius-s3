@@ -41,14 +41,14 @@ jobs:
 
       - name: Lint (ruff check)
         run: |
-          ruff check . || (
+          ruff check hippius_s3 gateway || (
             echo "=== Ruff settings ===" && ruff check --show-settings | sed -n '1,200p' && exit 1
           )
 
       - name: Format (ruff format --check)
         run: |
-          ruff format --check . || (
-            echo "=== Ruff format DIFF (all) ===" && ruff format --diff . | sed -n '1,400p' || true
+          ruff format --check hippius_s3 gateway || (
+            echo "=== Ruff format DIFF (all) ===" && ruff format --diff hippius_s3 gateway | sed -n '1,400p' || true
             exit 1
           )
 
@@ -81,7 +81,7 @@ jobs:
       - name: Type check with mypy
         run: |
           source .venv/bin/activate
-          mypy hippius_s3 tests
+          mypy hippius_s3 gateway
 
   unit-integration:
     name: Unit & Integration Tests

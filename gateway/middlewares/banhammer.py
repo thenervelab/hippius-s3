@@ -8,7 +8,7 @@ from starlette import status
 from starlette.requests import Request
 from starlette.responses import Response
 
-from hippius_s3.api.s3.errors import s3_error_response
+from gateway.utils.errors import s3_error_response
 
 
 logger = logging.getLogger(__name__)

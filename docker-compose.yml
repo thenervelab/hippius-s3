@@ -7,11 +7,45 @@ services:
       context: .
       dockerfile: Dockerfile.base
 
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    ports:
+      - "${HOST_BIND_IP:-127.0.0.1}:8080:8080"
+    env_file:
+      - .env.defaults
+      - .env
+    depends_on:
+      api:
+        condition: service_healthy
+      uploader:
+        condition: service_healthy
+      downloader:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-accounts:
+        condition: service_healthy
+      redis-chain:
+        condition: service_healthy
+      redis-rate-limiting:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - GATEWAY_BACKEND_URL=http://api:8000
+      - GATEWAY_PORT=8080
+      - HIPPIUS_BYPASS_CREDIT_CHECK=false
+    networks:
+      - hippius_net
+
   api:
     build:
       context: .
-    ports:
-      - "${HOST_BIND_IP:-127.0.0.1}:8000:8000"
+    # No external ports - only accessible via proxy on internal network
     env_file:
       - .env.defaults
       - .env
@@ -37,7 +71,12 @@ services:
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
-      - DEBUG=true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/ || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     networks:
       - hippius_net
 
@@ -65,7 +104,6 @@ services:
     ports:
       - "127.0.0.1:4001:4001"
       - "127.0.0.1:5001:5001"
-      - "127.0.0.1:8080:8080"
     volumes:
       - ipfs_data:/data/ipfs
     restart: unless-stopped
@@ -100,7 +138,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 50
-      start_period: 120s
+      start_period: 30s
     networks:
       - hippius_net
 
@@ -132,7 +170,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 50
-      start_period: 120s
+      start_period: 30s
     networks:
       - hippius_net
 
@@ -164,7 +202,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 50
-      start_period: 120s
+      start_period: 30s
     networks:
       - hippius_net
 
@@ -183,7 +221,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 50
-      start_period: 120s
+      start_period: 30s
     networks:
       - hippius_net
 
@@ -211,7 +249,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 50
-      start_period: 120s
+      start_period: 30s
     networks:
       - hippius_net
 
@@ -240,6 +278,12 @@ services:
       - .:/app
       # Shared object parts FS store (authoritative for uploader reads)
       - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
+    healthcheck:
+      test: ["CMD-SHELL", "exit 0"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
     networks:
       - hippius_net
 
@@ -257,6 +301,12 @@ services:
         condition: service_healthy
       redis-queues:
         condition: service_healthy
+    healthcheck:
+      test: [ "CMD-SHELL", "exit 0" ]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
     deploy:
       replicas: 1
     restart: unless-stopped
@@ -291,6 +341,12 @@ services:
     volumes:
       # Shared object parts FS store (not required for downloader, but harmless)
       - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
+    healthcheck:
+      test: [ "CMD-SHELL", "exit 0" ]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
     networks:
       - hippius_net
 
@@ -360,6 +416,26 @@ services:
       - PYTHONUNBUFFERED=1
       - WORKER_SCRIPT=workers/chain_profile_cacher.py
       - ENABLE_WATCHFILES=true
+    networks:
+      - hippius_net
+
+  account-cacher:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    depends_on:
+      redis-accounts:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - WORKER_SCRIPT=workers/run_account_cacher_in_loop.py
+      - ENABLE_WATCHFILES=true
+    env_file:
+      - .env.defaults
+      - .env
+    volumes:
+      - .:/app
     networks:
       - hippius_net
 

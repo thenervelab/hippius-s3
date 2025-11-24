@@ -75,18 +75,17 @@ async def handle_get_object(
         logger.info(f"GET start {bucket_name}/{object_key} read_mode={hdr_mode or 'auto'} range={bool(range_header)}")
 
     try:
-        # For anonymous access, skip user creation and pass NULL account for permission check
-        is_anonymous = getattr(request.state, "access_mode", None) == "anon"
+        # Gateway now handles all ACL/permission checks
+        # Backend trusts the account information from gateway
         account = getattr(request.state, "account", None)
-        account_id = None if is_anonymous else (account.main_account if account else None)
 
-        if not is_anonymous and account:
+        account_id = account.main_account if account else "anonymous"
+
+        # Skip user creation for anonymous accounts
+        if account and account.main_account != "anonymous":
             with tracer.start_as_current_span(
                 "get_object.get_or_create_user",
-                attributes={
-                    "main_account_id": account.main_account,
-                    "is_anonymous": False,
-                },
+                attributes={"main_account_id": account.main_account},
             ):
                 await db.fetchrow(
                     get_query("get_or_create_user_by_main_account"),
@@ -94,16 +93,15 @@ async def handle_get_object(
                     datetime.now(timezone.utc),
                 )
 
-        # Get object info for download with permission checks
+        # Get object info for download (gateway already checked permissions)
         with tracer.start_as_current_span(
-            "get_object.get_object_with_permissions",
-            attributes={"is_anonymous": is_anonymous},
+            "get_object.get_object_info",
+            attributes={"main_account_id": account_id},
         ) as span:
             object_info = await db.fetchrow(
                 get_query("get_object_for_download_with_permissions"),
                 bucket_name,
                 object_key,
-                account_id,
             )
             if object_info:
                 set_span_attributes(
@@ -221,10 +219,11 @@ async def handle_get_object(
         storage_version = int(object_info.get("storage_version") or 2)
         is_public_bucket = bool(object_info.get("is_public"))
         bucket_owner_id = str(object_info.get("bucket_owner_id") or "")
+        is_anonymous = account_id == "anonymous"
 
-        # Resolve key address: for public buckets always use bucket owner id (works for anon and authenticated)
+        # Resolve key address: for anonymous users always use bucket owner id (ACL already verified access)
         # Otherwise, use the caller's main account when authenticated
-        resolved_address = bucket_owner_id if is_public_bucket else (account.main_account if account else "")
+        resolved_address = bucket_owner_id if is_anonymous else (account.main_account if account else "")
 
         info_dict = {
             "object_id": str(object_info["object_id"]),
