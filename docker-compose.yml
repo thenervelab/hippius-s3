@@ -33,6 +33,8 @@ services:
         condition: service_healthy
       redis-rate-limiting:
         condition: service_healthy
+    volumes:
+      - .:/app
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1

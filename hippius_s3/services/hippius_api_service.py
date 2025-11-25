@@ -64,6 +64,15 @@ class UnpinResponse(BaseModel):
     updated_at: str | None = None
 
 
+class TokenAuthResponse(BaseModel):
+    valid: bool
+    status: str
+    account_address: str
+    token_type: str
+    encrypted_secret: str
+    nonce: str
+
+
 class HippiusAPIError(Exception):
     """Raised when there's an authentication issue with the API."""
 
@@ -147,9 +156,6 @@ class HippiusApiClient:
     ) -> None:
         """
         Initialize the Hippius API client.
-
-        Args:
-            api_url: Base URL for the Hippius API
         """
         self.api_url = config.hippius_api_base_url
         self._client = httpx.AsyncClient(
@@ -269,3 +275,33 @@ class HippiusApiClient:
 
         response.raise_for_status()
         return UnpinResponse.model_validate(response.json())
+
+    @retry_on_error(retries=3, backoff=5.0)
+    async def auth(
+        self,
+        access_key: str,
+    ) -> TokenAuthResponse:
+        """
+        Authenticate access key and retrieve encrypted secret.
+
+        Maps to: POST /objectstore/tokens/auth
+
+        Args:
+            access_key: Access key ID to authenticate
+
+        Returns:
+            TokenAuthResponse: Response with token info and encrypted secret
+
+        Raises:
+            HippiusAPIError: If the API request fails
+        """
+        payload = {"accessKeyId": access_key}
+
+        response = await self._client.post(
+            "/objectstore/tokens/auth/",
+            json=payload,
+            headers=self._get_headers(),
+        )
+
+        response.raise_for_status()
+        return TokenAuthResponse.model_validate(response.json())
