@@ -13,22 +13,30 @@ export OTEL_SERVICE_NAME=${OTEL_SERVICE_NAME:-hippius-worker}
 export OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED=true
 export OTEL_PYTHON_LOG_CORRELATION=true
 
-echo "Starting worker: $WORKER_SCRIPT (service: $OTEL_SERVICE_NAME) with OpenTelemetry instrumentation"
-
-if [[ "${ENABLE_WATCHFILES:-false}" == "true" ]]; then
-    opentelemetry-instrument \
-        --logs_exporter otlp \
-        --traces_exporter otlp \
-        --metrics_exporter otlp \
-        --service_name "$OTEL_SERVICE_NAME" \
-            watchfiles \
-            --filter python \
-            "python $WORKER_SCRIPT"
+if [ "${ENABLE_MONITORING:-false}" = "true" ]; then
+    echo "Starting worker: $WORKER_SCRIPT (service: $OTEL_SERVICE_NAME) with OpenTelemetry instrumentation"
+    if [[ "${ENABLE_WATCHFILES:-false}" == "true" ]]; then
+        opentelemetry-instrument \
+            --logs_exporter otlp \
+            --traces_exporter otlp \
+            --metrics_exporter otlp \
+            --service_name "$OTEL_SERVICE_NAME" \
+                watchfiles \
+                --filter python \
+                "python $WORKER_SCRIPT"
+    else
+        opentelemetry-instrument \
+            --logs_exporter otlp \
+            --traces_exporter otlp \
+            --metrics_exporter otlp \
+            --service_name "$OTEL_SERVICE_NAME" \
+                python "$WORKER_SCRIPT"
+    fi
 else
-    opentelemetry-instrument \
-        --logs_exporter otlp \
-        --traces_exporter otlp \
-        --metrics_exporter otlp \
-        --service_name "$OTEL_SERVICE_NAME" \
-            python "$WORKER_SCRIPT"
+    echo "Starting worker: $WORKER_SCRIPT (monitoring disabled)"
+    if [[ "${ENABLE_WATCHFILES:-false}" == "true" ]]; then
+        watchfiles --filter python "python $WORKER_SCRIPT"
+    else
+        python "$WORKER_SCRIPT"
+    fi
 fi

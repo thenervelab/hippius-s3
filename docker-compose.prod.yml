@@ -1,3 +1,8 @@
+# Production-specific overrides
+# Usage: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+include:
+  - docker-compose.utilities.yml
+
 services:
   db:
     shm_size: 2g

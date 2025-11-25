@@ -8,6 +8,12 @@ from hippius_s3.config import get_config
 logger = logging.getLogger(__name__)
 
 
+# TODO: Remove this entire module once all objects are migrated to new encryption format (storage_version >= 3).
+# This module provides backward compatibility for legacy SDK encryption (whole-ciphertext decryption).
+# It is used by hippius_s3/reader/decrypter.py when enable_legacy_sdk_compat=true.
+# Once migration is complete, set LEGACY_SDK_COMPAT=false and delete this file.
+
+
 async def get_sdk_key_b64(address: str, bucket_name: str) -> str:
     from hippius_s3.ipfs_service import get_encryption_key  # local import to avoid cycles
 

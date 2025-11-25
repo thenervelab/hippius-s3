@@ -1,0 +1,44 @@
+# Utility services for staging and production deployments
+# Includes: status monitoring (Cachet), database backups
+services:
+  cachet-health-checker:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    env_file:
+      - .env.defaults
+      - .env
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_ENABLED=false
+      - WORKER_SCRIPT=workers/cachet_health_check.py
+    volumes:
+      - .:/app
+    networks:
+      - hippius_net
+
+  backup:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    env_file:
+      - .env.defaults
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - WORKER_SCRIPT=workers/run_backup_in_loop.py
+    networks:
+      - hippius_net

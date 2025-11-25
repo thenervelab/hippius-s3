@@ -686,7 +686,13 @@ def set_metrics_collector(collector: MetricsCollector | NullMetricsCollector) ->
     _metrics_collector = collector
 
 
-def initialize_metrics_collector(redis_client: async_redis.Redis) -> MetricsCollector:
+def initialize_metrics_collector(redis_client: async_redis.Redis) -> MetricsCollector | NullMetricsCollector:
+    if os.getenv("ENABLE_MONITORING", "false").lower() not in ("true", "1", "yes"):
+        logger.info("Monitoring disabled, using NullMetricsCollector")
+        null_collector = NullMetricsCollector()
+        set_metrics_collector(null_collector)
+        return null_collector
+
     endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
     service_name = os.getenv("OTEL_SERVICE_NAME", "hippius-s3")
 
@@ -702,6 +708,7 @@ def initialize_metrics_collector(redis_client: async_redis.Redis) -> MetricsColl
 
     collector = MetricsCollector(redis_client)
     set_metrics_collector(collector)
+    logger.info(f"Monitoring enabled, exporting to {endpoint}")
     return collector
 
 
@@ -796,7 +803,24 @@ class SimpleMetricsCollector:
         self.backup_cleanup_deleted_count.add(deleted_count, attributes=attributes)
 
 
-def initialize_metrics_simple(service_name: str = "hippius-s3-backup") -> SimpleMetricsCollector:
+class NullSimpleMetricsCollector:
+    def record_backup_operation(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_backup_cycle(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_backup_cleanup(self, *args: object, **kwargs: object) -> None:
+        pass
+
+
+def initialize_metrics_simple(
+    service_name: str = "hippius-s3-backup",
+) -> SimpleMetricsCollector | NullSimpleMetricsCollector:
+    if os.getenv("ENABLE_MONITORING", "false").lower() not in ("true", "1", "yes"):
+        logger.info(f"Monitoring disabled for {service_name}, using NullSimpleMetricsCollector")
+        return NullSimpleMetricsCollector()
+
     endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
 
     resource = Resource.create({"service.name": service_name})
@@ -809,6 +833,7 @@ def initialize_metrics_simple(service_name: str = "hippius-s3-backup") -> Simple
     provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
     metrics.set_meter_provider(provider)
 
+    logger.info(f"Monitoring enabled for {service_name}, exporting to {endpoint}")
     return SimpleMetricsCollector()
 
 
