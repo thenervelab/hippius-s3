@@ -1,8 +1,9 @@
 -- migrate:up
 
 -- Create public-read ACL for buckets with is_public=true that don't have an ACL yet
+-- Using DISTINCT ON to handle duplicate bucket_name entries
 INSERT INTO bucket_acls (bucket_name, owner_id, acl_json)
-SELECT
+SELECT DISTINCT ON (b.bucket_name)
     b.bucket_name,
     b.main_account_id,
     jsonb_build_object(
@@ -26,11 +27,13 @@ SELECT
     )
 FROM buckets b
 LEFT JOIN bucket_acls ba ON b.bucket_name = ba.bucket_name
-WHERE b.is_public = true AND ba.bucket_name IS NULL;
+WHERE b.is_public = true AND ba.bucket_name IS NULL
+ORDER BY b.bucket_name, b.created_at DESC;
 
 -- Create private ACL for buckets with is_public=false that don't have an ACL yet
+-- Using DISTINCT ON to handle duplicate bucket_name entries
 INSERT INTO bucket_acls (bucket_name, owner_id, acl_json)
-SELECT
+SELECT DISTINCT ON (b.bucket_name)
     b.bucket_name,
     b.main_account_id,
     jsonb_build_object(
@@ -47,7 +50,8 @@ SELECT
     )
 FROM buckets b
 LEFT JOIN bucket_acls ba ON b.bucket_name = ba.bucket_name
-WHERE b.is_public = false AND ba.bucket_name IS NULL;
+WHERE b.is_public = false AND ba.bucket_name IS NULL
+ORDER BY b.bucket_name, b.created_at DESC;
 
 -- Update is_public to false for all buckets since ACLs now handle permissions
 UPDATE buckets SET is_public = false;
