@@ -60,8 +60,8 @@ jobs:
               echo "Updating git repository..."
               # Sync to remote even after force-pushes
               git fetch origin --prune
-              git checkout -B production origin/production
               git reset --hard origin/production
+              git checkout -B production origin/production
               git clean -ffd
             fi
 
