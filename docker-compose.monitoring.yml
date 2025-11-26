@@ -26,10 +26,6 @@ services:
     environment:
       <<: *monitoring-enabled
 
-  chain-profile-cacher:
-    environment:
-      <<: *monitoring-enabled
-
   backup:
     environment:
       <<: *monitoring-enabled
