@@ -52,7 +52,7 @@ class GatewayConfig:
     hippius_api_base_url: str = dataclasses.field(
         default_factory=lambda: os.getenv("HIPPIUS_API_BASE_URL", "https://api.hippius.com/api")
     )
-    hippius_service_key: str = dataclasses.field(default_factory=lambda: os.getenv("HIPPIUS_KEY", ""))
+    hippius_service_key: str = dataclasses.field(default_factory=lambda: os.getenv("HIPPIUS_SERVICE_KEY", ""))
     hippius_secret_decryption_material: str = dataclasses.field(
         default_factory=lambda: os.getenv("HIPPIUS_AUTH_ENCRYPTION_KEY", "")
     )
