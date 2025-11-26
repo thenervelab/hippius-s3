@@ -109,15 +109,29 @@ async def acl_middleware(
         logger.info(f"Bypassing ACL check for CreateBucket: {bucket}")
         return await call_next(request)
 
+    account_id = getattr(request.state, "account_id", None)
+    auth_method = getattr(request.state, "auth_method", None)
+    token_type = getattr(request.state, "token_type", None)
+    access_key = getattr(request.state, "access_key", None) if auth_method == "access_key" else None
+
+    acl_service = request.app.state.acl_service
+
+    bucket_owner_id = await acl_service.get_bucket_owner(bucket)
+    if bucket_owner_id is None:
+        logger.info(f"Bucket not found in ACL check: {bucket}, passing through to backend for proper S3 error")
+        return await call_next(request)
+
+    if auth_method == "access_key" and token_type == "master" and bucket_owner_id == account_id:
+        logger.info(f"Master token bypass for account {account_id} on bucket {bucket}")
+        request.state.bucket_owner_id = bucket_owner_id
+        request.state.is_anonymous_access = False
+        return await call_next(request)
+
     permission = get_required_permission(
         method=request.method,
         query_params=query_params,
         has_key=key is not None,
     )
-
-    account_id = getattr(request.state, "account_id", None)
-
-    acl_service = request.app.state.acl_service
 
     check_key = key
 
@@ -127,6 +141,7 @@ async def acl_middleware(
             bucket=bucket,
             key=check_key,
             permission=permission,
+            access_key=access_key,
         )
     except ValueError as e:
         if "Bucket not found" in str(e):
@@ -141,11 +156,6 @@ async def acl_middleware(
             message="Access Denied",
             status_code=403,
         )
-
-    bucket_owner_id = await acl_service.get_bucket_owner(bucket)
-    if bucket_owner_id is None:
-        logger.info(f"Bucket not found in ACL check: {bucket}, passing through to backend for proper S3 error")
-        return await call_next(request)
 
     request.state.bucket_owner_id = bucket_owner_id
 

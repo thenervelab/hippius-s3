@@ -778,3 +778,202 @@ class TestPutObjectAcl:
 
         assert response.status_code == 403
         assert b"<Code>AccessDenied</Code>" in response.content
+
+
+@pytest.mark.asyncio
+class TestAccessKeyXMLParsing:
+    async def test_xml_to_acl_parses_access_key_grantee(self) -> None:
+        """Test parsing AccessKey grantee type from XML"""
+        from gateway.routers.acl import xml_to_acl
+
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <Owner><ID>owner123</ID></Owner>
+          <AccessControlList>
+            <Grant>
+              <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="AccessKey">
+                <ID>hip_bob_key_123</ID>
+              </Grantee>
+              <Permission>READ</Permission>
+            </Grant>
+          </AccessControlList>
+        </AccessControlPolicy>"""
+
+        acl = xml_to_acl(xml)
+
+        assert acl.owner.id == "owner123"
+        assert len(acl.grants) == 1
+        assert acl.grants[0].grantee.type == GranteeType.ACCESS_KEY
+        assert acl.grants[0].grantee.id == "hip_bob_key_123"
+        assert acl.grants[0].permission == Permission.READ
+
+    async def test_xml_to_acl_parses_multiple_access_keys(self) -> None:
+        """Test parsing multiple AccessKey grantees"""
+        from gateway.routers.acl import xml_to_acl
+
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <Owner><ID>owner123</ID></Owner>
+          <AccessControlList>
+            <Grant>
+              <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="AccessKey">
+                <ID>hip_key1</ID>
+              </Grantee>
+              <Permission>READ</Permission>
+            </Grant>
+            <Grant>
+              <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="AccessKey">
+                <ID>hip_key2</ID>
+              </Grantee>
+              <Permission>WRITE</Permission>
+            </Grant>
+          </AccessControlList>
+        </AccessControlPolicy>"""
+
+        acl = xml_to_acl(xml)
+
+        assert len(acl.grants) == 2
+        assert acl.grants[0].grantee.type == GranteeType.ACCESS_KEY
+        assert acl.grants[0].grantee.id == "hip_key1"
+        assert acl.grants[0].permission == Permission.READ
+        assert acl.grants[1].grantee.type == GranteeType.ACCESS_KEY
+        assert acl.grants[1].grantee.id == "hip_key2"
+        assert acl.grants[1].permission == Permission.WRITE
+
+    async def test_xml_to_acl_mixes_canonical_and_access_key(self) -> None:
+        """Test parsing ACL with both CanonicalUser and AccessKey grants"""
+        from gateway.routers.acl import xml_to_acl
+
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <Owner><ID>owner123</ID></Owner>
+          <AccessControlList>
+            <Grant>
+              <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser">
+                <ID>5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty</ID>
+              </Grantee>
+              <Permission>FULL_CONTROL</Permission>
+            </Grant>
+            <Grant>
+              <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="AccessKey">
+                <ID>hip_bob_readonly</ID>
+              </Grantee>
+              <Permission>READ</Permission>
+            </Grant>
+          </AccessControlList>
+        </AccessControlPolicy>"""
+
+        acl = xml_to_acl(xml)
+
+        assert len(acl.grants) == 2
+        assert acl.grants[0].grantee.type == GranteeType.CANONICAL_USER
+        assert acl.grants[1].grantee.type == GranteeType.ACCESS_KEY
+
+
+@pytest.mark.asyncio
+class TestAccessKeyXMLGeneration:
+    async def test_acl_to_xml_generates_access_key_grantee(self) -> None:
+        """Test generating XML with AccessKey grantee"""
+        from gateway.routers.acl import acl_to_xml
+        from hippius_s3.models.acl import ACL
+        from hippius_s3.models.acl import Owner
+
+        acl = ACL(
+            owner=Owner(id="owner123"),
+            grants=[
+                Grant(
+                    grantee=Grantee(type=GranteeType.ACCESS_KEY, id="hip_bob_key"),
+                    permission=Permission.READ,
+                )
+            ],
+        )
+
+        xml = acl_to_xml(acl)
+
+        assert 'xsi:type="AccessKey"' in xml
+        assert "<ID>hip_bob_key</ID>" in xml
+        assert "<Permission>READ</Permission>" in xml
+
+    async def test_acl_to_xml_round_trip_with_access_key(self) -> None:
+        """Test XML round-trip preserves AccessKey grants"""
+        from gateway.routers.acl import acl_to_xml
+        from gateway.routers.acl import xml_to_acl
+        from hippius_s3.models.acl import ACL
+        from hippius_s3.models.acl import Owner
+
+        original_acl = ACL(
+            owner=Owner(id="owner123"),
+            grants=[
+                Grant(
+                    grantee=Grantee(type=GranteeType.ACCESS_KEY, id="hip_test_key"),
+                    permission=Permission.WRITE,
+                )
+            ],
+        )
+
+        xml = acl_to_xml(original_acl)
+        parsed_acl = xml_to_acl(xml)
+
+        assert parsed_acl.owner.id == original_acl.owner.id
+        assert len(parsed_acl.grants) == len(original_acl.grants)
+        assert parsed_acl.grants[0].grantee.type == GranteeType.ACCESS_KEY
+        assert parsed_acl.grants[0].grantee.id == "hip_test_key"
+        assert parsed_acl.grants[0].permission == Permission.WRITE
+
+
+@pytest.mark.asyncio
+class TestAccessKeyHeaderParsing:
+    async def test_parse_grant_header_with_access_key(self) -> None:
+        """Test parsing accessKey from grant header"""
+        from gateway.routers.acl import parse_grant_header
+
+        grants = parse_grant_header('accessKey="hip_bob_key"', Permission.READ)
+
+        assert len(grants) == 1
+        assert grants[0].grantee.type == GranteeType.ACCESS_KEY
+        assert grants[0].grantee.id == "hip_bob_key"
+        assert grants[0].permission == Permission.READ
+
+    async def test_parse_grant_header_multiple_access_keys(self) -> None:
+        """Test parsing multiple access keys from header"""
+        from gateway.routers.acl import parse_grant_header
+
+        grants = parse_grant_header('accessKey="hip_key1", accessKey="hip_key2"', Permission.WRITE)
+
+        assert len(grants) == 2
+        assert grants[0].grantee.type == GranteeType.ACCESS_KEY
+        assert grants[0].grantee.id == "hip_key1"
+        assert grants[1].grantee.type == GranteeType.ACCESS_KEY
+        assert grants[1].grantee.id == "hip_key2"
+
+    async def test_parse_grant_header_mix_id_and_access_key(self) -> None:
+        """Test parsing mixed id and accessKey from header"""
+        from gateway.routers.acl import parse_grant_header
+
+        grants = parse_grant_header(
+            'id="5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", accessKey="hip_bob_key"',
+            Permission.READ
+        )
+
+        assert len(grants) == 2
+        assert grants[0].grantee.type == GranteeType.CANONICAL_USER
+        assert grants[0].grantee.id == "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        assert grants[1].grantee.type == GranteeType.ACCESS_KEY
+        assert grants[1].grantee.id == "hip_bob_key"
+
+    async def test_parse_grant_header_rejects_invalid_access_key_format(self) -> None:
+        """Test that invalid access key format in header is rejected"""
+        from gateway.routers.acl import parse_grant_header
+
+        with pytest.raises(ValueError, match="Invalid access key format"):
+            parse_grant_header('accessKey="invalid_key"', Permission.READ)
+
+        with pytest.raises(ValueError, match="Invalid access key format"):
+            parse_grant_header('accessKey="HIP_key"', Permission.READ)
+
+    async def test_parse_grant_header_rejects_empty_access_key(self) -> None:
+        """Test that empty access key in header is rejected"""
+        from gateway.routers.acl import parse_grant_header
+
+        with pytest.raises(ValueError, match="Access key ID cannot be empty"):
+            parse_grant_header('accessKey=""', Permission.READ)

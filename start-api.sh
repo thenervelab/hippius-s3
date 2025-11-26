@@ -16,20 +16,32 @@ export OTEL_LOGS_EXPORTER=none
 echo "Running database migrations..."
 python -m hippius_s3.scripts.migrate
 
-echo "Starting hippius-s3-api via uvicorn with OpenTelemetry instrumentation"
-
 RELOAD_FLAG=""
 if [ "${DEBUG:-false}" = "true" ]; then
     RELOAD_FLAG="--reload"
     echo "DEBUG mode enabled - auto-reload is ON"
 fi
 
-opentelemetry-instrument \
-    --logs_exporter none \
-    --traces_exporter otlp \
-    --metrics_exporter otlp \
-    --service_name hippius-s3-api \
-        uvicorn \
+if [ "${ENABLE_MONITORING:-false}" = "true" ]; then
+    echo "Starting hippius-s3-api via uvicorn with OpenTelemetry instrumentation"
+    opentelemetry-instrument \
+        --logs_exporter none \
+        --traces_exporter otlp \
+        --metrics_exporter otlp \
+        --service_name hippius-s3-api \
+            uvicorn \
+            --host=$UVICORN_HOST \
+            --port=$UVICORN_PORT \
+            --workers=$UVICORN_WORKERS \
+            --loop=uvloop \
+            --log-level=$UVICORN_LOG_LEVEL \
+            --access-log \
+            --factory \
+            $RELOAD_FLAG \
+            hippius_s3.main:factory
+else
+    echo "Starting hippius-s3-api via uvicorn (monitoring disabled)"
+    uvicorn \
         --host=$UVICORN_HOST \
         --port=$UVICORN_PORT \
         --workers=$UVICORN_WORKERS \
@@ -39,3 +51,4 @@ opentelemetry-instrument \
         --factory \
         $RELOAD_FLAG \
         hippius_s3.main:factory
+fi

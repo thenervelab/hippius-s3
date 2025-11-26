@@ -10,6 +10,7 @@ from fastapi import Response
 from gateway.config import get_config
 from gateway.middlewares.account import account_middleware
 from gateway.middlewares.acl import acl_middleware
+from gateway.middlewares.auth_router import auth_router_middleware
 from gateway.middlewares.banhammer import BanHammerService
 from gateway.middlewares.banhammer import banhammer_middleware
 from gateway.middlewares.cors import cors_middleware
@@ -17,7 +18,6 @@ from gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
 from gateway.middlewares.metrics import metrics_middleware
 from gateway.middlewares.rate_limit import RateLimitService
 from gateway.middlewares.rate_limit import rate_limit_middleware
-from gateway.middlewares.sigv4 import sigv4_middleware
 from gateway.middlewares.tracing import tracing_middleware
 from gateway.middlewares.trailing_slash import trailing_slash_normalizer
 from gateway.routers.acl import router as acl_router
@@ -132,7 +132,7 @@ def factory() -> FastAPI:
         )
 
     # Register middleware in REVERSE order (outermost first)
-    # IMPORTANT: sigv4 must execute BEFORE account (so register AFTER)
+    # IMPORTANT: auth_router must execute BEFORE account (so register AFTER)
     app.middleware("http")(metrics_middleware)
     app.middleware("http")(tracing_middleware)
     app.middleware("http")(cors_middleware)
@@ -142,7 +142,7 @@ def factory() -> FastAPI:
     app.middleware("http")(rate_limit_wrapper)
     app.middleware("http")(acl_middleware)
     app.middleware("http")(account_middleware)
-    app.middleware("http")(sigv4_middleware)
+    app.middleware("http")(auth_router_middleware)
     app.middleware("http")(trailing_slash_normalizer)
 
     return app

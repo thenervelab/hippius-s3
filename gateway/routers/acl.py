@@ -53,6 +53,9 @@ def acl_to_xml(acl: ACL) -> str:
             ET.SubElement(grantee_elem, "ID").text = grant.grantee.id
             if grant.grantee.display_name:
                 ET.SubElement(grantee_elem, "DisplayName").text = grant.grantee.display_name
+        elif grant.grantee.type == GranteeType.ACCESS_KEY:
+            grantee_elem.set("xsi:type", "AccessKey")
+            ET.SubElement(grantee_elem, "ID").text = grant.grantee.id
         elif grant.grantee.type == GranteeType.GROUP:
             grantee_elem.set("xsi:type", "Group")
             ET.SubElement(grantee_elem, "URI").text = grant.grantee.uri
@@ -114,6 +117,20 @@ def parse_grant_header(header_value: str, permission: Permission) -> list[Grant]
                     permission=permission,
                 )
             )
+
+        elif part.startswith('accessKey="') and part.endswith('"'):
+            access_key_id = part[11:-1]
+            if not access_key_id:
+                raise ValueError("Access key ID cannot be empty")
+            if not access_key_id.startswith("hip_"):
+                raise ValueError(f"Invalid access key format: {access_key_id}")
+            grants.append(
+                Grant(
+                    grantee=Grantee(type=GranteeType.ACCESS_KEY, id=access_key_id),
+                    permission=permission,
+                )
+            )
+
         else:
             raise ValueError(f"Invalid grant header format: {part}")
 
@@ -185,6 +202,14 @@ def xml_to_acl(xml_content: str) -> ACL:
                 grantee = Grantee(
                     type=GranteeType.AMAZON_CUSTOMER_BY_EMAIL,
                     email_address=email_elem.text.strip(),
+                )
+            elif grantee_type == "AccessKey":
+                id_elem = _find_element(grantee_elem, "ID", ns)
+                if id_elem is None or not id_elem.text:
+                    continue
+                grantee = Grantee(
+                    type=GranteeType.ACCESS_KEY,
+                    id=id_elem.text.strip(),
                 )
             else:
                 continue
