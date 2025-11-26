@@ -474,3 +474,165 @@ class TestObjectACLInheritance:
         assert effective_acl.owner.id == bob_id
         assert len(effective_acl.grants) == 2
         assert effective_acl == object_acl
+
+
+class TestAccessKeyGrants:
+    def test_access_key_grant_matches_exact_key(self, acl_service: Any) -> None:
+        """Test that ACCESS_KEY grant matches when access key matches exactly"""
+        grant = Grant(
+            grantee=Grantee(type=GranteeType.ACCESS_KEY, id="hip_bob_key_123"),
+            permission=Permission.READ,
+        )
+        assert acl_service._grant_matches(grant, account_id=None, access_key="hip_bob_key_123") is True
+
+    def test_access_key_grant_does_not_match_different_key(self, acl_service: Any) -> None:
+        """Test that ACCESS_KEY grant does not match when access key differs"""
+        grant = Grant(
+            grantee=Grantee(type=GranteeType.ACCESS_KEY, id="hip_bob_key_123"),
+            permission=Permission.READ,
+        )
+        assert acl_service._grant_matches(grant, account_id=None, access_key="hip_bob_key_456") is False
+
+    def test_access_key_grant_does_not_match_account_id(self, acl_service: Any) -> None:
+        """Test that ACCESS_KEY grant does not match account ID"""
+        grant = Grant(
+            grantee=Grantee(type=GranteeType.ACCESS_KEY, id="hip_bob_key_123"),
+            permission=Permission.READ,
+        )
+        assert acl_service._grant_matches(grant, account_id="5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", access_key=None) is False
+
+    def test_canonical_user_grant_does_not_match_access_key(self, acl_service: Any) -> None:
+        """Test that CANONICAL_USER grant does not match access key"""
+        grant = Grant(
+            grantee=Grantee(type=GranteeType.CANONICAL_USER, id="5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"),
+            permission=Permission.READ,
+        )
+        assert acl_service._grant_matches(grant, account_id=None, access_key="hip_bob_key_123") is False
+
+    @pytest.mark.asyncio
+    async def test_permission_granted_to_access_key(self, acl_service: Any, mock_db_pool: Any) -> None:
+        """Test that permission is granted when ACCESS_KEY grant matches"""
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+
+        from hippius_s3.models.acl import ACL
+        from hippius_s3.models.acl import Owner
+
+        acl = ACL(
+            owner=Owner(id=owner_id),
+            grants=[
+                Grant(
+                    grantee=Grantee(type=GranteeType.CANONICAL_USER, id=owner_id),
+                    permission=Permission.FULL_CONTROL,
+                ),
+                Grant(
+                    grantee=Grantee(type=GranteeType.ACCESS_KEY, id="hip_bob_key_123"),
+                    permission=Permission.READ,
+                ),
+            ],
+        )
+
+        acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
+
+        has_permission = await acl_service.check_permission(
+            account_id=None,
+            bucket="bucket1",
+            key=None,
+            permission=Permission.READ,
+            access_key="hip_bob_key_123"
+        )
+
+        assert has_permission is True
+
+    @pytest.mark.asyncio
+    async def test_permission_denied_to_different_access_key(self, acl_service: Any, mock_db_pool: Any) -> None:
+        """Test that permission is denied when ACCESS_KEY grant does not match"""
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+
+        from hippius_s3.models.acl import ACL
+        from hippius_s3.models.acl import Owner
+
+        acl = ACL(
+            owner=Owner(id=owner_id),
+            grants=[
+                Grant(
+                    grantee=Grantee(type=GranteeType.CANONICAL_USER, id=owner_id),
+                    permission=Permission.FULL_CONTROL,
+                ),
+                Grant(
+                    grantee=Grantee(type=GranteeType.ACCESS_KEY, id="hip_bob_key_123"),
+                    permission=Permission.READ,
+                ),
+            ],
+        )
+
+        acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
+
+        has_permission = await acl_service.check_permission(
+            account_id=None,
+            bucket="bucket1",
+            key=None,
+            permission=Permission.READ,
+            access_key="hip_bob_key_456"
+        )
+
+        assert has_permission is False
+
+    @pytest.mark.asyncio
+    async def test_both_account_and_key_grants_allow_either(self, acl_service: Any, mock_db_pool: Any) -> None:
+        """Test that either account or access key grant allows access"""
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        bob_account = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+
+        from hippius_s3.models.acl import ACL
+        from hippius_s3.models.acl import Owner
+
+        acl = ACL(
+            owner=Owner(id=owner_id),
+            grants=[
+                Grant(
+                    grantee=Grantee(type=GranteeType.CANONICAL_USER, id=owner_id),
+                    permission=Permission.FULL_CONTROL,
+                ),
+                Grant(
+                    grantee=Grantee(type=GranteeType.CANONICAL_USER, id=bob_account),
+                    permission=Permission.READ,
+                ),
+            ],
+        )
+
+        acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
+
+        has_permission_via_account = await acl_service.check_permission(
+            account_id=bob_account,
+            bucket="bucket1",
+            key=None,
+            permission=Permission.READ,
+            access_key="hip_bob_key_123"
+        )
+
+        assert has_permission_via_account is True
+
+    @pytest.mark.asyncio
+    async def test_owner_check_ignores_access_key(self, acl_service: Any, mock_db_pool: Any) -> None:
+        """Test that ownership check is based on account ID, not access key"""
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+
+        from hippius_s3.models.acl import ACL
+        from hippius_s3.models.acl import Owner
+
+        acl = ACL(
+            owner=Owner(id=owner_id),
+            grants=[],
+        )
+
+        acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
+
+        has_permission = await acl_service.check_permission(
+            account_id=owner_id,
+            bucket="bucket1",
+            key=None,
+            permission=Permission.WRITE,
+            access_key="hip_some_key"
+        )
+
+        assert has_permission is True

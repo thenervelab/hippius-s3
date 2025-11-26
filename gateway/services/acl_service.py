@@ -24,8 +24,10 @@ class ACLService:
 
         return await shared_canned_acl_to_acl(canned_acl, owner_id, self.acl_repo.db, bucket)
 
-    def _grant_matches(self, grant: Grant, account_id: str | None) -> bool:
-        """Check if grant applies to this account."""
+    def _grant_matches(self, grant: Grant, account_id: str | None, access_key: str | None = None) -> bool:
+        """Check if grant applies to this account or access key."""
+        if grant.grantee.type == GranteeType.ACCESS_KEY:
+            return grant.grantee.id == access_key
         if grant.grantee.type == GranteeType.CANONICAL_USER:
             return grant.grantee.id == account_id
         if grant.grantee.type == GranteeType.GROUP:
@@ -64,13 +66,14 @@ class ACLService:
         bucket: str,
         key: str | None,
         permission: Permission,
+        access_key: str | None = None,
     ) -> bool:
-        """Check if account has permission for bucket/object."""
+        """Check if account or access key has permission for bucket/object."""
 
         acl = await self.get_effective_acl(bucket, key)
 
         logger.info(
-            f"DEBUG_ACL: check_permission - account_id={account_id}, bucket={bucket}, key={key}, permission={permission.value}"
+            f"DEBUG_ACL: check_permission - account_id={account_id}, access_key={access_key}, bucket={bucket}, key={key}, permission={permission.value}"
         )
         logger.info(f"DEBUG_ACL: ACL owner_id={acl.owner.id}")
         logger.info(f"DEBUG_ACL: ACL grants count={len(acl.grants)}")
@@ -84,8 +87,10 @@ class ACLService:
             return True
 
         for grant in acl.grants:
-            if self._grant_matches(grant, account_id) and self._permission_implies(grant.permission, permission):
-                logger.info("DEBUG_ACL: Access GRANTED (grant match): grant matches account")
+            if self._grant_matches(grant, account_id, access_key) and self._permission_implies(
+                grant.permission, permission
+            ):
+                logger.info("DEBUG_ACL: Access GRANTED (grant match): grant matches account or access key")
                 return True
 
         logger.info("DEBUG_ACL: Access DENIED: no matching owner or grant")

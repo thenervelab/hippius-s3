@@ -24,6 +24,7 @@ class GranteeType(str, Enum):
     CANONICAL_USER = "CanonicalUser"
     GROUP = "Group"
     AMAZON_CUSTOMER_BY_EMAIL = "AmazonCustomerByEmail"
+    ACCESS_KEY = "AccessKey"
 
 
 @dataclass
@@ -43,6 +44,8 @@ class Grantee:
     def __post_init__(self) -> None:
         if self.type == GranteeType.CANONICAL_USER and not self.id:
             raise ValueError("CanonicalUser grantee must have id")
+        if self.type == GranteeType.ACCESS_KEY and not self.id:
+            raise ValueError("AccessKey grantee must have id")
         if self.type == GranteeType.GROUP and not self.uri:
             raise ValueError("Group grantee must have uri")
         if self.type == GranteeType.AMAZON_CUSTOMER_BY_EMAIL and not self.email_address:
@@ -112,6 +115,7 @@ def validate_grant_grantees(acl: ACL) -> None:
     """
     aws_canonical_id_pattern = re.compile(r"^[a-f0-9]{64}$")
     substrate_account_id_pattern = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{47,48}$")
+    access_key_pattern = re.compile(r"^hip_[a-zA-Z0-9_-]{1,240}$")
     valid_group_uris = {
         WellKnownGroups.ALL_USERS,
         WellKnownGroups.AUTHENTICATED_USERS,
@@ -128,6 +132,14 @@ def validate_grant_grantees(acl: ACL) -> None:
             if not (aws_canonical_id_pattern.match(grantee.id) or substrate_account_id_pattern.match(grantee.id)):
                 raise ValueError(
                     f"Invalid canonical user ID: {grantee.id}. Must be 64-character hex string or Substrate account ID."
+                )
+
+        elif grantee.type == GranteeType.ACCESS_KEY:
+            if not grantee.id:
+                raise ValueError("AccessKey grantee must have id")
+            if not access_key_pattern.match(grantee.id):
+                raise ValueError(
+                    f"Invalid access key format: {grantee.id}. Must match pattern hip_[a-zA-Z0-9_-]{{1,240}}"
                 )
 
         elif grantee.type == GranteeType.GROUP:

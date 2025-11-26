@@ -112,6 +112,7 @@ async def acl_middleware(
     account_id = getattr(request.state, "account_id", None)
     auth_method = getattr(request.state, "auth_method", None)
     token_type = getattr(request.state, "token_type", None)
+    access_key = getattr(request.state, "access_key", None) if auth_method == "access_key" else None
 
     acl_service = request.app.state.acl_service
 
@@ -140,6 +141,7 @@ async def acl_middleware(
             bucket=bucket,
             key=check_key,
             permission=permission,
+            access_key=access_key,
         )
     except ValueError as e:
         if "Bucket not found" in str(e):

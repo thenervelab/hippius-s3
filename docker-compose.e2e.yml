@@ -69,15 +69,6 @@ services:
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
 
-  chain-pin-checker:
-    env_file:
-      - .env.defaults
-      - .env.test-docker
-    environment:
-      - HIPPIUS_KEY=${HIPPIUS_KEY}
-    volumes:
-      - .:/app
-
   toxiproxy:
     image: shopify/toxiproxy:latest
     ports:
@@ -87,7 +78,7 @@ services:
     networks:
       - hippius_net
 
-  chain-profile-cacher:
+  account-cacher:
     env_file:
       - .env.defaults
       - .env.test-docker
