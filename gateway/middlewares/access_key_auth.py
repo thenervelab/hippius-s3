@@ -25,7 +25,7 @@ class AccessKeyAuthError(Exception):
 
 
 ALLOWED_TOKEN_TYPES = {"master", "sub"}
-ACCESS_KEY_PATTERN = re.compile(r'^hip_[a-zA-Z0-9_-]{1,240}$')
+ACCESS_KEY_PATTERN = re.compile(r"^hip_[a-zA-Z0-9_-]{1,240}$")
 
 
 async def verify_access_key_signature(
@@ -71,7 +71,7 @@ async def verify_access_key_signature(
         logger.error(f"API returned empty account_address for key: {access_key[:8]}***")
         raise AccessKeyAuthError("Invalid API response: missing account_address")
 
-    if not re.match(r'^[1-9A-HJ-NP-Za-km-z]{47,48}$', token_response.account_address):
+    if not re.match(r"^[1-9A-HJ-NP-Za-km-z]{47,48}$", token_response.account_address):
         logger.error(f"Invalid account address format: {token_response.account_address}")
         raise AccessKeyAuthError("Invalid account address format")
 
