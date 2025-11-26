@@ -25,8 +25,8 @@ async def handle_list_buckets(ctx: RequestContext, db: Any) -> Response:
 
         root = ET.Element("ListAllMyBucketsResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
         owner = ET.SubElement(root, "Owner")
-        ET.SubElement(owner, "ID").text = "hippius-s3-ipfs-gateway"
-        ET.SubElement(owner, "DisplayName").text = "hippius-s3"
+        ET.SubElement(owner, "ID").text = ctx.main_account_id
+        ET.SubElement(owner, "DisplayName").text = ctx.main_account_id
         buckets = ET.SubElement(root, "Buckets")
         for row in results:
             bucket = ET.SubElement(buckets, "Bucket")
