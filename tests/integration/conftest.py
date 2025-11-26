@@ -21,15 +21,11 @@ from httpx import AsyncClient
 from tests.e2e.conftest import is_real_aws
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _load_test_env() -> Generator[None, None, None]:
-    """Load test environment variables from base + local env files."""
-    project_root = Path(__file__).parents[2]
-    dotenv.load_dotenv(project_root / ".env.defaults", override=True)
-    dotenv.load_dotenv(project_root / ".env.test-local", override=True)
-    os.environ["HIPPIUS_BYPASS_CREDIT_CHECK"] = "true"
-    os.environ["ENABLE_BANHAMMER"] = "false"
-    yield
+_project_root = Path(__file__).parents[2]
+dotenv.load_dotenv(_project_root / ".env.defaults", override=True)
+dotenv.load_dotenv(_project_root / ".env.test-local", override=True)
+os.environ["HIPPIUS_BYPASS_CREDIT_CHECK"] = "true"
+os.environ["ENABLE_BANHAMMER"] = "false"
 
 
 @pytest.fixture
