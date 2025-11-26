@@ -14,10 +14,6 @@ services:
     environment:
       <<: *monitoring-enabled
 
-  substrate:
-    environment:
-      <<: *monitoring-enabled
-
   downloader:
     environment:
       <<: *monitoring-enabled
@@ -27,10 +23,6 @@ services:
       <<: *monitoring-enabled
 
   janitor:
-    environment:
-      <<: *monitoring-enabled
-
-  chain-pin-checker:
     environment:
       <<: *monitoring-enabled
 
