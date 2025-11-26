@@ -93,7 +93,6 @@ async def account_middleware(request: Request, call_next: Callable) -> Response:
 
     if auth_method == "access_key":
         account_address = request.state.account_address
-        token_type = request.state.token_type
 
         try:
             redis_accounts_client = request.app.state.redis_accounts

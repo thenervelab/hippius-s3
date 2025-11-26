@@ -6,7 +6,6 @@ import re
 from fastapi import Request
 
 from gateway.config import get_config
-from gateway.middlewares.sigv4 import AuthParsingError
 from gateway.middlewares.sigv4 import calculate_signature
 from gateway.middlewares.sigv4 import create_canonical_request
 from gateway.middlewares.sigv4 import extract_signature_from_auth_header
@@ -127,6 +126,6 @@ async def verify_access_key_signature(
                 f"AUDIT: Master token used: key={access_key[:8]}***, account={token_response.account_address}"
             )
         return True, token_response.account_address, token_response.token_type
-    else:
-        logger.warning(f"Signature mismatch for access key: {access_key[:8]}***")
-        return False, "", ""
+
+    logger.warning(f"Signature mismatch for access key: {access_key[:8]}***")
+    return False, "", ""
