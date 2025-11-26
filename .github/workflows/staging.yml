@@ -60,8 +60,8 @@ jobs:
               echo "Updating git repository..."
               # Sync to remote even after force-pushes
               git fetch origin --prune
-              git checkout -B staging origin/staging
               git reset --hard origin/staging
+              git checkout -B staging origin/staging
               git clean -ffd
             fi
 
@@ -94,6 +94,7 @@ jobs:
             docker compose -f docker-compose.yml -f docker-compose.staging.yml -f docker-compose.monitoring.yml exec -T api dbmate up
 
             echo "Staging deployment completed successfully!"
+          EOF
 
       - name: Verify staging deployment
         env:
