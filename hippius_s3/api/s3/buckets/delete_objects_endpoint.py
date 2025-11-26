@@ -101,7 +101,6 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                     get_query("delete_object"),
                     bucket_id,
                     key,
-                    user["main_account_id"],
                 )
             except Exception:
                 logger.exception("Delete query failed for key %s", key)

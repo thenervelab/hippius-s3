@@ -50,9 +50,8 @@ async def handle_put_object(
 
         with tracer.start_as_current_span("put_object.get_bucket", attributes={"bucket_name": bucket_name}):
             bucket = await db.fetchrow(
-                get_query("get_bucket_by_name_and_owner"),
+                get_query("get_bucket_by_name"),
                 bucket_name,
-                main_account_id,
             )
 
         if not bucket:

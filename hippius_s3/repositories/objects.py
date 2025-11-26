@@ -17,7 +17,6 @@ class ObjectRepository:
             get_query("get_object_for_download_with_permissions"),
             bucket_name,
             object_key,
-            main_account_id,
         )
 
     async def get_by_path(self, bucket_id: str, object_key: str) -> Any:

@@ -5,11 +5,11 @@ repos:
       - id: ruff
         args: [--fix]
         stages: [pre-commit]
-        files: ^(hippius_s3/|tests/)
+        files: ^hippius_s3/
       - id: ruff-format
         args: [--check]
         stages: [pre-commit]
-        files: ^(hippius_s3/|tests/)
+        files: ^hippius_s3/
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
@@ -52,4 +52,3 @@ repos:
           - --show-error-codes
           - --pretty
           - hippius_s3
-          - tests

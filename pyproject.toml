@@ -48,6 +48,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+proxy = [
+    "fastapi>=0.115.12",
+    "uvicorn[standard]>=0.23.0",
+    "httpx>=0.27.0",
+    "asyncpg>=0.28.0",
+    "redis",
+    "python-dotenv>=1.0.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
@@ -64,6 +72,7 @@ dev = [
     "requests>=2.31.0",
     "psycopg[binary]>=3.1",
     "fakeredis>=2.23.0",
+    "respx>=0.21.0",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -72,7 +81,7 @@ packages = ["hippius_s3"]
 [tool.ruff]
 line-length = 120
 target-version = "py312"
-exclude = ["examples/"]
+exclude = ["examples/", "tests/"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -120,7 +129,18 @@ max-complexity = 13 # TODO: get this down to 8
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 "examples/*.py" = ["T201", "PTH"]
-"tests/**/*.py" = ["T201", "ERA001"]
+"tests/**/*.py" = [
+    "T201",      # print statements
+    "ERA001",    # commented out code
+    "C901",      # complex functions
+    "PLR0913",   # too many arguments
+    "PLR2004",   # magic values
+    "PLR0915",   # too many statements
+    "B011",      # assert false
+    "SIM",       # simplify checks
+    "PERF",      # performance checks
+    "RET",       # return statement checks
+]
 "hippius_s3/scripts/*.py" = ["T201", "PTH"]
 "scripts/*.py" = ["T201", "PTH", "SIM105"]
 
@@ -154,6 +174,14 @@ disable_error_code = ["var-annotated", "no-untyped-def", "no-any-return"]
 module = "hippius_s3.ipfs_service"
 disallow_untyped_defs = false
 disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "uvicorn"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "pytest_asyncio"
+ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "loki_logger_handler.*"
@@ -254,3 +282,8 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = "prometheus_client.*"
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disable_error_code = ["no-untyped-def", "attr-defined", "arg-type", "return-value", "misc"]

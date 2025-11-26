@@ -23,10 +23,15 @@ async def audit_log_middleware(
     if path == "/metrics":
         return await call_next(request)
 
+    client_ip = request.client.host if request.client else "unknown"
+    is_internal_ip = client_ip in ("127.0.0.1", "localhost") or client_ip.startswith("172.")
+
+    if is_internal_ip and path in ("/", "/health"):
+        return await call_next(request)
+
     start_time = time.time()
 
     # Extract key information before processing
-    client_ip = request.client.host if request.client else "unknown"
     user_agent = request.headers.get("user-agent", "unknown")
     method = request.method
     query_params = dict(request.query_params)

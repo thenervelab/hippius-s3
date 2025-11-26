@@ -7,11 +7,12 @@ from typing import Any
 from typing import List
 from typing import Optional
 
+from hippius_sdk.client import HippiusClient
 from pydantic import BaseModel
 
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
-from hippius_s3.ipfs_service import IPFSService
+from hippius_s3.ipfs_service import upload_to_ipfs
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
@@ -73,10 +74,10 @@ def compute_backoff_ms(attempt: int, base_ms: int = 1000, max_ms: int = 30000) -
 
 
 class Uploader:
-    def __init__(self, db_pool: Any, ipfs_service: IPFSService, redis_client: Any, config: Any):
+    def __init__(self, db_pool: Any, ipfs_client: HippiusClient, redis_client: Any, config: Any):
         # Support either a Pool (has acquire) or a single Connection
         self.db = db_pool
-        self.ipfs_service = ipfs_service
+        self.ipfs_client = ipfs_client
         self.redis_client = redis_client
         self.config = config
         self.obj_cache = RedisObjectPartsCache(redis_client)
@@ -302,13 +303,14 @@ class Uploader:
                 piece = await self.fs_store.get_chunk(object_id, int(object_version), part_number, ci)
                 if not isinstance(piece, (bytes, bytearray)):
                     raise RuntimeError("missing_cipher_chunk")
-                up_res = await self.ipfs_service.upload_file(
+                chunk_upload_result = await upload_to_ipfs(
                     file_data=bytes(piece),
                     file_name=f"{object_key}.part{part_number}.chunk{ci}",
                     content_type="application/octet-stream",
+                    client=self.ipfs_client,
                     encrypt=False,
                 )
-                piece_cid = str(up_res["cid"])
+                piece_cid = str(chunk_upload_result["cid"])
                 all_chunk_cids.append(piece_cid)
 
                 if part_chunk_size > 0 and part_plain_size > 0 and num_chunks_meta > 0:
@@ -411,16 +413,17 @@ class Uploader:
             manifest_json = json.dumps(manifest_data)
             logger.debug(f"Manifest built with {len(parts_data)} parts for object_id={object_id}")
 
-            manifest_result = await self.ipfs_service.upload_file(
+            manifest_upload_result = await upload_to_ipfs(
                 file_data=manifest_json.encode(),
                 file_name=f"{object_key}.manifest",
                 content_type="application/json",
+                client=self.ipfs_client,
                 encrypt=False,
             )
-            if not manifest_result["cid"]:
+            if not manifest_upload_result["cid"]:
                 raise ValueError("manifest_publish_missing_cid")
 
-            cid_row = await conn.fetchrow(get_query("upsert_cid"), manifest_result["cid"])
+            cid_row = await conn.fetchrow(get_query("upsert_cid"), manifest_upload_result["cid"])
             cid_id = cid_row["id"] if cid_row else None
 
             await conn.execute(
@@ -433,14 +436,14 @@ class Uploader:
                 """,
                 object_id,
                 object_version,
-                manifest_result["cid"],
+                manifest_upload_result["cid"],
                 cid_id,
             )
 
-            logger.info(f"Manifest uploaded object_id={object_id} cid={manifest_result['cid']}")
+            logger.info(f"Manifest uploaded object_id={object_id} cid={manifest_upload_result['cid']}")
 
-            manifest_data["manifest_cid"] = manifest_result["cid"]
-            manifest_data["manifest_size_bytes"] = manifest_result["size_bytes"]
+            manifest_data["manifest_cid"] = manifest_upload_result["cid"]
+            manifest_data["manifest_size_bytes"] = manifest_upload_result["size_bytes"]
 
             return manifest_data
 

@@ -34,16 +34,15 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
     if "lifecycle" in request.query_params:
         try:
             # Get user for user-scoped bucket lookup
-            user = await db.fetchrow(
+            _ = await db.fetchrow(
                 get_query("get_or_create_user_by_main_account"),
                 request.state.account.main_account,
                 datetime.now(timezone.utc),
             )
 
             bucket = await db.fetchrow(
-                get_query("get_bucket_by_name_and_owner"),
+                get_query("get_bucket_by_name"),
                 bucket_name,
-                user["main_account_id"],
             )
 
             if not bucket:
@@ -101,7 +100,7 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
     elif "tagging" in request.query_params:
         try:
             # Get user for user-scoped bucket lookup
-            user = await db.fetchrow(
+            _ = await db.fetchrow(
                 get_query("get_or_create_user_by_main_account"),
                 request.state.account.main_account,
                 datetime.now(timezone.utc),
@@ -109,9 +108,8 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
 
             # First check if the bucket exists
             bucket = await db.fetchrow(
-                get_query("get_bucket_by_name_and_owner"),
+                get_query("get_bucket_by_name"),
                 bucket_name,
-                user["main_account_id"],
             )
 
             if not bucket:
@@ -177,19 +175,10 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
     # Handle standard bucket creation if not a tagging, lifecycle, or policy request
     else:
         try:
-            # Reject ACLs to match AWS when ObjectOwnership is BucketOwnerEnforced
-            acl_header = request.headers.get("x-amz-acl")
-            if acl_header:
-                return errors.s3_error_response(
-                    "InvalidBucketAclWithObjectOwnership",
-                    "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting",
-                    status_code=400,
-                )
-
             bucket_id = str(uuid.uuid4())
             created_at = datetime.now(timezone.utc)
 
-            # Bucket public/private is managed via policy, not ACL
+            # Legacy field for backward compatibility - always false (ACLs handle access control)
             is_public = False
 
             # Get or create user record for the main account
@@ -202,15 +191,30 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
 
             logger.info(f"Creating bucket '{bucket_name}' via S3 protocol for account {main_account_id}")
 
-            query = get_query("create_bucket")
-            await db.fetchrow(
-                query,
-                bucket_id,
-                bucket_name,
-                created_at,
-                is_public,
-                main_account_id,
-            )
+            # Check for x-amz-acl header
+            x_amz_acl = request.headers.get("x-amz-acl")
+
+            # Start transaction for atomic bucket + ACL creation
+            async with db.transaction():
+                query = get_query("create_bucket")
+                await db.fetchrow(
+                    query,
+                    bucket_id,
+                    bucket_name,
+                    created_at,
+                    is_public,
+                    main_account_id,
+                )
+
+                # Create ACL if x-amz-acl header is present
+                if x_amz_acl:
+                    from hippius_s3.repositories.acl_repository import ACLRepository
+                    from hippius_s3.services.acl_helper import canned_acl_to_acl
+
+                    acl_repo = ACLRepository(db)
+                    acl = await canned_acl_to_acl(x_amz_acl, main_account_id, db, bucket_name)
+                    await acl_repo.set_bucket_acl_by_id(bucket_id, main_account_id, acl)
+                    logger.info(f"Created ACL '{x_amz_acl}' for bucket '{bucket_name}' (id: {bucket_id}) atomically")
 
             get_metrics_collector().record_s3_operation(
                 operation="put_bucket",

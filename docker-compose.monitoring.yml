@@ -1,4 +1,39 @@
+x-monitoring-enabled: &monitoring-enabled
+  ENABLE_MONITORING: "true"
+
 services:
+  api:
+    environment:
+      <<: *monitoring-enabled
+
+  gateway:
+    environment:
+      <<: *monitoring-enabled
+
+  uploader:
+    environment:
+      <<: *monitoring-enabled
+
+  downloader:
+    environment:
+      <<: *monitoring-enabled
+
+  unpinner:
+    environment:
+      <<: *monitoring-enabled
+
+  account-cacher:
+    environment:
+      <<: *monitoring-enabled
+
+  janitor:
+    environment:
+      <<: *monitoring-enabled
+
+  backup:
+    environment:
+      <<: *monitoring-enabled
+
   # Loki for log aggregation
   loki:
     image: grafana/loki:latest

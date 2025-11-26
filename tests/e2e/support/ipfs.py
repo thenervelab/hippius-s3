@@ -11,7 +11,11 @@ import requests  # type: ignore[import-untyped]
 
 def build_ipfs_url(cid: str, base_url: Optional[str] = None) -> str:
     print(f"DEBUG: build_ipfs_url: cid={cid}, base_url={base_url}")
-    base = base_url.strip() if base_url and base_url.strip() else "http://127.0.0.1:8080/ipfs"
+    base = (
+        base_url.strip()
+        if base_url and base_url.strip()
+        else os.environ.get("HIPPIUS_IPFS_GET_URL", "http://127.0.0.1:8081").strip()
+    )
     base = base.rstrip("/")
 
     print(f"DEBUG: build_ipfs_url: base={base}")

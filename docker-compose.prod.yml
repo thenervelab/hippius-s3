@@ -1,12 +1,9 @@
-services:
-  base:
-    image: hippius-s3-base:latest
-    profiles:
-      - build-base
-    build:
-      context: .
-      dockerfile: Dockerfile.base
+# Production-specific overrides
+# Usage: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+include:
+  - docker-compose.utilities.yml
 
+services:
   db:
     shm_size: 2g
     command:
@@ -66,7 +63,3 @@ services:
   downloader:
     deploy:
       replicas: 1
-
-# Remove the ipfs_data volume since we're using host mount
-volumes:
-  postgres_data:

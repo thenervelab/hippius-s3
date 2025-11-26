@@ -1,5 +1,6 @@
--- Get object info for download with chunks data, checking permissions
--- Parameters: $1: bucket_name, $2: object_key, $3: main_account_id
+-- Get object info for download with chunks data
+-- Gateway now handles all permission checks, backend just retrieves data
+-- Parameters: $1: bucket_name, $2: object_key
 WITH object_info AS (
     SELECT
         o.object_id,
@@ -24,7 +25,6 @@ WITH object_info AS (
     LEFT JOIN cids c ON ov.cid_id = c.id
     WHERE b.bucket_name = $1
       AND o.object_key = $2
-      AND (b.is_public = TRUE OR b.main_account_id = $3)
 ),
 multipart_chunks AS (
     SELECT

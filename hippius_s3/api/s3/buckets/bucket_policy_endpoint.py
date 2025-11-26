@@ -8,6 +8,9 @@ from fastapi import Request
 from fastapi import Response
 
 from hippius_s3.api.s3 import errors
+from hippius_s3.models.acl import Permission
+from hippius_s3.models.acl import WellKnownGroups
+from hippius_s3.repositories.acl_repository import ACLRepository
 from hippius_s3.repositories.buckets import BucketRepository
 
 
@@ -24,13 +27,31 @@ async def get_bucket_policy(bucket_name: str, db: Any, main_account_id: str) -> 
                 status_code=404,
                 BucketName=bucket_name,
             )
-        if not bucket["is_public"]:
+
+        acl_repo = ACLRepository(db)
+        acl = await acl_repo.get_bucket_acl(bucket_name)
+
+        if not acl:
             return errors.s3_error_response(
                 "NoSuchBucketPolicy",
                 "The bucket policy does not exist",
                 status_code=404,
                 BucketName=bucket_name,
             )
+
+        has_public_read = any(
+            grant.grantee.uri == WellKnownGroups.ALL_USERS and grant.permission == Permission.READ
+            for grant in acl.grants
+        )
+
+        if not has_public_read:
+            return errors.s3_error_response(
+                "NoSuchBucketPolicy",
+                "The bucket policy does not exist",
+                status_code=404,
+                BucketName=bucket_name,
+            )
+
         policy = {
             "Version": "2012-10-17",
             "Statement": [
@@ -60,13 +81,23 @@ async def set_bucket_policy(bucket_name: str, request: Request, db: Any) -> Resp
                 status_code=404,
                 BucketName=bucket_name,
             )
-        if bucket["is_public"]:
-            return errors.s3_error_response(
-                "PolicyAlreadyExists",
-                "The bucket policy already exists and bucket is public",
-                status_code=409,
-                BucketName=bucket_name,
+
+        acl_repo = ACLRepository(db)
+        existing_acl = await acl_repo.get_bucket_acl(bucket_name)
+
+        if existing_acl:
+            has_public_read = any(
+                grant.grantee.uri == WellKnownGroups.ALL_USERS and grant.permission == Permission.READ
+                for grant in existing_acl.grants
             )
+            if has_public_read:
+                return errors.s3_error_response(
+                    "PolicyAlreadyExists",
+                    "The bucket policy already exists and bucket is public",
+                    status_code=409,
+                    BucketName=bucket_name,
+                )
+
         body = await request.body()
         if not body:
             return errors.s3_error_response("MalformedPolicy", "Policy document is empty", status_code=400)
@@ -80,7 +111,14 @@ async def set_bucket_policy(bucket_name: str, request: Request, db: Any) -> Resp
                 "Policy document is invalid or not a public read policy",
                 status_code=400,
             )
-        await db.fetchrow("UPDATE buckets SET is_public = TRUE WHERE bucket_id = $1", bucket["bucket_id"])
+
+        from hippius_s3.services.acl_helper import canned_acl_to_acl
+
+        owner_id = str(bucket["main_account_id"])
+        public_acl = await canned_acl_to_acl("public-read", owner_id, db, bucket_name)
+        await acl_repo.set_bucket_acl(bucket_name, owner_id, public_acl)
+
+        logger.info(f"Set public-read ACL for bucket '{bucket_name}' via bucket policy")
         return Response(status_code=204)
     except Exception as e:
         logger.exception(f"Error setting bucket policy: {e}")
