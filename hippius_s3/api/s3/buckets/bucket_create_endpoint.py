@@ -213,8 +213,8 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
 
                     acl_repo = ACLRepository(db)
                     acl = await canned_acl_to_acl(x_amz_acl, main_account_id, db, bucket_name)
-                    await acl_repo.set_bucket_acl(bucket_name, main_account_id, acl)
-                    logger.info(f"Created ACL '{x_amz_acl}' for bucket '{bucket_name}' atomically")
+                    await acl_repo.set_bucket_acl_by_id(bucket_id, main_account_id, acl)
+                    logger.info(f"Created ACL '{x_amz_acl}' for bucket '{bucket_name}' (id: {bucket_id}) atomically")
 
             get_metrics_collector().record_s3_operation(
                 operation="put_bucket",
