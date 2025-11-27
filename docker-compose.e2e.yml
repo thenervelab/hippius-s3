@@ -79,9 +79,9 @@ services:
     ports:
       - "127.0.0.1:8001:8001"
     environment:
-      - IPFS_API_URL=http://ipfs:5001
+      - IPFS_API_URL=http://toxiproxy:15001
     depends_on:
-      ipfs:
+      toxiproxy:
         condition: service_started
     networks:
       - hippius_net
