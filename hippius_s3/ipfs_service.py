@@ -1,20 +1,12 @@
-import asyncio
 import base64
 import hashlib
 import logging
-import random
-import tempfile
 import time
-from pathlib import Path
 from typing import AsyncIterator
-from typing import Dict
-from typing import Optional
-from typing import Union
 
 import asyncpg
 import httpx
 import nacl.secret
-from hippius_sdk.client import HippiusClient
 from pydantic import BaseModel
 
 from hippius_s3.config import get_config
@@ -130,91 +122,3 @@ async def s3_download(
         elapsed=elapsed_time,
         size_bytes=size_bytes,
     )
-
-
-async def upload_to_ipfs(
-    *,
-    file_data: bytes,
-    file_name: str,
-    content_type: str,
-    client: HippiusClient,
-    encrypt: bool = False,
-    seed_phrase: Optional[str] = None,
-) -> Dict[str, Union[str, int]]:
-    """
-    Upload file data to IPFS (legacy method).
-
-    NOTE: This method is deprecated for regular uploads. Use client.s3_publish() instead
-    for full IPFS upload + pinning + blockchain publishing.
-
-    This method is still used for multipart upload parts, which only need IPFS upload
-    without blockchain publishing (the final concatenated file gets published).
-
-    TODO: Remove this function once multipart upload flow is refactored to use publish path.
-
-    Args:
-        file_data: Binary file data
-        file_name: Name of the file
-        content_type: MIME type of the file
-        client: HippiusClient instance for IPFS operations
-        encrypt: Whether to encrypt the file
-        seed_phrase: Seed phrase to use for blockchain operations
-
-    Returns:
-        Dict containing IPFS CID and file information
-    """
-    with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-        temp_path = temp_file.name
-        temp_file.write(file_data)
-
-    try:
-
-        def _compute_backoff_ms(attempt: int) -> float:
-            base = getattr(config, "ipfs_retry_base_ms", 500)
-            max_ms = getattr(config, "ipfs_retry_max_ms", 5000)
-            exp = base * (2 ** max(0, attempt - 1))
-            jitter = random.uniform(0, exp * 0.1)
-            return float(min(exp + jitter, max_ms))
-
-        for attempt in range(1, int(getattr(config, "ipfs_max_retries", 3)) + 1):
-            try:
-                if encrypt and seed_phrase:
-                    key_material = hashlib.sha256(seed_phrase.encode("utf-8")).digest()
-                    enc_client = HippiusClient(
-                        ipfs_api_url=config.ipfs_store_url,
-                        api_url=config.hippius_api_base_url,
-                        encrypt_by_default=False,
-                        encryption_key=key_material,
-                    )
-                    result = await enc_client.upload_file(
-                        temp_path,
-                        encrypt=encrypt,
-                        hippius_key=config.hippius_service_key,
-                        pin=False,
-                    )
-                else:
-                    result = await client.upload_file(
-                        temp_path,
-                        encrypt=encrypt,
-                        hippius_key=config.hippius_service_key,
-                        pin=False,
-                    )
-                break
-            except Exception as e:
-                if attempt >= int(getattr(config, "ipfs_max_retries", 3)):
-                    logger.exception(f"IPFS upload failed after {attempt} attempts: {e}")
-                    raise
-                backoff_ms = _compute_backoff_ms(attempt)
-                logger.warning(f"IPFS upload failed (attempt {attempt}), retrying in {backoff_ms:.0f}ms: {e}")
-                await asyncio.sleep(backoff_ms / 1000.0)
-
-        return {
-            "cid": result["cid"],
-            "file_name": file_name,
-            "content_type": content_type,
-            "size_bytes": result["size_bytes"],
-            "encrypted": result.get("encrypted", False),
-        }
-    finally:
-        if Path(temp_path).exists():
-            Path(temp_path).unlink()

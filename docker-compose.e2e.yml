@@ -52,6 +52,9 @@ services:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
       - ./.e2e/dlq_archive:/tmp/hippius_dlq_archive
+    depends_on:
+      mock-hippius-api:
+        condition: service_healthy
 
   unpinner:
     env_file:
@@ -68,6 +71,25 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
+
+  mock-hippius-api:
+    build:
+      context: .
+      dockerfile: tests/e2e/Dockerfile.mock-api
+    ports:
+      - "127.0.0.1:8001:8001"
+    environment:
+      - IPFS_API_URL=http://toxiproxy:15001
+    depends_on:
+      toxiproxy:
+        condition: service_started
+    networks:
+      - hippius_net
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import httpx; httpx.get(\"http://localhost:8001/health\", timeout=1).raise_for_status()' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   toxiproxy:
     image: shopify/toxiproxy:latest

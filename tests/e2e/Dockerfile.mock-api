@@ -1,0 +1,9 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir fastapi uvicorn pydantic httpx python-multipart
+
+COPY tests/e2e/mock_hippius_api.py /app/mock_hippius_api.py
+
+CMD ["python", "/app/mock_hippius_api.py"]
