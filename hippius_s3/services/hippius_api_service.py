@@ -9,6 +9,7 @@ API Documentation: https://api.hippius.com/?format=openapi
 
 import asyncio
 import functools
+import io
 import logging
 from typing import Any
 from typing import Callable
@@ -71,6 +72,32 @@ class TokenAuthResponse(BaseModel):
     token_type: str
     encrypted_secret: str
     nonce: str
+
+
+class UploadResponse(BaseModel):
+    id: str
+    original_name: str
+    content_type: str
+    size_bytes: int
+    sha256_hex: str
+    cid: str
+    status: str
+    file_url: str
+    created_at: str
+    updated_at: str
+
+
+class FileStatusResponse(BaseModel):
+    id: str
+    original_name: str
+    content_type: str
+    size_bytes: int
+    sha256_hex: str
+    cid: str
+    status: str
+    file_url: str
+    created_at: str
+    updated_at: str
 
 
 class HippiusAPIError(Exception):
@@ -180,7 +207,7 @@ class HippiusApiClient:
         await self._client.aclose()
 
     @staticmethod
-    def _get_headers() -> Dict[str, str]:
+    def _get_headers(content_type: str = "application/json") -> Dict[str, str]:
         """
         Get HTTP headers with authentication.
 
@@ -190,7 +217,7 @@ class HippiusApiClient:
         return {
             "Authorization": f"ServiceToken {config.hippius_service_key}",
             "Accept": "application/json",
-            "Content-Type": "application/json",
+            "Content-Type": content_type,
         }
 
     @retry_on_error(retries=3, backoff=5.0)
@@ -305,3 +332,68 @@ class HippiusApiClient:
 
         response.raise_for_status()
         return TokenAuthResponse.model_validate(response.json())
+
+    @retry_on_error(retries=3, backoff=5.0)
+    async def upload_file_and_get_cid(
+        self,
+        file_data: bytes,
+        file_name: str,
+        content_type: str,
+    ) -> UploadResponse:
+        """
+        Upload file directly to api.hippius.com storage endpoint.
+
+        Maps to: POST /storage-control/upload/
+
+        Args:
+            file_data: Binary file data to upload
+            file_name: Original filename
+            content_type: MIME type of the file
+
+        Returns:
+            UploadResponse: Response with file_id, CID, and metadata
+
+        Raises:
+            HippiusAPIError: If the API request fails
+        """
+
+        files = {"file": (file_name, io.BytesIO(file_data), content_type)}
+
+        headers = self._get_headers()
+        del headers["Content-Type"]
+
+        response = await self._client.post(
+            "/storage-control/upload/",
+            files=files,
+            headers=headers,
+        )
+
+        response.raise_for_status()
+        return UploadResponse.model_validate(response.json())
+
+    @retry_on_error(retries=3, backoff=5.0)
+    async def get_file_status(
+        self,
+        file_id: str,
+    ) -> FileStatusResponse:
+        """
+        Get file status from api.hippius.com.
+
+        Maps to: GET /storage-control/files/{file_id}/
+
+        Args:
+            file_id: File ID to query status for
+
+        Returns:
+            FileStatusResponse: File status and metadata
+
+        Raises:
+            HippiusAPIError: If the API request fails
+        """
+        response = await self._client.get(
+            f"/storage-control/files/{file_id}/",
+            headers=self._get_headers(),
+        )
+
+        response.raise_for_status()
+        return FileStatusResponse.model_validate(response.json())

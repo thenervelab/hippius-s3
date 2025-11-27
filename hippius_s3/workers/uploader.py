@@ -12,12 +12,10 @@ from pydantic import BaseModel
 
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
-from hippius_s3.ipfs_service import upload_to_ipfs
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.services.hippius_api_service import HippiusApiClient
-from hippius_s3.services.hippius_api_service import PinResponse
 from hippius_s3.utils import get_query
 
 
@@ -104,27 +102,6 @@ class Uploader:
             return acquire()
         return Uploader._ConnCtx(self.db)
 
-    async def pin_on_api(self, cids, account_ss58) -> list[PinResponse]:
-        if not cids:
-            return []
-
-        semaphore = asyncio.Semaphore(self.config.uploader_pin_parallelism)
-
-        async def pin_with_limit(
-            api_client: HippiusApiClient,
-            cid: str,
-            size_bytes: int,
-        ) -> PinResponse:
-            async with semaphore:
-                return await api_client.pin_file(
-                    cid,
-                    size_bytes,
-                    account_ss58,
-                )
-
-        async with HippiusApiClient() as api_client:
-            return await asyncio.gather(*[pin_with_limit(api_client, cid, size) for cid, size in cids.items()])
-
     async def process_upload(self, payload: UploadChainRequest) -> List[str]:
         start_time = time.time()
         logger.info(f"Processing upload object_id={payload.object_id} chunks={len(payload.chunks)}")
@@ -154,18 +131,9 @@ class Uploader:
         cids_and_sizes = {part["cid"]: part["size_bytes"] for part in manifest_data["parts"]}  # noqa: C416
         cids_and_sizes[manifest_data["manifest_cid"]] = manifest_data["manifest_size_bytes"]
 
-        if cids_and_sizes and self.config.publish_to_chain:
-            try:
-                await self.pin_on_api(cids_and_sizes, payload.address)
-                logger.info(f"Successfully pinned {len(cids_and_sizes)} CIDs for object_id={payload.object_id}")
-            except Exception as e:
-                logger.error(
-                    f"Pin failure for object_id={payload.object_id}: {e}. "
-                    f"Failed to pin {len(cids_and_sizes)} CIDs. Will move to DLQ."
-                )
-                raise
-        elif cids_and_sizes:
-            logger.debug(f"Skipping API pin for object_id={payload.object_id} (publish_to_chain=false)")
+        logger.info(
+            f"All uploads complete for object_id={payload.object_id}, {len(cids_and_sizes)} CIDs uploaded and pinned"
+        )
 
         async with self._acquire_conn() as conn:
             await conn.execute(
@@ -303,15 +271,22 @@ class Uploader:
                 piece = await self.fs_store.get_chunk(object_id, int(object_version), part_number, ci)
                 if not isinstance(piece, (bytes, bytearray)):
                     raise RuntimeError("missing_cipher_chunk")
-                chunk_upload_result = await upload_to_ipfs(
-                    file_data=bytes(piece),
-                    file_name=f"{object_key}.part{part_number}.chunk{ci}",
-                    content_type="application/octet-stream",
-                    client=self.ipfs_client,
-                    encrypt=False,
-                )
-                piece_cid = str(chunk_upload_result["cid"])
+                async with HippiusApiClient() as api_client:
+                    chunk_upload_result = await api_client.upload_file_and_get_cid(
+                        file_data=bytes(piece),
+                        file_name=f"{object_key}.part{part_number}.chunk{ci}",
+                        content_type="application/octet-stream",
+                    )
+                piece_cid = str(chunk_upload_result.cid)
+                piece_file_id = str(chunk_upload_result.id)
                 all_chunk_cids.append(piece_cid)
+
+                async with HippiusApiClient() as api_client:
+                    status_result = await api_client.get_file_status(piece_file_id)
+                logger.info(
+                    f"Uploaded chunk: object_id={object_id} part={part_number} chunk={ci} "
+                    f"file_id={piece_file_id} cid={piece_cid} status={status_result.status}"
+                )
 
                 if part_chunk_size > 0 and part_plain_size > 0 and num_chunks_meta > 0:
                     if ci < num_chunks_meta - 1:
@@ -330,6 +305,7 @@ class Uploader:
                         int(len(piece)),
                         int(pt_len) if isinstance(pt_len, int) else None,
                         None,
+                        piece_file_id,
                     )
 
             # Set parts.ipfs_cid to first chunk CID for manifest compatibility
@@ -413,17 +389,26 @@ class Uploader:
             manifest_json = json.dumps(manifest_data)
             logger.debug(f"Manifest built with {len(parts_data)} parts for object_id={object_id}")
 
-            manifest_upload_result = await upload_to_ipfs(
-                file_data=manifest_json.encode(),
-                file_name=f"{object_key}.manifest",
-                content_type="application/json",
-                client=self.ipfs_client,
-                encrypt=False,
-            )
-            if not manifest_upload_result["cid"]:
+            async with HippiusApiClient() as api_client:
+                manifest_upload_result = await api_client.upload_file_and_get_cid(
+                    file_data=manifest_json.encode(),
+                    file_name=f"{object_key}.manifest",
+                    content_type="application/json",
+                )
+            if not manifest_upload_result.cid:
                 raise ValueError("manifest_publish_missing_cid")
 
-            cid_row = await conn.fetchrow(get_query("upsert_cid"), manifest_upload_result["cid"])
+            manifest_cid = str(manifest_upload_result.cid)
+            manifest_file_id = str(manifest_upload_result.id)
+
+            async with HippiusApiClient() as api_client:
+                status_result = await api_client.get_file_status(manifest_file_id)
+            logger.info(
+                f"Uploaded manifest: object_id={object_id} file_id={manifest_file_id} "
+                f"cid={manifest_cid} status={status_result.status}"
+            )
+
+            cid_row = await conn.fetchrow(get_query("upsert_cid"), manifest_cid)
             cid_id = cid_row["id"] if cid_row else None
 
             await conn.execute(
@@ -431,19 +416,19 @@ class Uploader:
                 UPDATE object_versions
                 SET ipfs_cid = $3,
                     cid_id = COALESCE($4, cid_id),
+                    manifest_api_file_id = $5,
                     status = 'pinning'
                 WHERE object_id = $1 AND object_version = $2
                 """,
                 object_id,
                 object_version,
-                manifest_upload_result["cid"],
+                manifest_cid,
                 cid_id,
+                manifest_file_id,
             )
 
-            logger.info(f"Manifest uploaded object_id={object_id} cid={manifest_upload_result['cid']}")
-
-            manifest_data["manifest_cid"] = manifest_upload_result["cid"]
-            manifest_data["manifest_size_bytes"] = manifest_upload_result["size_bytes"]
+            manifest_data["manifest_cid"] = manifest_cid
+            manifest_data["manifest_size_bytes"] = manifest_upload_result.size_bytes
 
             return manifest_data
 
