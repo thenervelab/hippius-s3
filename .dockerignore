@@ -59,6 +59,7 @@ plan*.md
 test_*.py
 *_test.py
 tests/
+!tests/e2e/mock_hippius_api.py
 
 # Lock files (pyproject.toml is enough)
 uv.lock
