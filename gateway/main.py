@@ -133,6 +133,7 @@ def factory() -> FastAPI:
 
     # Register middleware in REVERSE order (outermost first)
     # IMPORTANT: auth_router must execute BEFORE account (so register AFTER)
+    # IMPORTANT: trailing_slash must execute AFTER auth_router (so register BEFORE)
     app.middleware("http")(metrics_middleware)
     app.middleware("http")(tracing_middleware)
     app.middleware("http")(cors_middleware)
@@ -142,8 +143,8 @@ def factory() -> FastAPI:
     app.middleware("http")(rate_limit_wrapper)
     app.middleware("http")(acl_middleware)
     app.middleware("http")(account_middleware)
-    app.middleware("http")(auth_router_middleware)
     app.middleware("http")(trailing_slash_normalizer)
+    app.middleware("http")(auth_router_middleware)
 
     return app
 
