@@ -187,5 +187,15 @@ async def account_middleware(request: Request, call_next: Callable) -> Response:
                 message="Something went wrong when verifying your account. Please try again later.",
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
+    else:
+        account_id = "anonymous"
+        request.state.account_id = account_id
+        request.state.account = HippiusAccount(
+            id=account_id,
+            main_account=account_id,
+            has_credits=True,
+            upload=False,
+            delete=False,
+        )
     # Continue with the request
     return await call_next(request)  # type: ignore[no-any-return]
