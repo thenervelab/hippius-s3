@@ -339,4 +339,5 @@ def canonicalize_query_string(query_string: str) -> str:
     params.sort(key=lambda x: x[0])
 
     # Re-encode with proper AWS formatting
-    return urlencode(params, quote_via=quote, safe="")
+    # RFC 3986 unreserved characters: -_.~
+    return urlencode(params, quote_via=quote, safe="-_.~")
