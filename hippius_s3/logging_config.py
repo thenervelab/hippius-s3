@@ -13,32 +13,17 @@ class LoggingConfig(Protocol):
     environment: str
 
 
-def _ray_id_log_record_factory(
-    name: str,
-    level: int,
-    fn: str,
-    lno: int,
-    msg: str,
-    args: tuple,
-    exc_info: tuple | None,
-    func: str | None = None,
-    sinfo: str | None = None,
-    **kwargs: object,
-) -> logging.LogRecord:
-    """Custom LogRecord factory that ensures ray_id is always present.
+class RayIDFilter(logging.Filter):
+    """Logging filter that ensures ray_id is always present in log records.
 
-    If ray_id is not in the record's extra data, defaults to 'no-ray-id'.
+    If ray_id is not in the record, defaults to 'no-ray-id'.
     This ensures the log format string never fails even when ray_id is missing.
     """
-    record = logging.LogRecord(name, level, fn, lno, msg, args, exc_info, func, sinfo)
 
-    if kwargs:
-        record.__dict__.update(kwargs)
-
-    if not hasattr(record, "ray_id"):
-        record.ray_id = "no-ray-id"
-
-    return record
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "ray_id"):
+            record.ray_id = "no-ray-id"
+        return True
 
 
 def setup_loki_logging(config: LoggingConfig, service_name: str) -> logging.Logger:
@@ -53,6 +38,8 @@ def setup_loki_logging(config: LoggingConfig, service_name: str) -> logging.Logg
         Configured logger instance
     """
     log_level = getattr(logging, config.log_level.upper(), logging.INFO)
+
+    ray_id_filter = RayIDFilter()
 
     handlers = [logging.StreamHandler(sys.stdout)]
 
@@ -69,7 +56,8 @@ def setup_loki_logging(config: LoggingConfig, service_name: str) -> logging.Logg
         )
         handlers.append(loki_handler)
 
-    logging.setLogRecordFactory(_ray_id_log_record_factory)
+    for handler in handlers:
+        handler.addFilter(ray_id_filter)
 
     logging.basicConfig(
         level=log_level,

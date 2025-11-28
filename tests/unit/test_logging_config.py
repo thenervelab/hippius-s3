@@ -3,7 +3,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from hippius_s3.logging_config import _ray_id_log_record_factory
+from hippius_s3.logging_config import RayIDFilter
 from hippius_s3.logging_config import setup_loki_logging
 
 
@@ -17,59 +17,8 @@ def mock_config():
     return config
 
 
-def test_ray_id_log_record_factory_with_ray_id():
-    record = _ray_id_log_record_factory(
-        name="test",
-        level=logging.INFO,
-        fn="test.py",
-        lno=10,
-        msg="Test message",
-        args=(),
-        exc_info=None,
-        ray_id="a1b2c3d4e5f67890",
-    )
-
-    assert record.ray_id == "a1b2c3d4e5f67890"
-    assert record.name == "test"
-    assert record.msg == "Test message"
-
-
-def test_ray_id_log_record_factory_without_ray_id():
-    record = _ray_id_log_record_factory(
-        name="test",
-        level=logging.INFO,
-        fn="test.py",
-        lno=10,
-        msg="Test message",
-        args=(),
-        exc_info=None,
-    )
-
-    assert record.ray_id == "no-ray-id"
-    assert record.name == "test"
-    assert record.msg == "Test message"
-
-
-def test_ray_id_log_record_factory_preserves_other_kwargs():
-    record = _ray_id_log_record_factory(
-        name="test",
-        level=logging.INFO,
-        fn="test.py",
-        lno=10,
-        msg="Test message",
-        args=(),
-        exc_info=None,
-        ray_id="a1b2c3d4e5f67890",
-        custom_field="custom_value",
-    )
-
-    assert record.ray_id == "a1b2c3d4e5f67890"
-    assert record.custom_field == "custom_value"
-
-
-def test_setup_loki_logging_sets_ray_id_factory(mock_config):
-    logger = setup_loki_logging(mock_config, "test_service")
-
+def test_ray_id_filter_adds_ray_id_when_missing():
+    ray_filter = RayIDFilter()
     record = logging.LogRecord(
         name="test",
         level=logging.INFO,
@@ -80,30 +29,97 @@ def test_setup_loki_logging_sets_ray_id_factory(mock_config):
         exc_info=None,
     )
 
-    factory = logging.getLogRecordFactory()
-    new_record = factory(
+    result = ray_filter.filter(record)
+
+    assert result is True
+    assert hasattr(record, "ray_id")
+    assert record.ray_id == "no-ray-id"
+
+
+def test_ray_id_filter_preserves_existing_ray_id():
+    ray_filter = RayIDFilter()
+    record = logging.LogRecord(
         name="test",
         level=logging.INFO,
-        fn="test.py",
-        lno=10,
+        pathname="test.py",
+        lineno=10,
+        msg="Test message",
+        args=(),
+        exc_info=None,
+    )
+    record.ray_id = "a1b2c3d4e5f67890"
+
+    result = ray_filter.filter(record)
+
+    assert result is True
+    assert record.ray_id == "a1b2c3d4e5f67890"
+
+
+def test_ray_id_filter_returns_true():
+    ray_filter = RayIDFilter()
+    record = logging.LogRecord(
+        name="test",
+        level=logging.INFO,
+        pathname="test.py",
+        lineno=10,
         msg="Test message",
         args=(),
         exc_info=None,
     )
 
-    assert hasattr(new_record, "ray_id")
-    assert new_record.ray_id == "no-ray-id"
+    result = ray_filter.filter(record)
+
+    assert result is True
 
 
-def test_setup_loki_logging_log_format_includes_ray_id(mock_config, caplog):
-    logger = setup_loki_logging(mock_config, "test_service")
+def test_ray_id_filter_works_with_logger():
+    logger = logging.getLogger("test_filter_logger")
     logger.setLevel(logging.INFO)
 
-    with caplog.at_level(logging.INFO):
-        logger.info("Test message with ray_id")
+    handler = logging.StreamHandler()
+    handler.addFilter(RayIDFilter())
+    logger.addHandler(handler)
 
-    assert len(caplog.records) == 1
-    assert hasattr(caplog.records[0], "ray_id")
+    log_records = []
+
+    class RecordCapture(logging.Handler):
+        def emit(self, record):
+            log_records.append(record)
+
+    capture_handler = RecordCapture()
+    capture_handler.addFilter(RayIDFilter())
+    logger.addHandler(capture_handler)
+
+    logger.info("Test message")
+
+    assert len(log_records) == 1
+    assert hasattr(log_records[0], "ray_id")
+    assert log_records[0].ray_id == "no-ray-id"
+
+    logger.handlers.clear()
+
+
+def test_ray_id_filter_works_with_extra():
+    logger = logging.getLogger("test_filter_extra_logger")
+    logger.setLevel(logging.INFO)
+
+    log_records = []
+
+    class RecordCapture(logging.Handler):
+        def emit(self, record):
+            log_records.append(record)
+
+    capture_handler = RecordCapture()
+    capture_handler.addFilter(RayIDFilter())
+    logger.addHandler(capture_handler)
+
+    logger.info("Test message", extra={"ray_id": "a1b2c3d4e5f67890"})
+
+    assert len(log_records) == 1
+    assert hasattr(log_records[0], "ray_id")
+    assert log_records[0].ray_id == "a1b2c3d4e5f67890"
+
+    logger.handlers.clear()
 
 
 def test_setup_loki_logging_returns_logger(mock_config):

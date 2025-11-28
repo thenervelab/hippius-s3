@@ -35,13 +35,12 @@ class RayIDLoggerAdapter(logging.LoggerAdapter):
     def process(self, msg: str, kwargs: MutableMapping[str, Any]) -> tuple[str, MutableMapping[str, Any]]:
         """Process the logging message and kwargs.
 
-        Ensures the ray_id from extra is always present in kwargs.
+        Adds ray_id to the extra dict so it appears in log records.
+        The RayIDFilter will ensure ray_id is present even if not added here.
         """
         if "extra" not in kwargs:
             kwargs["extra"] = {}
-        ray_id = self.extra.get("ray_id", "no-ray-id") if self.extra else "no-ray-id"
-        if isinstance(kwargs["extra"], dict):
-            kwargs["extra"]["ray_id"] = ray_id
+        kwargs["extra"]["ray_id"] = self.extra.get("ray_id", "no-ray-id") if self.extra else "no-ray-id"
         return msg, kwargs
 
 
