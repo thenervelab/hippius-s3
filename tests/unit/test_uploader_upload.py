@@ -19,7 +19,6 @@ def mock_config():
     config.uploader_multipart_max_concurrency = 5
     config.cache_ttl_seconds = 1800
     config.object_cache_dir = "/tmp/test_cache"
-    config.publish_to_chain = False
     return config
 
 
@@ -306,7 +305,6 @@ async def test_upload_stores_api_file_id_in_database(mock_config, mock_db_pool, 
 @pytest.mark.asyncio
 async def test_process_upload_no_longer_calls_pin_on_api(mock_config, mock_db_pool):
     redis = FakeRedis()
-    mock_config.publish_to_chain = True
 
     uploader = Uploader(mock_db_pool, redis, mock_config)
 
