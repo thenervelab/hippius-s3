@@ -12,7 +12,6 @@ from fastapi import Response
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 
-from hippius_s3.api.middlewares.audit_log import audit_log_middleware
 from hippius_s3.api.middlewares.ip_whitelist import ip_whitelist_middleware
 from hippius_s3.api.middlewares.metrics import metrics_middleware
 from hippius_s3.api.middlewares.parse_internal_headers import parse_internal_headers_middleware
@@ -208,9 +207,9 @@ def factory() -> FastAPI:
     # Custom middlewares - middleware("http") executes in REVERSE order
     # Backend now relies on gateway for authentication/authorization
     # All middleware here assume X-Hippius-* headers are already set by gateway
+    # Audit logging has been moved to gateway (which sees real client IPs)
     app.middleware("http")(metrics_middleware)
     app.middleware("http")(tracing_middleware)
-    app.middleware("http")(audit_log_middleware)
     app.middleware("http")(parse_internal_headers_middleware)
     app.middleware("http")(ip_whitelist_middleware)
     if config.enable_request_profiling:

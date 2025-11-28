@@ -29,6 +29,9 @@ class GatewayConfig:
     enable_banhammer: bool = dataclasses.field(
         default_factory=lambda: os.getenv("ENABLE_BANHAMMER", "false").lower() == "true"
     )
+    enable_audit_logging: bool = dataclasses.field(
+        default_factory=lambda: os.getenv("ENABLE_AUDIT_LOGGING", "true").lower() == "true"
+    )
     bypass_credit_check: bool = dataclasses.field(
         default_factory=lambda: os.getenv("HIPPIUS_BYPASS_CREDIT_CHECK", "false").lower() == "true"
     )
