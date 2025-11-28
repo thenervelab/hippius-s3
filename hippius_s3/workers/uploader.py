@@ -114,6 +114,7 @@ class Uploader:
             chunks=payload.chunks,
             upload_id=payload.upload_id,
             object_version=int(payload.object_version or 1),
+            account_ss58=payload.address,
         )
         chunk_duration = time.time() - chunk_start
 
@@ -122,6 +123,7 @@ class Uploader:
             object_id=payload.object_id,
             object_key=payload.object_key,
             object_version=int(payload.object_version or 1),
+            account_ss58=payload.address,
         )
         manifest_duration = time.time() - manifest_start
 
@@ -166,6 +168,7 @@ class Uploader:
         chunks: List[Chunk],
         upload_id: Optional[str],
         object_version: int,
+        account_ss58: str,
     ) -> List[str]:
         logger.debug(f"Uploading {len(chunks)} chunks for object_id={object_id}")
 
@@ -180,6 +183,7 @@ class Uploader:
                     chunk=chunk,
                     upload_id=upload_id,
                     object_version=int(object_version),
+                    account_ss58=account_ss58,
                 )
 
         chunks_sorted = sorted(chunks, key=lambda c: c.id)
@@ -213,6 +217,7 @@ class Uploader:
         chunk: Chunk,
         upload_id: Optional[str],
         object_version: int,
+        account_ss58: str,
     ) -> ChunkUploadResult:
         part_number = int(chunk.id)
         logger.debug(f"Uploading chunk object_id={object_id} part={part_number}")
@@ -280,16 +285,15 @@ class Uploader:
                         file_data=bytes(piece),
                         file_name=f"s3-{mangled_file_name}",
                         content_type="application/octet-stream",
+                        account_ss58=account_ss58,
                     )
                 piece_cid = str(chunk_upload_result.cid)
                 piece_file_id = str(chunk_upload_result.id)
                 all_chunk_cids.append(piece_cid)
 
-                async with HippiusApiClient() as api_client:
-                    status_result = await api_client.get_file_status(piece_file_id)
                 logger.info(
                     f"Uploaded chunk: object_id={object_id} part={part_number} chunk={ci} "
-                    f"file_id={piece_file_id} cid={piece_cid} status={status_result.status}"
+                    f"file_id={piece_file_id} cid={piece_cid} status={chunk_upload_result.status}"
                 )
 
                 if part_chunk_size > 0 and part_plain_size > 0 and num_chunks_meta > 0:
@@ -343,6 +347,7 @@ class Uploader:
         object_id: str,
         object_key: str,
         object_version: int,
+        account_ss58: str,
     ) -> dict:
         async with self._acquire_conn() as conn:
             logger.debug(f"Building manifest for object_id={object_id}")
@@ -401,6 +406,7 @@ class Uploader:
                     file_data=manifest_json.encode(),
                     file_name=f"s3-{mangled_file_name}",
                     content_type="application/json",
+                    account_ss58=account_ss58,
                 )
             if not manifest_upload_result.cid:
                 raise ValueError("manifest_publish_missing_cid")
@@ -408,11 +414,9 @@ class Uploader:
             manifest_cid = str(manifest_upload_result.cid)
             manifest_file_id = str(manifest_upload_result.id)
 
-            async with HippiusApiClient() as api_client:
-                status_result = await api_client.get_file_status(manifest_file_id)
             logger.info(
                 f"Uploaded manifest: object_id={object_id} file_id={manifest_file_id} "
-                f"cid={manifest_cid} status={status_result.status}"
+                f"cid={manifest_cid} status={manifest_upload_result.status}"
             )
 
             cid_row = await conn.fetchrow(get_query("upsert_cid"), manifest_cid)

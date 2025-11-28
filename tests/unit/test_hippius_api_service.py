@@ -33,7 +33,10 @@ async def test_upload_file_and_get_cid_success():
         mock_post.return_value = mock_response
 
         result = await client.upload_file_and_get_cid(
-            file_data=b"test data", file_name="test.bin", content_type="application/octet-stream"
+            file_data=b"test data",
+            file_name="test.bin",
+            content_type="application/octet-stream",
+            account_ss58="5FakeTestAccountAddress123456789012345678901234",
         )
 
         assert isinstance(result, UploadResponse)
@@ -73,7 +76,10 @@ async def test_upload_file_and_get_cid_multipart_format():
 
         file_data = b"test file contents"
         await client.upload_file_and_get_cid(
-            file_data=file_data, file_name="test.bin", content_type="application/octet-stream"
+            file_data=file_data,
+            file_name="test.bin",
+            content_type="application/octet-stream",
+            account_ss58="5FakeTestAccountAddress123456789012345678901234",
         )
 
         call_args = mock_post.call_args
@@ -117,7 +123,10 @@ async def test_upload_file_and_get_cid_retry_on_failure():
         mock_post.side_effect = [mock_response_fail, mock_response_success]
 
         result = await client.upload_file_and_get_cid(
-            file_data=b"test data", file_name="test.bin", content_type="application/octet-stream"
+            file_data=b"test data",
+            file_name="test.bin",
+            content_type="application/octet-stream",
+            account_ss58="5FakeTestAccountAddress123456789012345678901234",
         )
 
         assert result.cid == "QmTest123"
@@ -195,7 +204,10 @@ async def test_upload_file_encrypted_data():
 
         encrypted_data = b"\x00\x01\x02\x03\x04\x05" * 100
         result = await client.upload_file_and_get_cid(
-            file_data=encrypted_data, file_name="encrypted.bin", content_type="application/octet-stream"
+            file_data=encrypted_data,
+            file_name="encrypted.bin",
+            content_type="application/octet-stream",
+            account_ss58="5FakeTestAccountAddress123456789012345678901234",
         )
 
         assert result.cid == "QmEncrypted123"
@@ -225,7 +237,10 @@ async def test_upload_file_manifest_json():
 
         manifest_data = b'{"object_id":"123","parts":[]}'
         result = await client.upload_file_and_get_cid(
-            file_data=manifest_data, file_name="test.manifest", content_type="application/json"
+            file_data=manifest_data,
+            file_name="test.manifest",
+            content_type="application/json",
+            account_ss58="5FakeTestAccountAddress123456789012345678901234",
         )
 
         assert result.cid == "QmManifest456"
