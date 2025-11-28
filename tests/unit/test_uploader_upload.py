@@ -19,7 +19,6 @@ def mock_config():
     config.uploader_multipart_max_concurrency = 5
     config.cache_ttl_seconds = 1800
     config.object_cache_dir = "/tmp/test_cache"
-    config.publish_to_chain = False
     return config
 
 

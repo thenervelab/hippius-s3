@@ -55,7 +55,6 @@ Create a `.env` file with these critical variables:
 **Blockchain**
 - `HIPPIUS_SUBSTRATE_URL` - Blockchain RPC URL (wss://rpc.hippius.network)
 - `HIPPIUS_VALIDATOR_REGION` - Validator region identifier
-- `RESUBMISSION_SEED_PHRASE` - 12-word seed phrase for blockchain resubmissions
 
 **Note**: See `.env.example` for all configuration options and `.env.defaults` for feature flags.
 

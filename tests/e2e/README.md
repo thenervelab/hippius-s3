@@ -4,15 +4,12 @@ This directory contains end-to-end tests that verify the full Hippius S3 pipelin
 
 ## Current Setup (with bypass flags)
 
-The tests currently use environment variable bypasses to skip credit checks and blockchain publishing:
+The tests currently use environment variable bypasses to skip credit checks:
 
 - `HIPPIUS_BYPASS_CREDIT_CHECK=true` - Skips credit verification for write operations
-- `PUBLISH_TO_CHAIN=false` - Disables blockchain publishing for faster e2e runs
 
 These bypasses allow tests to run without:
 
-- A funded blockchain account
-- Chain connectivity
 - Credit verification
 
 **Note**: Multipart uploads are not currently bypassed and still require full blockchain publishing. The current tests focus on single-file operations only.
@@ -50,28 +47,15 @@ To make the tests truly end-to-end, you need to:
 
 ### 1. Remove Environment Bypasses
 
-Remove these from `docker-compose.e2e.yml` (they are set under the `api`, `uploader`, `substrate`, and `unpinner` services):
+Remove these from `docker-compose.e2e.yml` (set under the `api` service):
 
 ```yaml
 # In docker-compose.e2e.yml
 services:
   api:
     environment:
-      # delete these lines
+      # delete this line
       - HIPPIUS_BYPASS_CREDIT_CHECK=true
-      - PUBLISH_TO_CHAIN=false
-  uploader:
-    environment:
-      # delete this line
-      - PUBLISH_TO_CHAIN=false
-  substrate:
-    environment:
-      # delete this line
-      - PUBLISH_TO_CHAIN=false
-  unpinner:
-    environment:
-      # delete this line
-      - PUBLISH_TO_CHAIN=false
 ```
 
 ### 2. Remove Bypass Code from Source
