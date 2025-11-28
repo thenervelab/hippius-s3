@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import random
@@ -272,9 +273,12 @@ class Uploader:
                 if not isinstance(piece, (bytes, bytearray)):
                     raise RuntimeError("missing_cipher_chunk")
                 async with HippiusApiClient() as api_client:
+                    mangled_file_name = f"{object_id}.part{part_number}.chunk{ci}"
+                    mangled_file_name = hashlib.md5(mangled_file_name.encode()).hexdigest()
+
                     chunk_upload_result = await api_client.upload_file_and_get_cid(
                         file_data=bytes(piece),
-                        file_name=f"{object_key}.part{part_number}.chunk{ci}",
+                        file_name=f"s3-{mangled_file_name}",
                         content_type="application/octet-stream",
                     )
                 piece_cid = str(chunk_upload_result.cid)
@@ -390,9 +394,12 @@ class Uploader:
             logger.debug(f"Manifest built with {len(parts_data)} parts for object_id={object_id}")
 
             async with HippiusApiClient() as api_client:
+                mangled_file_name = f"{object_id}.manifest"
+                mangled_file_name = hashlib.md5(mangled_file_name.encode()).hexdigest()
+
                 manifest_upload_result = await api_client.upload_file_and_get_cid(
                     file_data=manifest_json.encode(),
-                    file_name=f"{object_key}.manifest",
+                    file_name=f"s3-{mangled_file_name}",
                     content_type="application/json",
                 )
             if not manifest_upload_result.cid:
