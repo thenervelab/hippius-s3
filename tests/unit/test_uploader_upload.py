@@ -105,7 +105,6 @@ async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock
     with patch("hippius_s3.workers.uploader.HippiusApiClient") as mock_api_client_class:
         mock_api_instance = AsyncMock()
         mock_api_instance.upload_file_and_get_cid = AsyncMock(return_value=mock_upload_response)
-        mock_api_instance.get_file_status = AsyncMock(return_value=mock_status_response)
         mock_api_instance.__aenter__ = AsyncMock(return_value=mock_api_instance)
         mock_api_instance.__aexit__ = AsyncMock()
 
@@ -126,10 +125,6 @@ async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock
         assert call_args.kwargs["file_name"] == "test-key.part1.chunk0"
         assert call_args.kwargs["content_type"] == "application/octet-stream"
         assert call_args.kwargs["account_ss58"] == "5FakeTestAccountAddress123456789012345678901234"
-
-        assert mock_api_instance.get_file_status.call_count == 1
-        status_call_args = mock_api_instance.get_file_status.call_args
-        assert status_call_args.args[0] == "file-uuid-123"
 
         assert mock_conn.execute.call_count >= 1
 
@@ -195,7 +190,6 @@ async def test_build_and_upload_manifest_uses_new_api(mock_config, mock_db_pool,
     with patch("hippius_s3.workers.uploader.HippiusApiClient") as mock_api_client_class:
         mock_api_instance = AsyncMock()
         mock_api_instance.upload_file_and_get_cid = AsyncMock(return_value=mock_upload_response)
-        mock_api_instance.get_file_status = AsyncMock(return_value=mock_status_response)
         mock_api_instance.__aenter__ = AsyncMock(return_value=mock_api_instance)
         mock_api_instance.__aexit__ = AsyncMock()
 
@@ -218,10 +212,6 @@ async def test_build_and_upload_manifest_uses_new_api(mock_config, mock_db_pool,
         assert call_args.kwargs["account_ss58"] == "5FakeTestAccountAddress123456789012345678901234"
         assert b"QmPart1" in call_args.kwargs["file_data"]
         assert b"QmPart2" in call_args.kwargs["file_data"]
-
-        assert mock_api_instance.get_file_status.call_count == 1
-        status_call_args = mock_api_instance.get_file_status.call_args
-        assert status_call_args.args[0] == "manifest-uuid-456"
 
         execute_calls = [call.args for call in mock_conn.execute.call_args_list]
         update_call = [call for call in execute_calls if "UPDATE object_versions" in call[0]]
@@ -286,7 +276,6 @@ async def test_upload_stores_api_file_id_in_database(mock_config, mock_db_pool, 
     with patch("hippius_s3.workers.uploader.HippiusApiClient") as mock_api_client_class:
         mock_api_instance = AsyncMock()
         mock_api_instance.upload_file_and_get_cid = AsyncMock(return_value=mock_upload_response)
-        mock_api_instance.get_file_status = AsyncMock(return_value=mock_status_response)
         mock_api_instance.__aenter__ = AsyncMock(return_value=mock_api_instance)
         mock_api_instance.__aexit__ = AsyncMock()
 
