@@ -112,7 +112,12 @@ async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock
         mock_api_client_class.return_value = mock_api_instance
 
         result = await uploader._upload_single_chunk(
-            object_id="obj-123", object_key="test-key", chunk=Chunk(id=1), upload_id="upload-123", object_version=1
+            object_id="obj-123",
+            object_key="test-key",
+            chunk=Chunk(id=1),
+            upload_id="upload-123",
+            object_version=1,
+            account_ss58="5FakeTestAccountAddress123456789012345678901234",
         )
 
         assert mock_api_instance.upload_file_and_get_cid.call_count == 1
@@ -120,6 +125,7 @@ async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock
         assert call_args.kwargs["file_data"] == b"encrypted_chunk_data_123"
         assert call_args.kwargs["file_name"] == "test-key.part1.chunk0"
         assert call_args.kwargs["content_type"] == "application/octet-stream"
+        assert call_args.kwargs["account_ss58"] == "5FakeTestAccountAddress123456789012345678901234"
 
         assert mock_api_instance.get_file_status.call_count == 1
         status_call_args = mock_api_instance.get_file_status.call_args
@@ -196,7 +202,10 @@ async def test_build_and_upload_manifest_uses_new_api(mock_config, mock_db_pool,
         mock_api_client_class.return_value = mock_api_instance
 
         result = await uploader._build_and_upload_manifest(
-            object_id="obj-123", object_key="test-key", object_version=1
+            object_id="obj-123",
+            object_key="test-key",
+            object_version=1,
+            account_ss58="5FakeTestAccountAddress123456789012345678901234",
         )
 
         assert result["manifest_cid"] == "QmManifest456"
@@ -206,6 +215,7 @@ async def test_build_and_upload_manifest_uses_new_api(mock_config, mock_db_pool,
         call_args = mock_api_instance.upload_file_and_get_cid.call_args
         assert call_args.kwargs["file_name"] == "test-key.manifest"
         assert call_args.kwargs["content_type"] == "application/json"
+        assert call_args.kwargs["account_ss58"] == "5FakeTestAccountAddress123456789012345678901234"
         assert b"QmPart1" in call_args.kwargs["file_data"]
         assert b"QmPart2" in call_args.kwargs["file_data"]
 
@@ -291,6 +301,7 @@ async def test_upload_stores_api_file_id_in_database(mock_config, mock_db_pool, 
                 chunk=Chunk(id=1),
                 upload_id="upload-123",
                 object_version=1,
+                account_ss58="5FakeTestAccountAddress123456789012345678901234",
             )
 
             execute_calls = mock_conn.execute.call_args_list

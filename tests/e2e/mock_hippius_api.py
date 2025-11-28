@@ -55,7 +55,7 @@ file_storage = {}
 
 
 @app.post("/storage-control/upload/", response_model=UploadResponse)
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(file: UploadFile = File(...), account_ss58: str = None):
     content = await file.read()
     file_id = str(uuid.uuid4())
     size_bytes = len(content)

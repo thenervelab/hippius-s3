@@ -149,7 +149,16 @@ def retry_on_error(
                     # Log retry attempt with response body and function arguments
                     func_name = func.__name__
                     args_repr = f"args={args}" if args else ""
-                    kwargs_repr = f"kwargs={kwargs}" if kwargs else ""
+
+                    # Filter out large binary data from kwargs to avoid log spam
+                    filtered_kwargs = {}
+                    for k, v in kwargs.items():
+                        if k == "file_data" and isinstance(v, bytes):
+                            filtered_kwargs[k] = f"<{len(v)} bytes>"
+                        else:
+                            filtered_kwargs[k] = v
+
+                    kwargs_repr = f"kwargs={filtered_kwargs}" if kwargs else ""
                     args_str = ", ".join(filter(None, [args_repr, kwargs_repr]))
 
                     error_msg = f"Request failed (attempt {attempt + 1}/{retries + 1}): {e}"
@@ -339,6 +348,7 @@ class HippiusApiClient:
         file_data: bytes,
         file_name: str,
         content_type: str,
+        account_ss58: str,
     ) -> UploadResponse:
         """
         Upload file directly to api.hippius.com storage endpoint.
@@ -349,6 +359,7 @@ class HippiusApiClient:
             file_data: Binary file data to upload
             file_name: Original filename
             content_type: MIME type of the file
+            account_ss58: Account SS58 address
 
         Returns:
             UploadResponse: Response with file_id, CID, and metadata
@@ -357,7 +368,14 @@ class HippiusApiClient:
             HippiusAPIError: If the API request fails
         """
 
-        files = {"file": (file_name, io.BytesIO(file_data), content_type)}
+        files = {
+            "file": (
+                file_name,
+                io.BytesIO(file_data),
+                content_type,
+            ),
+        }
+        data = {"account_ss58": account_ss58}
 
         headers = self._get_headers()
         del headers["Content-Type"]
@@ -365,6 +383,7 @@ class HippiusApiClient:
         response = await self._client.post(
             "/storage-control/upload/",
             files=files,
+            data=data,
             headers=headers,
         )
 
