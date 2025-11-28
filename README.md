@@ -4,120 +4,129 @@ A high-performance S3-compatible gateway for Hippius' decentralized IPFS storage
 
 ## Overview
 
-Hippius S3 is a production-ready S3-compatible API that stores data on IPFS while automatically publishing to the Hippius blockchain marketplace. It provides standard S3 operations with HMAC-based authentication, comprehensive middleware stack, and seamless integration with existing S3 clients.
+Hippius S3 is a production-ready S3-compatible API that stores data on IPFS while automatically publishing to the Hippius blockchain. It provides standard S3 operations with HMAC-based authentication and seamless integration with existing S3 clients (AWS CLI, boto3, MinIO).
 
 ## Features
 
-### ✅ Core S3 Operations
+**Core S3 Operations**: Bucket management, object operations, multipart uploads, metadata, tagging, ACLs, lifecycle policies
 
-- **Bucket Management**: Create, list, delete, and check bucket existence
-- **Object Operations**: Upload, download, list, delete, and copy objects
-- **Multipart Uploads**: Complete support for large file uploads with part assembly
-- **Metadata**: Custom metadata support with x-amz-meta-\* headers
-- **Tagging**: Bucket and object tagging with full CRUD operations
+**Security**: HMAC authentication, rate limiting, IP-based protection, input validation, account credit verification
 
-### ✅ Security & Authentication
+**Blockchain Integration**: Automatic IPFS storage and blockchain publishing with transaction tracking
 
-- **HMAC Authentication**: Full HMAC signature verification with seed phrase credentials
-- **Frontend/Backend HMAC**: Separate HMAC verification for different endpoints
-- **Account Credits**: Automatic credit verification for all operations
-- **Rate Limiting**: Configurable per-user rate limiting with Redis backend
-- **IP-based Banning**: BanHammer service for IP-based protection
-- **Input Validation**: AWS S3 compliance validation middleware
+**Production Ready**: Audit logging, health checks, multi-tenant support, CORS, performance profiling
 
-### ✅ Blockchain Integration
+**S3 Client Compatibility**: AWS CLI, MinIO Client, boto3, s3cmd
 
-- **IPFS Storage**: Automatic file storage and pinning via Hippius SDK
-- **Blockchain Publishing**: Files automatically published to Hippius marketplace
-- **Transaction Tracking**: Blockchain transaction hashes stored in metadata
-- **Decentralized Access**: Files remain accessible via IPFS network
-
-### ✅ Production Features
-
-- **Audit Logging**: Comprehensive audit trails for all operations
-- **Performance Profiling**: Optional request profiling with Speedscope integration
-- **Multi-tenant**: User-scoped buckets with isolated storage
-- **Health Checks**: Built-in health checking for all dependencies
-- **CORS Support**: Configurable cross-origin request handling
-
-### ✅ S3 Client Compatibility
-
-Works with standard S3 clients including:
-
-- AWS CLI
-- MinIO Client (minio-py)
-- boto3
-- s3cmd
-
-## Getting Started
-
-### Prerequisites
+## Prerequisites
 
 - Docker and Docker Compose
 - Python 3.10+ (for local development)
 
-### Quick Start with Docker
-
-1. **Clone the repository**:
-
-   ```bash
-   git clone <repository-url>
-   cd hippius-s3
-   ```
-
-2. **Create environment configuration**:
-
-   ```bash
-   cp .env.example .env
-   # Edit .env with your specific values (database URL, HMAC secret, etc.)
-   ```
-
-3. **Start all services**:
-
-   ```bash
-   docker compose up -d
-   ```
-
-   Note: Database migrations and keystore setup run automatically on container startup (via `hippius_s3.scripts.migrate`).
-
-4. **(Optional) Start with production compose**:
-   ```bash
-   docker compose -f docker-compose.prod.yml up -d
-   ```
-
-## Configuration
-
-### Environment File Hierarchy
-
-The project uses a layered environment configuration approach with multiple env files:
-
-- **`.env.defaults`** - Base configuration shared across all environments
-  - Feature flags (ENABLE_AUDIT_LOGGING, PUBLISH_TO_CHAIN, etc.)
-  - Worker configuration (retry limits, batch sizes, timeouts)
-  - Security limits (rate limits, request sizes, S3 limits)
-
-- **`.env`** - Production/development overrides and connection strings
-  - Database URLs with production credentials
-  - Redis connection strings for Docker services
-  - IPFS endpoints
-  - Secrets (HMAC keys, seed phrases)
-
-- **`.env.test-local`** - Localhost connection strings for pytest
-  - Used by integration tests running on host machine
-  - Points to localhost:5432, localhost:6379, etc.
-
-- **`.env.test-docker`** - Docker connection (service names) for E2E test containers
-  - Used by E2E tests running in docker-compose
-  - Points to db:5432, redis:6379, etc.
-
-**Loading order:**
-- Main stack: `.env.defaults` → `.env` (production/dev)
-- E2E stack: `.env.defaults` → `.env.test-docker` (containers)
-- Pytest tests: `.env.defaults` → `.env.test-local` (host)
+## Requirements
 
 ### Required Environment Variables
 
-Create a `.env` file with the required variables. See [`.env.example`](.env.example) for all configuration options and their descriptions.
+Create a `.env` file with these critical variables:
+
+**Environment**
+- `ENVIRONMENT` - Deployment environment (test/dev/staging/production)
+
+**Database**
+- `DATABASE_URL` - PostgreSQL connection string
+- `HIPPIUS_KEYSTORE_DATABASE_URL` - PostgreSQL for encryption keys (falls back to DATABASE_URL)
+
+**Redis (5 separate instances required)**
+- `REDIS_URL` - General cache and temp data
+- `REDIS_ACCOUNTS_URL` - Account credit cache (persistent)
+- `REDIS_CHAIN_URL` - Blockchain operation cache (persistent)
+- `REDIS_QUEUES_URL` - Work queues for async workers
+- `REDIS_RATE_LIMITING_URL` - Rate limit counters
+
+**IPFS**
+- `HIPPIUS_IPFS_GET_URL` - IPFS gateway for reads (e.g., http://ipfs:8080)
+- `HIPPIUS_IPFS_STORE_URL` - IPFS API for writes (e.g., http://ipfs:5001)
+
+**Authentication & Security**
+- `HIPPIUS_SERVICE_KEY` - API key for Hippius service (64 char hex string)
+- `HIPPIUS_AUTH_ENCRYPTION_KEY` - Encryption key for auth (64 char hex string)
+- `FRONTEND_HMAC_SECRET` - HMAC secret for frontend endpoints
+
+**Blockchain**
+- `HIPPIUS_SUBSTRATE_URL` - Blockchain RPC URL (wss://rpc.hippius.network)
+- `HIPPIUS_VALIDATOR_REGION` - Validator region identifier
+- `RESUBMISSION_SEED_PHRASE` - 12-word seed phrase for blockchain resubmissions
+
+**Note**: See `.env.example` for all configuration options and `.env.defaults` for feature flags.
+
+## Quick Start
+
+### Setup
+
+```bash
+# Create Docker network
+docker network create hippius_net
+
+# Copy and configure environment
+cp .env.example .env
+# Edit .env with required variables (see Requirements section above)
+```
+
+### Docker Compose Files
+
+The project includes multiple compose files for different environments:
+
+**docker-compose.yml** - Base configuration
+- Core services: API, gateway, PostgreSQL, IPFS, 5 Redis instances
+- Workers: uploader, downloader, unpinner, janitor, account-cacher
+- Use for local development
+
+**docker-compose.prod.yml** - Production overrides
+- Performance tuning (PostgreSQL, Redis optimizations)
+- Includes utilities (backup, health monitoring)
+
+**docker-compose.staging.yml** - Staging configuration
+- Minimal staging setup with utilities
+
+**docker-compose.e2e.yml** - E2E testing environment
+- Test-specific services (mock APIs, toxiproxy)
+- Bypass flags for faster tests
+
+**docker-compose.monitoring.yml** - Observability stack
+- Prometheus, Grafana, Loki, Tempo, OpenTelemetry
+- Add to any environment for full monitoring
+
+### Running the System
+
+**Development**
+```bash
+docker compose up -d
+docker compose logs -f api
+```
+
+**Production**
+```bash
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+```
+
+**Staging**
+```bash
+docker compose -f docker-compose.yml -f docker-compose.staging.yml up -d
+```
+
+**With Monitoring**
+```bash
+docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+```
+
+**E2E Testing**
+```bash
+COMPOSE_PROJECT_NAME=hippius-e2e docker compose -f docker-compose.yml -f docker-compose.e2e.yml up -d --wait
+pytest tests/e2e -v
+COMPOSE_PROJECT_NAME=hippius-e2e docker compose -f docker-compose.yml -f docker-compose.e2e.yml down -v
+```
+
+Database migrations run automatically on container startup via `hippius_s3.scripts.migrate`.
 
 ## Usage Examples
 
@@ -127,136 +136,134 @@ Create a `.env` file with the required variables. See [`.env.example`](.env.exam
 from minio import Minio
 import base64
 
-# Encode your seed phrase
 seed_phrase = "your twelve word seed phrase here"
 encoded_key = base64.b64encode(seed_phrase.encode('utf-8')).decode('utf-8')
 
-# Create client
 client = Minio(
-    "http://localhost:8000",
+    "http://localhost:8080",
     access_key=encoded_key,
     secret_key=seed_phrase,
     secure=False,
     region="decentralized"
 )
 
-# Upload with encryption
 client.put_object(
     "my-bucket",
-    "encrypted-file.txt",
+    "file.txt",
     data,
-    length,
-    metadata={"encrypted": "true"}
+    length
 )
 ```
 
 ### Using AWS CLI
 
 ```bash
-# Configure AWS CLI
 aws configure set aws_access_key_id "base64-encoded-seed-phrase"
 aws configure set aws_secret_access_key "your-seed-phrase"
 aws configure set default.region "decentralized"
 aws configure set default.s3.signature_version "s3v4"
 
-aws s3 mb s3://my-bucket/ --endpoint-url http://localhost:8000 --no-verify-ssl
-aws s3 cp file.txt s3://my-bucket/ --endpoint-url http://localhost:8000 --no-verify-ssl
+aws s3 mb s3://my-bucket/ --endpoint-url http://localhost:8080
+aws s3 cp file.txt s3://my-bucket/ --endpoint-url http://localhost:8080
 ```
-
-## API Reference
-
-The service implements S3-compatible endpoints:
-
-- `GET /` - List buckets
-- `PUT /{bucket}` - Create bucket
-- `DELETE /{bucket}` - Delete bucket
-- `PUT /{bucket}/{key}` - Upload object
-- `GET /{bucket}/{key}` - Download object
-- `DELETE /{bucket}/{key}` - Delete object
-- `POST /{bucket}/{key}?uploads` - Initiate multipart upload
-- `PUT /{bucket}/{key}?uploadId=X&partNumber=Y` - Upload part
-- `POST /{bucket}/{key}?uploadId=X` - Complete multipart upload
-
-All endpoints support standard S3 headers and return S3-compatible XML responses.
-
-### S3 Compatibility Matrix
-
-See the compatibility list of supported S3 features in [docs/s3-compatibility.md](docs/s3-compatibility.md).
-
-### S4 Extensions (Because Hippius is more than S3)
-
-See the features beyond the scope of S3 in [docs/s4.md](docs/s4.md).
 
 ## Architecture
 
 ```
-Client (MinIO/AWS CLI)
+Client (AWS CLI/MinIO/boto3)
     ↓ [HTTPS + AWS SigV4]
-HAProxy/Nginx
+Gateway (Auth + ACL + Rate Limiting)
     ↓ [HTTP]
 Hippius S3 API
-    ↓ [s3_publish()]
-Hippius SDK
-    ↓
+    ↓ [Background Workers]
 IPFS Network + Blockchain
 ```
 
 ### Project Structure
 
 - **`hippius_s3/`** - Main API application with S3-compatible endpoints
-- **`workers/`** - Background workers for async operations ([see workers README](workers/README.md))
-- **`tests/`** - Test suites including end-to-end S3 client testing
-- **`docs/`** - Documentation and API reference
+- **`gateway/`** - Authentication and access control gateway
+- **`workers/`** - Background workers for async operations
+- **`tests/`** - Test suites (unit, integration, E2E, ACL)
+- **`docs/`** - Documentation and specifications
+- **`monitoring/`** - Observability stack configuration
+
+See [CLAUDE.md](CLAUDE.md) for detailed architecture documentation.
 
 ## Development
 
+### Local Development
+
 ```bash
-# Install development dependencies
+# Install dependencies
 pip install -e ".[dev]"
 
 # Run tests
-pytest
+pytest tests/unit -v
+pytest tests/integration -v
+pytest tests/e2e -v
 
-# Format code
+# Format and type check
 ruff format .
-
-# Type checking
+ruff check . --fix
 mypy hippius_s3
 ```
 
-### E2E testing
+### Configuration
 
-See `tests/e2e/README.md` for end-to-end test setup. The e2e configuration uses an override compose file to run with:
+The project uses layered environment configuration:
+- `.env.defaults` - Base configuration with feature flags
+- `.env` - Production/development overrides
+- `.env.test-local` - Local testing configuration
+- `.env.test-docker` - Docker E2E testing configuration
+
+See [CLAUDE.md](CLAUDE.md) for detailed configuration guide.
+
+### API Compatibility
+
+See [docs/s3-compatibility.md](docs/s3-compatibility.md) for S3 compatibility matrix.
+
+See [docs/s4.md](docs/s4.md) for S4 extensions (atomic append operations).
+
+## Monitoring
+
+### Enabling Monitoring
+
+To enable the full observability stack, add `docker-compose.monitoring.yml`:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.e2e.yml up -d
-pytest tests/e2e -v
-docker compose -f docker-compose.yml -f docker-compose.e2e.yml down -v
+docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
 ```
 
-Note: The e2e override may enable `HIPPIUS_BYPASS_CREDIT_CHECK=true` and `PUBLISH_TO_CHAIN=false` for faster runs without chain publishing.
+### What's Included
 
-### Benchmarking
+The monitoring stack provides comprehensive observability:
 
-Compare AWS UploadPartCopy vs Hippius S4 Append performance:
+- **Prometheus** (localhost:9090) - Metrics collection with 30-day retention
+- **Grafana** (localhost:3000) - Dashboards and visualization
+- **Loki** (localhost:3100) - Log aggregation with 31-day retention
+- **Tempo** (localhost:3200) - Distributed tracing with 1-hour retention
+- **OpenTelemetry Collector** (localhost:4317/4318) - OTLP receiver and processor
 
-```bash
-# AWS S3 Multipart Upload with UploadPartCopy
-python hippius_s3/scripts/benchmark_copy_vs_append.py \
-    --mode aws --bucket test-bucket --size-mib 100 --part-mib 5
+### Accessing Monitoring Tools
 
-# Hippius S4 Append operations
-python hippius_s3/scripts/benchmark_copy_vs_append.py \
-    --mode hippius --bucket test-bucket --size-mib 100 --part-mib 5 \
-    --endpoint-url http://localhost:8000
+**Grafana Dashboard** (Primary Interface)
+- URL: http://localhost:3000
+- Default credentials: `admin` / `admin`
+- Pre-configured datasources: Prometheus, Loki, Tempo
+- Pre-built dashboards:
+  - Hippius S3 Overview (API performance, request rates, error rates)
+  - S3 Workers (queue depths, processing rates, IPFS latency)
 
-# With CSV output and multiple runs
-python hippius_s3/scripts/benchmark_copy_vs_append.py \
-    --mode hippius --bucket test-bucket --size-mib 50 --part-mib 10 \
-    --repeats 5 --csv results.csv
-```
+**Prometheus**
+- URL: http://localhost:9090
+- Direct metrics querying and exploration
+- View scrape targets and health status
 
-The benchmark measures end-to-end latency and throughput for building objects via different copy/append mechanisms, with configurable concurrency and validation options.
+**Application Metrics**
+- API: http://localhost:8080/metrics
+- Direct Prometheus metrics endpoint
+
 
 ## License
 

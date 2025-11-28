@@ -8,7 +8,6 @@ from typing import Any
 from typing import List
 from typing import Optional
 
-from hippius_sdk.client import HippiusClient
 from pydantic import BaseModel
 
 from hippius_s3.cache import FileSystemPartsStore
@@ -73,10 +72,9 @@ def compute_backoff_ms(attempt: int, base_ms: int = 1000, max_ms: int = 30000) -
 
 
 class Uploader:
-    def __init__(self, db_pool: Any, ipfs_client: HippiusClient, redis_client: Any, config: Any):
+    def __init__(self, db_pool: Any, redis_client: Any, config: Any):
         # Support either a Pool (has acquire) or a single Connection
         self.db = db_pool
-        self.ipfs_client = ipfs_client
         self.redis_client = redis_client
         self.config = config
         self.obj_cache = RedisObjectPartsCache(redis_client)

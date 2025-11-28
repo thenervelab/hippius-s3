@@ -12,8 +12,6 @@ from pydantic import ValidationError
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from hippius_sdk.client import HippiusClient
-
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.monitoring import get_metrics_collector
@@ -50,13 +48,11 @@ async def run_uploader_loop():
     logger.info(f"Redis Queues URL: {config.redis_queues_url}")
     logger.info(f"Database pool created: {config.database_url}")
 
-    ipfs_client = HippiusClient(
-        ipfs_api_url=config.ipfs_store_url,
-        api_url=config.hippius_api_base_url,
-        encrypt_by_default=False,
+    uploader = Uploader(
+        db_pool,
+        redis_client,
+        config,
     )
-    logger.info(f"IPFS client initialized: {config.ipfs_store_url}")
-    uploader = Uploader(db_pool, ipfs_client, redis_client, config)
 
     while True:
         try:

@@ -51,9 +51,8 @@ def mock_fs_store():
 @pytest.mark.asyncio
 async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock_fs_store):
     redis = FakeRedis()
-    ipfs_client = MagicMock()
 
-    uploader = Uploader(mock_db_pool, ipfs_client, redis, mock_config)
+    uploader = Uploader(mock_db_pool, redis, mock_config)
     uploader.fs_store = mock_fs_store
 
     mock_upload_response = UploadResponse(
@@ -122,7 +121,7 @@ async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock
         assert mock_api_instance.upload_file_and_get_cid.call_count == 1
         call_args = mock_api_instance.upload_file_and_get_cid.call_args
         assert call_args.kwargs["file_data"] == b"encrypted_chunk_data_123"
-        assert call_args.kwargs["file_name"] == "test-key.part1.chunk0"
+        assert call_args.kwargs["file_name"].startswith("s3-")
         assert call_args.kwargs["content_type"] == "application/octet-stream"
         assert call_args.kwargs["account_ss58"] == "5FakeTestAccountAddress123456789012345678901234"
 
@@ -132,9 +131,8 @@ async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock
 @pytest.mark.asyncio
 async def test_build_and_upload_manifest_uses_new_api(mock_config, mock_db_pool, mock_fs_store):
     redis = FakeRedis()
-    ipfs_client = MagicMock()
 
-    uploader = Uploader(mock_db_pool, ipfs_client, redis, mock_config)
+    uploader = Uploader(mock_db_pool, redis, mock_config)
 
     mock_upload_response = UploadResponse(
         id="manifest-uuid-456",
@@ -207,7 +205,7 @@ async def test_build_and_upload_manifest_uses_new_api(mock_config, mock_db_pool,
 
         assert mock_api_instance.upload_file_and_get_cid.call_count == 1
         call_args = mock_api_instance.upload_file_and_get_cid.call_args
-        assert call_args.kwargs["file_name"] == "test-key.manifest"
+        assert call_args.kwargs["file_name"].startswith("s3-")
         assert call_args.kwargs["content_type"] == "application/json"
         assert call_args.kwargs["account_ss58"] == "5FakeTestAccountAddress123456789012345678901234"
         assert b"QmPart1" in call_args.kwargs["file_data"]
@@ -223,9 +221,8 @@ async def test_build_and_upload_manifest_uses_new_api(mock_config, mock_db_pool,
 @pytest.mark.asyncio
 async def test_upload_stores_api_file_id_in_database(mock_config, mock_db_pool, mock_fs_store):
     redis = FakeRedis()
-    ipfs_client = MagicMock()
 
-    uploader = Uploader(mock_db_pool, ipfs_client, redis, mock_config)
+    uploader = Uploader(mock_db_pool, redis, mock_config)
     uploader.fs_store = mock_fs_store
 
     mock_upload_response = UploadResponse(
@@ -309,10 +306,9 @@ async def test_upload_stores_api_file_id_in_database(mock_config, mock_db_pool, 
 @pytest.mark.asyncio
 async def test_process_upload_no_longer_calls_pin_on_api(mock_config, mock_db_pool):
     redis = FakeRedis()
-    ipfs_client = MagicMock()
     mock_config.publish_to_chain = True
 
-    uploader = Uploader(mock_db_pool, ipfs_client, redis, mock_config)
+    uploader = Uploader(mock_db_pool, redis, mock_config)
 
     mock_conn = AsyncMock()
     mock_conn.execute = AsyncMock()
