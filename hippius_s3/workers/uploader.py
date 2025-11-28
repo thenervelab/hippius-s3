@@ -72,10 +72,11 @@ def compute_backoff_ms(attempt: int, base_ms: int = 1000, max_ms: int = 30000) -
 
 
 class Uploader:
-    def __init__(self, db_pool: Any, redis_client: Any, config: Any):
+    def __init__(self, db_pool: Any, redis_client: Any, redis_queues_client: Any, config: Any):
         # Support either a Pool (has acquire) or a single Connection
         self.db = db_pool
         self.redis_client = redis_client
+        self.redis_queues_client = redis_queues_client
         self.config = config
         self.obj_cache = RedisObjectPartsCache(redis_client)
         # Primary source: filesystem store (authoritative, survives Redis eviction)
@@ -461,8 +462,10 @@ class Uploader:
             "error_type": etype,
         }
 
-        await self.redis_client.lpush("upload_requests:dlq", json.dumps(dlq_entry))
-        logger.warning(f"Pushed to DLQ: object_id={payload.object_id}, error_type={error_type}, error={last_error}")
+        await self.redis_queues_client.lpush("upload_requests:dlq", json.dumps(dlq_entry))
+        logger.warning(
+            f"Pushed to DLQ (redis-queues): object_id={payload.object_id}, error_type={error_type}, error={last_error}"
+        )
 
         get_metrics_collector().record_uploader_operation(
             main_account=payload.address,
