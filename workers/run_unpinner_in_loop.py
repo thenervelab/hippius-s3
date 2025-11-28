@@ -30,8 +30,6 @@ setup_loki_logging(config, "unpinner")
 logger = logging.getLogger(__name__)
 
 
-
-
 async def process_unpin_request(request: UnpinChainRequest) -> None:
     """Process a single unpin request."""
     try:

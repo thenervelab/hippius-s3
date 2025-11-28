@@ -51,6 +51,7 @@ async def run_uploader_loop():
     uploader = Uploader(
         db_pool,
         redis_client,
+        redis_queues_client,
         config,
     )
 
