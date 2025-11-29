@@ -108,6 +108,7 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
 
             all_cids = deleted_object.get("all_cids") or [] if deleted_object else []
             if deleted_object:
+                ray_id = getattr(request.state, "ray_id", None)
                 obj_version = deleted_object.get("object_version") or deleted_object.get("current_object_version") or 1
                 for cid in all_cids:
                     await enqueue_unpin_request(
@@ -116,6 +117,7 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                             object_id=str(deleted_object["object_id"]),
                             object_version=int(obj_version),
                             cid=cid,
+                            ray_id=ray_id,
                         ),
                     )
 

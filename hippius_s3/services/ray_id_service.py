@@ -1,8 +1,12 @@
+import contextvars
 import logging
 import uuid
 from typing import Any
 from typing import MutableMapping
 from typing import Optional
+
+
+ray_id_context: contextvars.ContextVar[str] = contextvars.ContextVar("ray_id", default="no-ray-id")
 
 
 def generate_ray_id() -> str:

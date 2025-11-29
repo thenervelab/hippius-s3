@@ -170,6 +170,7 @@ async def build_stream_context(
                 size=int(info.get("size_bytes") or 0),
                 multipart=bool(info.get("multipart")),
                 chunks=dl_parts,
+                ray_id=info.get("ray_id"),
             )
             await enqueue_download_request(req)
 
