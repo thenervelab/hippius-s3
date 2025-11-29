@@ -13,9 +13,22 @@ class LoggingConfig(Protocol):
     environment: str
 
 
+class RayIDFilter(logging.Filter):
+    """Logging filter that ensures ray_id is always present in log records.
+
+    If ray_id is not in the record, defaults to 'no-ray-id'.
+    This ensures the log format string never fails even when ray_id is missing.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "ray_id"):
+            record.ray_id = "no-ray-id"
+        return True
+
+
 def setup_loki_logging(config: LoggingConfig, service_name: str) -> logging.Logger:
     """
-    Configure logging with optional Loki handler.
+    Configure logging with optional Loki handler and ray ID support.
 
     Args:
         config: Application configuration
@@ -25,6 +38,8 @@ def setup_loki_logging(config: LoggingConfig, service_name: str) -> logging.Logg
         Configured logger instance
     """
     log_level = getattr(logging, config.log_level.upper(), logging.INFO)
+
+    ray_id_filter = RayIDFilter()
 
     handlers = [logging.StreamHandler(sys.stdout)]
 
@@ -41,9 +56,12 @@ def setup_loki_logging(config: LoggingConfig, service_name: str) -> logging.Logg
         )
         handlers.append(loki_handler)
 
+    for handler in handlers:
+        handler.addFilter(ray_id_filter)
+
     logging.basicConfig(
         level=log_level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        format="%(asctime)s - [%(ray_id)s] - %(name)s - %(levelname)s - %(message)s",
         handlers=handlers,
     )
 

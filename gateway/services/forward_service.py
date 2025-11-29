@@ -29,6 +29,9 @@ class ForwardService:
                 logger.warning(f"Stripped client-provided header: {key}")
 
         # Add authenticated context headers from gateway
+        if hasattr(request.state, "ray_id"):
+            headers["X-Hippius-Ray-ID"] = request.state.ray_id
+
         if hasattr(request.state, "account_id"):
             headers["X-Hippius-Request-User"] = request.state.account_id
 

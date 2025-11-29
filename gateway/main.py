@@ -10,6 +10,7 @@ from fastapi import Response
 from gateway.config import get_config
 from gateway.middlewares.account import account_middleware
 from gateway.middlewares.acl import acl_middleware
+from gateway.middlewares.audit_log import audit_log_middleware
 from gateway.middlewares.auth_router import auth_router_middleware
 from gateway.middlewares.banhammer import BanHammerService
 from gateway.middlewares.banhammer import banhammer_middleware
@@ -18,6 +19,7 @@ from gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
 from gateway.middlewares.metrics import metrics_middleware
 from gateway.middlewares.rate_limit import RateLimitService
 from gateway.middlewares.rate_limit import rate_limit_middleware
+from gateway.middlewares.ray_id import ray_id_middleware
 from gateway.middlewares.tracing import tracing_middleware
 from gateway.middlewares.trailing_slash import trailing_slash_normalizer
 from gateway.routers.acl import router as acl_router
@@ -134,6 +136,11 @@ def factory() -> FastAPI:
     # Register middleware in REVERSE order (outermost first)
     # IMPORTANT: auth_router must execute BEFORE account (so register AFTER)
     # IMPORTANT: trailing_slash must execute AFTER auth_router (so register BEFORE)
+    # IMPORTANT: audit_log must execute AFTER account (so register BEFORE) to access account info
+    # IMPORTANT: ray_id must execute FIRST (so register LAST) to make ray_id available to all middlewares
+    app.middleware("http")(ray_id_middleware)
+    if config.enable_audit_logging:
+        app.middleware("http")(audit_log_middleware)
     app.middleware("http")(metrics_middleware)
     app.middleware("http")(tracing_middleware)
     app.middleware("http")(cors_middleware)
