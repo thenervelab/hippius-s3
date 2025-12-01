@@ -386,9 +386,15 @@ class HippiusApiClient:
             data=data,
             headers=headers,
         )
-
+        response_json = response.json()
         response.raise_for_status()
-        return UploadResponse.model_validate(response.json())
+
+        try:
+            return UploadResponse.model_validate(response_json)
+        except Exception as e:
+            error_summary = str(e).split("\n")[0] if "\n" in str(e) else str(e)
+            logger.error(f"API validation failed: {error_summary} | Response: {response_json}")
+            raise ValueError(f"Invalid API response: {error_summary}") from None
 
     @retry_on_error(retries=3, backoff=5.0)
     async def get_file_status(

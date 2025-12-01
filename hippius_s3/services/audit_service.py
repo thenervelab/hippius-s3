@@ -4,8 +4,10 @@ from typing import Any
 
 
 class AuditLogger:
-    def __init__(self, logger_name: str = "audit") -> None:
-        self.logger = logging.getLogger(logger_name)
+    def __init__(
+        self, logger_name: str = "audit", logger: logging.Logger | logging.LoggerAdapter | None = None
+    ) -> None:
+        self.logger = logger if logger is not None else logging.getLogger(logger_name)
 
     def should_skip(self, path: str, client_ip: str) -> bool:
         if path == "/metrics":

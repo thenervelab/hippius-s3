@@ -13,9 +13,7 @@ from gateway.middlewares.sigv4 import SigV4Verifier
 from gateway.middlewares.sigv4 import extract_credential_from_auth_header
 from gateway.utils.errors import s3_error_response
 from hippius_s3.services.hippius_api_service import HippiusAPIError
-
-
-logger = logging.getLogger(__name__)
+from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 
 
 async def auth_router_middleware(
@@ -34,6 +32,9 @@ async def auth_router_middleware(
     - For access key: access_key, account_address, token_type, auth_method="access_key"
     - For anonymous: auth_method="anonymous"
     """
+    ray_id = getattr(request.state, "ray_id", "no-ray-id")
+    logger = get_logger_with_ray_id(__name__, ray_id)
+
     exempt_paths = ["/docs", "/openapi.json", "/user/", "/robots.txt", "/metrics", "/health"]
 
     if request.method == "OPTIONS":

@@ -7,9 +7,7 @@ from fastapi import Response
 
 from gateway.utils.errors import s3_error_response
 from hippius_s3.models.acl import Permission
-
-
-logger = logging.getLogger(__name__)
+from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 
 
 def parse_s3_path(path: str) -> tuple[str | None, str | None]:
@@ -80,6 +78,9 @@ async def acl_middleware(
     Blocks unauthorized requests with 403 AccessDenied.
     Allows requests that pass ACL checks to continue to backend.
     """
+    ray_id = getattr(request.state, "ray_id", "no-ray-id")
+    logger = get_logger_with_ray_id(__name__, ray_id)
+
     path = request.url.path
 
     if path == "/health" or path.startswith("/user/"):

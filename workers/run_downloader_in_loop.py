@@ -21,6 +21,8 @@ from hippius_s3.ipfs_service import s3_download
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import dequeue_download_request
+from hippius_s3.services.ray_id_service import get_logger_with_ray_id
+from hippius_s3.services.ray_id_service import ray_id_context
 from hippius_s3.utils.timing import log_timing
 
 
@@ -253,6 +255,10 @@ async def run_downloader_loop():
                 continue
 
             if download_request:
+                ray_id = download_request.ray_id or "no-ray-id"
+                ray_id_context.set(ray_id)
+                worker_logger = get_logger_with_ray_id(__name__, ray_id)
+
                 try:
                     success = await process_download_request(download_request, redis_client)
                     if success:

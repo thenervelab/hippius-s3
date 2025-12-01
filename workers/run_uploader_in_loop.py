@@ -20,6 +20,8 @@ from hippius_s3.queue import dequeue_upload_request
 from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.queue import move_due_retries_to_primary
 from hippius_s3.redis_utils import with_redis_retry
+from hippius_s3.services.ray_id_service import get_logger_with_ray_id
+from hippius_s3.services.ray_id_service import ray_id_context
 from hippius_s3.workers.uploader import Uploader
 from hippius_s3.workers.uploader import classify_error
 from hippius_s3.workers.uploader import compute_backoff_ms
@@ -83,7 +85,11 @@ async def run_uploader_loop():
             continue
 
         if upload_request:
-            logger.info(
+            ray_id = upload_request.ray_id or "no-ray-id"
+            ray_id_context.set(ray_id)
+            worker_logger = get_logger_with_ray_id(__name__, ray_id)
+
+            worker_logger.info(
                 f"Processing upload request object_id={upload_request.object_id} chunks={len(upload_request.chunks)} attempts={upload_request.attempts or 0}"
             )
 

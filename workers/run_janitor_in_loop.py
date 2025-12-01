@@ -27,7 +27,7 @@ from hippius_s3.monitoring import initialize_metrics_collector
 
 
 config = get_config()
-setup_loki_logging(config, "janitor")
+setup_loki_logging(config, "janitor", include_ray_id=False)
 logger = logging.getLogger(__name__)
 
 

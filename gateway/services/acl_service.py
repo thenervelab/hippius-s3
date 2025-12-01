@@ -72,28 +72,36 @@ class ACLService:
 
         acl = await self.get_effective_acl(bucket, key)
 
-        logger.info(
-            f"DEBUG_ACL: check_permission - account_id={account_id}, access_key={access_key}, bucket={bucket}, key={key}, permission={permission.value}"
-        )
-        logger.info(f"DEBUG_ACL: ACL owner_id={acl.owner.id}")
-        logger.info(f"DEBUG_ACL: ACL grants count={len(acl.grants)}")
-        for i, grant in enumerate(acl.grants):
-            logger.info(
-                f"DEBUG_ACL: Grant {i}: type={grant.grantee.type.value}, id={grant.grantee.id}, uri={grant.grantee.uri}, permission={grant.permission.value}"
-            )
+        grants_summary = [
+            f"{{type={g.grantee.type.value}, id={g.grantee.id or 'None'}, uri={g.grantee.uri or 'None'}, perm={g.permission.value}}}"
+            for g in acl.grants
+        ]
 
         if account_id and acl.owner.id == account_id:
-            logger.info("DEBUG_ACL: Access GRANTED (owner match): account_id matches owner_id")
+            logger.info(
+                f"ACL check: account={account_id}, access_key={access_key or 'None'}, bucket={bucket}, "
+                f"key={key or 'None'}, required_perm={permission.value}, owner={acl.owner.id}, "
+                f"grants={len(acl.grants)}{grants_summary}, result=GRANTED (owner match)"
+            )
             return True
 
         for grant in acl.grants:
             if self._grant_matches(grant, account_id, access_key) and self._permission_implies(
                 grant.permission, permission
             ):
-                logger.info("DEBUG_ACL: Access GRANTED (grant match): grant matches account or access key")
+                match_reason = f"grant matched: grantee_type={grant.grantee.type.value}, grantee_id={grant.grantee.id or 'None'}, grant_perm={grant.permission.value}"
+                logger.info(
+                    f"ACL check: account={account_id}, access_key={access_key or 'None'}, bucket={bucket}, "
+                    f"key={key or 'None'}, required_perm={permission.value}, owner={acl.owner.id}, "
+                    f"grants={len(acl.grants)}{grants_summary}, result=GRANTED ({match_reason})"
+                )
                 return True
 
-        logger.info("DEBUG_ACL: Access DENIED: no matching owner or grant")
+        logger.info(
+            f"ACL check: account={account_id}, access_key={access_key or 'None'}, bucket={bucket}, "
+            f"key={key or 'None'}, required_perm={permission.value}, owner={acl.owner.id}, "
+            f"grants={len(acl.grants)}{grants_summary}, result=DENIED"
+        )
         return False
 
     async def get_effective_acl(self, bucket: str, key: str | None) -> ACL:
