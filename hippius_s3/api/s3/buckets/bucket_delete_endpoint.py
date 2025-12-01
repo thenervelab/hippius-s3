@@ -119,6 +119,7 @@ async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redi
             )
 
         # If we got here, the bucket was successfully deleted, so now enqueue objects for unpinning
+        ray_id = getattr(request.state, "ray_id", None)
         for obj in objects:
             try:
                 await enqueue_unpin_request(
@@ -127,6 +128,7 @@ async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redi
                         object_id=str(obj["object_id"]),
                         object_version=obj.get("current_object_version"),
                         cid=obj["ipfs_cid"],
+                        ray_id=ray_id,
                     ),
                 )
             except Exception:

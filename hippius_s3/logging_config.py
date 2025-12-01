@@ -5,6 +5,8 @@ from typing import Protocol
 
 from loki_logger_handler.loki_logger_handler import LokiLoggerHandler
 
+from hippius_s3.services.ray_id_service import ray_id_context
+
 
 class LoggingConfig(Protocol):
     log_level: str
@@ -16,13 +18,14 @@ class LoggingConfig(Protocol):
 class RayIDFilter(logging.Filter):
     """Logging filter that ensures ray_id is always present in log records.
 
-    If ray_id is not in the record, defaults to 'no-ray-id'.
+    Reads ray_id from contextvar if not already in the record.
+    If no ray_id in contextvar, defaults to 'no-ray-id'.
     This ensures the log format string never fails even when ray_id is missing.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         if not hasattr(record, "ray_id"):
-            record.ray_id = "no-ray-id"
+            record.ray_id = ray_id_context.get()
         return True
 
 

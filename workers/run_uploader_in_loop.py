@@ -96,7 +96,7 @@ async def run_uploader_loop():
             try:
                 await uploader.process_upload(upload_request)
             except Exception as e:
-                logger.exception(f"Upload failed object_id={upload_request.object_id}")
+                worker_logger.exception(f"Upload failed object_id={upload_request.object_id}")
                 err_str = str(e)
                 error_type = classify_error(e)
                 attempts_next = (upload_request.attempts or 0) + 1

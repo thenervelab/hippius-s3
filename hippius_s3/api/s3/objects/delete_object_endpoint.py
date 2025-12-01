@@ -101,6 +101,7 @@ async def handle_delete_object(
                     "object_version": int(obj_version),
                 },
             ):
+                ray_id = getattr(request.state, "ray_id", None)
                 for cid in all_cids:
                     await enqueue_unpin_request(
                         payload=UnpinChainRequest(
@@ -108,6 +109,7 @@ async def handle_delete_object(
                             object_id=str(deleted_object["object_id"]),
                             object_version=int(obj_version),
                             cid=cid,
+                            ray_id=ray_id,
                         ),
                     )
         return Response(status_code=204)

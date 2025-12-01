@@ -54,6 +54,7 @@ class RetryableRequest(BaseModel):
     attempts: int = 0
     first_enqueued_at: float | None = None
     last_error: str | None = None
+    ray_id: str | None = None
 
 
 class UploadChainRequest(RetryableRequest):

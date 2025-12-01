@@ -262,11 +262,11 @@ async def run_downloader_loop():
                 try:
                     success = await process_download_request(download_request, redis_client)
                     if success:
-                        logger.info(
+                        worker_logger.info(
                             f"Successfully processed download request {download_request.bucket_name}/{download_request.object_key}"
                         )
                     else:
-                        logger.error(
+                        worker_logger.error(
                             f"Failed to process download request {download_request.bucket_name}/{download_request.object_key}"
                         )
                 except (RedisConnectionError, RedisTimeoutError, BusyLoadingError) as e:

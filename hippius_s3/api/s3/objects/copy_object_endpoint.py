@@ -130,6 +130,7 @@ async def handle_copy_object(
             "is_public": bool(source_is_public),
             "multipart": bool(src_info.multipart),
             "metadata": src_info.metadata,
+            "ray_id": getattr(request.state, "ray_id", None),
         },
         rng=None,
         address=request.state.account.main_account,

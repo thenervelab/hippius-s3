@@ -43,7 +43,7 @@ async def process_unpin_request(request: UnpinChainRequest, worker_logger: loggi
         worker_logger.info(f"Successfully unpinned CID via API: {unpin_result=}")
 
     except Exception as e:
-        logger.error(f"Failed to process unpin request {request.name}: {e}")
+        worker_logger.error(f"Failed to process unpin request {request.name}: {e}")
         error_class = classify_error(e)
 
         attempts_next = (request.attempts or 0) + 1
