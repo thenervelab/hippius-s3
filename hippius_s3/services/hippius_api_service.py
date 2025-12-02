@@ -16,6 +16,7 @@ from typing import Callable
 from typing import Coroutine
 from typing import Dict
 from typing import TypeVar
+from typing import cast
 
 import httpx
 from pydantic import BaseModel
@@ -422,3 +423,33 @@ class HippiusApiClient:
 
         response.raise_for_status()
         return FileStatusResponse.model_validate(response.json())
+
+    @retry_on_error(retries=3, backoff=5.0)
+    async def list_files(
+        self,
+        page: int = 1,
+        page_size: int = 100,
+    ) -> Dict[str, Any]:
+        """
+        List files from Hippius API with pagination.
+
+        Maps to: GET /storage-control/files/
+
+        Args:
+            page: Page number (default: 1)
+            page_size: Results per page (default: 100)
+
+        Returns:
+            Dict containing 'results' list and pagination info
+
+        Raises:
+            HippiusAPIError: If the API request fails
+        """
+        response = await self._client.get(
+            "/storage-control/files/",
+            params={"page": page, "page_size": page_size},
+            headers=self._get_headers(),
+        )
+
+        response.raise_for_status()
+        return cast(Dict[str, Any], response.json())

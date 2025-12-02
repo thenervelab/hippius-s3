@@ -90,6 +90,8 @@ class Config:
     downloader_sleep_loop = 0.01
     cacher_loop_sleep = 60  # 1 minute
     pin_checker_loop_sleep = 7200  # 2 hours
+    orphan_checker_loop_sleep: int = env("ORPHAN_CHECKER_LOOP_SLEEP:7200", convert=int)  # 2 hours
+    orphan_checker_batch_size: int = env("ORPHAN_CHECKER_BATCH_SIZE:100", convert=int)  # Files per API call
 
     # Uploader configuration (supersedes legacy pinner config)
     uploader_max_attempts: int = env("HIPPIUS_UPLOADER_MAX_ATTEMPTS:5", convert=int)
