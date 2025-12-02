@@ -29,20 +29,19 @@ class RayIDFilter(logging.Filter):
         return True
 
 
-def setup_loki_logging(config: LoggingConfig, service_name: str) -> logging.Logger:
+def setup_loki_logging(config: LoggingConfig, service_name: str, include_ray_id: bool = True) -> logging.Logger:
     """
     Configure logging with optional Loki handler and ray ID support.
 
     Args:
         config: Application configuration
         service_name: Name of the service (e.g., "api", "uploader", "substrate")
+        include_ray_id: Whether to include ray_id in log format (default: True)
 
     Returns:
         Configured logger instance
     """
     log_level = getattr(logging, config.log_level.upper(), logging.INFO)
-
-    ray_id_filter = RayIDFilter()
 
     handlers = [logging.StreamHandler(sys.stdout)]
 
@@ -59,12 +58,17 @@ def setup_loki_logging(config: LoggingConfig, service_name: str) -> logging.Logg
         )
         handlers.append(loki_handler)
 
-    for handler in handlers:
-        handler.addFilter(ray_id_filter)
+    if include_ray_id:
+        ray_id_filter = RayIDFilter()
+        for handler in handlers:
+            handler.addFilter(ray_id_filter)
+        log_format = "%(asctime)s - [%(ray_id)s] - %(name)s - %(levelname)s - %(message)s"
+    else:
+        log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
     logging.basicConfig(
         level=log_level,
-        format="%(asctime)s - [%(ray_id)s] - %(name)s - %(levelname)s - %(message)s",
+        format=log_format,
         handlers=handlers,
     )
 

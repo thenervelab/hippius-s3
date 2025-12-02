@@ -6,9 +6,10 @@ from fastapi import Request
 from fastapi import Response
 
 from hippius_s3.services.audit_service import AuditLogger
+from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 
 
-audit_logger = AuditLogger("audit")
+base_audit_logger = AuditLogger("audit")
 
 
 async def audit_log_middleware(
@@ -18,7 +19,7 @@ async def audit_log_middleware(
     path = str(request.url.path)
     client_ip = request.client.host if request.client else "unknown"
 
-    if audit_logger.should_skip(path, client_ip):
+    if base_audit_logger.should_skip(path, client_ip):
         return await call_next(request)
 
     start_time = time.time()
@@ -27,14 +28,16 @@ async def audit_log_middleware(
     method = request.method
     query_params = dict(request.query_params)
 
-    account = getattr(request.state, "account", None)
-    account_id = getattr(account, "main_account", "unknown") if account else "unknown"
-    ray_id = getattr(request.state, "ray_id", "no-ray-id")
-
     response = await call_next(request)
 
     processing_time = time.time() - start_time
 
+    account = getattr(request.state, "account", None)
+    account_id = getattr(account, "main_account", "unknown") if account else "unknown"
+    ray_id = getattr(request.state, "ray_id", "no-ray-id")
+
+    ray_id_logger = get_logger_with_ray_id("audit", ray_id)
+    audit_logger = AuditLogger("audit", logger=ray_id_logger)
     audit_logger.log_request(
         client_ip=client_ip,
         user_agent=user_agent,

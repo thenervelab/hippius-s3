@@ -20,6 +20,7 @@ from hippius_s3.queue import move_due_unpin_retries_to_primary
 from hippius_s3.redis_utils import with_redis_retry
 from hippius_s3.services.hippius_api_service import HippiusApiClient
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
+from hippius_s3.services.ray_id_service import ray_id_context
 from hippius_s3.workers.uploader import classify_error
 from hippius_s3.workers.uploader import compute_backoff_ms
 
@@ -99,6 +100,7 @@ async def run_unpinner_loop() -> None:
             continue
 
         ray_id = unpin_request.ray_id or "no-ray-id"
+        ray_id_context.set(ray_id)
         worker_logger = get_logger_with_ray_id(__name__, ray_id)
         await process_unpin_request(unpin_request, worker_logger)
 
