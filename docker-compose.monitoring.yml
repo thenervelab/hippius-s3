@@ -30,9 +30,6 @@ services:
     environment:
       <<: *monitoring-enabled
 
-  backup:
-    environment:
-      <<: *monitoring-enabled
 
   # Loki for log aggregation
   loki:
