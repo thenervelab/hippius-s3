@@ -14,6 +14,7 @@ from starlette import status
 
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import get_postgres
+from hippius_s3.services.acl_helper import has_public_read_acl
 from hippius_s3.utils import get_query
 
 
@@ -43,7 +44,7 @@ async def list_buckets(
                 "bucket_id": str(bucket["bucket_id"]),
                 "bucket_name": bucket["bucket_name"],
                 "created_at": bucket["created_at"].isoformat(),
-                "is_public": bucket["is_public"],
+                "is_public": has_public_read_acl(bucket["acl_json"]),
                 "tags": bucket["tags"] or {},
                 "total_objects": bucket["total_objects"],
                 "total_size_bytes": bucket["total_size_bytes"],
@@ -100,7 +101,7 @@ async def get_bucket_location(
                 "bucket_id": str(bucket["bucket_id"]),
                 "bucket_name": bucket["bucket_name"],
                 "created_at": bucket["created_at"].isoformat(),
-                "is_public": bucket["is_public"],
+                "is_public": has_public_read_acl(bucket["acl_json"]),
                 "tags": bucket["tags"] or {},
                 "main_account_id": bucket["main_account_id"],
                 "location": "decentralized",  # Default S3 region

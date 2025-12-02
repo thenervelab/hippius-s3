@@ -230,6 +230,12 @@ class DLQManager:
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description="DLQ Requeue CLI for Hippius S3")
+    parser.add_argument(
+        "--worker",
+        choices=["upload", "unpin"],
+        default="upload",
+        help="Worker type: upload or unpin (default: upload)",
+    )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     # peek command
@@ -238,12 +244,14 @@ async def main() -> None:
 
     # requeue command
     requeue_parser = subparsers.add_parser("requeue", help="Requeue entries")
-    requeue_parser.add_argument("--object-id", help="Specific object ID to requeue (omit to requeue all)")
+    requeue_parser.add_argument("--object-id", help="Specific object ID to requeue")
+    requeue_parser.add_argument("--cid", help="Specific CID to requeue (for unpin worker)")
     requeue_parser.add_argument("--force", action="store_true", help="Force requeue of permanent errors")
 
     # purge command
     purge_parser = subparsers.add_parser("purge", help="Purge entries from DLQ")
-    purge_parser.add_argument("--object-id", help="Specific object ID to purge (omit to purge all)")
+    purge_parser.add_argument("--object-id", help="Specific object ID to purge")
+    purge_parser.add_argument("--cid", help="Specific CID to purge (for unpin worker)")
 
     # export command
     export_parser = subparsers.add_parser("export", help="Export DLQ to JSON file")
@@ -273,7 +281,17 @@ async def main() -> None:
     initialize_queue_client(redis_queues_client)
 
     try:
-        dlq_manager = DLQManager(redis_queues_client)
+        from hippius_s3.dlq.base import BaseDLQManager
+
+        dlq_manager: BaseDLQManager[Any]
+        if args.worker == "upload":
+            from hippius_s3.dlq.upload_dlq import UploadDLQManager
+
+            dlq_manager = UploadDLQManager(redis_queues_client)
+        else:
+            from hippius_s3.dlq.unpin_dlq import UnpinDLQManager
+
+            dlq_manager = UnpinDLQManager(redis_queues_client)
 
         if args.command == "peek":
             entries = await dlq_manager.peek(args.limit)
@@ -281,13 +299,18 @@ async def main() -> None:
                 print("DLQ is empty")
                 return
 
-            print(f"DLQ entries (showing {len(entries)}):")
+            print(f"DLQ entries for {args.worker} worker (showing {len(entries)}):")
             for i, entry in enumerate(entries, 1):
                 print(f"\n--- Entry {i} ---")
                 print(f"Object ID: {entry.get('object_id')}")
-                print(f"Upload ID: {entry.get('upload_id')}")
-                print(f"Bucket: {entry.get('bucket_name')}")
-                print(f"Key: {entry.get('object_key')}")
+                if args.worker == "upload":
+                    print(f"Upload ID: {entry.get('upload_id')}")
+                    print(f"Bucket: {entry.get('bucket_name')}")
+                    print(f"Key: {entry.get('object_key')}")
+                else:
+                    print(f"CID: {entry.get('cid')}")
+                    print(f"Address: {entry.get('address')}")
+                    print(f"Object Version: {entry.get('object_version')}")
                 print(f"Attempts: {entry.get('attempts')}")
                 print(f"Error Type: {entry.get('error_type')}")
                 print(f"Last Error: {entry.get('last_error', '')[:100]}...")
@@ -303,24 +326,30 @@ async def main() -> None:
                 print(f"    {error_type}: {count}")
 
         elif args.command == "requeue":
-            if args.object_id:
-                success = await dlq_manager.requeue(args.object_id, args.force)
+            identifier = args.cid if args.cid else args.object_id
+            if identifier:
+                success = await dlq_manager.requeue(identifier, args.force)
                 if success:
-                    print(f"Successfully requeued object_id: {args.object_id}")
+                    id_type = "CID" if args.cid else "object_id"
+                    print(f"Successfully requeued {id_type}: {identifier}")
                 else:
-                    print(f"Failed to requeue object_id: {args.object_id}")
+                    id_type = "CID" if args.cid else "object_id"
+                    print(f"Failed to requeue {id_type}: {identifier}")
                     sys.exit(1)
             else:
                 count = await dlq_manager.requeue_all(args.force)
                 print(f"Requeued {count} DLQ entries")
 
         elif args.command == "purge":
-            count = await dlq_manager.purge(args.object_id)
-            if args.object_id:
+            identifier = args.cid if args.cid else args.object_id
+            count = await dlq_manager.purge(identifier)
+            if identifier:
                 if count > 0:
-                    print(f"Purged 1 entry for object_id: {args.object_id}")
+                    id_type = "CID" if args.cid else "object_id"
+                    print(f"Purged 1 entry for {id_type}: {identifier}")
                 else:
-                    print(f"No entry found for object_id: {args.object_id}")
+                    id_type = "CID" if args.cid else "object_id"
+                    print(f"No entry found for {id_type}: {identifier}")
             else:
                 print(f"Purged {count} entries from DLQ")
 

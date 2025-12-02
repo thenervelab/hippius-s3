@@ -31,31 +31,32 @@ setup_loki_logging(config, "janitor", include_ray_id=False)
 logger = logging.getLogger(__name__)
 
 
-async def get_dlq_object_ids(redis_client: async_redis.Redis) -> set[str]:
-    """Fetch all object_ids currently in DLQ.
+async def get_all_dlq_object_ids(redis_client: async_redis.Redis) -> set[str]:
+    """Fetch all object_ids currently in both upload and unpin DLQs.
 
     Returns:
-        Set of object_id strings present in DLQ
+        Set of object_id strings present in any DLQ
     """
-    try:
-        dlq_entries = await asyncio.wait_for(redis_client.lrange("upload_requests:dlq", 0, -1), timeout=5.0)
-        object_ids = set()
-        for entry_json in dlq_entries:
-            try:
-                entry = json.loads(entry_json)
-                if obj_id := entry.get("object_id"):
-                    object_ids.add(str(obj_id))
-            except json.JSONDecodeError:
-                logger.warning(f"Invalid JSON in DLQ: {entry_json[:100]}")
-        if object_ids:
-            logger.info(f"Found {len(object_ids)} unique object_ids in DLQ")
-        return object_ids
-    except asyncio.TimeoutError:
-        logger.error("DLQ fetch timeout (5s)")
-        return set()
-    except Exception as e:
-        logger.error(f"Failed to fetch DLQ object_ids: {e}")
-        return set()
+    object_ids = set()
+
+    for dlq_key in ["upload_requests:dlq", "unpin_requests:dlq"]:
+        try:
+            dlq_entries = await asyncio.wait_for(redis_client.lrange(dlq_key, 0, -1), timeout=5.0)
+            for entry_json in dlq_entries:
+                try:
+                    entry = json.loads(entry_json)
+                    if obj_id := entry.get("object_id"):
+                        object_ids.add(str(obj_id))
+                except json.JSONDecodeError:
+                    logger.warning(f"Invalid JSON in {dlq_key}: {entry_json[:100]}")
+        except asyncio.TimeoutError:
+            logger.error(f"{dlq_key} fetch timeout (5s)")
+        except Exception as e:
+            logger.error(f"Failed to fetch {dlq_key} object_ids: {e}")
+
+    if object_ids:
+        logger.info(f"Found {len(object_ids)} unique object_ids protected across all DLQs")
+    return object_ids
 
 
 async def cleanup_stale_parts(
@@ -71,7 +72,7 @@ async def cleanup_stale_parts(
     stale_threshold_seconds = config.mpu_stale_seconds
     cutoff_sql = "NOW() - INTERVAL '1 second' * $4"
 
-    dlq_object_ids = await get_dlq_object_ids(redis_client)
+    dlq_object_ids = await get_all_dlq_object_ids(redis_client)
     if dlq_object_ids:
         logger.info(f"Protecting {len(dlq_object_ids)} DLQ objects from stale cleanup")
 
@@ -172,7 +173,7 @@ async def cleanup_old_parts_by_mtime(fs_store: FileSystemPartsStore, redis_clien
     max_age_seconds = config.fs_cache_gc_max_age_seconds
     logger.info(f"Scanning for orphaned FS parts older than {max_age_seconds}s")
 
-    dlq_object_ids = await get_dlq_object_ids(redis_client)
+    dlq_object_ids = await get_all_dlq_object_ids(redis_client)
     if dlq_object_ids:
         logger.info(f"Protecting {len(dlq_object_ids)} DLQ objects from GC")
 

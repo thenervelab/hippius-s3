@@ -11,7 +11,6 @@ from hippius_s3.utils_core import env  # noqa: F401
 from hippius_s3.utils_core import get_object_download_info  # noqa: F401
 from hippius_s3.utils_core import get_query  # noqa: F401
 from hippius_s3.utils_core import get_request_body  # noqa: F401
-from hippius_s3.utils_core import is_public_bucket  # noqa: F401
 from hippius_s3.utils_core import upsert_cid_and_get_id  # noqa: F401
 
 
@@ -21,7 +20,6 @@ __all__ = [
     "get_request_body",
     "get_query",
     "get_object_download_info",
-    "is_public_bucket",
     "upsert_cid_and_get_id",
     # From timing.py
     "async_timing_context",

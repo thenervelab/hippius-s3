@@ -193,31 +193,3 @@ async def get_object_download_info(db: asyncpg.Pool, object_id: str) -> dict:
         "needs_decryption": result["needs_decryption"],
         "download_chunks": result["download_chunks"],
     }
-
-
-async def is_public_bucket(request: Request, bucket_name: str) -> bool:
-    """Return True if the bucket is marked public.
-
-    Uses Redis cache with a short TTL to avoid hot DB lookups; falls back to DB on miss.
-    """
-    try:
-        redis = request.app.state.redis_client
-        from hippius_s3.config import get_config  # local to avoid cycles
-
-        config = get_config()
-
-        cache_key = f"public_bucket_flag:{bucket_name}"
-        cached = await redis.get(cache_key)
-        if cached is not None:
-            val = cached.decode() if isinstance(cached, (bytes, bytearray)) else str(cached)
-            return val == "1"
-
-        db = request.app.state.postgres_pool
-        row = await db.fetchrow(get_query("get_bucket_by_name"), bucket_name)
-        is_public = bool(row and row.get("is_public"))
-
-        await redis.set(cache_key, "1" if is_public else "0", ex=config.public_bucket_cache_ttl_seconds)
-        return is_public
-    except Exception:
-        logger.exception("Failed to check public bucket flag")
-        return False
