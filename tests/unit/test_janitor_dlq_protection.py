@@ -205,7 +205,7 @@ class TestJanitorDlqProtection:
         mock_fs_store.delete_part = AsyncMock()
 
         # Run cleanup
-        result = await cleanup_stale_parts(mock_db, mock_fs_store, redis_with_dlq)
+        await cleanup_stale_parts(mock_db, mock_fs_store, redis_with_dlq)
 
         # Protected object should NOT be deleted
         # Non-protected object should be checked and potentially deleted
