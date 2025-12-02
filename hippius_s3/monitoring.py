@@ -186,6 +186,18 @@ class MetricsCollector:
             unit="s",
         )
 
+        self.unpinner_requests_retried_total = self.meter.create_counter(
+            name="unpinner_requests_retried_total",
+            description="Total unpinner requests retried",
+            unit="1",
+        )
+
+        self.unpinner_dlq_total = self.meter.create_counter(
+            name="unpinner_dlq_total",
+            description="Total unpinner requests moved to Dead Letter Queue",
+            unit="1",
+        )
+
         self.backup_cycles_total = self.meter.create_counter(
             name="backup_cycles_total",
             description="Total backup cycles completed",
@@ -561,19 +573,34 @@ class MetricsCollector:
         success: bool,
         num_files: int = 0,
         duration: Optional[float] = None,
+        attempt: Optional[int] = None,
+        error_type: Optional[str] = None,
     ) -> None:
         attributes = {
             "main_account": main_account,
             "success": str(success).lower(),
         }
 
-        self.unpinner_requests_total.add(1, attributes=attributes)
+        if attempt is not None:
+            retry_attributes = {
+                "main_account": main_account,
+                "attempt": str(attempt),
+            }
+            self.unpinner_requests_retried_total.add(1, attributes=retry_attributes)
+        elif error_type is not None:
+            dlq_attributes = {
+                "main_account": main_account,
+                "error_type": error_type,
+            }
+            self.unpinner_dlq_total.add(1, attributes=dlq_attributes)
+        else:
+            self.unpinner_requests_total.add(1, attributes=attributes)
 
-        if num_files > 0:
-            self.unpinner_files_unpinned.add(num_files, attributes=attributes)
+            if num_files > 0:
+                self.unpinner_files_unpinned.add(num_files, attributes=attributes)
 
-        if duration is not None:
-            self.unpinner_duration.record(duration, attributes=attributes)
+            if duration is not None:
+                self.unpinner_duration.record(duration, attributes=attributes)
 
     def set_pin_checker_missing_cids(self, user: str, count: int) -> None:
         self._pin_checker_missing_cids[user] = count

@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
+from hippius_s3.dlq.upload_dlq import UploadDLQManager
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
@@ -81,6 +82,7 @@ class Uploader:
         self.obj_cache = RedisObjectPartsCache(redis_client)
         # Primary source: filesystem store (authoritative, survives Redis eviction)
         self.fs_store = FileSystemPartsStore(config.object_cache_dir)
+        self.dlq_manager = UploadDLQManager(redis_queues_client)
 
     class _ConnCtx:
         def __init__(self, conn: Any):
@@ -444,28 +446,11 @@ class Uploader:
 
     async def _push_to_dlq(self, payload: UploadChainRequest, last_error: str, error_type: str) -> None:
         """Push a failed request to the Dead-Letter Queue."""
+        await self.dlq_manager.push(payload, last_error, error_type)
 
         etype = error_type
         if isinstance(etype, bool):
             etype = "transient" if etype else "permanent"
-
-        dlq_entry = {
-            "payload": payload.model_dump(),
-            "object_id": payload.object_id,
-            "upload_id": payload.upload_id,
-            "bucket_name": payload.bucket_name,
-            "object_key": payload.object_key,
-            "attempts": payload.attempts or 0,
-            "first_enqueued_at": getattr(payload, "first_enqueued_at", time.time()),
-            "last_attempt_at": time.time(),
-            "last_error": last_error,
-            "error_type": etype,
-        }
-
-        await self.redis_queues_client.lpush("upload_requests:dlq", json.dumps(dlq_entry))
-        logger.warning(
-            f"Pushed to DLQ (redis-queues): object_id={payload.object_id}, error_type={error_type}, error={last_error}"
-        )
 
         get_metrics_collector().record_uploader_operation(
             main_account=payload.address,

@@ -127,7 +127,6 @@ async def handle_get_object(
         # Build manifest purely from DB parts, 0-based; prefer ObjectReader if provided
         with tracer.start_as_current_span("get_object.build_manifest") as span:
             download_chunks = json.loads(object_info["download_chunks"]) if object_info.get("download_chunks") else []
-            manifest_source = "unknown"
             try:
                 built_chunks = await ManifestService.build_initial_download_chunks(
                     db, object_info if isinstance(object_info, dict) else dict(object_info)
@@ -217,7 +216,6 @@ async def handle_get_object(
 
         # Decide decryption internally based on storage_version (v3+: always decrypt)
         storage_version = int(object_info.get("storage_version") or 2)
-        is_public_bucket = bool(object_info.get("is_public"))
         bucket_owner_id = str(object_info.get("bucket_owner_id") or "")
         is_anonymous = account_id == "anonymous"
 
@@ -238,7 +236,7 @@ async def handle_get_object(
             # Ensure reader uses the current object version for cache keys and downloader
             "object_version": int(object_info.get("object_version") or 1),
             # should_decrypt derived in reader from storage_version; keep for now to avoid breaking
-            "should_decrypt": storage_version >= 3 or (not is_public_bucket),
+            "should_decrypt": storage_version >= 3,
             "storage_version": storage_version,
             "ray_id": getattr(request.state, "ray_id", None),
         }

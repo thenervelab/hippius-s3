@@ -155,3 +155,33 @@ async def canned_acl_to_acl(
 
         return ACL(owner=Owner(id=owner_id), grants=grants)
     raise ValueError(f"Unknown canned ACL: {canned_acl}")
+
+
+def has_public_read_acl(acl_json: dict | str | None) -> bool:
+    if not acl_json:
+        return False
+
+    import json
+
+    acl_data: dict = json.loads(acl_json) if isinstance(acl_json, str) else acl_json
+
+    grants = acl_data.get("grants", [])
+    if not isinstance(grants, list):
+        return False
+
+    for grant in grants:
+        if not isinstance(grant, dict):
+            continue
+
+        grantee = grant.get("grantee", {})
+        if not isinstance(grantee, dict):
+            continue
+
+        if (
+            grantee.get("type") == "Group"
+            and grantee.get("uri") == "http://acs.amazonaws.com/groups/global/AllUsers"
+            and grant.get("permission") == "READ"
+        ):
+            return True
+
+    return False
