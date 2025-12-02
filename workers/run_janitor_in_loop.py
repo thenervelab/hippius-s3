@@ -7,12 +7,14 @@ incomplete uploads that were never finalized or cleaned up.
 """
 
 import asyncio
+import json
 import logging
 import sys
 import time
 from pathlib import Path
 
 import asyncpg
+import redis.asyncio as async_redis
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -25,11 +27,40 @@ from hippius_s3.monitoring import initialize_metrics_collector
 
 
 config = get_config()
-setup_loki_logging(config, "janitor")
+setup_loki_logging(config, "janitor", include_ray_id=False)
 logger = logging.getLogger(__name__)
 
 
-async def cleanup_stale_parts(db: asyncpg.Connection, fs_store: FileSystemPartsStore) -> int:
+async def get_dlq_object_ids(redis_client: async_redis.Redis) -> set[str]:
+    """Fetch all object_ids currently in DLQ.
+
+    Returns:
+        Set of object_id strings present in DLQ
+    """
+    try:
+        dlq_entries = await asyncio.wait_for(redis_client.lrange("upload_requests:dlq", 0, -1), timeout=5.0)
+        object_ids = set()
+        for entry_json in dlq_entries:
+            try:
+                entry = json.loads(entry_json)
+                if obj_id := entry.get("object_id"):
+                    object_ids.add(str(obj_id))
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid JSON in DLQ: {entry_json[:100]}")
+        if object_ids:
+            logger.info(f"Found {len(object_ids)} unique object_ids in DLQ")
+        return object_ids
+    except asyncio.TimeoutError:
+        logger.error("DLQ fetch timeout (5s)")
+        return set()
+    except Exception as e:
+        logger.error(f"Failed to fetch DLQ object_ids: {e}")
+        return set()
+
+
+async def cleanup_stale_parts(
+    db: asyncpg.Connection, fs_store: FileSystemPartsStore, redis_client: async_redis.Redis
+) -> int:
     """Conservative cleanup of stale parts: rely on FS mtime only for now.
 
     Rationale: DB schemas for tracking MPU progress vary across deployments.
@@ -39,6 +70,10 @@ async def cleanup_stale_parts(db: asyncpg.Connection, fs_store: FileSystemPartsS
     """
     stale_threshold_seconds = config.mpu_stale_seconds
     cutoff_sql = "NOW() - INTERVAL '1 second' * $4"
+
+    dlq_object_ids = await get_dlq_object_ids(redis_client)
+    if dlq_object_ids:
+        logger.info(f"Protecting {len(dlq_object_ids)} DLQ objects from stale cleanup")
 
     parts_cleaned = 0
     root = fs_store.root
@@ -78,6 +113,13 @@ async def cleanup_stale_parts(db: asyncpg.Connection, fs_store: FileSystemPartsS
                     # Recently touched, skip
                     continue
 
+                # Skip deletion if object is in DLQ
+                if object_id in dlq_object_ids:
+                    logger.debug(
+                        f"Skipping DLQ-protected part: object_id={object_id} v={object_version} part={part_number}"
+                    )
+                    continue
+
                 # Cross-check DB: skip deletion if there was recent part activity
                 try:
                     recent = await db.fetchval(
@@ -114,7 +156,7 @@ async def cleanup_stale_parts(db: asyncpg.Connection, fs_store: FileSystemPartsS
     return parts_cleaned
 
 
-async def cleanup_old_parts_by_mtime(fs_store: FileSystemPartsStore) -> int:
+async def cleanup_old_parts_by_mtime(fs_store: FileSystemPartsStore, redis_client: async_redis.Redis) -> int:
     """Clean up old parts from FS based on modification time (backup GC).
 
     This is a safety net to remove orphaned parts that weren't caught by the
@@ -122,12 +164,17 @@ async def cleanup_old_parts_by_mtime(fs_store: FileSystemPartsStore) -> int:
 
     Args:
         fs_store: FileSystemPartsStore instance
+        redis_client: Redis client for DLQ checks
 
     Returns:
         Number of parts cleaned up
     """
     max_age_seconds = config.fs_cache_gc_max_age_seconds
     logger.info(f"Scanning for orphaned FS parts older than {max_age_seconds}s")
+
+    dlq_object_ids = await get_dlq_object_ids(redis_client)
+    if dlq_object_ids:
+        logger.info(f"Protecting {len(dlq_object_ids)} DLQ objects from GC")
 
     root = fs_store.root
     if not root.exists():
@@ -142,6 +189,8 @@ async def cleanup_old_parts_by_mtime(fs_store: FileSystemPartsStore) -> int:
     for object_dir in root.iterdir():
         if not object_dir.is_dir():
             continue
+
+        object_id = object_dir.name
 
         for version_dir in object_dir.iterdir():
             if not version_dir.is_dir() or not version_dir.name.startswith("v"):
@@ -161,6 +210,11 @@ async def cleanup_old_parts_by_mtime(fs_store: FileSystemPartsStore) -> int:
                     if oldest_mtime is None or mtime < oldest_mtime:
                         oldest_mtime = mtime
                     if mtime < cutoff_time:
+                        # Skip deletion if object is in DLQ
+                        if object_id in dlq_object_ids:
+                            logger.debug(f"Skipping DLQ-protected part (GC): {part_dir}")
+                            continue
+
                         # Old enough to clean
                         import shutil
 
@@ -196,6 +250,7 @@ async def run_janitor_loop():
     """Main janitor loop: periodically clean stale and old parts."""
     db = await asyncpg.connect(config.database_url)
     fs_store = FileSystemPartsStore(config.object_cache_dir)
+    redis_client = async_redis.from_url(config.redis_queues_url)
 
     # Initialize metrics
     try:
@@ -205,6 +260,7 @@ async def run_janitor_loop():
 
     logger.info("Starting janitor service...")
     logger.info(f"Database: {config.database_url}")
+    logger.info(f"Redis (for DLQ checks): {config.redis_queues_url}")
     logger.info(f"FS store root: {config.object_cache_dir}")
     logger.info(f"MPU stale threshold: {config.mpu_stale_seconds}s")
     logger.info(f"FS GC max age: {config.fs_cache_gc_max_age_seconds}s")
@@ -212,23 +268,29 @@ async def run_janitor_loop():
     # Run immediately on start, then periodically
     sleep_interval = 3600  # 1 hour
 
-    while True:
-        try:
-            logger.info("Janitor cycle starting...")
+    try:
+        while True:
+            try:
+                logger.info("Janitor cycle starting...")
 
-            # Phase 1: Clean stale MPU parts
-            stale_count = await cleanup_stale_parts(db, fs_store)
+                # Phase 1: Clean stale MPU parts
+                stale_count = await cleanup_stale_parts(db, fs_store, redis_client)
 
-            # Phase 2: GC old parts by mtime (backup safety net)
-            gc_count = await cleanup_old_parts_by_mtime(fs_store)
+                # Phase 2: GC old parts by mtime (backup safety net)
+                gc_count = await cleanup_old_parts_by_mtime(fs_store, redis_client)
 
-            logger.info(f"Janitor cycle complete: stale={stale_count} gc={gc_count}")
+                logger.info(f"Janitor cycle complete: stale={stale_count} gc={gc_count}")
 
-        except Exception as e:
-            logger.error(f"Janitor cycle error: {e}", exc_info=True)
+            except Exception as e:
+                logger.error(f"Janitor cycle error: {e}", exc_info=True)
 
-        logger.info(f"Janitor sleeping {sleep_interval}s until next cycle...")
-        await asyncio.sleep(sleep_interval)
+            logger.info(f"Janitor sleeping {sleep_interval}s until next cycle...")
+            await asyncio.sleep(sleep_interval)
+    finally:
+        if redis_client:
+            await redis_client.close()
+        if db:
+            await db.close()
 
 
 if __name__ == "__main__":

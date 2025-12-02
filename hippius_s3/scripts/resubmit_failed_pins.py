@@ -47,7 +47,7 @@ async def main() -> None:
     parser.add_argument(
         "--seed",
         type=str,
-        default=os.getenv("RESUBMISSION_SEED_PHRASE") or os.getenv("SEED_PHRASE") or "",
+        default=os.getenv("SEED_PHRASE") or "",
         help="Seed phrase to use for encryption/pin (required for private buckets)",
     )
     parser.add_argument("--dry-run", action="store_true", help="Print planned actions without enqueueing")

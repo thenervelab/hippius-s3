@@ -266,7 +266,6 @@ async def main() -> None:
     # Get Redis clients
     config = get_config()
 
-    redis_client = async_redis.from_url(config.redis_url)
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
 
     from hippius_s3.queue import initialize_queue_client
@@ -274,7 +273,7 @@ async def main() -> None:
     initialize_queue_client(redis_queues_client)
 
     try:
-        dlq_manager = DLQManager(redis_client)
+        dlq_manager = DLQManager(redis_queues_client)
 
         if args.command == "peek":
             entries = await dlq_manager.peek(args.limit)
@@ -338,8 +337,6 @@ async def main() -> None:
         # removed DLQ filesystem-related command handlers
 
     finally:
-        if redis_client:
-            await redis_client.close()
         if redis_queues_client:
             await redis_queues_client.close()
 

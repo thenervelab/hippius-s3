@@ -85,10 +85,11 @@ def test_dlq_requeue_multipart_upload(
         # Poll DLQ up to a short timeout
         import redis as _redis  # type: ignore[import-untyped]
 
-        r = _redis.Redis.from_url("redis://localhost:6379/0")
+        # DLQ is stored in redis-queues (port 6382), not main redis
+        r_queues = _redis.Redis.from_url("redis://localhost:6382/0")
         found = False
         for _ in range(130):
-            entries = list(r.lrange("upload_requests:dlq", 0, -1))  # type: ignore[arg-type]
+            entries = list(r_queues.lrange("upload_requests:dlq", 0, -1))  # type: ignore[arg-type]
             for entry_json in entries:
                 import json as _json
 
@@ -101,9 +102,8 @@ def test_dlq_requeue_multipart_upload(
             time.sleep(0.2)
         assert found, "DLQ entry not found after waiting for uploader to fail"
 
-        # Verify DLQ entry exists
-        r = redis.Redis.from_url("redis://localhost:6379/0")
-        dlq_entries = list(r.lrange("upload_requests:dlq", 0, -1))  # type: ignore[arg-type]
+        # Verify DLQ entry exists in redis-queues
+        dlq_entries = list(r_queues.lrange("upload_requests:dlq", 0, -1))  # type: ignore[arg-type]
 
         assert len(dlq_entries) > 0, "No DLQ entries found"
 
@@ -125,9 +125,10 @@ def test_dlq_requeue_multipart_upload(
         clear_object_cache(object_id, parts=[0, 1])
 
         # Verify cache is actually cleared (meta) using versioned keys
-        # version already fetched above
-        assert not r.exists(f"obj:{object_id}:v:{ov}:part:0:meta"), "Part 0 cache not cleared"
-        assert not r.exists(f"obj:{object_id}:v:{ov}:part:1:meta"), "Part 1 cache not cleared"
+        # Cache keys are stored in main redis (port 6379), not redis-queues
+        r_cache = _redis.Redis.from_url("redis://localhost:6379/0")
+        assert not r_cache.exists(f"obj:{object_id}:v:{ov}:part:0:meta"), "Part 0 cache not cleared"
+        assert not r_cache.exists(f"obj:{object_id}:v:{ov}:part:1:meta"), "Part 1 cache not cleared"
 
         # Heal IPFS before requeue so uploader can complete successfully
         enable_ipfs_proxy()

@@ -1060,6 +1060,7 @@ async def complete_multipart_upload(
             object_id,
             object_version,
         )
+        ray_id = getattr(request.state, "ray_id", None)
         await enqueue_upload_request(
             UploadChainRequest(
                 address=request.state.account.id,
@@ -1074,6 +1075,7 @@ async def complete_multipart_upload(
                     for part in parts
                 ],
                 upload_id=upload_id,
+                ray_id=ray_id,
             ),
         )
 

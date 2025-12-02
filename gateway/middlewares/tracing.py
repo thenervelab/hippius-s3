@@ -36,6 +36,9 @@ async def tracing_middleware(
         try:
             response = await call_next(request)
 
+            if hasattr(request.state, "ray_id"):
+                set_span_attributes(span, {"hippius.ray_id": request.state.ray_id})
+
             if hasattr(request.state, "account_id"):
                 set_span_attributes(
                     span,

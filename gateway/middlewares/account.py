@@ -1,7 +1,6 @@
 """Account verification and credit checking middleware for the gateway."""
 
 import hashlib
-import logging
 import re
 from typing import Callable
 
@@ -17,10 +16,10 @@ from gateway.services.account_service import fetch_account
 from gateway.services.account_service import fetch_account_by_main_address
 from gateway.utils.errors import s3_error_response
 from hippius_s3.models.account import HippiusAccount
+from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 
 
 config = get_config()
-logger = logging.getLogger(__name__)
 
 
 async def account_middleware(request: Request, call_next: Callable) -> Response:
@@ -33,6 +32,9 @@ async def account_middleware(request: Request, call_next: Callable) -> Response:
 
     Read operations (GET, HEAD) get the account object but skip credit checks.
     """
+    ray_id = getattr(request.state, "ray_id", "no-ray-id")
+    logger = get_logger_with_ray_id(__name__, ray_id)
+
     path = request.url.path
 
     # Test bypass: short-circuit credit and substrate/redis access entirely
@@ -49,14 +51,10 @@ async def account_middleware(request: Request, call_next: Callable) -> Response:
                 upload=True,
                 delete=True,
             )
-            logger.info(f"DEBUG_ACL: Access key auth bypass: account_id={account_address}")
         elif hasattr(request.state, "seed_phrase"):
             seed_phrase = request.state.seed_phrase
             seed_hash = hashlib.sha256(seed_phrase.encode()).digest()
             account_id = seed_hash.hex()
-            logger.info(
-                f"DEBUG_ACL: Derived account_id from seed phrase: account_id={account_id}, seed_preview={seed_phrase[:20]}..."
-            )
             request.state.account_id = account_id
             request.state.account = HippiusAccount(
                 id=account_id,
@@ -67,7 +65,6 @@ async def account_middleware(request: Request, call_next: Callable) -> Response:
             )
         else:
             account_id = "anonymous"
-            logger.info("DEBUG_ACL: No seed phrase, using anonymous account_id")
             request.state.account_id = account_id
             request.state.account = HippiusAccount(
                 id=account_id,

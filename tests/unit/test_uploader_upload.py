@@ -19,7 +19,6 @@ def mock_config():
     config.uploader_multipart_max_concurrency = 5
     config.cache_ttl_seconds = 1800
     config.object_cache_dir = "/tmp/test_cache"
-    config.publish_to_chain = False
     return config
 
 
@@ -51,8 +50,9 @@ def mock_fs_store():
 @pytest.mark.asyncio
 async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock_fs_store):
     redis = FakeRedis()
+    redis_queues = FakeRedis()
 
-    uploader = Uploader(mock_db_pool, redis, mock_config)
+    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config)
     uploader.fs_store = mock_fs_store
 
     mock_upload_response = UploadResponse(
@@ -131,8 +131,9 @@ async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock
 @pytest.mark.asyncio
 async def test_build_and_upload_manifest_uses_new_api(mock_config, mock_db_pool, mock_fs_store):
     redis = FakeRedis()
+    redis_queues = FakeRedis()
 
-    uploader = Uploader(mock_db_pool, redis, mock_config)
+    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config)
 
     mock_upload_response = UploadResponse(
         id="manifest-uuid-456",
@@ -221,8 +222,9 @@ async def test_build_and_upload_manifest_uses_new_api(mock_config, mock_db_pool,
 @pytest.mark.asyncio
 async def test_upload_stores_api_file_id_in_database(mock_config, mock_db_pool, mock_fs_store):
     redis = FakeRedis()
+    redis_queues = FakeRedis()
 
-    uploader = Uploader(mock_db_pool, redis, mock_config)
+    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config)
     uploader.fs_store = mock_fs_store
 
     mock_upload_response = UploadResponse(
@@ -306,9 +308,10 @@ async def test_upload_stores_api_file_id_in_database(mock_config, mock_db_pool, 
 @pytest.mark.asyncio
 async def test_process_upload_no_longer_calls_pin_on_api(mock_config, mock_db_pool):
     redis = FakeRedis()
+    redis_queues = FakeRedis()
     mock_config.publish_to_chain = True
 
-    uploader = Uploader(mock_db_pool, redis, mock_config)
+    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config)
 
     mock_conn = AsyncMock()
     mock_conn.execute = AsyncMock()

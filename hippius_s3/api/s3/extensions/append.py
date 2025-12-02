@@ -157,6 +157,7 @@ async def handle_append(
             object_version=int(object_version),
             upload_id=str(result["upload_id"]),
             chunk_ids=[int(next_part)],
+            ray_id=getattr(request.state, "ray_id", "no-ray-id"),
         )
         with contextlib.suppress(Exception):
             logger.info(

@@ -28,7 +28,7 @@ async def run_cacher_once():
         logger.info("Cache update completed successfully")
     finally:
         if cacher.redis_client:
-            await cacher.redis_client.close()
+            await cacher.redis_client.aclose()
 
 
 async def main():

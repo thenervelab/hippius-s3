@@ -16,6 +16,7 @@ async def enqueue_upload(
     object_version: int,
     upload_id: str,
     chunk_ids: Iterable[int],
+    ray_id: str,
 ) -> None:
     payload = UploadChainRequest(
         address=address,
@@ -25,5 +26,6 @@ async def enqueue_upload(
         object_version=int(object_version),
         chunks=[Chunk(id=int(i)) for i in chunk_ids],
         upload_id=str(upload_id),
+        ray_id=ray_id,
     )
     await enqueue_upload_request(payload)

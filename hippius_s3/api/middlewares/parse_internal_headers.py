@@ -8,6 +8,8 @@ from fastapi import Request
 from fastapi import Response
 
 from hippius_s3.models.account import HippiusAccount
+from hippius_s3.services.ray_id_service import get_logger_with_ray_id
+from hippius_s3.services.ray_id_service import ray_id_context
 
 
 logger = logging.getLogger(__name__)
@@ -21,6 +23,7 @@ async def parse_internal_headers_middleware(
     Parse X-Hippius-* headers injected by the gateway into request.state.
 
     The gateway sets these headers after authenticating the request:
+    - X-Hippius-Ray-ID: Request tracing ID
     - X-Hippius-Account-Id: Subaccount ID from seed phrase
     - X-Hippius-Seed: Seed phrase
     - X-Hippius-Main-Account: Main account ID
@@ -28,6 +31,11 @@ async def parse_internal_headers_middleware(
     - X-Hippius-Can-Upload: Boolean upload permission
     - X-Hippius-Can-Delete: Boolean delete permission
     """
+    ray_id = request.headers.get("X-Hippius-Ray-ID", "no-ray-id")
+    ray_id_context.set(ray_id)
+    request.state.ray_id = ray_id
+    request.state.logger = get_logger_with_ray_id(__name__, ray_id)
+
     request.state.request_user_id = request.headers.get("X-Hippius-Request-User", "")
     request.state.bucket_owner_id = request.headers.get("X-Hippius-Bucket-Owner", "")
     request.state.account_id = request.state.request_user_id

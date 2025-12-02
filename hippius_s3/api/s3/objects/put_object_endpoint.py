@@ -179,6 +179,7 @@ async def handle_put_object(
                 object_version=int(current_object_version),
                 upload_id=str(put_res.upload_id),
                 chunk_ids=[1],
+                ray_id=getattr(request.state, "ray_id", "no-ray-id"),
             )
 
         get_metrics_collector().record_s3_operation(

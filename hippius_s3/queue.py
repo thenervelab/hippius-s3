@@ -54,6 +54,7 @@ class RetryableRequest(BaseModel):
     attempts: int = 0
     first_enqueued_at: float | None = None
     last_error: str | None = None
+    ray_id: str | None = None
 
 
 class UploadChainRequest(RetryableRequest):
@@ -101,17 +102,6 @@ class DownloadChainRequest(RetryableRequest):
     @property
     def name(self):
         return f"download::{self.request_id}::{self.object_id}::{self.address}"
-
-
-class SubstratePinningRequest(RetryableRequest):
-    cids: list[str]
-    address: str
-    object_id: str
-    object_version: int
-
-    @property
-    def name(self):
-        return f"substrate::{self.object_id}::{self.address}"
 
 
 async def enqueue_upload_request(payload: UploadChainRequest) -> None:
@@ -258,37 +248,18 @@ async def move_due_unpin_retries_to_primary(
     return moved
 
 
-DOWNLOAD_QUEUE = "download_requests"
-
-
 async def enqueue_download_request(payload: DownloadChainRequest) -> None:
     """Add a download request to the Redis queue for processing by downloader."""
     client = get_queue_client()
-    await client.lpush(DOWNLOAD_QUEUE, payload.model_dump_json())
+    await client.lpush("download_requests", payload.model_dump_json())
     logger.info(f"Enqueued download request {payload.name=}")
 
 
 async def dequeue_download_request() -> Union[DownloadChainRequest, None]:
     """Get the next download request from the Redis queue."""
     client = get_queue_client()
-    result = await client.brpop(DOWNLOAD_QUEUE, timeout=5)
+    result = await client.brpop("download_requests", timeout=5)
     if result:
         _, queue_data = result
         return DownloadChainRequest.model_validate_json(queue_data)
     return None
-
-
-SUBSTRATE_QUEUE = "substrate_requests"
-
-
-async def enqueue_substrate_request(payload: SubstratePinningRequest) -> None:
-    """Add a substrate pinning request to the Redis queue."""
-    client = get_queue_client()
-    if payload.request_id is None:
-        payload.request_id = uuid.uuid4().hex
-    if payload.first_enqueued_at is None:
-        payload.first_enqueued_at = time.time()
-    if payload.attempts is None:
-        payload.attempts = 0
-    await client.lpush(SUBSTRATE_QUEUE, payload.model_dump_json())
-    logger.info(f"Enqueued substrate request {payload.name=}")

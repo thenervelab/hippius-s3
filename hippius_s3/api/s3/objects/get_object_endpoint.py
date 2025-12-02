@@ -240,6 +240,7 @@ async def handle_get_object(
             # should_decrypt derived in reader from storage_version; keep for now to avoid breaking
             "should_decrypt": storage_version >= 3 or (not is_public_bucket),
             "storage_version": storage_version,
+            "ray_id": getattr(request.state, "ray_id", None),
         }
 
         with tracer.start_as_current_span(

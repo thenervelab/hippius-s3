@@ -91,9 +91,6 @@ class Config:
     cacher_loop_sleep = 60  # 1 minute
     pin_checker_loop_sleep = 7200  # 2 hours
 
-    # Resubmission settings
-    resubmission_seed_phrase: str = env("RESUBMISSION_SEED_PHRASE")
-
     # Uploader configuration (supersedes legacy pinner config)
     uploader_max_attempts: int = env("HIPPIUS_UPLOADER_MAX_ATTEMPTS:5", convert=int)
     uploader_backoff_base_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_BASE_MS:500", convert=int)
@@ -105,14 +102,6 @@ class Config:
 
     # Unpinner configuration
     unpinner_parallelism: int = env("HIPPIUS_UNPINNER_PARALLELISM:5", convert=int)
-
-    # Substrate worker configuration
-    substrate_batch_size: int = env("HIPPIUS_SUBSTRATE_BATCH_SIZE:5000", convert=int)
-    substrate_batch_max_age_sec: int = env("HIPPIUS_SUBSTRATE_BATCH_MAX_AGE_SEC:60", convert=int)
-    substrate_max_retries: int = env("HIPPIUS_SUBSTRATE_MAX_RETRIES:3", convert=int)
-    substrate_retry_base_ms: int = env("HIPPIUS_SUBSTRATE_RETRY_BASE_MS:5000", convert=int)
-    substrate_retry_max_ms: int = env("HIPPIUS_SUBSTRATE_RETRY_MAX_MS:15000", convert=int)
-    substrate_call_timeout_seconds: float = env("HIPPIUS_SUBSTRATE_CALL_TIMEOUT_SECONDS:20.0", convert=float)
 
     # Upload queue configuration
     upload_queue_names: str = env("HIPPIUS_UPLOAD_QUEUE_NAMES:upload_requests", convert=str)
@@ -155,12 +144,6 @@ class Config:
     ipfs_retry_base_ms: int = env("HIPPIUS_IPFS_RETRY_BASE_MS:500", convert=int)
     ipfs_retry_max_ms: int = env("HIPPIUS_IPFS_RETRY_MAX_MS:5000", convert=int)
 
-    # Substrate worker configuration
-    substrate_queue_name: str = env("HIPPIUS_SUBSTRATE_QUEUE_NAME:substrate_requests", convert=str)
-
-    # Publishing toggle (read directly from env; default true)
-    publish_to_chain: bool = env("PUBLISH_TO_CHAIN:true", convert=lambda x: x.lower() == "true")
-
     # Legacy SDK compatibility (temporary; set LEGACY_SDK_COMPAT=true to enable)
     enable_legacy_sdk_compat: bool = env("LEGACY_SDK_COMPAT:true", convert=lambda x: x.lower() == "true")
 
@@ -192,9 +175,7 @@ def get_config() -> Config:
 
     # Enforce environment constraints:
     # - Only in 'test' can enable_bypass_credit_check be True
-    # - Only in 'test' can publish_to_chain be False
     if env_value.lower() != "test":
         object.__setattr__(cfg, "enable_bypass_credit_check", False)
-        object.__setattr__(cfg, "publish_to_chain", True)
 
     return cfg
