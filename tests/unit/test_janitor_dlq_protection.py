@@ -2,6 +2,9 @@
 
 import asyncio
 import json
+
+# Import the janitor functions we need to test
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
@@ -14,10 +17,8 @@ from fakeredis.aioredis import FakeRedis
 from hippius_s3.cache import FileSystemPartsStore
 
 
-# Import the janitor functions we need to test
-import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "workers"))
-from run_janitor_in_loop import get_dlq_object_ids  # noqa: E402
+from run_janitor_in_loop import get_all_dlq_object_ids  # noqa: E402
 
 
 @pytest.fixture
@@ -39,6 +40,7 @@ def redis_with_dlq():
 @pytest_asyncio.fixture
 async def populate_dlq(redis_with_dlq):
     """Helper to populate DLQ with test entries."""
+
     async def _populate(object_ids: list[str]):
         for obj_id in object_ids:
             entry = {
@@ -51,40 +53,41 @@ async def populate_dlq(redis_with_dlq):
                 "first_enqueued_at": 1234567890.0,
                 "last_attempt_at": 1234567899.0,
                 "last_error": "connection timeout",
-                "error_type": "transient"
+                "error_type": "transient",
             }
             await redis_with_dlq.lpush("upload_requests:dlq", json.dumps(entry))
+
     return _populate
 
 
-class TestGetDlqObjectIds:
-    """Test suite for get_dlq_object_ids helper function."""
+class TestGetAllDlqObjectIds:
+    """Test suite for get_all_dlq_object_ids helper function."""
 
     @pytest.mark.asyncio
     async def test_empty_dlq_returns_empty_set(self, redis_with_dlq):
         """Test that empty DLQ returns empty set."""
-        result = await get_dlq_object_ids(redis_with_dlq)
+        result = await get_all_dlq_object_ids(redis_with_dlq)
         assert result == set()
 
     @pytest.mark.asyncio
     async def test_single_entry_returns_one_object_id(self, redis_with_dlq, populate_dlq):
         """Test DLQ with single entry."""
         await populate_dlq(["obj-123"])
-        result = await get_dlq_object_ids(redis_with_dlq)
+        result = await get_all_dlq_object_ids(redis_with_dlq)
         assert result == {"obj-123"}
 
     @pytest.mark.asyncio
     async def test_multiple_entries_returns_all_object_ids(self, redis_with_dlq, populate_dlq):
         """Test DLQ with multiple entries."""
         await populate_dlq(["obj-123", "obj-456", "obj-789"])
-        result = await get_dlq_object_ids(redis_with_dlq)
+        result = await get_all_dlq_object_ids(redis_with_dlq)
         assert result == {"obj-123", "obj-456", "obj-789"}
 
     @pytest.mark.asyncio
     async def test_duplicate_object_ids_deduplicated(self, redis_with_dlq, populate_dlq):
         """Test that duplicate object_ids are deduplicated."""
         await populate_dlq(["obj-123", "obj-123", "obj-456"])
-        result = await get_dlq_object_ids(redis_with_dlq)
+        result = await get_all_dlq_object_ids(redis_with_dlq)
         assert result == {"obj-123", "obj-456"}
 
     @pytest.mark.asyncio
@@ -92,7 +95,7 @@ class TestGetDlqObjectIds:
         """Test that invalid JSON entries are skipped."""
         await redis_with_dlq.lpush("upload_requests:dlq", "invalid-json{")
         await redis_with_dlq.lpush("upload_requests:dlq", json.dumps({"object_id": "obj-123"}))
-        result = await get_dlq_object_ids(redis_with_dlq)
+        result = await get_all_dlq_object_ids(redis_with_dlq)
         assert result == {"obj-123"}
 
     @pytest.mark.asyncio
@@ -100,7 +103,7 @@ class TestGetDlqObjectIds:
         """Test that entries without object_id are skipped."""
         await redis_with_dlq.lpush("upload_requests:dlq", json.dumps({"upload_id": "upload-123"}))
         await redis_with_dlq.lpush("upload_requests:dlq", json.dumps({"object_id": "obj-123"}))
-        result = await get_dlq_object_ids(redis_with_dlq)
+        result = await get_all_dlq_object_ids(redis_with_dlq)
         assert result == {"obj-123"}
 
     @pytest.mark.asyncio
@@ -108,7 +111,7 @@ class TestGetDlqObjectIds:
         """Test that timeout returns empty set."""
         mock_redis = MagicMock()
         mock_redis.lrange = AsyncMock(side_effect=asyncio.TimeoutError())
-        result = await get_dlq_object_ids(mock_redis)
+        result = await get_all_dlq_object_ids(mock_redis)
         assert result == set()
 
     @pytest.mark.asyncio
@@ -116,8 +119,34 @@ class TestGetDlqObjectIds:
         """Test that Redis errors return empty set."""
         mock_redis = MagicMock()
         mock_redis.lrange = AsyncMock(side_effect=Exception("Redis connection failed"))
-        result = await get_dlq_object_ids(mock_redis)
+        result = await get_all_dlq_object_ids(mock_redis)
         assert result == set()
+
+    @pytest.mark.asyncio
+    async def test_returns_object_ids_from_both_upload_and_unpin_dlqs(self, redis_with_dlq):
+        """Test that function returns object_ids from both upload and unpin DLQs."""
+        upload_entry = {
+            "object_id": "obj-upload-123",
+            "upload_id": "upload-123",
+            "bucket_name": "test-bucket",
+            "object_key": "key-123",
+            "attempts": 3,
+            "error_type": "transient",
+        }
+        await redis_with_dlq.lpush("upload_requests:dlq", json.dumps(upload_entry))
+
+        unpin_entry = {
+            "object_id": "obj-unpin-456",
+            "cid": "QmTest123",
+            "address": "0xTest",
+            "object_version": 1,
+            "attempts": 2,
+            "error_type": "transient",
+        }
+        await redis_with_dlq.lpush("unpin_requests:dlq", json.dumps(unpin_entry))
+
+        result = await get_all_dlq_object_ids(redis_with_dlq)
+        assert result == {"obj-upload-123", "obj-unpin-456"}
 
 
 class TestJanitorDlqProtection:
@@ -232,9 +261,10 @@ class TestJanitorDlqProtection:
     async def test_dlq_protection_logs_skipped_parts(self, redis_with_dlq, populate_dlq, caplog):
         """Test that DLQ protection logs debug messages."""
         import logging
+
         caplog.set_level(logging.DEBUG)
 
         await populate_dlq(["obj-123"])
 
-        result = await get_dlq_object_ids(redis_with_dlq)
+        result = await get_all_dlq_object_ids(redis_with_dlq)
         assert "obj-123" in result
