@@ -16,7 +16,6 @@ from typing import Callable
 from typing import Coroutine
 from typing import Dict
 from typing import TypeVar
-from typing import cast
 
 import httpx
 from pydantic import BaseModel
@@ -99,6 +98,26 @@ class FileStatusResponse(BaseModel):
     file_url: str
     created_at: str
     updated_at: str
+
+
+class FileItem(BaseModel):
+    file_id: str
+    cid: str
+    original_name: str
+    size_bytes: int
+    status: str
+    pinned_node_ids: list[str]
+    active_replica_count: int
+    miners: str
+    updated_at: str
+    created_at: str
+
+
+class ListFilesResponse(BaseModel):
+    count: int
+    next: str | None
+    previous: str | None
+    results: list[FileItem]
 
 
 class HippiusAPIError(Exception):
@@ -427,29 +446,37 @@ class HippiusApiClient:
     @retry_on_error(retries=3, backoff=5.0)
     async def list_files(
         self,
+        account_ss58: str,
         page: int = 1,
         page_size: int = 100,
-    ) -> Dict[str, Any]:
+    ) -> ListFilesResponse:
         """
         List files from Hippius API with pagination.
 
         Maps to: GET /storage-control/files/
 
         Args:
+            account_ss58: Account SS58 address
             page: Page number (default: 1)
             page_size: Results per page (default: 100)
 
         Returns:
-            Dict containing 'results' list and pagination info
+            ListFilesResponse: Paginated list of files with metadata
 
         Raises:
             HippiusAPIError: If the API request fails
         """
         response = await self._client.get(
             "/storage-control/files/",
-            params={"page": page, "page_size": page_size},
+            params={
+                "page": page,
+                "page_size": page_size,
+                "search": "^s3-*",
+                "include_pending": True,
+                "account_ss58": account_ss58,
+            },
             headers=self._get_headers(),
         )
 
         response.raise_for_status()
-        return cast(Dict[str, Any], response.json())
+        return ListFilesResponse.model_validate(response.json())

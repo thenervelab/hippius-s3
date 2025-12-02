@@ -32,61 +32,63 @@ async def check_for_orphans(
     """Check for orphaned files on chain that don't exist in local DB."""
     logger.info("Starting orphan check cycle...")
 
+    accounts = await db.fetch("SELECT DISTINCT main_account_id FROM users WHERE main_account_id IS NOT NULL")
+
+    total_checked = 0
+    total_orphans = 0
+
     async with HippiusApiClient() as api_client:
-        page = 1
-        total_checked = 0
-        total_orphans = 0
+        for account_row in accounts:
+            account_ss58 = account_row["main_account_id"]
+            logger.info(f"Checking files for account: {account_ss58}")
 
-        while True:
-            response = await api_client.list_files(
-                page=page,
-                page_size=config.orphan_checker_batch_size,
-            )
+            page = 1
+            while True:
+                response = await api_client.list_files(
+                    account_ss58=account_ss58,
+                    page=page,
+                    page_size=config.orphan_checker_batch_size,
+                )
 
-            results = response.get("results", [])
-            if not results:
-                break
+                if not response.results:
+                    break
 
-            logger.info(f"Processing page {page} with {len(results)} files")
+                logger.info(f"Processing page {page} with {len(response.results)} files for {account_ss58}")
 
-            for file_data in results:
-                total_checked += 1
+                for file_item in response.results:
+                    total_checked += 1
 
-                cid = file_data.get("cid")
-                original_name = file_data.get("original_name", "")
-                account = file_data.get("account_ss58")
+                    if not file_item.original_name.startswith("s3-"):
+                        continue
 
-                if not original_name.startswith("s3-"):
-                    continue
+                    if not file_item.cid:
+                        logger.warning(f"Skipping file with missing CID: {file_item.file_id}")
+                        continue
 
-                if not cid or not account:
-                    logger.warning(f"Skipping file with missing CID or account: {file_data}")
-                    continue
-
-                row = await db.fetchrow("SELECT EXISTS(SELECT 1 FROM cids WHERE cid = $1) AS exists", cid)
-
-                if not row["exists"]:
-                    logger.warning(
-                        f"Found orphaned file: CID={cid}, account={account}, "
-                        f"filename={original_name}, size={file_data.get('size_bytes')}"
-                    )
-                    total_orphans += 1
-
-                    await enqueue_unpin_request(
-                        payload=UnpinChainRequest(
-                            address=account,
-                            object_id="00000000-0000-0000-0000-000000000000",
-                            object_version=0,
-                            cid=cid,
-                        ),
+                    row = await db.fetchrow(
+                        "SELECT EXISTS(SELECT 1 FROM cids WHERE cid = $1) AS exists", file_item.cid
                     )
 
+                    if not row["exists"]:
+                        logger.warning(
+                            f"Found orphaned file: CID={file_item.cid}, "
+                            f"filename={file_item.original_name}, size={file_item.size_bytes}"
+                        )
+                        total_orphans += 1
 
-            next_page = response.get("next")
-            if not next_page:
-                break
+                        await enqueue_unpin_request(
+                            payload=UnpinChainRequest(
+                                address=account_ss58,
+                                object_id="00000000-0000-0000-0000-000000000000",
+                                object_version=0,
+                                cid=file_item.cid,
+                            ),
+                        )
 
-            page += 1
+                if not response.next:
+                    break
+
+                page += 1
 
     logger.info(f"Orphan check complete: checked {total_checked} files, found {total_orphans} orphans")
     get_metrics_collector().record_orphan_checker_operation(

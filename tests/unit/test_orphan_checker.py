@@ -1,7 +1,12 @@
 import json
+from unittest.mock import AsyncMock
+from unittest.mock import patch
+
 import pytest
-from unittest.mock import AsyncMock, patch
 from fakeredis.aioredis import FakeRedis
+
+from hippius_s3.services.hippius_api_service import FileItem
+from hippius_s3.services.hippius_api_service import ListFilesResponse
 
 
 @pytest.fixture
@@ -9,6 +14,7 @@ def mock_db():
     """Mock asyncpg connection"""
     conn = AsyncMock()
     conn.fetchrow = AsyncMock()
+    conn.fetch = AsyncMock()
     return conn
 
 
@@ -25,22 +31,31 @@ def mock_redis_queues():
 @pytest.mark.asyncio
 async def test_orphan_file_queued_for_unpinning(mock_db, mock_redis_queues):
     """Test that orphan files (on chain but not in DB) are queued for unpinning"""
+    mock_db.fetch.return_value = [{"main_account_id": "5TestAccount"}]
     mock_db.fetchrow.return_value = {"exists": False}
 
     with patch("workers.run_orphan_checker_in_loop.HippiusApiClient") as mock_api:
         mock_api_instance = AsyncMock()
         mock_api_instance.list_files = AsyncMock(
-            return_value={
-                "results": [
-                    {
-                        "cid": "QmOrphanFile123",
-                        "original_name": "s3-orphan-test",
-                        "account_ss58": "5TestAccount",
-                        "size_bytes": 1024,
-                    }
+            return_value=ListFilesResponse(
+                count=1,
+                next=None,
+                previous=None,
+                results=[
+                    FileItem(
+                        file_id="file123",
+                        cid="QmOrphanFile123",
+                        original_name="s3-orphan-test",
+                        size_bytes=1024,
+                        status="active",
+                        pinned_node_ids=["node1"],
+                        active_replica_count=1,
+                        miners="miner1",
+                        updated_at="2025-01-01T00:00:00Z",
+                        created_at="2025-01-01T00:00:00Z",
+                    )
                 ],
-                "next": None,
-            }
+            )
         )
         mock_api_instance.__aenter__ = AsyncMock(return_value=mock_api_instance)
         mock_api_instance.__aexit__ = AsyncMock()
@@ -63,22 +78,31 @@ async def test_orphan_file_queued_for_unpinning(mock_db, mock_redis_queues):
 @pytest.mark.asyncio
 async def test_non_orphan_file_not_queued(mock_db, mock_redis_queues):
     """Test that non-orphan files (exist in DB) are not queued for unpinning"""
+    mock_db.fetch.return_value = [{"main_account_id": "5TestAccount"}]
     mock_db.fetchrow.return_value = {"exists": True}
 
     with patch("workers.run_orphan_checker_in_loop.HippiusApiClient") as mock_api:
         mock_api_instance = AsyncMock()
         mock_api_instance.list_files = AsyncMock(
-            return_value={
-                "results": [
-                    {
-                        "cid": "QmValidFile456",
-                        "original_name": "s3-valid-file",
-                        "account_ss58": "5TestAccount",
-                        "size_bytes": 2048,
-                    }
+            return_value=ListFilesResponse(
+                count=1,
+                next=None,
+                previous=None,
+                results=[
+                    FileItem(
+                        file_id="file456",
+                        cid="QmValidFile456",
+                        original_name="s3-valid-file",
+                        size_bytes=2048,
+                        status="active",
+                        pinned_node_ids=["node1"],
+                        active_replica_count=1,
+                        miners="miner1",
+                        updated_at="2025-01-01T00:00:00Z",
+                        created_at="2025-01-01T00:00:00Z",
+                    )
                 ],
-                "next": None,
-            }
+            )
         )
         mock_api_instance.__aenter__ = AsyncMock(return_value=mock_api_instance)
         mock_api_instance.__aexit__ = AsyncMock()
@@ -95,34 +119,51 @@ async def test_non_orphan_file_not_queued(mock_db, mock_redis_queues):
 @pytest.mark.asyncio
 async def test_pagination_processes_all_pages(mock_db, mock_redis_queues):
     """Test that pagination is handled correctly and all pages are processed"""
+    mock_db.fetch.return_value = [{"main_account_id": "5TestAccount"}]
     mock_db.fetchrow.return_value = {"exists": False}
 
     with patch("workers.run_orphan_checker_in_loop.HippiusApiClient") as mock_api:
         mock_api_instance = AsyncMock()
 
-        page1_response = {
-            "results": [
-                {
-                    "cid": "QmPage1File1",
-                    "original_name": "s3-page1-file1",
-                    "account_ss58": "5TestAccount",
-                    "size_bytes": 1024,
-                }
+        page1_response = ListFilesResponse(
+            count=2,
+            next="http://api.hippius.com/storage-control/files/?page=2",
+            previous=None,
+            results=[
+                FileItem(
+                    file_id="file1",
+                    cid="QmPage1File1",
+                    original_name="s3-page1-file1",
+                    size_bytes=1024,
+                    status="active",
+                    pinned_node_ids=["node1"],
+                    active_replica_count=1,
+                    miners="miner1",
+                    updated_at="2025-01-01T00:00:00Z",
+                    created_at="2025-01-01T00:00:00Z",
+                )
             ],
-            "next": "http://api.hippius.com/storage-control/files/?page=2",
-        }
+        )
 
-        page2_response = {
-            "results": [
-                {
-                    "cid": "QmPage2File1",
-                    "original_name": "s3-page2-file1",
-                    "account_ss58": "5TestAccount",
-                    "size_bytes": 2048,
-                }
+        page2_response = ListFilesResponse(
+            count=2,
+            next=None,
+            previous="http://api.hippius.com/storage-control/files/?page=1",
+            results=[
+                FileItem(
+                    file_id="file2",
+                    cid="QmPage2File1",
+                    original_name="s3-page2-file1",
+                    size_bytes=2048,
+                    status="active",
+                    pinned_node_ids=["node1"],
+                    active_replica_count=1,
+                    miners="miner1",
+                    updated_at="2025-01-01T00:00:00Z",
+                    created_at="2025-01-01T00:00:00Z",
+                )
             ],
-            "next": None,
-        }
+        )
 
         mock_api_instance.list_files = AsyncMock(side_effect=[page1_response, page2_response])
         mock_api_instance.__aenter__ = AsyncMock(return_value=mock_api_instance)
