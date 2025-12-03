@@ -59,6 +59,12 @@ class GatewayConfig:
     hippius_secret_decryption_material: str = dataclasses.field(
         default_factory=lambda: os.getenv("HIPPIUS_AUTH_ENCRYPTION_KEY", "")
     )
+    enable_api_docs: bool = dataclasses.field(
+        default_factory=lambda: os.getenv("ENABLE_API_DOCS", "true").lower() == "true"
+    )
+    docs_cache_ttl_seconds: int = dataclasses.field(
+        default_factory=lambda: int(os.getenv("DOCS_CACHE_TTL_SECONDS", "300"))
+    )
 
 
 _config: GatewayConfig | None = None

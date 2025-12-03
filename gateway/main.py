@@ -23,7 +23,9 @@ from gateway.middlewares.ray_id import ray_id_middleware
 from gateway.middlewares.tracing import tracing_middleware
 from gateway.middlewares.trailing_slash import trailing_slash_normalizer
 from gateway.routers.acl import router as acl_router
+from gateway.routers.docs import router as docs_router
 from gateway.services.acl_service import ACLService
+from gateway.services.docs_proxy_service import DocsProxyService
 from gateway.services.forward_service import ForwardService
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.monitoring import MetricsCollector
@@ -35,7 +37,13 @@ logger = setup_loki_logging(config, "hippius-s3-gateway")
 
 
 def factory() -> FastAPI:
-    app = FastAPI(title="Hippius S3 Gateway", version="1.0.0")
+    app = FastAPI(
+        title="Hippius S3 API",
+        version="1.0.0",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
 
     @app.on_event("startup")
     async def startup() -> None:
@@ -75,6 +83,13 @@ def factory() -> FastAPI:
         )
         logger.info("ACLService initialized")
 
+        app.state.docs_proxy_service = DocsProxyService(
+            backend_url=config.backend_url,
+            redis_client=app.state.redis_client,
+            cache_ttl=config.docs_cache_ttl_seconds,
+        )
+        logger.info("DocsProxyService initialized")
+
         logger.info("Gateway startup complete")
 
     @app.on_event("shutdown")
@@ -110,6 +125,7 @@ def factory() -> FastAPI:
     async def health() -> Dict[str, str]:
         return {"status": "healthy", "service": "gateway"}
 
+    app.include_router(docs_router)
     app.include_router(acl_router)
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD", "PATCH"])
