@@ -234,7 +234,7 @@ async def test_presigned_get_with_access_key_uses_access_key_auth(auth_router_ap
         "X-Amz-Signature": "deadbeef",
     }
 
-    with patch("gateway.middlewares.auth_router.verify_access_key_presigned_url", mock_verify):
+    with patch("gateway.services.auth_orchestrator.verify_access_key_presigned_url", mock_verify):
         async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
             response = await client.get("/test", params=query_params)
 
