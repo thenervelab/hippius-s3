@@ -25,10 +25,7 @@ async def get_openapi_json(request: Request) -> JSONResponse:
         return JSONResponse(schema)
     except Exception as e:
         logger.error(f"Failed to fetch OpenAPI schema: {e}")
-        return JSONResponse(
-            {"error": "Failed to fetch API documentation"},
-            status_code=500
-        )
+        return JSONResponse({"error": "Failed to fetch API documentation"}, status_code=500)
 
 
 @router.get("/docs", response_class=HTMLResponse, include_in_schema=False)
@@ -42,7 +39,7 @@ async def get_redoc() -> HTMLResponse:
 
 
 @router.delete("/docs/cache", include_in_schema=False)
-async def clear_docs_cache(request: Request):
+async def clear_docs_cache(request: Request) -> dict[str, str]:
     docs_service: DocsProxyService = request.app.state.docs_proxy_service
     await docs_service.clear_cache()
     return {"status": "cache cleared"}

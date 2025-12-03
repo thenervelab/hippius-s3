@@ -1,6 +1,7 @@
 import json
 import logging
 import time
+from typing import Any
 
 import httpx
 from redis.asyncio import Redis
@@ -15,16 +16,17 @@ class DocsProxyService:
         self.redis_client = redis_client
         self.cache_ttl = cache_ttl
         self.cache_key = "docs:openapi_schema"
-        self.memory_cache = None
-        self.cache_timestamp = 0
+        self.memory_cache: dict[Any, Any] | None = None
+        self.cache_timestamp: float = 0.0
         logger.info(f"DocsProxyService initialized with backend: {backend_url}, cache TTL: {cache_ttl}s")
 
-    async def get_openapi_schema(self) -> dict:
+    async def get_openapi_schema(self) -> dict[Any, Any]:
         try:
             cached = await self.redis_client.get(self.cache_key)
             if cached:
                 logger.debug("OpenAPI schema cache hit (Redis)")
-                return json.loads(cached)
+                schema_dict: dict[Any, Any] = json.loads(cached)
+                return schema_dict
         except Exception as e:
             logger.warning(f"Redis cache read failed: {e}")
 
@@ -46,14 +48,14 @@ class DocsProxyService:
 
         return schema
 
-    async def fetch_from_backend(self) -> dict:
+    async def fetch_from_backend(self) -> dict[Any, Any]:
         url = f"{self.backend_url}/openapi.json"
         async with httpx.AsyncClient(timeout=10.0) as client:
             try:
                 logger.debug(f"Fetching OpenAPI schema from {url}")
                 response = await client.get(url)
                 response.raise_for_status()
-                schema = response.json()
+                schema: dict[Any, Any] = response.json()
                 logger.info("Successfully fetched OpenAPI schema from backend")
                 return schema
             except httpx.HTTPError as e:
@@ -63,7 +65,7 @@ class DocsProxyService:
                 logger.error(f"Unexpected error fetching OpenAPI schema: {e}")
                 raise
 
-    async def clear_cache(self):
+    async def clear_cache(self) -> None:
         try:
             await self.redis_client.delete(self.cache_key)
             logger.info("Cleared OpenAPI schema from Redis cache")
@@ -71,5 +73,5 @@ class DocsProxyService:
             logger.warning(f"Failed to clear Redis cache: {e}")
 
         self.memory_cache = None
-        self.cache_timestamp = 0
+        self.cache_timestamp = 0.0
         logger.info("Cleared OpenAPI schema from memory cache")
