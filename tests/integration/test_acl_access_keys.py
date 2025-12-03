@@ -51,7 +51,7 @@ async def test_sub_token_denied_without_grants(integration_app: Any) -> None:
     # Patch verify function as AsyncMock
     mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
 
-    with patch("gateway.middlewares.auth_router.verify_access_key_signature", mock_verify):
+    with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
         with patch("gateway.middlewares.account.config.bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
@@ -76,7 +76,7 @@ async def test_sub_token_allowed_with_access_key_grant(integration_app: Any) -> 
 
     mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
 
-    with patch("gateway.middlewares.auth_router.verify_access_key_signature", mock_verify):
+    with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
         with patch("gateway.middlewares.account.config.bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
@@ -102,7 +102,7 @@ async def test_sub_token_denied_with_different_key_grant(integration_app: Any) -
 
     mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
 
-    with patch("gateway.middlewares.auth_router.verify_access_key_signature", mock_verify):
+    with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
         with patch("gateway.middlewares.account.config.bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
@@ -124,7 +124,7 @@ async def test_master_token_bypasses_acl_for_owned_bucket(integration_app: Any) 
 
     mock_verify = AsyncMock(return_value=(True, alice_id, "master"))
 
-    with patch("gateway.middlewares.auth_router.verify_access_key_signature", mock_verify):
+    with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
         with patch("gateway.middlewares.account.config.bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.put(
@@ -150,7 +150,7 @@ async def test_account_grant_allows_all_keys(integration_app: Any) -> None:
 
         mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
 
-        with patch("gateway.middlewares.auth_router.verify_access_key_signature", mock_verify):
+        with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
             with patch("gateway.middlewares.account.config.bypass_credit_check", True):
                 async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                     response = await client.get(
@@ -174,7 +174,7 @@ async def test_cross_account_access_key_grant(integration_app: Any) -> None:
 
     mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
 
-    with patch("gateway.middlewares.auth_router.verify_access_key_signature", mock_verify):
+    with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
         with patch("gateway.middlewares.account.config.bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
@@ -208,7 +208,7 @@ async def test_presigned_get_uses_access_key_for_acl(integration_app: Any) -> No
     # Patch presigned verifier to simulate successful verification and account mapping
     mock_verify_presigned = AsyncMock(return_value=(True, bob_id, "sub"))
 
-    with patch("gateway.middlewares.auth_router.verify_access_key_presigned_url", mock_verify_presigned):
+    with patch("gateway.services.auth_orchestrator.verify_access_key_presigned_url", mock_verify_presigned):
         with patch("gateway.middlewares.account.config.bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get("/alice-bucket/test.txt", params=query_params)
