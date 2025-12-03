@@ -108,7 +108,7 @@ class FileItem(BaseModel):
     status: str
     pinned_node_ids: list[str]
     active_replica_count: int
-    miners: str
+    miners: Any
     updated_at: str
     created_at: str
 
@@ -471,7 +471,7 @@ class HippiusApiClient:
             params={
                 "page": page,
                 "page_size": page_size,
-                "search": "^s3-*",
+                "only_s3": True,
                 "include_pending": True,
                 "account_ss58": account_ss58,
             },
