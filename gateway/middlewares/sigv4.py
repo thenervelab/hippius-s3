@@ -341,3 +341,25 @@ def canonicalize_query_string(query_string: str) -> str:
     # Re-encode with proper AWS formatting
     # RFC 3986 unreserved characters: -_.~
     return urlencode(params, quote_via=quote, safe="-_.~")
+
+
+def canonicalize_presigned_query_string(query_string: str) -> str:
+    """
+    Canonicalize query string for AWS SigV4 presigned URLs.
+
+    This is similar to canonicalize_query_string but excludes X-Amz-Signature
+    from the canonical representation, matching AWS S3 presigned URL rules.
+    """
+    if not query_string:
+        return ""
+
+    params = parse_qsl(query_string, keep_blank_values=True)
+
+    # Exclude the signature itself from the canonical query string
+    params = [(k, v) for (k, v) in params if k != "X-Amz-Signature"]
+
+    # Sort by (name, value) to match AWS canonicalization for repeated keys
+    params.sort(key=lambda x: (x[0], x[1]))
+
+    # RFC 3986 unreserved characters: -_.~
+    return urlencode(params, quote_via=quote, safe="-_.~")

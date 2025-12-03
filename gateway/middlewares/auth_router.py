@@ -6,6 +6,7 @@ from fastapi import Response
 from starlette import status
 
 from gateway.middlewares.access_key_auth import AccessKeyAuthError
+from gateway.middlewares.access_key_auth import verify_access_key_presigned_url
 from gateway.middlewares.access_key_auth import verify_access_key_signature
 from gateway.middlewares.sigv4 import AuthParsingError
 from gateway.middlewares.sigv4 import SigV4Verifier
@@ -41,6 +42,74 @@ async def auth_router_middleware(
 
     path = request.url.path
     if any(path.startswith(exempt_path) or path == exempt_path for exempt_path in exempt_paths):
+        return await call_next(request)
+
+    # Detect AWS SigV4 query-string authentication (presigned URL)
+    query_params = request.query_params
+    x_amz_algorithm = query_params.get("X-Amz-Algorithm")
+    x_amz_credential = query_params.get("X-Amz-Credential")
+    x_amz_signature = query_params.get("X-Amz-Signature")
+
+    is_presigned = (
+        x_amz_algorithm == "AWS4-HMAC-SHA256"
+        and x_amz_credential is not None
+        and x_amz_signature is not None
+    )
+
+    if is_presigned:
+        # Extract access key ID from X-Amz-Credential
+        credential_id = x_amz_credential.split("/", 1)[0]
+
+        # v1: presigned URLs are only supported for access keys (hip_*)
+        if not credential_id.startswith("hip_"):
+            logger.warning(f"Presigned URL credential is not a hip_ access key: {credential_id[:8]}***")
+            return s3_error_response(
+                code="InvalidAccessKeyId",
+                message="The AWS Access Key Id you provided does not exist in our records.",
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+
+        logger.debug(f"Detected presigned URL access key authentication: {credential_id[:8]}***")
+
+        try:
+            is_valid, account_address, token_type = await verify_access_key_presigned_url(
+                request=request,
+                access_key=credential_id,
+            )
+        except AccessKeyAuthError as e:
+            logger.warning(f"Presigned URL access key auth error: {e}")
+            return s3_error_response(
+                code="SignatureDoesNotMatch",
+                message="The request signature we calculated does not match the signature you provided",
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+        except HippiusAPIError as e:
+            logger.error(f"Hippius API error during presigned URL auth: {e}")
+            return s3_error_response(
+                code="ServiceUnavailable",
+                message="Authentication service temporarily unavailable",
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except Exception as e:
+            logger.exception(f"Unexpected presigned URL auth error: {e}")
+            return s3_error_response(
+                code="InternalError",
+                message="An internal error occurred",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        if not is_valid:
+            return s3_error_response(
+                code="SignatureDoesNotMatch",
+                message="The request signature we calculated does not match the signature you provided",
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+
+        request.state.access_key = credential_id
+        request.state.account_address = account_address
+        request.state.token_type = token_type
+        request.state.auth_method = "access_key"
+
         return await call_next(request)
 
     if request.method in ["GET", "HEAD"]:
