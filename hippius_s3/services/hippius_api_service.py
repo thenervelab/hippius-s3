@@ -100,6 +100,26 @@ class FileStatusResponse(BaseModel):
     updated_at: str
 
 
+class FileItem(BaseModel):
+    file_id: str
+    cid: str
+    original_name: str
+    size_bytes: int
+    status: str
+    pinned_node_ids: list[str]
+    active_replica_count: int
+    miners: Any
+    updated_at: str
+    created_at: str
+
+
+class ListFilesResponse(BaseModel):
+    count: int
+    next: str | None
+    previous: str | None
+    results: list[FileItem]
+
+
 class HippiusAPIError(Exception):
     """Raised when there's an authentication issue with the API."""
 
@@ -422,3 +442,41 @@ class HippiusApiClient:
 
         response.raise_for_status()
         return FileStatusResponse.model_validate(response.json())
+
+    @retry_on_error(retries=3, backoff=5.0)
+    async def list_files(
+        self,
+        account_ss58: str,
+        page: int = 1,
+        page_size: int = 100,
+    ) -> ListFilesResponse:
+        """
+        List files from Hippius API with pagination.
+
+        Maps to: GET /storage-control/files/
+
+        Args:
+            account_ss58: Account SS58 address
+            page: Page number (default: 1)
+            page_size: Results per page (default: 100)
+
+        Returns:
+            ListFilesResponse: Paginated list of files with metadata
+
+        Raises:
+            HippiusAPIError: If the API request fails
+        """
+        response = await self._client.get(
+            "/storage-control/files/",
+            params={
+                "page": page,
+                "page_size": page_size,
+                "only_s3": True,
+                "include_pending": True,
+                "account_ss58": account_ss58,
+            },
+            headers=self._get_headers(),
+        )
+
+        response.raise_for_status()
+        return ListFilesResponse.model_validate(response.json())
