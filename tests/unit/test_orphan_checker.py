@@ -180,3 +180,89 @@ async def test_pagination_processes_all_pages(mock_db, mock_redis_queues):
         cids = [json.loads(item)["cid"] for item in queued_items]
         assert "QmPage1File1" in cids
         assert "QmPage2File1" in cids
+
+
+@pytest.mark.asyncio
+async def test_chunk_cid_in_part_chunks_not_orphaned(mock_db, mock_redis_queues):
+    """Test that chunk CIDs stored in part_chunks are not marked as orphans"""
+    mock_db.fetch.return_value = [{"main_account_id": "5TestAccount"}]
+    mock_db.fetchrow.return_value = {"exists": True}
+
+    with patch("workers.run_orphan_checker_in_loop.HippiusApiClient") as mock_api:
+        mock_api_instance = AsyncMock()
+        mock_api_instance.list_files = AsyncMock(
+            return_value=ListFilesResponse(
+                count=1,
+                next=None,
+                previous=None,
+                results=[
+                    FileItem(
+                        file_id="chunk789",
+                        cid="QmChunkCID789",
+                        original_name="s3-chunk-test",
+                        size_bytes=512,
+                        status="active",
+                        pinned_node_ids=["node1"],
+                        active_replica_count=1,
+                        miners="miner1",
+                        updated_at="2025-01-01T00:00:00Z",
+                        created_at="2025-01-01T00:00:00Z",
+                    )
+                ],
+            )
+        )
+        mock_api_instance.__aenter__ = AsyncMock(return_value=mock_api_instance)
+        mock_api_instance.__aexit__ = AsyncMock()
+        mock_api.return_value = mock_api_instance
+
+        from workers.run_orphan_checker_in_loop import check_for_orphans
+
+        await check_for_orphans(mock_db)
+
+        queued_items = await mock_redis_queues.lrange("unpin_requests", 0, -1)
+        assert len(queued_items) == 0
+
+
+@pytest.mark.asyncio
+async def test_orphan_chunk_cid_queued_for_unpinning(mock_db, mock_redis_queues):
+    """Test that orphaned chunk CIDs (not in cids or part_chunks) are queued"""
+    mock_db.fetch.return_value = [{"main_account_id": "5TestAccount"}]
+    mock_db.fetchrow.return_value = {"exists": False}
+
+    with patch("workers.run_orphan_checker_in_loop.HippiusApiClient") as mock_api:
+        mock_api_instance = AsyncMock()
+        mock_api_instance.list_files = AsyncMock(
+            return_value=ListFilesResponse(
+                count=1,
+                next=None,
+                previous=None,
+                results=[
+                    FileItem(
+                        file_id="orphan_chunk",
+                        cid="QmOrphanChunk999",
+                        original_name="s3-orphan-chunk",
+                        size_bytes=256,
+                        status="active",
+                        pinned_node_ids=["node1"],
+                        active_replica_count=1,
+                        miners="miner1",
+                        updated_at="2025-01-01T00:00:00Z",
+                        created_at="2025-01-01T00:00:00Z",
+                    )
+                ],
+            )
+        )
+        mock_api_instance.__aenter__ = AsyncMock(return_value=mock_api_instance)
+        mock_api_instance.__aexit__ = AsyncMock()
+        mock_api.return_value = mock_api_instance
+
+        from workers.run_orphan_checker_in_loop import check_for_orphans
+
+        await check_for_orphans(mock_db)
+
+        queued_items = await mock_redis_queues.lrange("unpin_requests", 0, -1)
+        assert len(queued_items) == 1
+
+        request = json.loads(queued_items[0])
+        assert request["cid"] == "QmOrphanChunk999"
+        assert request["address"] == "5TestAccount"

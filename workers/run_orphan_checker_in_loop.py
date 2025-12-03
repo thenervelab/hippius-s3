@@ -34,6 +34,10 @@ async def check_for_orphans(
 
     accounts = await db.fetch("SELECT DISTINCT main_account_id FROM users WHERE main_account_id IS NOT NULL")
 
+    if config.orphan_checker_account_whitelist:
+        accounts = [acc for acc in accounts if acc["main_account_id"] in config.orphan_checker_account_whitelist]
+        logger.info(f"Filtered to {len(accounts)} whitelisted accounts: {config.orphan_checker_account_whitelist}")
+
     total_checked = 0
     total_orphans = 0
 
@@ -66,7 +70,13 @@ async def check_for_orphans(
                         continue
 
                     row = await db.fetchrow(
-                        "SELECT EXISTS(SELECT 1 FROM cids WHERE cid = $1) AS exists", file_item.cid
+                        """
+                        SELECT (
+                            EXISTS(SELECT 1 FROM cids WHERE cid = $1)
+                            OR EXISTS(SELECT 1 FROM part_chunks WHERE cid = $1)
+                        ) AS exists
+                        """,
+                        file_item.cid,
                     )
 
                     if not row["exists"]:
@@ -79,6 +89,7 @@ async def check_for_orphans(
                         await enqueue_unpin_request(
                             payload=UnpinChainRequest(
                                 address=account_ss58,
+                                # id not needed
                                 object_id="00000000-0000-0000-0000-000000000000",
                                 object_version=0,
                                 cid=file_item.cid,
@@ -113,6 +124,10 @@ async def run_orphan_checker_loop() -> None:
     logger.info(f"Redis Queues URL: {config.redis_queues_url}")
     logger.info(f"Check interval: {config.orphan_checker_loop_sleep} seconds")
     logger.info(f"Batch size: {config.orphan_checker_batch_size} files")
+    if config.orphan_checker_account_whitelist:
+        logger.info(f"Account whitelist: {config.orphan_checker_account_whitelist}")
+    else:
+        logger.info("Account whitelist: disabled (processing all accounts)")
 
     while True:
         try:
