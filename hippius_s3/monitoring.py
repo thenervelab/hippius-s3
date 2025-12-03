@@ -646,6 +646,11 @@ class MetricsCollector:
         attributes = {"database": database_name}
         self.backup_cleanup_deleted_count.add(deleted_count, attributes=attributes)
 
+    def record_orphan_checker_operation(
+        self, orphans_found: int = 0, files_checked: int = 0, success: bool = True
+    ) -> None:
+        pass
+
 
 class NullMetricsCollector:
     def __init__(self) -> None:
@@ -698,6 +703,9 @@ class NullMetricsCollector:
         pass
 
     def record_backup_cleanup(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_orphan_checker_operation(self, *args: object, **kwargs: object) -> None:
         pass
 
 
