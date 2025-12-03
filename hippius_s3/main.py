@@ -2,6 +2,7 @@
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncGenerator
 
 import asyncpg
@@ -11,6 +12,7 @@ from fastapi import FastAPI
 from fastapi import Response
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from hippius_s3.api.middlewares.ip_whitelist import ip_whitelist_middleware
 from hippius_s3.api.middlewares.metrics import metrics_middleware
@@ -174,9 +176,10 @@ def factory() -> FastAPI:
 
     app = FastAPI(
         title="Hippius S3",
-        description="S3 Gateway for Hippius' IPFS storage",
+        description="Hippius S3 Gateway",
         docs_url="/docs" if config.enable_api_docs else None,
         redoc_url="/redoc" if config.enable_api_docs else None,
+        swagger_favicon_url="/static/favicon.ico",
         lifespan=lifespan,
         debug=config.debug,
         default_response_class=Response,
@@ -192,13 +195,18 @@ def factory() -> FastAPI:
             routes=app.routes,
         )
         openapi_schema["components"]["securitySchemes"] = {
-            "Base64 encoded seed phrase": {
+            "Access Key": {
                 "type": "http",
                 "scheme": "bearer",
-                "description": "Enter your base64-encoded seed phrase",
+                "description": (
+                    "Bearer token authentication using Hippius access keys. "
+                    "Format: 'hip_' followed by alphanumeric characters. "
+                    "Example: hip_abc123def456ghi789. "
+                    "Obtain from https://console.hippius.com/dashboard/settings"
+                ),
             }
         }
-        openapi_schema["security"] = [{"Base64 encoded seed phrase": []}]
+        openapi_schema["security"] = [{"Access Key": []}]
         app.openapi_schema = openapi_schema
         return app.openapi_schema
 
@@ -269,6 +277,9 @@ Disallow: /"""
     app.include_router(public_router, prefix="")
     app.include_router(s3_router_new, prefix="")
     app.include_router(multipart_router, prefix="")
+
+    static_dir = Path(__file__).parent / "static"
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
     return app
 

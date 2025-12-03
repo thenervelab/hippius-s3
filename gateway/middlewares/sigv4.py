@@ -307,9 +307,10 @@ async def sigv4_middleware(
 
     # Allow anonymous GET/HEAD requests for public bucket access
     # ACL middleware will handle authorization
+    # Exclude ListBuckets (/) which always requires authentication
     if request.method in ["GET", "HEAD"]:
         auth_header = request.headers.get("authorization")
-        if not auth_header:
+        if not auth_header and path != "/":
             # No authentication provided - continue as anonymous
             # request.state.seed_phrase will not be set
             return await call_next(request)
