@@ -18,6 +18,7 @@ from hippius_s3.services.hippius_api_service import HippiusApiClient
 from hippius_s3.services.hippius_api_service import HippiusAPIError
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 
+
 logger = logging.getLogger(__name__)
 
 AuthMethod = Literal["access_key", "seed_phrase", "anonymous", "bearer_access_key"]
@@ -64,7 +65,7 @@ async def authenticate_request(request: Request) -> AuthResult:
     if not auth_header:
         if request.method in ["GET", "HEAD"]:
             return AuthResult(is_valid=True, auth_method="anonymous")
-        
+
         return AuthResult(
             error_response=s3_error_response(
                 code="InvalidAccessKeyId",
@@ -92,8 +93,8 @@ async def authenticate_request(request: Request) -> AuthResult:
     # 4. Access Key vs Seed Phrase Branching
     if credential.startswith("hip_"):
         return await _authenticate_access_key_header(request, credential, logger)
-    else:
-        return await _authenticate_seed_phrase(request, logger)
+
+    return await _authenticate_seed_phrase(request, logger)
 
 
 async def _authenticate_presigned_url(request: Request, logger: Any) -> AuthResult:
@@ -180,9 +181,7 @@ async def _authenticate_bearer(request: Request, auth_header: str, logger: Any) 
             token_response = await api_client.auth(token)
 
         if not token_response.valid or token_response.status != "active":
-            logger.warning(
-                f"Invalid or inactive Bearer access key: {token[:8]}***, status={token_response.status}"
-            )
+            logger.warning(f"Invalid or inactive Bearer access key: {token[:8]}***, status={token_response.status}")
             return AuthResult(
                 error_response=s3_error_response(
                     code="InvalidAccessKeyId",
@@ -233,9 +232,7 @@ async def _authenticate_bearer(request: Request, auth_header: str, logger: Any) 
         )
 
 
-async def _authenticate_access_key_header(
-    request: Request, credential: str, logger: Any
-) -> AuthResult:
+async def _authenticate_access_key_header(request: Request, credential: str, logger: Any) -> AuthResult:
     logger.debug(f"Detected access key authentication: {credential[:8]}***")
 
     try:

@@ -182,23 +182,19 @@ async def verify_access_key_presigned_url(
     service = credential_parts[3]
 
     if credential_id != access_key:
-        logger.error(
-            f"Presigned URL credential ID mismatch: header={access_key[:8]}***, query={credential_id[:8]}***"
-        )
+        logger.error(f"Presigned URL credential ID mismatch: header={access_key[:8]}***, query={credential_id[:8]}***")
         raise AccessKeyAuthError("Credential does not match access key")
 
     # Ensure credential scope date matches X-Amz-Date date prefix (YYYYMMDD)
     if not amz_date or len(amz_date) < 8 or date_scope != amz_date[:8]:
-        logger.error(
-            f"X-Amz-Date ({amz_date}) and credential scope date ({date_scope}) mismatch in presigned URL"
-        )
+        logger.error(f"X-Amz-Date ({amz_date}) and credential scope date ({date_scope}) mismatch in presigned URL")
         raise AccessKeyAuthError("Invalid credential scope")
 
     try:
         expires = int(expires_str)  # type: ignore[arg-type]
     except ValueError:
         logger.error(f"Invalid X-Amz-Expires value: {expires_str}")
-        raise AccessKeyAuthError("Invalid expires value")
+        raise AccessKeyAuthError("Invalid expires value") from None
 
     if expires <= 0 or expires > 604800:
         logger.error(f"X-Amz-Expires out of allowed range (1-604800): {expires}")
@@ -208,7 +204,7 @@ async def verify_access_key_presigned_url(
         signed_at = datetime.datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=datetime.timezone.utc)
     except ValueError:
         logger.error(f"Invalid X-Amz-Date format: {amz_date}")
-        raise AccessKeyAuthError("Invalid date format")
+        raise AccessKeyAuthError("Invalid date format") from None
 
     now = datetime.datetime.now(datetime.timezone.utc)
     expiry_time = signed_at + datetime.timedelta(seconds=expires)
