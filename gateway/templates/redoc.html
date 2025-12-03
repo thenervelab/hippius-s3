@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hippius S3 API Documentation</title>
+    <link href="https://fonts.googleapis.com/css?family=Montserrat:300,400,700|Roboto:300,400,700" rel="stylesheet">
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Roboto', sans-serif;
+        }
+        .auth-instructions {
+            max-width: 1400px;
+            margin: 20px auto;
+            padding: 20px;
+            background-color: #f8f9fa;
+            border-left: 4px solid #007bff;
+            border-radius: 4px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .auth-instructions h3 {
+            margin-top: 0;
+            color: #333;
+            font-size: 18px;
+            font-weight: 600;
+        }
+        .auth-instructions p {
+            margin: 10px 0;
+            color: #555;
+            line-height: 1.6;
+        }
+        .auth-instructions code {
+            background-color: #e9ecef;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+            color: #d63384;
+        }
+        .auth-instructions a {
+            color: #007bff;
+            text-decoration: none;
+        }
+        .auth-instructions a:hover {
+            text-decoration: underline;
+        }
+        .auth-instructions strong {
+            color: #333;
+        }
+        #redoc-container {
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="auth-instructions">
+        <h3>🔐 Authentication</h3>
+        <p>This API uses Bearer token authentication with Hippius access keys.</p>
+        <p><strong>Authorization Header Format:</strong> <code>Authorization: Bearer hip_abc123def456...</code></p>
+        <p><strong>Access Key Format:</strong> Starts with <code>hip_</code> followed by alphanumeric characters</p>
+        <p><strong>Get your access key:</strong> Visit <a href="https://console.hippius.com/dashboard/settings" target="_blank">console.hippius.com/dashboard/settings</a> to generate access keys for your account</p>
+        <p><strong>Interactive API Testing:</strong> Use <a href="/docs">/docs</a> (Swagger UI) for interactive endpoint testing with built-in authentication</p>
+    </div>
+
+    <div id="redoc-container"></div>
+
+    <script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
+    <script>
+        Redoc.init('/openapi.json', {
+            scrollYOffset: 50,
+            hideHostname: false,
+            expandResponses: "200,201",
+            requiredPropsFirst: true,
+            pathInMiddlePanel: true,
+            hideDownloadButton: false,
+            theme: {
+                colors: {
+                    primary: {
+                        main: '#007bff'
+                    }
+                },
+                typography: {
+                    fontSize: '14px',
+                    fontFamily: 'Roboto, sans-serif',
+                    headings: {
+                        fontFamily: 'Montserrat, sans-serif'
+                    }
+                }
+            }
+        }, document.getElementById('redoc-container'));
+    </script>
+</body>
+</html>
