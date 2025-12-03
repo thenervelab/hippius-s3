@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hippius S3 API Documentation</title>
+    <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui.css">
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+        }
+        .topbar {
+            display: none;
+        }
+        .info {
+            margin: 20px 0;
+        }
+        .info .description {
+            margin-top: 10px;
+            padding: 15px;
+            background-color: #f8f9fa;
+            border-left: 4px solid #007bff;
+        }
+    </style>
+</head>
+<body>
+    <div id="swagger-ui"></div>
+
+    <script src="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui-bundle.js"></script>
+    <script src="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui-standalone-preset.js"></script>
+    <script>
+        window.onload = function() {
+            const ui = SwaggerUIBundle({
+                url: "/openapi.json",
+                dom_id: '#swagger-ui',
+                deepLinking: true,
+                presets: [
+                    SwaggerUIBundle.presets.apis,
+                    SwaggerUIStandalonePreset
+                ],
+                plugins: [
+                    SwaggerUIBundle.plugins.DownloadUrl
+                ],
+                layout: "StandaloneLayout",
+                persistAuthorization: true,
+                onComplete: () => {
+                    const authBtn = document.querySelector('.btn.authorize');
+                    if (authBtn) {
+                        const instructionDiv = document.createElement('div');
+                        instructionDiv.className = 'info';
+                        instructionDiv.innerHTML = `
+                            <div class="description">
+                                <h4>Authentication Instructions</h4>
+                                <p>To test API endpoints:</p>
+                                <ol>
+                                    <li>Click the <strong>Authorize</strong> button above</li>
+                                    <li>Enter your Hippius access key in the "Value" field (starts with <code>hip_</code>)</li>
+                                    <li>Click <strong>Authorize</strong>, then <strong>Close</strong></li>
+                                    <li>You can now test API endpoints with the "Try it out" button</li>
+                                </ol>
+                                <p><strong>Example access key format:</strong> <code>hip_abc123def456...</code></p>
+                                <p><strong>Get your access key:</strong> Visit <a href="https://api.hippius.com" target="_blank">api.hippius.com</a> to generate access keys for your account</p>
+                            </div>
+                        `;
+
+                        const infoSection = document.querySelector('.information-container');
+                        if (infoSection) {
+                            infoSection.appendChild(instructionDiv);
+                        }
+                    }
+                }
+            });
+
+            window.ui = ui;
+        };
+    </script>
+</body>
+</html>

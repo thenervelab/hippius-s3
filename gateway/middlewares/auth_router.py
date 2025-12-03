@@ -45,7 +45,7 @@ async def auth_router_middleware(
 
     if request.method in ["GET", "HEAD"]:
         auth_header = request.headers.get("authorization")
-        if not auth_header:
+        if not auth_header and request.url.path != "/":
             request.state.auth_method = "anonymous"
             return await call_next(request)
 
@@ -53,7 +53,65 @@ async def auth_router_middleware(
     if not auth_header:
         return s3_error_response(
             code="InvalidAccessKeyId",
-            message="The AWS Access Key Id you provided does not exist in our records.",
+            message='Please provide a valid "hip_*" access key. See https://docs.hippius.com/storage/s3/integration#authentication for more information.',  # noqa: Q003
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+    if auth_header.startswith("Bearer "):
+        from hippius_s3.services.hippius_api_service import HippiusApiClient
+
+        token = auth_header.replace("Bearer ", "").strip()
+
+        if token.startswith("hip_"):
+            try:
+                async with HippiusApiClient() as api_client:
+                    token_response = await api_client.auth(token)
+
+                if not token_response.valid or token_response.status != "active":
+                    logger.warning(
+                        f"Invalid or inactive Bearer access key: {token[:8]}***, status={token_response.status}"
+                    )
+                    return s3_error_response(
+                        code="InvalidAccessKeyId",
+                        message="Invalid or inactive access key",
+                        status_code=status.HTTP_403_FORBIDDEN,
+                    )
+
+                if not token_response.account_address:
+                    logger.error(f"API returned empty account_address for Bearer key: {token[:8]}***")
+                    return s3_error_response(
+                        code="InvalidAccessKeyId",
+                        message="Invalid API response",
+                        status_code=status.HTTP_403_FORBIDDEN,
+                    )
+
+                request.state.access_key = token
+                request.state.account_address = token_response.account_address
+                request.state.token_type = token_response.token_type
+                request.state.account_id = token_response.account_address
+                request.state.auth_method = "bearer_access_key"
+                logger.info(
+                    f"Bearer access key auth successful: {token[:8]}***, account={token_response.account_address}, type={token_response.token_type}"
+                )
+                return await call_next(request)
+            except HippiusAPIError as e:
+                logger.error(f"Hippius API error during Bearer auth: {e}")
+                return s3_error_response(
+                    code="ServiceUnavailable",
+                    message="Authentication service temporarily unavailable",
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+            except Exception as e:
+                logger.exception(f"Unexpected Bearer auth error: {e}")
+                return s3_error_response(
+                    code="InternalError",
+                    message="An internal error occurred",
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+
+        return s3_error_response(
+            code="InvalidAccessKeyId",
+            message="Bearer token must be a valid access key starting with 'hip_'",
             status_code=status.HTTP_403_FORBIDDEN,
         )
 
