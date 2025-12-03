@@ -271,6 +271,10 @@ class Uploader:
             )
             raise RuntimeError("part_row_missing_for_chunked_upload")
 
+        if num_chunks_meta == 0:
+            logger.debug(f"Empty file upload: object_id={object_id} part={part_number}")
+            return ChunkUploadResult(cids=[], part_number=part_number)
+
         if num_chunks_meta > 0 and part_id:
             all_chunk_cids: list[str] = []
             for ci in range(num_chunks_meta):
@@ -372,7 +376,9 @@ class Uploader:
                 cid_raw = r[1]
                 cid = str(cid_raw).strip() if cid_raw else None
                 size = int(r[2] or 0)
-                if not cid or cid.lower() in {"", "none", "pending"}:
+                if size == 0:
+                    cid = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
+                elif not cid or cid.lower() in {"", "none", "pending"}:
                     logger.debug(f"Manifest deferred: missing CID for part {part_number} (object_id={object_id})")
                     return {"status": "pending"}
                 parts_data.append({"part_number": part_number, "cid": cid, "size_bytes": size})
