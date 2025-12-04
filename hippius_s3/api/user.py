@@ -1,6 +1,7 @@
 """User API endpoints for frontend JSON responses."""
 
 import base64
+import ipaddress
 import logging
 from typing import Optional
 
@@ -8,6 +9,7 @@ from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import HTTPException
 from fastapi import Query
+from fastapi import Request
 from fastapi.responses import JSONResponse
 from hippius_sdk.substrate import SubstrateClient
 from starlette import status
@@ -231,4 +233,45 @@ async def list_objects(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to list objects",
+        ) from e
+
+
+@router.post("/unban")
+async def unban(
+    request: Request,
+    ip: str = Query(..., description="IP address to unban"),
+) -> JSONResponse:
+    """
+    Unban an IP address by removing block key and infringement counters.
+
+    Performs a full reset of the banhammer state for the specified IP.
+    """
+    try:
+        ipaddress.ip_address(ip)
+
+        redis = request.app.state.redis_rate_limiting_client
+
+        block_key = f"hippius_banhammer:block:{ip}"
+        await redis.delete(block_key)
+
+        pattern = f"hippius_banhammer:infringements:{ip}:*"
+        counter_keys = [key async for key in redis.scan_iter(match=pattern)]
+
+        if counter_keys:
+            await redis.delete(*counter_keys)
+
+        logger.info(f"Unbanned IP {ip} (deleted {len(counter_keys)} infringement counters)")
+
+        return JSONResponse({"success": True, "ip": ip})
+
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid IP address format: {ip}",
+        ) from None
+    except Exception as e:
+        logger.exception(f"Error unbanning IP {ip}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to unban IP",
         ) from e
