@@ -91,6 +91,16 @@ async def test_anonymous_get_request_allowed(auth_router_app: Any) -> None:
 
 
 @pytest.mark.asyncio
+async def test_root_get_without_auth_requires_access_key(auth_router_app: Any) -> None:
+    """GET / without auth should still require an access key (no anonymous listing)."""
+    async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
+        response = await client.get("/")
+
+    assert response.status_code == 403
+    assert b"InvalidAccessKeyId" in response.content
+
+
+@pytest.mark.asyncio
 async def test_access_key_detection_and_routing(auth_router_app: Any) -> None:
     """Test that access keys starting with hip_ are detected and routed correctly"""
     test_access_key = "hip_test_key_12345"
@@ -213,3 +223,58 @@ async def test_access_key_with_invalid_signature_returns_403(auth_router_app: An
 
     assert response.status_code == 403
     assert b"SignatureDoesNotMatch" in response.content
+
+
+@pytest.mark.asyncio
+async def test_presigned_get_with_access_key_uses_access_key_auth(auth_router_app: Any) -> None:
+    """Presigned GET with hip_ access key should route through access key auth and set state."""
+    test_access_key = "hip_presigned_key_12345"
+    test_account_address = "5FH2aQUbix3nNatzST4mPM8iuebGvSMFerZLdwvDmAwRDFep"
+    test_token_type = "sub"
+
+    # Patch the presigned URL verifier so we don't depend on its implementation here
+    mock_verify = AsyncMock(return_value=(True, test_account_address, test_token_type))
+
+    query_params = {
+        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+        "X-Amz-Credential": f"{test_access_key}/20250101/us-east-1/s3/aws4_request",
+        "X-Amz-Date": "20250101T000000Z",
+        "X-Amz-Expires": "3600",
+        "X-Amz-SignedHeaders": "host",
+        "X-Amz-Signature": "deadbeef",
+    }
+
+    with patch("gateway.services.auth_orchestrator.verify_access_key_presigned_url", mock_verify):
+        async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
+            response = await client.get("/test", params=query_params)
+
+    # Once implemented, we expect presigned URLs with hip_ keys to authenticate as access keys
+    assert response.status_code == 200
+    data = response.json()
+    assert data["auth_method"] == "access_key"
+    assert data["access_key"] == test_access_key
+    assert data["account_address"] == test_account_address
+    assert data["token_type"] == test_token_type
+
+
+@pytest.mark.asyncio
+async def test_presigned_get_with_non_hip_credential_rejected(auth_router_app: Any) -> None:
+    """Presigned GET with non-hip credential should be rejected with InvalidAccessKeyId."""
+    # Credential that does not start with hip_
+    bad_credential = "not_hip_key_123"
+
+    query_params = {
+        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+        "X-Amz-Credential": f"{bad_credential}/20250101/us-east-1/s3/aws4_request",
+        "X-Amz-Date": "20250101T000000Z",
+        "X-Amz-Expires": "3600",
+        "X-Amz-SignedHeaders": "host",
+        "X-Amz-Signature": "deadbeef",
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
+        response = await client.get("/test", params=query_params)
+
+    # v1 behavior: non-hip credentials in presigned URLs should be treated as invalid access keys
+    assert response.status_code == 403
+    assert b"InvalidAccessKeyId" in response.content

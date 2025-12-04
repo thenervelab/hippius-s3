@@ -3,15 +3,8 @@ from typing import Callable
 
 from fastapi import Request
 from fastapi import Response
-from starlette import status
 
-from gateway.middlewares.access_key_auth import AccessKeyAuthError
-from gateway.middlewares.access_key_auth import verify_access_key_signature
-from gateway.middlewares.sigv4 import AuthParsingError
-from gateway.middlewares.sigv4 import SigV4Verifier
-from gateway.middlewares.sigv4 import extract_credential_from_auth_header
-from gateway.utils.errors import s3_error_response
-from hippius_s3.services.hippius_api_service import HippiusAPIError
+from gateway.services.auth_orchestrator import authenticate_request
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 
 
@@ -22,14 +15,7 @@ async def auth_router_middleware(
     """
     Route authentication to appropriate handler based on credential format.
 
-    Detects auth type:
-    - Access key: credential starts with "hip_"
-    - Seed phrase: credential is base64-encoded seed phrase
-
-    Sets request.state fields:
-    - For seed phrase: seed_phrase, auth_method="seed_phrase"
-    - For access key: access_key, account_address, token_type, auth_method="access_key"
-    - For anonymous: auth_method="anonymous"
+    Delegates logic to `authenticate_request` service.
     """
     ray_id = getattr(request.state, "ray_id", "no-ray-id")
     logger = get_logger_with_ray_id(__name__, ray_id)
@@ -43,145 +29,31 @@ async def auth_router_middleware(
     if any(path.startswith(exempt_path) or path == exempt_path for exempt_path in exempt_paths):
         return await call_next(request)
 
-    if request.method in ["GET", "HEAD"]:
-        auth_header = request.headers.get("authorization")
-        if not auth_header and request.url.path != "/":
-            request.state.auth_method = "anonymous"
-            return await call_next(request)
+    auth_result = await authenticate_request(request)
 
-    auth_header = request.headers.get("authorization", "")
-    if not auth_header:
-        return s3_error_response(
-            code="InvalidAccessKeyId",
-            message='Please provide a valid "hip_*" access key. See https://docs.hippius.com/storage/s3/integration#authentication for more information.',  # noqa: Q003
-            status_code=status.HTTP_403_FORBIDDEN,
-        )
+    if auth_result.error_response:
+        return auth_result.error_response
 
-    if auth_header.startswith("Bearer "):
-        from hippius_s3.services.hippius_api_service import HippiusApiClient
+    # Populate request state
+    request.state.auth_method = auth_result.auth_method
 
-        token = auth_header.replace("Bearer ", "").strip()
-
-        if token.startswith("hip_"):
-            try:
-                async with HippiusApiClient() as api_client:
-                    token_response = await api_client.auth(token)
-
-                if not token_response.valid or token_response.status != "active":
-                    logger.warning(
-                        f"Invalid or inactive Bearer access key: {token[:8]}***, status={token_response.status}"
-                    )
-                    return s3_error_response(
-                        code="InvalidAccessKeyId",
-                        message="Invalid or inactive access key",
-                        status_code=status.HTTP_403_FORBIDDEN,
-                    )
-
-                if not token_response.account_address:
-                    logger.error(f"API returned empty account_address for Bearer key: {token[:8]}***")
-                    return s3_error_response(
-                        code="InvalidAccessKeyId",
-                        message="Invalid API response",
-                        status_code=status.HTTP_403_FORBIDDEN,
-                    )
-
-                request.state.access_key = token
-                request.state.account_address = token_response.account_address
-                request.state.token_type = token_response.token_type
-                request.state.account_id = token_response.account_address
-                request.state.auth_method = "bearer_access_key"
-                logger.info(
-                    f"Bearer access key auth successful: {token[:8]}***, account={token_response.account_address}, type={token_response.token_type}"
-                )
-                return await call_next(request)
-            except HippiusAPIError as e:
-                logger.error(f"Hippius API error during Bearer auth: {e}")
-                return s3_error_response(
-                    code="ServiceUnavailable",
-                    message="Authentication service temporarily unavailable",
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                )
-            except Exception as e:
-                logger.exception(f"Unexpected Bearer auth error: {e}")
-                return s3_error_response(
-                    code="InternalError",
-                    message="An internal error occurred",
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                )
-
-        return s3_error_response(
-            code="InvalidAccessKeyId",
-            message="Bearer token must be a valid access key starting with 'hip_'",
-            status_code=status.HTTP_403_FORBIDDEN,
-        )
-
-    try:
-        credential, date_scope, region, service = extract_credential_from_auth_header(auth_header)
-    except AuthParsingError as e:
-        logger.error(f"Failed to extract credential: {e}")
-        return s3_error_response(
-            code="InvalidAccessKeyId",
-            message="Invalid credential format",
-            status_code=status.HTTP_403_FORBIDDEN,
-        )
-
-    if credential.startswith("hip_"):
-        logger.debug(f"Detected access key authentication: {credential[:8]}***")
-
-        try:
-            is_valid, account_address, token_type = await verify_access_key_signature(
-                request=request,
-                access_key=credential,
-            )
-        except AccessKeyAuthError as e:
-            logger.warning(f"Access key auth error: {e}")
-            return s3_error_response(
-                code="SignatureDoesNotMatch",
-                message="The request signature we calculated does not match the signature you provided",
-                status_code=status.HTTP_403_FORBIDDEN,
-            )
-        except HippiusAPIError as e:
-            logger.error(f"Hippius API error during auth: {e}")
-            return s3_error_response(
-                code="ServiceUnavailable",
-                message="Authentication service temporarily unavailable",
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-        except Exception as e:
-            logger.exception(f"Unexpected auth error: {e}")
-            return s3_error_response(
-                code="InternalError",
-                message="An internal error occurred",
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-        if not is_valid:
-            return s3_error_response(
-                code="SignatureDoesNotMatch",
-                message="The request signature we calculated does not match the signature you provided",
-                status_code=status.HTTP_403_FORBIDDEN,
-            )
-
-        request.state.access_key = credential
-        request.state.account_address = account_address
-        request.state.token_type = token_type
-        request.state.auth_method = "access_key"
-    else:
-        logger.debug("Attempting seed phrase authentication")
-
-        verifier = SigV4Verifier(request)
-        is_valid = await verifier.verify_signature()
-
-        if not is_valid:
-            return s3_error_response(
-                code="SignatureDoesNotMatch",
-                message="The request signature we calculated does not match the signature you provided",
-                status_code=status.HTTP_403_FORBIDDEN,
-            )
-
-        request.state.seed_phrase = verifier.seed_phrase
-        request.state.auth_method = "seed_phrase"
-
-        logger.info("Seed phrase auth successful")
+    if auth_result.auth_method == "access_key":
+        request.state.access_key = auth_result.access_key
+        request.state.account_address = auth_result.account_address
+        request.state.token_type = auth_result.token_type
+        if auth_result.access_key:
+            logger.debug(f"Authenticated with access key: {auth_result.access_key[:8]}***")
+    elif auth_result.auth_method == "bearer_access_key":
+        request.state.access_key = auth_result.access_key
+        request.state.account_address = auth_result.account_address
+        request.state.token_type = auth_result.token_type
+        request.state.account_id = auth_result.account_id
+        if auth_result.access_key:
+            logger.debug(f"Authenticated with Bearer access key: {auth_result.access_key[:8]}***")
+    elif auth_result.auth_method == "seed_phrase":
+        request.state.seed_phrase = auth_result.seed_phrase
+        logger.debug("Authenticated with seed phrase")
+    elif auth_result.auth_method == "anonymous":
+        logger.debug("Anonymous request")
 
     return await call_next(request)
