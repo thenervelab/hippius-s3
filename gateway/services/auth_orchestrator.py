@@ -63,7 +63,6 @@ async def authenticate_request(request: Request) -> AuthResult:
     # 2. Authorization Header Detection
     auth_header = request.headers.get("authorization", "")
     if not auth_header:
-
         if request.method in ["GET", "HEAD"] and request.url.path != "/":
             return AuthResult(is_valid=True, auth_method="anonymous")
 
