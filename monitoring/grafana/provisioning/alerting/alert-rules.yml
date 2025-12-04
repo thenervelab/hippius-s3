@@ -170,8 +170,8 @@ groups:
     folder: Hippius S3 Alerts
     interval: 1m
     rules:
-      - uid: high-error-rate-during-activity
-        title: High Error Rate During Activity
+      - uid: upload-failures-detected
+        title: Upload Failures Detected
         condition: C
         data:
           - refId: A
@@ -180,7 +180,7 @@ groups:
               to: 0
             datasourceUid: PBFA97CFB590B2093
             model:
-              expr: '((sum(increase(http_requests_total{job="otel-collector"}[5m])) or vector(0)) >= 5) and ((sum(increase(s3_errors_total{job="otel-collector"}[5m])) or vector(0)) / (sum(increase(http_requests_total{job="otel-collector"}[5m])) + 0.0001) * 100)'
+              expr: 'sum(increase(s3_errors_total{job="otel-collector",operation="put_object",error_type=~"http_5.*|internal_error"}[5m])) or vector(0)'
               refId: A
           - refId: B
             relativeTimeRange:
@@ -203,7 +203,7 @@ groups:
               conditions:
                 - evaluator:
                     params:
-                      - 15
+                      - 5
                     type: gt
                   type: query
               refId: C
@@ -211,10 +211,102 @@ groups:
         execErrState: Error
         for: 5m
         annotations:
-          description: 'Error rate is {{ if $values.B }}{{ printf "%.2f" $values.B.Value }}{{ else }}N/A{{ end }}% during active traffic (threshold: 15%)'
-          summary: S3 API experiencing elevated errors during user activity
+          summary: 'Uploads are failing - {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} errors in last 5 minutes'
+          description: 'PUT operations returning 5xx errors. Check IPFS/storage backend.'
         labels:
-          severity: high
+          severity: critical
+
+      - uid: download-failures-detected
+        title: Download Failures Detected
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'sum(increase(s3_errors_total{job="otel-collector",operation="get_object",error_type=~"http_5.*|internal_error"}[5m])) or vector(0)'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 5
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          summary: 'Downloads are failing - {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} errors in last 5 minutes'
+          description: 'GET operations returning 5xx errors. Check IPFS/cache.'
+        labels:
+          severity: critical
+
+      - uid: s3-system-down
+        title: S3 System Down
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'sum(increase(http_requests_total{job="otel-collector"}[10m])) or vector(0)'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 1
+                    type: lt
+                  type: query
+              refId: C
+        noDataState: Alerting
+        execErrState: Error
+        for: 10m
+        annotations:
+          summary: 'S3 gateway not receiving traffic for 10+ minutes'
+          description: 'No HTTP requests detected. System may be down or unreachable.'
+        labels:
+          severity: critical
 
       - uid: slow-response-time-during-activity
         title: Slow Response Time During Activity
