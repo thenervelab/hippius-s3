@@ -84,11 +84,13 @@ async def create_canonical_request(
         Canonical request string
     """
     logger.debug(f"Creating canonical request with signed headers: {signed_headers}")
-    canonical_headers = ""
-    sorted_headers = sorted(signed_headers, key=str.lower)
 
-    for header in sorted_headers:
-        if header.lower() == "host":
+    # Normalize header names to lowercase and sort for canonicalization
+    lower_sorted_headers = sorted({h.lower() for h in signed_headers})
+    canonical_headers = ""
+
+    for header in lower_sorted_headers:
+        if header == "host":
             value = (
                 request.headers.get("x-forwarded-host")
                 or request.headers.get("x-original-host")
@@ -98,23 +100,35 @@ async def create_canonical_request(
                 f"Host header processing: x-forwarded-host={request.headers.get('x-forwarded-host')}, x-original-host={request.headers.get('x-original-host')}, host={request.headers.get('host')}, final_value='{value}'"
             )
         else:
+            # Header lookup in Starlette is case-insensitive
             value = request.headers.get(header, "")
 
         value = " ".join((value or "").strip().split())
-        canonical_headers += f"{header.lower()}:{value}\n"
-        logger.debug(f"Canonical header: {header.lower()}:{value}")
+        canonical_headers += f"{header}:{value}\n"
+        logger.debug(f"Canonical header: {header}:{value}")
 
     canonical_headers = canonical_headers.rstrip("\n")
-    signed_headers_str = ";".join(sorted_headers)
+    signed_headers_str = ";".join(lower_sorted_headers)
 
     canonical_query_string = canonicalize_query_string(query_string)
+
+    # Detect presigned SigV4 via query parameters
+    query_params = request.query_params
+    is_presigned = (
+        query_params.get("X-Amz-Algorithm") == "AWS4-HMAC-SHA256"
+        and query_params.get("X-Amz-SignedHeaders") is not None
+    )
 
     payload_hash = request.headers.get("x-amz-content-sha256", "")
     logger.debug(f"Payload hash from header: '{payload_hash}'")
 
     if not payload_hash:
-        logger.error("FAIL: Missing x-amz-content-sha256 header")
-        raise AuthParsingError("Missing payload hash header")
+        if is_presigned:
+            logger.debug("No payload hash header found; treating presigned request as UNSIGNED-PAYLOAD")
+            payload_hash = "UNSIGNED-PAYLOAD"
+        else:
+            logger.error("FAIL: Missing x-amz-content-sha256 header")
+            raise AuthParsingError("Missing payload hash header")
     if payload_hash == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD":
         payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         logger.debug(f"Converted streaming payload to empty body hash: {payload_hash}")
@@ -340,5 +354,27 @@ def canonicalize_query_string(query_string: str) -> str:
     params.sort(key=lambda x: x[0])
 
     # Re-encode with proper AWS formatting
+    # RFC 3986 unreserved characters: -_.~
+    return urlencode(params, quote_via=quote, safe="-_.~")
+
+
+def canonicalize_presigned_query_string(query_string: str) -> str:
+    """
+    Canonicalize query string for AWS SigV4 presigned URLs.
+
+    This is similar to canonicalize_query_string but excludes X-Amz-Signature
+    from the canonical representation, matching AWS S3 presigned URL rules.
+    """
+    if not query_string:
+        return ""
+
+    params = parse_qsl(query_string, keep_blank_values=True)
+
+    # Exclude the signature itself from the canonical query string
+    params = [(k, v) for (k, v) in params if k != "X-Amz-Signature"]
+
+    # Sort by (name, value) to match AWS canonicalization for repeated keys
+    params.sort(key=lambda x: (x[0], x[1]))
+
     # RFC 3986 unreserved characters: -_.~
     return urlencode(params, quote_via=quote, safe="-_.~")

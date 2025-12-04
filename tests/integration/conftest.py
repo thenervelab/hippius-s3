@@ -29,6 +29,20 @@ os.environ["ENABLE_BANHAMMER"] = "false"
 
 
 @pytest.fixture
+def test_run_id() -> str:
+    """Short unique ID for this integration test run (mirrors e2e semantics)."""
+    import uuid
+
+    return str(uuid.uuid4())[:8]
+
+
+@pytest.fixture
+def test_seed_phrase() -> str:
+    """Seed phrase used for local integration tests (mirrors e2e fixture semantics)."""
+    return "about acid actor absent action able actual abandon abstract above ability achieve"
+
+
+@pytest.fixture
 def boto3_client(
     test_seed_phrase: str,
 ) -> Any:

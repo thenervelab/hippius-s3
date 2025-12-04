@@ -13,14 +13,13 @@ from httpx import AsyncClient
 from gateway.middlewares.account import account_middleware
 from gateway.middlewares.acl import acl_middleware
 from gateway.middlewares.auth_router import auth_router_middleware
-from gateway.services.acl_service import ACLService
 
 
 @pytest.fixture  # type: ignore[misc]
 def integration_app() -> Any:
     """Create FastAPI app with full auth + ACL middleware chain"""
     app = FastAPI()
-    app.state.acl_service = MagicMock(spec=ACLService)
+    app.state.acl_service = MagicMock()
     app.state.redis_accounts = AsyncMock()
 
     @app.get("/{bucket}/{key:path}")
@@ -52,7 +51,7 @@ async def test_sub_token_denied_without_grants(integration_app: Any) -> None:
     # Patch verify function as AsyncMock
     mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
 
-    with patch("gateway.middlewares.auth_router.verify_access_key_signature", mock_verify):
+    with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
         with patch("gateway.middlewares.account.config.bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
@@ -77,7 +76,7 @@ async def test_sub_token_allowed_with_access_key_grant(integration_app: Any) -> 
 
     mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
 
-    with patch("gateway.middlewares.auth_router.verify_access_key_signature", mock_verify):
+    with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
         with patch("gateway.middlewares.account.config.bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
@@ -103,7 +102,7 @@ async def test_sub_token_denied_with_different_key_grant(integration_app: Any) -
 
     mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
 
-    with patch("gateway.middlewares.auth_router.verify_access_key_signature", mock_verify):
+    with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
         with patch("gateway.middlewares.account.config.bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
@@ -125,7 +124,7 @@ async def test_master_token_bypasses_acl_for_owned_bucket(integration_app: Any) 
 
     mock_verify = AsyncMock(return_value=(True, alice_id, "master"))
 
-    with patch("gateway.middlewares.auth_router.verify_access_key_signature", mock_verify):
+    with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
         with patch("gateway.middlewares.account.config.bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.put(
@@ -151,7 +150,7 @@ async def test_account_grant_allows_all_keys(integration_app: Any) -> None:
 
         mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
 
-        with patch("gateway.middlewares.auth_router.verify_access_key_signature", mock_verify):
+        with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
             with patch("gateway.middlewares.account.config.bypass_credit_check", True):
                 async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                     response = await client.get(
@@ -175,7 +174,7 @@ async def test_cross_account_access_key_grant(integration_app: Any) -> None:
 
     mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
 
-    with patch("gateway.middlewares.auth_router.verify_access_key_signature", mock_verify):
+    with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
         with patch("gateway.middlewares.account.config.bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
@@ -183,4 +182,36 @@ async def test_cross_account_access_key_grant(integration_app: Any) -> None:
                     headers={"Authorization": auth_header, "x-amz-date": "20250101T000000Z"},
                 )
 
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_presigned_get_uses_access_key_for_acl(integration_app: Any) -> None:
+    """Presigned GET with hip_ key should populate access key account for ACL checks."""
+    alice_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+    bob_id = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+
+    integration_app.state.acl_service.get_bucket_owner = AsyncMock(return_value=alice_id)
+    integration_app.state.acl_service.check_permission = AsyncMock(return_value=True)
+
+    access_key = "hip_bob_presigned"
+
+    query_params = {
+        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+        "X-Amz-Credential": f"{access_key}/20250101/us-east-1/s3/aws4_request",
+        "X-Amz-Date": "20250101T000000Z",
+        "X-Amz-Expires": "3600",
+        "X-Amz-SignedHeaders": "host",
+        "X-Amz-Signature": "deadbeef",
+    }
+
+    # Patch presigned verifier to simulate successful verification and account mapping
+    mock_verify_presigned = AsyncMock(return_value=(True, bob_id, "sub"))
+
+    with patch("gateway.services.auth_orchestrator.verify_access_key_presigned_url", mock_verify_presigned):
+        with patch("gateway.middlewares.account.config.bypass_credit_check", True):
+            async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
+                response = await client.get("/alice-bucket/test.txt", params=query_params)
+
+    # Once implemented, presigned URLs should behave like normal access-key auth for ACL
     assert response.status_code == 200
