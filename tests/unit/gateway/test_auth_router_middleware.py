@@ -91,6 +91,16 @@ async def test_anonymous_get_request_allowed(auth_router_app: Any) -> None:
 
 
 @pytest.mark.asyncio
+async def test_root_get_without_auth_requires_access_key(auth_router_app: Any) -> None:
+    """GET / without auth should still require an access key (no anonymous listing)."""
+    async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
+        response = await client.get("/")
+
+    assert response.status_code == 403
+    assert b"InvalidAccessKeyId" in response.content
+
+
+@pytest.mark.asyncio
 async def test_access_key_detection_and_routing(auth_router_app: Any) -> None:
     """Test that access keys starting with hip_ are detected and routed correctly"""
     test_access_key = "hip_test_key_12345"
