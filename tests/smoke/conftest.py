@@ -6,6 +6,7 @@ from datetime import timedelta
 import boto3
 import pytest
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 from .session_tracker import SessionTracker
 
@@ -55,6 +56,15 @@ def cleanup_old_files(production_s3_client):
     retention_days = 30
     cutoff = datetime.utcnow() - timedelta(days=retention_days)
 
+    try:
+        production_s3_client.create_bucket(Bucket=bucket)
+        print(f"Bucket '{bucket}' created")
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ["BucketAlreadyOwnedByYou", "BucketAlreadyExists"]:
+            print(f"Bucket '{bucket}' already exists")
+        else:
+            raise
+
     deleted_count = 0
     paginator = production_s3_client.get_paginator("list_objects_v2")
 
@@ -68,10 +78,16 @@ def cleanup_old_files(production_s3_client):
             if len(parts) < 2:
                 continue
 
-            session_ts = datetime.strptime(parts[1], "%Y%m%d-%H%M%S")
-            if session_ts < cutoff:
-                production_s3_client.delete_object(Bucket=bucket, Key=key)
-                deleted_count += 1
+            if parts[1] == ".index":
+                continue
+
+            try:
+                session_ts = datetime.strptime(parts[1], "%Y%m%d-%H%M%S")
+                if session_ts < cutoff:
+                    production_s3_client.delete_object(Bucket=bucket, Key=key)
+                    deleted_count += 1
+            except ValueError:
+                continue
 
     print(f"Cleanup: deleted {deleted_count} files older than {retention_days} days")
 
