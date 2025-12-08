@@ -1,0 +1,69 @@
+name: Production Smoke Tests
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+
+  workflow_dispatch:
+
+  workflow_run:
+    workflows: ["Deploy to Production"]
+    types:
+      - completed
+
+  push:
+    branches:
+      - production
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-tests:
+    name: Smoke Tests (s3.hippius.com)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    if: |
+      (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/production') &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r tests/smoke/requirements.txt
+
+      - name: Run smoke tests
+        env:
+          AWS_ACCESS_KEY: ${{ secrets.HIPPIUS_PROD_ACCESS_KEY }}
+          AWS_SECRET_KEY: ${{ secrets.HIPPIUS_PROD_SECRET_KEY }}
+        run: |
+          mkdir -p reports
+          pytest tests/smoke/ \
+            -v \
+            --tb=short \
+            --json-report \
+            --json-report-file=reports/smoke-tests.json
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-results-${{ github.run_id }}
+          path: reports/
+          retention-days: 90
+
+      - name: Check test status
+        if: failure()
+        run: |
+          echo "Smoke tests failed - check artifacts"
+          echo "Run ID: ${{ github.run_id }}"
