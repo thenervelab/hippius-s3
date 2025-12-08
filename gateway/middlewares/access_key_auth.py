@@ -8,6 +8,7 @@ from fastapi import Request
 
 from gateway.config import get_config
 from gateway.middlewares.sigv4 import calculate_signature
+from gateway.middlewares.sigv4 import canonical_path_from_scope
 from gateway.middlewares.sigv4 import canonicalize_presigned_query_string
 from gateway.middlewares.sigv4 import create_canonical_request
 from gateway.middlewares.sigv4 import extract_signature_from_auth_header
@@ -97,11 +98,15 @@ async def verify_access_key_signature(
     region = credential_match.group(2)
     service = credential_match.group(3)
 
+    # Use the canonical path derived from raw_path so that we match exactly
+    # what the AWS client signed (including percent-encoding).
+    canonical_path = canonical_path_from_scope(request)
+
     canonical_request = await create_canonical_request(
         request=request,
         signed_headers=signed_headers,
         method=request.method,
-        path=request.url.path,
+        path=canonical_path,
         query_string=request.url.query,
     )
 
@@ -257,11 +262,14 @@ async def verify_access_key_presigned_url(
     # Build canonical request with presigned query canonicalization
     canonical_query = canonicalize_presigned_query_string(request.url.query)
 
+    # Path must also match what the client signed; derive from raw_path.
+    canonical_path = canonical_path_from_scope(request)
+
     canonical_request = await create_canonical_request(
         request=request,
         signed_headers=signed_headers,
         method=request.method,
-        path=request.url.path,
+        path=canonical_path,
         query_string=canonical_query,
     )
 

@@ -63,6 +63,29 @@ def extract_signed_headers(auth_header: str) -> list[str]:
     return signed_headers_match.group(1).split(";")
 
 
+def canonical_path_from_scope(request: Request) -> str:
+    """
+    Derive the canonical request path from the ASGI scope.
+
+    We require raw_path bytes so that we operate on the exact path that the
+    client signed, including any percent-encoding of spaces and other
+    characters. Falling back to request.url.path would risk subtle
+    mismatches due to normalization or re-encoding in the framework stack.
+    """
+    raw_path = request.scope.get("raw_path")
+    if not isinstance(raw_path, (bytes, bytearray)):
+        logger.error(
+            "ASGI scope missing 'raw_path' bytes; SigV4 canonicalization "
+            "requires raw_path to match the client-signed request path."
+        )
+        raise RuntimeError("ASGI scope missing 'raw_path' for SigV4 canonical path")
+
+    # raw_path is already percent-encoded on the wire; decode bytes to str
+    # using ASCII, which is sufficient for HTTP path bytes. Non-ASCII should
+    # raise rather than being silently altered.
+    return raw_path.decode("ascii")
+
+
 async def create_canonical_request(
     request: Request,
     signed_headers: list[str],
@@ -186,23 +209,8 @@ class SigV4Verifier:
         self.amz_date = request.headers.get("x-amz-date", "")
         self.method = request.method
 
-        # Use the raw_path from the ASGI scope so that we canonicalize *exactly*
-        # the path that the client signed, including any percent-encoding of
-        # spaces and special characters. If raw_path is missing, we treat this
-        # as a configuration error rather than guessing, because any
-        # re-encoding risks subtle signature mismatches.
-        raw_path = request.scope.get("raw_path")
-        if not isinstance(raw_path, (bytes, bytearray)):
-            logger.error(
-                "ASGI scope missing 'raw_path' bytes; SigV4Verifier requires "
-                "raw_path to match the client-signed request path."
-            )
-            raise RuntimeError("ASGI scope missing 'raw_path' for SigV4 verification")
-
-        # raw_path is already percent-encoded on the wire; decode bytes to str.
-        # We assume ASCII for HTTP path bytes; if non-ASCII appears, this should
-        # fail loudly rather than silently altering the path.
-        self.path = raw_path.decode("ascii")
+        # Canonical path derived strictly from raw_path bytes in the ASGI scope.
+        self.path = canonical_path_from_scope(request)
         self.query_string = request.url.query
         self.seed_phrase = ""
         self.region = config.validator_region

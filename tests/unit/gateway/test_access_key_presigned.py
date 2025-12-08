@@ -19,6 +19,7 @@ def make_request(
     path: str = "/bucket/key",
     query_params: dict[str, str] | None = None,
     headers: dict[str, str] | None = None,
+    raw_path: bytes | None = None,
 ) -> Request:
     """Create a minimal FastAPI Request suitable for presigned URL verification tests."""
     headers = headers or {}
@@ -32,6 +33,10 @@ def make_request(
         "server": ("testserver", 80),
         "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers.items()],
         "query_string": urlencode(query_params).encode("latin-1"),
+        # By default, mirror the path as raw_path so canonical_path_from_scope
+        # can operate; individual tests can override this to simulate percent-
+        # encoded wire paths.
+        "raw_path": raw_path if raw_path is not None else path.encode("latin-1"),
     }
     return Request(scope)
 
@@ -211,6 +216,76 @@ async def test_canonical_query_for_presigned_excludes_signature() -> None:
     assert "X-Amz-Signature" not in captured_query_string
     # But should contain other params like foo=bar
     assert "foo=bar" in captured_query_string
+
+
+@pytest.mark.asyncio
+async def test_presigned_url_uses_raw_path_for_canonical_path() -> None:
+    """
+    Presigned URL verification must use the raw_path bytes from the ASGI
+    scope when building the canonical request path, so that percent-encoding
+    of spaces and other characters exactly matches what the client signed.
+    """
+    access_key = "hip_presigned_key_12345"
+    account_address = "5FH2aQUbix3nNatzST4mPM8iuebGvSMFerZLdwvDmAwRDFep"
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    signed_at = now
+    amz_date = signed_at.strftime("%Y%m%dT%H%M%SZ")
+    date_scope = amz_date[:8]
+
+    logical_path = "/bucket/conflict65 (3).jpg"
+    wire_path = b"/bucket/conflict65%20(3).jpg"
+
+    query_params = {
+        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+        "X-Amz-Credential": f"{access_key}/{date_scope}/us-east-1/s3/aws4_request",
+        "X-Amz-Date": amz_date,
+        "X-Amz-Expires": "3600",
+        "X-Amz-SignedHeaders": "host",
+        "X-Amz-Signature": "deadbeef",
+    }
+
+    request = make_request(path=logical_path, query_params=query_params, raw_path=wire_path)
+
+    mock_token_response = MagicMock()
+    mock_token_response.valid = True
+    mock_token_response.status = "active"
+    mock_token_response.account_address = account_address
+    mock_token_response.token_type = "sub"
+    mock_token_response.encrypted_secret = "enc"
+    mock_token_response.nonce = "nonce"
+
+    mock_api_client = AsyncMock()
+    mock_api_client.__aenter__ = AsyncMock(return_value=mock_api_client)
+    mock_api_client.__aexit__ = AsyncMock()
+    mock_api_client.auth = AsyncMock(return_value=mock_token_response)
+
+    captured_path: str | None = None
+
+    async def fake_create_canonical_request(
+        request: Request,
+        signed_headers: list[str],
+        method: str,
+        path: str,
+        query_string: str,
+    ) -> str:
+        nonlocal captured_path
+        captured_path = path
+        return "canonical"
+
+    with patch("gateway.middlewares.access_key_auth.HippiusApiClient", return_value=mock_api_client):
+        with patch("gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"):
+            with patch(
+                "gateway.middlewares.access_key_auth.create_canonical_request",
+                new=fake_create_canonical_request,
+            ):
+                with patch(
+                    "gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"
+                ):
+                    is_valid, _, _ = await verify_access_key_presigned_url(request, access_key)
+
+    assert is_valid is True
+    assert captured_path == "/bucket/conflict65%20(3).jpg"
 
 
 @pytest.mark.asyncio
