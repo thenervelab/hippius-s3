@@ -11,6 +11,10 @@ on:
     types:
       - completed
 
+  push:
+    branches:
+      - production
+
 permissions:
   contents: read
 
@@ -21,8 +25,8 @@ jobs:
     timeout-minutes: 30
 
     if: |
-      github.event_name != 'workflow_run' ||
-      github.event.workflow_run.conclusion == 'success'
+      (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/production') &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
 
     steps:
       - name: Checkout code
