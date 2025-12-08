@@ -185,9 +185,24 @@ class SigV4Verifier:
         self.auth_header = request.headers.get("authorization", "")
         self.amz_date = request.headers.get("x-amz-date", "")
         self.method = request.method
-        # URI encode the path according to AWS Signature V4 specs
-        # Use quote with safe='/' to encode spaces as %20 but keep slashes
-        self.path = quote(request.url.path, safe="/")
+
+        # Use the raw_path from the ASGI scope so that we canonicalize *exactly*
+        # the path that the client signed, including any percent-encoding of
+        # spaces and special characters. If raw_path is missing, we treat this
+        # as a configuration error rather than guessing, because any
+        # re-encoding risks subtle signature mismatches.
+        raw_path = request.scope.get("raw_path")
+        if not isinstance(raw_path, (bytes, bytearray)):
+            logger.error(
+                "ASGI scope missing 'raw_path' bytes; SigV4Verifier requires "
+                "raw_path to match the client-signed request path."
+            )
+            raise RuntimeError("ASGI scope missing 'raw_path' for SigV4 verification")
+
+        # raw_path is already percent-encoded on the wire; decode bytes to str.
+        # We assume ASCII for HTTP path bytes; if non-ASCII appears, this should
+        # fail loudly rather than silently altering the path.
+        self.path = raw_path.decode("ascii")
         self.query_string = request.url.query
         self.seed_phrase = ""
         self.region = config.validator_region
