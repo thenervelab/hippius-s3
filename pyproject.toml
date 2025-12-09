@@ -45,6 +45,9 @@ dependencies = [
     "opentelemetry-exporter-otlp-proto-grpc>=1.37.0",
     "prometheus-client>=0.23.1",
     "loki-logger-handler>=1.1.2",
+    "sqlmodel>=0.0.27",
+    "sqlalchemy>=2.0.44",
+    "greenlet>=3.2.4",
 ]
 
 [project.optional-dependencies]
@@ -207,6 +210,25 @@ disallow_untyped_defs = false
 disable_error_code = ["no-untyped-def"]
 
 [[tool.mypy.overrides]]
+module = "hippius_s3.orm.*"
+disable_error_code = ["no-any-return", "attr-defined", "call-arg"]
+
+[[tool.mypy.overrides]]
+module = "hippius_s3.models.*"
+disable_error_code = ["call-arg"]
+
+[[tool.mypy.overrides]]
+module = [
+    "hippius_s3.repositories.users",
+    "hippius_s3.repositories.bucket_repository",
+    "hippius_s3.repositories.object_repository",
+    "hippius_s3.repositories.part_repository",
+    "hippius_s3.repositories.cid_repository",
+    "hippius_s3.repositories.multipart_upload_repository"
+]
+disable_error_code = ["no-any-return", "attr-defined"]
+
+[[tool.mypy.overrides]]
 module = "hippius_s3.api.middlewares.credit_check"
 disallow_untyped_defs = false
 disable_error_code = ["no-untyped-def", "no-any-return"]
@@ -263,6 +285,14 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "substrateinterface.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "sqlmodel.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "sqlalchemy.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

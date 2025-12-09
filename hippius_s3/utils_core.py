@@ -175,7 +175,11 @@ def get_query(name: str) -> str:
 
 
 async def upsert_cid_and_get_id(db: asyncpg.Pool, cid: str) -> str:
-    """Insert or get existing CID and return the cid_id (UUID)."""
+    """Insert or get existing CID and return the cid_id (UUID).
+
+    DEPRECATED: This function uses the old asyncpg pool interface.
+    New code should use CIDRepository directly with AsyncSession.
+    """
     result = await db.fetchrow(get_query("upsert_cid"), cid)
     return str(result["id"])
 

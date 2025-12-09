@@ -63,6 +63,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.postgres_pool = await postgres_create_pool(config.database_url)
         logger.info("Postgres connection pool created")
 
+        from hippius_s3.orm import initialize_engine
+
+        sqlalchemy_url = config.database_url.replace("postgresql://", "postgresql+asyncpg://")
+        app.state.sqlalchemy_engine = initialize_engine(sqlalchemy_url)
+        logger.info("SQLAlchemy async engine initialized")
+
         app.state.redis_client = async_redis.from_url(config.redis_url)
         logger.info("Redis client initialized")
 
