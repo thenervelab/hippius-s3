@@ -6,54 +6,8 @@ groups:
     folder: Hippius S3 Alerts
     interval: 1m
     rules:
-      - uid: redis-memory-exhaustion
-        title: Redis Memory Exhaustion
-        condition: C
-        data:
-          - refId: A
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: PBFA97CFB590B2093
-            model:
-              expr: '(redis_memory_used_bytes / redis_memory_max_bytes) * 100'
-              refId: A
-          - refId: B
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: __expr__
-            model:
-              type: reduce
-              expression: A
-              reducer: last
-              refId: B
-          - refId: C
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: __expr__
-            model:
-              type: threshold
-              expression: B
-              conditions:
-                - evaluator:
-                    params:
-                      - 90
-                    type: gt
-                  type: query
-              refId: C
-        noDataState: OK
-        execErrState: Error
-        for: 3m
-        annotations:
-          description: 'Redis memory usage is {{ if $values.B }}{{ printf "%.2f" $values.B.Value }}{{ else }}N/A{{ end }}% (threshold: 90%)'
-          summary: Redis memory usage critically high
-        labels:
-          severity: critical
-
       - uid: queue-backup-critical
-        title: Queue Backup Critical
+        title: Queue Backup - Critical Threshold Exceeded
         condition: C
         data:
           - refId: A
@@ -98,80 +52,13 @@ groups:
         labels:
           severity: critical
 
-      - uid: monitoring-pipeline-down
-        title: Monitoring Pipeline Down
-        condition: A
-        data:
-          - refId: A
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: PBFA97CFB590B2093
-            model:
-              expr: 'absent(up{job="otel-collector"})'
-              refId: A
-        noDataState: OK
-        execErrState: Error
-        for: 5m
-        annotations:
-          description: 'No metrics received from otel-collector for 5+ minutes'
-          summary: Monitoring pipeline is down - cannot observe system health
-        labels:
-          severity: critical
-
-      - uid: consecutive-upload-failures
-        title: Consecutive Upload Failures
-        condition: C
-        data:
-          - refId: A
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: PBFA97CFB590B2093
-            model:
-              expr: 'increase(s3_errors_total{job="otel-collector",operation="put_object",error_type=~"http_5.*|internal_error|http_408"}[5m])'
-              refId: A
-          - refId: B
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: __expr__
-            model:
-              type: reduce
-              expression: A
-              reducer: last
-              refId: B
-          - refId: C
-            relativeTimeRange:
-              from: 300
-              to: 0
-            datasourceUid: __expr__
-            model:
-              type: threshold
-              expression: B
-              conditions:
-                - evaluator:
-                    params:
-                      - 3
-                    type: gt
-                  type: query
-              refId: C
-        noDataState: OK
-        execErrState: Error
-        for: 2m
-        annotations:
-          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} server errors during uploads in last 5 minutes (excludes auth failures)'
-          summary: Multiple upload server errors detected - users impacted
-        labels:
-          severity: critical
-
   - orgId: 1
     name: hippius-s3-high-priority
     folder: Hippius S3 Alerts
     interval: 1m
     rules:
       - uid: upload-failures-detected
-        title: Upload Failures Detected
+        title: Upload Failures - Server Errors Detected
         condition: C
         data:
           - refId: A
@@ -217,7 +104,7 @@ groups:
           severity: critical
 
       - uid: download-failures-detected
-        title: Download Failures Detected
+        title: Download Failures - IPFS/Cache Errors
         condition: C
         data:
           - refId: A
@@ -263,7 +150,7 @@ groups:
           severity: critical
 
       - uid: s3-system-down
-        title: S3 System Down
+        title: S3 Gateway - No Traffic Received
         condition: C
         data:
           - refId: A
@@ -309,7 +196,7 @@ groups:
           severity: critical
 
       - uid: slow-response-time-during-activity
-        title: Slow Response Time During Activity
+        title: API Performance - High P95 Latency
         condition: C
         data:
           - refId: A
