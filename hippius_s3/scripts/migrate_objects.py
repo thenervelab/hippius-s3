@@ -282,35 +282,39 @@ async def main_async(args: argparse.Namespace) -> int:
 
         async def _process(o: dict[str, Any]) -> None:
             async with sem:
-                address = str(o.get("main_account_id", ""))
-                obj_display = f"{o['bucket_name']}/{o['object_key']} ({o['object_id']})"
-                if args.dry_run:
-                    log.info(f"DRY-RUN migrate {obj_display} from ov={o['object_version']}")
-                    results.append(True)
-                    planned.append(obj_display)
-                    return
-                log.info(f"START migrate {obj_display}")
-                ok = await migrate_one(
-                    db=db,
-                    redis_client=redis_client,
-                    object_id=o["object_id"],
-                    bucket_id=o["bucket_id"],
-                    bucket_name=o["bucket_name"],
-                    object_key=o["object_key"],
-                    content_type=o["content_type"],
-                    metadata=o["metadata"] or {},
-                    expected_old_version=int(o["object_version"]),
-                    is_public=bool(o.get("is_public", False)),
-                    source_storage_version=int(o.get("storage_version", 2)),
-                    address=address,
-                )
-                results.append(ok)
-                if ok:
-                    log.info(f"DONE migrate {obj_display}")
-                    migrated.append(obj_display)
-                else:
-                    log.error(f"FAILED migrate {obj_display}")
-                    failed.append(obj_display)
+                task_db = await asyncpg.connect(config.database_url)  # type: ignore[arg-type]
+                try:
+                    address = str(o.get("main_account_id", ""))
+                    obj_display = f"{o['bucket_name']}/{o['object_key']} ({o['object_id']})"
+                    if args.dry_run:
+                        log.info(f"DRY-RUN migrate {obj_display} from ov={o['object_version']}")
+                        results.append(True)
+                        planned.append(obj_display)
+                        return
+                    log.info(f"START migrate {obj_display}")
+                    ok = await migrate_one(
+                        db=task_db,
+                        redis_client=redis_client,
+                        object_id=o["object_id"],
+                        bucket_id=o["bucket_id"],
+                        bucket_name=o["bucket_name"],
+                        object_key=o["object_key"],
+                        content_type=o["content_type"],
+                        metadata=o["metadata"] or {},
+                        expected_old_version=int(o["object_version"]),
+                        is_public=bool(o.get("is_public", False)),
+                        source_storage_version=int(o.get("storage_version", 2)),
+                        address=address,
+                    )
+                    results.append(ok)
+                    if ok:
+                        log.info(f"DONE migrate {obj_display}")
+                        migrated.append(obj_display)
+                    else:
+                        log.error(f"FAILED migrate {obj_display}")
+                        failed.append(obj_display)
+                finally:
+                    await task_db.close()
 
         tasks = [asyncio.create_task(_process(o)) async for o in _iter_targets()]
         if tasks:
