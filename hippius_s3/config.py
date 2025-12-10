@@ -122,6 +122,9 @@ class Config:
     # Upload queue configuration
     upload_queue_names: str = env("HIPPIUS_UPLOAD_QUEUE_NAMES:upload_requests", convert=str)
 
+    # Download queue configuration
+    download_queue_names: str = env("HIPPIUS_DOWNLOAD_QUEUE_NAMES:download_requests", convert=str)
+
     # Cache TTL (shared across components)
     cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:259200", convert=int)
     # Unified object part chunk size (bytes) for cache and range math
@@ -144,7 +147,7 @@ class Config:
 
     # initial stream timeout (seconds) before sending first byte
     http_stream_initial_timeout_seconds: float = env("HTTP_STREAM_INITIAL_TIMEOUT_SECONDS:5", convert=float)
-    httpx_ipfs_api_timeout = httpx.Timeout(10.0, read=300.0)
+    httpx_ipfs_api_timeout = httpx.Timeout(10.0, read=5.0)
 
     # DLQ configuration
     dlq_dir: str = env("HIPPIUS_DLQ_DIR:/tmp/hippius_dlq")

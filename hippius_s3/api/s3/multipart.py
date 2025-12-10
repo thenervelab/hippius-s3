@@ -506,6 +506,7 @@ async def upload_part(
                     request_id=f"{object_id_str}::upload_part_copy",
                     object_id=object_id_str,
                     object_version=src_ver,
+                    object_storage_version=int(source_obj["storage_version"]),
                     object_key=source_object_key,
                     bucket_name=source_bucket_name,
                     address=request.state.account.main_account,

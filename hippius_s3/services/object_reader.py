@@ -159,6 +159,7 @@ async def build_stream_context(
                 request_id=f"{info['object_id']}::shared",
                 object_id=info["object_id"],
                 object_version=int(info.get("object_version") or info.get("current_object_version") or 1),
+                object_storage_version=int(info["storage_version"]),
                 object_key=info.get("object_key", ""),
                 bucket_name=info.get("bucket_name", ""),
                 address=address,
