@@ -89,6 +89,7 @@ class DownloadChainRequest(RetryableRequest):
     object_version: int
     object_key: str
     bucket_name: str
+    object_storage_version: int
     address: str
     subaccount: str
     subaccount_seed_phrase: str
@@ -251,8 +252,24 @@ async def move_due_unpin_retries_to_primary(
 async def enqueue_download_request(payload: DownloadChainRequest) -> None:
     """Add a download request to the Redis queue for processing by downloader."""
     client = get_queue_client()
-    await client.lpush("download_requests", payload.model_dump_json())
-    logger.info(f"Enqueued download request {payload.name=}")
+    raw = payload.model_dump_json()
+
+    from hippius_s3.config import get_config  # local import to avoid cycles
+
+    config = get_config()
+    queue_names_str: str = getattr(config, "download_queue_names", "download_requests")
+
+    def _norm(name: str) -> str:
+        return name.strip().strip('"').strip("'")
+
+    queue_names: list[str] = [_norm(q) for q in queue_names_str.split(",") if _norm(q)]
+    if not queue_names:
+        queue_names = ["download_requests"]
+
+    for qname in queue_names:
+        await client.lpush(qname, raw)
+
+    logger.info(f"Enqueued download request {payload.name=} queues={queue_names}")
 
 
 async def dequeue_download_request() -> Union[DownloadChainRequest, None]:
