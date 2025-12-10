@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import logging
@@ -6,6 +7,13 @@ from typing import AsyncIterator
 
 import asyncpg
 import httpx
+
+
+try:
+    from asyncio import timeout as asyncio_timeout  # type: ignore[attr-defined]
+except ImportError:
+    from async_timeout import timeout as asyncio_timeout  # type: ignore[import-not-found]
+
 import nacl.secret
 from pydantic import BaseModel
 
@@ -94,10 +102,19 @@ async def s3_download(
 ) -> S3Download:
     start_time = time.time()
 
-    raw_data = bytearray()
-    async for chunk in _stream_cid(cid):
-        raw_data.extend(chunk)
-    raw_data_bytes = bytes(raw_data)
+    # Two-layer timeout defense:
+    # 1. httpx timeout (config.httpx_ipfs_api_timeout): protects against network stalls (no data received)
+    # 2. asyncio.timeout (30s): enforces absolute wall-clock limit regardless of slow streaming
+    # Whichever triggers first will raise TimeoutError
+    try:
+        async with asyncio_timeout(30):
+            raw_data = bytearray()
+            async for chunk in _stream_cid(cid):
+                raw_data.extend(chunk)
+            raw_data_bytes = bytes(raw_data)
+    except asyncio.TimeoutError:
+        elapsed = time.time() - start_time
+        raise TimeoutError(f"IPFS download timeout after {elapsed:.1f}s for CID {cid}") from None
 
     if decrypt:
         identifier = f"{account_address}:{bucket_name}"
