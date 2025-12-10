@@ -63,7 +63,7 @@ if [ -n "$DRY_RUN_FLAG" ] && [ "$DRY_RUN_FLAG" = "--dry-run" ]; then
 fi
 
 # Count objects
-TOTAL=$(grep -v '^#' "$OBJECTS_FILE" | grep -v '^[[:space:]]*$' | wc -l | xargs)
+TOTAL=$(grep -v '^#' "$OBJECTS_FILE" | grep -v '^[[:space:]]*$' | wc -l | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 
 echo "========================================="
 echo "Migration Plan (Running Inside Docker)"
@@ -106,8 +106,8 @@ while IFS='|' read -r bucket key; do
     [[ -z "$bucket" ]] && continue
 
     # Trim whitespace
-    bucket=$(echo "$bucket" | xargs)
-    key=$(echo "$key" | xargs)
+    bucket=$(echo "$bucket" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    key=$(echo "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 
     COUNTER=$((COUNTER + 1))
 
@@ -184,8 +184,8 @@ if [ -z "$DRY_RUN_FLAG" ]; then
     echo ""
     echo "State files:"
     echo "  Checkpoint: $CHECKPOINT_FILE"
-    echo "  Succeeded: $SUCCESS_FILE ($(wc -l < "$SUCCESS_FILE" | xargs) objects)"
-    echo "  Failed: $FAILED_FILE ($(wc -l < "$FAILED_FILE" | xargs) objects)"
+    echo "  Succeeded: $SUCCESS_FILE ($(wc -l < "$SUCCESS_FILE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//') objects)"
+    echo "  Failed: $FAILED_FILE ($(wc -l < "$FAILED_FILE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//') objects)"
     echo ""
 
     if [ $FAILED -gt 0 ]; then
