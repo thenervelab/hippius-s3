@@ -10,4 +10,5 @@ JOIN buckets b ON o.bucket_id = b.bucket_id
 LEFT JOIN cids c ON ov.cid_id = c.id
 WHERE o.bucket_id = $1
   AND ($2::text IS NULL OR o.object_key LIKE $2::text || '%')
+  AND ov.status != 'failed'
 ORDER BY o.object_key COLLATE "C"
