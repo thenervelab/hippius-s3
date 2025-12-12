@@ -18,7 +18,7 @@ from hippius_s3.reader.planner import build_chunk_plan
 from hippius_s3.reader.streamer import stream_plan
 from hippius_s3.reader.types import ChunkPlanItem
 from hippius_s3.reader.types import RangeRequest
-from hippius_s3.services.acl_helper import bucket_has_public_read_acl
+from hippius_s3.storage_version import require_supported_storage_version
 
 
 logger = logging.getLogger(__name__)
@@ -77,6 +77,8 @@ async def build_stream_context(
     address: str,
 ) -> StreamContext:
     cfg = get_config()
+    storage_version = require_supported_storage_version(int(info["storage_version"]))
+    should_decrypt = bool(info.get("should_decrypt", True))
 
     ov = int(info.get("object_version") or info.get("current_object_version") or 1)
     parts = await read_parts_manifest(db, info["object_id"], ov)
@@ -120,7 +122,6 @@ async def build_stream_context(
             idx_set = indices_by_part.setdefault(int(item.part_number), set())
             idx_set.add(int(item.chunk_index))
         dl_parts: list[PartToDownload] = []
-        storage_version = int(info.get("storage_version") or 0)
         if storage_version >= 4:
             # v4+: CIDs are optional.
             # - If per-chunk CIDs exist in part_chunks, include them so the IPFS downloader can hydrate from IPFS.
@@ -236,7 +237,7 @@ async def build_stream_context(
                 request_id=f"{info['object_id']}::shared",
                 object_id=info["object_id"],
                 object_version=int(info.get("object_version") or info.get("current_object_version") or 1),
-                object_storage_version=int(info["storage_version"]),
+                object_storage_version=int(storage_version),
                 object_key=info.get("object_key", ""),
                 bucket_name=info.get("bucket_name", ""),
                 address=address,
@@ -244,7 +245,7 @@ async def build_stream_context(
                 subaccount_seed_phrase="",
                 substrate_url=cfg.substrate_url,
                 ipfs_node=cfg.ipfs_get_url,
-                should_decrypt=bool(info.get("should_decrypt")),
+                should_decrypt=should_decrypt,
                 size=int(info.get("size_bytes") or 0),
                 multipart=bool(info.get("multipart")),
                 chunks=dl_parts,
@@ -252,15 +253,7 @@ async def build_stream_context(
             )
             await enqueue_download_request(req)
 
-    storage_version = int(info.get("storage_version") or 2)
     object_version = int(info.get("object_version") or info.get("current_object_version") or 1)
-
-    if "should_decrypt" in info:
-        should_decrypt = bool(info.get("should_decrypt"))
-    else:
-        bucket_name = info["bucket_name"]
-        is_public = await bucket_has_public_read_acl(db, bucket_name)
-        should_decrypt = (storage_version >= 3) or (not is_public)
 
     return StreamContext(
         plan=plan,
