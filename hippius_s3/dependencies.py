@@ -15,7 +15,6 @@ from hippius_s3.config import Config
 from hippius_s3.repositories import BucketRepository
 from hippius_s3.repositories import ObjectRepository
 from hippius_s3.repositories import UserRepository
-from hippius_s3.services.object_reader import ObjectReader
 
 
 logger = logging.getLogger(__name__)
@@ -76,11 +75,6 @@ def get_redis_accounts(request: Request) -> async_redis.Redis:
     """Extract the Redis accounts client from the request."""
     redis_accounts_client: async_redis.Redis = request.app.state.redis_accounts_client
     return redis_accounts_client
-
-
-def get_object_reader(request: Request) -> ObjectReader:
-    """Provide an ObjectReader service configured with app Config."""
-    return ObjectReader(request.app.state.config)
 
 
 @dataclass

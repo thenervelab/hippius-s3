@@ -28,36 +28,6 @@ class DownloadNotReadyError(Exception):
     pass
 
 
-# Back-compat type stubs for existing imports
-@dataclass
-class ObjectInfo:
-    object_id: str
-    bucket_name: str
-    object_key: str
-    size_bytes: int
-    content_type: str
-    md5_hash: str
-    created_at: Any
-    metadata: dict
-    multipart: bool
-    should_decrypt: bool
-    simple_cid: str | None = None
-    upload_id: str | None = None
-
-
-@dataclass
-class Range:
-    start: int
-    end: int
-
-
-class ObjectReader:  # noqa: D401 (compat shim)
-    """Compatibility stub; legacy ObjectReader no longer used."""
-
-    def __init__(self, config: Any | None = None) -> None:
-        self.config = config
-
-
 @dataclass
 class StreamContext:
     plan: list[ChunkPlanItem]

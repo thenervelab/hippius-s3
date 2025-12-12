@@ -13,7 +13,6 @@ from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
 from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
-from hippius_s3.services.object_reader import ObjectReader
 from hippius_s3.utils import get_query
 
 
@@ -48,8 +47,6 @@ async def handle_head_object(
     object_key: str,
     request: Request,
     db: Any,
-    *,
-    object_reader: ObjectReader | None = None,
 ) -> Response:
     # Gateway now handles all ACL/permission checks
     # Backend trusts the account information from gateway
