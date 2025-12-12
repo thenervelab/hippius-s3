@@ -33,8 +33,6 @@ async def handle_copy_object(
     request: Request,
     db: Any,
     redis_client: Any,
-    *,
-    object_reader: Any | None = None,
 ) -> Response:
     copy_source = request.headers.get("x-amz-copy-source")
     if not copy_source:
@@ -87,7 +85,7 @@ async def handle_copy_object(
     object_id = str(uuid.uuid4())
     created_at = datetime.now(timezone.utc)
 
-    # Prefer ObjectReader to manage readiness and cache hydration
+    # Prefer reader service to manage readiness and cache hydration
     # Resolve source object via repository (avoid reader shim)
     src_obj_row = await ObjectRepository(db).get_by_path(source_bucket["bucket_id"], source_object_key)
     if not src_obj_row:

@@ -35,7 +35,6 @@ async def handle_get_object(
     request: Request,
     db: Any,
     redis_client: Any,
-    object_reader: Any | None = None,
 ) -> Response:
     """Isolated GET object endpoint handler."""
     # If tagging is in query params, handle object tags request
@@ -125,7 +124,7 @@ async def handle_get_object(
                 Key=object_key,
             )
 
-        # Build manifest purely from DB parts, 0-based; prefer ObjectReader if provided
+        # Build manifest purely from DB parts, 0-based
         with tracer.start_as_current_span("get_object.build_manifest") as span:
             download_chunks = json.loads(object_info["download_chunks"]) if object_info.get("download_chunks") else []
             try:
