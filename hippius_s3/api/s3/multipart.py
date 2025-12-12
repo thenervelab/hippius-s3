@@ -31,6 +31,7 @@ from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.services.object_reader import ObjectReader
+from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 from hippius_s3.writer.object_writer import ObjectWriter
 
@@ -265,7 +266,7 @@ async def initiate_multipart_upload(
             "",  # initial md5_hash (will be updated on completion)
             0,  # initial size_bytes (will be updated on completion)
             initiated_at,  # created_at
-            config.target_storage_version,
+            int(getattr(config, "target_storage_version", 4)),
         )
 
         # Use the returned object_id (will be existing one if conflict occurred)
@@ -506,14 +507,14 @@ async def upload_part(
                     request_id=f"{object_id_str}::upload_part_copy",
                     object_id=object_id_str,
                     object_version=src_ver,
-                    object_storage_version=int(source_obj["storage_version"]),
                     object_key=source_object_key,
                     bucket_name=source_bucket_name,
                     address=request.state.account.main_account,
                     subaccount=request.state.account.main_account,
                     subaccount_seed_phrase=request.state.seed_phrase,
                     substrate_url=config.substrate_url,
-                    should_decrypt=True,  # v3 path will decrypt; legacy parts unaffected
+                    ipfs_node=config.ipfs_get_url,
+                    should_decrypt=True,
                     size=int(source_obj.get("size_bytes") or 0),
                     multipart=bool((json.loads(source_obj.get("metadata") or "{}") or {}).get("multipart", False)),
                     chunks=dl_parts,
@@ -521,16 +522,17 @@ async def upload_part(
                 await enqueue_download_request(req)
 
             # Stream plaintext bytes
+            _ = require_supported_storage_version(int(source_obj["storage_version"]))
             chunks_iter = stream_plan(
                 obj_cache=obj_cache,
                 object_id=object_id_str,
                 object_version=src_ver,
                 plan=plan,
                 should_decrypt=True,
-                sleep_seconds=config.http_download_sleep_loop,
+                sleep_seconds=float(config.http_download_sleep_loop),
                 address=request.state.account.main_account,
                 bucket_name=source_bucket_name,
-                storage_version=int(source_obj.get("storage_version") or 2),
+                storage_version=int(source_obj["storage_version"]),
             )
             try:
                 source_bytes = b"".join([piece async for piece in chunks_iter])

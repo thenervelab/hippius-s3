@@ -20,6 +20,7 @@ from hippius_s3.config import get_config
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.services.manifest_service import ManifestService
 from hippius_s3.services.object_reader import DownloadNotReadyError
+from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 
 
@@ -111,7 +112,7 @@ async def handle_get_object(
                         "has_object_id": True,
                         "size_bytes": int(object_info.get("size_bytes") or 0),
                         "multipart": bool(object_info.get("multipart")),
-                        "storage_version": int(object_info.get("storage_version") or 2),
+                        "storage_version": int(object_info["storage_version"]),
                         "is_public": bool(object_info.get("is_public")),
                     },
                 )
@@ -215,7 +216,7 @@ async def handle_get_object(
             v2_rng = V2Range(start=int(start_byte), end=int(end_byte))
 
         # Decide decryption internally based on storage_version (v3+: always decrypt)
-        storage_version = int(object_info.get("storage_version") or 2)
+        storage_version = require_supported_storage_version(int(object_info["storage_version"]))
         bucket_owner_id = str(object_info.get("bucket_owner_id") or "")
         is_anonymous = account_id == "anonymous"
 
@@ -235,8 +236,6 @@ async def handle_get_object(
             "multipart": bool(object_info["multipart"]),
             # Ensure reader uses the current object version for cache keys and downloader
             "object_version": int(object_info.get("object_version") or 1),
-            # should_decrypt derived in reader from storage_version; keep for now to avoid breaking
-            "should_decrypt": storage_version >= 3,
             "storage_version": storage_version,
             "ray_id": getattr(request.state, "ray_id", None),
         }

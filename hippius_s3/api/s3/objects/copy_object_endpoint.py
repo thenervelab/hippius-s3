@@ -18,8 +18,8 @@ from hippius_s3.config import get_config
 from hippius_s3.repositories.buckets import BucketRepository
 from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
-from hippius_s3.services.acl_helper import bucket_has_public_read_acl
 from hippius_s3.services.object_reader import stream_object
+from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.writer.object_writer import ObjectWriter
 
 
@@ -84,9 +84,6 @@ async def handle_copy_object(
             "NotImplemented", "Copying multipart objects is not currently supported", status_code=501
         )
 
-    # Determine encryption context
-    source_is_public = await bucket_has_public_read_acl(db, source_bucket_name)
-
     object_id = str(uuid.uuid4())
     created_at = datetime.now(timezone.utc)
 
@@ -107,10 +104,10 @@ async def handle_copy_object(
             raw_meta = {}
     src_metadata: dict[str, Any] = raw_meta if isinstance(raw_meta, dict) else {}
     src_multipart = bool(src_metadata.get("multipart", False))
-
     # Assemble bytes via high-level reader API (internally handles downloader/cache)
     logger.info("CopyObject assembling bytes via object_reader.stream_object")
     obj_cache = RedisObjectPartsCache(redis_client)
+    storage_version = require_supported_storage_version(int(src_obj_row["storage_version"]))
     chunks_iter = await stream_object(
         db,
         redis_client,
@@ -119,7 +116,7 @@ async def handle_copy_object(
             "object_id": src_object_id,
             "bucket_name": source_bucket_name,
             "object_key": source_object_key,
-            "storage_version": int(src_obj_row.get("storage_version") or 2),
+            "storage_version": storage_version,
             "object_version": int(src_obj_row.get("object_version") or 1),
             "is_public": source_is_public,
             "multipart": src_multipart,
@@ -142,7 +139,7 @@ async def handle_copy_object(
         account_address=request.state.account.main_account,
         content_type=content_type,
         metadata=metadata,
-        storage_version=config.target_storage_version,
+        storage_version=int(getattr(config, "target_storage_version", 4)),
         body_iter=chunks_iter,
     )
 
