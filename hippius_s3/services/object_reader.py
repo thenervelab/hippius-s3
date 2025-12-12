@@ -16,6 +16,7 @@ from hippius_s3.reader.planner import build_chunk_plan
 from hippius_s3.reader.streamer import stream_plan
 from hippius_s3.reader.types import ChunkPlanItem
 from hippius_s3.reader.types import RangeRequest
+from hippius_s3.storage_version import require_supported_storage_version
 
 
 class DownloadNotReadyError(Exception):
@@ -34,7 +35,6 @@ class ObjectInfo:
     created_at: Any
     metadata: dict
     multipart: bool
-    should_decrypt: bool
     simple_cid: str | None = None
     upload_id: str | None = None
 
@@ -57,7 +57,6 @@ class StreamContext:
     plan: list[ChunkPlanItem]
     object_version: int
     storage_version: int
-    should_decrypt: bool
     source: str
 
 
@@ -159,7 +158,6 @@ async def build_stream_context(
                 request_id=f"{info['object_id']}::shared",
                 object_id=info["object_id"],
                 object_version=int(info.get("object_version") or info.get("current_object_version") or 1),
-                object_storage_version=int(info["storage_version"]),
                 object_key=info.get("object_key", ""),
                 bucket_name=info.get("bucket_name", ""),
                 address=address,
@@ -167,7 +165,6 @@ async def build_stream_context(
                 subaccount_seed_phrase="",
                 substrate_url=cfg.substrate_url,
                 ipfs_node=cfg.ipfs_get_url,
-                should_decrypt=bool(info.get("should_decrypt")),
                 size=int(info.get("size_bytes") or 0),
                 multipart=bool(info.get("multipart")),
                 chunks=dl_parts,
@@ -175,19 +172,13 @@ async def build_stream_context(
             )
             await enqueue_download_request(req)
 
-    storage_version = int(info.get("storage_version") or 2)
+    storage_version = require_supported_storage_version(int(info["storage_version"]))
     object_version = int(info.get("object_version") or info.get("current_object_version") or 1)
-    if "should_decrypt" in info:
-        should_decrypt = bool(info.get("should_decrypt"))
-    else:
-        is_public = bool(info.get("is_public", False))
-        should_decrypt = (storage_version >= 3) or (not is_public)
 
     return StreamContext(
         plan=plan,
         object_version=object_version,
         storage_version=storage_version,
-        should_decrypt=should_decrypt,
         source=source,
     )
 
@@ -217,11 +208,9 @@ async def read_response(
         object_id=info["object_id"],
         object_version=ctx.object_version,
         plan=ctx.plan,
-        should_decrypt=ctx.should_decrypt,
         sleep_seconds=float(cfg.http_download_sleep_loop),
         address=address,
         bucket_name=str(info.get("bucket_name", "")),
-        storage_version=ctx.storage_version,
     )
     headers = build_headers(
         info,
@@ -267,9 +256,7 @@ async def stream_object(
         object_id=info["object_id"],
         object_version=ctx.object_version,
         plan=ctx.plan,
-        should_decrypt=ctx.should_decrypt,
         sleep_seconds=float(cfg.http_download_sleep_loop),
         address=address,
         bucket_name=str(info.get("bucket_name", "")),
-        storage_version=ctx.storage_version,
     )
