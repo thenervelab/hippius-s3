@@ -49,8 +49,15 @@ def factory() -> FastAPI:
     async def startup() -> None:
         logger.info("Starting Hippius S3 Gateway...")
 
-        app.state.postgres_pool = await asyncpg.create_pool(config.database_url)
-        logger.info("Connected to PostgreSQL")
+        app.state.postgres_pool = await asyncpg.create_pool(
+            config.database_url,
+            min_size=config.db_pool_min_size,
+            max_size=config.db_pool_max_size,
+            max_queries=config.db_pool_max_queries,
+            max_inactive_connection_lifetime=config.db_pool_max_inactive_lifetime,
+            command_timeout=config.db_pool_command_timeout,
+        )
+        logger.info(f"PostgreSQL pool created: min={config.db_pool_min_size}, max={config.db_pool_max_size}")
 
         app.state.redis_client = redis.from_url(config.redis_url, decode_responses=False)
         logger.info("Connected to Redis")
@@ -89,6 +96,22 @@ def factory() -> FastAPI:
             cache_ttl=config.docs_cache_ttl_seconds,
         )
         logger.info("DocsProxyService initialized")
+
+        async def collect_pool_metrics() -> None:
+            import asyncio
+
+            while True:
+                await asyncio.sleep(60)
+                if hasattr(app.state, "postgres_pool") and hasattr(app.state, "metrics_collector"):
+                    pool = app.state.postgres_pool
+                    size = pool.get_size()
+                    free = pool.get_idle_size()
+                    app.state.metrics_collector.update_db_pool_metrics(size, free)
+
+        import asyncio
+
+        asyncio.create_task(collect_pool_metrics())
+        logger.info("Pool metrics collection task started")
 
         logger.info("Gateway startup complete")
 

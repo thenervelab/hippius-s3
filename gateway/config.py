@@ -65,6 +65,17 @@ class GatewayConfig:
     docs_cache_ttl_seconds: int = dataclasses.field(
         default_factory=lambda: int(os.getenv("DOCS_CACHE_TTL_SECONDS", "300"))
     )
+    db_pool_min_size: int = dataclasses.field(default_factory=lambda: int(os.getenv("GATEWAY_DB_POOL_MIN_SIZE", "10")))
+    db_pool_max_size: int = dataclasses.field(default_factory=lambda: int(os.getenv("GATEWAY_DB_POOL_MAX_SIZE", "50")))
+    db_pool_max_queries: int = dataclasses.field(
+        default_factory=lambda: int(os.getenv("GATEWAY_DB_POOL_MAX_QUERIES", "50000"))
+    )
+    db_pool_max_inactive_lifetime: int = dataclasses.field(
+        default_factory=lambda: int(os.getenv("GATEWAY_DB_POOL_MAX_INACTIVE_LIFETIME", "300"))
+    )
+    db_pool_command_timeout: int = dataclasses.field(
+        default_factory=lambda: int(os.getenv("GATEWAY_DB_POOL_COMMAND_TIMEOUT", "30"))
+    )
 
 
 _config: GatewayConfig | None = None

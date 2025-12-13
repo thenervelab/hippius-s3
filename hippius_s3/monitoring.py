@@ -37,6 +37,9 @@ class MetricsCollector:
         # FS store metrics
         self._fs_store_oldest_age_seconds = 0.0
         self._fs_store_parts_on_disk = 0
+        self._db_pool_size = 0
+        self._db_pool_free = 0
+        self._db_pool_used = 0
         self._setup_metrics()
 
     def _setup_metrics(self) -> None:
@@ -289,6 +292,22 @@ class MetricsCollector:
             description="Unix timestamp of last successful backup cycle",
         )
 
+        self.meter.create_observable_gauge(
+            name="db_pool_size",
+            callbacks=[self._obs_db_pool_size],
+            description="Database connection pool current size",
+        )
+        self.meter.create_observable_gauge(
+            name="db_pool_free_connections",
+            callbacks=[self._obs_db_pool_free],
+            description="Database connection pool free connections",
+        )
+        self.meter.create_observable_gauge(
+            name="db_pool_used_connections",
+            callbacks=[self._obs_db_pool_used],
+            description="Database connection pool used connections",
+        )
+
     def _obs_redis_used_mem(self, _: object) -> list[metrics.Observation]:
         return [metrics.Observation(self._used_mem, {})]
 
@@ -328,12 +347,26 @@ class MetricsCollector:
     def _obs_fs_store_parts_on_disk(self, _: object) -> list[metrics.Observation]:
         return [metrics.Observation(int(self._fs_store_parts_on_disk), {})]
 
+    def _obs_db_pool_size(self, _: object) -> list[metrics.Observation]:
+        return [metrics.Observation(self._db_pool_size, {})]
+
+    def _obs_db_pool_free(self, _: object) -> list[metrics.Observation]:
+        return [metrics.Observation(self._db_pool_free, {})]
+
+    def _obs_db_pool_used(self, _: object) -> list[metrics.Observation]:
+        return [metrics.Observation(self._db_pool_used, {})]
+
     # Public setters for FS metrics
     def set_fs_store_oldest_age_seconds(self, age_seconds: float) -> None:
         self._fs_store_oldest_age_seconds = float(max(0.0, age_seconds))
 
     def set_fs_store_parts_on_disk(self, count: int) -> None:
         self._fs_store_parts_on_disk = int(max(0, count))
+
+    def update_db_pool_metrics(self, size: int, free: int) -> None:
+        self._db_pool_size = size
+        self._db_pool_free = free
+        self._db_pool_used = size - free
 
     def record_http_request(
         self,
