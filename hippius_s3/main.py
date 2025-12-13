@@ -27,6 +27,7 @@ from hippius_s3.api.user import router as user_router
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisDownloadChunksCache
 from hippius_s3.cache import RedisObjectPartsCache
+from hippius_s3.config import Config
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
@@ -35,21 +36,23 @@ from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
 logger = logging.getLogger(__name__)
 
 
-async def postgres_create_pool(database_url: str) -> asyncpg.Pool:
+async def postgres_create_pool(database_url: str, config: Config) -> asyncpg.Pool:
     """Create and return a Postgres connection pool.
 
     Args:
         database_url: Postgres connection URL
+        config: Application configuration with pool settings
 
     Returns:
         Connection pool for Postgres
     """
     return await asyncpg.create_pool(
         database_url,
-        min_size=5,
-        max_size=20,
-        max_queries=50000,
-        max_inactive_connection_lifetime=300,
+        min_size=config.db_pool_min_size,
+        max_size=config.db_pool_max_size,
+        max_queries=config.db_pool_max_queries,
+        max_inactive_connection_lifetime=config.db_pool_max_inactive_lifetime,
+        command_timeout=config.db_pool_command_timeout,
     )
 
 
@@ -60,8 +63,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.config = get_config()
         config = app.state.config
 
-        app.state.postgres_pool = await postgres_create_pool(config.database_url)
-        logger.info("Postgres connection pool created")
+        app.state.postgres_pool = await postgres_create_pool(config.database_url, config)
+        logger.info(f"Postgres connection pool created: min={config.db_pool_min_size}, max={config.db_pool_max_size}")
 
         app.state.redis_client = async_redis.from_url(config.redis_url)
         logger.info("Redis client initialized")
@@ -119,6 +122,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         )
         await app.state.background_metrics_collector.start()
         logger.info("Background metrics collection started")
+
+        async def collect_pool_metrics() -> None:
+            import asyncio
+
+            while True:
+                await asyncio.sleep(60)
+                if hasattr(app.state, "postgres_pool") and hasattr(app.state, "metrics_collector"):
+                    pool = app.state.postgres_pool
+                    size = pool.get_size()
+                    free = pool.get_idle_size()
+                    app.state.metrics_collector.update_db_pool_metrics(size, free)
+
+        import asyncio
+
+        asyncio.create_task(collect_pool_metrics())
+        logger.info("Pool metrics collection task started")
 
         yield
 

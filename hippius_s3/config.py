@@ -87,6 +87,13 @@ class Config:
     # Redis for queues (persistent)
     redis_queues_url: str = env("REDIS_QUEUES_URL:redis://127.0.0.1:6382/0")
 
+    # Database connection pool configuration
+    db_pool_min_size: int = env("API_DB_POOL_MIN_SIZE:5", convert=int)
+    db_pool_max_size: int = env("API_DB_POOL_MAX_SIZE:20", convert=int)
+    db_pool_max_queries: int = env("API_DB_POOL_MAX_QUERIES:50000", convert=int)
+    db_pool_max_inactive_lifetime: int = env("API_DB_POOL_MAX_INACTIVE_LIFETIME:300", convert=int)
+    db_pool_command_timeout: int = env("API_DB_POOL_COMMAND_TIMEOUT:30", convert=int)
+
     # API signing key for pre-signed URLs
     # Generated on first run if not provided
     api_signing_key: str = env("API_SIGNING_KEY:" + str(uuid.uuid4()))
