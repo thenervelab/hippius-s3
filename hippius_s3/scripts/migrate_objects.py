@@ -80,7 +80,7 @@ async def migrate_one(
         object_id=object_id,
         content_type=content_type,
         metadata=metadata,
-        storage_version_target=int(getattr(config, "target_storage_version", 3)),
+        storage_version_target=int(getattr(config, "target_storage_version", 4)),
     )
 
     obj_cache = RedisObjectPartsCache(redis_client)
@@ -143,11 +143,9 @@ async def migrate_one(
                 object_id=object_id,
                 object_version=ctx.object_version,
                 plan=part_plan,
-                should_decrypt=ctx.should_decrypt,
                 sleep_seconds=float(config.http_download_sleep_loop),
                 address=address,
                 bucket_name=bucket_name,
-                storage_version=ctx.storage_version,
             )
             # Accumulate bytes for this part
             buf = bytearray()
@@ -254,7 +252,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
     initialize_queue_client(redis_queues_client)
     try:
-        target = int(getattr(config, "target_storage_version", 3))
+        target = int(getattr(config, "target_storage_version", 4))
 
         async def _iter_targets() -> AsyncGenerator[dict[str, Any], None]:
             row_filter_bucket = args.bucket or None
