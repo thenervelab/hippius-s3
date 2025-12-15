@@ -52,6 +52,7 @@ def _atomic_write_json(path: Path, obj: Any) -> None:
 
 
 def _format_progress_dashboard(work_items: list[dict[str, Any]]) -> str:
+    now = _now_ts()
     total = len(work_items)
     counts: dict[str, int] = {}
     for it in work_items:
@@ -72,6 +73,22 @@ def _format_progress_dashboard(work_items: list[dict[str, Any]]) -> str:
     )
     lines.append("")
 
+    # Show a rough "liveness" indicator: how long since the last terminal event.
+    last_finished = 0.0
+    for it in work_items:
+        finished_at = it.get("finished_at")
+        if finished_at is None:
+            continue
+        try:
+            last_finished = max(last_finished, float(finished_at))
+        except Exception:
+            continue
+    if last_finished > 0:
+        lines.append(f"Last completion: {now - last_finished:.0f}s ago")
+    else:
+        lines.append("Last completion: (none yet)")
+    lines.append("")
+
     # Show a few most recent non-success items for quick debugging.
     # We sort by finished_at/started_at if present.
     def ts(it: dict[str, Any]) -> float:
@@ -86,10 +103,17 @@ def _format_progress_dashboard(work_items: list[dict[str, Any]]) -> str:
             bucket = str(it.get("bucket") or "")
             key = str(it.get("key") or "")
             err = str(it.get("last_error") or it.get("skip_reason") or "")
+            started_at = it.get("started_at")
+            elapsed = ""
+            if status == "running" and started_at is not None:
+                try:
+                    elapsed = f" ({now - float(started_at):.0f}s)"
+                except Exception:
+                    elapsed = ""
             if err:
-                lines.append(f"- {status:9s} {bucket}/{key} — {err}")
+                lines.append(f"- {status:9s} {bucket}/{key}{elapsed} — {err}")
             else:
-                lines.append(f"- {status:9s} {bucket}/{key}")
+                lines.append(f"- {status:9s} {bucket}/{key}{elapsed}")
     return "\n".join(lines)
 
 
@@ -784,8 +808,8 @@ def main() -> None:
     ap.add_argument(
         "--timeout-seconds",
         type=float,
-        default=0.0,
-        help="Per-object timeout in seconds (0 disables).",
+        default=30.0,
+        help="Per-object timeout in seconds (0 disables). Default: 30s.",
     )
     args = ap.parse_args()
 

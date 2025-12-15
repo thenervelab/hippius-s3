@@ -39,7 +39,7 @@ CLI Usage
 
   - Step 2: Run the migration from the worklist (stdin) with safe periodic checkpoints:
 
-    - `docker compose exec api sh -lc 'python hippius_s3/scripts/migrate_objects.py --objects-json-stdin --resume --state-file /var/lib/hippius/persist/worklist.state.json --concurrency 4 --timeout-seconds 0 --progress < /var/lib/hippius/persist/worklist.json'`
+    - `docker compose exec api sh -lc 'python hippius_s3/scripts/migrate_objects.py --objects-json-stdin --resume --state-file /var/lib/hippius/persist/worklist.state.json --concurrency 4 --progress < /var/lib/hippius/persist/worklist.json'`
 
   - Flags (worklist mode):
 
@@ -50,7 +50,7 @@ CLI Usage
     - `--progress`: render a live, refreshing progress dashboard
     - `--progress-output stdout|stderr`: send the dashboard to stdout/stderr (default stderr)
     - `--concurrency N`: max objects processed concurrently (default 4). This controls **objects in parallel**, not parts-per-object.
-    - `--timeout-seconds`: per-object timeout (0 disables)
+    - `--timeout-seconds`: per-object timeout (0 disables). Default is 30s.
     - `--dry-run`: print plan without executing (marks items as planned)
 
   - Notes:
