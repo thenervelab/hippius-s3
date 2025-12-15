@@ -1,3 +1,4 @@
+import asyncio
 from typing import Callable
 from typing import Dict
 
@@ -72,6 +73,9 @@ def factory() -> FastAPI:
         app.state.redis_rate_limiting = redis.from_url(config.redis_rate_limiting_url, decode_responses=False)
         logger.info("Connected to Redis (rate limiting)")
 
+        app.state.redis_acl = redis.from_url(config.redis_acl_url, decode_responses=True)
+        logger.info("Connected to Redis (ACL cache)")
+
         app.state.metrics_collector = MetricsCollector(app.state.redis_client)
         set_metrics_collector(app.state.metrics_collector)
         logger.info("Metrics collector initialized")
@@ -88,6 +92,8 @@ def factory() -> FastAPI:
 
         app.state.acl_service = ACLService(
             db_pool=app.state.postgres_pool,
+            redis_client=app.state.redis_acl,
+            cache_ttl=config.acl_cache_ttl_seconds,
         )
         logger.info("ACLService initialized")
 
@@ -99,8 +105,6 @@ def factory() -> FastAPI:
         logger.info("DocsProxyService initialized")
 
         async def collect_pool_metrics() -> None:
-            import asyncio
-
             while True:
                 await asyncio.sleep(60)
                 if hasattr(app.state, "postgres_pool") and hasattr(app.state, "metrics_collector"):
@@ -109,9 +113,7 @@ def factory() -> FastAPI:
                     free = pool.get_idle_size()
                     app.state.metrics_collector.update_db_pool_metrics(size, free)
 
-        import asyncio
-
-        asyncio.create_task(collect_pool_metrics())
+        await asyncio.create_task(collect_pool_metrics())
         logger.info("Pool metrics collection task started")
 
         logger.info("Gateway startup complete")
@@ -142,6 +144,10 @@ def factory() -> FastAPI:
         if hasattr(app.state, "redis_rate_limiting"):
             await app.state.redis_rate_limiting.close()
             logger.info("Redis rate limiting client closed")
+
+        if hasattr(app.state, "redis_acl"):
+            await app.state.redis_acl.close()
+            logger.info("Redis ACL client closed")
 
         logger.info("Gateway shutdown complete")
 
@@ -197,7 +203,6 @@ def factory() -> FastAPI:
 
 
 app = factory()
-
 
 if __name__ == "__main__":
     import os

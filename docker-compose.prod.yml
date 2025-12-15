@@ -60,6 +60,21 @@ services:
         limits:
           cpus: "4"
 
+  redis-acl:
+    command:
+      [
+        "redis-server",
+        "/usr/local/etc/redis/redis.conf",
+        "--maxmemory",
+        "4gb",
+        "--maxmemory-policy",
+        "allkeys-lru",
+        "--save",
+        "",
+        "--appendonly",
+        "no",
+      ]
+
   downloader:
     deploy:
       replicas: 10

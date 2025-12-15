@@ -1,7 +1,9 @@
 import logging
 
 import asyncpg
+import redis.asyncio as redis
 
+from gateway.repositories.cached_acl_repository import CachedACLRepository
 from hippius_s3.models.acl import ACL
 from hippius_s3.models.acl import Grant
 from hippius_s3.models.acl import GranteeType
@@ -14,15 +16,22 @@ logger = logging.getLogger(__name__)
 
 
 class ACLService:
-    def __init__(self, db_pool: asyncpg.Pool):
-        self.acl_repo = ACLRepository(db_pool)
-        logger.info("ACLService initialized (direct DB queries, no caching)")
+    def __init__(self, db_pool: asyncpg.Pool, redis_client: redis.Redis | None = None, cache_ttl: int = 600):
+        base_repo = ACLRepository(db_pool)
+        if redis_client:
+            self.acl_repo = CachedACLRepository(base_repo, redis_client, cache_ttl)
+            logger.info(f"ACLService initialized with Redis caching (TTL={cache_ttl}s)")
+        else:
+            self.acl_repo = base_repo
+            logger.info("ACLService initialized (direct DB queries, no caching)")
 
     async def canned_acl_to_acl(self, canned_acl: str, owner_id: str, bucket: str | None = None) -> ACL:
         """Convert canned ACL name to ACL object with grants."""
         from hippius_s3.services.acl_helper import canned_acl_to_acl as shared_canned_acl_to_acl
 
-        return await shared_canned_acl_to_acl(canned_acl, owner_id, self.acl_repo.db, bucket)
+        db_pool = self.acl_repo.acl_repo.db if isinstance(self.acl_repo, CachedACLRepository) else self.acl_repo.db
+
+        return await shared_canned_acl_to_acl(canned_acl, owner_id, db_pool, bucket)
 
     def _grant_matches(self, grant: Grant, account_id: str | None, access_key: str | None = None) -> bool:
         """Check if grant applies to this account or access key."""
@@ -126,5 +135,9 @@ class ACLService:
         return await self.canned_acl_to_acl("private", owner_id, bucket)
 
     async def invalidate_cache(self, bucket: str, key: str | None = None) -> None:
-        """No-op: caching removed for simplicity and consistency."""
-        pass
+        """Invalidate ACL cache for bucket or object."""
+        if isinstance(self.acl_repo, CachedACLRepository):
+            if key:
+                await self.acl_repo.invalidate_object_acl(bucket, key)
+            else:
+                await self.acl_repo.invalidate_bucket_acl(bucket)
