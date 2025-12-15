@@ -113,7 +113,7 @@ def factory() -> FastAPI:
                     free = pool.get_idle_size()
                     app.state.metrics_collector.update_db_pool_metrics(size, free)
 
-        await asyncio.create_task(collect_pool_metrics())
+        asyncio.create_task(collect_pool_metrics())
         logger.info("Pool metrics collection task started")
 
         logger.info("Gateway startup complete")
