@@ -121,6 +121,8 @@ async def acl_middleware(
         logger.info(f"Bucket not found in ACL check: {bucket}, passing through to backend for proper S3 error")
         return await call_next(request)
 
+    request.state.bucket_owner_id = bucket_owner_id
+
     if auth_method == "access_key" and token_type == "master" and bucket_owner_id == account_id:
         logger.info(f"Master token bypass for account {account_id} on bucket {bucket}")
         request.state.bucket_owner_id = bucket_owner_id
@@ -142,6 +144,7 @@ async def acl_middleware(
             key=check_key,
             permission=permission,
             access_key=access_key,
+            bucket_owner_id=bucket_owner_id,
         )
     except ValueError as e:
         if "Bucket not found" in str(e):
@@ -156,8 +159,6 @@ async def acl_middleware(
             message="Access Denied",
             status_code=403,
         )
-
-    request.state.bucket_owner_id = bucket_owner_id
 
     is_anonymous = account_id is None or account_id == "anonymous"
     request.state.is_anonymous_access = is_anonymous
