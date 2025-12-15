@@ -25,8 +25,8 @@ async def redis_client() -> redis.Redis:
 
 
 @pytest.fixture
-async def cached_acl_repo(postgres_pool, redis_client) -> CachedACLRepository:
-    base_repo = ACLRepository(postgres_pool)
+async def cached_acl_repo(gateway_db_pool, redis_client) -> CachedACLRepository:
+    base_repo = ACLRepository(gateway_db_pool)
     return CachedACLRepository(base_repo, redis_client, ttl_seconds=600)
 
 
@@ -42,13 +42,18 @@ def sample_acl() -> ACL:
     return ACL(owner=owner, grants=grants)
 
 
-@pytest.mark.integration
 class TestACLCacheFlow:
     @pytest.mark.asyncio
     async def test_bucket_acl_caching_flow(
-        self, cached_acl_repo: CachedACLRepository, redis_client: redis.Redis, sample_acl: ACL, test_bucket
+        self, cached_acl_repo: CachedACLRepository, redis_client: redis.Redis, sample_acl: ACL, gateway_db_pool
     ) -> None:
-        bucket_name = test_bucket["bucket_name"]
+        bucket_name = "test-cache-bucket"
+
+        await gateway_db_pool.execute(
+            "INSERT INTO buckets (bucket_name, main_account_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            bucket_name,
+            "account123",
+        )
 
         cache_key = f"hippius_acl:bucket:{bucket_name}"
         cached_before = await redis_client.get(cache_key)
@@ -83,11 +88,24 @@ class TestACLCacheFlow:
         cached_acl_repo: CachedACLRepository,
         redis_client: redis.Redis,
         sample_acl: ACL,
-        test_bucket,
-        test_object,
+        gateway_db_pool,
     ) -> None:
-        bucket_name = test_bucket["bucket_name"]
-        object_key = test_object["object_key"]
+        bucket_name = "test-cache-bucket"
+        object_key = "test-object.txt"
+
+        await gateway_db_pool.execute(
+            "INSERT INTO buckets (bucket_name, main_account_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            bucket_name,
+            "account123",
+        )
+
+        bucket_id = await gateway_db_pool.fetchval("SELECT bucket_id FROM buckets WHERE bucket_name = $1", bucket_name)
+
+        await gateway_db_pool.execute(
+            "INSERT INTO objects (bucket_id, object_key, size_bytes, etag) VALUES ($1, $2, 0, 'test') ON CONFLICT DO NOTHING",
+            bucket_id,
+            object_key,
+        )
 
         cache_key = f"hippius_acl:object:{bucket_name}:{object_key}"
         cached_before = await redis_client.get(cache_key)
@@ -120,10 +138,8 @@ class TestACLCacheFlow:
         cached_acl_repo: CachedACLRepository,
         redis_client: redis.Redis,
         sample_acl: ACL,
-        test_bucket,
-        test_object,
     ) -> None:
-        bucket_name = test_bucket["bucket_name"]
+        bucket_name = "test-cache-bucket"
         object_key_1 = "obj1.txt"
         object_key_2 = "obj2.txt"
 
@@ -144,9 +160,15 @@ class TestACLCacheFlow:
 
     @pytest.mark.asyncio
     async def test_cache_ttl_set_correctly(
-        self, cached_acl_repo: CachedACLRepository, redis_client: redis.Redis, sample_acl: ACL, test_bucket
+        self, cached_acl_repo: CachedACLRepository, redis_client: redis.Redis, sample_acl: ACL, gateway_db_pool
     ) -> None:
-        bucket_name = test_bucket["bucket_name"]
+        bucket_name = "test-cache-bucket"
+
+        await gateway_db_pool.execute(
+            "INSERT INTO buckets (bucket_name, main_account_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            bucket_name,
+            "account123",
+        )
 
         await cached_acl_repo.set_bucket_acl(bucket_name, "account123", sample_acl)
 
