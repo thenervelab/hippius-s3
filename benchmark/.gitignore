@@ -1,0 +1,7 @@
+test_files/
+downloads/
+*.csv
+__pycache__/
+*.pyc
+.DS_Store
+.env
