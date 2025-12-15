@@ -76,6 +76,8 @@ services:
       - .:/app
       # Shared object parts FS store (write-through cache)
       - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
+      # General persistent storage (worklists, checkpoints, misc state)
+      - /var/lib/hippius/persist:/var/lib/hippius/persist
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
