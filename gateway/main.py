@@ -56,6 +56,7 @@ def factory() -> FastAPI:
             max_queries=config.db_pool_max_queries,
             max_inactive_connection_lifetime=config.db_pool_max_inactive_lifetime,
             command_timeout=config.db_pool_command_timeout,
+            timeout=10,
         )
         logger.info(f"PostgreSQL pool created: min={config.db_pool_min_size}, max={config.db_pool_max_size}")
 
