@@ -394,17 +394,20 @@ async def main_async(args: argparse.Namespace) -> int:
                 We write full snapshots using atomic rename to avoid partial/corrupted files.
                 """
                 assert work_items is not None
-                while True:
-                    await state_dirty.wait()
-                    state_dirty.clear()
-                    # Coalesce bursts of updates.
-                    if state_flush_seconds > 0:
-                        await asyncio.sleep(state_flush_seconds)
-                    async with state_lock:
-                        try:
-                            _atomic_write_json(state_file, work_items)
-                        except Exception:
-                            log.exception("Failed to write state file: %s", state_file)
+                try:
+                    while True:
+                        await state_dirty.wait()
+                        state_dirty.clear()
+                        # Coalesce bursts of updates.
+                        if state_flush_seconds > 0:
+                            await asyncio.sleep(state_flush_seconds)
+                        async with state_lock:
+                            try:
+                                _atomic_write_json(state_file, work_items)
+                            except Exception:
+                                log.exception("Failed to write state file: %s", state_file)
+                except asyncio.CancelledError:
+                    return
 
             state_writer_task = asyncio.create_task(_state_writer())
 
@@ -432,7 +435,7 @@ async def main_async(args: argparse.Namespace) -> int:
                                 continue
                     finally:
                         # Final draw
-                        with suppress(Exception):
+                        with suppress(asyncio.CancelledError):
                             async with state_lock:
                                 dash = _format_progress_dashboard(work_items)
                             progress_stream.write(_clear_screen())
@@ -712,7 +715,7 @@ async def main_async(args: argparse.Namespace) -> int:
     finally:
         progress_done.set()
         if progress_task is not None:
-            with suppress(Exception):
+            with suppress(asyncio.CancelledError):
                 await progress_task
         if state_writer_task is not None:
             state_writer_task.cancel()
