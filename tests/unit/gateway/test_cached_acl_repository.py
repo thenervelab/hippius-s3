@@ -32,7 +32,7 @@ def mock_redis() -> Any:
     redis.get = AsyncMock()
     redis.setex = AsyncMock()
     redis.delete = AsyncMock()
-    redis.scan_iter = AsyncMock()
+    redis.scan_iter = MagicMock()
     return redis
 
 
