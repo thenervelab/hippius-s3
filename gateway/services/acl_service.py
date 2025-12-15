@@ -67,10 +67,11 @@ class ACLService:
         key: str | None,
         permission: Permission,
         access_key: str | None = None,
+        bucket_owner_id: str | None = None,
     ) -> bool:
         """Check if account or access key has permission for bucket/object."""
 
-        acl = await self.get_effective_acl(bucket, key)
+        acl = await self.get_effective_acl(bucket, key, bucket_owner_id)
 
         grants_summary = [
             f"{{type={g.grantee.type.value}, id={g.grantee.id or 'None'}, uri={g.grantee.uri or 'None'}, perm={g.permission.value}}}"
@@ -104,7 +105,7 @@ class ACLService:
         )
         return False
 
-    async def get_effective_acl(self, bucket: str, key: str | None) -> ACL:
+    async def get_effective_acl(self, bucket: str, key: str | None, bucket_owner_id: str | None = None) -> ACL:
         """Get effective ACL with inheritance (direct DB queries)."""
         if key:
             acl = await self.acl_repo.get_object_acl(bucket, key)
@@ -115,9 +116,12 @@ class ACLService:
         if acl:
             return acl
 
-        owner_id = await self.get_bucket_owner(bucket)
-        if not owner_id:
-            raise ValueError(f"Bucket not found: {bucket}")
+        if bucket_owner_id is None:
+            owner_id = await self.get_bucket_owner(bucket)
+            if not owner_id:
+                raise ValueError(f"Bucket not found: {bucket}")
+        else:
+            owner_id = bucket_owner_id
 
         return await self.canned_acl_to_acl("private", owner_id, bucket)
 

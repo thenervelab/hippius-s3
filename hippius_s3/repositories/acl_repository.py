@@ -45,10 +45,20 @@ class ACLRepository:
         return ACL.from_dict(acl_data)
 
     async def get_bucket_acl(self, bucket_name: str) -> Optional[ACL]:
-        bucket_id = await self._get_bucket_id(bucket_name)
-        if not bucket_id:
+        query = """
+        SELECT ba.owner_id, ba.acl_json
+        FROM bucket_acls ba
+        JOIN buckets b ON ba.bucket_id = b.bucket_id
+        WHERE b.bucket_name = $1
+        """
+        row = await self.db.fetchrow(query, bucket_name)
+        if not row:
             return None
-        return await self.get_bucket_acl_by_id(bucket_id)
+
+        acl_data = row["acl_json"]
+        if isinstance(acl_data, str):
+            acl_data = json.loads(acl_data)
+        return ACL.from_dict(acl_data)
 
     async def set_bucket_acl_by_id(self, bucket_id: str, owner_id: str, acl: ACL) -> None:
         query = """
@@ -99,10 +109,21 @@ class ACLRepository:
         return ACL.from_dict(acl_data)
 
     async def get_object_acl(self, bucket_name: str, object_key: str) -> Optional[ACL]:
-        object_id = await self._get_object_id(bucket_name, object_key)
-        if not object_id:
+        query = """
+        SELECT oa.owner_id, oa.acl_json
+        FROM object_acls oa
+        JOIN objects o ON oa.object_id = o.object_id
+        JOIN buckets b ON o.bucket_id = b.bucket_id
+        WHERE b.bucket_name = $1 AND o.object_key = $2
+        """
+        row = await self.db.fetchrow(query, bucket_name, object_key)
+        if not row:
             return None
-        return await self.get_object_acl_by_id(object_id)
+
+        acl_data = row["acl_json"]
+        if isinstance(acl_data, str):
+            acl_data = json.loads(acl_data)
+        return ACL.from_dict(acl_data)
 
     async def set_object_acl_by_id(self, object_id: str, owner_id: str, acl: ACL) -> None:
         query = """
