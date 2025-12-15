@@ -17,8 +17,11 @@ WITH cur AS (
   JOIN object_versions ov
     ON ov.object_id = o.object_id
    AND ov.object_version = o.current_object_version
+  LEFT JOIN cids c
+    ON c.id = ov.cid_id
   JOIN buckets b ON b.bucket_id = o.bucket_id
   WHERE ov.storage_version < $1
+    AND (c.cid IS NULL OR LOWER(TRIM(c.cid)) <> 'pending')
     AND ($2::text IS NULL OR b.bucket_name = $2::text)
     AND ($3::text IS NULL OR o.object_key = $3::text)
 )
