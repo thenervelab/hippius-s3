@@ -210,11 +210,24 @@ class TestInvalidation:
     async def test_invalidate_all_bucket_objects_scans_and_deletes(
         self, cached_repo: CachedACLRepository, mock_redis: Any
     ) -> None:
-        async def mock_scan_iter(*args: Any, **kwargs: Any) -> Any:
-            for key in ["hippius_acl:object:my-bucket:obj1", "hippius_acl:object:my-bucket:obj2"]:
-                yield key
+        class AsyncIterator:
+            def __init__(self, items: list[str]):
+                self.items = items
+                self.index = 0
 
-        mock_redis.scan_iter.return_value = mock_scan_iter()
+            def __aiter__(self) -> "AsyncIterator":
+                return self
+
+            async def __anext__(self) -> str:
+                if self.index >= len(self.items):
+                    raise StopAsyncIteration
+                item = self.items[self.index]
+                self.index += 1
+                return item
+
+        mock_redis.scan_iter.return_value = AsyncIterator(
+            ["hippius_acl:object:my-bucket:obj1", "hippius_acl:object:my-bucket:obj2"]
+        )
         mock_redis.delete.return_value = 2
 
         await cached_repo.invalidate_all_bucket_objects("my-bucket")
