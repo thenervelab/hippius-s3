@@ -2,6 +2,7 @@ import json
 import os
 
 import pytest
+import pytest_asyncio
 import redis.asyncio as redis
 
 from gateway.repositories.cached_acl_repository import CachedACLRepository
@@ -14,7 +15,7 @@ from hippius_s3.models.acl import Permission
 from hippius_s3.repositories.acl_repository import ACLRepository
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def redis_client() -> redis.Redis:
     redis_url = os.getenv("REDIS_ACL_URL", "redis://localhost:6384/0")
     client = redis.from_url(redis_url, decode_responses=True)
@@ -24,7 +25,7 @@ async def redis_client() -> redis.Redis:
     await client.close()
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def cached_acl_repo(gateway_db_pool, redis_client) -> CachedACLRepository:
     base_repo = ACLRepository(gateway_db_pool)
     return CachedACLRepository(base_repo, redis_client, ttl_seconds=600)
