@@ -16,15 +16,15 @@ logger = logging.getLogger(__name__)
 
 
 class ACLService:
+    acl_repo: ACLRepository | CachedACLRepository
+
     def __init__(self, db_pool: asyncpg.Pool, redis_client: redis.Redis | None = None, cache_ttl: int = 600):
         base_repo = ACLRepository(db_pool)
         if redis_client:
-            self.acl_repo: ACLRepository | CachedACLRepository = CachedACLRepository(
-                base_repo, redis_client, cache_ttl
-            )
+            self.acl_repo = CachedACLRepository(base_repo, redis_client, cache_ttl)
             logger.info(f"ACLService initialized with Redis caching (TTL={cache_ttl}s)")
         else:
-            self.acl_repo: ACLRepository | CachedACLRepository = base_repo
+            self.acl_repo = base_repo
             logger.info("ACLService initialized (direct DB queries, no caching)")
 
     async def canned_acl_to_acl(self, canned_acl: str, owner_id: str, bucket: str | None = None) -> ACL:

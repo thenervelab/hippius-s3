@@ -1,5 +1,6 @@
 import json
 import logging
+from typing import Any
 from typing import Optional
 
 import redis.asyncio as redis
@@ -19,7 +20,7 @@ class CachedACLRepository:
         logger.info(f"CachedACLRepository initialized with TTL={ttl_seconds}s")
 
     @property
-    def db(self):
+    def db(self) -> Any:
         return self.acl_repo.db
 
     def _bucket_acl_key(self, bucket_name: str) -> str:
