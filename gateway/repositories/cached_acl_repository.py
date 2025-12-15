@@ -18,6 +18,10 @@ class CachedACLRepository:
         self.ttl = ttl_seconds
         logger.info(f"CachedACLRepository initialized with TTL={ttl_seconds}s")
 
+    @property
+    def db(self):
+        return self.acl_repo.db
+
     def _bucket_acl_key(self, bucket_name: str) -> str:
         return f"hippius_acl:bucket:{bucket_name}"
 
@@ -99,3 +103,6 @@ class CachedACLRepository:
         if keys:
             deleted = await self.redis.delete(*keys)
             logger.info(f"Invalidated {deleted} object ACL cache entries for bucket {bucket_name}")
+
+    async def object_exists(self, bucket_name: str, object_key: str) -> bool:
+        return await self.acl_repo.object_exists(bucket_name, object_key)
