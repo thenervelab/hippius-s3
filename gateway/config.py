@@ -21,6 +21,9 @@ class GatewayConfig:
     redis_rate_limiting_url: str = dataclasses.field(
         default_factory=lambda: os.getenv("REDIS_RATE_LIMITING_URL", "redis://redis-rate-limiting:6379/0")
     )
+    redis_acl_url: str = dataclasses.field(
+        default_factory=lambda: os.getenv("REDIS_ACL_URL", "redis://redis-acl:6379/0")
+    )
     hippius_chain_url: str = dataclasses.field(default_factory=lambda: os.getenv("HIPPIUS_CHAIN_URL", ""))
     substrate_url: str = dataclasses.field(default_factory=lambda: os.getenv("HIPPIUS_SUBSTRATE_URL", ""))
     enable_public_read: bool = dataclasses.field(
