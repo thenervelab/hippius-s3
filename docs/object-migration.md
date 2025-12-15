@@ -28,14 +28,38 @@ What it does NOT do
 
 CLI Usage
 
-- Migration (one-shot):
+- Production Migration (recommended):
 
-  - `uv run hippius_s3/scripts/migrate_objects.py --bucket <name> [--key <key>] --concurrency 4`
-  - Flags:
-    - `--bucket <name>`: scope to one bucket (required for `--key`)
-    - `--key <key>`: migrate a single object
-    - `--concurrency N`: max objects processed concurrently (default 4)
-    - `--dry-run`: print plan without executing
+  - Step 1: Build the worklist (JSON):
+
+    - `docker compose exec -T api python hippius_s3/scripts/dump_migration_worklist.py --output /var/lib/hippius/persist/worklist.json`
+    - Optional filters:
+      - `--bucket <name>`
+      - `--key <key>` (requires `--bucket`)
+
+  - Step 2: Run the migration from the worklist (stdin) with safe periodic checkpoints:
+
+    - `docker compose exec api sh -lc 'python hippius_s3/scripts/migrate_objects.py --objects-json-stdin --resume --state-file /var/lib/hippius/persist/worklist.state.json --concurrency 4 --timeout-seconds 0 --progress < /var/lib/hippius/persist/worklist.json'`
+
+  - Flags (worklist mode):
+
+    - `--objects-json-stdin`: read a JSON array worklist from stdin and update per-item statuses
+    - `--resume`: skip items already marked `succeeded` / `skipped`
+    - `--state-file <path>`: write updated JSON snapshots periodically (atomic writes)
+    - `--state-flush-seconds <n>`: checkpoint coalescing delay (default 2s)
+    - `--progress`: render a live, refreshing progress dashboard
+    - `--progress-output stdout|stderr`: send the dashboard to stdout/stderr (default stderr)
+    - `--concurrency N`: max objects processed concurrently (default 4). This controls **objects in parallel**, not parts-per-object.
+    - `--timeout-seconds`: per-object timeout (0 disables)
+    - `--dry-run`: print plan without executing (marks items as planned)
+
+  - Notes:
+
+    - The worklist + state file live under `/var/lib/hippius/persist/`, which is mounted as persistent storage in `docker-compose.yml`.
+    - The progress dashboard uses ANSI clear/redraw; it only renders when `--progress-output` is a TTY. Default progress output is `stderr`.
+
+  - Migration (one-shot, DB selection):
+    - `uv run hippius_s3/scripts/migrate_objects.py --bucket <name> [--key <key>] --concurrency 4`
 
 - Cleanup (manual):
   - `uv run hippius_s3/scripts/cleanup_migration_versions.py [--bucket <name>] [--key <key>] [--min-age-minutes 30] [--limit 1000] [--dry-run]`
