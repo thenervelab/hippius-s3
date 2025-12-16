@@ -23,6 +23,23 @@ from hippius_s3.config import get_config
 logger = logging.getLogger(__name__)
 config = get_config()
 
+PENDING_CID_SENTINELS: set[str] = {"", "none", "pending"}
+
+
+class PendingCIDError(ValueError):
+    """Raised when a placeholder CID (e.g. 'pending') is used for an IPFS fetch."""
+
+
+def _normalize_cid(cid: str) -> str:
+    return str(cid or "").strip().lower()
+
+
+def _ensure_concrete_cid(cid: str) -> str:
+    cid_norm = _normalize_cid(cid)
+    if cid_norm in PENDING_CID_SENTINELS:
+        raise PendingCIDError(f"Refusing to download placeholder CID: {cid!r}")
+    return cid_norm
+
 
 class S3Download(BaseModel):
     """Result model for s3_download method."""
@@ -81,7 +98,8 @@ async def get_all_encryption_keys(identifier: str) -> list[str]:
 
 
 async def _stream_cid(cid: str) -> AsyncIterator[bytes]:
-    download_url = f"{config.ipfs_store_url.rstrip('/')}/api/v0/cat?arg={cid}"
+    cid_norm = _ensure_concrete_cid(cid)
+    download_url = f"{config.ipfs_store_url.rstrip('/')}/api/v0/cat?arg={cid_norm}"
 
     async with httpx.AsyncClient(timeout=config.httpx_ipfs_api_timeout) as client:  # noqa: SIM117
         async with client.stream(
@@ -100,6 +118,8 @@ async def s3_download(
     bucket_name: str,
     decrypt: bool,
 ) -> S3Download:
+    # Fast-fail placeholder CIDs so we don't spam IPFS with arg=pending
+    _ensure_concrete_cid(cid)
     start_time = time.time()
 
     # Two-layer timeout defense:
