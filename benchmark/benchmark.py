@@ -3,14 +3,17 @@ import argparse
 import csv
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 from typing import Dict
 from typing import List
 from typing import Optional
+from typing import Protocol
 from typing import Tuple
 
 from dotenv import load_dotenv
@@ -29,6 +32,13 @@ TEST_FILES = {
 MULTIPART_THRESHOLD = 64 * 1024 * 1024
 MULTIPART_CHUNKSIZE = 64 * 1024 * 1024
 MAX_CONCURRENT_REQUESTS = 10
+
+
+class BenchmarkBackend(Protocol):
+    def create_bucket(self, *, bucket: str) -> bool: ...
+    def upload_file(self, *, file_path: Path, bucket: str, key: str) -> Tuple[float, float]: ...
+    def download_file(self, *, bucket: str, key: str, download_path: Path) -> Tuple[float, float]: ...
+    def delete_bucket(self, *, bucket: str) -> None: ...
 
 
 def generate_test_file(path: Path, size_mb: int) -> None:
@@ -133,79 +143,174 @@ def setup_aws_cli_config(endpoint: str, region: str, access_key: str, secret_key
     return env
 
 
-def create_bucket(bucket: str, endpoint: str, env: Dict[str, str]) -> bool:
-    print(f"\nCreating bucket: {bucket}")
+class AwsCliBackend:
+    def __init__(self, *, endpoint: str, env: Dict[str, str]) -> None:
+        self.endpoint = endpoint
+        self.env = env
 
-    cmd = ["aws", "s3api", "create-bucket", "--bucket", bucket, "--endpoint-url", endpoint]
+    def create_bucket(self, *, bucket: str) -> bool:
+        print(f"\nCreating bucket: {bucket}")
+        cmd = ["aws", "s3api", "create-bucket", "--bucket", bucket, "--endpoint-url", self.endpoint]
+        result = subprocess.run(cmd, env=self.env, capture_output=True, text=True)
+        if result.returncode == 0:
+            print("  Bucket created")
+            return True
+        print(f"  Error creating bucket: {result.stderr}")
+        return False
 
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    def upload_file(self, *, file_path: Path, bucket: str, key: str) -> Tuple[float, float]:
+        size_mb = file_path.stat().st_size / (1024 * 1024)
+        print(f"\nUploading {key} ({size_mb:.2f}MB)...")
+        cmd = ["aws", "s3", "cp", str(file_path), f"s3://{bucket}/{key}", "--endpoint-url", self.endpoint]
+        start_time = time.perf_counter()
+        result = subprocess.run(cmd, env=self.env, capture_output=True, text=True)
+        end_time = time.perf_counter()
+        if result.returncode != 0:
+            print(f"  Error uploading: {result.stderr}")
+            return 0, 0
+        upload_time = end_time - start_time
+        upload_speed = size_mb / upload_time if upload_time > 0 else 0
+        print(f"  Upload time: {upload_time:.2f}s")
+        print(f"  Upload speed: {upload_speed:.2f} MB/s")
+        return upload_time, upload_speed
 
-    if result.returncode == 0:
-        print(f"  Bucket created")
-        return True
+    def download_file(self, *, bucket: str, key: str, download_path: Path) -> Tuple[float, float]:
+        print(f"\nDownloading {key}...")
+        cmd = ["aws", "s3", "cp", f"s3://{bucket}/{key}", str(download_path), "--endpoint-url", self.endpoint]
+        start_time = time.perf_counter()
+        result = subprocess.run(cmd, env=self.env, capture_output=True, text=True)
+        end_time = time.perf_counter()
+        if result.returncode != 0:
+            print(f"  Error downloading: {result.stderr}")
+            return 0, 0
+        download_time = end_time - start_time
+        size_mb = download_path.stat().st_size / (1024 * 1024)
+        download_speed = size_mb / download_time if download_time > 0 else 0
+        print(f"  Download time: {download_time:.2f}s")
+        print(f"  Download speed: {download_speed:.2f} MB/s")
+        return download_time, download_speed
 
-    print(f"  Error creating bucket: {result.stderr}")
-    return False
-
-
-def upload_file(file_path: Path, bucket: str, key: str, endpoint: str, env: Dict[str, str]) -> Tuple[float, float]:
-    size_mb = file_path.stat().st_size / (1024 * 1024)
-
-    print(f"\nUploading {key} ({size_mb:.2f}MB)...")
-
-    cmd = ["aws", "s3", "cp", str(file_path), f"s3://{bucket}/{key}", "--endpoint-url", endpoint]
-
-    start_time = time.perf_counter()
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    end_time = time.perf_counter()
-
-    if result.returncode != 0:
-        print(f"  Error uploading: {result.stderr}")
-        return 0, 0
-
-    upload_time = end_time - start_time
-    upload_speed = size_mb / upload_time if upload_time > 0 else 0
-
-    print(f"  Upload time: {upload_time:.2f}s")
-    print(f"  Upload speed: {upload_speed:.2f} MB/s")
-
-    return upload_time, upload_speed
-
-
-def download_file(bucket: str, key: str, download_path: Path, endpoint: str, env: Dict[str, str]) -> Tuple[float, float]:
-    print(f"\nDownloading {key}...")
-
-    cmd = ["aws", "s3", "cp", f"s3://{bucket}/{key}", str(download_path), "--endpoint-url", endpoint]
-
-    start_time = time.perf_counter()
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    end_time = time.perf_counter()
-
-    if result.returncode != 0:
-        print(f"  Error downloading: {result.stderr}")
-        return 0, 0
-
-    download_time = end_time - start_time
-    size_mb = download_path.stat().st_size / (1024 * 1024)
-    download_speed = size_mb / download_time if download_time > 0 else 0
-
-    print(f"  Download time: {download_time:.2f}s")
-    print(f"  Download speed: {download_speed:.2f} MB/s")
-
-    return download_time, download_speed
+    def delete_bucket(self, *, bucket: str) -> None:
+        print(f"\nCleaning up bucket {bucket}...")
+        cmd = ["aws", "s3", "rb", f"s3://{bucket}", "--force", "--endpoint-url", self.endpoint]
+        result = subprocess.run(cmd, env=self.env, capture_output=True, text=True)
+        if result.returncode == 0:
+            print("  Bucket deleted")
+        else:
+            print(f"  Error deleting bucket: {result.stderr}")
 
 
-def delete_bucket(bucket: str, endpoint: str, env: Dict[str, str]) -> None:
-    print(f"\nCleaning up bucket {bucket}...")
+class Boto3Backend:
+    def __init__(self, *, endpoint: str, region: str, access_key: str, secret_key: str) -> None:
+        try:
+            import boto3  # type: ignore[import-not-found]
+            from boto3.s3.transfer import TransferConfig  # type: ignore[import-not-found]
+            from botocore.config import Config as BotocoreConfig  # type: ignore[import-not-found]
+        except Exception as e:
+            raise RuntimeError(
+                "boto3 is required for --engine boto3 (or auto fallback when aws CLI is missing). "
+                "Install it with: pip install boto3"
+            ) from e
 
-    cmd = ["aws", "s3", "rb", f"s3://{bucket}", "--force", "--endpoint-url", endpoint]
+        self._boto3 = boto3
+        self._transfer_config_cls = TransferConfig
 
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        # Path-style is safest for custom S3 gateways.
+        bc = BotocoreConfig(
+            s3={"addressing_style": "path"},
+            retries={"max_attempts": 5, "mode": "standard"},
+        )
+        self._client = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            region_name=region,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            config=bc,
+        )
+        self._transfer_config = TransferConfig(
+            multipart_threshold=int(MULTIPART_THRESHOLD),
+            multipart_chunksize=int(MULTIPART_CHUNKSIZE),
+            max_concurrency=int(MAX_CONCURRENT_REQUESTS),
+            use_threads=True,
+        )
 
-    if result.returncode == 0:
-        print("  Bucket deleted")
-    else:
-        print(f"  Error deleting bucket: {result.stderr}")
+    def create_bucket(self, *, bucket: str) -> bool:
+        print(f"\nCreating bucket: {bucket}")
+        try:
+            self._client.create_bucket(Bucket=bucket)
+            print("  Bucket created")
+            return True
+        except Exception as e:
+            print(f"  Error creating bucket: {e}")
+            return False
+
+    def upload_file(self, *, file_path: Path, bucket: str, key: str) -> Tuple[float, float]:
+        size_mb = file_path.stat().st_size / (1024 * 1024)
+        print(f"\nUploading {key} ({size_mb:.2f}MB)...")
+        start_time = time.perf_counter()
+        try:
+            self._client.upload_file(
+                Filename=str(file_path),
+                Bucket=bucket,
+                Key=key,
+                Config=self._transfer_config,
+            )
+        except Exception as e:
+            end_time = time.perf_counter()
+            print(f"  Error uploading: {e}")
+            _ = end_time - start_time
+            return 0, 0
+        end_time = time.perf_counter()
+        upload_time = end_time - start_time
+        upload_speed = size_mb / upload_time if upload_time > 0 else 0
+        print(f"  Upload time: {upload_time:.2f}s")
+        print(f"  Upload speed: {upload_speed:.2f} MB/s")
+        return upload_time, upload_speed
+
+    def download_file(self, *, bucket: str, key: str, download_path: Path) -> Tuple[float, float]:
+        print(f"\nDownloading {key}...")
+        start_time = time.perf_counter()
+        try:
+            self._client.download_file(
+                Bucket=bucket,
+                Key=key,
+                Filename=str(download_path),
+                Config=self._transfer_config,
+            )
+        except Exception as e:
+            end_time = time.perf_counter()
+            print(f"  Error downloading: {e}")
+            _ = end_time - start_time
+            return 0, 0
+        end_time = time.perf_counter()
+        download_time = end_time - start_time
+        size_mb = download_path.stat().st_size / (1024 * 1024)
+        download_speed = size_mb / download_time if download_time > 0 else 0
+        print(f"  Download time: {download_time:.2f}s")
+        print(f"  Download speed: {download_speed:.2f} MB/s")
+        return download_time, download_speed
+
+    def delete_bucket(self, *, bucket: str) -> None:
+        print(f"\nCleaning up bucket {bucket}...")
+        try:
+            # Delete objects then delete bucket (S3 requires empty bucket).
+            paginator = self._client.get_paginator("list_objects_v2")
+            to_delete: list[dict[str, str]] = []
+            for page in paginator.paginate(Bucket=bucket):
+                for obj in page.get("Contents", []) or []:
+                    k = obj.get("Key")
+                    if k:
+                        to_delete.append({"Key": str(k)})
+                        if len(to_delete) >= 1000:
+                            self._client.delete_objects(Bucket=bucket, Delete={"Objects": to_delete})
+                            to_delete = []
+            if to_delete:
+                self._client.delete_objects(Bucket=bucket, Delete={"Objects": to_delete})
+            self._client.delete_bucket(Bucket=bucket)
+            print("  Bucket deleted")
+        except Exception as e:
+            print(f"  Error deleting bucket: {e}")
 
 
 def ensure_test_files(test_files_dir: Path, regenerate: bool) -> None:
@@ -230,12 +335,11 @@ def compute_hashes(test_files_dir: Path, files: List[str]) -> Dict[str, str]:
 
 def run_benchmark(
     bucket: str,
-    endpoint: str,
-    env: Dict[str, str],
+    backend: BenchmarkBackend,
     test_files_dir: Path,
     download_dir: Path,
     verify: bool,
-) -> List[Dict[str, any]]:
+) -> List[Dict[str, Any]]:
     results = []
     test_file_list = list(TEST_FILES.keys())
 
@@ -251,7 +355,7 @@ def run_benchmark(
         file_path = test_files_dir / filename
         size_mb = file_path.stat().st_size / (1024 * 1024)
 
-        upload_time, upload_speed = upload_file(file_path, bucket, filename, endpoint, env)
+        upload_time, upload_speed = backend.upload_file(file_path=file_path, bucket=bucket, key=filename)
 
         results.append({
             "file_name": filename,
@@ -278,7 +382,7 @@ def run_benchmark(
 
         download_path = download_dir / filename
 
-        download_time, download_speed = download_file(bucket, filename, download_path, endpoint, env)
+        download_time, download_speed = backend.download_file(bucket=bucket, key=filename, download_path=download_path)
 
         hash_match = "skipped"
         if verify and download_time > 0:
@@ -298,7 +402,7 @@ def run_benchmark(
     return results
 
 
-def save_results(results: List[Dict[str, any]], csv_path: Path) -> None:
+def save_results(results: List[Dict[str, Any]], csv_path: Path) -> None:
     print(f"\nSaving results to {csv_path}...")
 
     with csv_path.open("w", newline="") as f:
@@ -321,7 +425,7 @@ def save_results(results: List[Dict[str, any]], csv_path: Path) -> None:
     print(f"  Results saved to {csv_path}")
 
 
-def print_summary(results: List[Dict[str, any]]) -> None:
+def print_summary(results: List[Dict[str, Any]]) -> None:
     print(f"\n{'='*80}")
     print("SUMMARY")
     print(f"{'='*80}")
@@ -346,7 +450,7 @@ def print_summary(results: List[Dict[str, any]]) -> None:
     print(f"Average upload speed: {avg_upload_speed:.2f} MB/s")
     print(f"Average download speed: {avg_download_speed:.2f} MB/s")
 
-    print(f"\nAWS CLI Configuration:")
+    print(f"\nMultipart Configuration:")
     print(f"  Multipart threshold: {MULTIPART_THRESHOLD / (1024 * 1024):.0f} MB")
     print(f"  Multipart chunk size: {MULTIPART_CHUNKSIZE / (1024 * 1024):.0f} MB")
     print(f"  Max concurrent requests: {MAX_CONCURRENT_REQUESTS}")
@@ -360,7 +464,7 @@ def print_summary(results: List[Dict[str, any]]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Benchmark S3-compatible endpoint upload/download performance using AWS CLI"
+        description="Benchmark S3-compatible endpoint upload/download performance (AWS CLI or boto3)"
     )
 
     endpoint_group = parser.add_mutually_exclusive_group()
@@ -394,6 +498,12 @@ def main() -> None:
         action="store_true",
         help="Force regeneration of test files even if they exist",
     )
+    parser.add_argument(
+        "--engine",
+        choices=["auto", "awscli", "boto3"],
+        default="auto",
+        help="Transfer engine to use: auto (default) uses awscli if installed, otherwise boto3.",
+    )
 
     args = parser.parse_args()
 
@@ -412,7 +522,12 @@ def main() -> None:
     test_files_dir = script_dir / "test_files"
 
     print("="*80)
-    print("S3 Endpoint Benchmark (AWS CLI with Multipart)")
+    engine_label = "auto"
+    if args.engine == "auto":
+        engine_label = "awscli" if shutil.which("aws") else "boto3"
+    else:
+        engine_label = args.engine
+    print(f"S3 Endpoint Benchmark ({engine_label} with Multipart)")
     print("="*80)
     print(f"Endpoint: {endpoint}")
     print(f"Region: {region}")
@@ -424,12 +539,20 @@ def main() -> None:
 
     ensure_test_files(test_files_dir, args.regenerate)
 
-    env = setup_aws_cli_config(endpoint, region, access_key, secret_key)
+    if args.engine == "awscli" or (args.engine == "auto" and shutil.which("aws")):
+        env = setup_aws_cli_config(endpoint, region, access_key, secret_key)
+        backend: BenchmarkBackend = AwsCliBackend(endpoint=endpoint, env=env)
+    else:
+        if args.engine == "awscli" and not shutil.which("aws"):
+            print("Error: --engine awscli requested but 'aws' executable not found.")
+            print("Install awscli (e.g. apt install awscli) or use --engine boto3.")
+            sys.exit(1)
+        backend = Boto3Backend(endpoint=endpoint, region=region, access_key=access_key, secret_key=secret_key)
 
     timestamp = int(time.time())
     bucket = f"speedtest-{timestamp}"
 
-    if not create_bucket(bucket, endpoint, env):
+    if not backend.create_bucket(bucket=bucket):
         print("Failed to create bucket, exiting")
         sys.exit(1)
 
@@ -438,8 +561,7 @@ def main() -> None:
 
         results = run_benchmark(
             bucket,
-            endpoint,
-            env,
+            backend,
             test_files_dir,
             download_dir,
             verify=not args.no_verify,
@@ -454,7 +576,7 @@ def main() -> None:
         save_results(results, csv_path)
 
     if not args.keep_bucket:
-        delete_bucket(bucket, endpoint, env)
+        backend.delete_bucket(bucket=bucket)
     else:
         print(f"\nBucket {bucket} was kept (use without --keep-bucket to auto-delete)")
 

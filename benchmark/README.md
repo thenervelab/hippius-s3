@@ -10,6 +10,7 @@ A standalone benchmark script for testing upload/download performance against S3
 - CSV results export with detailed metrics
 - Configurable endpoint support (default: https://s3.hippius.com)
 - Automatic bucket cleanup
+- Supports **AWS CLI** (if installed) or **boto3** (automatic fallback)
 
 ## Installation
 
@@ -18,6 +19,14 @@ pip install -r requirements.txt
 ```
 
 Or if you have the main project dependencies installed, you can run directly since boto3 is already available.
+
+### Optional: AWS CLI
+
+If you want to use the AWS CLI engine, install `aws` on the machine running the benchmark:
+
+```bash
+sudo apt-get update && sudo apt-get install -y awscli
+```
 
 ## Setup
 
@@ -38,6 +47,7 @@ R2_SECRET_KEY=your-r2-secret-key
 ```
 
 For custom endpoints, use standard AWS environment variables:
+
 ```bash
 export AWS_ACCESS_KEY_ID="your-access-key"
 export AWS_SECRET_ACCESS_KEY="your-secret-key"
@@ -51,6 +61,11 @@ export AWS_SECRET_ACCESS_KEY="your-secret-key"
 python benchmark.py --hippius
 ```
 
+By default, the script uses `--engine auto`:
+
+- Uses **AWS CLI** if the `aws` executable is present
+- Otherwise falls back to **boto3**
+
 ### Test Cloudflare R2
 
 ```bash
@@ -63,7 +78,18 @@ python benchmark.py --r2
 python benchmark.py --endpoint https://s3.amazonaws.com
 ```
 
+### Choose transfer engine explicitly
+
+```bash
+# Force boto3 (recommended on minimal servers without awscli)
+python benchmark.py --hippius --engine boto3
+
+# Force AWS CLI (requires awscli installed)
+python benchmark.py --hippius --engine awscli
+```
+
 The benchmark will:
+
 1. Generate test files (5MB, 50MB, 500MB, 2GB, 5GB) in `test_files/` directory
 2. Create a timestamped bucket `speedtest-{timestamp}`
 3. Upload all files sequentially and measure performance
@@ -98,14 +124,14 @@ python benchmark.py --regenerate
 
 ## Command-Line Options
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--hippius` | Use Hippius endpoint from .env | - |
-| `--r2` | Use R2 endpoint from .env | - |
-| `--endpoint URL` | Custom S3 endpoint URL | - |
-| `--keep-bucket` | Keep bucket after benchmark | Auto-delete |
-| `--no-verify` | Skip MD5 verification | Verify enabled |
-| `--regenerate` | Force regenerate test files | Use existing |
+| Option           | Description                    | Default        |
+| ---------------- | ------------------------------ | -------------- |
+| `--hippius`      | Use Hippius endpoint from .env | -              |
+| `--r2`           | Use R2 endpoint from .env      | -              |
+| `--endpoint URL` | Custom S3 endpoint URL         | -              |
+| `--keep-bucket`  | Keep bucket after benchmark    | Auto-delete    |
+| `--no-verify`    | Skip MD5 verification          | Verify enabled |
+| `--regenerate`   | Force regenerate test files    | Use existing   |
 
 **Note:** You must specify one of `--hippius`, `--r2`, or `--endpoint`.
 
@@ -202,6 +228,7 @@ benchmark/
 ### Missing Credentials
 
 If you see:
+
 ```
 Error: Hippius credentials not found in .env file
 ```
@@ -213,6 +240,7 @@ For custom endpoints, ensure `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` env
 ### Connection Errors
 
 If you get connection errors, verify:
+
 1. The endpoint URL is correct and accessible
 2. Your network allows outbound HTTPS connections
 3. The credentials are valid for the endpoint
@@ -224,11 +252,13 @@ The 2GB and 5GB files will take significant time depending on your network speed
 ### Hash Mismatch
 
 If you see:
+
 ```
 WARNING: Hash mismatch!
 ```
 
 This indicates data corruption during transfer. This could be due to:
+
 - Network issues
 - Endpoint issues
 - Storage issues
