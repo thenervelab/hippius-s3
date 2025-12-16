@@ -222,6 +222,7 @@ async def read_response(
         address=address,
         bucket_name=str(info.get("bucket_name", "")),
         storage_version=ctx.storage_version,
+        prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
     )
     headers = build_headers(
         info,
@@ -272,4 +273,5 @@ async def stream_object(
         address=address,
         bucket_name=str(info.get("bucket_name", "")),
         storage_version=ctx.storage_version,
+        prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
     )

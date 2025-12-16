@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import logging
 import sys
+import time
 from pathlib import Path
 
 import redis.asyncio as async_redis
@@ -66,9 +67,9 @@ async def process_download_request(
                 if not cid_plan:
                     return False
 
-            max_attempts = getattr(config, "downloader_chunk_retries", 5)
-            base_sleep = getattr(config, "downloader_retry_base_seconds", 0.25)
-            jitter = getattr(config, "downloader_retry_jitter_seconds", 0.2)
+            max_attempts = getattr(config, "downloader_chunk_retries", 3)
+            base_sleep = getattr(config, "downloader_retry_base_seconds", 0.1)
+            jitter = getattr(config, "downloader_retry_jitter_seconds", 0.1)
 
             import random as _random
 
@@ -260,6 +261,10 @@ async def run_downloader_loop():
                 continue
 
             if download_request:
+                if download_request.expire_at and time.time() > download_request.expire_at:
+                    logger.warning(f"Discarding expired {download_request=}")
+                    continue
+
                 ray_id = download_request.ray_id or "no-ray-id"
                 ray_id_context.set(ray_id)
                 worker_logger = get_logger_with_ray_id(__name__, ray_id)
@@ -280,7 +285,6 @@ async def run_downloader_loop():
                     )
                     with contextlib.suppress(Exception):
                         await redis_client.aclose()
-                    await asyncio.sleep(2)
                     redis_client = async_redis.from_url(config.redis_url)
                     initialize_cache_client(redis_client)
                     continue
