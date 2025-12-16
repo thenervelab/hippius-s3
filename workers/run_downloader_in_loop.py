@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import logging
 import sys
+import time
 from pathlib import Path
 
 import redis.asyncio as async_redis
@@ -260,6 +261,10 @@ async def run_downloader_loop():
                 continue
 
             if download_request:
+                if download_request.expire_at and time.time() > download_request.expire_at:
+                    logger.warning(f"Discarding expired {download_request=}")
+                    continue
+
                 ray_id = download_request.ray_id or "no-ray-id"
                 ray_id_context.set(ray_id)
                 worker_logger = get_logger_with_ray_id(__name__, ray_id)

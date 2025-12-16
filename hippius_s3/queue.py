@@ -99,6 +99,7 @@ class DownloadChainRequest(RetryableRequest):
     size: int
     multipart: bool
     chunks: list[PartToDownload]
+    expire_at: float | None = None
 
     @property
     def name(self):
