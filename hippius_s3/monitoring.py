@@ -24,6 +24,7 @@ class MetricsCollector:
         self._upload_len = 0
         self._unpin_len = 0
         self._substrate_len = 0
+        self._download_len = 0
         self._main_db_size = 0
         self._accounts_db_size = 0
         self._chain_db_size = 0
@@ -319,6 +320,7 @@ class MetricsCollector:
             metrics.Observation(self._upload_len, {"queue_name": "upload_requests"}),
             metrics.Observation(self._unpin_len, {"queue_name": "unpin_requests"}),
             metrics.Observation(self._substrate_len, {"queue_name": "substrate_requests"}),
+            metrics.Observation(self._download_len, {"queue_name": "download_requests"}),
         ]
 
     def _obs_db_sizes(self, _: object) -> list[metrics.Observation]:

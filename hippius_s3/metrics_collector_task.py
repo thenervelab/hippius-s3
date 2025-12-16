@@ -70,10 +70,14 @@ class BackgroundMetricsCollector:
                 self.metrics_collector._substrate_len = int(
                     await self.redis_queues_client.llen("substrate_requests") or 0
                 )
+                self.metrics_collector._download_len = int(
+                    await self.redis_queues_client.llen("download_requests") or 0
+                )
             else:
                 self.metrics_collector._upload_len = int(await self.redis_client.llen("upload_requests") or 0)
                 self.metrics_collector._unpin_len = int(await self.redis_client.llen("unpin_requests") or 0)
                 self.metrics_collector._substrate_len = int(await self.redis_client.llen("substrate_requests") or 0)
+                self.metrics_collector._download_len = int(await self.redis_client.llen("download_requests") or 0)
 
             self.metrics_collector._main_db_size = int(await self.redis_client.dbsize() or 0)
             self.metrics_collector._accounts_db_size = int(await self.redis_accounts_client.dbsize() or 0)

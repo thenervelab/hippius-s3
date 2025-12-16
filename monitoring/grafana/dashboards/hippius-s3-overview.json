@@ -1235,6 +1235,16 @@
           "interval": "",
           "legendFormat": "Substrate Queue",
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "hippius_queue_length{queue_name=\"download_requests\"}",
+          "interval": "",
+          "legendFormat": "Download Queue",
+          "refId": "D"
         }
       ],
       "title": "Redis Queue Lengths",
