@@ -7,6 +7,7 @@ WITH object_info AS (
         ov.cid_id as simple_cid_id,
         b.is_public,
         c.cid as simple_cid,
+        ov.storage_version,
         ov.object_version as object_version
     FROM objects o
     JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
@@ -15,31 +16,58 @@ WITH object_info AS (
     WHERE o.object_id = $1
 ),
 multipart_chunks AS (
+    -- Keep legacy shape stable even if cid_id is NULL (part still returned with cid=NULL);
+    -- Legacy (<4): allow cid_id NULL by falling back to parts.ipfs_cid; may still be NULL if metadata is incomplete.
+    -- v4+: CID-less.
     SELECT
         p.part_number,
-        c.cid,
+        COALESCE(c.cid, p.ipfs_cid) AS cid,
         p.size_bytes,
         oi.object_id
     FROM object_info oi
     JOIN parts p ON p.object_id = oi.object_id AND p.object_version = oi.object_version
-    JOIN cids c ON p.cid_id = c.id
-    WHERE oi.multipart = TRUE
-    ORDER BY p.part_number ASC
+    LEFT JOIN cids c ON p.cid_id = c.id
+    WHERE oi.multipart = TRUE AND oi.storage_version < 4
+
+    UNION ALL
+
+    SELECT
+        p.part_number,
+        NULL AS cid,
+        p.size_bytes,
+        oi.object_id
+    FROM object_info oi
+    JOIN parts p ON p.object_id = oi.object_id AND p.object_version = oi.object_version
+    WHERE oi.multipart = TRUE AND oi.storage_version >= 4
 )
 SELECT
     oi.object_id,
     oi.multipart,
     oi.object_version,
+    oi.storage_version,
     NOT oi.is_public as needs_decryption,
     CASE
         WHEN oi.multipart = FALSE THEN
-            JSON_BUILD_ARRAY(
-                JSON_BUILD_OBJECT(
-                    'part_number', 1,
-                    'cid', oi.simple_cid,
-                    'size_bytes', NULL
-                )
-            )
+            CASE
+                WHEN oi.storage_version >= 4 THEN
+                    JSON_BUILD_ARRAY(
+                        JSON_BUILD_OBJECT(
+                            'part_number', 1,
+                            'cid', NULL,
+                            'size_bytes', NULL
+                        )
+                    )
+                WHEN oi.simple_cid IS NULL THEN
+                    '[]'::json
+                ELSE
+                    JSON_BUILD_ARRAY(
+                        JSON_BUILD_OBJECT(
+                            'part_number', 1,
+                            'cid', oi.simple_cid,
+                            'size_bytes', NULL
+                        )
+                    )
+            END
         ELSE
             COALESCE(
                 (SELECT JSON_AGG(

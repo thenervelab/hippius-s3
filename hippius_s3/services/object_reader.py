@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,6 +10,7 @@ from fastapi.responses import StreamingResponse
 from hippius_s3.api.s3.common import build_headers
 from hippius_s3.config import get_config
 from hippius_s3.queue import DownloadChainRequest
+from hippius_s3.queue import PartChunkSpec
 from hippius_s3.queue import PartToDownload
 from hippius_s3.queue import enqueue_download_request
 from hippius_s3.reader.db_meta import read_parts_manifest
@@ -17,6 +19,9 @@ from hippius_s3.reader.streamer import stream_plan
 from hippius_s3.reader.types import ChunkPlanItem
 from hippius_s3.reader.types import RangeRequest
 from hippius_s3.services.acl_helper import bucket_has_public_read_acl
+
+
+logger = logging.getLogger(__name__)
 
 
 class DownloadNotReadyError(Exception):
@@ -112,49 +117,101 @@ async def build_stream_context(
             )  # type: ignore[attr-defined]
             if ok:
                 continue
-            s = indices_by_part.setdefault(int(item.part_number), set())
-            s.add(int(item.chunk_index))
+            idx_set = indices_by_part.setdefault(int(item.part_number), set())
+            idx_set.add(int(item.chunk_index))
         dl_parts: list[PartToDownload] = []
-        for pn, idxs in indices_by_part.items():
-            try:
-                from hippius_s3.utils import get_query  # local import
-
-                rows = await db.fetch(
-                    get_query("get_part_chunks_by_object_and_number"),
-                    info["object_id"],
-                    int(info.get("object_version") or info.get("current_object_version") or 1),
-                    int(pn),
-                )
-                all_entries = [(int(r[0]), str(r[1]), int(r[2]) if r[2] is not None else None) for r in rows or []]
-                chunk_specs: list[dict] = []
-                include = {int(i) for i in idxs}
-                for ci, cid, clen in all_entries:
-                    if int(ci) in include:
-                        chunk_specs.append(
-                            {
-                                "index": int(ci),
-                                "cid": str(cid),
-                                "cipher_size_bytes": int(clen) if clen is not None else None,
-                            }
-                        )
-                if not chunk_specs:
-                    continue
+        storage_version = int(info.get("storage_version") or 0)
+        if storage_version >= 4:
+            # Backup/hydrator mode: don't depend on part_chunks/CIDs. Hydrator uses
+            # deterministic keys derived from (object_id, version, part, chunk).
+            for pn, idxs in indices_by_part.items():
                 dl_parts.append(
                     PartToDownload(
                         part_number=int(pn),
-                        chunks=[
-                            # type: ignore[arg-type]
-                            {
-                                "index": s["index"],
-                                "cid": s["cid"],
-                                "cipher_size_bytes": s.get("cipher_size_bytes"),
-                            }
-                            for s in chunk_specs
-                        ],
+                        chunks=[PartChunkSpec(index=int(i), cid=None) for i in sorted({int(x) for x in idxs})],
                     )
                 )
-            except Exception:
-                continue
+        else:
+            missing_meta_parts: list[int] = []
+            for pn, idxs in indices_by_part.items():
+                try:
+                    from hippius_s3.utils import get_query  # local import
+
+                    rows = await db.fetch(
+                        get_query("get_part_chunks_by_object_and_number"),
+                        info["object_id"],
+                        int(info.get("object_version") or info.get("current_object_version") or 1),
+                        int(pn),
+                    )
+                    # Preserve raw cid (may be NULL on corrupt rows) so validation is explicit.
+                    all_entries = [(int(r[0]), r[1], int(r[2]) if r[2] is not None else None) for r in rows or []]
+                    chunk_specs: list[dict] = []
+                    include = {int(i) for i in idxs}
+                    for ci, cid, clen in all_entries:
+                        if int(ci) in include:
+                            chunk_specs.append(
+                                {
+                                    "index": int(ci),
+                                    "cid": cid,
+                                    "cipher_size_bytes": int(clen) if clen is not None else None,
+                                }
+                            )
+                    if not chunk_specs:
+                        missing_meta_parts.append(int(pn))
+                        continue
+                    found = {
+                        int(spec["index"]) for spec in chunk_specs if ("index" in spec and spec["index"] is not None)
+                    }
+                    missing = include - found
+                    if missing:
+                        logger.debug(
+                            "STREAM legacy missing chunk metadata indices object_id=%s v=%s part=%s missing=%s",
+                            info.get("object_id"),
+                            int(info.get("object_version") or info.get("current_object_version") or 1),
+                            int(pn),
+                            sorted(missing),
+                        )
+                        missing_meta_parts.append(int(pn))
+                        continue
+                    # Defensive: ensure every required chunk has a concrete CID (legacy path).
+                    # If any are missing/placeholder, treat the whole part as not-ready to
+                    # avoid hanging mid-stream on chunks that can never be fetched.
+                    bad = []
+                    for spec in chunk_specs:
+                        c = str(spec.get("cid") or "").strip().lower()
+                        if c in {"", "none", "pending"}:
+                            bad.append(spec.get("index"))
+                    if bad:
+                        logger.debug(
+                            "STREAM legacy bad CID(s) object_id=%s v=%s part=%s bad_indices=%s",
+                            info.get("object_id"),
+                            int(info.get("object_version") or info.get("current_object_version") or 1),
+                            int(pn),
+                            sorted([int(x) for x in bad if isinstance(x, int)]),
+                        )
+                        missing_meta_parts.append(int(pn))
+                        continue
+                    dl_parts.append(
+                        PartToDownload(
+                            part_number=int(pn),
+                            chunks=[
+                                # type: ignore[arg-type]
+                                {
+                                    "index": spec["index"],
+                                    "cid": spec.get("cid"),
+                                    "cipher_size_bytes": spec.get("cipher_size_bytes"),
+                                }
+                                for spec in chunk_specs
+                            ],
+                        )
+                    )
+                except Exception:
+                    missing_meta_parts.append(int(pn))
+                    continue
+            if missing_meta_parts:
+                raise DownloadNotReadyError(
+                    f"Parts not ready: missing chunk metadata for parts {sorted(set(missing_meta_parts))}"
+                )
         if dl_parts:
             req = DownloadChainRequest(
                 request_id=f"{info['object_id']}::shared",

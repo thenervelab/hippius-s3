@@ -108,6 +108,26 @@ class Uploader:
         start_time = time.time()
         logger.info(f"Processing upload object_id={payload.object_id} chunks={len(payload.chunks)}")
 
+        try:
+            async with self._acquire_conn() as conn:
+                row = await conn.fetchrow(
+                    "SELECT storage_version FROM object_versions WHERE object_id = $1 AND object_version = $2",
+                    payload.object_id,
+                    int(payload.object_version or 1),
+                )
+            sv = (
+                int(row["storage_version"])
+                if row and ("storage_version" in row) and row["storage_version"] is not None
+                else 0
+            )
+        except Exception:
+            sv = 0
+        if sv >= 4:
+            raise RuntimeError(
+                f"misrouted_storage_version_v4_upload: "
+                f"(object_id={payload.object_id} v={int(payload.object_version or 1)} storage_version={sv})"
+            )
+
         chunk_start = time.time()
         _ = await self._upload_chunks(
             object_id=payload.object_id,

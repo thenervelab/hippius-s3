@@ -25,23 +25,49 @@ class ManifestService:
             except Exception:
                 ov_param = None
 
-            rows = await db.fetch(
-                """
-                SELECT p.part_number,
-                       COALESCE(c.cid, p.ipfs_cid) AS cid,
-                       p.size_bytes::bigint AS size_bytes
-                FROM objects o
-                JOIN parts p
-                  ON p.object_id = o.object_id
-                 AND p.object_version = COALESCE($2, o.current_object_version)
-                LEFT JOIN cids c ON p.cid_id = c.id
-                WHERE o.object_id = $1
-                ORDER BY p.part_number
-                """,
-                object_info["object_id"],
-                ov_param,
+            storage_version = int(object_info.get("storage_version") or 0)
+            if storage_version >= 4:
+                # Backup/hydrator mode: manifest should not depend on CIDs.
+                rows = await db.fetch(
+                    """
+                    SELECT p.part_number,
+                           NULL AS cid,
+                           p.size_bytes::bigint AS size_bytes
+                    FROM objects o
+                    JOIN parts p
+                      ON p.object_id = o.object_id
+                     AND p.object_version = COALESCE($2, o.current_object_version)
+                    WHERE o.object_id = $1
+                    ORDER BY p.part_number
+                    """,
+                    object_info["object_id"],
+                    ov_param,
+                )
+            else:
+                rows = await db.fetch(
+                    """
+                    SELECT p.part_number,
+                           COALESCE(c.cid, p.ipfs_cid) AS cid,
+                           p.size_bytes::bigint AS size_bytes
+                    FROM objects o
+                    JOIN parts p
+                      ON p.object_id = o.object_id
+                     AND p.object_version = COALESCE($2, o.current_object_version)
+                    LEFT JOIN cids c ON p.cid_id = c.id
+                    WHERE o.object_id = $1
+                    ORDER BY p.part_number
+                    """,
+                    object_info["object_id"],
+                    ov_param,
+                )
+            # Avoid exploding logs for large multipart objects.
+            preview = [(r[0], r[1], r[2]) for r in rows[:25]]
+            logger.debug(
+                "MANIFEST found %s parts rows (preview=%s%s)",
+                len(rows),
+                preview,
+                "" if len(rows) <= 25 else "…",
             )
-            logger.debug(f"MANIFEST found {len(rows)} parts rows: {[(r[0], r[1], r[2]) for r in rows]}")
 
             manifest: list[dict] = []
             for r in rows:

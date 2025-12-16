@@ -40,7 +40,9 @@ class Chunk(BaseModel):
 
 class PartChunkSpec(BaseModel):
     index: int
-    cid: str
+    # CID is required for legacy (IPFS-backed) objects but intentionally optional
+    # for storage_version>=4 where chunks are addressed by deterministic keys.
+    cid: str | None = None
     cipher_size_bytes: int | None = None
 
 
