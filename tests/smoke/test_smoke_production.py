@@ -65,9 +65,7 @@ def test_02_upload_simple_file(production_s3_client, session_tracker, file_gener
     etag = response["ETag"].strip('"')
     assert not etag.endswith("-")
 
-    session_tracker.add_file(
-        key=key, file_type="simple", size=size, hash_md5=hash_md5, upload_time=upload_time
-    )
+    session_tracker.add_file(key=key, file_type="simple", size=size, hash_md5=hash_md5, upload_time=upload_time)
 
     print(f"Uploaded simple file: {key} (1 MB, hash={hash_md5[:8]}...)")
 
@@ -146,9 +144,7 @@ def test_04_download_current_session_files(production_s3_client, session_tracker
         assert downloaded_hash == expected_hash
         assert len(downloaded_data) == expected_size
 
-        print(
-            f"Downloaded and validated: {key} ({expected_size} bytes, hash={expected_hash[:8]}...)"
-        )
+        print(f"Downloaded and validated: {key} ({expected_size} bytes, hash={expected_hash[:8]}...)")
 
 
 def test_05_download_historical_files(production_s3_client, session_tracker):
@@ -166,6 +162,8 @@ def test_05_download_historical_files(production_s3_client, session_tracker):
             continue
 
         file_info = random.choice(manifest["files"])
+
+        print(f"Attempting to download {file_info=} from {session_tracker.bucket=}")
 
         response = production_s3_client.get_object(Bucket=session_tracker.bucket, Key=file_info["key"])
         data = response["Body"].read()
