@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
+from hippius_s3.ipfs_service import PendingCIDError
 from hippius_s3.ipfs_service import s3_download
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.queue import DownloadChainRequest
@@ -182,6 +183,10 @@ async def process_download_request(
                         chunk_logger.debug("Failed to delete in-progress flag after success", exc_info=True)
                     return True
 
+                except PendingCIDError as e:
+                    # Never retry placeholder CIDs (e.g. "pending") - they will always fail.
+                    chunk_logger.error(f"Non-retryable CID for chunk part={part_number}: {e}")
+                    return False
                 except Exception as e:
                     if attempt == max_attempts:
                         chunk_logger.error(

@@ -22,6 +22,14 @@ WITH cur AS (
   JOIN buckets b ON b.bucket_id = o.bucket_id
   WHERE ov.storage_version < $1
     AND (c.cid IS NULL OR LOWER(TRIM(c.cid)) <> 'pending')
+    AND NOT EXISTS (
+      SELECT 1
+      FROM parts p
+      JOIN part_chunks pc ON pc.part_id = p.part_id
+      WHERE p.object_id = o.object_id
+        AND p.object_version = o.current_object_version
+        AND LOWER(TRIM(COALESCE(pc.cid, ''))) = 'pending'
+    )
     AND ($2::text IS NULL OR b.bucket_name = $2::text)
     AND ($3::text IS NULL OR o.object_key = $3::text)
 )
