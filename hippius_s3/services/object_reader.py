@@ -16,6 +16,7 @@ from hippius_s3.reader.planner import build_chunk_plan
 from hippius_s3.reader.streamer import stream_plan
 from hippius_s3.reader.types import ChunkPlanItem
 from hippius_s3.reader.types import RangeRequest
+from hippius_s3.services.acl_helper import bucket_has_public_read_acl
 
 
 class DownloadNotReadyError(Exception):
@@ -177,10 +178,12 @@ async def build_stream_context(
 
     storage_version = int(info.get("storage_version") or 2)
     object_version = int(info.get("object_version") or info.get("current_object_version") or 1)
+
     if "should_decrypt" in info:
         should_decrypt = bool(info.get("should_decrypt"))
     else:
-        is_public = bool(info.get("is_public", False))
+        bucket_name = info["bucket_name"]
+        is_public = await bucket_has_public_read_acl(db, bucket_name)
         should_decrypt = (storage_version >= 3) or (not is_public)
 
     return StreamContext(

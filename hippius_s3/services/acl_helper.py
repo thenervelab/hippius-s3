@@ -185,3 +185,14 @@ def has_public_read_acl(acl_json: dict | str | None) -> bool:
             return True
 
     return False
+
+
+async def bucket_has_public_read_acl(db: asyncpg.Pool, bucket_name: str) -> bool:
+    from hippius_s3.utils import get_query
+
+    row = await db.fetchrow(get_query("get_bucket_acl_json"), bucket_name)
+    if not row:
+        return False
+
+    acl_json = row.get("acl_json")
+    return has_public_read_acl(acl_json)

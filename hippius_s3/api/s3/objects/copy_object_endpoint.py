@@ -18,6 +18,7 @@ from hippius_s3.config import get_config
 from hippius_s3.repositories.buckets import BucketRepository
 from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
+from hippius_s3.services.acl_helper import bucket_has_public_read_acl
 from hippius_s3.services.object_reader import stream_object
 from hippius_s3.writer.object_writer import ObjectWriter
 
@@ -84,7 +85,7 @@ async def handle_copy_object(
         )
 
     # Determine encryption context
-    source_is_public = source_bucket["is_public"]
+    source_is_public = await bucket_has_public_read_acl(db, source_bucket_name)
 
     object_id = str(uuid.uuid4())
     created_at = datetime.now(timezone.utc)
@@ -127,7 +128,7 @@ async def handle_copy_object(
             "object_key": source_object_key,
             "storage_version": int(src_obj_row.get("storage_version") or 2),
             "object_version": int(src_obj_row.get("object_version") or 1),
-            "is_public": bool(source_is_public),
+            "is_public": source_is_public,
             "multipart": bool(src_info.multipart),
             "metadata": src_info.metadata,
             "ray_id": getattr(request.state, "ray_id", None),
