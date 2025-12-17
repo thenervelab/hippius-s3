@@ -25,6 +25,8 @@ class ManifestService:
             except Exception:
                 ov_param = None
 
+            # CIDs are optional: v4+ deployments may be CID-less (deterministic chunk addressing),
+            # but we still want to surface CIDs when present so IPFS-backed reads remain possible.
             rows = await db.fetch(
                 """
                 SELECT p.part_number,
@@ -41,7 +43,14 @@ class ManifestService:
                 object_info["object_id"],
                 ov_param,
             )
-            logger.debug(f"MANIFEST found {len(rows)} parts rows: {[(r[0], r[1], r[2]) for r in rows]}")
+            # Avoid exploding logs for large multipart objects.
+            preview = [(r[0], r[1], r[2]) for r in rows[:25]]
+            logger.debug(
+                "MANIFEST found %s parts rows (preview=%s%s)",
+                len(rows),
+                preview,
+                "" if len(rows) <= 25 else "…",
+            )
 
             manifest: list[dict] = []
             for r in rows:

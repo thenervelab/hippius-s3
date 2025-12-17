@@ -56,16 +56,35 @@ async def process_download_request(
         # Process all chunks concurrently with higher concurrency for better IPFS utilization
         semaphore = asyncio.Semaphore(10)  # Increased for better parallel downloads
 
+        def _is_placeholder_cid(cid: str | None) -> bool:
+            if cid is None:
+                return True
+            s = str(cid).strip()
+            return (not s) or (s.lower() in {"none", "pending"})
+
         async def download_chunk(chunk):
             chunk_logger = logging.getLogger(__name__)
             async with semaphore:
                 part_number = int(getattr(chunk, "part_number", 0))
-                cid_plan: list[tuple[int, str, int | None]] = [
-                    (int(s.index), str(s.cid), int(s.cipher_size_bytes) if s.cipher_size_bytes is not None else None)
-                    for s in (chunk.chunks or [])
-                ]
+                # Filter to entries that actually have a usable CID (IPFS-backed).
+                # CID-less entries are expected for some storage_version>=4 flows and should be skipped here.
+                cid_plan: list[tuple[int, str, int | None]] = []
+                for s in (chunk.chunks or []):
+                    cid_raw = getattr(s, "cid", None)
+                    if _is_placeholder_cid(cid_raw):
+                        continue
+                    cid_plan.append(
+                        (
+                            int(s.index),
+                            str(cid_raw).strip(),
+                            int(s.cipher_size_bytes) if s.cipher_size_bytes is not None else None,
+                        )
+                    )
                 if not cid_plan:
-                    return False
+                    chunk_logger.info(
+                        f"Skipping part {part_number}: no usable CIDs in download plan (cid-less or not ready)"
+                    )
+                    return True
 
             max_attempts = getattr(config, "downloader_chunk_retries", 3)
             base_sleep = getattr(config, "downloader_retry_base_seconds", 0.1)
@@ -94,12 +113,7 @@ async def process_download_request(
                     async def fetch_and_store(entry: tuple[int, str, int | None]) -> int:
                         ci, cid_val, expected_len = entry
                         chunk_logger.debug(f"Downloading part {part_number} ci={ci}")
-                        # Fetch per-chunk using provided mapping
-                        cid_for_ci = None
-                        for e in cid_plan:
-                            if int(e[0]) == int(ci):
-                                cid_for_ci = str(e[1])
-                                break
+                        cid_for_ci = str(cid_val).strip()
                         if not cid_for_ci:
                             raise RuntimeError("missing_chunk_cid_for_index")
                         if cid_for_ci in cid_cache:
@@ -250,7 +264,7 @@ async def run_downloader_loop():
             except (BusyLoadingError, RedisConnectionError, RedisTimeoutError) as e:
                 logger.warning(f"Redis error while dequeuing download request: {e}. Reconnecting in 2s...")
                 with contextlib.suppress(Exception):
-                    await redis_queues_client.aclose()
+                    await redis_queues_client.aclose()  # type: ignore[attr-defined]
                 await asyncio.sleep(2)
                 redis_queues_client = async_redis.from_url(config.redis_queues_url)
                 initialize_queue_client(redis_queues_client)
@@ -284,7 +298,7 @@ async def run_downloader_loop():
                         f"Redis connection issue during processing: {e}. Reconnecting in 2s and continuing..."
                     )
                     with contextlib.suppress(Exception):
-                        await redis_client.aclose()
+                        await redis_client.aclose()  # type: ignore[attr-defined]
                     redis_client = async_redis.from_url(config.redis_url)
                     initialize_cache_client(redis_client)
                     continue
@@ -298,8 +312,8 @@ async def run_downloader_loop():
         logger.error(f"Error in downloader loop: {e}")
         raise
     finally:
-        await redis_client.aclose()
-        await redis_queues_client.aclose()
+        await redis_client.aclose()  # type: ignore[attr-defined]
+        await redis_queues_client.aclose()  # type: ignore[attr-defined]
 
 
 if __name__ == "__main__":
