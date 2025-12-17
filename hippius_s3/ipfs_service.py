@@ -24,12 +24,13 @@ class PendingCIDError(ValueError):
 
 
 def _normalize_cid(cid: str) -> str:
-    return str(cid or "").strip().lower()
+    return str(cid or "").strip()
 
 
 def _ensure_concrete_cid(cid: str) -> str:
     cid_norm = _normalize_cid(cid)
-    if cid_norm in PENDING_CID_SENTINELS:
+    # Placeholder detection is case-insensitive, but returned CID must preserve original casing.
+    if cid_norm.lower() in PENDING_CID_SENTINELS:
         raise PendingCIDError(f"Refusing to download placeholder CID: {cid!r}")
     return cid_norm
 
