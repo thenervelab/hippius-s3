@@ -27,8 +27,8 @@ WITH object_info AS (
       AND o.object_key = $2
 ),
 multipart_chunks AS (
-    -- Legacy (<4): allow cid_id NULL by falling back to parts.ipfs_cid; may still be NULL if metadata is incomplete.
-    -- v4+: CID-less.
+    -- CIDs are optional: allow cid_id NULL by falling back to parts.ipfs_cid; may still be NULL
+    -- for CID-less (v4+) objects.
     SELECT
         p.part_number,
         COALESCE(c.cid, p.ipfs_cid) AS cid,
@@ -37,18 +37,7 @@ multipart_chunks AS (
     FROM object_info oi
     JOIN parts p ON p.object_id = oi.object_id AND p.object_version = oi.object_version
     LEFT JOIN cids c ON p.cid_id = c.id
-    WHERE oi.multipart = TRUE AND oi.storage_version < 4
-
-    UNION ALL
-
-    SELECT
-        p.part_number,
-        NULL AS cid,
-        p.size_bytes,
-        oi.object_id
-    FROM object_info oi
-    JOIN parts p ON p.object_id = oi.object_id AND p.object_version = oi.object_version
-    WHERE oi.multipart = TRUE AND oi.storage_version >= 4
+    WHERE oi.multipart = TRUE
 )
 SELECT
     oi.object_id,

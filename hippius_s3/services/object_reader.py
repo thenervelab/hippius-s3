@@ -122,15 +122,41 @@ async def build_stream_context(
         dl_parts: list[PartToDownload] = []
         storage_version = int(info.get("storage_version") or 0)
         if storage_version >= 4:
-            # Backup/hydrator mode: don't depend on part_chunks/CIDs. Hydrator uses
-            # deterministic keys derived from (object_id, version, part, chunk).
+            # v4+: CIDs are optional.
+            # - If per-chunk CIDs exist in part_chunks, include them so the IPFS downloader can hydrate from IPFS.
+            # - Otherwise, keep cid=None so alternative hydrators (deterministic addressing) can handle it.
             for pn, idxs in indices_by_part.items():
-                dl_parts.append(
-                    PartToDownload(
-                        part_number=int(pn),
-                        chunks=[PartChunkSpec(index=int(i), cid=None) for i in sorted({int(x) for x in idxs})],
+                include = {int(i) for i in idxs}
+                by_index: dict[int, tuple[str | None, int | None]] = {}
+                try:
+                    from hippius_s3.utils import get_query  # local import
+
+                    rows = await db.fetch(
+                        get_query("get_part_chunks_by_object_and_number"),
+                        info["object_id"],
+                        int(info.get("object_version") or info.get("current_object_version") or 1),
+                        int(pn),
                     )
-                )
+                    for r in rows or []:
+                        ci = int(r[0])
+                        if ci not in include:
+                            continue
+                        cid_raw = r[1]
+                        cid_val = str(cid_raw).strip() if cid_raw is not None else None
+                        if cid_val and cid_val.lower() in {"", "none", "pending"}:
+                            cid_val = None
+                        clen = int(r[2]) if (len(r) > 2 and r[2] is not None) else None
+                        by_index[ci] = (cid_val, clen)
+                except Exception:
+                    # If chunk metadata isn't present (common for CID-less objects), keep cid=None
+                    by_index = {}
+
+                v4_specs: list[PartChunkSpec] = []
+                for ci in sorted(include):
+                    cid_val, clen = by_index.get(int(ci), (None, None))
+                    v4_specs.append(PartChunkSpec(index=int(ci), cid=cid_val, cipher_size_bytes=clen))
+
+                dl_parts.append(PartToDownload(part_number=int(pn), chunks=v4_specs))
         else:
             missing_meta_parts: list[int] = []
             for pn, idxs in indices_by_part.items():
@@ -145,23 +171,24 @@ async def build_stream_context(
                     )
                     # Preserve raw cid (may be NULL on corrupt rows) so validation is explicit.
                     all_entries = [(int(r[0]), r[1], int(r[2]) if r[2] is not None else None) for r in rows or []]
-                    chunk_specs: list[dict] = []
+                    specs: list[PartChunkSpec] = []
                     include = {int(i) for i in idxs}
                     for ci, cid, clen in all_entries:
                         if int(ci) in include:
-                            chunk_specs.append(
-                                {
-                                    "index": int(ci),
-                                    "cid": cid,
-                                    "cipher_size_bytes": int(clen) if clen is not None else None,
-                                }
+                            cid_val = str(cid).strip() if cid is not None else None
+                            if cid_val and cid_val.lower() in {"", "none", "pending"}:
+                                cid_val = None
+                            specs.append(
+                                PartChunkSpec(
+                                    index=int(ci),
+                                    cid=cid_val,
+                                    cipher_size_bytes=int(clen) if clen is not None else None,
+                                )
                             )
-                    if not chunk_specs:
+                    if not specs:
                         missing_meta_parts.append(int(pn))
                         continue
-                    found = {
-                        int(spec["index"]) for spec in chunk_specs if ("index" in spec and spec["index"] is not None)
-                    }
+                    found = {int(spec.index) for spec in specs}
                     missing = include - found
                     if missing:
                         logger.debug(
@@ -177,10 +204,10 @@ async def build_stream_context(
                     # If any are missing/placeholder, treat the whole part as not-ready to
                     # avoid hanging mid-stream on chunks that can never be fetched.
                     bad = []
-                    for spec in chunk_specs:
-                        c = str(spec.get("cid") or "").strip().lower()
+                    for spec in specs:
+                        c = str(spec.cid or "").strip().lower()
                         if c in {"", "none", "pending"}:
-                            bad.append(spec.get("index"))
+                            bad.append(spec.index)
                     if bad:
                         logger.debug(
                             "STREAM legacy bad CID(s) object_id=%s v=%s part=%s bad_indices=%s",
@@ -194,15 +221,7 @@ async def build_stream_context(
                     dl_parts.append(
                         PartToDownload(
                             part_number=int(pn),
-                            chunks=[
-                                # type: ignore[arg-type]
-                                {
-                                    "index": spec["index"],
-                                    "cid": spec.get("cid"),
-                                    "cipher_size_bytes": spec.get("cipher_size_bytes"),
-                                }
-                                for spec in chunk_specs
-                            ],
+                            chunks=specs,
                         )
                     )
                 except Exception:
