@@ -269,7 +269,7 @@ async def initiate_multipart_upload(
             "",  # initial md5_hash (will be updated on completion)
             0,  # initial size_bytes (will be updated on completion)
             initiated_at,  # created_at
-            int(getattr(config, "target_storage_version", 4)),
+            int(config.target_storage_version),
         )
 
         # Use the returned object_id (will be existing one if conflict occurred)
@@ -514,7 +514,7 @@ async def upload_part(
                     subaccount=request.state.account.main_account,
                     subaccount_seed_phrase=request.state.seed_phrase,
                     substrate_url=config.substrate_url,
-                    ipfs_node=config.ipfs_get_url,
+                    ipfs_node=str(config.ipfs_api_urls[0]) if config.ipfs_api_urls else "",
                     should_decrypt=True,
                     size=int(source_obj.get("size_bytes") or 0),
                     multipart=bool((json.loads(source_obj.get("metadata") or "{}") or {}).get("multipart", False)),
@@ -523,7 +523,7 @@ async def upload_part(
                 await enqueue_download_request(req)
 
             # Stream plaintext bytes
-            _ = require_supported_storage_version(int(source_obj["storage_version"]))
+            source_storage_version = require_supported_storage_version(int(source_obj["storage_version"]))
             chunks_iter = stream_plan(
                 obj_cache=obj_cache,
                 object_id=object_id_str,
@@ -533,7 +533,7 @@ async def upload_part(
                 sleep_seconds=float(config.http_download_sleep_loop),
                 address=request.state.account.main_account,
                 bucket_name=source_bucket_name,
-                storage_version=int(source_obj["storage_version"]),
+                storage_version=source_storage_version,
             )
             try:
                 source_bytes = b"".join([piece async for piece in chunks_iter])

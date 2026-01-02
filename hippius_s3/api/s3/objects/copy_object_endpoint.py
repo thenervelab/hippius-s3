@@ -116,7 +116,7 @@ async def handle_copy_object(
             "object_key": source_object_key,
             "storage_version": storage_version,
             "object_version": int(src_obj_row.get("object_version") or 1),
-            "is_public": source_is_public,
+            "is_public": bool(source_bucket.get("is_public", False)),
             "multipart": src_multipart,
             "metadata": src_metadata,
             "ray_id": getattr(request.state, "ray_id", None),
@@ -137,7 +137,7 @@ async def handle_copy_object(
         account_address=request.state.account.main_account,
         content_type=content_type,
         metadata=metadata,
-        storage_version=int(getattr(config, "target_storage_version", 4)),
+        storage_version=int(config.target_storage_version),
         body_iter=chunks_iter,
     )
 

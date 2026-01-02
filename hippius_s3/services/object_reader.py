@@ -214,7 +214,8 @@ async def build_stream_context(
                 subaccount=address,
                 subaccount_seed_phrase="",
                 substrate_url=cfg.substrate_url,
-                ipfs_node=cfg.ipfs_get_url,
+                # Use first configured IPFS API URL as the preferred node for downloader worker
+                ipfs_node=str(cfg.ipfs_api_urls[0]) if cfg.ipfs_api_urls else "",
                 should_decrypt=should_decrypt,
                 size=int(info.get("size_bytes") or 0),
                 multipart=bool(info.get("multipart")),
