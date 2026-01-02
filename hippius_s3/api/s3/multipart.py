@@ -522,15 +522,17 @@ async def upload_part(
                 await enqueue_download_request(req)
 
             # Stream plaintext bytes
-            _ = require_supported_storage_version(int(source_obj["storage_version"]))
+            source_storage_version = require_supported_storage_version(int(source_obj["storage_version"]))
             chunks_iter = stream_plan(
                 obj_cache=obj_cache,
                 object_id=object_id_str,
                 object_version=src_ver,
                 plan=plan,
+                should_decrypt=True,
                 sleep_seconds=float(config.http_download_sleep_loop),
                 address=request.state.account.main_account,
                 bucket_name=source_bucket_name,
+                storage_version=source_storage_version,
             )
             try:
                 source_bytes = b"".join([piece async for piece in chunks_iter])

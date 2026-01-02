@@ -290,9 +290,11 @@ async def migrate_one(
                 object_id=object_id,
                 object_version=ctx.object_version,
                 plan=part_plan,
+                should_decrypt=ctx.should_decrypt,
                 sleep_seconds=float(config.http_download_sleep_loop),
                 address=address,
                 bucket_name=bucket_name,
+                storage_version=ctx.storage_version,
             )
             # Accumulate bytes for this part
             buf = bytearray()
