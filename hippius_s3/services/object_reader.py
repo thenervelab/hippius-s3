@@ -48,7 +48,9 @@ async def build_stream_context(
 ) -> StreamContext:
     cfg = get_config()
     storage_version = require_supported_storage_version(int(info["storage_version"]))
-    should_decrypt = bool(info.get("should_decrypt", True))
+    # Stage-1 v4-only policy: always decrypt at read time.
+    # Keep `should_decrypt` in the interface for backward compatibility, but ignore it.
+    should_decrypt = True
 
     ov = int(info.get("object_version") or info.get("current_object_version") or 1)
     parts = await read_parts_manifest(db, info["object_id"], ov)
