@@ -22,7 +22,7 @@ async def decrypt_chunk(
 ) -> bytes:
     """Decrypt a ciphertext chunk.
 
-    Hippius S3 now assumes v4+ objects everywhere; legacy (< v3) decrypt paths are removed.
+    Hippius S3 now assumes v4+ objects everywhere; legacy (< v4) decrypt paths are removed.
     """
     from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
 

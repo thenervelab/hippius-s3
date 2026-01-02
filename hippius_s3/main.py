@@ -20,7 +20,6 @@ from hippius_s3.api.middlewares.parse_internal_headers import parse_internal_hea
 from hippius_s3.api.middlewares.profiler import SpeedscopeProfilerMiddleware
 from hippius_s3.api.middlewares.tracing import tracing_middleware
 from hippius_s3.api.s3 import errors as s3_errors
-from hippius_s3.api.s3.multipart import router as multipart_router
 from hippius_s3.api.s3.public_router import router as public_router
 from hippius_s3.api.s3.router import router as s3_router_new
 from hippius_s3.api.user import router as user_router
@@ -31,6 +30,7 @@ from hippius_s3.config import Config
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
+from hippius_s3.storage_version import UnsupportedStorageVersionError
 
 
 logger = logging.getLogger(__name__)
@@ -250,6 +250,12 @@ def factory() -> FastAPI:
                 message="Object not ready for download yet. Please retry.",
                 status_code=503,
             )
+        if isinstance(exc, UnsupportedStorageVersionError):
+            return s3_errors.s3_error_response(
+                code="NotImplemented",
+                message=(f"Object uses unsupported storage version (sv={exc.storage_version}). Migrate object to v4."),
+                status_code=501,
+            )
         raise exc
 
     @app.get("/robots.txt", include_in_schema=False)
@@ -295,7 +301,6 @@ Disallow: /"""
     app.include_router(user_router, prefix="/user")
     app.include_router(public_router, prefix="")
     app.include_router(s3_router_new, prefix="")
-    app.include_router(multipart_router, prefix="")
 
     static_dir = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")

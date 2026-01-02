@@ -341,16 +341,6 @@ async def get_all_cached_chunks(
         return []
 
 
-@router.put(
-    "/{bucket_name}/{object_key:path}/",
-    status_code=200,
-    include_in_schema=True,
-)
-@router.put(
-    "/{bucket_name}/{object_key:path}",
-    status_code=200,
-    include_in_schema=True,
-)
 async def upload_part(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
