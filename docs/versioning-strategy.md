@@ -29,13 +29,13 @@ GET /bucket/myfile.txt?versionId=abc123
 **Lifecycle**: Temporary, cleaned up after grace period
 
 ```sql
--- System migrates v1 → v3 internally
+-- System migrates v1 → v4 internally
 object_v1 (old_id, is_migration_version=TRUE, is_latest=FALSE)
-object_v3 (new_id, is_migration_version=FALSE, is_latest=TRUE)
+object_v4 (new_id, is_migration_version=FALSE, is_latest=TRUE)
 
--- User sees only the latest v3
+-- User sees only the latest v4
 GET /bucket/myfile.txt
--- Returns: object_v3 only
+-- Returns: object_v4 only
 
 -- After 7 days, cleanup worker deletes object_v1
 ```
@@ -144,7 +144,7 @@ GET /bucket/file.txt
   → object_id: bbb-222
   → is_migration_version: FALSE
   → is_latest: TRUE
-  → storage_version: 3
+  → storage_version: 4
   → old object aaa-111 deleted
 ```
 

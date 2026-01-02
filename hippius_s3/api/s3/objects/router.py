@@ -19,8 +19,6 @@ from hippius_s3.api.s3.objects.put_object_endpoint import handle_put_object
 from hippius_s3.api.s3.objects.tagging_endpoint import delete_object_tags as tags_delete_object_tags
 from hippius_s3.api.s3.objects.tagging_endpoint import get_object_tags as tags_get_object_tags
 from hippius_s3.api.s3.objects.tagging_endpoint import set_object_tags as tags_set_object_tags
-from hippius_s3.dependencies import get_object_reader
-from hippius_s3.services.object_reader import ObjectReader
 
 
 router = APIRouter()
@@ -43,7 +41,6 @@ async def get_object(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
     redis_client: Any = Depends(dependencies.get_redis),
-    object_reader: ObjectReader = Depends(get_object_reader),
 ) -> Response:
     # Handle query variants by delegation
     if "tagging" in request.query_params:
@@ -52,9 +49,10 @@ async def get_object(
         )
     if "uploadId" in request.query_params:
         return await list_parts_internal(bucket_name, object_key, request, db)
-    return await handle_get_object(bucket_name, object_key, request, db, redis_client, object_reader)
+    return await handle_get_object(bucket_name, object_key, request, db, redis_client)
 
 
+@router.put("/{bucket_name}/{object_key:path}/", status_code=200, include_in_schema=False)
 @router.put("/{bucket_name}/{object_key:path}", status_code=200)
 async def put_object(
     bucket_name: str,

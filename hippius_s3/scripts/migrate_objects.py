@@ -227,7 +227,7 @@ async def migrate_one(
         object_id=object_id,
         content_type=content_type,
         metadata=metadata,
-        storage_version_target=int(getattr(config, "target_storage_version", 3)),
+        storage_version_target=int(getattr(config, "target_storage_version", 4)),
     )
 
     obj_cache = RedisObjectPartsCache(redis_client)
@@ -477,7 +477,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
     initialize_queue_client(redis_queues_client)
     try:
-        target = int(getattr(config, "target_storage_version", 3))
+        target = int(getattr(config, "target_storage_version", 4))
 
         async def _iter_targets() -> AsyncGenerator[dict[str, Any], None]:
             if work_items is not None:

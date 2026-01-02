@@ -123,9 +123,13 @@ class Uploader:
         except Exception:
             sv = 0
         if sv >= 4:
-            raise RuntimeError(
-                f"misrouted_storage_version_v4_upload: "
-                f"(object_id={payload.object_id} v={int(payload.object_version or 1)} storage_version={sv})"
+            # Stage-1 v4-only rollout: still allow the uploader worker to publish chunk CIDs + manifest
+            # so pipeline reads that expect IPFS-backed hydration continue to function.
+            logger.info(
+                "Uploader processing v4 upload (IPFS-backed) object_id=%s v=%s storage_version=%s",
+                payload.object_id,
+                int(payload.object_version or 1),
+                sv,
             )
 
         chunk_start = time.time()

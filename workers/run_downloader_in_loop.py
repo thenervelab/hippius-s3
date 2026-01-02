@@ -46,7 +46,7 @@ async def process_download_request(
     short_id = f"{download_request.bucket_name}/{download_request.object_key}"
     logger.info(
         f"Processing download request for {short_id} with {len(download_request.chunks)} chunks; "
-        f"should_decrypt={download_request.should_decrypt} subaccount={download_request.subaccount[:8]}..."
+        f"subaccount={download_request.subaccount[:8]}..."
     )
     logger.info(
         f"Download request ids: object_id={download_request.object_id} request_id={download_request.request_id} parts={[c.part_number for c in download_request.chunks]}"
