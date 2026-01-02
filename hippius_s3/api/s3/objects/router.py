@@ -52,6 +52,7 @@ async def get_object(
     return await handle_get_object(bucket_name, object_key, request, db, redis_client)
 
 
+@router.put("/{bucket_name}/{object_key:path}/", status_code=200, include_in_schema=False)
 @router.put("/{bucket_name}/{object_key:path}", status_code=200)
 async def put_object(
     bucket_name: str,
