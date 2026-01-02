@@ -125,11 +125,11 @@ async def test_unban_deletes_correct_keys(unban_app: Any) -> None:
         return len(keys)
 
     async def mock_scan_iter(match: str) -> Any:
-        assert match == "hippius_banhammer:infringements:10.0.0.1:*"
+        assert match == "hippius_banhammer:infringements:*:10.0.0.1:*"
         for key in [
-            b"hippius_banhammer:infringements:10.0.0.1:1000",
-            b"hippius_banhammer:infringements:10.0.0.1:1001",
-            b"hippius_banhammer:infringements:10.0.0.1:1002",
+            b"hippius_banhammer:infringements:unauth:10.0.0.1:1000",
+            b"hippius_banhammer:infringements:auth:10.0.0.1:1001",
+            b"hippius_banhammer:infringements:unauth:10.0.0.1:1002",
         ]:
             yield key
 
@@ -142,6 +142,6 @@ async def test_unban_deletes_correct_keys(unban_app: Any) -> None:
     assert response.status_code == 200
 
     assert "hippius_banhammer:block:10.0.0.1" in deleted_keys
-    assert b"hippius_banhammer:infringements:10.0.0.1:1000" in deleted_keys
-    assert b"hippius_banhammer:infringements:10.0.0.1:1001" in deleted_keys
-    assert b"hippius_banhammer:infringements:10.0.0.1:1002" in deleted_keys
+    assert b"hippius_banhammer:infringements:unauth:10.0.0.1:1000" in deleted_keys
+    assert b"hippius_banhammer:infringements:auth:10.0.0.1:1001" in deleted_keys
+    assert b"hippius_banhammer:infringements:unauth:10.0.0.1:1002" in deleted_keys
