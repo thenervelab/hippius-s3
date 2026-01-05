@@ -118,7 +118,7 @@ class BanHammerService:
         """Classification rules for what counts as an infringement.
 
         Keep this intentionally simple:
-        - Strict for unauthenticated probing (counts 400/403 and optionally 404 for GET/HEAD)
+        - Strict for unauthenticated probing (counts 400/401/403/405 and 404 for selected methods)
         - Lenient for authenticated traffic (counts only 400)
         """
         sc = int(status_code)
@@ -139,9 +139,7 @@ class BanHammerService:
         # Include 401 (common unauth response) and 405 (method probing).
         if sc in (400, 401, 403, 405):
             return True
-        if sc == 404 and str(request_method).upper() in self.unauth_404_methods:
-            return True
-        return False
+        return sc == 404 and str(request_method).upper() in self.unauth_404_methods
 
     async def add_infringement(self, ip: str, *, is_authenticated: bool = False, reason: str = "") -> None:
         """Add an infringement for an IP and check if it should be banned.
