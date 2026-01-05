@@ -87,11 +87,21 @@ def factory() -> FastAPI:
         app.state.rate_limit_service = RateLimitService(app.state.redis_rate_limiting)
         logger.info("RateLimitService initialized")
 
-        app.state.banhammer_service = BanHammerService(app.state.redis_rate_limiting)
+        app.state.banhammer_service = BanHammerService(
+            app.state.redis_rate_limiting,
+            allowlist_ips=config.banhammer_allowlist_ips,
+            unauth_infringement_window_seconds=config.banhammer_unauth_window_seconds,
+            unauth_infringement_cooldown_seconds=config.banhammer_unauth_ban_seconds,
+            unauth_infringement_max=config.banhammer_unauth_max,
+            auth_infringement_window_seconds=config.banhammer_auth_window_seconds,
+            auth_infringement_cooldown_seconds=config.banhammer_auth_ban_seconds,
+            auth_infringement_max=config.banhammer_auth_max,
+            unauth_404_methods=config.banhammer_unauth_404_methods,
+        )
         logger.info("BanHammerService initialized")
 
         app.state.acl_service = ACLService(
-            db_pool=app.state.postgres_pool,
+            db_pool=app.state.postgres_pool,  # type: ignore[arg-type]
             redis_client=app.state.redis_acl,
             cache_ttl=config.acl_cache_ttl_seconds,
         )

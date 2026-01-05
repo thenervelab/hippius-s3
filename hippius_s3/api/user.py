@@ -254,7 +254,9 @@ async def unban(
         block_key = f"hippius_banhammer:block:{ip}"
         await redis.delete(block_key)
 
-        pattern = f"hippius_banhammer:infringements:{ip}:*"
+        # Banhammer infringement keys are profile-scoped:
+        #   hippius_banhammer:infringements:{profile}:{ip}:{window_bucket}
+        pattern = f"hippius_banhammer:infringements:*:{ip}:*"
         counter_keys = [key async for key in redis.scan_iter(match=pattern)]
 
         if counter_keys:

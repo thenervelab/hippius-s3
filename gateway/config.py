@@ -6,6 +6,12 @@ import os
 logger = logging.getLogger(__name__)
 
 
+def _parse_csv(value: str) -> list[str]:
+    if not value:
+        return []
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+
 @dataclasses.dataclass
 class GatewayConfig:
     backend_url: str = dataclasses.field(default_factory=lambda: os.getenv("GATEWAY_BACKEND_URL", "http://api:8000"))
@@ -40,6 +46,35 @@ class GatewayConfig:
     )
     rate_limit_per_minute: int = dataclasses.field(
         default_factory=lambda: int(os.getenv("HIPPIUS_RATE_LIMIT_PER_MINUTE", "7200"))
+    )
+
+    # Banhammer tuning (enforced in gateway.middlewares.banhammer)
+    # Allowlist of exact IP strings (no CIDR parsing yet)
+    banhammer_allowlist_ips: set[str] = dataclasses.field(
+        default_factory=lambda: set(_parse_csv(os.getenv("BANHAMMER_ALLOWLIST_IPS", "")))
+    )
+
+    # Unauthenticated profile (strict)
+    banhammer_unauth_window_seconds: int = dataclasses.field(
+        default_factory=lambda: int(os.getenv("BANHAMMER_UNAUTH_WINDOW_SECONDS", "60"))
+    )
+    banhammer_unauth_max: int = dataclasses.field(default_factory=lambda: int(os.getenv("BANHAMMER_UNAUTH_MAX", "50")))
+    banhammer_unauth_ban_seconds: int = dataclasses.field(
+        default_factory=lambda: int(os.getenv("BANHAMMER_UNAUTH_BAN_SECONDS", "3600"))
+    )
+
+    # Authenticated profile (lenient, short ban)
+    banhammer_auth_window_seconds: int = dataclasses.field(
+        default_factory=lambda: int(os.getenv("BANHAMMER_AUTH_WINDOW_SECONDS", "60"))
+    )
+    banhammer_auth_max: int = dataclasses.field(default_factory=lambda: int(os.getenv("BANHAMMER_AUTH_MAX", "200")))
+    banhammer_auth_ban_seconds: int = dataclasses.field(
+        default_factory=lambda: int(os.getenv("BANHAMMER_AUTH_BAN_SECONDS", "300"))
+    )
+
+    # Methods where unauthenticated 404s count (default: GET,HEAD)
+    banhammer_unauth_404_methods: set[str] = dataclasses.field(
+        default_factory=lambda: {m.upper() for m in _parse_csv(os.getenv("BANHAMMER_UNAUTH_404_METHODS", "GET,HEAD"))}
     )
     frontend_hmac_secret: str = dataclasses.field(default_factory=lambda: os.getenv("FRONTEND_HMAC_SECRET", ""))
     validator_region: str = dataclasses.field(default_factory=lambda: os.getenv("VALIDATOR_REGION", "decentralized"))
