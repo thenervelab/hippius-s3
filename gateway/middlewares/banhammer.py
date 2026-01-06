@@ -156,7 +156,14 @@ class BanHammerService:
         if count == 1:
             await self.redis.expire(count_key, int(window_seconds))
 
-        logger.info("banhammer_infringement ip=%s profile=%s count=%s/%s reason=%s", ip, profile, count, infringement_max, reason)
+        logger.info(
+            "banhammer_infringement ip=%s profile=%s count=%s/%s reason=%s",
+            ip,
+            profile,
+            count,
+            infringement_max,
+            reason,
+        )
 
         # Ban if threshold exceeded
         if count >= int(infringement_max):
