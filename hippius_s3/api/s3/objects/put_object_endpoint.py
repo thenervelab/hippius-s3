@@ -123,7 +123,7 @@ async def handle_put_object(
                     "has_object_id": True,
                     "file_size_bytes": file_size,
                     "content_type": content_type,
-                    "storage_version": int(getattr(config, "target_storage_version", 3)),
+                    "storage_version": config.target_storage_version,
                 },
             ) as span:
                 writer = ObjectWriter(db=db, redis_client=redis_client, fs_store=request.app.state.fs_store)
@@ -139,7 +139,7 @@ async def handle_put_object(
                     account_address=request.state.account.main_account,
                     content_type=content_type,
                     metadata=metadata,
-                    storage_version=int(getattr(config, "target_storage_version", 3)),
+                    storage_version=config.target_storage_version,
                     body_iter=_iter_once(),
                 )
 

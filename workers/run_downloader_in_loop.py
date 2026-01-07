@@ -86,9 +86,9 @@ async def process_download_request(
                     )
                     return True
 
-            max_attempts = getattr(config, "downloader_chunk_retries", 3)
-            base_sleep = getattr(config, "downloader_retry_base_seconds", 0.1)
-            jitter = getattr(config, "downloader_retry_jitter_seconds", 0.1)
+            max_attempts = config.downloader_chunk_retries
+            base_sleep = config.downloader_retry_base_seconds
+            jitter = config.downloader_retry_jitter_seconds
 
             import random as _random
 

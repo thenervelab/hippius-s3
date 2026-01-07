@@ -141,6 +141,11 @@ class Config:
         "DOWNLOADER_ALLOW_PART_BACKFILL:false", convert=lambda x: x.lower() == "true"
     )
 
+    # Downloader retry tuning (used by workers/run_downloader_in_loop.py)
+    downloader_chunk_retries: int = env("DOWNLOADER_CHUNK_RETRIES:3", convert=int)
+    downloader_retry_base_seconds: float = env("DOWNLOADER_RETRY_BASE_SECONDS:0.1", convert=float)
+    downloader_retry_jitter_seconds: float = env("DOWNLOADER_RETRY_JITTER_SECONDS:0.1", convert=float)
+
     # Crypto configuration
     # Default encryption suite for new objects
     # hip-enc/legacy: SecretBox per-chunk (current default)

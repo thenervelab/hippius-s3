@@ -120,7 +120,7 @@ async def enqueue_upload_request(payload: UploadChainRequest) -> None:
 
     config = get_config()
     raw = payload.model_dump_json()
-    queue_names_str: str = getattr(config, "upload_queue_names", "upload_requests")
+    queue_names_str: str = config.upload_queue_names
 
     def _norm(name: str) -> str:
         return name.strip().strip('"').strip("'")
@@ -135,8 +135,13 @@ async def dequeue_upload_request() -> UploadChainRequest | None:
     """Get the next upload request from the Redis queue."""
     client = get_queue_client()
     config = get_config()
-    raw_qname: str = getattr(config, "pinner_consume_queue", "upload_requests")
-    queue_name: str = raw_qname.strip().strip('"').strip("'")
+    queue_names_str: str = config.upload_queue_names
+
+    def _norm(name: str) -> str:
+        return name.strip().strip('"').strip("'")
+
+    queue_names: List[str] = [_norm(q) for q in queue_names_str.split(",") if _norm(q)]
+    queue_name: str = queue_names[0] if queue_names else "upload_requests"
     result = await client.brpop(queue_name, timeout=0.5)
     if result:
         _, queue_data = result
@@ -175,6 +180,15 @@ async def move_due_retries_to_primary(
 ) -> int:
     """Move due retry items back to the primary queue. Returns number moved."""
     client = get_queue_client()
+    config = get_config()
+    queue_names_str: str = config.upload_queue_names
+
+    def _norm(name: str) -> str:
+        return name.strip().strip('"').strip("'")
+
+    queue_names: List[str] = [_norm(q) for q in queue_names_str.split(",") if _norm(q)]
+    primary_queue: str = queue_names[0] if queue_names else "upload_requests"
+
     now_ts = time.time() if now_ts is None else now_ts
     members = await client.zrangebyscore(RETRY_ZSET, min="-inf", max=now_ts, start=0, num=max_items)
     moved = 0
@@ -182,7 +196,7 @@ async def move_due_retries_to_primary(
         try:
             async with client.pipeline(transaction=True) as pipe:
                 pipe.zrem(RETRY_ZSET, m)
-                pipe.lpush("upload_requests", m)
+                pipe.lpush(primary_queue, m)
                 await pipe.execute()
             moved += 1
         except Exception:
@@ -260,7 +274,7 @@ async def enqueue_download_request(payload: DownloadChainRequest) -> None:
     from hippius_s3.config import get_config  # local import to avoid cycles
 
     config = get_config()
-    queue_names_str: str = getattr(config, "download_queue_names", "download_requests")
+    queue_names_str: str = config.download_queue_names
 
     def _norm(name: str) -> str:
         return name.strip().strip('"').strip("'")
