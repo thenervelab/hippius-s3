@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from datetime import timezone
 from typing import Any
@@ -10,7 +11,6 @@ from urllib.parse import unquote
 
 from fastapi import Request
 from fastapi import Response
-from lxml import etree as ET
 
 from hippius_s3.api.s3 import errors
 from hippius_s3.cache import RedisObjectPartsCache
@@ -97,13 +97,7 @@ async def handle_copy_object(
         return errors.s3_error_response(
             "NoSuchKey", f"The specified key {source_object_key} does not exist", status_code=404
         )
-    # Build src_info with safe fallbacks (metadata may be JSON string)
-    src_info = type("_Src", (), {})()
-    src_info.object_id = str(src_obj_row.get("object_id"))
-    src_info.bucket_name = source_bucket_name
-    src_info.object_key = source_object_key
-    src_info.size_bytes = int(src_obj_row.get("size_bytes") or 0)
-    src_info.content_type = str(src_obj_row.get("content_type") or "application/octet-stream")
+    src_object_id = str(src_obj_row.get("object_id"))
     # metadata column may be missing or be JSON string
     raw_meta = src_obj_row.get("metadata") if hasattr(src_obj_row, "get") else None
     if isinstance(raw_meta, str):
@@ -111,9 +105,8 @@ async def handle_copy_object(
             raw_meta = json.loads(raw_meta)
         except Exception:
             raw_meta = {}
-    src_info.metadata = raw_meta or {}
-    src_info.multipart = bool((src_info.metadata or {}).get("multipart", False))
-    src_info.should_decrypt = not source_is_public
+    src_metadata: dict[str, Any] = raw_meta if isinstance(raw_meta, dict) else {}
+    src_multipart = bool(src_metadata.get("multipart", False))
 
     # Assemble bytes via high-level reader API (internally handles downloader/cache)
     logger.info("CopyObject assembling bytes via object_reader.stream_object")
@@ -123,14 +116,14 @@ async def handle_copy_object(
         redis_client,
         obj_cache,
         {
-            "object_id": src_info.object_id,
+            "object_id": src_object_id,
             "bucket_name": source_bucket_name,
             "object_key": source_object_key,
             "storage_version": int(src_obj_row.get("storage_version") or 2),
             "object_version": int(src_obj_row.get("object_version") or 1),
             "is_public": source_is_public,
-            "multipart": bool(src_info.multipart),
-            "metadata": src_info.metadata,
+            "multipart": src_multipart,
+            "metadata": src_metadata,
             "ray_id": getattr(request.state, "ray_id", None),
         },
         rng=None,
@@ -149,11 +142,11 @@ async def handle_copy_object(
         account_address=request.state.account.main_account,
         content_type=content_type,
         metadata=metadata,
-        storage_version=int(getattr(config, "target_storage_version", 3)),
+        storage_version=config.target_storage_version,
         body_iter=chunks_iter,
     )
 
-    # Success XML
+    # Success XML (AWS-style; keep declaration for client compatibility)
     root = ET.Element("CopyObjectResult")
     etag = ET.SubElement(root, "ETag")
     etag.text = put_res.etag

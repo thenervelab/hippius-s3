@@ -93,7 +93,7 @@ class ObjectWriter:
         This method assumes the object row/version already exists in DB.
         """
         # Encrypt into chunks
-        chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+        chunk_size = self.config.object_chunk_size_bytes
         key_bytes = await get_or_create_encryption_key_bytes(
             main_account_id=account_address,
             bucket_name=bucket_name,
@@ -107,7 +107,7 @@ class ObjectWriter:
             key=key_bytes,
         )
 
-        ttl = int(getattr(self.config, "cache_ttl_seconds", 1800))
+        ttl = self.config.cache_ttl_seconds
         writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
         await writer.write_chunks(object_id, int(object_version), 1, ct_chunks)
         await writer.write_meta(
@@ -162,8 +162,8 @@ class ObjectWriter:
         - Keeps peak memory bounded to configured chunk size.
         - Uses server-side keys; seed phrases are not required.
         """
-        chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
-        ttl = int(getattr(self.config, "cache_ttl_seconds", 1800))
+        chunk_size = self.config.object_chunk_size_bytes
+        ttl = self.config.cache_ttl_seconds
 
         with tracer.start_as_current_span(
             "put_simple_stream_full.key_retrieval",
@@ -262,7 +262,7 @@ class ObjectWriter:
 
         # Upsert DB row with final md5/size and storage version
         resolved_storage_version = int(
-            storage_version if storage_version is not None else getattr(self.config, "target_storage_version", 3)
+            storage_version if storage_version is not None else self.config.target_storage_version
         )
         with tracer.start_as_current_span(
             "put_simple_stream_full.upsert_metadata",
@@ -340,7 +340,7 @@ class ObjectWriter:
         if file_size == 0:
             raise ValueError("Zero-length part not allowed")
 
-        chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+        chunk_size = self.config.object_chunk_size_bytes
         key_bytes = await get_or_create_encryption_key_bytes(
             main_account_id=account_address,
             bucket_name=bucket_name,
@@ -354,7 +354,7 @@ class ObjectWriter:
             key=key_bytes,
         )
 
-        ttl = int(getattr(self.config, "cache_ttl_seconds", 1800))
+        ttl = self.config.cache_ttl_seconds
         writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
         await writer.write_chunks(str(object_id), int(object_version), int(part_number), ct_chunks)
         await writer.write_meta(
@@ -531,7 +531,7 @@ class ObjectWriter:
                 part_number=int(next_part),
                 size_bytes=int(delta_size),
                 etag=delta_md5,
-                chunk_size_bytes=int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024)),
+                chunk_size_bytes=self.config.object_chunk_size_bytes,
                 object_version=int(cov),
             )
 
@@ -592,7 +592,7 @@ class ObjectWriter:
             new_append_version_val = int(updated["append_version"])  # type: ignore
 
         # Cache write-through
-        chunk_size = int(getattr(self.config, "object_chunk_size_bytes", 4 * 1024 * 1024))
+        chunk_size = self.config.object_chunk_size_bytes
         key_bytes = await get_or_create_encryption_key_bytes(
             main_account_id=account_address,
             bucket_name=bucket_name,
@@ -605,7 +605,7 @@ class ObjectWriter:
             chunk_size=chunk_size,
             key=key_bytes,
         )
-        ttl = int(getattr(self.config, "cache_ttl_seconds", 1800))
+        ttl = self.config.cache_ttl_seconds
         writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
         await writer.write_chunks(object_id, int(cov), int(next_part), ct_chunks)
         await writer.write_meta(

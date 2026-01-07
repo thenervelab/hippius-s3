@@ -141,6 +141,11 @@ class Config:
         "DOWNLOADER_ALLOW_PART_BACKFILL:false", convert=lambda x: x.lower() == "true"
     )
 
+    # Downloader retry tuning (used by workers/run_downloader_in_loop.py)
+    downloader_chunk_retries: int = env("DOWNLOADER_CHUNK_RETRIES:3", convert=int)
+    downloader_retry_base_seconds: float = env("DOWNLOADER_RETRY_BASE_SECONDS:0.1", convert=float)
+    downloader_retry_jitter_seconds: float = env("DOWNLOADER_RETRY_JITTER_SECONDS:0.1", convert=float)
+
     # Crypto configuration
     # Default encryption suite for new objects
     # hip-enc/legacy: SecretBox per-chunk (current default)
@@ -179,8 +184,8 @@ class Config:
     enable_legacy_sdk_compat: bool = env("LEGACY_SDK_COMPAT:true", convert=lambda x: x.lower() == "true")
 
     # Storage version to assign for newly created/overwritten objects
-    # Defaults to 3 (latest layout)
-    target_storage_version: int = env("HIPPIUS_TARGET_STORAGE_VERSION:3", convert=int)
+    # Defaults to 4 (latest layout)
+    target_storage_version: int = env("HIPPIUS_TARGET_STORAGE_VERSION:4", convert=int)
 
     # Cachet health monitoring
     cachet_api_url: str = env("CACHET_API_URL", convert=str)
