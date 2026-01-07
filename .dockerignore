@@ -45,6 +45,7 @@ Thumbs.db
 backups/
 artifacts/
 monitoring-review.txt
+benchmark/
 
 # Environment files (will be mounted via docker-compose)
 .env*
