@@ -184,8 +184,8 @@ class Config:
     enable_legacy_sdk_compat: bool = env("LEGACY_SDK_COMPAT:true", convert=lambda x: x.lower() == "true")
 
     # Storage version to assign for newly created/overwritten objects
-    # Defaults to 3 (latest layout)
-    target_storage_version: int = env("HIPPIUS_TARGET_STORAGE_VERSION:3", convert=int)
+    # Defaults to 4 (latest layout)
+    target_storage_version: int = env("HIPPIUS_TARGET_STORAGE_VERSION:4", convert=int)
 
     # Cachet health monitoring
     cachet_api_url: str = env("CACHET_API_URL", convert=str)

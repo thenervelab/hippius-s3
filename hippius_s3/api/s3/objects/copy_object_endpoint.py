@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from datetime import timezone
 from typing import Any
@@ -10,7 +11,6 @@ from urllib.parse import unquote
 
 from fastapi import Request
 from fastapi import Response
-from lxml import etree as ET
 
 from hippius_s3.api.s3 import errors
 from hippius_s3.cache import RedisObjectPartsCache
@@ -146,13 +146,13 @@ async def handle_copy_object(
         body_iter=chunks_iter,
     )
 
-    # Success XML
-    root = ET.Element("CopyObjectResult", attrib={}, nsmap=None)
-    etag = ET.SubElement(root, "ETag", attrib={}, nsmap=None)
+    # Success XML (AWS-style; keep declaration for client compatibility)
+    root = ET.Element("CopyObjectResult")
+    etag = ET.SubElement(root, "ETag")
     etag.text = put_res.etag
-    last_modified = ET.SubElement(root, "LastModified", attrib={}, nsmap=None)
+    last_modified = ET.SubElement(root, "LastModified")
     last_modified.text = created_at.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    xml_response = ET.tostring(root)
+    xml_response = ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
     return Response(
         content=xml_response,
