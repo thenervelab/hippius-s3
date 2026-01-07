@@ -292,18 +292,7 @@ async def enqueue_download_request(payload: DownloadChainRequest) -> None:
 async def dequeue_download_request() -> Union[DownloadChainRequest, None]:
     """Get the next download request from the Redis queue."""
     client = get_queue_client()
-    config = get_config()
-    queue_names_str: str = config.download_queue_names
-
-    def _norm(name: str) -> str:
-        return name.strip().strip('"').strip("'")
-
-    queue_names: list[str] = [_norm(q) for q in queue_names_str.split(",") if _norm(q)]
-    if not queue_names:
-        queue_names = ["download_requests"]
-
-    # Block-pop from any configured queue (first available wins)
-    result = await client.brpop(queue_names, timeout=5)
+    result = await client.brpop("download_requests", timeout=5)
     if result:
         _, queue_data = result
         return DownloadChainRequest.model_validate_json(queue_data)
