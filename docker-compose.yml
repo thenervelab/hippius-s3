@@ -43,6 +43,7 @@ services:
       - GATEWAY_BACKEND_URL=http://api:8000
       - GATEWAY_PORT=8080
       - HIPPIUS_BYPASS_CREDIT_CHECK=false
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
       interval: 60s

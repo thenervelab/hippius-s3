@@ -22,6 +22,8 @@ from typing import Iterator
 import boto3  # type: ignore[import-untyped]
 import pytest
 from botocore.config import Config  # type: ignore[import-untyped]
+from botocore.exceptions import ClientError  # type: ignore[import-untyped]
+from botocore.exceptions import ReadTimeoutError  # type: ignore[import-untyped]
 
 from .support.compose import enable_ipfs_proxy
 from .support.compose import wait_for_toxiproxy
@@ -114,6 +116,9 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
 
     env = os.environ.copy()
     env["COMPOSE_PROJECT_NAME"] = compose_project_name
+    # Important: tests run on the host, but docker-compose variable interpolation uses this env dict.
+    # We want containers to talk to IPFS via toxiproxy inside the compose network, not 127.0.0.1.
+    env["HIPPIUS_IPFS_API_URLS"] = os.environ.get("HIPPIUS_IPFS_API_URLS_DOCKER", "http://toxiproxy:15001")
     project_root = str(Path(__file__).resolve().parents[2])
 
     # Ensure .e2e directories exist for volume mounts
@@ -161,6 +166,7 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
             "up",
             "-d",
             "--wait",
+                "--build",
         ]
         result = subprocess.run(up_cmd, env=env, cwd=project_root, capture_output=True, text=True)
         if result.returncode != 0:
@@ -299,6 +305,10 @@ def boto3_client(test_seed_phrase: str) -> Any:
         config=Config(
             s3={"addressing_style": "path"},
             signature_version="s3v4",
+            # E2E reads can legitimately block while the pipeline hydrates from IPFS.
+            # Use a short read timeout and retry in the test helper instead of hanging for ~60s.
+            connect_timeout=5,
+            read_timeout=5,
         ),
     )
 
@@ -321,11 +331,20 @@ def signed_http_get(boto3_client: Any) -> Any:
         params: dict[str, Any] = {"Bucket": bucket, "Key": key}
         if extra_headers and "Range" in extra_headers:
             params["Range"] = extra_headers["Range"]
-        resp = boto3_client.get_object(**params)
-        status = int(resp.get("ResponseMetadata", {}).get("HTTPStatusCode", 200))
-        headers = resp.get("ResponseMetadata", {}).get("HTTPHeaders", {})
-        body = resp["Body"].read()
-        return _Resp(status, headers, body)
+        try:
+            resp = boto3_client.get_object(**params)
+            status = int(resp.get("ResponseMetadata", {}).get("HTTPStatusCode", 200))
+            headers = resp.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+            body = resp["Body"].read()
+            return _Resp(status, headers, body)
+        except ReadTimeoutError:
+            # The gateway/API may be waiting for downloader hydration; allow caller loops to retry.
+            return _Resp(504, {}, b"")
+        except ClientError as e:
+            meta = (e.response or {}).get("ResponseMetadata", {}) if hasattr(e, "response") else {}
+            status = int(meta.get("HTTPStatusCode", 500))
+            headers = meta.get("HTTPHeaders", {}) or {}
+            return _Resp(status, headers, b"")
 
     return _get
 

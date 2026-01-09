@@ -36,8 +36,8 @@ def build_ipfs_url(cid: str, base_url: Optional[str] = None) -> str:
 def fetch_raw_cid(cid: str, *, base_url: Optional[str] = None, timeout_sec: float = 30.0) -> bytes:
     """Fetch raw bytes for a CID via the IPFS HTTP API (`/api/v0/cat`)."""
     base = _get_ipfs_api_url(base_url=base_url)
-    url = f"{base}/api/v0/cat?arg={cid}"
-    resp = requests.post(url, timeout=timeout_sec)
+    url = f"{base}/api/v0/cat"
+    resp = requests.post(url, params={"arg": cid}, timeout=timeout_sec)
     resp.raise_for_status()
     return resp.content
 
@@ -45,8 +45,8 @@ def fetch_raw_cid(cid: str, *, base_url: Optional[str] = None, timeout_sec: floa
 def ipfs_ls(cid: str, *, timeout: float = 5.0) -> dict[str, Any]:
     """Return the result of `ipfs ls` for a CID via the IPFS HTTP API."""
     base = _get_ipfs_api_url()
-    url = f"{base}/api/v0/ls?arg={cid}"
-    resp = requests.post(url, timeout=timeout)
+    url = f"{base}/api/v0/ls"
+    resp = requests.post(url, params={"arg": cid}, timeout=timeout)
     resp.raise_for_status()
     return resp.json()  # type: ignore[no-any-return]
 
