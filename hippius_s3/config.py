@@ -179,7 +179,7 @@ class Config:
     # initial stream timeout (seconds) before sending first byte
     http_stream_initial_timeout_seconds: float = env("HTTP_STREAM_INITIAL_TIMEOUT_SECONDS:5", convert=float)
 
-    httpx_ipfs_api_timeout: httpx.Timeout = httpx.Timeout(5)
+    httpx_ipfs_api_timeout: httpx.Timeout = dataclasses.field(default_factory=lambda: httpx.Timeout(5))
 
     # Download streaming prefetch window (number of chunks to fetch concurrently).
     # Helps cache-hit throughput by reducing per-chunk Redis roundtrip stalls.
