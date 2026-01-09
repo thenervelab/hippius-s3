@@ -44,8 +44,7 @@ Create a `.env` file with these critical variables:
 - `REDIS_RATE_LIMITING_URL` - Rate limit counters
 
 **IPFS**
-- `HIPPIUS_IPFS_GET_URL` - IPFS gateway for reads (e.g., http://ipfs:8080)
-- `HIPPIUS_IPFS_STORE_URL` - IPFS API for writes (e.g., http://ipfs:5001)
+- `HIPPIUS_IPFS_API_URLS` - IPFS HTTP API base URL(s) (comma-separated) for reads/writes (e.g., http://ipfs:5001 or http://ipfs1:5001,http://ipfs2:5001)
 
 **Authentication & Security**
 - `HIPPIUS_SERVICE_KEY` - API key for Hippius service (64 char hex string)

@@ -35,7 +35,7 @@ async def dump_worklist_async(args: argparse.Namespace) -> int:
     config = get_config()
     db = await asyncpg.connect(config.database_url)  # type: ignore[arg-type]
     try:
-        target = int(args.target_storage_version or getattr(config, "target_storage_version", 3))
+        target = args.target_storage_version or config.target_storage_version
         rows = await db.fetch(get_query("list_objects_to_migrate"), target, args.bucket or None, args.key or None)
         items: list[dict[str, Any]] = [
             {

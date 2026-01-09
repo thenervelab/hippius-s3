@@ -5,6 +5,7 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_BYPASS_CREDIT_CHECK=true
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
     depends_on:
       api:
         condition: service_started
@@ -20,6 +21,7 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
     depends_on:
       db:
         condition: service_healthy
@@ -48,6 +50,7 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
     volumes:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
@@ -62,6 +65,7 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
     volumes:
       - .:/app
 
@@ -71,6 +75,7 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
 
   mock-hippius-api:
     build:
@@ -86,7 +91,11 @@ services:
     networks:
       - hippius_net
     healthcheck:
-      test: ["CMD-SHELL", "python -c 'import httpx; httpx.get(\"http://localhost:8001/health\", timeout=1).raise_for_status()' || exit 1"]
+      test:
+        [
+          "CMD-SHELL",
+          'python -c ''import httpx; httpx.get("http://localhost:8001/health", timeout=1).raise_for_status()'' || exit 1',
+        ]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -106,9 +115,9 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
     volumes:
       - .:/app
-
 
   ipfs:
     user: "0:0"
@@ -179,13 +188,18 @@ services:
     image: redis:7-alpine
     ports:
       - "127.0.0.1:6382:6379"
-    command: [
-      "redis-server",
-      "--maxmemory", "2gb",
-      "--maxmemory-policy", "allkeys-lru",
-      "--appendonly", "yes",
-      "--appendfsync", "everysec"
-    ]
+    command:
+      [
+        "redis-server",
+        "--maxmemory",
+        "2gb",
+        "--maxmemory-policy",
+        "allkeys-lru",
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+      ]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

@@ -45,6 +45,16 @@ class S3Download(BaseModel):
     size_bytes: int
 
 
+def _ipfs_api_candidates() -> list[str]:
+    """
+    Return IPFS API base URLs to try, in order.
+
+    - Prefer HIPPIUS_IPFS_API_URLS (CSV) when set.
+    """
+    # Parsed/validated in Config; consumers should not re-parse env strings.
+    return list(config.ipfs_api_urls)
+
+
 async def get_encryption_key(identifier: str) -> str:
     """Get the most recent encryption key for an identifier.
 
@@ -93,17 +103,55 @@ async def get_all_encryption_keys(identifier: str) -> list[str]:
 
 async def _stream_cid(cid: str) -> AsyncIterator[bytes]:
     cid_norm = _ensure_concrete_cid(cid)
-    download_url = f"{config.ipfs_store_url.rstrip('/')}/api/v0/cat?arg={cid_norm}"
+    candidates = _ipfs_api_candidates()
+    if not candidates:
+        raise RuntimeError("No IPFS API URL configured (HIPPIUS_IPFS_API_URLS)")
 
+    last_err: Exception | None = None
+    yielded_any = False
     async with httpx.AsyncClient(timeout=config.httpx_ipfs_api_timeout) as client:  # noqa: SIM117
-        async with client.stream(
-            "POST",
-            download_url,
-        ) as response:
-            response.raise_for_status()
+        for idx, base in enumerate(candidates, 1):
+            download_url = f"{base}/api/v0/cat"
+            try:
+                logger.debug(
+                    "IPFS cat attempt %s/%s cid=%s base=%s",
+                    idx,
+                    len(candidates),
+                    cid_norm,
+                    base,
+                )
+                async with client.stream("POST", download_url, params={"arg": cid_norm}) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes(chunk_size=8192):
+                        yielded_any = True
+                        yield chunk
+                return
+            except Exception as e:
+                last_err = e
+                if yielded_any:
+                    # Correctness: once we've yielded any bytes, we must not fail over to another node,
+                    # otherwise the consumer will see duplicated/restarted stream content.
+                    logger.error(
+                        "IPFS cat failed after yielding bytes (no failover) cid=%s base=%s err=%s",
+                        cid_norm,
+                        base,
+                        repr(e),
+                    )
+                    raise
 
-            async for chunk in response.aiter_bytes(chunk_size=8192):
-                yield chunk
+                # Safe to fail over before any bytes have been yielded.
+                logger.warning(
+                    "IPFS cat failed attempt %s/%s (will failover) cid=%s base=%s err=%s",
+                    idx,
+                    len(candidates),
+                    cid_norm,
+                    base,
+                    repr(e),
+                )
+                continue
+
+    assert last_err is not None
+    raise last_err
 
 
 async def s3_download(

@@ -513,7 +513,6 @@ async def upload_part(
                     subaccount=request.state.account.main_account,
                     subaccount_seed_phrase=request.state.seed_phrase,
                     substrate_url=config.substrate_url,
-                    ipfs_node=config.ipfs_get_url,
                     should_decrypt=True,  # v3 path will decrypt; legacy parts unaffected
                     size=int(source_obj.get("size_bytes") or 0),
                     multipart=bool((json.loads(source_obj.get("metadata") or "{}") or {}).get("multipart", False)),
@@ -528,7 +527,7 @@ async def upload_part(
                 object_version=src_ver,
                 plan=plan,
                 should_decrypt=True,
-                sleep_seconds=float(config.http_download_sleep_loop),
+                sleep_seconds=config.http_download_sleep_loop,
                 address=request.state.account.main_account,
                 bucket_name=source_bucket_name,
                 storage_version=int(source_obj.get("storage_version") or 2),

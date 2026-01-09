@@ -37,6 +37,7 @@ from typing import Any
 from typing import Dict
 from typing import List
 from typing import Tuple
+from typing import cast
 
 import boto3
 from botocore.config import Config as BotoConfig
@@ -159,15 +160,17 @@ class BenchmarkRunner:
         connect_to = getattr(self.args, "connect_timeout", 5)
         read_to = getattr(self.args, "read_timeout", 60)
         retries_max = getattr(self.args, "retries", 3)
-        cfg = client_kwargs.get("config") or BotoConfig()
-        cfg = BotoConfig(
-            signature_version=getattr(cfg, "signature_version", None),
-            s3=getattr(cfg, "s3", None),  # type: ignore
+        # Build botocore config explicitly (avoid depending on botocore stubs exposing attributes).
+        s3_cfg: Any | None = None
+        if self.args.mode == "hippius" or (self.args.endpoint_url and "hippius" in self.args.endpoint_url):
+            # botocore stubs expect an internal TypedDict; cast to Any to avoid type friction.
+            s3_cfg = cast(Any, {"addressing_style": "path"})
+        client_kwargs["config"] = BotoConfig(
+            s3=s3_cfg,
             retries={"max_attempts": retries_max, "mode": "standard"},
             connect_timeout=connect_to,
             read_timeout=read_to,
         )
-        client_kwargs["config"] = cfg
 
         client = session.client("s3", **client_kwargs)
         self._log(

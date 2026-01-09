@@ -47,7 +47,7 @@ async def decrypt_chunk_if_needed(
             # Debugging aid for key/DSN mismatches during decryption
             logger.error(
                 "decrypt_failed key_debug dsn=%s addr=%s bucket=%s object_id=%s part=%s chunk=%s storage_version=%s",
-                getattr(cfg, "encryption_database_url", ""),
+                cfg.encryption_database_url,
                 address,
                 bucket_name,
                 object_id,

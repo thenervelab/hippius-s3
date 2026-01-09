@@ -8,6 +8,7 @@ from typing import Union
 
 import redis.asyncio as async_redis
 from pydantic import BaseModel
+from pydantic import ConfigDict
 
 from hippius_s3.config import get_config
 
@@ -52,6 +53,10 @@ class PartToDownload(BaseModel):
 
 
 class RetryableRequest(BaseModel):
+    # Important: queue payloads are persisted. We must tolerate older/newer producers
+    # sending fields that this version of the code doesn't know about.
+    model_config = ConfigDict(extra="ignore")
+
     request_id: str | None = None
     attempts: int = 0
     first_enqueued_at: float | None = None
@@ -96,7 +101,6 @@ class DownloadChainRequest(RetryableRequest):
     subaccount: str
     subaccount_seed_phrase: str
     substrate_url: str
-    ipfs_node: str
     should_decrypt: bool
     size: int
     multipart: bool
