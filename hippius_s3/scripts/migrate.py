@@ -189,13 +189,11 @@ def main() -> None:
         logger.info("Skipping keystore setup as requested")
 
     # Configure IPFS if environment variables are set
-    if os.environ.get("HIPPIUS_IPFS_STORE_URL"):
-        logger.info(f"Setting IPFS store URL: {os.environ['HIPPIUS_IPFS_STORE_URL']}")
-        run_command(["hippius", "config", "set", "ipfs", "api_url", os.environ["HIPPIUS_IPFS_STORE_URL"]])
-
-    if os.environ.get("HIPPIUS_IPFS_GET_URL"):
-        logger.info(f"Setting IPFS gateway URL: {os.environ['HIPPIUS_IPFS_GET_URL']}")
-        run_command(["hippius", "config", "set", "ipfs", "gateway", os.environ["HIPPIUS_IPFS_GET_URL"]])
+    ipfs_api_urls = (os.environ.get("HIPPIUS_IPFS_API_URLS") or "").strip()
+    if ipfs_api_urls:
+        first_api_url = ipfs_api_urls.split(",", 1)[0].strip()
+        logger.info(f"Setting IPFS API URL (first of HIPPIUS_IPFS_API_URLS): {first_api_url}")
+        run_command(["hippius", "config", "set", "ipfs", "api_url", first_api_url])
 
     logger.info("Migration process completed successfully")
 

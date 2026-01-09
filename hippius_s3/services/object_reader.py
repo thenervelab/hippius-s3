@@ -243,7 +243,6 @@ async def build_stream_context(
                 subaccount=address,
                 subaccount_seed_phrase="",
                 substrate_url=cfg.substrate_url,
-                ipfs_node=cfg.ipfs_get_url,
                 should_decrypt=bool(info.get("should_decrypt")),
                 size=int(info.get("size_bytes") or 0),
                 multipart=bool(info.get("multipart")),

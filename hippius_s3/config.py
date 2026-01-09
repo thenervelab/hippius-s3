@@ -30,8 +30,9 @@ class Config:
     encryption_database_url: str = env("HIPPIUS_KEYSTORE_DATABASE_URL:", convert=str)
 
     # IPFS Configuration
-    ipfs_get_url: str = env("HIPPIUS_IPFS_GET_URL")
-    ipfs_store_url: str = env("HIPPIUS_IPFS_STORE_URL")
+    # Preferred naming: comma-separated IPFS HTTP API base URLs used for reads/writes (`/api/v0/*`).
+    # Example: http://ipfs1:5001,http://ipfs2:5001
+    ipfs_api_urls: str = env("HIPPIUS_IPFS_API_URLS", convert=str)
 
     # Security
     frontend_hmac_secret: str = env("FRONTEND_HMAC_SECRET")

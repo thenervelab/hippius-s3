@@ -9,42 +9,43 @@ from typing import Optional
 import requests  # type: ignore[import-untyped]
 
 
-def build_ipfs_url(cid: str, base_url: Optional[str] = None) -> str:
-    print(f"DEBUG: build_ipfs_url: cid={cid}, base_url={base_url}")
-    base = (
-        base_url.strip()
-        if base_url and base_url.strip()
-        else os.environ.get("HIPPIUS_IPFS_GET_URL", "http://127.0.0.1:8081").strip()
-    )
-    base = base.rstrip("/")
+def _get_ipfs_api_url(base_url: Optional[str] = None) -> str:
+    """
+    Return a single IPFS API base URL for tests.
 
-    print(f"DEBUG: build_ipfs_url: base={base}")
-    if not base.endswith("/ipfs"):
-        base = f"{base}/ipfs"
-    print(f"DEBUG: build_ipfs_url: final={base}/{cid}")
-    return f"{base}/{cid}"
+    Tests should use the IPFS HTTP API (not the gateway) to align with backend behavior.
+    We pick the first entry from HIPPIUS_IPFS_API_URLS.
+    """
+    if base_url and base_url.strip():
+        return base_url.strip().rstrip("/")
+    urls = (os.environ.get("HIPPIUS_IPFS_API_URLS") or "").strip()
+    if not urls:
+        # Match prior local-dev defaults.
+        return "http://127.0.0.1:5001"
+    first = urls.split(",", 1)[0].strip()
+    return first.rstrip("/")
+
+
+def build_ipfs_url(cid: str, base_url: Optional[str] = None) -> str:
+    # Kept for compatibility with any older tests that expect a helper returning a CID fetch URL.
+    # Note: this now returns an IPFS *API* `cat` URL (not a gateway `/ipfs/<cid>` URL).
+    base = _get_ipfs_api_url(base_url=base_url)
+    return f"{base}/api/v0/cat?arg={cid}"
 
 
 def fetch_raw_cid(cid: str, *, base_url: Optional[str] = None, timeout_sec: float = 30.0) -> bytes:
-    """Fetch raw bytes for a CID from the configured IPFS gateway.
-
-    This performs a simple HTTP GET to the gateway and returns the body bytes.
-    """
-    url = build_ipfs_url(cid, base_url=base_url)
-    print(f"DEBUG: fetch_raw_cid: url={url}")
-    resp = requests.get(url, timeout=timeout_sec)
-    print(f"DEBUG: fetch_raw_cid: resp={resp}")
+    """Fetch raw bytes for a CID via the IPFS HTTP API (`/api/v0/cat`)."""
+    base = _get_ipfs_api_url(base_url=base_url)
+    url = f"{base}/api/v0/cat?arg={cid}"
+    resp = requests.post(url, timeout=timeout_sec)
     resp.raise_for_status()
     return resp.content
 
 
 def ipfs_ls(cid: str, *, timeout: float = 5.0) -> dict[str, Any]:
-    """Return the result of `ipfs ls` for a CID via the configured gateway.
-
-    Uses HIPPIUS_IPFS_GET_URL (defaults to http://ipfs:8080) and calls /api/v0/ls.
-    """
-    ipfs_gateway = os.environ.get("HIPPIUS_IPFS_GET_URL", "http://toxiproxy:18080")
-    url = f"{ipfs_gateway}/api/v0/ls?arg={cid}"
+    """Return the result of `ipfs ls` for a CID via the IPFS HTTP API."""
+    base = _get_ipfs_api_url()
+    url = f"{base}/api/v0/ls?arg={cid}"
     resp = requests.post(url, timeout=timeout)
     resp.raise_for_status()
     return resp.json()  # type: ignore[no-any-return]
