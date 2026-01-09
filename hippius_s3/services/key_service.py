@@ -25,7 +25,7 @@ async def get_or_create_encryption_key_bytes(
 
     # Resolve DSN strictly from application config
     cfg = get_config()
-    dsn: Optional[str] = getattr(cfg, "encryption_database_url", None)
+    dsn: Optional[str] = cfg.encryption_database_url
     if not dsn:
         raise RuntimeError("encryption_key_unavailable")
 

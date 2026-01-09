@@ -45,32 +45,14 @@ class S3Download(BaseModel):
     size_bytes: int
 
 
-def _parse_csv_urls(value: str | None) -> list[str]:
-    raw = str(value or "")
-    out: list[str] = []
-    for part in raw.split(","):
-        u = part.strip().strip('"').strip("'")
-        if not u:
-            continue
-        out.append(u.rstrip("/"))
-    # Preserve order but de-dup
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for u in out:
-        if u in seen:
-            continue
-        seen.add(u)
-        deduped.append(u)
-    return deduped
-
-
 def _ipfs_api_candidates() -> list[str]:
     """
     Return IPFS API base URLs to try, in order.
 
     - Prefer HIPPIUS_IPFS_API_URLS (CSV) when set.
     """
-    return _parse_csv_urls(getattr(config, "ipfs_api_urls", "") or "")
+    # Parsed/validated in Config; consumers should not re-parse env strings.
+    return list(config.ipfs_api_urls)
 
 
 async def get_encryption_key(identifier: str) -> str:

@@ -527,7 +527,7 @@ async def upload_part(
                 object_version=src_ver,
                 plan=plan,
                 should_decrypt=True,
-                sleep_seconds=float(config.http_download_sleep_loop),
+                sleep_seconds=config.http_download_sleep_loop,
                 address=request.state.account.main_account,
                 bucket_name=source_bucket_name,
                 storage_version=int(source_obj.get("storage_version") or 2),

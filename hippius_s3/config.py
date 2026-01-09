@@ -10,6 +10,24 @@ from hippius_s3.utils import env
 dotenv.load_dotenv()
 
 
+def _parse_csv_urls(value: str | None) -> list[str]:
+    out: list[str] = []
+    for part in str(value or "").split(","):
+        u = part.strip().strip('"').strip("'")
+        if not u:
+            continue
+        out.append(u.rstrip("/"))
+    # Preserve order but de-dup
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for u in out:
+        if u in seen:
+            continue
+        seen.add(u)
+        deduped.append(u)
+    return deduped
+
+
 def _parse_account_whitelist() -> list[str]:
     """Parse comma-separated account whitelist from environment variable."""
     import os
@@ -32,7 +50,7 @@ class Config:
     # IPFS Configuration
     # Preferred naming: comma-separated IPFS HTTP API base URLs used for reads/writes (`/api/v0/*`).
     # Example: http://ipfs1:5001,http://ipfs2:5001
-    ipfs_api_urls: str = env("HIPPIUS_IPFS_API_URLS", convert=str)
+    ipfs_api_urls: list[str] = env("HIPPIUS_IPFS_API_URLS", convert=_parse_csv_urls)
 
     # Security
     frontend_hmac_secret: str = env("FRONTEND_HMAC_SECRET")
@@ -100,14 +118,14 @@ class Config:
     api_signing_key: str = env("API_SIGNING_KEY:" + str(uuid.uuid4()))
 
     # s3 specific settings
-    max_multipart_file_size = 15 * 1024 * 1024 * 1024  # 15GB
-    max_multipart_chunk_size = 128 * 1024 * 1024  # 128 MB
+    max_multipart_file_size: int = 15 * 1024 * 1024 * 1024  # 15GB
+    max_multipart_chunk_size: int = 128 * 1024 * 1024  # 128 MB
 
     # worker specific settings
-    unpinner_sleep_loop = 5
-    downloader_sleep_loop = 0.01
-    cacher_loop_sleep = 60  # 1 minute
-    pin_checker_loop_sleep = 7200  # 2 hours
+    unpinner_sleep_loop: float = 5.0
+    downloader_sleep_loop: float = 0.01
+    cacher_loop_sleep: float = 60.0  # 1 minute
+    pin_checker_loop_sleep: float = 7200.0  # 2 hours
     orphan_checker_loop_sleep: int = env("ORPHAN_CHECKER_LOOP_SLEEP:7200", convert=int)  # 2 hours
     orphan_checker_batch_size: int = env("ORPHAN_CHECKER_BATCH_SIZE:500", convert=int)  # Files per API call
     orphan_checker_account_whitelist: list[str] = dataclasses.field(default_factory=_parse_account_whitelist)
@@ -154,14 +172,14 @@ class Config:
     crypto_suite_id: str = env("HIPPIUS_CRYPTO_SUITE_ID:hip-enc/legacy")
 
     # endpoint chunk download settings, quite aggressive
-    redis_read_chunk_timeout = 60
-    http_download_sleep_loop = 0.1
-    http_redis_get_retries = int(60 / http_download_sleep_loop)
+    redis_read_chunk_timeout: int = 60
+    http_download_sleep_loop: float = 0.1
+    http_redis_get_retries: int = int(redis_read_chunk_timeout / http_download_sleep_loop)
 
     # initial stream timeout (seconds) before sending first byte
     http_stream_initial_timeout_seconds: float = env("HTTP_STREAM_INITIAL_TIMEOUT_SECONDS:5", convert=float)
 
-    httpx_ipfs_api_timeout = httpx.Timeout(5)
+    httpx_ipfs_api_timeout: httpx.Timeout = httpx.Timeout(5)
 
     # Download streaming prefetch window (number of chunks to fetch concurrently).
     # Helps cache-hit throughput by reducing per-chunk Redis roundtrip stalls.
@@ -196,19 +214,24 @@ class Config:
 
 def get_config() -> Config:
     """Get application configuration."""
-    cfg = Config()
+    try:
+        cfg = Config()
+    except KeyError as e:
+        # env() raises KeyError for required vars without defaults (e.g. ENVIRONMENT).
+        raise ValueError(f"{e.args[0]} environment variable is required but not set or empty") from None
 
     # Validate required ENVIRONMENT variable
-    env_value = getattr(cfg, "environment", None)
-    if not env_value or not env_value.strip():
+    env_value = cfg.environment
+    if not env_value or not str(env_value).strip():
         raise ValueError("ENVIRONMENT variable is required but not set or empty")
 
-    try:
-        if not getattr(cfg, "encryption_database_url", None):
-            object.__setattr__(cfg, "encryption_database_url", cfg.database_url)
-    except Exception:
-        # Last resort: ensure a usable value
+    # Ensure a usable keystore DSN (falls back to DATABASE_URL)
+    if not cfg.encryption_database_url:
         object.__setattr__(cfg, "encryption_database_url", cfg.database_url)
+
+    # Sanity checks (avoid division-by-zero and confusing runtime behavior)
+    if cfg.http_download_sleep_loop <= 0:
+        raise ValueError("HTTP_DOWNLOAD_SLEEP_LOOP_SECONDS must be > 0")
 
     # Enforce environment constraints:
     # - Only in 'test' can enable_bypass_credit_check be True

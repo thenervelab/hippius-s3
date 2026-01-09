@@ -296,11 +296,11 @@ async def read_response(
         object_version=ctx.object_version,
         plan=ctx.plan,
         should_decrypt=ctx.should_decrypt,
-        sleep_seconds=float(cfg.http_download_sleep_loop),
+        sleep_seconds=cfg.http_download_sleep_loop,
         address=address,
         bucket_name=str(info.get("bucket_name", "")),
         storage_version=ctx.storage_version,
-        prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
+        prefetch_chunks=cfg.http_stream_prefetch_chunks,
     )
     headers = build_headers(
         info,
@@ -347,9 +347,9 @@ async def stream_object(
         object_version=ctx.object_version,
         plan=ctx.plan,
         should_decrypt=ctx.should_decrypt,
-        sleep_seconds=float(cfg.http_download_sleep_loop),
+        sleep_seconds=cfg.http_download_sleep_loop,
         address=address,
         bucket_name=str(info.get("bucket_name", "")),
         storage_version=ctx.storage_version,
-        prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
+        prefetch_chunks=cfg.http_stream_prefetch_chunks,
     )

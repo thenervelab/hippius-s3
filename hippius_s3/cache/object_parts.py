@@ -35,8 +35,13 @@ def _get_config_value(name: str, default: int) -> int:
         # Local import to avoid triggering httpx and other deps at module import time
         from hippius_s3.config import get_config  # type: ignore
 
-        value = getattr(get_config(), name, default)
-        return int(value) if isinstance(value, (int,)) else default
+        cfg = get_config()
+        if name == "object_chunk_size_bytes":
+            return cfg.object_chunk_size_bytes
+        if name == "cache_ttl_seconds":
+            return cfg.cache_ttl_seconds
+        # Unknown config keys must not be accessed dynamically.
+        return default
     except Exception:
         return default
 
