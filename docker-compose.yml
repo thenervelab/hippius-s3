@@ -83,6 +83,7 @@ services:
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/ || exit 1"]
       interval: 60s
@@ -316,6 +317,7 @@ services:
       - PYTHONUNBUFFERED=1
       - WORKER_SCRIPT=workers/run_uploader_in_loop.py
       - ENABLE_WATCHFILES=true
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
     volumes:
       - .:/app
       # Shared object parts FS store (authoritative for uploader reads)
@@ -356,6 +358,7 @@ services:
       - PYTHONUNBUFFERED=1
       - WORKER_SCRIPT=workers/run_unpinner_in_loop.py
       - ENABLE_WATCHFILES=true
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
     networks:
       - hippius_net
 
@@ -380,6 +383,7 @@ services:
       - PYTHONUNBUFFERED=1
       - WORKER_SCRIPT=workers/run_downloader_in_loop.py
       - ENABLE_WATCHFILES=true
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
     volumes:
       # Shared object parts FS store (not required for downloader, but harmless)
       - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
@@ -409,6 +413,7 @@ services:
       - PYTHONUNBUFFERED=1
       - WORKER_SCRIPT=workers/run_janitor_in_loop.py
       - ENABLE_WATCHFILES=true
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
     volumes:
       - .:/app
       - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
@@ -428,6 +433,7 @@ services:
       - PYTHONUNBUFFERED=1
       - WORKER_SCRIPT=workers/run_account_cacher_in_loop.py
       - ENABLE_WATCHFILES=true
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
     env_file:
       - .env.defaults
       - .env

@@ -20,6 +20,7 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
     depends_on:
       db:
         condition: service_healthy
@@ -48,6 +49,7 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
     volumes:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
@@ -62,6 +64,7 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
     volumes:
       - .:/app
 
@@ -71,6 +74,7 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
 
   mock-hippius-api:
     build:
@@ -106,6 +110,7 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
     volumes:
       - .:/app
 
@@ -114,6 +119,7 @@ services:
     user: "0:0"
     ports:
       - "127.0.0.1:8081:8080"
+      - "127.0.0.1:5001:5001"
     expose:
       - "4001"
       - "5001"

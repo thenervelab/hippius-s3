@@ -27,6 +27,9 @@ from .support.compose import enable_ipfs_proxy
 from .support.compose import wait_for_toxiproxy
 
 
+# Ensure required app config vars exist during collection (some modules call get_config() at import-time).
+os.environ.setdefault("HIPPIUS_IPFS_API_URLS", "http://127.0.0.1:5001")
+
 # type: ignore[import-untyped]
 # Note: event_loop fixture removed as it's not needed for synchronous tests
 
