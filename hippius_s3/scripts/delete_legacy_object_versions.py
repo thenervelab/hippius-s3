@@ -92,7 +92,7 @@ async def main_async(args: argparse.Namespace) -> int:
               AND ($3::bool OR ov.object_version <> o.current_object_version)
               AND f.has_v4
             ORDER BY b.bucket_name, o.object_key, ov.object_id, ov.object_version
-            LIMIT COALESCE($5::int, 1000000)
+            LIMIT COALESCE($4::int, 1000000)
             """,
             max_sv,
             bucket,
