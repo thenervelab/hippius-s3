@@ -144,7 +144,7 @@ async def main_async(args: argparse.Namespace, *, out_file: TextIO, output_jsonl
               cid,
               MIN(bucket_name) AS bucket_name,
               MIN(object_key) AS object_key,
-              MIN(object_id)::uuid AS object_id,
+              MIN(object_id::text) AS object_id,
               MIN(object_version)::bigint AS object_version,
               CASE
                 WHEN COUNT(DISTINCT cid_kind) > 1 THEN 'mixed'
