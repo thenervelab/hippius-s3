@@ -56,7 +56,6 @@ async def decrypt_chunk(
 
 
 async def decrypt_chunk_if_needed(
-    should_decrypt: bool,
     cbytes: bytes,
     *,
     object_id: str,
@@ -66,10 +65,9 @@ async def decrypt_chunk_if_needed(
     bucket_name: str,
     storage_version: int,
 ) -> bytes:
-    """Decrypt a chunk (Stage-1 policy: always decrypt).
+    """Decrypt a chunk (v4-only policy: always decrypt).
 
     Note: Hippius S3 only supports storage_version>=4.
-    The `should_decrypt` flag is ignored (retained for backward compatibility).
     """
     _ = require_supported_storage_version(int(storage_version))
     return await decrypt_chunk(

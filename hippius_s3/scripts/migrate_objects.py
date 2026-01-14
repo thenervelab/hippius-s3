@@ -227,7 +227,7 @@ async def migrate_one(
         object_id=object_id,
         content_type=content_type,
         metadata=metadata,
-        storage_version_target=int(config.target_storage_version),
+        storage_version_target=config.target_storage_version,
     )
 
     obj_cache = RedisObjectPartsCache(redis_client)
@@ -290,7 +290,6 @@ async def migrate_one(
                 object_id=object_id,
                 object_version=ctx.object_version,
                 plan=part_plan,
-                should_decrypt=ctx.should_decrypt,
                 sleep_seconds=float(config.http_download_sleep_loop),
                 address=address,
                 bucket_name=bucket_name,

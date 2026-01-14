@@ -33,7 +33,6 @@ class StreamContext:
     plan: list[ChunkPlanItem]
     object_version: int
     storage_version: int
-    should_decrypt: bool
     source: str
 
 
@@ -48,9 +47,7 @@ async def build_stream_context(
 ) -> StreamContext:
     cfg = get_config()
     storage_version = require_supported_storage_version(int(info["storage_version"]))
-    # Stage-1 v4-only policy: always decrypt at read time.
-    # Keep `should_decrypt` in the interface for backward compatibility, but ignore it.
-    should_decrypt = True
+    # v4-only policy: always decrypt at read time.
 
     ov = int(info.get("object_version") or info.get("current_object_version") or 1)
     parts = await read_parts_manifest(db, info["object_id"], ov)
@@ -216,9 +213,6 @@ async def build_stream_context(
                 subaccount=address,
                 subaccount_seed_phrase="",
                 substrate_url=cfg.substrate_url,
-                # Use first configured IPFS API URL as the preferred node for downloader worker
-                ipfs_node=str(cfg.ipfs_api_urls[0]) if cfg.ipfs_api_urls else "",
-                should_decrypt=should_decrypt,
                 size=int(info.get("size_bytes") or 0),
                 multipart=bool(info.get("multipart")),
                 chunks=dl_parts,
@@ -232,7 +226,6 @@ async def build_stream_context(
         plan=plan,
         object_version=object_version,
         storage_version=storage_version,
-        should_decrypt=should_decrypt,
         source=source,
     )
 
@@ -262,7 +255,6 @@ async def read_response(
         object_id=info["object_id"],
         object_version=ctx.object_version,
         plan=ctx.plan,
-        should_decrypt=ctx.should_decrypt,
         sleep_seconds=cfg.http_download_sleep_loop,
         address=address,
         bucket_name=str(info.get("bucket_name", "")),
@@ -313,7 +305,6 @@ async def stream_object(
         object_id=info["object_id"],
         object_version=ctx.object_version,
         plan=ctx.plan,
-        should_decrypt=ctx.should_decrypt,
         sleep_seconds=cfg.http_download_sleep_loop,
         address=address,
         bucket_name=str(info.get("bucket_name", "")),

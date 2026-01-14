@@ -103,10 +103,6 @@ class DownloadChainRequest(RetryableRequest):
     subaccount: str
     subaccount_seed_phrase: str
     substrate_url: str
-    ipfs_node: str
-    # Deprecated: retained for backward compatibility with older queued payloads.
-    # Chunks are fetched and stored as ciphertext; decryption happens at read time.
-    should_decrypt: bool = True
     size: int
     multipart: bool
     chunks: list[PartToDownload]
