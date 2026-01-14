@@ -269,7 +269,7 @@ async def initiate_multipart_upload(
             "",  # initial md5_hash (will be updated on completion)
             0,  # initial size_bytes (will be updated on completion)
             initiated_at,  # created_at
-            int(config.target_storage_version),
+            config.target_storage_version,
         )
 
         # Use the returned object_id (will be existing one if conflict occurred)
@@ -518,7 +518,7 @@ async def upload_part(
                 object_id=object_id_str,
                 object_version=src_ver,
                 plan=plan,
-                sleep_seconds=float(config.http_download_sleep_loop),
+                sleep_seconds=config.http_download_sleep_loop,
                 address=request.state.account.main_account,
                 bucket_name=source_bucket_name,
                 storage_version=source_storage_version,

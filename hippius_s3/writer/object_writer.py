@@ -263,7 +263,7 @@ class ObjectWriter:
 
         # Upsert DB row with final md5/size and storage version
         resolved_storage_version = int(
-            storage_version if storage_version is not None else int(self.config.target_storage_version)
+            storage_version if storage_version is not None else self.config.target_storage_version
         )
         resolved_storage_version = require_supported_storage_version(resolved_storage_version)
         with tracer.start_as_current_span(

@@ -137,7 +137,7 @@ async def handle_copy_object(
         account_address=request.state.account.main_account,
         content_type=content_type,
         metadata=metadata,
-        storage_version=int(config.target_storage_version),
+        storage_version=config.target_storage_version,
         body_iter=chunks_iter,
     )
 

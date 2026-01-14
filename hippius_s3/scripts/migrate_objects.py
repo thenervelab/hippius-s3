@@ -290,7 +290,7 @@ async def migrate_one(
                 object_id=object_id,
                 object_version=ctx.object_version,
                 plan=part_plan,
-                sleep_seconds=float(config.http_download_sleep_loop),
+                sleep_seconds=config.http_download_sleep_loop,
                 address=address,
                 bucket_name=bucket_name,
                 storage_version=ctx.storage_version,
@@ -476,7 +476,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
     initialize_queue_client(redis_queues_client)
     try:
-        target = int(config.target_storage_version)
+        target = config.target_storage_version
 
         async def _iter_targets() -> AsyncGenerator[dict[str, Any], None]:
             if work_items is not None:
