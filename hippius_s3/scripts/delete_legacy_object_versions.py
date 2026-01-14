@@ -38,6 +38,34 @@ async def main_async(args: argparse.Namespace) -> int:
         # - For objects with NO v4+ versions, deleting their only legacy version directly will usually fail
         #   because objects.current_object_version references object_versions (RESTRICT).
         #   To delete "legacy-only objects", we delete the *object row* instead (cascades to versions/parts).
+        #
+        # NOTE: legacy-only objects must be detected independently from the candidate rowset:
+        # when include_current=False (default), current legacy versions are excluded from rows,
+        # which would incorrectly undercount legacy-only objects.
+
+        legacy_only_objects_count: int = 0
+        if include_objects_without_v4:
+            legacy_only_objects_count = await db.fetchval(
+                """
+                SELECT COUNT(*)::bigint
+                FROM objects o
+                JOIN buckets b ON b.bucket_id = o.bucket_id
+                WHERE ($2::text IS NULL OR b.bucket_name = $2)
+                  AND EXISTS (
+                    SELECT 1 FROM object_versions ov
+                    WHERE ov.object_id = o.object_id
+                      AND ov.storage_version <= $1
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM object_versions ov
+                    WHERE ov.object_id = o.object_id
+                      AND ov.storage_version >= 4
+                  )
+                """,
+                max_sv,
+                bucket,
+            )
+
         rows = await db.fetch(
             """
             WITH obj_flags AS (
@@ -62,22 +90,15 @@ async def main_async(args: argparse.Namespace) -> int:
             WHERE ov.storage_version <= $1
               AND ($2::text IS NULL OR b.bucket_name = $2)
               AND ($3::bool OR ov.object_version <> o.current_object_version)
-              AND ($4::bool OR f.has_v4)
+              AND f.has_v4
             ORDER BY b.bucket_name, o.object_key, ov.object_id, ov.object_version
             LIMIT COALESCE($5::int, 1000000)
             """,
             max_sv,
             bucket,
             include_current,
-            include_objects_without_v4,
             (args.limit if args.limit and args.limit > 0 else None),
         )
-
-        # Identify legacy-only objects (no v4+ versions). If include_objects_without_v4 is set,
-        # we will delete these objects (not individual versions) to bypass the current-version FK.
-        legacy_only_object_ids: set[str] = set()
-        if include_objects_without_v4:
-            legacy_only_object_ids = {str(r["object_id"]) for r in rows if not bool(r["has_v4"])}
 
         candidates: list[DeleteCandidate] = [
             DeleteCandidate(
@@ -96,7 +117,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 json.dumps(
                     {
                         "candidates": len(candidates),
-                        "legacy_only_objects": len(legacy_only_object_ids),
+                        "legacy_only_objects": int(legacy_only_objects_count or 0),
                         "max_storage_version": max_sv,
                         "include_current": include_current,
                         "include_objects_without_v4": include_objects_without_v4,
@@ -131,10 +152,29 @@ async def main_async(args: argparse.Namespace) -> int:
 
         # 1) If requested, delete legacy-only objects entirely (cascades to versions/parts).
         # This is the only reliable way to delete an object whose current version is legacy.
-        if legacy_only_object_ids:
-            for oid in sorted(legacy_only_object_ids):
-                await db.execute("DELETE FROM objects WHERE object_id = $1::uuid", oid)
-                deleted_objects += 1
+        if include_objects_without_v4:
+            r0 = await db.execute(
+                """
+                DELETE FROM objects o
+                USING buckets b
+                WHERE b.bucket_id = o.bucket_id
+                  AND ($2::text IS NULL OR b.bucket_name = $2)
+                  AND EXISTS (
+                    SELECT 1 FROM object_versions ov
+                    WHERE ov.object_id = o.object_id
+                      AND ov.storage_version <= $1
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM object_versions ov
+                    WHERE ov.object_id = o.object_id
+                      AND ov.storage_version >= 4
+                  )
+                """,
+                max_sv,
+                bucket,
+            )
+            with suppress(Exception):
+                deleted_objects += int(str(r0).split()[-1])
 
         # Deleting object_versions will cascade-delete parts and part_chunks due to FKs:
         # - parts_object_version_fk ON DELETE CASCADE
@@ -143,9 +183,6 @@ async def main_async(args: argparse.Namespace) -> int:
         # NOTE: objects_current_version_fk is ON DELETE RESTRICT, so deleting current versions
         # requires first moving current_object_version (not handled here; use --include-current only knowingly).
         for c in candidates:
-            # Skip versions for objects we deleted above.
-            if c.object_id in legacy_only_object_ids:
-                continue
             if c.is_current and not include_current:
                 # Defensive: avoid surprising failures unless user explicitly asked.
                 continue
