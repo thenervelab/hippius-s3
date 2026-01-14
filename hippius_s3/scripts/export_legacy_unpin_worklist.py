@@ -60,8 +60,7 @@ async def main_async(args: argparse.Namespace, *, out_file: TextIO, output_jsonl
         include_current = bool(args.include_current)
         bucket = args.bucket or None
 
-        query = (
-            """
+        query = """
             WITH target_versions AS (
               SELECT
                 b.main_account_id,
@@ -135,8 +134,7 @@ async def main_async(args: argparse.Namespace, *, out_file: TextIO, output_jsonl
               SELECT * FROM chunk_cids
             ) all_cids
             ORDER BY bucket_name, object_key, object_id, object_version
-            """,
-        )
+            """
 
         # Stream rows to avoid loading huge datasets into memory.
         # Dedup on (address, cid) to avoid spamming unpin for the same account/CID pair.
