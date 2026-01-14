@@ -60,6 +60,8 @@ async def main_async(args: argparse.Namespace, *, out_file: TextIO, output_jsonl
         include_current = bool(args.include_current)
         bucket = args.bucket or None
 
+        # IMPORTANT: We intentionally dedupe in SQL (GROUP BY main_account_id, cid) to avoid
+        # unbounded Python memory usage on large datasets.
         query = """
             WITH target_versions AS (
               SELECT
@@ -124,21 +126,37 @@ async def main_async(args: argparse.Namespace, *, out_file: TextIO, output_jsonl
                AND p.object_version = tv.object_version
               JOIN part_chunks pc
                 ON pc.part_id = p.part_id
-            )
-            SELECT *
-            FROM (
+            ),
+            all_cids AS (
+              SELECT *
+              FROM (
               SELECT * FROM object_cids
               UNION ALL
               SELECT * FROM part_cids
               UNION ALL
               SELECT * FROM chunk_cids
-            ) all_cids
-            ORDER BY bucket_name, object_key, object_id, object_version
+              ) u
+              WHERE cid IS NOT NULL
+                AND LOWER(TRIM(cid)) NOT IN ('', 'none', 'pending')
+            )
+            SELECT
+              main_account_id,
+              cid,
+              MIN(bucket_name) AS bucket_name,
+              MIN(object_key) AS object_key,
+              MIN(object_id)::uuid AS object_id,
+              MIN(object_version)::bigint AS object_version,
+              CASE
+                WHEN COUNT(DISTINCT cid_kind) > 1 THEN 'mixed'
+                ELSE MIN(cid_kind)
+              END AS cid_kind,
+              MIN(part_number) AS part_number,
+              MIN(chunk_index) AS chunk_index
+            FROM all_cids
+            GROUP BY main_account_id, cid
             """
 
         # Stream rows to avoid loading huge datasets into memory.
-        # Dedup on (address, cid) to avoid spamming unpin for the same account/CID pair.
-        seen: set[tuple[str, str]] = set()
         selected_cid_rows = 0
         skipped_no_cid = 0
         unpin_items = 0
@@ -146,36 +164,32 @@ async def main_async(args: argparse.Namespace, *, out_file: TextIO, output_jsonl
 
         limit = int(args.limit or 0)
 
-        async for r in db.cursor(query, max_sv, bucket, include_current):
-            selected_cid_rows += 1
-            if limit > 0 and selected_cid_rows > limit:
-                break
+        async with db.transaction():
+            async for r in db.cursor(query, max_sv, bucket, include_current):
+                selected_cid_rows += 1
+                if limit > 0 and selected_cid_rows > limit:
+                    break
 
-            cid = _norm_cid(r["cid"])
-            if not cid:
-                skipped_no_cid += 1
-                continue
+                cid = _norm_cid(r["cid"])
+                if not cid:
+                    skipped_no_cid += 1
+                    continue
 
-            unpin_items += 1
-            address = str(r["main_account_id"])
-            key = (address, cid)
-            if key in seen:
-                continue
-            seen.add(key)
-            unpin_items_deduped += 1
+                unpin_items += 1
+                unpin_items_deduped += 1
 
-            it = UnpinWorkItem(
-                address=address,
-                bucket_name=str(r["bucket_name"]),
-                object_key=str(r["object_key"]),
-                object_id=str(r["object_id"]),
-                object_version=int(r["object_version"]),
-                cid=cid,
-                cid_kind=str(r["cid_kind"]),
-                part_number=(int(r["part_number"]) if r["part_number"] is not None else None),
-                chunk_index=(int(r["chunk_index"]) if r["chunk_index"] is not None else None),
-            )
-            out_file.write(json.dumps(it.to_debug_dict(), sort_keys=True) + "\n")
+                it = UnpinWorkItem(
+                    address=str(r["main_account_id"]),
+                    bucket_name=str(r["bucket_name"]),
+                    object_key=str(r["object_key"]),
+                    object_id=str(r["object_id"]),
+                    object_version=int(r["object_version"]),
+                    cid=cid,
+                    cid_kind=str(r["cid_kind"]),
+                    part_number=(int(r["part_number"]) if r["part_number"] is not None else None),
+                    chunk_index=(int(r["chunk_index"]) if r["chunk_index"] is not None else None),
+                )
+                out_file.write(json.dumps(it.to_debug_dict(), sort_keys=True) + "\n")
 
         print(
             json.dumps(
