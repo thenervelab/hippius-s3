@@ -78,9 +78,9 @@ services:
     volumes:
       - .:/app
       # Shared object parts FS store (write-through cache)
-      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
+      - /cache/hippius/object_cache:/var/lib/hippius/object_cache
       # General persistent storage (worklists, checkpoints, misc state)
-      - /var/lib/hippius/persist:/var/lib/hippius/persist
+      - /cache/hippius/persist:/var/lib/hippius/persist
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
@@ -322,7 +322,7 @@ services:
     volumes:
       - .:/app
       # Shared object parts FS store (authoritative for uploader reads)
-      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
+      - /cache/hippius/object_cache:/var/lib/hippius/object_cache
     healthcheck:
       test: ["CMD-SHELL", "exit 0"]
       interval: 5s
@@ -387,7 +387,7 @@ services:
       - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
     volumes:
       # Shared object parts FS store (not required for downloader, but harmless)
-      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
+      - /cache/hippius/object_cache:/var/lib/hippius/object_cache
     healthcheck:
       test: [ "CMD-SHELL", "exit 0" ]
       interval: 5s
@@ -417,7 +417,7 @@ services:
       - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
     volumes:
       - .:/app
-      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
+      - /cache/hippius/object_cache:/var/lib/hippius/object_cache
     networks:
       - hippius_net
 
