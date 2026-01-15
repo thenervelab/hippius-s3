@@ -282,8 +282,10 @@ async def cleanup_uploaded_chunks(
         FROM part_chunks pc
         JOIN parts p ON pc.part_id = p.part_id
         WHERE
-            pc.storage_backends_uploaded >= $1
-            OR pc.created_at < NOW() - INTERVAL '7 days'
+            (pc.storage_backends_uploaded >= $1
+            OR pc.created_at < NOW() - INTERVAL '7 days')
+            AND p.object_id IS NOT NULL
+            AND p.object_version IS NOT NULL
         ORDER BY pc.created_at ASC
         LIMIT 10000
         """,
