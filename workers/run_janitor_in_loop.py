@@ -379,7 +379,7 @@ async def run_janitor_loop():
     logger.info(f"FS GC max age: {config.fs_cache_gc_max_age_seconds}s")
 
     # Run immediately on start, then periodically
-    sleep_interval = 3600  # 1 hour
+    sleep_interval = 600  # 10m
 
     try:
         while True:
