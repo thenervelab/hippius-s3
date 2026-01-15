@@ -321,6 +321,17 @@ class Uploader:
                         piece_file_id,
                     )
 
+                    # Increment storage backend counter after successful upload
+                    backend_count = await conn.fetchval(
+                        get_query("increment_chunk_backend_count"),
+                        part_id,
+                        int(ci),
+                    )
+                    logger.debug(
+                        f"Incremented backend count to {backend_count}: "
+                        f"object_id={object_id} part={part_number} chunk={ci}"
+                    )
+
             # Set parts.ipfs_cid to first chunk CID for manifest compatibility
             first_chunk_cid = all_chunk_cids[0] if all_chunk_cids else ""
             async with self._acquire_conn() as conn:
