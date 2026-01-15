@@ -322,11 +322,27 @@ async def cleanup_uploaded_chunks(
         chunk_file = part_dir / f"chunk_{chunk_index}.bin"
 
         if not chunk_file.exists():
+            await db.execute(
+                "DELETE FROM part_chunks WHERE part_id = $1 AND chunk_index = $2",
+                row["part_id"],
+                chunk_index,
+            )
+            logger.debug(
+                f"Deleted orphaned part_chunks row (file not found): {object_id} v={object_version} "
+                f"part={part_number} chunk={chunk_index}"
+            )
             continue
 
         try:
             chunk_file.unlink()
             chunks_cleaned += 1
+
+            await db.execute(
+                "DELETE FROM part_chunks WHERE part_id = $1 AND chunk_index = $2",
+                row["part_id"],
+                chunk_index,
+            )
+
             logger.info(
                 f"Cleaned chunk: {object_id} v={object_version} part={part_number} "
                 f"chunk={chunk_index} backends={backends_count}"
