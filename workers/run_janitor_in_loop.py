@@ -255,7 +255,7 @@ async def cleanup_uploaded_chunks(
     """Clean up chunks based on storage backend upload status.
 
     Deletion criteria:
-    - storage_backends_uploaded >= 2 (replicated to multiple backends), OR
+    - storage_backends_uploaded >= total_number_of_storage_backends (fully replicated), OR
     - age > 7 days AND not in DLQ
 
     Deletes individual chunk_X.bin files, prunes empty directories.
@@ -282,11 +282,12 @@ async def cleanup_uploaded_chunks(
         FROM part_chunks pc
         JOIN parts p ON pc.part_id = p.part_id
         WHERE
-            pc.storage_backends_uploaded >= 2
+            pc.storage_backends_uploaded >= $1
             OR pc.created_at < NOW() - INTERVAL '7 days'
         ORDER BY pc.created_at ASC
         LIMIT 10000
-        """
+        """,
+        config.total_number_of_storage_backends,
     )
 
     if not rows:
