@@ -298,6 +298,9 @@ async def cleanup_uploaded_chunks(
 
     for row in rows:
         object_id = str(row["object_id"])
+        if row["object_version"] is None:
+            logger.warning(f"Skipping chunk with NULL object_version: object_id={object_id}")
+            continue
         object_version = int(row["object_version"])
         part_number = int(row["part_number"])
         chunk_index = int(row["chunk_index"])
