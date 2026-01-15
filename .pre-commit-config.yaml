@@ -35,7 +35,9 @@ repos:
         stages: [pre-commit]
         pass_filenames: false
         additional_dependencies:
+          - click
           - fastapi
+          - rich
           - starlette
           - python-dotenv
           - pyinstrument
