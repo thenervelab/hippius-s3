@@ -193,6 +193,7 @@ class Config:
     object_cache_dir: str = env("HIPPIUS_OBJECT_CACHE_DIR:/var/lib/hippius/object_cache")
     fs_cache_gc_max_age_seconds: int = env("HIPPIUS_FS_CACHE_GC_MAX_AGE_SECONDS:604800", convert=int)  # 7 days
     mpu_stale_seconds: int = env("HIPPIUS_MPU_STALE_SECONDS:86400", convert=int)  # 1 day
+    total_number_of_storage_backends: int = env("HIPPIUS_TOTAL_NUMBER_OF_STORAGE_BACKENDS:2", convert=int)
 
     # IPFS upload/pin retry settings
     ipfs_max_retries: int = env("HIPPIUS_IPFS_MAX_RETRIES:3", convert=int)

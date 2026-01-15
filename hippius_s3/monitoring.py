@@ -309,6 +309,28 @@ class MetricsCollector:
             description="Database connection pool used connections",
         )
 
+        self.performance_index = self.meter.create_histogram(
+            name="hippius_performance_index",
+            description="Normalized performance index score (0-100)",
+            unit="1",
+        )
+
+        self.throughput_mbps = self.meter.create_histogram(
+            name="hippius_throughput_mbps",
+            description="Data transfer throughput in MB/s",
+            unit="MB/s",
+        )
+
+        self.overhead_ms = self.meter.create_histogram(
+            name="hippius_overhead_ms",
+            description="Fixed overhead latency in milliseconds",
+            unit="ms",
+        )
+
+        logger.info(
+            "Performance metrics histograms created: hippius_performance_index, hippius_throughput_mbps, hippius_overhead_ms"
+        )
+
     def _obs_redis_used_mem(self, _: object) -> list[metrics.Observation]:
         return [metrics.Observation(self._used_mem, {})]
 
@@ -686,6 +708,23 @@ class MetricsCollector:
     ) -> None:
         pass
 
+    def record_performance_metrics(
+        self,
+        operation: str,
+        bucket: str,
+        performance_index: float,
+        throughput_mbps: float,
+        overhead_ms: float,
+    ) -> None:
+        attributes = {"operation": operation, "bucket": bucket}
+        self.performance_index.record(performance_index, attributes=attributes)
+        self.throughput_mbps.record(throughput_mbps, attributes=attributes)
+        self.overhead_ms.record(overhead_ms, attributes=attributes)
+        logger.info(
+            f"PERF_METRICS: operation={operation}, bucket={bucket}, "
+            f"index={performance_index:.2f}, throughput={throughput_mbps:.2f}MB/s, overhead={overhead_ms:.2f}ms"
+        )
+
 
 class NullMetricsCollector:
     def __init__(self) -> None:
@@ -741,6 +780,9 @@ class NullMetricsCollector:
         pass
 
     def record_orphan_checker_operation(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_performance_metrics(self, *args: object, **kwargs: object) -> None:
         pass
 
 
