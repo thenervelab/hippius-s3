@@ -1,3 +1,4 @@
+import time
 from typing import Awaitable
 from typing import Callable
 
@@ -29,6 +30,7 @@ async def ray_id_middleware(
     ray_id_context.set(ray_id)
     request.state.ray_id = ray_id
     request.state.logger = get_logger_with_ray_id(__name__, ray_id)
+    request.state.gateway_start_time = time.time()
 
     response = await call_next(request)
 

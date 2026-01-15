@@ -247,6 +247,115 @@ async def cleanup_old_parts_by_mtime(fs_store: FileSystemPartsStore, redis_clien
     return parts_cleaned
 
 
+async def cleanup_uploaded_chunks(
+    db: asyncpg.Connection,
+    fs_store: FileSystemPartsStore,
+    redis_client: async_redis.Redis,
+) -> int:
+    """Clean up chunks based on storage backend upload status.
+
+    Deletion criteria:
+    - storage_backends_uploaded >= total_number_of_storage_backends (fully replicated), OR
+    - age > 7 days AND not in DLQ
+
+    Deletes individual chunk_X.bin files, prunes empty directories.
+    """
+    logger.info("Starting uploaded chunks cleanup...")
+
+    dlq_object_ids = await get_all_dlq_object_ids(redis_client)
+    if dlq_object_ids:
+        logger.info(f"Protecting {len(dlq_object_ids)} DLQ objects")
+
+    chunks_cleaned = 0
+
+    # Query chunks eligible for cleanup
+    rows = await db.fetch(
+        """
+        SELECT
+            pc.part_id,
+            pc.chunk_index,
+            p.object_id,
+            p.object_version,
+            p.part_number,
+            pc.storage_backends_uploaded,
+            pc.created_at
+        FROM part_chunks pc
+        JOIN parts p ON pc.part_id = p.part_id
+        WHERE
+            pc.storage_backends_uploaded >= $1
+            OR pc.created_at < NOW() - INTERVAL '7 days'
+        ORDER BY pc.created_at ASC
+        LIMIT 10000
+        """,
+        config.total_number_of_storage_backends,
+    )
+
+    if not rows:
+        logger.info("No uploaded chunks eligible for cleanup")
+        return 0
+
+    logger.info(f"Found {len(rows)} chunks eligible for cleanup")
+
+    for row in rows:
+        object_id = str(row["object_id"])
+        object_version = int(row["object_version"])
+        part_number = int(row["part_number"])
+        chunk_index = int(row["chunk_index"])
+        backends_count = int(row["storage_backends_uploaded"])
+
+        # Skip if object is in DLQ
+        if object_id in dlq_object_ids:
+            logger.debug(
+                f"Skipping DLQ-protected chunk: {object_id} v={object_version} part={part_number} chunk={chunk_index}"
+            )
+            continue
+
+        # Delete individual chunk file
+        part_dir = Path(fs_store.part_path(object_id, object_version, part_number))
+        chunk_file = part_dir / f"chunk_{chunk_index}.bin"
+
+        if not chunk_file.exists():
+            continue
+
+        try:
+            chunk_file.unlink()
+            chunks_cleaned += 1
+            logger.info(
+                f"Cleaned chunk: {object_id} v={object_version} part={part_number} "
+                f"chunk={chunk_index} backends={backends_count}"
+            )
+
+            # Prune empty directories after all chunks deleted
+            remaining_chunks = list(part_dir.glob("chunk_*.bin"))
+            if not remaining_chunks:
+                meta_file = part_dir / "meta.json"
+                if meta_file.exists():
+                    meta_file.unlink()
+
+                try:
+                    part_dir.rmdir()
+                    logger.info(f"Removed empty part directory: {part_dir}")
+
+                    # Prune parent directories
+                    version_dir = part_dir.parent
+                    if version_dir.exists() and not list(version_dir.iterdir()):
+                        version_dir.rmdir()
+
+                        object_dir = version_dir.parent
+                        if object_dir.exists() and not list(object_dir.iterdir()):
+                            object_dir.rmdir()
+                except OSError:
+                    pass  # Directory not empty or race condition
+
+        except Exception as e:
+            logger.warning(
+                f"Failed to clean chunk {object_id} v={object_version} part={part_number} chunk={chunk_index}: {e}"
+            )
+
+    logger.info(f"Cleaned {chunks_cleaned} uploaded chunks")
+    return chunks_cleaned
+
+
 async def run_janitor_loop():
     """Main janitor loop: periodically clean stale and old parts."""
     db = await asyncpg.connect(config.database_url)
@@ -274,13 +383,16 @@ async def run_janitor_loop():
             try:
                 logger.info("Janitor cycle starting...")
 
-                # Phase 1: Clean stale MPU parts
+                # Phase 1: Clean uploaded chunks (primary cleanup path)
+                uploaded_count = await cleanup_uploaded_chunks(db, fs_store, redis_client)
+
+                # Phase 2: Clean stale MPU parts (aborted uploads)
                 stale_count = await cleanup_stale_parts(db, fs_store, redis_client)
 
-                # Phase 2: GC old parts by mtime (backup safety net)
+                # Phase 3: GC old parts by mtime (safety net for pre-migration chunks)
                 gc_count = await cleanup_old_parts_by_mtime(fs_store, redis_client)
 
-                logger.info(f"Janitor cycle complete: stale={stale_count} gc={gc_count}")
+                logger.info(f"Janitor cycle complete: uploaded={uploaded_count} stale={stale_count} gc={gc_count}")
 
             except Exception as e:
                 logger.error(f"Janitor cycle error: {e}", exc_info=True)
