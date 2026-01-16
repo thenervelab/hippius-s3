@@ -9,6 +9,7 @@ incomplete uploads that were never finalized or cleaned up.
 import asyncio
 import json
 import logging
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -157,7 +158,51 @@ async def cleanup_stale_parts(
     return parts_cleaned
 
 
-async def cleanup_old_parts_by_mtime(fs_store: FileSystemPartsStore, redis_client: async_redis.Redis) -> int:
+async def is_replicated_on_all_backends(
+    db: asyncpg.Connection,
+    object_id: str,
+    object_version: int,
+    part_number: int,
+) -> bool:
+    """Check if all chunks for a given part are replicated on all backends.
+
+    Args:
+        db: Database connection
+        object_id: Object UUID
+        object_version: Object version number
+        part_number: Part number
+
+    Returns:
+        True if ALL chunks have storage_backends_uploaded >= total_number_of_storage_backends,
+        False otherwise (including if no chunks exist)
+    """
+    result = await db.fetchrow(
+        """
+        SELECT COUNT(*) as total_chunks,
+               COUNT(*) FILTER (WHERE pc.storage_backends_uploaded >= $4) as replicated_chunks
+        FROM part_chunks pc
+        JOIN parts p ON pc.part_id = p.part_id
+        WHERE p.object_id = $1
+          AND p.object_version = $2
+          AND p.part_number = $3
+        """,
+        object_id,
+        object_version,
+        part_number,
+        config.total_number_of_storage_backends,
+    )
+
+    if not result or result["total_chunks"] == 0:
+        return False
+
+    return result["total_chunks"] == result["replicated_chunks"]
+
+
+async def cleanup_old_parts_by_mtime(
+    db: asyncpg.Connection,
+    fs_store: FileSystemPartsStore,
+    redis_client: async_redis.Redis,
+) -> int:
     """Clean up old parts from FS based on modification time (backup GC).
 
     This is a safety net to remove orphaned parts that weren't caught by the
@@ -193,14 +238,29 @@ async def cleanup_old_parts_by_mtime(fs_store: FileSystemPartsStore, redis_clien
 
         object_id = object_dir.name
 
+        # Skip deletion if object is in DLQ
+        if object_id in dlq_object_ids:
+            logger.debug(f"Skipping DLQ-protected {object_id=}")
+            continue
+
         for version_dir in object_dir.iterdir():
             if not version_dir.is_dir() or not version_dir.name.startswith("v"):
+                continue
+
+            try:
+                object_version = int(version_dir.name[1:])
+            except (ValueError, IndexError):
                 continue
 
             for part_dir in version_dir.iterdir():
                 if not part_dir.is_dir() or not part_dir.name.startswith("part_"):
                     continue
                 parts_seen += 1
+
+                try:
+                    part_number = int(part_dir.name.split("_")[1])
+                except (ValueError, IndexError):
+                    continue
 
                 # Check mtime of meta.json (if present) or the directory itself
                 meta_file = part_dir / "meta.json"
@@ -210,18 +270,22 @@ async def cleanup_old_parts_by_mtime(fs_store: FileSystemPartsStore, redis_clien
                     mtime = check_path.stat().st_mtime
                     if oldest_mtime is None or mtime < oldest_mtime:
                         oldest_mtime = mtime
-                    if mtime < cutoff_time:
-                        # Skip deletion if object is in DLQ
-                        if object_id in dlq_object_ids:
-                            logger.debug(f"Skipping DLQ-protected part (GC): {part_dir}")
-                            continue
 
-                        # Old enough to clean
-                        import shutil
+                    old_enough = mtime < cutoff_time
+                    fully_replicated = await is_replicated_on_all_backends(
+                        db,
+                        object_id,
+                        object_version,
+                        part_number,
+                    )
 
+                    if old_enough or fully_replicated:
                         shutil.rmtree(part_dir)
                         parts_cleaned += 1
-                        logger.info(f"GC cleaned old part: {part_dir} (mtime age={(time.time() - mtime) / 3600:.1f}h)")
+                        age = (time.time() - mtime) / 3600
+                        logger.info(
+                            f"GC cleaned part: {part_dir} {old_enough=} {fully_replicated=} (mtime {age=:.1f}h)"
+                        )
 
                         # Try to prune empty parents
                         try:
@@ -243,120 +307,8 @@ async def cleanup_old_parts_by_mtime(fs_store: FileSystemPartsStore, redis_clien
     except Exception:
         logger.debug("Failed to record FS metrics", exc_info=True)
 
-    logger.info(f"GC cleaned {parts_cleaned} orphaned parts by mtime")
+    logger.info(f"GC cleaned {parts_cleaned=}")
     return parts_cleaned
-
-
-async def cleanup_uploaded_chunks(
-    db: asyncpg.Connection,
-    fs_store: FileSystemPartsStore,
-    redis_client: async_redis.Redis,
-) -> int:
-    """Clean up chunks based on storage backend upload status.
-
-    Deletion criteria:
-    - storage_backends_uploaded >= total_number_of_storage_backends (fully replicated), OR
-    - age > 7 days AND not in DLQ
-
-    Deletes individual chunk_X.bin files, prunes empty directories.
-    """
-    logger.info("Starting uploaded chunks cleanup...")
-
-    dlq_object_ids = await get_all_dlq_object_ids(redis_client)
-    if dlq_object_ids:
-        logger.info(f"Protecting {len(dlq_object_ids)} DLQ objects")
-
-    chunks_cleaned = 0
-
-    # Query chunks eligible for cleanup
-    rows = await db.fetch(
-        """
-        SELECT
-            pc.part_id,
-            pc.chunk_index,
-            p.object_id,
-            p.object_version,
-            p.part_number,
-            pc.storage_backends_uploaded,
-            pc.created_at
-        FROM part_chunks pc
-        JOIN parts p ON pc.part_id = p.part_id
-        WHERE
-            pc.storage_backends_uploaded >= $1
-            OR pc.created_at < NOW() - INTERVAL '7 days'
-        ORDER BY pc.created_at ASC
-        LIMIT 10000
-        """,
-        config.total_number_of_storage_backends,
-    )
-
-    if not rows:
-        logger.info("No uploaded chunks eligible for cleanup")
-        return 0
-
-    logger.info(f"Found {len(rows)} chunks eligible for cleanup")
-
-    for row in rows:
-        object_id = str(row["object_id"])
-        if row["object_version"] is None:
-            logger.warning(f"Skipping chunk with NULL object_version: object_id={object_id}")
-            continue
-        object_version = int(row["object_version"])
-        part_number = int(row["part_number"])
-        chunk_index = int(row["chunk_index"])
-        backends_count = int(row["storage_backends_uploaded"])
-
-        # Skip if object is in DLQ
-        if object_id in dlq_object_ids:
-            logger.debug(
-                f"Skipping DLQ-protected chunk: {object_id} v={object_version} part={part_number} chunk={chunk_index}"
-            )
-            continue
-
-        # Delete individual chunk file
-        part_dir = Path(fs_store.part_path(object_id, object_version, part_number))
-        chunk_file = part_dir / f"chunk_{chunk_index}.bin"
-
-        if not chunk_file.exists():
-            continue
-
-        try:
-            chunk_file.unlink()
-            chunks_cleaned += 1
-            logger.info(
-                f"Cleaned chunk: {object_id} v={object_version} part={part_number} "
-                f"chunk={chunk_index} backends={backends_count}"
-            )
-
-            # Prune empty directories after all chunks deleted
-            remaining_chunks = list(part_dir.glob("chunk_*.bin"))
-            if not remaining_chunks:
-                meta_file = part_dir / "meta.json"
-                if meta_file.exists():
-                    meta_file.unlink()
-
-                try:
-                    part_dir.rmdir()
-                    logger.info(f"Removed empty part directory: {part_dir}")
-
-                    # Prune parent directories
-                    version_dir = part_dir.parent
-                    if version_dir.exists() and not list(version_dir.iterdir()):
-                        version_dir.rmdir()
-
-                        object_dir = version_dir.parent
-                        if object_dir.exists() and not list(object_dir.iterdir()):
-                            object_dir.rmdir()
-                except OSError:
-                    pass  # Directory not empty or race condition
-
-        except Exception as e:
-            logger.warning(
-                f"Failed to clean chunk {object_id} v={object_version} part={part_number} chunk={chunk_index}: {e}"
-            )
-
-    logger.info(f"Cleaned {chunks_cleaned} uploaded chunks")
-    return chunks_cleaned
 
 
 async def run_janitor_loop():
@@ -379,23 +331,20 @@ async def run_janitor_loop():
     logger.info(f"FS GC max age: {config.fs_cache_gc_max_age_seconds}s")
 
     # Run immediately on start, then periodically
-    sleep_interval = 3600  # 1 hour
+    sleep_interval = 600  # 10m
 
     try:
         while True:
             try:
                 logger.info("Janitor cycle starting...")
 
-                # Phase 1: Clean uploaded chunks (primary cleanup path)
-                uploaded_count = await cleanup_uploaded_chunks(db, fs_store, redis_client)
-
-                # Phase 2: Clean stale MPU parts (aborted uploads)
+                # Phase 1: Clean stale MPU parts (aborted uploads)
                 stale_count = await cleanup_stale_parts(db, fs_store, redis_client)
 
-                # Phase 3: GC old parts by mtime (safety net for pre-migration chunks)
-                gc_count = await cleanup_old_parts_by_mtime(fs_store, redis_client)
+                # Phase 2: GC old parts by mtime (safety net for pre-migration chunks)
+                gc_count = await cleanup_old_parts_by_mtime(db, fs_store, redis_client)
 
-                logger.info(f"Janitor cycle complete: uploaded={uploaded_count} stale={stale_count} gc={gc_count}")
+                logger.info(f"Janitor cycle complete: stale={stale_count} gc={gc_count}")
 
             except Exception as e:
                 logger.error(f"Janitor cycle error: {e}", exc_info=True)

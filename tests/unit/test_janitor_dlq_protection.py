@@ -219,6 +219,10 @@ class TestJanitorDlqProtection:
         # Populate DLQ
         await populate_dlq(["obj-protected-1"])
 
+        # Create mock DB connection
+        mock_db = AsyncMock()
+        mock_db.fetchrow = AsyncMock(return_value=None)
+
         # Create mock FS store
         mock_fs_store = MagicMock(spec=FileSystemPartsStore)
         mock_root = MagicMock()
@@ -252,7 +256,7 @@ class TestJanitorDlqProtection:
 
         # Run cleanup
         with patch("run_janitor_in_loop.config", mock_config):
-            result = await cleanup_old_parts_by_mtime(mock_fs_store, redis_with_dlq)
+            result = await cleanup_old_parts_by_mtime(mock_db, mock_fs_store, redis_with_dlq)
 
         # Should be 0 because object is protected
         assert result == 0
