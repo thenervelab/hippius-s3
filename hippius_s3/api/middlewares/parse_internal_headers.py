@@ -1,6 +1,7 @@
 """Parse internal headers set by the gateway into request.state."""
 
 import logging
+import time
 from typing import Awaitable
 from typing import Callable
 
@@ -35,6 +36,12 @@ async def parse_internal_headers_middleware(
     ray_id_context.set(ray_id)
     request.state.ray_id = ray_id
     request.state.logger = get_logger_with_ray_id(__name__, ray_id)
+
+    gateway_time_ms = request.headers.get("x-hippius-gateway-time-ms")
+    if gateway_time_ms:
+        request.state.gateway_time_ms = float(gateway_time_ms)
+
+    request.state.api_start_time = time.time()
 
     request.state.request_user_id = request.headers.get("X-Hippius-Request-User", "")
     request.state.bucket_owner_id = request.headers.get("X-Hippius-Bucket-Owner", "")

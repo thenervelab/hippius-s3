@@ -4,6 +4,28 @@ include:
   - docker-compose.utilities.yml
 
 services:
+  api:
+    volumes:
+      - .:/app
+      - /cache/hippius/object_cache:/var/lib/hippius/object_cache
+      - /cache/hippius/persist:/var/lib/hippius/persist
+
+  uploader:
+    volumes:
+      - .:/app
+      - /cache/hippius/object_cache:/var/lib/hippius/object_cache
+
+  downloader:
+    volumes:
+      - /cache/hippius/object_cache:/var/lib/hippius/object_cache
+    deploy:
+      replicas: 10
+
+  janitor:
+    volumes:
+      - .:/app
+      - /cache/hippius/object_cache:/var/lib/hippius/object_cache
+
   db:
     shm_size: 2g
     command:
@@ -75,9 +97,6 @@ services:
         "no",
       ]
 
-  downloader:
-    deploy:
-      replicas: 10
 
   orphan-checker:
     build:

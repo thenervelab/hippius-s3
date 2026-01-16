@@ -1,7 +1,10 @@
 """Filesystem cleanup utilities for removing parts after successful pin confirmation.
 
-This module provides helpers to delete parts from the FS store once all their chunk
-CIDs have been confirmed pinned on substrate or IPFS.
+DEPRECATED: This module is being phased out in favor of chunk-level cleanup in janitor.
+The cleanup_pinned_object_parts() function should no longer be called from uploader.
+Cleanup is now handled by janitor based on storage_backends_uploaded counter.
+
+This module remains for backward compatibility and manual cleanup operations.
 """
 
 import logging
@@ -21,6 +24,9 @@ async def cleanup_pinned_object_parts(
 ) -> None:
     """Delete all parts for an object/version from FS after confirming all chunks are pinned.
 
+    DEPRECATED: This function should no longer be called. Cleanup is now handled by janitor
+    based on storage_backends_uploaded counter.
+
     This is called by the substrate pinner after successful pin submission and verification.
     It verifies that all chunk CIDs for all parts in the object are present in the DB
     (indicating successful upload and pinning), then deletes each part directory.
@@ -31,6 +37,10 @@ async def cleanup_pinned_object_parts(
         object_id: Object UUID
         object_version: Object version number
     """
+    logger.warning(
+        f"cleanup_pinned_object_parts() is deprecated; cleanup handled by janitor. "
+        f"object_id={object_id} v={object_version}"
+    )
     try:
         # Fetch all parts for this object/version
         rows = await db.fetch(

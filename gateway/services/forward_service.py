@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 import typing
 
 import httpx
@@ -89,6 +90,10 @@ class ForwardService:
         for key in list(headers.keys()):
             if key.lower() in ["host", "x-forwarded-for", "x-forwarded-host"]:
                 del headers[key]
+
+        if hasattr(request.state, "gateway_start_time"):
+            gateway_time_ms = (time.time() - request.state.gateway_start_time) * 1000
+            headers["X-Hippius-Gateway-Time-Ms"] = str(round(gateway_time_ms, 2))
 
         target_url = f"{self.backend_url}{request.scope['path']}"
         if request.url.query:

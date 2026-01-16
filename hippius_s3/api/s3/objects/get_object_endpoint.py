@@ -125,6 +125,7 @@ async def handle_get_object(
             )
 
         # Build manifest purely from DB parts, 0-based
+        request.state.object_size = int(object_info.get("size_bytes") or 0)
         with tracer.start_as_current_span("get_object.build_manifest") as span:
             download_chunks = json.loads(object_info["download_chunks"]) if object_info.get("download_chunks") else []
             try:

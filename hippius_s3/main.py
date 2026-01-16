@@ -14,6 +14,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from hippius_s3.api.middlewares.fs_cache_pressure import fs_cache_pressure_middleware
 from hippius_s3.api.middlewares.ip_whitelist import ip_whitelist_middleware
 from hippius_s3.api.middlewares.metrics import metrics_middleware
 from hippius_s3.api.middlewares.parse_internal_headers import parse_internal_headers_middleware
@@ -239,6 +240,7 @@ def factory() -> FastAPI:
     app.middleware("http")(tracing_middleware)
     app.middleware("http")(parse_internal_headers_middleware)
     app.middleware("http")(ip_whitelist_middleware)
+    app.middleware("http")(fs_cache_pressure_middleware)
     if config.enable_request_profiling:
         app.add_middleware(SpeedscopeProfilerMiddleware)
 
