@@ -195,6 +195,14 @@ class Config:
     mpu_stale_seconds: int = env("HIPPIUS_MPU_STALE_SECONDS:86400", convert=int)  # 1 day
     total_number_of_storage_backends: int = env("HIPPIUS_TOTAL_NUMBER_OF_STORAGE_BACKENDS:2", convert=int)
 
+    # Filesystem cache disk-pressure backoff (ingress control).
+    # Threshold can be expressed as either absolute bytes or ratio; we trigger if ANY threshold is hit.
+    fs_cache_min_free_bytes: int = env("HIPPIUS_FS_CACHE_MIN_FREE_BYTES:10737418240", convert=int)  # 10 GiB
+    fs_cache_min_free_ratio: float = env("HIPPIUS_FS_CACHE_MIN_FREE_RATIO:0.08", convert=float)  # 8%
+
+    # Retry-After (seconds) for SlowDown responses caused by disk pressure.
+    fs_cache_retry_after_seconds: float = env("HIPPIUS_FS_CACHE_RETRY_AFTER_SECONDS:2", convert=float)
+
     # IPFS upload/pin retry settings
     ipfs_max_retries: int = env("HIPPIUS_IPFS_MAX_RETRIES:3", convert=int)
     ipfs_retry_base_ms: int = env("HIPPIUS_IPFS_RETRY_BASE_MS:500", convert=int)
