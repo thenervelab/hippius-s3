@@ -22,7 +22,6 @@ async def stream_plan(
     object_id: str,
     object_version: int,
     plan: Iterable[ChunkPlanItem],
-    should_decrypt: bool,
     sleep_seconds: float,
     address: str,
     bucket_name: str,
@@ -44,7 +43,6 @@ async def stream_plan(
                 sleep_seconds=sleep_seconds,
             )
             pt = await decrypt_chunk_if_needed(
-                should_decrypt,
                 c,
                 object_id=object_id,
                 part_number=int(item.part_number),
@@ -121,7 +119,6 @@ async def stream_plan(
                 pass
 
             pt = await decrypt_chunk_if_needed(
-                should_decrypt,
                 c,
                 object_id=object_id,
                 part_number=int(item.part_number),

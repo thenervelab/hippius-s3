@@ -319,7 +319,6 @@ async def test_process_upload_no_longer_calls_pin_on_api(mock_config, mock_db_po
 
     payload = UploadChainRequest(
         substrate_url="http://test",
-        ipfs_node="http://test",
         address="user1",
         subaccount="user1",
         subaccount_seed_phrase="test-seed",

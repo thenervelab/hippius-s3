@@ -208,9 +208,6 @@ class Config:
     ipfs_retry_base_ms: int = env("HIPPIUS_IPFS_RETRY_BASE_MS:500", convert=int)
     ipfs_retry_max_ms: int = env("HIPPIUS_IPFS_RETRY_MAX_MS:5000", convert=int)
 
-    # Legacy SDK compatibility (temporary; set LEGACY_SDK_COMPAT=true to enable)
-    enable_legacy_sdk_compat: bool = env("LEGACY_SDK_COMPAT:true", convert=lambda x: x.lower() == "true")
-
     # Storage version to assign for newly created/overwritten objects
     # Defaults to 4 (latest layout)
     target_storage_version: int = env("HIPPIUS_TARGET_STORAGE_VERSION:4", convert=int)
