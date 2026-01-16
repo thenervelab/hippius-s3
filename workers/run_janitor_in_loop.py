@@ -307,7 +307,7 @@ async def cleanup_old_parts_by_mtime(
     except Exception:
         logger.debug("Failed to record FS metrics", exc_info=True)
 
-    logger.info(f"GC cleaned {parts_cleaned} orphaned parts by mtime")
+    logger.info(f"GC cleaned {parts_cleaned=}")
     return parts_cleaned
 
 
