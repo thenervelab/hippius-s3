@@ -90,7 +90,7 @@ async def handle_copy_object(
         )
 
     object_id = str(uuid.uuid4())
-    created_at = datetime.now(timezone.utc)
+    copy_created_at = datetime.now(timezone.utc)
 
     # Prefer reader service to manage readiness and cache hydration
     # Resolve source object via repository (avoid reader shim)
@@ -258,7 +258,7 @@ async def handle_copy_object(
                 etag = ET.SubElement(root, "ETag")
                 etag.text = md5_hash or ""
                 last_modified = ET.SubElement(root, "LastModified")
-                last_modified.text = created_at.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                last_modified.text = copy_created_at.strftime("%Y-%m-%dT%H:%M:%S.000Z")
                 xml_response = ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
                 return Response(
@@ -320,7 +320,7 @@ async def handle_copy_object(
     etag = ET.SubElement(root, "ETag")
     etag.text = put_res.etag
     last_modified = ET.SubElement(root, "LastModified")
-    last_modified.text = created_at.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    last_modified.text = copy_created_at.strftime("%Y-%m-%dT%H:%M:%S.000Z")
     xml_response = ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
     return Response(
