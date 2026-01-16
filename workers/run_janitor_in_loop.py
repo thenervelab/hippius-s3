@@ -238,6 +238,11 @@ async def cleanup_old_parts_by_mtime(
 
         object_id = object_dir.name
 
+        # Skip deletion if object is in DLQ
+        if object_id in dlq_object_ids:
+            logger.debug(f"Skipping DLQ-protected {object_id=}")
+            continue
+
         for version_dir in object_dir.iterdir():
             if not version_dir.is_dir() or not version_dir.name.startswith("v"):
                 continue
@@ -265,24 +270,22 @@ async def cleanup_old_parts_by_mtime(
                     mtime = check_path.stat().st_mtime
                     if oldest_mtime is None or mtime < oldest_mtime:
                         oldest_mtime = mtime
-                    if mtime < cutoff_time:
-                        # Skip deletion if object is in DLQ
-                        if object_id in dlq_object_ids:
-                            logger.debug(f"Skipping DLQ-protected part (GC): {part_dir}")
-                            continue
 
-                        # check if backed up on _all_ backends
-                        if not await is_replicated_on_all_backends(
-                            db,
-                            object_id,
-                            object_version,
-                            part_number,
-                        ):
-                            continue
+                    old_enough = mtime < cutoff_time
+                    fully_replicated = await is_replicated_on_all_backends(
+                        db,
+                        object_id,
+                        object_version,
+                        part_number,
+                    )
 
+                    if old_enough or fully_replicated:
                         shutil.rmtree(part_dir)
                         parts_cleaned += 1
-                        logger.info(f"GC cleaned old part: {part_dir} (mtime age={(time.time() - mtime) / 3600:.1f}h)")
+                        age = (time.time() - mtime) / 3600
+                        logger.info(
+                            f"GC cleaned part: {part_dir} {old_enough=} {fully_replicated=} (mtime {age=:.1f}h)"
+                        )
 
                         # Try to prune empty parents
                         try:
