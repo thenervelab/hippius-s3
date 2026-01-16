@@ -512,16 +512,57 @@ async def upload_part(
                 await enqueue_download_request(req)
 
             # Stream plaintext bytes
-            source_storage_version = require_supported_storage_version(int(source_obj["storage_version"]))
+            raw_storage_version = source_obj.get("storage_version")
+            if raw_storage_version is None:
+                return s3_error_response("InternalError", "Missing storage version", status_code=500)
+            storage_version = require_supported_storage_version(int(raw_storage_version))
+            bucket_id = str(source_obj.get("bucket_id") or "")
+            suite_id = str(
+                source_obj.get("enc_suite_id") or ("hip-enc/aes256gcm" if storage_version >= 5 else "hip-enc/legacy")
+            )
+            key_bytes: bytes | None = None
+            expected_size = (
+                int(range_end - range_start + 1)
+                if range_start is not None and range_end is not None
+                else int(source_obj.get("size_bytes") or 0)
+            )
+            if expected_size > int(config.max_multipart_chunk_size):
+                return s3_error_response(
+                    "EntityTooLarge",
+                    "UploadPartCopy source is too large to buffer in memory",
+                    status_code=413,
+                )
+            if storage_version >= 5:
+                from hippius_s3.services.envelope_service import unwrap_dek
+                from hippius_s3.services.kek_service import get_bucket_kek_bytes
+
+                kek_id = source_obj.get("kek_id")
+                wrapped_dek = source_obj.get("wrapped_dek")
+                if not bucket_id or not kek_id or not wrapped_dek:
+                    return s3_error_response("InternalError", "Missing v5 envelope metadata", status_code=500)
+                kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
+                aad = f"hippius-dek:{bucket_id}:{object_id_str}:{src_ver}".encode("utf-8")
+                key_bytes = unwrap_dek(kek=kek_bytes, wrapped_dek=bytes(wrapped_dek), aad=aad)
+            else:
+                from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
+
+                key_bytes = await get_or_create_encryption_key_bytes(
+                    main_account_id=request.state.account.main_account,
+                    bucket_name=source_bucket_name,
+                )
             chunks_iter = stream_plan(
                 obj_cache=obj_cache,
                 object_id=object_id_str,
                 object_version=src_ver,
                 plan=plan,
                 sleep_seconds=config.http_download_sleep_loop,
+                storage_version=storage_version,
+                key_bytes=key_bytes,
+                suite_id=suite_id,
+                bucket_id=bucket_id,
+                upload_id="",
                 address=request.state.account.main_account,
                 bucket_name=source_bucket_name,
-                storage_version=source_storage_version,
             )
             try:
                 source_bytes = b"".join([piece async for piece in chunks_iter])

@@ -25,6 +25,7 @@ from typing import List
 from typing import Optional
 from typing import Tuple
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # type: ignore[import-not-found]
 from nacl.exceptions import CryptoError  # type: ignore[import-not-found]
 from nacl.secret import SecretBox  # type: ignore[import-not-found]
 
@@ -85,7 +86,7 @@ class CryptoAdapter(ABC):
 class SecretBoxChunkedAdapter(CryptoAdapter):
     """XSalsa20-Poly1305 adapter using PyNaCl SecretBox with random nonces.
 
-    Suite ID: hip-enc/1
+    Suite ID: hip-enc/legacy
     - Nonce: 24 bytes random (libsodium default, prepended to ciphertext)
     - MAC: 16 bytes Poly1305
     - Total overhead: 40 bytes per chunk
@@ -266,6 +267,150 @@ class LegacySecretBoxAdapter(CryptoAdapter):
         )
 
 
+class AESGCMChunkedAdapter(CryptoAdapter):
+    """AES-256-GCM adapter with per-chunk nonces and AAD binding.
+
+    Deprecated internal variant kept for compatibility.
+    - Nonce: 12 bytes (prepended to ciphertext)
+    - Tag: 16 bytes (appended by AESGCM)
+    - Total overhead: 28 bytes per chunk
+
+    Note: This variant binds upload_id into nonce/AAD. This is easy to mismatch across
+    code paths (e.g. simple PUT vs append/MPU), so prefer hip-enc/aes256gcm for new writes.
+    """
+
+    NONCE_SIZE = 12
+    TAG_SIZE = 16
+
+    @property
+    def overhead_per_chunk(self) -> int:
+        return int(self.NONCE_SIZE + self.TAG_SIZE)
+
+    def _build_aad(
+        self,
+        bucket_id: str,
+        object_id: str,
+        part_number: int,
+        chunk_index: int,
+        upload_id: str,
+    ) -> bytes:
+        # Keep format stable and compact; bound to auth tag.
+        parts = []
+        for s in [bucket_id, object_id, upload_id]:
+            s_bytes = s.encode("utf-8")
+            parts.append(struct.pack("<H", len(s_bytes)))
+            parts.append(s_bytes)
+        parts.append(struct.pack("<II", int(part_number), int(chunk_index)))
+        return b"".join(parts)
+
+    def _derive_nonce(
+        self,
+        key: bytes,
+        bucket_id: str,
+        object_id: str,
+        part_number: int,
+        chunk_index: int,
+        upload_id: str,
+    ) -> bytes:
+        """Derive a deterministic nonce to avoid reliance on RNG quality at extreme scale."""
+        info = (
+            f"hippius-aesgcm-nonce:"
+            f"bucket={bucket_id}:"
+            f"object={object_id}:"
+            f"upload={upload_id}:"
+            f"part={int(part_number)}:"
+            f"chunk={int(chunk_index)}"
+        ).encode("utf-8")
+        return hmac.new(key, info, hashlib.sha256).digest()[: self.NONCE_SIZE]
+
+    def encrypt_chunk(
+        self,
+        plaintext: bytes,
+        *,
+        key: bytes,
+        bucket_id: str,
+        object_id: str,
+        part_number: int,
+        chunk_index: int,
+        upload_id: str,
+    ) -> bytes:
+        aad = self._build_aad(bucket_id, object_id, int(part_number), int(chunk_index), upload_id)
+        nonce = self._derive_nonce(key, bucket_id, object_id, int(part_number), int(chunk_index), upload_id)
+        ct = AESGCM(key).encrypt(nonce, plaintext, aad)
+        return nonce + ct
+
+    def decrypt_chunk(
+        self,
+        ciphertext: bytes,
+        *,
+        key: bytes,
+        bucket_id: str,
+        object_id: str,
+        part_number: int,
+        chunk_index: int,
+        upload_id: str,
+    ) -> bytes:
+        if len(ciphertext) < self.NONCE_SIZE + self.TAG_SIZE:
+            raise CryptoError("ciphertext_too_short")
+        nonce = ciphertext[: self.NONCE_SIZE]
+        body = ciphertext[self.NONCE_SIZE :]
+        aad = self._build_aad(bucket_id, object_id, int(part_number), int(chunk_index), upload_id)
+        return bytes(AESGCM(key).decrypt(nonce, body, aad))
+
+    def decrypt_chunk_legacy(
+        self,
+        ciphertext: bytes,
+        *,
+        key: bytes,
+        object_id: str,
+        part_number: int,
+        chunk_index: int,
+    ) -> bytes:
+        # No legacy format for AESGCM suite; keep as strict failure.
+        raise CryptoError("decrypt_failed")
+
+
+class AESGCMChunkedAdapterV2(AESGCMChunkedAdapter):
+    """AES-256-GCM adapter variant without upload_id in nonce/AAD.
+
+    Suite ID: hip-enc/aes256gcm
+    """
+
+    def _build_aad(
+        self,
+        bucket_id: str,
+        object_id: str,
+        part_number: int,
+        chunk_index: int,
+        upload_id: str,
+    ) -> bytes:
+        parts = []
+        for s in [bucket_id, object_id]:
+            s_bytes = s.encode("utf-8")
+            parts.append(struct.pack("<H", len(s_bytes)))
+            parts.append(s_bytes)
+        parts.append(struct.pack("<II", int(part_number), int(chunk_index)))
+        return b"".join(parts)
+
+    def _derive_nonce(
+        self,
+        key: bytes,
+        bucket_id: str,
+        object_id: str,
+        part_number: int,
+        chunk_index: int,
+        upload_id: str,
+    ) -> bytes:
+        info = (
+            f"hippius-aesgcm-nonce-v2:"
+            f"bucket={bucket_id}:"
+            f"object={object_id}:"
+            f"part={int(part_number)}:"
+            f"chunk={int(chunk_index)}"
+        ).encode("utf-8")
+        return hmac.new(key, info, hashlib.sha256).digest()[: self.NONCE_SIZE]
+
+
 class CryptoService:
     """Unified crypto service with adapter-based encryption/decryption.
 
@@ -279,6 +424,7 @@ class CryptoService:
     # Adapter registry
     _ADAPTERS: Dict[str, CryptoAdapter] = {
         "hip-enc/legacy": LegacySecretBoxAdapter(),
+        "hip-enc/aes256gcm": AESGCMChunkedAdapterV2(),
     }
 
     # Default suite for new writes
@@ -286,6 +432,12 @@ class CryptoService:
 
     # Backward compat: exposed for existing code
     OVERHEAD_PER_CHUNK = SecretBox.NONCE_SIZE + SecretBox.MACBYTES  # 40 bytes
+
+    @classmethod
+    def is_supported_suite_id(cls, suite_id: Optional[str]) -> bool:
+        if not suite_id:
+            return False
+        return suite_id in cls._ADAPTERS
 
     @classmethod
     def get_adapter(cls, suite_id: Optional[str] = None) -> CryptoAdapter:

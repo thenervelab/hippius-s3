@@ -18,6 +18,7 @@ from hippius_s3.reader.planner import build_chunk_plan
 from hippius_s3.reader.streamer import stream_plan
 from hippius_s3.reader.types import ChunkPlanItem
 from hippius_s3.reader.types import RangeRequest
+from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.storage_version import require_supported_storage_version
 
 
@@ -34,6 +35,10 @@ class StreamContext:
     object_version: int
     storage_version: int
     source: str
+    key_bytes: bytes | None
+    suite_id: str | None
+    bucket_id: str
+    upload_id: str
 
 
 async def build_stream_context(
@@ -221,12 +226,43 @@ async def build_stream_context(
             await enqueue_download_request(req)
 
     object_version = int(info.get("object_version") or info.get("current_object_version") or 1)
+    bucket_id = str(info.get("bucket_id") or "")
+    upload_id = str(info.get("upload_id") or "")
+    suite_id: str | None = None
+    key_bytes: bytes | None = None
 
+    if storage_version >= 5:
+        suite_id = str(info.get("enc_suite_id") or "hip-enc/aes256gcm")
+        kek_id = info.get("kek_id")
+        wrapped_dek = info.get("wrapped_dek")
+        if not bucket_id or not kek_id or not wrapped_dek:
+            raise RuntimeError("v5_missing_envelope_metadata")
+        from hippius_s3.services.envelope_service import unwrap_dek
+        from hippius_s3.services.kek_service import get_bucket_kek_bytes
+
+        kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
+        aad = f"hippius-dek:{bucket_id}:{info.get('object_id')}:{object_version}".encode("utf-8")
+        key_bytes = unwrap_dek(kek=kek_bytes, wrapped_dek=bytes(wrapped_dek), aad=aad)
+    else:
+        # v2-v4: per-bucket key from keystore DB
+        suite_id = str(info.get("enc_suite_id") or "hip-enc/legacy")
+        from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
+
+        bucket_name = str(info.get("bucket_name") or "")
+        if not address or not bucket_name:
+            raise RuntimeError("missing_address_or_bucket")
+        key_bytes = await get_or_create_encryption_key_bytes(main_account_id=address, bucket_name=bucket_name)
+    if not CryptoService.is_supported_suite_id(suite_id):
+        raise RuntimeError(f"unsupported_enc_suite_id:{suite_id}")
     return StreamContext(
         plan=plan,
         object_version=object_version,
         storage_version=storage_version,
         source=source,
+        key_bytes=key_bytes,
+        suite_id=suite_id,
+        bucket_id=bucket_id,
+        upload_id=upload_id,
     )
 
 
@@ -256,10 +292,14 @@ async def read_response(
         object_version=ctx.object_version,
         plan=ctx.plan,
         sleep_seconds=cfg.http_download_sleep_loop,
+        storage_version=ctx.storage_version,
+        key_bytes=ctx.key_bytes,
+        suite_id=ctx.suite_id,
+        bucket_id=ctx.bucket_id,
+        upload_id=ctx.upload_id,
         address=address,
         bucket_name=str(info.get("bucket_name", "")),
-        storage_version=ctx.storage_version,
-        prefetch_chunks=cfg.http_stream_prefetch_chunks,
+        prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
     )
     headers = build_headers(
         info,
@@ -306,8 +346,12 @@ async def stream_object(
         object_version=ctx.object_version,
         plan=ctx.plan,
         sleep_seconds=cfg.http_download_sleep_loop,
+        storage_version=ctx.storage_version,
+        key_bytes=ctx.key_bytes,
+        suite_id=ctx.suite_id,
+        bucket_id=ctx.bucket_id,
+        upload_id=ctx.upload_id,
         address=address,
         bucket_name=str(info.get("bucket_name", "")),
-        storage_version=ctx.storage_version,
-        prefetch_chunks=cfg.http_stream_prefetch_chunks,
+        prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
     )

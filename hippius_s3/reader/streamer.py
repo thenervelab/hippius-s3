@@ -23,9 +23,13 @@ async def stream_plan(
     object_version: int,
     plan: Iterable[ChunkPlanItem],
     sleep_seconds: float,
-    address: str,
-    bucket_name: str,
     storage_version: int,
+    key_bytes: bytes | None,
+    suite_id: str | None,
+    bucket_id: str,
+    upload_id: str,
+    address: str = "",
+    bucket_name: str = "",
     prefetch_chunks: int = 0,
 ) -> AsyncGenerator[bytes, None]:
     prefetch = max(0, int(prefetch_chunks))
@@ -47,9 +51,13 @@ async def stream_plan(
                 object_id=object_id,
                 part_number=int(item.part_number),
                 chunk_index=int(item.chunk_index),
+                storage_version=int(storage_version),
+                key_bytes=key_bytes,
+                suite_id=suite_id,
+                bucket_id=bucket_id,
+                upload_id=upload_id,
                 address=address,
                 bucket_name=bucket_name,
-                storage_version=int(storage_version),
             )
             yield maybe_slice(pt, item.slice_start, item.slice_end_excl)
         return
@@ -123,9 +131,13 @@ async def stream_plan(
                 object_id=object_id,
                 part_number=int(item.part_number),
                 chunk_index=int(item.chunk_index),
+                storage_version=int(storage_version),
+                key_bytes=key_bytes,
+                suite_id=suite_id,
+                bucket_id=bucket_id,
+                upload_id=upload_id,
                 address=address,
                 bucket_name=bucket_name,
-                storage_version=int(storage_version),
             )
             yield maybe_slice(pt, item.slice_start, item.slice_end_excl)
     finally:

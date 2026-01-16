@@ -166,10 +166,11 @@ class Config:
     downloader_retry_jitter_seconds: float = env("DOWNLOADER_RETRY_JITTER_SECONDS:0.1", convert=float)
 
     # Crypto configuration
-    # Default encryption suite for new objects
-    # hip-enc/legacy: SecretBox per-chunk (current default)
-    # hip-enc/1: Reserved for future adapter variants
-    crypto_suite_id: str = env("HIPPIUS_CRYPTO_SUITE_ID:hip-enc/legacy")
+    # hip-enc/legacy: SecretBox per-chunk (legacy objects)
+    # hip-enc/aes256gcm: AES-256-GCM per-chunk (no upload_id in AAD)
+    kek_db_pool_min_size: int = env("KEK_DB_POOL_MIN_SIZE:1", convert=int)
+    kek_db_pool_max_size: int = env("KEK_DB_POOL_MAX_SIZE:10", convert=int)
+    kek_cache_ttl_seconds: int = env("KEK_CACHE_TTL_SECONDS:300", convert=int)
 
     # endpoint chunk download settings, quite aggressive
     redis_read_chunk_timeout: int = 60
@@ -210,7 +211,7 @@ class Config:
 
     # Storage version to assign for newly created/overwritten objects
     # Defaults to 4 (latest layout)
-    target_storage_version: int = env("HIPPIUS_TARGET_STORAGE_VERSION:4", convert=int)
+    target_storage_version: int = env("HIPPIUS_TARGET_STORAGE_VERSION:5", convert=int)
 
     # Cachet health monitoring
     cachet_api_url: str = env("CACHET_API_URL", convert=str)

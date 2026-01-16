@@ -4,6 +4,7 @@
 WITH object_info AS (
     SELECT
         o.object_id,
+        o.bucket_id,
         o.object_key,
         ov.size_bytes,
         ov.multipart,
@@ -18,7 +19,12 @@ WITH object_info AS (
         b.main_account_id as bucket_owner_id,
         c.cid as simple_cid,
         ov.storage_version,
-        ov.object_version as object_version
+        ov.object_version as object_version,
+        ov.encryption_version,
+        ov.enc_suite_id,
+        ov.enc_chunk_size_bytes,
+        ov.kek_id,
+        ov.wrapped_dek
     FROM objects o
     JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
     JOIN buckets b ON o.bucket_id = b.bucket_id
@@ -41,6 +47,7 @@ multipart_chunks AS (
 )
 SELECT
     oi.object_id,
+    oi.bucket_id,
     oi.object_key,
     oi.size_bytes,
     oi.multipart,
@@ -55,6 +62,11 @@ SELECT
     oi.is_public,
     oi.bucket_owner_id,
     oi.object_version,
+    oi.encryption_version,
+    oi.enc_suite_id,
+    oi.enc_chunk_size_bytes,
+    oi.kek_id,
+    oi.wrapped_dek,
     (
         SELECT mu.upload_id
         FROM multipart_uploads mu

@@ -1,6 +1,8 @@
 """Main application module for Hippius S3 service."""
 
 import logging
+import platform
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator
@@ -37,6 +39,28 @@ from hippius_s3.storage_version import UnsupportedStorageVersionError
 logger = logging.getLogger(__name__)
 
 
+def _warn_if_no_aes_hw_accel() -> None:
+    """Best-effort warning when AES-NI (x86) isn't advertised.
+
+    This is a heuristic for performance expectations when using AES-GCM. On Linux,
+    we check /proc/cpuinfo for the 'aes' flag. In containers, this generally reflects
+    the host CPU flags exposed to the workload.
+    """
+    try:
+        if platform.system().lower() != "linux":
+            return
+        txt = Path("/proc/cpuinfo").read_text(encoding="utf-8").lower()
+        # cpuinfo lines include: "flags : ... aes ..."
+        if "flags" in txt and re.search(r"\baes\b", txt) is None:
+            logger.warning(
+                "AES hardware acceleration flag not detected in /proc/cpuinfo. "
+                "AES-GCM may be significantly slower on this node."
+            )
+    except Exception:
+        # Don't fail startup for a best-effort performance hint.
+        return
+
+
 async def postgres_create_pool(database_url: str, config: Config) -> asyncpg.Pool:
     """Create and return a Postgres connection pool.
 
@@ -63,6 +87,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         app.state.config = get_config()
         config = app.state.config
+        _warn_if_no_aes_hw_accel()
 
         app.state.postgres_pool = await postgres_create_pool(config.database_url, config)
         logger.info(f"Postgres connection pool created: min={config.db_pool_min_size}, max={config.db_pool_max_size}")
@@ -186,6 +211,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.info("Postgres connection pool closed")
         except Exception:
             logger.exception("Error shutting down postgres pool")
+
+        try:
+            from hippius_s3.services.kek_service import close_kek_pool
+
+            await close_kek_pool()
+            logger.info("KEK connection pool closed")
+        except Exception:
+            logger.exception("Error shutting down KEK pool")
 
 
 def factory() -> FastAPI:
