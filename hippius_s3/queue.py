@@ -96,12 +96,13 @@ class DownloadChainRequest(RetryableRequest):
     object_version: int
     object_key: str
     bucket_name: str
-    object_storage_version: int
+    # Deprecated: retained for backward compatibility with older queued payloads.
+    # Workers no longer depend on storage_version to populate the chunk cache.
+    object_storage_version: int | None = None
     address: str
     subaccount: str
     subaccount_seed_phrase: str
     substrate_url: str
-    should_decrypt: bool
     size: int
     multipart: bool
     chunks: list[PartToDownload]

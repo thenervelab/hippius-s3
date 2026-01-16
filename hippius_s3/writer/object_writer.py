@@ -16,6 +16,7 @@ from hippius_s3.config import get_config
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
 from hippius_s3.services.parts_service import upsert_part_placeholder
+from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import ensure_upload_row
 from hippius_s3.writer.db import upsert_object_basic
@@ -264,6 +265,7 @@ class ObjectWriter:
         resolved_storage_version = int(
             storage_version if storage_version is not None else self.config.target_storage_version
         )
+        resolved_storage_version = require_supported_storage_version(resolved_storage_version)
         with tracer.start_as_current_span(
             "put_simple_stream_full.upsert_metadata",
             attributes={

@@ -9,13 +9,14 @@ import time
 import uuid
 from datetime import UTC
 from datetime import datetime
+from typing import Any
 from urllib.parse import unquote
 
+import lxml.etree as _ET  # type: ignore[import-untyped]
 from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import Request
 from fastapi import Response
-from lxml import etree as ET
 from opentelemetry import trace
 from redis.asyncio import Redis
 from starlette.requests import ClientDisconnect
@@ -25,12 +26,11 @@ from hippius_s3 import utils
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
-from hippius_s3.dependencies import get_object_reader
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
-from hippius_s3.services.object_reader import ObjectReader
+from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 from hippius_s3.writer.object_writer import ObjectWriter
 
@@ -40,6 +40,10 @@ router = APIRouter(tags=["s3-multipart"])
 
 config = get_config()
 tracer = trace.get_tracer(__name__)
+
+# Type checkers don't understand lxml.etree's runtime API well (Element/SubElement/tostring kwargs).
+# Treat the module as Any to avoid hundreds of noisy type errors.
+ET: Any = _ET
 
 
 async def get_request_body(request: Request) -> bytes:
@@ -99,7 +103,7 @@ async def handle_post_object(
                 )
 
     # Not a multipart operation we handle
-    return None
+    return s3_error_response("InvalidRequest", "Unsupported multipart POST request", status_code=400)
 
 
 async def list_parts_internal(
@@ -337,20 +341,9 @@ async def get_all_cached_chunks(
         return []
 
 
-@router.put(
-    "/{bucket_name}/{object_key:path}/",
-    status_code=200,
-    include_in_schema=True,
-)
-@router.put(
-    "/{bucket_name}/{object_key:path}",
-    status_code=200,
-    include_in_schema=True,
-)
 async def upload_part(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    object_reader: ObjectReader = Depends(get_object_reader),
 ) -> Response:
     """Upload a part for a multipart upload (PUT with partNumber & uploadId)."""
     # These two parameters are required for multipart upload parts
@@ -358,9 +351,8 @@ async def upload_part(
     part_number_str = request.query_params.get("partNumber")
 
     # If this doesn't have both uploadId and partNumber, it's not a multipart upload part.
-    # We should return None to allow the main S3 router to handle it
     if not upload_id or not part_number_str:
-        return None  # Allow the request to fall through to the main S3 router
+        return s3_error_response("InvalidRequest", "Missing uploadId or partNumber", status_code=400)
 
     # Validate part number format
     try:
@@ -506,14 +498,13 @@ async def upload_part(
                     request_id=f"{object_id_str}::upload_part_copy",
                     object_id=object_id_str,
                     object_version=src_ver,
-                    object_storage_version=int(source_obj["storage_version"]),
+                    object_storage_version=int(source_obj.get("storage_version") or 0),
                     object_key=source_object_key,
                     bucket_name=source_bucket_name,
                     address=request.state.account.main_account,
                     subaccount=request.state.account.main_account,
                     subaccount_seed_phrase=request.state.seed_phrase,
                     substrate_url=config.substrate_url,
-                    should_decrypt=True,  # v3 path will decrypt; legacy parts unaffected
                     size=int(source_obj.get("size_bytes") or 0),
                     multipart=bool((json.loads(source_obj.get("metadata") or "{}") or {}).get("multipart", False)),
                     chunks=dl_parts,
@@ -521,16 +512,16 @@ async def upload_part(
                 await enqueue_download_request(req)
 
             # Stream plaintext bytes
+            source_storage_version = require_supported_storage_version(int(source_obj["storage_version"]))
             chunks_iter = stream_plan(
                 obj_cache=obj_cache,
                 object_id=object_id_str,
                 object_version=src_ver,
                 plan=plan,
-                should_decrypt=True,
                 sleep_seconds=config.http_download_sleep_loop,
                 address=request.state.account.main_account,
                 bucket_name=source_bucket_name,
-                storage_version=int(source_obj.get("storage_version") or 2),
+                storage_version=source_storage_version,
             )
             try:
                 source_bytes = b"".join([piece async for piece in chunks_iter])

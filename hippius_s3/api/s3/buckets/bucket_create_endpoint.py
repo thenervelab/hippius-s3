@@ -11,6 +11,7 @@ import asyncpg
 from fastapi import Request
 from fastapi import Response
 from lxml import etree as ET
+from substrateinterface.utils.ss58 import is_valid_ss58_address
 
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.buckets.bucket_policy_endpoint import set_bucket_policy
@@ -174,6 +175,13 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
 
     # Handle standard bucket creation if not a tagging, lifecycle, or policy request
     else:
+        if is_valid_ss58_address(bucket_name):
+            return errors.s3_error_response(
+                "InvalidBucketName",
+                "Bucket names matching SS58 addresses are reserved",
+                status_code=400,
+                BucketName=bucket_name,
+            )
         try:
             bucket_id = str(uuid.uuid4())
             created_at = datetime.now(timezone.utc)
