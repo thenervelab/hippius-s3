@@ -18,7 +18,6 @@ from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.services.hippius_api_service import HippiusApiClient
 from hippius_s3.utils import get_query
-from hippius_s3.workers.fs_cleanup import cleanup_pinned_object_parts
 
 
 logger = logging.getLogger(__name__)
@@ -147,14 +146,6 @@ class Uploader:
                 int(payload.object_version or 1),
             )
         logger.info(f"Updated object status to 'uploaded' object_id={payload.object_id}")
-
-        async with self._acquire_conn() as conn:
-            await cleanup_pinned_object_parts(
-                self.fs_store,
-                conn,
-                payload.object_id,
-                int(payload.object_version or 1),
-            )
 
         total_duration = time.time() - start_time
         logger.info(
