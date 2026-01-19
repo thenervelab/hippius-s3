@@ -1,0 +1,219 @@
+name: Build and Deploy to Kubernetes
+
+on:
+  push:
+    branches:
+      - staging
+      - production
+
+env:
+  REGISTRY: registry.starkleytech.com
+  IMAGE_PREFIX: hippius-s3
+
+jobs:
+  build-base:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/base
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=latest
+
+      - name: Build and push base image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.base
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-images:
+    runs-on: ubuntu-latest
+    needs: build-base
+    strategy:
+      matrix:
+        service: [api, gateway, workers]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=latest
+
+      - name: Determine Dockerfile
+        id: dockerfile
+        run: |
+          if [ "${{ matrix.service }}" = "api" ]; then
+            echo "dockerfile=./Dockerfile" >> $GITHUB_OUTPUT
+          elif [ "${{ matrix.service }}" = "gateway" ]; then
+            echo "dockerfile=./gateway/Dockerfile" >> $GITHUB_OUTPUT
+          elif [ "${{ matrix.service }}" = "workers" ]; then
+            echo "dockerfile=./workers/Dockerfile" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ steps.dockerfile.outputs.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            BASE_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/base:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: build-images
+    if: github.ref == 'refs/heads/staging'
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > $HOME/.kube/config
+
+      - name: Update secrets
+        run: |
+          kubectl create secret generic hippius-s3-secrets \
+            --from-literal=DATABASE_URL="${{ secrets.STAGING_DATABASE_URL }}" \
+            --from-literal=HIPPIUS_KEYSTORE_DATABASE_URL="${{ secrets.STAGING_DATABASE_URL }}" \
+            --from-literal=REDIS_URL="redis://redis:6379/0" \
+            --from-literal=REDIS_ACCOUNTS_URL="redis://redis-accounts:6379/0" \
+            --from-literal=REDIS_CHAIN_URL="redis://redis-chain:6379/0" \
+            --from-literal=REDIS_QUEUES_URL="redis://redis-queues:6379/0" \
+            --from-literal=REDIS_RATE_LIMITING_URL="redis://redis-rate-limiting:6379/0" \
+            --from-literal=REDIS_ACL_URL="redis://redis-acl:6379/0" \
+            --from-literal=HIPPIUS_SERVICE_KEY="${{ secrets.STAGING_HIPPIUS_SERVICE_KEY }}" \
+            --from-literal=HIPPIUS_AUTH_ENCRYPTION_KEY="${{ secrets.STAGING_HIPPIUS_AUTH_ENCRYPTION_KEY }}" \
+            --from-literal=HIPPIUS_IPFS_API_URLS="http://ipfs:5001" \
+            --from-literal=DATABASE_PASSWORD="${{ secrets.STAGING_DATABASE_PASSWORD }}" \
+            --namespace=hippius-s3-staging \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Update image tags
+        run: |
+          cd k8s/staging
+          kustomize edit set image \
+            registry.starkleytech.com/hippius-s3/api:${{ github.sha }} \
+            registry.starkleytech.com/hippius-s3/gateway:${{ github.sha }} \
+            registry.starkleytech.com/hippius-s3/workers:${{ github.sha }}
+
+      - name: Deploy to staging
+        run: |
+          kubectl apply -k k8s/staging
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/gateway -n hippius-s3-staging --timeout=10m
+          kubectl rollout status deployment/api -n hippius-s3-staging --timeout=10m
+          kubectl rollout status deployment/downloader -n hippius-s3-staging --timeout=10m
+
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n hippius-s3-staging
+          kubectl get services -n hippius-s3-staging
+          kubectl get ingress -n hippius-s3-staging
+
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: build-images
+    if: github.ref == 'refs/heads/production'
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG_PRODUCTION }}" | base64 -d > $HOME/.kube/config
+
+      - name: Update secrets
+        run: |
+          kubectl create secret generic hippius-s3-secrets \
+            --from-literal=DATABASE_URL="${{ secrets.PRODUCTION_DATABASE_URL }}" \
+            --from-literal=HIPPIUS_KEYSTORE_DATABASE_URL="${{ secrets.PRODUCTION_DATABASE_URL }}" \
+            --from-literal=REDIS_URL="redis://redis:6379/0" \
+            --from-literal=REDIS_ACCOUNTS_URL="redis://redis-accounts:6379/0" \
+            --from-literal=REDIS_CHAIN_URL="redis://redis-chain:6379/0" \
+            --from-literal=REDIS_QUEUES_URL="redis://redis-queues:6379/0" \
+            --from-literal=REDIS_RATE_LIMITING_URL="redis://redis-rate-limiting:6379/0" \
+            --from-literal=REDIS_ACL_URL="redis://redis-acl:6379/0" \
+            --from-literal=HIPPIUS_SERVICE_KEY="${{ secrets.PRODUCTION_HIPPIUS_SERVICE_KEY }}" \
+            --from-literal=HIPPIUS_AUTH_ENCRYPTION_KEY="${{ secrets.PRODUCTION_HIPPIUS_AUTH_ENCRYPTION_KEY }}" \
+            --from-literal=HIPPIUS_IPFS_API_URLS="http://ipfs:5001" \
+            --from-literal=DATABASE_PASSWORD="${{ secrets.PRODUCTION_DATABASE_PASSWORD }}" \
+            --namespace=hippius-s3-prod \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Update image tags
+        run: |
+          cd k8s/production
+          kustomize edit set image \
+            registry.starkleytech.com/hippius-s3/api:${{ github.sha }} \
+            registry.starkleytech.com/hippius-s3/gateway:${{ github.sha }} \
+            registry.starkleytech.com/hippius-s3/workers:${{ github.sha }}
+
+      - name: Deploy to production
+        run: |
+          kubectl apply -k k8s/production
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/gateway -n hippius-s3-prod --timeout=10m
+          kubectl rollout status deployment/api -n hippius-s3-prod --timeout=10m
+          kubectl rollout status deployment/downloader -n hippius-s3-prod --timeout=10m
+
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n hippius-s3-prod
+          kubectl get services -n hippius-s3-prod
+          kubectl get ingress -n hippius-s3-prod

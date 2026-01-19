@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hippius-s3
+  namespace: hippius-s3-prod
+spec:
+  tls:
+    - hosts:
+        - s3.hippius.com
+      secretName: hippius-s3-prod-tls
+  rules:
+    - host: s3.hippius.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 8080

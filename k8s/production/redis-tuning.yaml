@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: hippius-s3-prod
+spec:
+  template:
+    spec:
+      containers:
+        - name: redis
+          command:
+            - redis-server
+            - /usr/local/etc/redis/redis.conf
+            - --maxmemory
+            - 200gb
+          resources:
+            requests:
+              cpu: 1000m
+              memory: 200Gi
+            limits:
+              cpu: 4000m
+              memory: 210Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-acl
+  namespace: hippius-s3-prod
+spec:
+  template:
+    spec:
+      containers:
+        - name: redis
+          command:
+            - redis-server
+            - /usr/local/etc/redis/redis.conf
+            - --maxmemory
+            - 4gb
+            - --maxmemory-policy
+            - allkeys-lru
+            - --save
+            - ""
+            - --appendonly
+            - "no"

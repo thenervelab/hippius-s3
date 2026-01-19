@@ -1,0 +1,33 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: hippius-s3-staging
+
+resources:
+  - ../base/namespace.yaml
+  - ../base/configmap-defaults.yaml
+  - ../base/configmap-redis.yaml
+  - ../base/configmap-environment.yaml
+  - ../base/secret.yaml
+  - ../base/pvc-shared.yaml
+  - ../base/postgres-statefulset.yaml
+  - ../base/redis-statefulsets.yaml
+  - ../base/ipfs-statefulset.yaml
+  - ../base/api-deployment.yaml
+  - ../base/gateway-deployment.yaml
+  - ../base/workers-deployments.yaml
+  - ../base/services.yaml
+  - ../base/ingress.yaml
+  - ../base/networkpolicy.yaml
+  - ../base/servicemonitor.yaml
+
+patchesStrategicMerge:
+  - resource-limits.yaml
+
+images:
+  - name: registry.starkleytech.com/hippius-s3/api
+    newTag: latest
+  - name: registry.starkleytech.com/hippius-s3/gateway
+    newTag: latest
+  - name: registry.starkleytech.com/hippius-s3/workers
+    newTag: latest
