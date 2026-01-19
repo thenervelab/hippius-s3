@@ -2,7 +2,6 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: redis
-  namespace: hippius-s3-prod
 spec:
   template:
     spec:
@@ -25,7 +24,6 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: redis-acl
-  namespace: hippius-s3-prod
 spec:
   template:
     spec:

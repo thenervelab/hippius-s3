@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: uploader
-  namespace: hippius-s3-staging
+
 spec:
   replicas: 1
   strategy:
@@ -93,7 +93,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: downloader
-  namespace: hippius-s3-staging
+
 spec:
   replicas: 5
   selector:
@@ -173,7 +173,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: unpinner
-  namespace: hippius-s3-staging
+
 spec:
   replicas: 1
   strategy:
@@ -252,7 +252,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: janitor
-  namespace: hippius-s3-staging
+
 spec:
   replicas: 1
   selector:
@@ -326,7 +326,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: account-cacher
-  namespace: hippius-s3-staging
+
 spec:
   replicas: 1
   selector:
@@ -393,7 +393,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: orphan-checker
-  namespace: hippius-s3-staging
+
 spec:
   replicas: 0
   strategy:

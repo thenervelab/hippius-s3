@@ -4,3 +4,4 @@ metadata:
   name: hippius-s3
   labels:
     app: hippius-s3
+    environment: staging

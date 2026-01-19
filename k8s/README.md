@@ -124,7 +124,16 @@ kubectl create secret generic hippius-s3-secrets \
 kubectl apply -k k8s/staging
 ```
 
-#### 4. Deploy to production
+#### 4. Run migrations (one-time)
+
+The migration Job runs automatically during deployment. To manually trigger:
+
+```bash
+kubectl delete job db-migrations -n hippius-s3-staging
+kubectl apply -k k8s/staging
+```
+
+#### 5. Deploy to production
 
 ```bash
 kubectl apply -k k8s/production
@@ -212,7 +221,8 @@ kubectl logs <pod-name> -n hippius-s3-staging --previous
 ### Database migration issues
 
 ```bash
-kubectl logs -n hippius-s3-staging deployment/api -c migrations
+kubectl logs -n hippius-s3-staging job/db-migrations
+kubectl describe job db-migrations -n hippius-s3-staging
 ```
 
 ### IPFS connectivity issues

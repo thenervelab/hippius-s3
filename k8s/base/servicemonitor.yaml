@@ -2,7 +2,7 @@ apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: hippius-s3-metrics
-  namespace: hippius-s3-staging
+
   labels:
     app: hippius-s3
 spec:
@@ -18,7 +18,7 @@ apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: hippius-s3-api-metrics
-  namespace: hippius-s3-staging
+
   labels:
     app: hippius-s3
 spec:

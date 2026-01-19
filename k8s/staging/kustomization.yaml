@@ -4,24 +4,11 @@ kind: Kustomization
 namespace: hippius-s3-staging
 
 resources:
-  - ../base/namespace.yaml
-  - ../base/configmap-defaults.yaml
-  - ../base/configmap-redis.yaml
-  - ../base/configmap-environment.yaml
-  - ../base/secret.yaml
-  - ../base/pvc-shared.yaml
-  - ../base/postgres-statefulset.yaml
-  - ../base/redis-statefulsets.yaml
-  - ../base/ipfs-statefulset.yaml
-  - ../base/api-deployment.yaml
-  - ../base/gateway-deployment.yaml
-  - ../base/workers-deployments.yaml
-  - ../base/services.yaml
-  - ../base/ingress.yaml
-  - ../base/networkpolicy.yaml
-  - ../base/servicemonitor.yaml
+  - ../base
 
 patchesStrategicMerge:
+  - namespace-patch.yaml
+  - environment-patch.yaml
   - resource-limits.yaml
 
 images:

@@ -6,11 +6,11 @@ resources:
   - configmap-defaults.yaml
   - configmap-redis.yaml
   - configmap-environment.yaml
-  - secret.yaml
   - pvc-shared.yaml
   - postgres-statefulset.yaml
   - redis-statefulsets.yaml
   - ipfs-statefulset.yaml
+  - migration-job.yaml
   - api-deployment.yaml
   - gateway-deployment.yaml
   - workers-deployments.yaml

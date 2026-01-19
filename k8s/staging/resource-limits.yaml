@@ -2,7 +2,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: gateway
-  namespace: hippius-s3-staging
 spec:
   replicas: 2
 ---
@@ -10,7 +9,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: api
-  namespace: hippius-s3-staging
 spec:
   replicas: 2
 ---
@@ -18,7 +16,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: downloader
-  namespace: hippius-s3-staging
 spec:
   replicas: 5
 ---
@@ -26,7 +23,6 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: object-cache-pvc
-  namespace: hippius-s3-staging
 spec:
   resources:
     requests:
@@ -36,7 +32,6 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: persist-pvc
-  namespace: hippius-s3-staging
 spec:
   resources:
     requests:
@@ -46,7 +41,6 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: dlq-pvc
-  namespace: hippius-s3-staging
 spec:
   resources:
     requests:
