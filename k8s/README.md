@@ -55,15 +55,16 @@ Configure the following secrets in your GitHub repository:
 - `REGISTRY_USERNAME`: Username for registry.starkleytech.com
 - `REGISTRY_PASSWORD`: Password for registry.starkleytech.com
 
+### Kubernetes Access
+- `KUBE_CONFIG`: Base64-encoded kubeconfig (used for both staging and production namespaces)
+
 ### Staging Secrets
-- `KUBECONFIG_STAGING`: Base64-encoded kubeconfig for staging cluster
 - `STAGING_DATABASE_URL`: PostgreSQL connection string
 - `STAGING_DATABASE_PASSWORD`: PostgreSQL password
 - `STAGING_HIPPIUS_SERVICE_KEY`: Hippius service seed phrase
 - `STAGING_HIPPIUS_AUTH_ENCRYPTION_KEY`: Encryption key
 
 ### Production Secrets
-- `KUBECONFIG_PRODUCTION`: Base64-encoded kubeconfig for production cluster
 - `PRODUCTION_DATABASE_URL`: PostgreSQL connection string
 - `PRODUCTION_DATABASE_PASSWORD`: PostgreSQL password
 - `PRODUCTION_HIPPIUS_SERVICE_KEY`: Hippius service seed phrase
