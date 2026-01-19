@@ -155,28 +155,6 @@ disallow_incomplete_defs = true
 plugins = [
     "pydantic.mypy"
 ]
-# Ignore errors in specific modules
-[[tool.mypy.overrides]]
-module = "hippius_s3.api.s3.multipart"
-disallow_untyped_defs = false
-disable_error_code = ["attr-defined", "no-untyped-def", "misc", "return-value"]
-
-
-[[tool.mypy.overrides]]
-module = "hippius_s3.queue"
-disallow_untyped_defs = false
-disable_error_code = ["no-untyped-def", "misc", "arg-type"]
-
-[[tool.mypy.overrides]]
-module = "hippius_s3.utils"
-disallow_untyped_defs = false
-disable_error_code = ["var-annotated", "no-untyped-def", "no-any-return"]
-
-[[tool.mypy.overrides]]
-module = "hippius_s3.ipfs_service"
-disallow_untyped_defs = false
-disable_error_code = ["no-untyped-def"]
-
 [[tool.mypy.overrides]]
 module = "uvicorn"
 ignore_missing_imports = true
@@ -192,36 +170,6 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = "nacl.*"
 ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "hippius_s3.api.middlewares.profiler"
-disallow_untyped_defs = false
-disable_error_code = ["attr-defined", "no-untyped-def"]
-
-[[tool.mypy.overrides]]
-module = "hippius_s3.dependencies"
-disallow_untyped_defs = false
-disable_error_code = ["no-untyped-def"]
-
-[[tool.mypy.overrides]]
-module = "hippius_s3.api.user"
-disallow_untyped_defs = false
-disable_error_code = ["no-untyped-def"]
-
-[[tool.mypy.overrides]]
-module = "hippius_s3.api.middlewares.credit_check"
-disallow_untyped_defs = false
-disable_error_code = ["no-untyped-def", "no-any-return"]
-
-[[tool.mypy.overrides]]
-module = "hippius_s3.workers.uploader"
-disallow_untyped_defs = false
-disable_error_code = ["no-untyped-def", "abstract"]
-
-[[tool.mypy.overrides]]
-module = "hippius_s3.main"
-disallow_untyped_defs = false
-disable_error_code = ["no-untyped-def"]
 
 [[tool.mypy.overrides]]
 module = "aiofiles.*"

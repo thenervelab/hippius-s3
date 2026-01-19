@@ -5,12 +5,14 @@ import platform
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 from typing import AsyncGenerator
 
 import asyncpg
 import redis.asyncio as async_redis
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi import Request
 from fastapi import Response
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
@@ -238,7 +240,7 @@ def factory() -> FastAPI:
         default_response_class=Response,
     )
 
-    def custom_openapi() -> dict:
+    def custom_openapi() -> dict[str, Any]:
         if app.openapi_schema:
             return app.openapi_schema
         openapi_schema = get_openapi(
@@ -278,7 +280,7 @@ def factory() -> FastAPI:
         app.add_middleware(SpeedscopeProfilerMiddleware)
 
     @app.exception_handler(Exception)
-    async def global_exception_handler(request, exc):  # type: ignore[no-untyped-def]
+    async def global_exception_handler(request: Request, exc: Exception) -> Response:
         if exc.__class__.__name__ == "DownloadNotReadyError" or str(exc) in {"initial_stream_timeout"}:
             return s3_errors.s3_error_response(
                 code="SlowDown",
@@ -294,7 +296,7 @@ def factory() -> FastAPI:
         raise exc
 
     @app.get("/robots.txt", include_in_schema=False)
-    async def robots_txt():
+    async def robots_txt() -> Response:
         """Serve robots.txt to prevent crawler indexing."""
         content = """User-agent: *
 Disallow: /
@@ -329,7 +331,7 @@ Disallow: /"""
         )
 
     @app.get("/health", include_in_schema=False, response_class=JSONResponse)
-    async def health():
+    async def health() -> JSONResponse:
         """Health check endpoint for monitoring."""
         return JSONResponse(content={"status": "healthy"})
 
