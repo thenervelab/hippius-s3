@@ -6,6 +6,10 @@ on:
       - staging
       - production
 
+permissions:
+  contents: read
+  packages: write
+
 env:
   REGISTRY: ghcr.io
   IMAGE_PREFIX: ${{ github.repository_owner }}/hippius-s3
