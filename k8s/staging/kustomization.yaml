@@ -12,9 +12,9 @@ patchesStrategicMerge:
   - resource-limits.yaml
 
 images:
-  - name: registry.starkleytech.com/hippius-s3/api
+  - name: registry.starkleytech.com/hippius/api
     newTag: latest
-  - name: registry.starkleytech.com/hippius-s3/gateway
+  - name: registry.starkleytech.com/hippius/gateway
     newTag: latest
-  - name: registry.starkleytech.com/hippius-s3/workers
+  - name: registry.starkleytech.com/hippius/workers
     newTag: latest

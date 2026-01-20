@@ -20,7 +20,7 @@ spec:
             - until nc -z postgres 5432; do echo waiting for postgres; sleep 5; done
       containers:
         - name: migrations
-          image: registry.starkleytech.com/hippius-s3/api:latest
+          image: registry.starkleytech.com/hippius/api:latest
           command:
             - python
             - -m

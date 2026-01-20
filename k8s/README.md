@@ -86,17 +86,17 @@ git push origin staging
 #### 1. Build and push images
 
 ```bash
-docker build -t registry.starkleytech.com/hippius-s3/base:latest -f Dockerfile.base .
-docker push registry.starkleytech.com/hippius-s3/base:latest
+docker build -t registry.starkleytech.com/hippius/base:latest -f Dockerfile.base .
+docker push registry.starkleytech.com/hippius/base:latest
 
-docker build -t registry.starkleytech.com/hippius-s3/api:latest .
-docker push registry.starkleytech.com/hippius-s3/api:latest
+docker build -t registry.starkleytech.com/hippius/api:latest .
+docker push registry.starkleytech.com/hippius/api:latest
 
-docker build -t registry.starkleytech.com/hippius-s3/gateway:latest -f gateway/Dockerfile .
-docker push registry.starkleytech.com/hippius-s3/gateway:latest
+docker build -t registry.starkleytech.com/hippius/gateway:latest -f gateway/Dockerfile .
+docker push registry.starkleytech.com/hippius/gateway:latest
 
-docker build -t registry.starkleytech.com/hippius-s3/workers:latest -f workers/Dockerfile .
-docker push registry.starkleytech.com/hippius-s3/workers:latest
+docker build -t registry.starkleytech.com/hippius/workers:latest -f workers/Dockerfile .
+docker push registry.starkleytech.com/hippius/workers:latest
 ```
 
 #### 2. Update secrets

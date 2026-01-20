@@ -8,7 +8,7 @@ on:
 
 env:
   REGISTRY: registry.starkleytech.com
-  IMAGE_PREFIX: hippius-s3
+  IMAGE_PREFIX: hippius
 
 jobs:
   build-base:

@@ -22,7 +22,7 @@ spec:
             - until nc -z api 8000; do echo waiting for api; sleep 5; done
       containers:
         - name: gateway
-          image: registry.starkleytech.com/hippius-s3/gateway:latest
+          image: registry.starkleytech.com/hippius/gateway:latest
           ports:
             - containerPort: 8080
           envFrom:
