@@ -18,7 +18,7 @@ jobs:
   build-base:
     runs-on: ubuntu-latest
     outputs:
-      image_tag: ${{ steps.meta.outputs.tags }}
+      base_image: ${{ steps.base-image.outputs.image }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -53,6 +53,11 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: false
           outputs: type=registry,oci-mediatypes=true,compression=gzip,compression-level=9
+
+      - name: Set base image output
+        id: base-image
+        run: |
+          echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/base:$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
 
   build-images:
     runs-on: ubuntu-latest
@@ -102,7 +107,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           build-args: |
-            BASE_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/base:${{ github.sha }}
+            BASE_IMAGE=${{ needs.build-base.outputs.base_image }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
