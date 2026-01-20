@@ -14,7 +14,7 @@ This directory contains Kubernetes manifests for deploying hippius-s3 to a Kuber
 ## Prerequisites
 
 1. **Kubernetes Cluster**: RKE2 v1.32+ with Longhorn storage
-2. **Registry Access**: registry.starkleytech.com credentials
+2. **Registry Access**: GitHub Container Registry (ghcr.io) via GitHub Actions
 3. **GitHub Secrets**: Configure required secrets (see below)
 4. **cert-manager**: Installed with `letsencrypt-prod` ClusterIssuer
 5. **NGINX Ingress**: Installed and configured
@@ -51,10 +51,6 @@ k8s/
 
 Configure the following secrets in your GitHub repository:
 
-### Registry Secrets
-- `REGISTRY_USERNAME`: Username for registry.starkleytech.com
-- `REGISTRY_PASSWORD`: Password for registry.starkleytech.com
-
 ### Kubernetes Access
 - `KUBE_CONFIG`: Base64-encoded kubeconfig (used for both staging and production namespaces)
 
@@ -86,17 +82,17 @@ git push origin staging
 #### 1. Build and push images
 
 ```bash
-docker build -t registry.starkleytech.com/hippius/base:latest -f Dockerfile.base .
-docker push registry.starkleytech.com/hippius/base:latest
+docker build -t ghcr.io/thenervelab/hippius-s3/base:latest -f Dockerfile.base .
+docker push ghcr.io/thenervelab/hippius-s3/base:latest
 
-docker build -t registry.starkleytech.com/hippius/api:latest .
-docker push registry.starkleytech.com/hippius/api:latest
+docker build -t ghcr.io/thenervelab/hippius-s3/api:latest .
+docker push ghcr.io/thenervelab/hippius-s3/api:latest
 
-docker build -t registry.starkleytech.com/hippius/gateway:latest -f gateway/Dockerfile .
-docker push registry.starkleytech.com/hippius/gateway:latest
+docker build -t ghcr.io/thenervelab/hippius-s3/gateway:latest -f gateway/Dockerfile .
+docker push ghcr.io/thenervelab/hippius-s3/gateway:latest
 
-docker build -t registry.starkleytech.com/hippius/workers:latest -f workers/Dockerfile .
-docker push registry.starkleytech.com/hippius/workers:latest
+docker build -t ghcr.io/thenervelab/hippius-s3/workers:latest -f workers/Dockerfile .
+docker push ghcr.io/thenervelab/hippius-s3/workers:latest
 ```
 
 #### 2. Update secrets

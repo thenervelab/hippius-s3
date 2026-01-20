@@ -25,7 +25,7 @@ spec:
             - until nc -z postgres 5432 && nc -z redis 6379 && nc -z redis-queues 6379 && nc -z ipfs 5001; do echo waiting for services; sleep 5; done
       containers:
         - name: uploader
-          image: registry.starkleytech.com/hippius/workers:latest
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
           envFrom:
             - configMapRef:
                 name: hippius-s3-defaults
@@ -114,7 +114,7 @@ spec:
             - until nc -z postgres 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
       containers:
         - name: downloader
-          image: registry.starkleytech.com/hippius/workers:latest
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
           envFrom:
             - configMapRef:
                 name: hippius-s3-defaults
@@ -196,7 +196,7 @@ spec:
             - until nc -z postgres 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
       containers:
         - name: unpinner
-          image: registry.starkleytech.com/hippius/workers:latest
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
           envFrom:
             - configMapRef:
                 name: hippius-s3-defaults
@@ -273,7 +273,7 @@ spec:
             - until nc -z postgres 5432 && nc -z redis 6379; do echo waiting for services; sleep 5; done
       containers:
         - name: janitor
-          image: registry.starkleytech.com/hippius/workers:latest
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
           envFrom:
             - configMapRef:
                 name: hippius-s3-defaults
@@ -347,7 +347,7 @@ spec:
             - until nc -z redis-accounts 6379; do echo waiting for redis-accounts; sleep 5; done
       containers:
         - name: account-cacher
-          image: registry.starkleytech.com/hippius/workers:latest
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
           envFrom:
             - configMapRef:
                 name: hippius-s3-defaults
@@ -416,7 +416,7 @@ spec:
             - until nc -z postgres 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
       containers:
         - name: orphan-checker
-          image: registry.starkleytech.com/hippius/workers:latest
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
           envFrom:
             - configMapRef:
                 name: hippius-s3-defaults

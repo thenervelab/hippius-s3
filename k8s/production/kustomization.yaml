@@ -15,9 +15,9 @@ patchesStrategicMerge:
   - ingress-patch.yaml
 
 images:
-  - name: registry.starkleytech.com/hippius/api
+  - name: ghcr.io/thenervelab/hippius-s3/api
     newTag: latest
-  - name: registry.starkleytech.com/hippius/gateway
+  - name: ghcr.io/thenervelab/hippius-s3/gateway
     newTag: latest
-  - name: registry.starkleytech.com/hippius/workers
+  - name: ghcr.io/thenervelab/hippius-s3/workers
     newTag: latest
