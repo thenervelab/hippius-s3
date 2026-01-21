@@ -158,6 +158,10 @@ jobs:
             ghcr.io/thenervelab/hippius-s3/gateway:${{ github.sha }} \
             ghcr.io/thenervelab/hippius-s3/workers:${{ github.sha }}
 
+      - name: Delete old migration job if exists
+        run: |
+          kubectl delete job db-migrations -n hippius-s3-staging --ignore-not-found=true
+
       - name: Deploy to staging
         run: |
           kubectl apply -k k8s/staging
@@ -220,6 +224,10 @@ jobs:
             ghcr.io/thenervelab/hippius-s3/api:${{ github.sha }} \
             ghcr.io/thenervelab/hippius-s3/gateway:${{ github.sha }} \
             ghcr.io/thenervelab/hippius-s3/workers:${{ github.sha }}
+
+      - name: Delete old migration job if exists
+        run: |
+          kubectl delete job db-migrations -n hippius-s3-prod --ignore-not-found=true
 
       - name: Deploy to production
         run: |
