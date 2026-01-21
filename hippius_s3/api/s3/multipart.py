@@ -526,7 +526,7 @@ async def upload_part(
                 if range_start is not None and range_end is not None
                 else int(source_obj.get("size_bytes") or 0)
             )
-            if expected_size > int(config.max_multipart_chunk_size):
+            if expected_size > int(config.max_multipart_part_size):
                 return s3_error_response(
                     "EntityTooLarge",
                     "UploadPartCopy source is too large to buffer in memory",
