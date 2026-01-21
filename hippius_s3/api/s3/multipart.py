@@ -250,11 +250,11 @@ async def initiate_multipart_upload(
                 with contextlib.suppress(ValueError):
                     file_size = int(value)
 
-        if file_size and file_size > config.max_multipart_file_size:
+        if file_size and file_size > config.max_object_size:
             return s3_error_response(
                 "EntityTooLarge",
                 f"Your proposed upload size {file_size} bytes exceeds the maximum "
-                f"allowed object size of {config.max_multipart_file_size} bytes",
+                f"allowed object size of {config.max_object_size} bytes",
                 status_code=400,
             )
 
@@ -365,11 +365,11 @@ async def upload_part(
             status_code=400,
         )
 
-    if part_number < 1 or part_number > 10000:
-        logger.error(f"Part number {part_number} out of range 1-10000")
+    if part_number < 1 or part_number > config.max_multipart_part_count:
+        logger.error(f"Part number {part_number} out of range 1-{config.max_multipart_part_count}")
         return s3_error_response(
             "InvalidArgument",
-            "Part number must be an integer between 1 and 10000",
+            f"Part number must be an integer between 1 and {config.max_multipart_part_count}",
             status_code=400,
         )
 
@@ -587,10 +587,10 @@ async def upload_part(
             status_code=400,
         )
 
-    if file_size > config.max_multipart_chunk_size:
+    if file_size > config.max_multipart_part_size:
         return s3_error_response(
             "EntityTooLarge",
-            f"Part size {file_size} bytes exceeds maximum {config.max_multipart_chunk_size} bytes",
+            f"Part size {file_size} bytes exceeds maximum {config.max_multipart_part_size} bytes",
             status_code=400,
         )
 
