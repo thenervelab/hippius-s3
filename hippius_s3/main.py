@@ -1,14 +1,18 @@
 """Main application module for Hippius S3 service."""
 
 import logging
+import platform
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 from typing import AsyncGenerator
 
 import asyncpg
 import redis.asyncio as async_redis
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi import Request
 from fastapi import Response
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
@@ -37,6 +41,28 @@ from hippius_s3.storage_version import UnsupportedStorageVersionError
 logger = logging.getLogger(__name__)
 
 
+def _warn_if_no_aes_hw_accel() -> None:
+    """Best-effort warning when AES-NI (x86) isn't advertised.
+
+    This is a heuristic for performance expectations when using AES-GCM. On Linux,
+    we check /proc/cpuinfo for the 'aes' flag. In containers, this generally reflects
+    the host CPU flags exposed to the workload.
+    """
+    try:
+        if platform.system().lower() != "linux":
+            return
+        txt = Path("/proc/cpuinfo").read_text(encoding="utf-8").lower()
+        # cpuinfo lines include: "flags : ... aes ..."
+        if "flags" in txt and re.search(r"\baes\b", txt) is None:
+            logger.warning(
+                "AES hardware acceleration flag not detected in /proc/cpuinfo. "
+                "AES-GCM may be significantly slower on this node."
+            )
+    except Exception:
+        # Don't fail startup for a best-effort performance hint.
+        return
+
+
 async def postgres_create_pool(database_url: str, config: Config) -> asyncpg.Pool:
     """Create and return a Postgres connection pool.
 
@@ -63,6 +89,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         app.state.config = get_config()
         config = app.state.config
+        _warn_if_no_aes_hw_accel()
 
         app.state.postgres_pool = await postgres_create_pool(config.database_url, config)
         logger.info(f"Postgres connection pool created: min={config.db_pool_min_size}, max={config.db_pool_max_size}")
@@ -187,6 +214,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         except Exception:
             logger.exception("Error shutting down postgres pool")
 
+        try:
+            from hippius_s3.services.kek_service import close_kek_pool
+
+            await close_kek_pool()
+            logger.info("KEK connection pool closed")
+        except Exception:
+            logger.exception("Error shutting down KEK pool")
+
 
 def factory() -> FastAPI:
     """Factory function to create and configure the FastAPI application."""
@@ -205,7 +240,7 @@ def factory() -> FastAPI:
         default_response_class=Response,
     )
 
-    def custom_openapi() -> dict:
+    def custom_openapi() -> dict[str, Any]:
         if app.openapi_schema:
             return app.openapi_schema
         openapi_schema = get_openapi(
@@ -245,7 +280,7 @@ def factory() -> FastAPI:
         app.add_middleware(SpeedscopeProfilerMiddleware)
 
     @app.exception_handler(Exception)
-    async def global_exception_handler(request, exc):  # type: ignore[no-untyped-def]
+    async def global_exception_handler(request: Request, exc: Exception) -> Response:
         if exc.__class__.__name__ == "DownloadNotReadyError" or str(exc) in {"initial_stream_timeout"}:
             return s3_errors.s3_error_response(
                 code="SlowDown",
@@ -261,7 +296,7 @@ def factory() -> FastAPI:
         raise exc
 
     @app.get("/robots.txt", include_in_schema=False)
-    async def robots_txt():
+    async def robots_txt() -> Response:
         """Serve robots.txt to prevent crawler indexing."""
         content = """User-agent: *
 Disallow: /
@@ -296,7 +331,7 @@ Disallow: /"""
         )
 
     @app.get("/health", include_in_schema=False, response_class=JSONResponse)
-    async def health():
+    async def health() -> JSONResponse:
         """Health check endpoint for monitoring."""
         return JSONResponse(content={"status": "healthy"})
 

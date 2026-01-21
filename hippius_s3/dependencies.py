@@ -90,21 +90,15 @@ def get_request_context(request: Request) -> RequestContext:
     return RequestContext(main_account_id=main_account_id, seed_phrase=seed_phrase)
 
 
-def get_user_repo(db: Any = None):
-    if db is None:
-        raise RuntimeError("get_user_repo requires DB dependency injection")
+def get_user_repo(db: DBConnection) -> UserRepository:
     return UserRepository(db)
 
 
-def get_bucket_repo(db: Any = None):
-    if db is None:
-        raise RuntimeError("get_bucket_repo requires DB dependency injection")
+def get_bucket_repo(db: DBConnection) -> BucketRepository:
     return BucketRepository(db)
 
 
-def get_object_repo(db: Any = None):
-    if db is None:
-        raise RuntimeError("get_object_repo requires DB dependency injection")
+def get_object_repo(db: DBConnection) -> ObjectRepository:
     return ObjectRepository(db)
 
 
@@ -131,7 +125,7 @@ async def extract_seed_phrase(request: Request) -> str:
 
 async def check_account_has_credit(
     subaccount: str,
-    main_account,
+    main_account: str,
     seed_phrase: str,
     substrate_url: str,
 ) -> bool:

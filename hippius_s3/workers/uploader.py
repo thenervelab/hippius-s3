@@ -4,10 +4,12 @@ import json
 import logging
 import random
 import time
+from types import TracebackType
 from typing import Any
 from typing import List
 from typing import Optional
 
+import redis.asyncio as async_redis
 from pydantic import BaseModel
 
 from hippius_s3.cache import FileSystemPartsStore
@@ -73,7 +75,13 @@ def compute_backoff_ms(attempt: int, base_ms: int = 1000, max_ms: int = 30000) -
 
 
 class Uploader:
-    def __init__(self, db_pool: Any, redis_client: Any, redis_queues_client: Any, config: Any):
+    def __init__(
+        self,
+        db_pool: Any,
+        redis_client: async_redis.Redis,  # type: ignore[type-arg]
+        redis_queues_client: async_redis.Redis,  # type: ignore[type-arg]
+        config: Any,
+    ) -> None:
         # Support either a Pool (has acquire) or a single Connection
         self.db = db_pool
         self.redis_client = redis_client
@@ -85,16 +93,21 @@ class Uploader:
         self.dlq_manager = UploadDLQManager(redis_queues_client)
 
     class _ConnCtx:
-        def __init__(self, conn: Any):
+        def __init__(self, conn: Any) -> None:
             self._conn = conn
 
-        async def __aenter__(self):
+        async def __aenter__(self) -> Any:
             return self._conn
 
-        async def __aexit__(self, exc_type, exc, tb):
+        async def __aexit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            tb: TracebackType | None,
+        ) -> bool:
             return False
 
-    def _acquire_conn(self):
+    def _acquire_conn(self) -> Any:
         """Return an async context manager yielding a connection.
 
         Works with either a Pool (has acquire) or a single Connection.

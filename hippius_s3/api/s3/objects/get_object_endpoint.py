@@ -226,6 +226,7 @@ async def handle_get_object(
 
         info_dict = {
             "object_id": str(object_info["object_id"]),
+            "bucket_id": str(object_info.get("bucket_id") or ""),
             "bucket_name": object_info["bucket_name"],
             "object_key": object_key,
             "size_bytes": int(object_info["size_bytes"]),
@@ -237,6 +238,12 @@ async def handle_get_object(
             # Ensure reader uses the current object version for cache keys and downloader
             "object_version": int(object_info.get("object_version") or 1),
             "storage_version": storage_version,
+            # v5 envelope encryption metadata (required when storage_version >= 5)
+            "encryption_version": object_info.get("encryption_version"),
+            "enc_suite_id": object_info.get("enc_suite_id"),
+            "enc_chunk_size_bytes": object_info.get("enc_chunk_size_bytes"),
+            "kek_id": object_info.get("kek_id"),
+            "wrapped_dek": object_info.get("wrapped_dek"),
             "ray_id": getattr(request.state, "ray_id", None),
         }
 

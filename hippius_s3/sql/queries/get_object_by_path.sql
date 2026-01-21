@@ -6,6 +6,11 @@ SELECT o.object_id, o.bucket_id, o.object_key,
        ov.append_version,
        ov.storage_version,
        ov.object_version,
+       ov.encryption_version,
+       ov.enc_suite_id,
+       ov.enc_chunk_size_bytes,
+       ov.kek_id,
+       ov.wrapped_dek,
        b.bucket_name
 FROM objects o
 JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version

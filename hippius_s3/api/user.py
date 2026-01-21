@@ -15,6 +15,7 @@ from hippius_sdk.substrate import SubstrateClient
 from starlette import status
 
 from hippius_s3.config import get_config
+from hippius_s3.dependencies import DBConnection
 from hippius_s3.dependencies import get_postgres
 from hippius_s3.services.acl_helper import has_public_read_acl
 from hippius_s3.utils import get_query
@@ -28,7 +29,7 @@ config = get_config()
 @router.get("/list_buckets")
 async def list_buckets(
     main_account_id: str = Query(..., description="Main account ID to list buckets for"),
-    db=Depends(get_postgres),
+    db: DBConnection = Depends(get_postgres),
 ) -> JSONResponse:
     """
     List all buckets owned by a specific main account.
@@ -79,7 +80,7 @@ async def list_buckets(
 async def get_bucket_location(
     bucket_name: str = Query(..., description="Bucket name to get location for"),
     main_account_id: str = Query(..., description="Main account ID that owns the bucket"),
-    db=Depends(get_postgres),
+    db: DBConnection = Depends(get_postgres),
 ) -> JSONResponse:
     """
     Get bucket location information for a specific bucket.
@@ -166,7 +167,7 @@ async def list_objects(
     prefix: Optional[str] = Query(None, description="Object key prefix filter"),
     limit: int = Query(100, ge=1, le=1000, description="Number of objects to return per page"),
     offset: int = Query(0, ge=0, description="Number of objects to skip"),
-    db=Depends(get_postgres),
+    db: DBConnection = Depends(get_postgres),
 ) -> JSONResponse:
     """
     List objects in a bucket owned by a specific main account with pagination.
