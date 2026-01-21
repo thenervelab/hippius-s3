@@ -2,8 +2,8 @@
 
 import logging
 import pathlib
-from datetime import UTC
 from datetime import datetime
+from datetime import timezone
 
 import aiofiles
 from fastapi import Request
@@ -12,6 +12,7 @@ from pyinstrument.renderers.speedscope import SpeedscopeRenderer
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
+from starlette.types import ASGIApp
 
 from hippius_s3.config import get_config
 
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 class SpeedscopeProfilerMiddleware(BaseHTTPMiddleware):
     """Profile requests when ENABLE_REQUEST_PROFILING environment variable is set to true."""
 
-    def __init__(self, app):
+    def __init__(self, app: ASGIApp) -> None:
         super().__init__(app)
         # Create profiler_runs directory if it doesn't exist
         self.profile_dir = pathlib.Path("profiler_runs")
@@ -47,7 +48,7 @@ class SpeedscopeProfilerMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         # Generate filename components before profiling
-        timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")[:-3]  # microseconds to milliseconds
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")[:-3]  # microseconds to milliseconds
         method = request.method
         # Clean URL path for filename (replace / with _)
         url_path = str(request.url.path).replace("/", "_").replace("?", "_")

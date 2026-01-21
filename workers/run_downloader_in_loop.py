@@ -69,7 +69,7 @@ async def process_download_request(
                 # Filter to entries that actually have a usable CID (IPFS-backed).
                 # CID-less entries are expected for some storage_version>=4 flows and should be skipped here.
                 cid_plan: list[tuple[int, str, int | None]] = []
-                for s in (chunk.chunks or []):
+                for s in chunk.chunks or []:
                     cid_raw = getattr(s, "cid", None)
                     if _is_placeholder_cid(cid_raw):
                         continue

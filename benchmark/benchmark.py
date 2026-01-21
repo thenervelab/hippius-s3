@@ -70,6 +70,7 @@ def compute_md5(file_path: Path) -> str:
 
 def sanitize_endpoint_name(endpoint: str) -> str:
     from urllib.parse import urlparse
+
     parsed = urlparse(endpoint)
     hostname = parsed.netloc or parsed.path
     return hostname.replace(":", "-").replace("/", "-")
@@ -347,9 +348,9 @@ def run_benchmark(
     if verify:
         original_hashes = compute_hashes(test_files_dir, test_file_list)
 
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print("UPLOAD PHASE")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
 
     for filename in test_file_list:
         file_path = test_files_dir / filename
@@ -357,20 +358,22 @@ def run_benchmark(
 
         upload_time, upload_speed = backend.upload_file(file_path=file_path, bucket=bucket, key=filename)
 
-        results.append({
-            "file_name": filename,
-            "file_size_mb": f"{size_mb:.2f}",
-            "upload_time_s": f"{upload_time:.2f}" if upload_time > 0 else "ERROR",
-            "upload_speed_mbps": f"{upload_speed:.2f}" if upload_speed > 0 else "ERROR",
-            "download_time_s": "",
-            "download_speed_mbps": "",
-            "hash_match": "",
-            "status": "uploaded" if upload_time > 0 else "upload_failed",
-        })
+        results.append(
+            {
+                "file_name": filename,
+                "file_size_mb": f"{size_mb:.2f}",
+                "upload_time_s": f"{upload_time:.2f}" if upload_time > 0 else "ERROR",
+                "upload_speed_mbps": f"{upload_speed:.2f}" if upload_speed > 0 else "ERROR",
+                "download_time_s": "",
+                "download_speed_mbps": "",
+                "hash_match": "",
+                "status": "uploaded" if upload_time > 0 else "upload_failed",
+            }
+        )
 
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print("DOWNLOAD PHASE")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
 
     for idx, filename in enumerate(test_file_list):
         if results[idx]["status"] == "upload_failed":
@@ -386,11 +389,11 @@ def run_benchmark(
 
         hash_match = "skipped"
         if verify and download_time > 0:
-            print(f"  Verifying integrity...")
+            print("  Verifying integrity...")
             downloaded_hash = compute_md5(download_path)
             hash_match = "true" if downloaded_hash == original_hashes[filename] else "false"
             if hash_match == "false":
-                print(f"  WARNING: Hash mismatch!")
+                print("  WARNING: Hash mismatch!")
                 print(f"    Original: {original_hashes[filename]}")
                 print(f"    Downloaded: {downloaded_hash}")
 
@@ -426,9 +429,9 @@ def save_results(results: List[Dict[str, Any]], csv_path: Path) -> None:
 
 
 def print_summary(results: List[Dict[str, Any]]) -> None:
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print("SUMMARY")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
 
     total_upload_time = 0
     total_download_time = 0
@@ -450,7 +453,7 @@ def print_summary(results: List[Dict[str, Any]]) -> None:
     print(f"Average upload speed: {avg_upload_speed:.2f} MB/s")
     print(f"Average download speed: {avg_download_speed:.2f} MB/s")
 
-    print(f"\nMultipart Configuration:")
+    print("\nMultipart Configuration:")
     print(f"  Multipart threshold: {MULTIPART_THRESHOLD / (1024 * 1024):.0f} MB")
     print(f"  Multipart chunk size: {MULTIPART_CHUNKSIZE / (1024 * 1024):.0f} MB")
     print(f"  Max concurrent requests: {MAX_CONCURRENT_REQUESTS}")
@@ -521,14 +524,14 @@ def main() -> None:
     script_dir = Path(__file__).parent
     test_files_dir = script_dir / "test_files"
 
-    print("="*80)
+    print("=" * 80)
     engine_label = "auto"
     if args.engine == "auto":
         engine_label = "awscli" if shutil.which("aws") else "boto3"
     else:
         engine_label = args.engine
     print(f"S3 Endpoint Benchmark ({engine_label} with Multipart)")
-    print("="*80)
+    print("=" * 80)
     print(f"Endpoint: {endpoint}")
     print(f"Region: {region}")
     print(f"Verify hashes: {not args.no_verify}")

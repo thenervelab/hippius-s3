@@ -16,6 +16,11 @@ from hippius_s3.config import get_config
 logger = logging.getLogger(__name__)
 
 
+def _normalize_queue_name(name: str) -> str:
+    """Strip whitespace and quotes from queue name."""
+    return name.strip().strip('"').strip("'")
+
+
 _queue_client: Optional[async_redis.Redis] = None
 
 
@@ -74,7 +79,7 @@ class UploadChainRequest(RetryableRequest):
     upload_id: str | None = None
 
     @property
-    def name(self):
+    def name(self) -> str:
         if self.upload_id is not None:
             return f"multipart::{self.object_id}::{self.upload_id}::{self.address}"
         return f"simple::{self.object_id}::{self.address}"
@@ -87,7 +92,7 @@ class UnpinChainRequest(RetryableRequest):
     cid: str
 
     @property
-    def name(self):
+    def name(self) -> str:
         return f"unpin::{self.cid}::{self.address}::{self.object_id}"
 
 
@@ -109,7 +114,7 @@ class DownloadChainRequest(RetryableRequest):
     expire_at: float | None = None
 
     @property
-    def name(self):
+    def name(self) -> str:
         return f"download::{self.request_id}::{self.object_id}::{self.address}"
 
 
@@ -127,10 +132,7 @@ async def enqueue_upload_request(payload: UploadChainRequest) -> None:
     raw = payload.model_dump_json()
     queue_names_str: str = config.upload_queue_names
 
-    def _norm(name: str) -> str:
-        return name.strip().strip('"').strip("'")
-
-    queue_names: List[str] = [_norm(q) for q in queue_names_str.split(",") if _norm(q)]
+    queue_names: List[str] = [_normalize_queue_name(q) for q in queue_names_str.split(",") if _normalize_queue_name(q)]
     for qname in queue_names:
         await client.lpush(qname, raw)
     logger.info(f"Enqueued upload request {payload.name=} queues={queue_names}")
@@ -142,10 +144,7 @@ async def dequeue_upload_request() -> UploadChainRequest | None:
     config = get_config()
     queue_names_str: str = config.upload_queue_names
 
-    def _norm(name: str) -> str:
-        return name.strip().strip('"').strip("'")
-
-    queue_names: List[str] = [_norm(q) for q in queue_names_str.split(",") if _norm(q)]
+    queue_names: List[str] = [_normalize_queue_name(q) for q in queue_names_str.split(",") if _normalize_queue_name(q)]
     queue_name: str = queue_names[0] if queue_names else "upload_requests"
     result = await client.brpop(queue_name, timeout=0.5)
     if result:
@@ -188,10 +187,7 @@ async def move_due_retries_to_primary(
     config = get_config()
     queue_names_str: str = config.upload_queue_names
 
-    def _norm(name: str) -> str:
-        return name.strip().strip('"').strip("'")
-
-    queue_names: List[str] = [_norm(q) for q in queue_names_str.split(",") if _norm(q)]
+    queue_names: List[str] = [_normalize_queue_name(q) for q in queue_names_str.split(",") if _normalize_queue_name(q)]
     primary_queue: str = queue_names[0] if queue_names else "upload_requests"
 
     now_ts = time.time() if now_ts is None else now_ts
@@ -281,10 +277,7 @@ async def enqueue_download_request(payload: DownloadChainRequest) -> None:
     config = get_config()
     queue_names_str: str = config.download_queue_names
 
-    def _norm(name: str) -> str:
-        return name.strip().strip('"').strip("'")
-
-    queue_names: list[str] = [_norm(q) for q in queue_names_str.split(",") if _norm(q)]
+    queue_names: list[str] = [_normalize_queue_name(q) for q in queue_names_str.split(",") if _normalize_queue_name(q)]
     if not queue_names:
         queue_names = ["download_requests"]
 
