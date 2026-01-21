@@ -117,9 +117,10 @@ class Config:
     # Generated on first run if not provided
     api_signing_key: str = env("API_SIGNING_KEY:" + str(uuid.uuid4()))
 
-    # s3 specific settings
-    max_multipart_file_size: int = 15 * 1024 * 1024 * 1024  # 15GB
-    max_multipart_chunk_size: int = 128 * 1024 * 1024  # 128 MB
+    # S3 multipart upload settings
+    max_multipart_part_size: int = 512 * 1024 * 1024  # 512 MiB per part
+    max_multipart_part_count: int = 10000  # AWS S3 standard
+    max_object_size: int = 0  # Computed at runtime in get_config()
 
     # worker specific settings
     unpinner_sleep_loop: float = 5.0
@@ -243,5 +244,10 @@ def get_config() -> Config:
     # - Only in 'test' can enable_bypass_credit_check be True
     if env_value.lower() != "test":
         object.__setattr__(cfg, "enable_bypass_credit_check", False)
+
+    # Compute max object size: min of S3 standard (5 TiB) and (part_size × part_count)
+    s3_max_object_size = 5 * 1024**4  # 5 TiB - AWS S3 max object size
+    computed_max = cfg.max_multipart_part_size * cfg.max_multipart_part_count
+    object.__setattr__(cfg, "max_object_size", min(s3_max_object_size, computed_max))
 
     return cfg

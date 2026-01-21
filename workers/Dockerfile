@@ -1,4 +1,5 @@
-FROM hippius-s3-base:latest
+ARG BASE_IMAGE=ghcr.io/thenervelab/hippius-s3/base:latest
+FROM ${BASE_IMAGE}
 
 COPY . .
 
