@@ -91,6 +91,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         config = app.state.config
         _warn_if_no_aes_hw_accel()
 
+        # Initialize KMS client (fail-fast in required mode, no-op in disabled mode)
+        from hippius_s3.services.kek_service import init_kms_client
+
+        await init_kms_client(config)
+
         app.state.postgres_pool = await postgres_create_pool(config.database_url, config)
         logger.info(f"Postgres connection pool created: min={config.db_pool_min_size}, max={config.db_pool_max_size}")
 

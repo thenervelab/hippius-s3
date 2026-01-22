@@ -37,10 +37,13 @@ services:
         condition: service_healthy
       redis-queues:
         condition: service_healthy
+      mock-kms:
+        condition: service_healthy
     volumes:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
       - ./.e2e/dlq_archive:/tmp/hippius_dlq_archive
+      - kms_certs:/kms_certs:ro
     networks:
       - hippius_net
 
@@ -55,8 +58,11 @@ services:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
       - ./.e2e/dlq_archive:/tmp/hippius_dlq_archive
+      - kms_certs:/kms_certs:ro
     depends_on:
       mock-hippius-api:
+        condition: service_healthy
+      mock-kms:
         condition: service_healthy
 
   unpinner:
@@ -100,6 +106,34 @@ services:
       timeout: 3s
       retries: 5
 
+  mock-kms:
+    build:
+      context: .
+      dockerfile: tests/e2e/Dockerfile.mock-kms
+    ports:
+      - "127.0.0.1:8443:8443"
+    environment:
+      - MOCK_KMS_MASTER_KEY=test-master-key-0123456789abcdef
+      # Client cert optional for mock - healthcheck can't easily provide certs.
+      # mTLS is still validated by actual api/worker connections which provide certs.
+      - MOCK_KMS_REQUIRE_CLIENT_CERT=false
+      - KMS_CERT_PATH=/certs/server.crt
+      - KMS_KEY_PATH=/certs/server.key
+      - KMS_CA_PATH=/certs/ca.crt
+    volumes:
+      - kms_certs:/certs
+    networks:
+      - hippius_net
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'python -c ''import httpx; httpx.get("https://localhost:8443/health", timeout=1, verify=False).raise_for_status()'' || exit 1',
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   toxiproxy:
     image: shopify/toxiproxy:latest
     ports:
@@ -120,6 +154,7 @@ services:
       - .:/app
 
   ipfs:
+    image: ipfs/kubo:latest
     user: "0:0"
     ports:
       - "127.0.0.1:8081:8080"
@@ -209,6 +244,7 @@ services:
 
 volumes:
   ipfs_data:
+  kms_certs:
 
 networks:
   hippius_net:

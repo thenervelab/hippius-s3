@@ -1,0 +1,24 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends openssl && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir fastapi uvicorn pydantic
+
+COPY tests/e2e/mock_kms_server.py /app/mock_kms_server.py
+COPY tests/e2e/certs/generate.sh /app/generate_certs.sh
+
+# Create certs directory and generate certs at build time
+RUN mkdir -p /certs && chmod +x /app/generate_certs.sh
+
+# Startup script that generates certs if missing, then runs server
+RUN echo '#!/bin/bash\n\
+set -e\n\
+if [ ! -f /certs/server.crt ]; then\n\
+    echo "Generating certificates..."\n\
+    /app/generate_certs.sh /certs\n\
+fi\n\
+exec python /app/mock_kms_server.py\n' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+
+CMD ["/app/entrypoint.sh"]

@@ -111,6 +111,10 @@ _TOXI_LISTEN_CTL = os.environ.get("TOXI_LISTEN_CTL", "0.0.0.0:15001")
 _TOXI_UPSTREAM_GET = os.environ.get("TOXI_UPSTREAM_GET", "ipfs:8080")
 _TOXI_UPSTREAM_CTL = os.environ.get("TOXI_UPSTREAM_CTL", "ipfs:5001")
 
+# KMS proxy config
+_TOXI_LISTEN_KMS = os.environ.get("TOXI_LISTEN_KMS", "0.0.0.0:18443")
+_TOXI_UPSTREAM_KMS = os.environ.get("TOXI_UPSTREAM_KMS", "mock-kms:8443")
+
 
 def _toxiproxy_get(name: str) -> requests.Response:
     return requests.get(f"{_TOXI_BASE}/proxies/{name}", timeout=2)
@@ -214,3 +218,63 @@ def wait_for_toxiproxy(timeout_seconds: float = 10.0, poll_seconds: float = 0.5)
             pass
         time.sleep(poll_seconds)
     return False
+
+
+# ---- KMS Toxiproxy helpers ----
+
+
+def _ensure_kms_proxy() -> None:
+    """Ensure the KMS proxy exists in toxiproxy."""
+    try:
+        r = _toxiproxy_get("kms")
+        if r.status_code == 404:
+            print(f"DEBUG: Creating kms proxy: {_TOXI_LISTEN_KMS} -> {_TOXI_UPSTREAM_KMS}")
+            ok = _toxiproxy_create("kms", _TOXI_LISTEN_KMS, _TOXI_UPSTREAM_KMS)
+            if not ok:
+                raise RuntimeError("failed to create toxiproxy kms")
+            print("DEBUG: Created kms proxy")
+    except Exception as e:
+        print(f"DEBUG: Error ensuring KMS proxy: {e}")
+        raise
+
+
+def disable_kms_proxy() -> None:
+    """Disable KMS proxy to simulate KMS outage."""
+    _ensure_kms_proxy()
+    ok = _toxiproxy_set_enabled("kms", enabled=False)
+    if not ok:
+        raise RuntimeError("failed to disable kms proxy")
+
+
+def enable_kms_proxy() -> None:
+    """Enable KMS proxy to restore KMS connectivity."""
+    _ensure_kms_proxy()
+    ok = _toxiproxy_set_enabled("kms", enabled=True)
+    if not ok:
+        raise RuntimeError("failed to enable kms proxy")
+
+
+def pause_service(service: str) -> None:
+    """Pause a service by disabling its toxiproxy.
+
+    Supported services: 'mock-kms', 'ipfs'
+    """
+    if service == "mock-kms":
+        disable_kms_proxy()
+    elif service == "ipfs":
+        disable_ipfs_proxy()
+    else:
+        raise ValueError(f"Unknown service: {service}. Supported: mock-kms, ipfs")
+
+
+def unpause_service(service: str) -> None:
+    """Unpause a service by enabling its toxiproxy.
+
+    Supported services: 'mock-kms', 'ipfs'
+    """
+    if service == "mock-kms":
+        enable_kms_proxy()
+    elif service == "ipfs":
+        enable_ipfs_proxy()
+    else:
+        raise ValueError(f"Unknown service: {service}. Supported: mock-kms, ipfs")
