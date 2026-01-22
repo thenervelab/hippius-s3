@@ -200,16 +200,19 @@ def test_overwrite_object_reuses_kek(
 
 
 @pytest.mark.local
-def test_kms_outage_blocks_new_bucket_operations(
+def test_kms_outage_blocks_new_object_operations(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
 ) -> None:
-    """When KMS is down, new bucket creation fails (fail-closed).
+    """When KMS is down, new object creation fails (fail-closed).
 
-    Creating a new bucket requires wrapping a new KEK, which needs KMS.
+    Writing an object to a new bucket requires wrapping a new KEK, which needs KMS.
     This verifies the system doesn't silently fall back to unprotected keys.
+
+    Note: Bucket creation itself doesn't require KMS - the KEK is only created
+    when the first object is written to the bucket.
     """
     import time
 
@@ -221,16 +224,26 @@ def test_kms_outage_blocks_new_bucket_operations(
     bucket = unique_bucket_name("kms-outage")
     cleanup_buckets(bucket)
 
-    # Pause mock KMS via toxiproxy
+    # Create bucket while KMS is up (bucket creation doesn't need KMS)
+    boto3_client.create_bucket(Bucket=bucket)
+
+    # Pause mock KMS via toxiproxy (deletes the proxy)
     pause_service("mock-kms")
 
     try:
-        # Give a moment for the proxy to fully disable
-        time.sleep(0.5)
+        # Give time for proxy to fully close and connections to drop
+        time.sleep(2.0)
 
-        # Creating a bucket should fail - can't wrap new KEK without KMS
-        with pytest.raises(ClientError):
-            boto3_client.create_bucket(Bucket=bucket)
+        # Writing an object should fail - can't wrap new KEK without KMS
+        with pytest.raises(ClientError) as exc_info:
+            boto3_client.put_object(Bucket=bucket, Key="test.txt", Body=b"test content")
+
+        # Verify it's a server error (500), not a client error
+        assert exc_info.value.response["Error"]["Code"] in (
+            "InternalServerError",
+            "InternalError",
+            "500",
+        ) or exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 500
     finally:
         unpause_service("mock-kms")
 

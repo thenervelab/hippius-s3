@@ -130,13 +130,12 @@ def _toxiproxy_create(name: str, listen: str, upstream: str) -> bool:
 
 
 def _toxiproxy_set_enabled(name: str, enabled: bool) -> bool:
-    # Toxiproxy API requires PUTting the full proxy config, not just the enabled field
-    get_url = f"{_TOXI_BASE}/proxies/{name}"
-    put_url = f"{_TOXI_BASE}/proxies/{name}"
+    # Toxiproxy API requires POSTing the full proxy config to update (not PUT)
+    url = f"{_TOXI_BASE}/proxies/{name}"
     print(f"DEBUG: Setting proxy {name} enabled={enabled}")
 
     # First get current proxy config
-    get_resp = requests.get(get_url, timeout=3)
+    get_resp = requests.get(url, timeout=3)
     if get_resp.status_code != 200:
         print(f"DEBUG: Failed to get proxy config: {get_resp.status_code}, {get_resp.text}")
         return False
@@ -144,17 +143,22 @@ def _toxiproxy_set_enabled(name: str, enabled: bool) -> bool:
     proxy_config = get_resp.json()
     print(f"DEBUG: Current proxy config: {proxy_config}")
 
+    # If already in desired state, skip the update
+    if proxy_config.get("enabled") == enabled:
+        print(f"DEBUG: Proxy already in desired state (enabled={enabled})")
+        return True
+
     # Update enabled field
     proxy_config["enabled"] = enabled
 
-    # PUT back the full config
-    put_resp = requests.put(
-        put_url,
+    # POST back the full config (Toxiproxy uses POST for updates, not PUT)
+    post_resp = requests.post(
+        url,
         json=proxy_config,
         timeout=3,
     )
-    print(f"DEBUG: PUT response status: {put_resp.status_code}, content: {put_resp.text}")
-    return put_resp.status_code in (200, 204)
+    print(f"DEBUG: POST response status: {post_resp.status_code}, content: {post_resp.text}")
+    return post_resp.status_code in (200, 201)
 
 
 def _toxiproxy_delete(name: str) -> bool:
@@ -239,19 +243,23 @@ def _ensure_kms_proxy() -> None:
 
 
 def disable_kms_proxy() -> None:
-    """Disable KMS proxy to simulate KMS outage."""
-    _ensure_kms_proxy()
-    ok = _toxiproxy_set_enabled("kms", enabled=False)
-    if not ok:
-        raise RuntimeError("failed to disable kms proxy")
+    """Disable KMS proxy to simulate KMS outage.
+
+    Uses delete approach (like IPFS proxies) rather than enabled=false,
+    because enabled=false only refuses new connections but doesn't
+    break existing ones immediately.
+    """
+    print("DEBUG: Disabling KMS proxy by deleting it")
+    try:
+        ok = _toxiproxy_delete("kms")
+        print(f"DEBUG: Delete result: {ok}")
+    except Exception as e:
+        print(f"DEBUG: Delete failed with exception: {e}")
 
 
 def enable_kms_proxy() -> None:
     """Enable KMS proxy to restore KMS connectivity."""
     _ensure_kms_proxy()
-    ok = _toxiproxy_set_enabled("kms", enabled=True)
-    if not ok:
-        raise RuntimeError("failed to enable kms proxy")
 
 
 def pause_service(service: str) -> None:
