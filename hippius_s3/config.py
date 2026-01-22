@@ -182,6 +182,7 @@ class Config:
     # OVH KMS Configuration (for KEK wrapping)
     # Required when kms_mode=required, ignored when kms_mode=disabled
     ovh_kms_endpoint: str = env("HIPPIUS_OVH_KMS_ENDPOINT:", convert=str)
+    ovh_kms_okms_id: str = env("HIPPIUS_OVH_KMS_OKMS_ID:", convert=str)
     ovh_kms_default_key_id: str = env("HIPPIUS_OVH_KMS_DEFAULT_KEY_ID:", convert=str)
     ovh_kms_cert_path: str = env("HIPPIUS_OVH_KMS_CERT_PATH:", convert=str)
     ovh_kms_key_path: str = env("HIPPIUS_OVH_KMS_KEY_PATH:", convert=str)
@@ -280,6 +281,7 @@ def get_config() -> Config:
         # KMS is mandatory - validate all env vars are present at config time
         kms_vars = [
             ("ovh_kms_endpoint", "HIPPIUS_OVH_KMS_ENDPOINT"),
+            ("ovh_kms_okms_id", "HIPPIUS_OVH_KMS_OKMS_ID"),
             ("ovh_kms_default_key_id", "HIPPIUS_OVH_KMS_DEFAULT_KEY_ID"),
             ("ovh_kms_cert_path", "HIPPIUS_OVH_KMS_CERT_PATH"),
             ("ovh_kms_key_path", "HIPPIUS_OVH_KMS_KEY_PATH"),

@@ -148,22 +148,25 @@ def _get_kms_client() -> "OVHKMSClient | None":  # type: ignore[name-defined]
     return _KMS_CLIENT
 
 
-async def _wrap_kek(plaintext: bytes, context: str) -> tuple[bytes, str]:
-    """Wrap a KEK using KMS or local wrapping.
+async def _create_wrapped_kek(context: str) -> tuple[bytes, bytes, str]:
+    """Generate a new KEK and wrap it using KMS or local wrapping.
+
+    For KMS mode: KMS generates and wraps the key (centralizes key generation)
+    For local mode: We generate the key and wrap it locally
 
     Args:
-        plaintext: Plaintext KEK bytes to wrap
         context: Context for error messages
 
     Returns:
-        Tuple of (wrapped_bytes, key_id)
-        - For KMS: key_id is the KMS key ID
-        - For local: key_id is "local"
+        Tuple of (kek_plaintext, wrapped_bytes, key_id)
+        - kek_plaintext: The plaintext KEK for immediate use
+        - wrapped_bytes: The wrapped key to store in DB
+        - key_id: KMS key ID or "local"
     """
     kms_client = _get_kms_client()
 
     if kms_client is not None:
-        # Use KMS wrapping
+        # Use KMS - it generates AND wraps the key in one call
         from hippius_s3.services.ovh_kms_client import OVHKMSAuthenticationError
         from hippius_s3.services.ovh_kms_client import OVHKMSError
         from hippius_s3.services.ovh_kms_client import OVHKMSUnavailableError
@@ -172,16 +175,18 @@ async def _wrap_kek(plaintext: bytes, context: str) -> tuple[bytes, str]:
         key_id = cfg.ovh_kms_default_key_id
 
         try:
-            wrapped = await kms_client.wrap_key(plaintext, key_id=key_id)
-            return wrapped, key_id
+            kek_bytes, wrapped_jwe = await kms_client.generate_data_key(key_id=key_id, name="kek")
+            # Store JWE string as UTF-8 bytes in DB
+            wrapped_bytes = wrapped_jwe.encode("utf-8")
+            return kek_bytes, wrapped_bytes, key_id
         except OVHKMSAuthenticationError as e:
-            logger.error(f"KMS authentication failed during wrap ({context}): {e}")
+            logger.error(f"KMS authentication failed during key generation ({context}): {e}")
             raise RuntimeError("kms_auth_failed") from e
         except OVHKMSUnavailableError as e:
-            logger.error(f"KMS unavailable during wrap ({context}): {e}")
+            logger.error(f"KMS unavailable during key generation ({context}): {e}")
             raise RuntimeError("kms_unavailable") from e
         except OVHKMSError as e:
-            logger.error(f"KMS error during wrap ({context}): {e}")
+            logger.error(f"KMS error during key generation ({context}): {e}")
             raise RuntimeError("kms_error") from e
     else:
         # Use local software wrapping (derives key from HIPPIUS_AUTH_ENCRYPTION_KEY)
@@ -189,11 +194,13 @@ async def _wrap_kek(plaintext: bytes, context: str) -> tuple[bytes, str]:
         from hippius_s3.services.local_kek_wrapper import wrap_key_local
 
         cfg = get_config()
+        # Generate random KEK locally
+        kek_bytes = os.urandom(KEK_SIZE_BYTES)
         # hippius_secret_decryption_material = HIPPIUS_AUTH_ENCRYPTION_KEY env var
         secret = cfg.hippius_secret_decryption_material
-        wrapped = wrap_key_local(plaintext, secret)
-        logger.debug(f"Wrapped KEK using local software wrapping ({context})")
-        return wrapped, LOCAL_WRAP_KEY_ID
+        wrapped_bytes = wrap_key_local(kek_bytes, secret)
+        logger.debug(f"Created KEK using local software wrapping ({context})")
+        return kek_bytes, wrapped_bytes, LOCAL_WRAP_KEY_ID
 
 
 async def _unwrap_kek(
@@ -204,7 +211,7 @@ async def _unwrap_kek(
     """Unwrap a KEK using KMS or local unwrapping based on stored key_id.
 
     Args:
-        wrapped: Wrapped key bytes
+        wrapped: Wrapped key bytes (JWE string for KMS, AES-GCM ciphertext for local)
         stored_key_id: The key ID stored with the wrapped key
                       ("local" for software wrap, KMS key ID otherwise)
         kek_id: The KEK ID (for logging)
@@ -244,15 +251,24 @@ async def _unwrap_kek(
         from hippius_s3.services.ovh_kms_client import OVHKMSUnavailableError
 
         try:
-            return await kms_client.unwrap_key(wrapped, key_id=stored_key_id)
+            # Wrapped key is stored as UTF-8 bytes (JWE string)
+            try:
+                wrapped_jwe = wrapped.decode("utf-8")
+            except UnicodeDecodeError as e:
+                logger.error(
+                    f"Invalid wrapped key format (kek_id={kek_id}, key_id={stored_key_id}): "
+                    "not valid UTF-8 - possible DB corruption or format mismatch"
+                )
+                raise RuntimeError("kms_error") from e
+            return await kms_client.decrypt_data_key(wrapped_jwe, key_id=stored_key_id)
         except OVHKMSAuthenticationError as e:
-            logger.error(f"KMS authentication failed during unwrap (kek_id={kek_id}): {e}")
+            logger.error(f"KMS authentication failed during decrypt (kek_id={kek_id}): {e}")
             raise RuntimeError("kms_auth_failed") from e
         except OVHKMSUnavailableError as e:
-            logger.error(f"KMS unavailable during unwrap (kek_id={kek_id}): {e}")
+            logger.error(f"KMS unavailable during decrypt (kek_id={kek_id}): {e}")
             raise RuntimeError("kms_unavailable") from e
         except OVHKMSError as e:
-            logger.error(f"KMS error during unwrap (kek_id={kek_id}): {e}")
+            logger.error(f"KMS error during decrypt (kek_id={kek_id}): {e}")
             raise RuntimeError("kms_error") from e
 
 
@@ -374,12 +390,9 @@ async def get_or_create_active_bucket_kek(
             await _set_cached_kek(bucket_id, kek_id, kek_bytes)
             return kek_id, kek_bytes
 
-        # Create new KEK
+        # Create new KEK (KMS generates the key, or we generate locally)
         kek_id = uuid.uuid4()
-        kek_bytes = os.urandom(KEK_SIZE_BYTES)
-
-        # Wrap the KEK (using KMS or local wrapping)
-        wrapped_kek_bytes, kms_key_id = await _wrap_kek(kek_bytes, f"new KEK for bucket {bucket_id}")
+        kek_bytes, wrapped_kek_bytes, kms_key_id = await _create_wrapped_kek(f"new KEK for bucket {bucket_id}")
 
         try:
             await conn.execute(

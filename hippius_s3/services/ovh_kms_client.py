@@ -1,4 +1,4 @@
-"""OVH KMS client for wrapping/unwrapping KEKs using mTLS authentication."""
+"""OVH KMS client for generating/decrypting data keys using mTLS authentication."""
 
 from __future__ import annotations
 
@@ -46,11 +46,15 @@ def _compute_backoff_ms(attempt: int, base_ms: int = 500, max_ms: int = 5000) ->
 class OVHKMSClient:
     """Client for OVH KMS API with mTLS authentication.
 
-    Provides wrap (encrypt) and unwrap (decrypt) operations for KEK management.
+    Provides data key generation and decryption for KEK management.
     Uses exponential backoff retry for transient errors.
 
+    OVH KMS uses a data key generation model:
+    - generate_data_key(): KMS generates a random key, returns both plaintext and wrapped
+    - decrypt_data_key(): Decrypts (unwraps) a previously wrapped key
+
     Key rotation support:
-    - wrap_key() and unwrap_key() accept key_id per call
+    - generate_data_key() and decrypt_data_key() accept key_id per call
     - New KEKs should use cfg.ovh_kms_default_key_id
     - Existing KEKs use the key_id stored in their DB row
     - This allows seamless rotation: old keys remain decryptable
@@ -77,6 +81,7 @@ class OVHKMSClient:
             config = get_config()
 
         self._endpoint = config.ovh_kms_endpoint.rstrip("/")
+        self._okms_id = config.ovh_kms_okms_id
         self._timeout = config.ovh_kms_timeout_seconds
         self._max_retries = config.ovh_kms_max_retries
         self._retry_base_ms = config.ovh_kms_retry_base_ms
@@ -162,45 +167,46 @@ class OVHKMSClient:
             )
             await asyncio.sleep(wait_interval)
 
-    async def wrap_key(self, plaintext: bytes, *, key_id: str) -> bytes:
-        """Wrap a key using the specified KMS key.
+    async def generate_data_key(self, *, key_id: str, name: str = "kek") -> tuple[bytes, str]:
+        """Generate a new data key using the specified KMS key.
 
-        Uses the dedicated /wrap endpoint (wrapKey operation), which allows
-        configuring the KMS key with only wrap/unwrap permissions for tighter security.
+        KMS generates a random 256-bit key and returns both the plaintext
+        (for immediate use) and the wrapped version (for storage).
+        Centralizes key generation for auditability and policy controls.
 
         Args:
-            plaintext: The plaintext key bytes to wrap.
-            key_id: The KMS key ID to use for wrapping (typically the default key).
+            key_id: The KMS service key ID to use for wrapping.
+            name: Optional name for the data key (for KMS tracking).
 
         Returns:
-            The wrapped key bytes.
+            Tuple of (plaintext_bytes, wrapped_jwe_string).
+            - plaintext_bytes: The raw 32-byte key for immediate use
+            - wrapped_jwe_string: JWE token to store in DB (for later decryption)
 
         Raises:
             OVHKMSAuthenticationError: On authentication failure (401/403).
             OVHKMSUnavailableError: On transient errors after max retries.
             OVHKMSError: On other errors.
         """
-        url = f"/v1/servicekey/{key_id}/wrap"
-        payload = {"plaintext": base64.b64encode(plaintext).decode("ascii")}
+        url = f"/api/{self._okms_id}/v1/servicekey/{key_id}/datakey"
+        payload = {"name": name, "size": 256}
 
         response = await self._request_with_retry("POST", url, json=payload)
 
         try:
             data = response.json()
-            ciphertext_b64 = data["ciphertext"]
-            return base64.b64decode(ciphertext_b64)
+            plaintext_b64 = data["plaintext"]
+            wrapped_jwe = data["key"]
+            return base64.b64decode(plaintext_b64), wrapped_jwe
         except (KeyError, ValueError) as e:
-            raise OVHKMSError(f"Invalid response from KMS wrap: {e}") from e
+            raise OVHKMSError(f"Invalid response from KMS generate_data_key: {e}") from e
 
-    async def unwrap_key(self, wrapped: bytes, *, key_id: str) -> bytes:
-        """Unwrap a key using the specified KMS key.
-
-        Uses the dedicated /unwrap endpoint (unwrapKey operation), which allows
-        configuring the KMS key with only wrap/unwrap permissions for tighter security.
+    async def decrypt_data_key(self, wrapped_jwe: str, *, key_id: str) -> bytes:
+        """Decrypt (unwrap) a data key using the specified KMS key.
 
         Args:
-            wrapped: The wrapped key bytes.
-            key_id: The KMS key ID that was used to wrap (from DB row).
+            wrapped_jwe: The JWE token returned by generate_data_key().
+            key_id: The KMS service key ID that was used to wrap (from DB row).
 
         Returns:
             The plaintext key bytes.
@@ -210,8 +216,8 @@ class OVHKMSClient:
             OVHKMSUnavailableError: On transient errors after max retries.
             OVHKMSError: On other errors.
         """
-        url = f"/v1/servicekey/{key_id}/unwrap"
-        payload = {"ciphertext": base64.b64encode(wrapped).decode("ascii")}
+        url = f"/api/{self._okms_id}/v1/servicekey/{key_id}/datakey/decrypt"
+        payload = {"key": wrapped_jwe}
 
         response = await self._request_with_retry("POST", url, json=payload)
 
@@ -220,7 +226,7 @@ class OVHKMSClient:
             plaintext_b64 = data["plaintext"]
             return base64.b64decode(plaintext_b64)
         except (KeyError, ValueError) as e:
-            raise OVHKMSError(f"Invalid response from KMS unwrap: {e}") from e
+            raise OVHKMSError(f"Invalid response from KMS decrypt_data_key: {e}") from e
 
     async def _request_with_retry(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         """Make an HTTP request with exponential backoff retry.
