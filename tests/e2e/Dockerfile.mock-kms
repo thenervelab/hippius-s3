@@ -4,7 +4,7 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends openssl && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir fastapi uvicorn pydantic
+RUN pip install --no-cache-dir fastapi uvicorn pydantic httpx
 
 COPY tests/e2e/mock_kms_server.py /app/mock_kms_server.py
 COPY tests/e2e/certs/generate.sh /app/generate_certs.sh
