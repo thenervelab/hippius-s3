@@ -21,6 +21,7 @@ def mock_config():
     """Create a mock config for KMS client tests."""
     config = MagicMock()
     config.ovh_kms_endpoint = "https://eu-west-rbx.okms.ovh.net"
+    config.ovh_kms_okms_id = "test-okms-id"
     config.ovh_kms_default_key_id = "test-key-id"
     config.ovh_kms_cert_path = "/path/to/client.crt"
     config.ovh_kms_key_path = "/path/to/client.key"
@@ -76,15 +77,16 @@ class TestOVHKMSClient:
         """Auto-use the mock_cert_paths fixture for all tests in this class."""
         pass
 
-    async def test_wrap_key_success(self, mock_config):
-        """Wrap returns base64-decoded ciphertext."""
-        plaintext = b"plaintext-kek-32-bytes-12345678"
-        expected_wrapped = b"wrapped-ciphertext"
+    async def test_generate_data_key_success(self, mock_config):
+        """Generate returns plaintext and wrapped JWE."""
+        expected_plaintext = b"plaintext-kek-32-bytes-12345678"
+        expected_wrapped_jwe = "mock-jwe.wrapped-data"
 
         mock_response = MagicMock()
-        mock_response.status_code = 200
+        mock_response.status_code = 201
         mock_response.json.return_value = {
-            "ciphertext": base64.b64encode(expected_wrapped).decode()
+            "plaintext": base64.b64encode(expected_plaintext).decode(),
+            "key": expected_wrapped_jwe,
         }
 
         with patch("httpx.AsyncClient") as MockClient:
@@ -93,18 +95,19 @@ class TestOVHKMSClient:
             MockClient.return_value = mock_client_instance
 
             client = OVHKMSClient(config=mock_config)
-            result = await client.wrap_key(plaintext, key_id="test-key-id")
+            plaintext, wrapped = await client.generate_data_key(key_id="test-key-id")
 
-            assert result == expected_wrapped
+            assert plaintext == expected_plaintext
+            assert wrapped == expected_wrapped_jwe
             mock_client_instance.request.assert_called_once()
             call_args = mock_client_instance.request.call_args
             assert call_args[0][0] == "POST"
-            # Verify full path format: /v1/servicekey/{key_id}/wrap
-            assert call_args[0][1] == "/v1/servicekey/test-key-id/wrap"
+            # Verify full path format: /api/{okms_id}/v1/servicekey/{key_id}/datakey
+            assert call_args[0][1] == "/api/test-okms-id/v1/servicekey/test-key-id/datakey"
 
-    async def test_unwrap_key_success(self, mock_config):
-        """Unwrap returns base64-decoded plaintext."""
-        wrapped = b"wrapped-ciphertext"
+    async def test_decrypt_data_key_success(self, mock_config):
+        """Decrypt returns base64-decoded plaintext."""
+        wrapped_jwe = "mock-jwe.wrapped-data"
         expected_plaintext = b"plaintext-kek-32-bytes-12345678"
 
         mock_response = MagicMock()
@@ -119,24 +122,25 @@ class TestOVHKMSClient:
             MockClient.return_value = mock_client_instance
 
             client = OVHKMSClient(config=mock_config)
-            result = await client.unwrap_key(wrapped, key_id="test-key-id")
+            result = await client.decrypt_data_key(wrapped_jwe, key_id="test-key-id")
 
             assert result == expected_plaintext
             mock_client_instance.request.assert_called_once()
             call_args = mock_client_instance.request.call_args
             assert call_args[0][0] == "POST"
-            # Verify full path format: /v1/servicekey/{key_id}/unwrap
-            assert call_args[0][1] == "/v1/servicekey/test-key-id/unwrap"
+            # Verify full path format: /api/{okms_id}/v1/servicekey/{key_id}/datakey/decrypt
+            assert call_args[0][1] == "/api/test-okms-id/v1/servicekey/test-key-id/datakey/decrypt"
 
-    async def test_wrap_key_uses_provided_key_id(self, mock_config):
-        """Wrap uses the provided key_id in the URL (supports rotation)."""
-        plaintext = b"plaintext-kek"
-        expected_wrapped = b"wrapped"
+    async def test_generate_data_key_uses_provided_key_id(self, mock_config):
+        """Generate uses the provided key_id in the URL (supports rotation)."""
+        expected_plaintext = b"plaintext-kek"
+        expected_wrapped = "mock-jwe.wrapped"
 
         mock_response = MagicMock()
-        mock_response.status_code = 200
+        mock_response.status_code = 201
         mock_response.json.return_value = {
-            "ciphertext": base64.b64encode(expected_wrapped).decode()
+            "plaintext": base64.b64encode(expected_plaintext).decode(),
+            "key": expected_wrapped,
         }
 
         with patch("httpx.AsyncClient") as MockClient:
@@ -145,14 +149,14 @@ class TestOVHKMSClient:
             MockClient.return_value = mock_client_instance
 
             client = OVHKMSClient(config=mock_config)
-            await client.wrap_key(plaintext, key_id="custom-key-123")
+            await client.generate_data_key(key_id="custom-key-123")
 
             call_args = mock_client_instance.request.call_args
             assert "custom-key-123" in call_args[0][1]
 
-    async def test_unwrap_key_uses_stored_key_id(self, mock_config):
-        """Unwrap uses the provided key_id (supports key rotation)."""
-        wrapped = b"wrapped"
+    async def test_decrypt_data_key_uses_stored_key_id(self, mock_config):
+        """Decrypt uses the provided key_id (supports key rotation)."""
+        wrapped_jwe = "mock-jwe.wrapped"
         expected_plaintext = b"plaintext"
 
         mock_response = MagicMock()
@@ -168,31 +172,32 @@ class TestOVHKMSClient:
 
             client = OVHKMSClient(config=mock_config)
             # Use a different key ID than the default - simulates rotation
-            await client.unwrap_key(wrapped, key_id="old-rotated-key-456")
+            await client.decrypt_data_key(wrapped_jwe, key_id="old-rotated-key-456")
 
             call_args = mock_client_instance.request.call_args
             assert "old-rotated-key-456" in call_args[0][1]
 
-    async def test_wrap_key_retry_on_503(self, mock_config):
+    async def test_generate_data_key_retry_on_503(self, mock_config):
         """Retries on 5xx, eventually succeeds."""
-        plaintext = b"plaintext-kek"
-        expected_wrapped = b"wrapped"
+        expected_plaintext = b"plaintext-kek"
+        expected_wrapped = "mock-jwe.wrapped"
 
         # First two calls fail with 503, third succeeds
         mock_response_503 = MagicMock()
         mock_response_503.status_code = 503
         mock_response_503.text = "Service Unavailable"
 
-        mock_response_200 = MagicMock()
-        mock_response_200.status_code = 200
-        mock_response_200.json.return_value = {
-            "ciphertext": base64.b64encode(expected_wrapped).decode()
+        mock_response_201 = MagicMock()
+        mock_response_201.status_code = 201
+        mock_response_201.json.return_value = {
+            "plaintext": base64.b64encode(expected_plaintext).decode(),
+            "key": expected_wrapped,
         }
 
         with patch("httpx.AsyncClient") as MockClient:
             mock_client_instance = AsyncMock()
             mock_client_instance.request = AsyncMock(
-                side_effect=[mock_response_503, mock_response_503, mock_response_200]
+                side_effect=[mock_response_503, mock_response_503, mock_response_201]
             )
             MockClient.return_value = mock_client_instance
 
@@ -201,30 +206,32 @@ class TestOVHKMSClient:
             mock_config.ovh_kms_retry_max_ms = 10
 
             client = OVHKMSClient(config=mock_config)
-            result = await client.wrap_key(plaintext, key_id="test-key-id")
+            plaintext, wrapped = await client.generate_data_key(key_id="test-key-id")
 
-            assert result == expected_wrapped
+            assert plaintext == expected_plaintext
+            assert wrapped == expected_wrapped
             assert mock_client_instance.request.call_count == 3
 
-    async def test_wrap_key_retry_on_429(self, mock_config):
+    async def test_generate_data_key_retry_on_429(self, mock_config):
         """Retries on 429 rate limit, eventually succeeds."""
-        plaintext = b"plaintext-kek"
-        expected_wrapped = b"wrapped"
+        expected_plaintext = b"plaintext-kek"
+        expected_wrapped = "mock-jwe.wrapped"
 
         mock_response_429 = MagicMock()
         mock_response_429.status_code = 429
         mock_response_429.text = "Too Many Requests"
 
-        mock_response_200 = MagicMock()
-        mock_response_200.status_code = 200
-        mock_response_200.json.return_value = {
-            "ciphertext": base64.b64encode(expected_wrapped).decode()
+        mock_response_201 = MagicMock()
+        mock_response_201.status_code = 201
+        mock_response_201.json.return_value = {
+            "plaintext": base64.b64encode(expected_plaintext).decode(),
+            "key": expected_wrapped,
         }
 
         with patch("httpx.AsyncClient") as MockClient:
             mock_client_instance = AsyncMock()
             mock_client_instance.request = AsyncMock(
-                side_effect=[mock_response_429, mock_response_200]
+                side_effect=[mock_response_429, mock_response_201]
             )
             MockClient.return_value = mock_client_instance
 
@@ -232,15 +239,14 @@ class TestOVHKMSClient:
             mock_config.ovh_kms_retry_max_ms = 10
 
             client = OVHKMSClient(config=mock_config)
-            result = await client.wrap_key(plaintext, key_id="test-key-id")
+            plaintext, wrapped = await client.generate_data_key(key_id="test-key-id")
 
-            assert result == expected_wrapped
+            assert plaintext == expected_plaintext
+            assert wrapped == expected_wrapped
             assert mock_client_instance.request.call_count == 2
 
-    async def test_wrap_key_no_retry_on_401(self, mock_config):
+    async def test_generate_data_key_no_retry_on_401(self, mock_config):
         """No retry on auth errors - raises immediately."""
-        plaintext = b"plaintext-kek"
-
         mock_response = MagicMock()
         mock_response.status_code = 401
 
@@ -252,15 +258,13 @@ class TestOVHKMSClient:
             client = OVHKMSClient(config=mock_config)
 
             with pytest.raises(OVHKMSAuthenticationError):
-                await client.wrap_key(plaintext, key_id="test-key-id")
+                await client.generate_data_key(key_id="test-key-id")
 
             # Should not retry on auth error
             assert mock_client_instance.request.call_count == 1
 
-    async def test_wrap_key_no_retry_on_403(self, mock_config):
+    async def test_generate_data_key_no_retry_on_403(self, mock_config):
         """No retry on 403 forbidden - raises immediately."""
-        plaintext = b"plaintext-kek"
-
         mock_response = MagicMock()
         mock_response.status_code = 403
 
@@ -272,13 +276,13 @@ class TestOVHKMSClient:
             client = OVHKMSClient(config=mock_config)
 
             with pytest.raises(OVHKMSAuthenticationError):
-                await client.wrap_key(plaintext, key_id="test-key-id")
+                await client.generate_data_key(key_id="test-key-id")
 
             assert mock_client_instance.request.call_count == 1
 
-    async def test_unwrap_key_unavailable_after_retries(self, mock_config):
+    async def test_decrypt_data_key_unavailable_after_retries(self, mock_config):
         """OVHKMSUnavailableError after max retries exhausted."""
-        wrapped = b"wrapped"
+        wrapped_jwe = "mock-jwe.wrapped"
 
         mock_response = MagicMock()
         mock_response.status_code = 503
@@ -296,20 +300,21 @@ class TestOVHKMSClient:
             client = OVHKMSClient(config=mock_config)
 
             with pytest.raises(OVHKMSUnavailableError):
-                await client.unwrap_key(wrapped, key_id="test-key-id")
+                await client.decrypt_data_key(wrapped_jwe, key_id="test-key-id")
 
             # Should have tried max_retries times
             assert mock_client_instance.request.call_count == mock_config.ovh_kms_max_retries
 
-    async def test_wrap_key_timeout_retry(self, mock_config):
+    async def test_generate_data_key_timeout_retry(self, mock_config):
         """Retries on timeout, eventually succeeds."""
-        plaintext = b"plaintext-kek"
-        expected_wrapped = b"wrapped"
+        expected_plaintext = b"plaintext-kek"
+        expected_wrapped = "mock-jwe.wrapped"
 
-        mock_response_200 = MagicMock()
-        mock_response_200.status_code = 200
-        mock_response_200.json.return_value = {
-            "ciphertext": base64.b64encode(expected_wrapped).decode()
+        mock_response_201 = MagicMock()
+        mock_response_201.status_code = 201
+        mock_response_201.json.return_value = {
+            "plaintext": base64.b64encode(expected_plaintext).decode(),
+            "key": expected_wrapped,
         }
 
         with patch("httpx.AsyncClient") as MockClient:
@@ -317,7 +322,7 @@ class TestOVHKMSClient:
             mock_client_instance.request = AsyncMock(
                 side_effect=[
                     httpx.TimeoutException("timeout"),
-                    mock_response_200,
+                    mock_response_201,
                 ]
             )
             MockClient.return_value = mock_client_instance
@@ -326,20 +331,21 @@ class TestOVHKMSClient:
             mock_config.ovh_kms_retry_max_ms = 10
 
             client = OVHKMSClient(config=mock_config)
-            result = await client.wrap_key(plaintext, key_id="test-key-id")
+            plaintext, wrapped = await client.generate_data_key(key_id="test-key-id")
 
-            assert result == expected_wrapped
+            assert plaintext == expected_plaintext
             assert mock_client_instance.request.call_count == 2
 
-    async def test_wrap_key_connection_error_retry(self, mock_config):
+    async def test_generate_data_key_connection_error_retry(self, mock_config):
         """Retries on connection error, eventually succeeds."""
-        plaintext = b"plaintext-kek"
-        expected_wrapped = b"wrapped"
+        expected_plaintext = b"plaintext-kek"
+        expected_wrapped = "mock-jwe.wrapped"
 
-        mock_response_200 = MagicMock()
-        mock_response_200.status_code = 200
-        mock_response_200.json.return_value = {
-            "ciphertext": base64.b64encode(expected_wrapped).decode()
+        mock_response_201 = MagicMock()
+        mock_response_201.status_code = 201
+        mock_response_201.json.return_value = {
+            "plaintext": base64.b64encode(expected_plaintext).decode(),
+            "key": expected_wrapped,
         }
 
         with patch("httpx.AsyncClient") as MockClient:
@@ -347,7 +353,7 @@ class TestOVHKMSClient:
             mock_client_instance.request = AsyncMock(
                 side_effect=[
                     httpx.ConnectError("connection failed"),
-                    mock_response_200,
+                    mock_response_201,
                 ]
             )
             MockClient.return_value = mock_client_instance
@@ -356,15 +362,13 @@ class TestOVHKMSClient:
             mock_config.ovh_kms_retry_max_ms = 10
 
             client = OVHKMSClient(config=mock_config)
-            result = await client.wrap_key(plaintext, key_id="test-key-id")
+            plaintext, wrapped = await client.generate_data_key(key_id="test-key-id")
 
-            assert result == expected_wrapped
+            assert plaintext == expected_plaintext
             assert mock_client_instance.request.call_count == 2
 
-    async def test_wrap_key_400_no_retry(self, mock_config):
+    async def test_generate_data_key_400_no_retry(self, mock_config):
         """4xx client errors (except 401/403/429) raise immediately without retry."""
-        plaintext = b"plaintext-kek"
-
         mock_response = MagicMock()
         mock_response.status_code = 400
         mock_response.text = "Bad Request"
@@ -377,17 +381,15 @@ class TestOVHKMSClient:
             client = OVHKMSClient(config=mock_config)
 
             with pytest.raises(OVHKMSError):
-                await client.wrap_key(plaintext, key_id="test-key-id")
+                await client.generate_data_key(key_id="test-key-id")
 
             # Should not retry on 4xx
             assert mock_client_instance.request.call_count == 1
 
     async def test_invalid_response_raises_error(self, mock_config):
         """Invalid response format raises OVHKMSError."""
-        plaintext = b"plaintext-kek"
-
         mock_response = MagicMock()
-        mock_response.status_code = 200
+        mock_response.status_code = 201
         mock_response.json.return_value = {"wrong_key": "value"}
 
         with patch("httpx.AsyncClient") as MockClient:
@@ -398,7 +400,7 @@ class TestOVHKMSClient:
             client = OVHKMSClient(config=mock_config)
 
             with pytest.raises(OVHKMSError, match="Invalid response"):
-                await client.wrap_key(plaintext, key_id="test-key-id")
+                await client.generate_data_key(key_id="test-key-id")
 
     async def test_context_manager(self, mock_config):
         """Client works as async context manager."""

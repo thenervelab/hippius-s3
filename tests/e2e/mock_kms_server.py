@@ -1,12 +1,13 @@
 """Mock OVH KMS server for E2E testing.
 
-Implements a simple key wrap/unwrap API that mimics OVH KMS behavior.
+Implements a simple data key generation/decryption API that mimics OVH KMS behavior.
 Uses XOR with a fixed key for "encryption" - this is NOT secure and is
 only for testing purposes.
 """
 
 import base64
 import os
+import secrets
 import ssl
 from pathlib import Path
 
@@ -22,21 +23,26 @@ MOCK_MASTER_KEY = os.environ.get(
     "MOCK_KMS_MASTER_KEY", "test-master-key-0123456789abcdef"
 ).encode()
 
-
-class WrapRequest(BaseModel):
-    plaintext: str  # Base64-encoded
-
-
-class WrapResponse(BaseModel):
-    ciphertext: str  # Base64-encoded
+# Mock OKMS ID for path matching
+MOCK_OKMS_ID = os.environ.get("MOCK_KMS_OKMS_ID", "mock-okms-id")
 
 
-class UnwrapRequest(BaseModel):
-    ciphertext: str  # Base64-encoded
+class GenerateDataKeyRequest(BaseModel):
+    name: str = "kek"
+    size: int = 256
 
 
-class UnwrapResponse(BaseModel):
-    plaintext: str  # Base64-encoded
+class GenerateDataKeyResponse(BaseModel):
+    plaintext: str  # Base64-encoded plaintext key
+    key: str  # "Wrapped" key (mock JWE-like format)
+
+
+class DecryptDataKeyRequest(BaseModel):
+    key: str  # The wrapped key from GenerateDataKeyResponse
+
+
+class DecryptDataKeyResponse(BaseModel):
+    plaintext: str  # Base64-encoded plaintext key
 
 
 def xor_bytes(data: bytes) -> bytes:
@@ -47,40 +53,61 @@ def xor_bytes(data: bytes) -> bytes:
     return bytes(a ^ b for a, b in zip(data, key_repeated, strict=True))
 
 
-@app.post("/v1/servicekey/{key_id}/wrap", response_model=WrapResponse)
-async def wrap_key(key_id: str, request: WrapRequest):
-    """Wrap a key.
+@app.post("/api/{okms_id}/v1/servicekey/{key_id}/datakey", response_model=GenerateDataKeyResponse)
+async def generate_data_key(okms_id: str, key_id: str, request: GenerateDataKeyRequest):
+    """Generate a new data key.
 
-    Mimics OVH KMS wrapKey endpoint.
+    Mimics OVH KMS datakey endpoint - generates a random key and returns
+    both the plaintext (for immediate use) and wrapped version (for storage).
     """
-    try:
-        plaintext = base64.b64decode(request.plaintext)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid base64 plaintext") from None
+    # Validate OKMS ID to catch path construction bugs in client
+    if okms_id != MOCK_OKMS_ID:
+        raise HTTPException(status_code=404, detail=f"Unknown OKMS ID: {okms_id}")
+
+    # Validate key size (OVH supports 128, 192, 256 bit AES keys)
+    if request.size not in (128, 192, 256):
+        raise HTTPException(status_code=400, detail=f"Invalid key size: {request.size}. Must be 128, 192, or 256")
+
+    # Generate random key (size is in bits, so divide by 8 for bytes)
+    key_bytes = secrets.token_bytes(request.size // 8)
 
     # Simple XOR wrap (NOT SECURE - testing only!)
-    wrapped = xor_bytes(plaintext)
-    ciphertext = base64.b64encode(wrapped).decode()
+    wrapped = xor_bytes(key_bytes)
 
-    return WrapResponse(ciphertext=ciphertext)
+    # Return mock JWE-like format (prefix helps identify it as wrapped)
+    wrapped_key = f"mock-jwe.{base64.b64encode(wrapped).decode()}"
+
+    return GenerateDataKeyResponse(
+        plaintext=base64.b64encode(key_bytes).decode(),
+        key=wrapped_key,
+    )
 
 
-@app.post("/v1/servicekey/{key_id}/unwrap", response_model=UnwrapResponse)
-async def unwrap_key(key_id: str, request: UnwrapRequest):
-    """Unwrap a key.
+@app.post("/api/{okms_id}/v1/servicekey/{key_id}/datakey/decrypt", response_model=DecryptDataKeyResponse)
+async def decrypt_data_key(okms_id: str, key_id: str, request: DecryptDataKeyRequest):
+    """Decrypt (unwrap) a data key.
 
-    Mimics OVH KMS unwrapKey endpoint.
+    Mimics OVH KMS datakey/decrypt endpoint.
     """
+    # Validate OKMS ID to catch path construction bugs in client
+    if okms_id != MOCK_OKMS_ID:
+        raise HTTPException(status_code=404, detail=f"Unknown OKMS ID: {okms_id}")
+
     try:
-        wrapped = base64.b64decode(request.ciphertext)
+        # Parse mock JWE format
+        if not request.key.startswith("mock-jwe."):
+            raise HTTPException(status_code=400, detail="Invalid wrapped key format")
+
+        wrapped_b64 = request.key[len("mock-jwe."):]
+        wrapped = base64.b64decode(wrapped_b64)
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid base64 ciphertext") from None
+        raise HTTPException(status_code=400, detail="Invalid wrapped key") from None
 
     # XOR unwrap (symmetric operation)
     plaintext = xor_bytes(wrapped)
     plaintext_b64 = base64.b64encode(plaintext).decode()
 
-    return UnwrapResponse(plaintext=plaintext_b64)
+    return DecryptDataKeyResponse(plaintext=plaintext_b64)
 
 
 @app.get("/health")
