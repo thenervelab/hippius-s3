@@ -217,6 +217,7 @@ def test_kms_outage_blocks_new_object_operations(
     import time
 
     from botocore.exceptions import ClientError
+    from botocore.exceptions import ReadTimeoutError
 
     from .support.compose import pause_service
     from .support.compose import unpause_service
@@ -235,15 +236,21 @@ def test_kms_outage_blocks_new_object_operations(
         time.sleep(2.0)
 
         # Writing an object should fail - can't wrap new KEK without KMS
-        with pytest.raises(ClientError) as exc_info:
+        # May fail with either:
+        # - ClientError (500 Internal Server Error) if API responds with error
+        # - ReadTimeoutError if KMS retries exhaust the request timeout
+        # Both are valid "fail closed" behaviors
+        with pytest.raises((ClientError, ReadTimeoutError)) as exc_info:
             boto3_client.put_object(Bucket=bucket, Key="test.txt", Body=b"test content")
 
-        # Verify it's a server error (500), not a client error
-        assert exc_info.value.response["Error"]["Code"] in (
-            "InternalServerError",
-            "InternalError",
-            "500",
-        ) or exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 500
+        # If it's a ClientError, verify it's a server error (500)
+        if isinstance(exc_info.value, ClientError):
+            assert exc_info.value.response["Error"]["Code"] in (
+                "InternalServerError",
+                "InternalError",
+                "500",
+            ) or exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 500
+        # ReadTimeoutError is also acceptable - means API couldn't complete due to KMS unavailability
     finally:
         unpause_service("mock-kms")
 

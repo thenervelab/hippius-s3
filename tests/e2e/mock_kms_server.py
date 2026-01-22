@@ -23,19 +23,19 @@ MOCK_MASTER_KEY = os.environ.get(
 ).encode()
 
 
-class EncryptRequest(BaseModel):
+class WrapRequest(BaseModel):
     plaintext: str  # Base64-encoded
 
 
-class EncryptResponse(BaseModel):
+class WrapResponse(BaseModel):
     ciphertext: str  # Base64-encoded
 
 
-class DecryptRequest(BaseModel):
+class UnwrapRequest(BaseModel):
     ciphertext: str  # Base64-encoded
 
 
-class DecryptResponse(BaseModel):
+class UnwrapResponse(BaseModel):
     plaintext: str  # Base64-encoded
 
 
@@ -47,11 +47,11 @@ def xor_bytes(data: bytes) -> bytes:
     return bytes(a ^ b for a, b in zip(data, key_repeated, strict=True))
 
 
-@app.post("/v1/servicekey/{key_id}/encrypt", response_model=EncryptResponse)
-async def encrypt(key_id: str, request: EncryptRequest):
-    """Wrap (encrypt) a key.
+@app.post("/v1/servicekey/{key_id}/wrap", response_model=WrapResponse)
+async def wrap_key(key_id: str, request: WrapRequest):
+    """Wrap a key.
 
-    Mimics OVH KMS encrypt endpoint.
+    Mimics OVH KMS wrapKey endpoint.
     """
     try:
         plaintext = base64.b64decode(request.plaintext)
@@ -62,14 +62,14 @@ async def encrypt(key_id: str, request: EncryptRequest):
     wrapped = xor_bytes(plaintext)
     ciphertext = base64.b64encode(wrapped).decode()
 
-    return EncryptResponse(ciphertext=ciphertext)
+    return WrapResponse(ciphertext=ciphertext)
 
 
-@app.post("/v1/servicekey/{key_id}/decrypt", response_model=DecryptResponse)
-async def decrypt(key_id: str, request: DecryptRequest):
-    """Unwrap (decrypt) a key.
+@app.post("/v1/servicekey/{key_id}/unwrap", response_model=UnwrapResponse)
+async def unwrap_key(key_id: str, request: UnwrapRequest):
+    """Unwrap a key.
 
-    Mimics OVH KMS decrypt endpoint.
+    Mimics OVH KMS unwrapKey endpoint.
     """
     try:
         wrapped = base64.b64decode(request.ciphertext)
@@ -80,7 +80,7 @@ async def decrypt(key_id: str, request: DecryptRequest):
     plaintext = xor_bytes(wrapped)
     plaintext_b64 = base64.b64encode(plaintext).decode()
 
-    return DecryptResponse(plaintext=plaintext_b64)
+    return UnwrapResponse(plaintext=plaintext_b64)
 
 
 @app.get("/health")

@@ -163,21 +163,24 @@ class OVHKMSClient:
             await asyncio.sleep(wait_interval)
 
     async def wrap_key(self, plaintext: bytes, *, key_id: str) -> bytes:
-        """Wrap (encrypt) a key using the specified KMS key.
+        """Wrap a key using the specified KMS key.
+
+        Uses the dedicated /wrap endpoint (wrapKey operation), which allows
+        configuring the KMS key with only wrap/unwrap permissions for tighter security.
 
         Args:
             plaintext: The plaintext key bytes to wrap.
             key_id: The KMS key ID to use for wrapping (typically the default key).
 
         Returns:
-            The wrapped (encrypted) key bytes.
+            The wrapped key bytes.
 
         Raises:
             OVHKMSAuthenticationError: On authentication failure (401/403).
             OVHKMSUnavailableError: On transient errors after max retries.
             OVHKMSError: On other errors.
         """
-        url = f"/v1/servicekey/{key_id}/encrypt"
+        url = f"/v1/servicekey/{key_id}/wrap"
         payload = {"plaintext": base64.b64encode(plaintext).decode("ascii")}
 
         response = await self._request_with_retry("POST", url, json=payload)
@@ -187,13 +190,16 @@ class OVHKMSClient:
             ciphertext_b64 = data["ciphertext"]
             return base64.b64decode(ciphertext_b64)
         except (KeyError, ValueError) as e:
-            raise OVHKMSError(f"Invalid response from KMS encrypt: {e}") from e
+            raise OVHKMSError(f"Invalid response from KMS wrap: {e}") from e
 
     async def unwrap_key(self, wrapped: bytes, *, key_id: str) -> bytes:
-        """Unwrap (decrypt) a key using the specified KMS key.
+        """Unwrap a key using the specified KMS key.
+
+        Uses the dedicated /unwrap endpoint (unwrapKey operation), which allows
+        configuring the KMS key with only wrap/unwrap permissions for tighter security.
 
         Args:
-            wrapped: The wrapped (encrypted) key bytes.
+            wrapped: The wrapped key bytes.
             key_id: The KMS key ID that was used to wrap (from DB row).
 
         Returns:
@@ -204,7 +210,7 @@ class OVHKMSClient:
             OVHKMSUnavailableError: On transient errors after max retries.
             OVHKMSError: On other errors.
         """
-        url = f"/v1/servicekey/{key_id}/decrypt"
+        url = f"/v1/servicekey/{key_id}/unwrap"
         payload = {"ciphertext": base64.b64encode(wrapped).decode("ascii")}
 
         response = await self._request_with_retry("POST", url, json=payload)
@@ -214,7 +220,7 @@ class OVHKMSClient:
             plaintext_b64 = data["plaintext"]
             return base64.b64decode(plaintext_b64)
         except (KeyError, ValueError) as e:
-            raise OVHKMSError(f"Invalid response from KMS decrypt: {e}") from e
+            raise OVHKMSError(f"Invalid response from KMS unwrap: {e}") from e
 
     async def _request_with_retry(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         """Make an HTTP request with exponential backoff retry.

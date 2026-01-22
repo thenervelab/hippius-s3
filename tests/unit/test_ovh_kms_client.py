@@ -99,7 +99,8 @@ class TestOVHKMSClient:
             mock_client_instance.request.assert_called_once()
             call_args = mock_client_instance.request.call_args
             assert call_args[0][0] == "POST"
-            assert "/encrypt" in call_args[0][1]
+            # Verify full path format: /v1/servicekey/{key_id}/wrap
+            assert call_args[0][1] == "/v1/servicekey/test-key-id/wrap"
 
     async def test_unwrap_key_success(self, mock_config):
         """Unwrap returns base64-decoded plaintext."""
@@ -124,7 +125,8 @@ class TestOVHKMSClient:
             mock_client_instance.request.assert_called_once()
             call_args = mock_client_instance.request.call_args
             assert call_args[0][0] == "POST"
-            assert "/decrypt" in call_args[0][1]
+            # Verify full path format: /v1/servicekey/{key_id}/unwrap
+            assert call_args[0][1] == "/v1/servicekey/test-key-id/unwrap"
 
     async def test_wrap_key_uses_provided_key_id(self, mock_config):
         """Wrap uses the provided key_id in the URL (supports rotation)."""
