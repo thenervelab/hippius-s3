@@ -3,7 +3,12 @@ WITH upsert_object AS (
   INSERT INTO objects (object_id, bucket_id, object_key, created_at, current_object_version)
   VALUES ($1, $2, $3, $8, 1)
   ON CONFLICT (bucket_id, object_key)
-  DO UPDATE SET object_id = EXCLUDED.object_id, current_object_version = COALESCE(objects.current_object_version, 1)
+  DO UPDATE SET object_id = EXCLUDED.object_id,
+               current_object_version = (
+                 SELECT COALESCE(MAX(object_version), objects.current_object_version, 0) + 1
+                 FROM object_versions
+                 WHERE object_id = objects.object_id
+               )
   RETURNING object_id, bucket_id, object_key, created_at, current_object_version
 ), ins_version AS (
   INSERT INTO object_versions (
