@@ -4,6 +4,8 @@ import asyncio
 import hashlib
 import json
 import uuid
+from datetime import datetime
+from datetime import timezone
 from typing import Any
 from typing import AsyncIterator
 
@@ -197,15 +199,28 @@ class ObjectWriter:
         wrapped_dek = None
 
         part_number = 1
-        # Resolve current object_version for this object_id if exists; default to 1 for new objects
-        try:
-            row = await self.db.fetchrow(
-                "SELECT current_object_version FROM objects WHERE object_id = $1",
-                object_id,
+
+        # Reserve the version upfront by upserting with placeholder values
+        # This ensures we write chunks to the correct version from the start
+        with tracer.start_as_current_span(
+            "put_simple_stream_full.reserve_version",
+            attributes={
+                "object_id": object_id,
+                "has_object_id": True,
+            },
+        ):
+            reserve_row = await upsert_object_basic(
+                self.db,
+                object_id=object_id,
+                bucket_id=bucket_id,
+                object_key=object_key,
+                content_type=content_type,
+                metadata=metadata,
+                md5_hash="",
+                size_bytes=0,
+                storage_version=resolved_storage_version,
             )
-            object_version = int(row["current_object_version"]) if row and row.get("current_object_version") else 1
-        except Exception:
-            object_version = 1
+            object_version = int(reserve_row.get("current_object_version") or 1) if reserve_row else 1
 
         if resolved_storage_version >= 5:
             suite_id = "hip-enc/aes256gcm"
@@ -306,30 +321,38 @@ class ObjectWriter:
                 },
             )
 
-        # Upsert DB row with final md5/size and storage version
+        # Update the reserved object_versions row with final md5/size
         with tracer.start_as_current_span(
-            "put_simple_stream_full.upsert_metadata",
+            "put_simple_stream_full.update_metadata",
             attributes={
                 "object_id": object_id,
                 "has_object_id": True,
                 "size_bytes": int(total_size),
                 "md5_hash": md5_hash,
-                "storage_version": resolved_storage_version,
+                "object_version": object_version,
             },
         ):
-            row = await upsert_object_basic(
-                self.db,
-                object_id=object_id,
-                bucket_id=bucket_id,
-                object_key=object_key,
-                content_type=content_type,
-                metadata=metadata,
-                md5_hash=md5_hash,
-                size_bytes=int(total_size),
-                storage_version=resolved_storage_version,
+            await self.db.execute(
+                """
+                UPDATE object_versions
+                   SET size_bytes = $1,
+                       md5_hash = $2,
+                       content_type = $3,
+                       metadata = $4,
+                       last_modified = $5
+                 WHERE object_id = $6 AND object_version = $7
+                """,
+                int(total_size),
+                md5_hash,
+                content_type,
+                json.dumps(metadata),
+                datetime.now(timezone.utc),
+                object_id,
+                int(object_version),
             )
-            if row and resolved_storage_version >= 5 and kek_id and wrapped_dek:
-                ov = int(row.get("current_object_version") or object_version or 1)
+
+            if resolved_storage_version >= 5 and kek_id and wrapped_dek:
+                ov = object_version
                 aad = f"hippius-dek:{bucket_id}:{object_id}:{ov}".encode("utf-8")
                 # Re-wrap with correct object_version AAD (in case object_version differs)
                 from hippius_s3.services.envelope_service import wrap_dek
