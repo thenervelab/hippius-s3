@@ -171,6 +171,10 @@ async def handle_copy_object(
                     metadata=dest_metadata,
                 )
                 # Part CID is optional for v4+ objects; keep pending while chunk CIDs drive hydration.
+                src_chunk_size = src_obj_row.get("enc_chunk_size_bytes")
+                chunk_size_bytes = (
+                    int(src_chunk_size) if src_chunk_size is not None else int(config.object_chunk_size_bytes)
+                )
                 await upsert_part_placeholder(
                     db,
                     object_id=object_id,
@@ -179,7 +183,7 @@ async def handle_copy_object(
                     size_bytes=size_bytes,
                     etag=md5_hash or "",
                     placeholder_cid="pending",
-                    chunk_size_bytes=int(src_obj_row.get("enc_chunk_size_bytes") or config.object_chunk_size_bytes),
+                    chunk_size_bytes=chunk_size_bytes,
                     object_version=int(dest_object_version),
                 )
                 dest_part = await db.fetchrow(
@@ -236,19 +240,22 @@ async def handle_copy_object(
                 dest_aad = f"hippius-dek:{dest_bucket_id}:{object_id}:{dest_object_version}".encode("utf-8")
                 dest_wrapped = wrap_dek(kek=dest_kek_bytes, dek=dek, aad=dest_aad)
 
+                src_chunk_size = src_obj_row.get("enc_chunk_size_bytes")
+                chunk_size_bytes = (
+                    int(src_chunk_size) if src_chunk_size is not None else int(config.object_chunk_size_bytes)
+                )
                 await db.execute(
                     """
                     UPDATE object_versions
                        SET encryption_version = 5,
-                           enc_suite_id = COALESCE($1, 'hip-enc/aes256gcm'),
-                           enc_chunk_size_bytes = COALESCE($2, $3),
-                           kek_id = $4,
-                           wrapped_dek = $5
-                     WHERE object_id = $6 AND object_version = $7
+                           enc_suite_id = $1,
+                           enc_chunk_size_bytes = $2,
+                           kek_id = $3,
+                           wrapped_dek = $4
+                     WHERE object_id = $5 AND object_version = $6
                     """,
                     str(src_obj_row.get("enc_suite_id") or "hip-enc/aes256gcm"),
-                    src_obj_row.get("enc_chunk_size_bytes"),
-                    int(config.object_chunk_size_bytes),
+                    chunk_size_bytes,
                     dest_kek_id,
                     dest_wrapped,
                     object_id,
