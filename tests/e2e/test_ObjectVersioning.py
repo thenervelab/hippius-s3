@@ -1,8 +1,9 @@
 from typing import Any
 from typing import Callable
 
-import psycopg
 import pytest
+
+from .support.db import get_object_versioning_info
 
 
 @pytest.mark.local
@@ -38,37 +39,22 @@ def test_simple_object_overwrite_creates_new_versions(
 
     assert etag1 != etag2
 
-    with psycopg.connect("postgresql://postgres:postgres@localhost:5432/hippius") as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT object_id, current_object_version FROM objects WHERE bucket_id = (SELECT bucket_id FROM buckets WHERE bucket_name = %s) AND object_key = %s",
-            (bucket_name, key)
-        )
-        row = cur.fetchone()
-        assert row is not None, "Object not found in database"
-        object_id, current_version = row
-        assert current_version == 2, f"Expected current_object_version=2, got {current_version}"
+    info = get_object_versioning_info(bucket_name, key)
+    assert info["current_object_version"] == 2, f"Expected current_object_version=2, got {info['current_object_version']}"
 
-        cur.execute(
-            "SELECT object_version, size_bytes, md5_hash FROM object_versions WHERE object_id = %s ORDER BY object_version",
-            (object_id,)
-        )
-        versions = cur.fetchall()
-        assert len(versions) == 2, f"Expected 2 versions, got {len(versions)}"
+    versions = info["versions"]
+    assert len(versions) == 2, f"Expected 2 versions, got {len(versions)}"
 
-        assert versions[0][0] == 1
-        assert versions[0][1] == len(b"version 1 content")
+    assert versions[0][0] == 1
+    assert versions[0][1] == len(b"version 1 content")
 
-        assert versions[1][0] == 2
-        assert versions[1][1] == len(b"version 2 content different")
+    assert versions[1][0] == 2
+    assert versions[1][1] == len(b"version 2 content different")
 
-        cur.execute(
-            "SELECT object_version, COUNT(*) FROM parts WHERE object_id = %s GROUP BY object_version ORDER BY object_version",
-            (object_id,)
-        )
-        part_counts = cur.fetchall()
-        assert len(part_counts) == 2, "Should have parts for both versions"
-        assert part_counts[0][0] == 1
-        assert part_counts[1][0] == 2
+    part_counts = info["part_counts"]
+    assert len(part_counts) == 2, "Should have parts for both versions"
+    assert part_counts[0][0] == 1
+    assert part_counts[1][0] == 2
 
     resp_get = boto3_client.get_object(Bucket=bucket_name, Key=key)
     body = resp_get["Body"].read()
@@ -127,35 +113,18 @@ def test_multipart_upload_overwrite_creates_new_versions(
 
     assert etag1 != etag2
 
-    with psycopg.connect("postgresql://postgres:postgres@localhost:5432/hippius") as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT object_id, current_object_version FROM objects WHERE bucket_id = (SELECT bucket_id FROM buckets WHERE bucket_name = %s) AND object_key = %s",
-            (bucket_name, key)
-        )
-        row = cur.fetchone()
-        assert row is not None
-        object_id, current_version = row
-        assert current_version == 2, f"Expected current_object_version=2, got {current_version}"
+    info = get_object_versioning_info(bucket_name, key)
+    assert info["current_object_version"] == 2, f"Expected current_object_version=2, got {info['current_object_version']}"
 
-        cur.execute(
-            "SELECT object_version, size_bytes FROM object_versions WHERE object_id = %s ORDER BY object_version",
-            (object_id,)
-        )
-        versions = cur.fetchall()
-        assert len(versions) == 2
-        assert versions[0][0] == 1
-        assert versions[1][0] == 2
+    versions = info["versions"]
+    assert len(versions) == 2
+    assert versions[0][0] == 1
+    assert versions[1][0] == 2
 
-        cur.execute(
-            "SELECT object_version, part_number FROM parts WHERE object_id = %s ORDER BY object_version, part_number",
-            (object_id,)
-        )
-        parts = cur.fetchall()
-        v1_parts = [p for p in parts if p[0] == 1]
-        v2_parts = [p for p in parts if p[0] == 2]
-
-        assert len(v1_parts) == 1, f"Version 1 should have 1 part, got {len(v1_parts)}"
-        assert len(v2_parts) == 2, f"Version 2 should have 2 parts, got {len(v2_parts)}"
+    part_counts = info["part_counts"]
+    assert len(part_counts) == 2, "Should have parts for both versions"
+    assert part_counts[0][1] == 1, f"Version 1 should have 1 part, got {part_counts[0][1]}"
+    assert part_counts[1][1] == 2, f"Version 2 should have 2 parts, got {part_counts[1][1]}"
 
 
 @pytest.mark.local
@@ -178,22 +147,67 @@ def test_three_overwrites_create_three_versions(
             Body=f"version {i}".encode(),
         )
 
-    with psycopg.connect("postgresql://postgres:postgres@localhost:5432/hippius") as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT object_id, current_object_version FROM objects WHERE bucket_id = (SELECT bucket_id FROM buckets WHERE bucket_name = %s) AND object_key = %s",
-            (bucket_name, key)
-        )
-        row = cur.fetchone()
-        assert row is not None
-        object_id, current_version = row
-        assert current_version == 3, f"Expected current_object_version=3, got {current_version}"
+    info = get_object_versioning_info(bucket_name, key)
+    assert info["current_object_version"] == 3, f"Expected current_object_version=3, got {info['current_object_version']}"
 
-        cur.execute(
-            "SELECT object_version FROM object_versions WHERE object_id = %s ORDER BY object_version",
-            (object_id,)
-        )
-        versions = [v[0] for v in cur.fetchall()]
-        assert versions == [1, 2, 3], f"Expected versions [1, 2, 3], got {versions}"
+    version_numbers = [v[0] for v in info["versions"]]
+    assert version_numbers == [1, 2, 3], f"Expected versions [1, 2, 3], got {version_numbers}"
 
     resp = boto3_client.get_object(Bucket=bucket_name, Key=key)
     assert resp["Body"].read() == b"version 3"
+
+
+@pytest.mark.local
+def test_copy_over_existing_key_creates_new_version(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+) -> None:
+    """Test that copying over an existing destination key creates a new version."""
+    bucket_name = unique_bucket_name("versioning-copy")
+    cleanup_buckets(bucket_name)
+
+    boto3_client.create_bucket(Bucket=bucket_name)
+
+    # Create source object
+    source_key = "source.txt"
+    boto3_client.put_object(
+        Bucket=bucket_name,
+        Key=source_key,
+        Body=b"source content",
+    )
+
+    # Create destination object (v1)
+    dest_key = "destination.txt"
+    boto3_client.put_object(
+        Bucket=bucket_name,
+        Key=dest_key,
+        Body=b"original destination content",
+    )
+
+    # Copy source to destination (should create destination v2)
+    boto3_client.copy_object(
+        Bucket=bucket_name,
+        Key=dest_key,
+        CopySource={"Bucket": bucket_name, "Key": source_key},
+    )
+
+    # Verify destination now has 2 versions
+    info = get_object_versioning_info(bucket_name, dest_key)
+    assert info["current_object_version"] == 2, f"Expected destination to be v2 after copy, got {info['current_object_version']}"
+
+    versions = info["versions"]
+    assert len(versions) == 2, f"Expected 2 versions for destination, got {len(versions)}"
+    assert versions[0][0] == 1  # v1 (original content)
+    assert versions[1][0] == 2  # v2 (copied content)
+
+    # Verify v1 has original content size
+    assert versions[0][1] == len(b"original destination content")
+
+    # Verify v2 has source content size
+    assert versions[1][1] == len(b"source content")
+
+    # Verify download returns copied content
+    resp = boto3_client.get_object(Bucket=bucket_name, Key=dest_key)
+    assert resp["Body"].read() == b"source content"

@@ -89,7 +89,9 @@ async def handle_copy_object(
             "NotImplemented", "Copying multipart objects is not currently supported", status_code=501
         )
 
-    object_id = str(uuid.uuid4())
+    # Check if destination object already exists; reuse its object_id for versioning
+    existing_dest = await ObjectRepository(db).get_by_path(dest_bucket["bucket_id"], object_key)
+    object_id = str(existing_dest["object_id"]) if existing_dest else str(uuid.uuid4())
     copy_created_at = datetime.now(timezone.utc)
 
     # Prefer reader service to manage readiness and cache hydration
