@@ -330,18 +330,11 @@ class ObjectWriter:
                 "size_bytes": int(total_size),
                 "md5_hash": md5_hash,
                 "object_version": object_version,
+                "storage_version": resolved_storage_version,
             },
         ):
             await self.db.execute(
-                """
-                UPDATE object_versions
-                   SET size_bytes = $1,
-                       md5_hash = $2,
-                       content_type = $3,
-                       metadata = $4,
-                       last_modified = $5
-                 WHERE object_id = $6 AND object_version = $7
-                """,
+                get_query("update_object_version_metadata"),
                 int(total_size),
                 md5_hash,
                 content_type,
@@ -352,8 +345,7 @@ class ObjectWriter:
             )
 
             if resolved_storage_version >= 5 and kek_id and wrapped_dek:
-                ov = object_version
-                aad = f"hippius-dek:{bucket_id}:{object_id}:{ov}".encode("utf-8")
+                aad = f"hippius-dek:{bucket_id}:{object_id}:{object_version}".encode("utf-8")
                 # Re-wrap with correct object_version AAD (in case object_version differs)
                 from hippius_s3.services.envelope_service import wrap_dek
                 from hippius_s3.services.kek_service import get_bucket_kek_bytes
@@ -375,7 +367,7 @@ class ObjectWriter:
                     kek_id,
                     wrapped_dek,
                     object_id,
-                    int(ov),
+                    int(object_version),
                 )
 
         # Now that we know counts and sizes, write meta last using exact chunk count
