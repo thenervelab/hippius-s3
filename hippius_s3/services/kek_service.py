@@ -287,6 +287,8 @@ async def _get_cached_kek(bucket_id: str, kek_id: uuid.UUID) -> bytes | None:
         if expires_at <= now:
             _KEK_CACHE.pop(key, None)
             return None
+        # Sliding window: refresh TTL on access
+        _KEK_CACHE[key] = (kek_bytes, now + ttl)
         return kek_bytes
 
 
