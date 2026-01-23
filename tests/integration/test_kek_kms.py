@@ -1,5 +1,6 @@
 """Integration tests for KEK service with KMS wrapping."""
 
+import base64
 import os
 import uuid
 from unittest.mock import AsyncMock
@@ -23,19 +24,36 @@ def xor_with_mock_key(data: bytes) -> bytes:
     return bytes(a ^ b for a, b in zip(data, key_repeated, strict=True))
 
 
+def make_mock_jwe(plaintext: bytes) -> str:
+    """Create a mock JWE-format wrapped key from plaintext."""
+    wrapped = xor_with_mock_key(plaintext)
+    return f"mock-jwe.{base64.b64encode(wrapped).decode()}"
+
+
+def unwrap_mock_jwe(jwe: str) -> bytes:
+    """Unwrap a mock JWE-format key to get plaintext."""
+    wrapped_b64 = jwe[len("mock-jwe."):]
+    wrapped = base64.b64decode(wrapped_b64)
+    return xor_with_mock_key(wrapped)
+
+
 @pytest.fixture
 def mock_kms_client():
-    """Create a mock KMS client that wraps/unwraps using XOR."""
+    """Create a mock KMS client that generates/decrypts data keys using XOR."""
     client = AsyncMock()
 
-    async def mock_wrap(plaintext: bytes, *, key_id: str) -> bytes:
-        return xor_with_mock_key(plaintext)
+    async def mock_generate(*, key_id: str, name: str = "kek") -> tuple[bytes, str]:
+        """Generate a random key and return (plaintext, wrapped_jwe)."""
+        plaintext = os.urandom(32)
+        wrapped_jwe = make_mock_jwe(plaintext)
+        return plaintext, wrapped_jwe
 
-    async def mock_unwrap(wrapped: bytes, *, key_id: str) -> bytes:
-        return xor_with_mock_key(wrapped)
+    async def mock_decrypt(wrapped_jwe: str, *, key_id: str) -> bytes:
+        """Decrypt a wrapped JWE key to get plaintext."""
+        return unwrap_mock_jwe(wrapped_jwe)
 
-    client.wrap_key = AsyncMock(side_effect=mock_wrap)
-    client.unwrap_key = AsyncMock(side_effect=mock_unwrap)
+    client.generate_data_key = AsyncMock(side_effect=mock_generate)
+    client.decrypt_data_key = AsyncMock(side_effect=mock_decrypt)
     client.close = AsyncMock()
 
     return client
@@ -47,6 +65,7 @@ def required_mode_config():
     config = MagicMock()
     config.kms_mode = "required"
     config.ovh_kms_endpoint = "https://mock-kms:8443"
+    config.ovh_kms_okms_id = "mock-okms-id"
     config.ovh_kms_default_key_id = "test-key-id"
     config.ovh_kms_cert_path = "/path/to/cert"
     config.ovh_kms_key_path = "/path/to/key"
@@ -112,8 +131,8 @@ class TestKEKServiceRequiredMode:
         ):
             kek_id, kek_bytes = await kek_service.get_or_create_active_bucket_kek(bucket_id=bucket_id)
 
-            # Verify KMS wrap was called
-            mock_kms_client.wrap_key.assert_called_once()
+            # Verify KMS generate_data_key was called
+            mock_kms_client.generate_data_key.assert_called_once()
 
             # Verify plaintext KEK returned (32 bytes)
             assert len(kek_bytes) == 32
@@ -138,11 +157,12 @@ class TestKEKServiceRequiredMode:
         kek_id = uuid.uuid4()
         plaintext_kek = os.urandom(32)
 
-        # Simulate wrapped KEK using test helper
-        wrapped_kek = xor_with_mock_key(plaintext_kek)
+        # Simulate wrapped KEK using JWE format (UTF-8 bytes in DB)
+        wrapped_jwe = make_mock_jwe(plaintext_kek)
+        wrapped_kek_bytes = wrapped_jwe.encode("utf-8")
 
         # Mock database returning wrapped KEK
-        mock_record = {"wrapped_kek_bytes": wrapped_kek, "kms_key_id": "test-key-id"}
+        mock_record = {"wrapped_kek_bytes": wrapped_kek_bytes, "kms_key_id": "test-key-id"}
         mock_conn = AsyncMock()
         mock_conn.fetchrow = AsyncMock(return_value=mock_record)
 
@@ -155,9 +175,9 @@ class TestKEKServiceRequiredMode:
         ):
             result = await kek_service.get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
 
-            # Verify KMS unwrap was called with the stored key_id
-            mock_kms_client.unwrap_key.assert_called_once()
-            call_kwargs = mock_kms_client.unwrap_key.call_args
+            # Verify KMS decrypt was called with the stored key_id
+            mock_kms_client.decrypt_data_key.assert_called_once()
+            call_kwargs = mock_kms_client.decrypt_data_key.call_args
             assert call_kwargs[1]["key_id"] == "test-key-id"
 
             # Verify plaintext KEK returned
@@ -189,10 +209,52 @@ class TestKEKServiceRequiredMode:
             result = await kek_service.get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
 
             # Verify KMS was NOT called (cache hit)
-            mock_kms_client.unwrap_key.assert_not_called()
+            mock_kms_client.decrypt_data_key.assert_not_called()
 
             # Verify cached KEK returned
             assert result == cached_kek
+
+    async def test_cache_sliding_window_refreshes_ttl(self, mock_kms_client, required_mode_config):
+        """Cache TTL is refreshed on access (sliding window)."""
+        import hippius_s3.services.kek_service as kek_service
+
+        kek_service._POOL = None
+        kek_service._POOL_DSN = None
+        kek_service._KMS_CLIENT = mock_kms_client
+        kek_service._KEK_CACHE.clear()
+
+        bucket_id = str(uuid.uuid4())
+        kek_id = uuid.uuid4()
+        cached_kek = os.urandom(32)
+
+        ttl = required_mode_config.kek_cache_ttl_seconds  # 300s
+        t0 = 1000.0
+
+        with patch("hippius_s3.services.kek_service.get_config", return_value=required_mode_config):
+            # T=0: Cache the KEK
+            with patch("hippius_s3.services.kek_service.time") as mock_time:
+                mock_time.monotonic.return_value = t0
+                await kek_service._set_cached_kek(bucket_id, kek_id, cached_kek)
+
+            # T=280s: Access within TTL → hit, TTL refreshed
+            with patch("hippius_s3.services.kek_service.time") as mock_time:
+                mock_time.monotonic.return_value = t0 + 280
+                result = await kek_service._get_cached_kek(bucket_id, kek_id)
+                assert result == cached_kek
+
+            # T=560s: 560s from original cache, but only 280s from last access
+            # Without sliding window this would be a miss (560 > 300)
+            # With sliding window this is a hit (280 < 300)
+            with patch("hippius_s3.services.kek_service.time") as mock_time:
+                mock_time.monotonic.return_value = t0 + 560
+                result = await kek_service._get_cached_kek(bucket_id, kek_id)
+                assert result == cached_kek
+
+            # T=870s: 310s since last access → expired
+            with patch("hippius_s3.services.kek_service.time") as mock_time:
+                mock_time.monotonic.return_value = t0 + 870
+                result = await kek_service._get_cached_kek(bucket_id, kek_id)
+                assert result is None
 
     async def test_kms_unavailable_fails_closed(self, required_mode_config):
         """KMS outage blocks operations (fail-closed)."""
@@ -201,7 +263,7 @@ class TestKEKServiceRequiredMode:
 
         # Mock KMS that raises unavailable error
         mock_kms_client = AsyncMock()
-        mock_kms_client.unwrap_key = AsyncMock(side_effect=OVHKMSUnavailableError("KMS timeout"))
+        mock_kms_client.decrypt_data_key = AsyncMock(side_effect=OVHKMSUnavailableError("KMS timeout"))
 
         kek_service._POOL = None
         kek_service._POOL_DSN = None
@@ -211,9 +273,10 @@ class TestKEKServiceRequiredMode:
         bucket_id = str(uuid.uuid4())
         kek_id = uuid.uuid4()
 
-        # Mock database returning wrapped KEK
-        wrapped_kek = os.urandom(32)
-        mock_record = {"wrapped_kek_bytes": wrapped_kek, "kms_key_id": "test-key-id"}
+        # Mock database returning wrapped KEK (JWE format as UTF-8 bytes)
+        wrapped_jwe = make_mock_jwe(os.urandom(32))
+        wrapped_kek_bytes = wrapped_jwe.encode("utf-8")
+        mock_record = {"wrapped_kek_bytes": wrapped_kek_bytes, "kms_key_id": "test-key-id"}
         mock_conn = AsyncMock()
         mock_conn.fetchrow = AsyncMock(return_value=mock_record)
 
@@ -249,12 +312,13 @@ class TestKEKServiceRequiredMode:
         kek_id = uuid.uuid4()
         plaintext_kek = os.urandom(32)
 
-        # Simulate wrapped KEK using test helper
-        wrapped_kek = xor_with_mock_key(plaintext_kek)
+        # Simulate wrapped KEK using JWE format (UTF-8 bytes in DB)
+        wrapped_jwe = make_mock_jwe(plaintext_kek)
+        wrapped_kek_bytes = wrapped_jwe.encode("utf-8")
 
         # The KEK was wrapped with old-key-123, not the current default
         old_key_id = "old-key-123"
-        mock_record = {"wrapped_kek_bytes": wrapped_kek, "kms_key_id": old_key_id}
+        mock_record = {"wrapped_kek_bytes": wrapped_kek_bytes, "kms_key_id": old_key_id}
         mock_conn = AsyncMock()
         mock_conn.fetchrow = AsyncMock(return_value=mock_record)
 
@@ -264,12 +328,12 @@ class TestKEKServiceRequiredMode:
         # Create a mock KMS client that tracks which key_id was used
         captured_key_ids = []
 
-        async def mock_unwrap(wrapped: bytes, *, key_id: str) -> bytes:
+        async def mock_decrypt(wrapped_jwe: str, *, key_id: str) -> bytes:
             captured_key_ids.append(key_id)
-            return xor_with_mock_key(wrapped)
+            return unwrap_mock_jwe(wrapped_jwe)
 
         mock_kms_client = AsyncMock()
-        mock_kms_client.unwrap_key = AsyncMock(side_effect=mock_unwrap)
+        mock_kms_client.decrypt_data_key = AsyncMock(side_effect=mock_decrypt)
 
         kek_service._POOL = None
         kek_service._POOL_DSN = None
