@@ -392,19 +392,16 @@ class ObjectWriter:
         )
 
         # Ensure parts table has placeholder for base part (part 1) so append/read paths see it
-        import contextlib
-
-        with contextlib.suppress(Exception):
-            await upsert_part_placeholder(
-                self.db,
-                object_id=object_id,
-                upload_id=str(upload_id),
-                part_number=int(part_number),
-                size_bytes=int(total_size),
-                etag=md5_hash,
-                chunk_size_bytes=int(chunk_size),
-                object_version=int(object_version),
-            )
+        await upsert_part_placeholder(
+            self.db,
+            object_id=object_id,
+            upload_id=str(upload_id),
+            part_number=int(part_number),
+            size_bytes=int(total_size),
+            etag=md5_hash,
+            chunk_size_bytes=int(chunk_size),
+            object_version=int(object_version),
+        )
 
         return PutResult(etag=md5_hash, size_bytes=int(total_size), upload_id=str(upload_id))
 
