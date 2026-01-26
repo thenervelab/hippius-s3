@@ -4,16 +4,15 @@ from typing import Any
 from typing import Callable
 
 import pytest
-from botocore.exceptions import ClientError
 
 
-def test_copy_multipart_source_rejected(
+def test_copy_multipart_source_succeeds(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
 ) -> None:
-    """Test that copying multipart objects returns 501 NotImplemented."""
+    """Test that copying multipart objects succeeds."""
     bucket = unique_bucket_name("copy-mpu")
     cleanup_buckets(bucket)
 
@@ -36,11 +35,13 @@ def test_copy_multipart_source_rejected(
     )
 
     copy_source = f"/{bucket}/{src_key}"
-    with pytest.raises(ClientError) as exc_info:
-        boto3_client.copy_object(Bucket=bucket, Key=dst_key, CopySource=copy_source)
+    resp = boto3_client.copy_object(Bucket=bucket, Key=dst_key, CopySource=copy_source)
 
-    error = exc_info.value.response["Error"]
-    assert error["Code"] in ["NotImplemented", "501"]
+    assert "CopyObjectResult" in resp
+    assert "ETag" in resp["CopyObjectResult"]
+
+    head = boto3_client.head_object(Bucket=bucket, Key=dst_key)
+    assert head["ContentLength"] == len(part1_data)
 
 
 @pytest.mark.local
