@@ -5,6 +5,10 @@ on:
     branches: [k8s-production]
   workflow_dispatch:
 
+concurrency:
+  group: k8s-production-deployment
+  cancel-in-progress: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
