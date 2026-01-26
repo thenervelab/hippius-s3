@@ -99,6 +99,12 @@ jobs:
           echo "Backup configuration:"
           grep -A 5 "barmanObjectStore:" k8s/production/postgres-backup.yaml || true
 
+      - name: Delete old failed migration job
+        run: |
+          # Delete old migration job if it exists (allows fresh retry)
+          kubectl delete job db-migrations -n hippius-s3-prod --ignore-not-found=true
+          echo "Cleaned up old migration job"
+
       - name: Deploy with Kustomize
         run: |
           kubectl apply -k k8s/production
