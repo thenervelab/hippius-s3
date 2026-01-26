@@ -153,6 +153,16 @@ services:
     volumes:
       - .:/app
 
+  janitor:
+    env_file:
+      - .env.defaults
+      - .env.test-docker
+    environment:
+      - HIPPIUS_KEY=${HIPPIUS_KEY}
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
+    volumes:
+      - .:/app
+
   ipfs:
     image: ipfs/kubo:latest
     user: "0:0"
