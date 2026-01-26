@@ -6,14 +6,14 @@ namespace: hippius-s3-prod
 resources:
   - ../base
 
-patches:
-  - path: namespace-patch.yaml
-  - path: environment-patch.yaml
-  - path: resource-limits.yaml
-  - path: postgres-tuning.yaml
-  - path: postgres-backup.yaml
-  - path: redis-tuning.yaml
-  - path: ingress-patch.yaml
+patchesStrategicMerge:
+  - namespace-patch.yaml
+  - environment-patch.yaml
+  - resource-limits.yaml
+  - postgres-tuning.yaml
+  - postgres-backup.yaml
+  - redis-tuning.yaml
+  - ingress-patch.yaml
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api
