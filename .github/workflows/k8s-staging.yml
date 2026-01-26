@@ -101,18 +101,81 @@ jobs:
       - name: Wait for PostgreSQL cluster
         run: |
           echo "Waiting for PostgreSQL cluster to be ready..."
-          kubectl wait --for=condition=Ready cluster/postgres \
-            -n hippius-s3-staging \
-            --timeout=600s || true
+
+          # Wait for cluster to be ready
+          for i in {1..60}; do
+            STATUS=$(kubectl get cluster postgres -n hippius-s3-staging -o jsonpath='{.status.phase}' 2>/dev/null || echo "not-found")
+            echo "Attempt $i/60: Cluster status: $STATUS"
+
+            if [ "$STATUS" = "Cluster in healthy state" ]; then
+              echo "PostgreSQL cluster is ready!"
+              break
+            fi
+
+            if [ $i -eq 60 ]; then
+              echo "ERROR: PostgreSQL cluster not ready after 10 minutes"
+              kubectl describe cluster postgres -n hippius-s3-staging
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+          # Verify postgres-rw service exists
+          echo -e "\n=== Checking for postgres-rw service ==="
+          for i in {1..30}; do
+            if kubectl get svc postgres-rw -n hippius-s3-staging &>/dev/null; then
+              echo "postgres-rw service found!"
+              kubectl get svc postgres-rw -n hippius-s3-staging
+              break
+            fi
+            echo "Waiting for postgres-rw service... ($i/30)"
+            sleep 5
+          done
+
+          # Show cluster details
+          echo -e "\n=== PostgreSQL Cluster Status ==="
           kubectl get cluster postgres -n hippius-s3-staging
+
+          echo -e "\n=== PostgreSQL Pods ==="
+          kubectl get pods -n hippius-s3-staging -l cnpg.io/cluster=postgres
+
+          echo -e "\n=== PostgreSQL Services ==="
+          kubectl get svc -n hippius-s3-staging | grep postgres
 
       - name: Check migration job
         run: |
           echo "Checking database migration job..."
+
+          # Show job status
+          kubectl get job db-migrations -n hippius-s3-staging -o yaml || true
+
+          # Show pod status
+          kubectl get pods -n hippius-s3-staging -l job-name=db-migrations || true
+
+          # Get migration pod logs (init container first)
+          MIGRATION_POD=$(kubectl get pods -n hippius-s3-staging -l job-name=db-migrations -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+
+          if [ -n "$MIGRATION_POD" ]; then
+            echo "=== Init container logs (wait-for-postgres) ==="
+            kubectl logs -n hippius-s3-staging "$MIGRATION_POD" -c wait-for-postgres --tail=50 || true
+
+            echo -e "\n=== Main container logs (migrations) ==="
+            kubectl logs -n hippius-s3-staging "$MIGRATION_POD" -c migrations --tail=50 || true
+          fi
+
+          # Check PostgreSQL services
+          echo -e "\n=== PostgreSQL Services ==="
+          kubectl get svc -n hippius-s3-staging | grep postgres || true
+
+          # Check PostgreSQL cluster status
+          echo -e "\n=== PostgreSQL Cluster Status ==="
+          kubectl get cluster postgres -n hippius-s3-staging -o yaml | grep -A 20 "status:" || true
+
+          # Wait for job (allow failure for now)
           kubectl wait --for=condition=complete job/db-migrations \
             -n hippius-s3-staging \
-            --timeout=300s || true
-          kubectl logs -n hippius-s3-staging job/db-migrations --tail=50 || true
+            --timeout=300s || echo "Migration job did not complete in time"
 
       - name: Wait for deployments
         run: |
