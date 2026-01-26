@@ -63,10 +63,3 @@ spec:
         compression: gzip
         maxParallel: 2
     retentionPolicy: "30d"
-
-scheduledBackups:
-  - name: daily-backup
-    schedule: "0 2 * * *"
-    backupOwnerReference: self
-    method: barmanObjectStore
-    target: primary

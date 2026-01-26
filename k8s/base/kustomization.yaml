@@ -8,6 +8,7 @@ resources:
   - configmap-environment.yaml
   - pvc-shared.yaml
   - postgres-cluster.yaml
+  - postgres-scheduledbackup.yaml
   - redis-statefulsets.yaml
   - ipfs-statefulset.yaml
   - migration-job.yaml

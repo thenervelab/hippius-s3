@@ -6,7 +6,7 @@ namespace: hippius-s3-staging
 resources:
   - ../base
 
-patchesStrategicMerge:
+patches:
   - namespace-patch.yaml
   - environment-patch.yaml
   - resource-limits.yaml
