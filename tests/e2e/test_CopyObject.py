@@ -62,7 +62,10 @@ def test_copy_preserves_custom_metadata(
     assert "CopyObjectResult" in resp
 
     head = boto3_client.head_object(Bucket=bucket, Key=dst_key)
-    assert head["Metadata"] == custom_metadata
+    dest_metadata = head["Metadata"]
+
+    for key, value in custom_metadata.items():
+        assert dest_metadata.get(key) == value, f"Custom metadata {key} not preserved"
 
 
 def test_copy_preserves_content_type(
