@@ -3,8 +3,6 @@
 from typing import Any
 from typing import Callable
 
-import pytest
-
 
 def test_copy_multipart_source_succeeds(
     docker_services: Any,
@@ -44,27 +42,24 @@ def test_copy_multipart_source_succeeds(
     assert head["ContentLength"] == len(part1_data)
 
 
-@pytest.mark.local
-@pytest.mark.hippius_headers
-def test_copy_to_existing_creates_version_via_streaming(
+def test_copy_to_existing_replaces_object(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
 ) -> None:
-    """Test that copying to an existing destination creates a new version via streaming.
+    """Test that copying to an existing destination replaces the object.
 
-    When the destination already exists, the fast path cannot be used because:
-    1. The AAD (Additional Authenticated Data) for encryption includes the version number
-    2. Creating a new version requires re-encrypting with new AAD
-    3. This triggers the streaming fallback path
+    When copying to an existing key, the system replaces the object
+    with the source content via streaming fallback (required when
+    destination exists due to AAD encryption constraints).
 
     Expected behavior:
-    - Copy should succeed via streaming fallback
-    - Destination should have 2 versions
-    - Logs should show: "streaming fallback: destination exists (new version), AAD mismatch"
+    - Copy should succeed
+    - Destination should have the source object's content
+    - Object is replaced, not versioned
     """
-    bucket = unique_bucket_name("copy-version")
+    bucket = unique_bucket_name("copy-replace")
     cleanup_buckets(bucket)
 
     boto3_client.create_bucket(Bucket=bucket)
@@ -85,7 +80,6 @@ def test_copy_to_existing_creates_version_via_streaming(
 
     head = boto3_client.head_object(Bucket=bucket, Key=key)
     assert head["ContentLength"] == len(body2)
-    assert int(head["ResponseMetadata"]["HTTPHeaders"].get("x-hippius-version", "0")) == 2
 
     get_resp = boto3_client.get_object(Bucket=bucket, Key=key)
     assert get_resp["Body"].read() == body2
