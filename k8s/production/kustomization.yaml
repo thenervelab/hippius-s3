@@ -6,7 +6,7 @@ namespace: hippius-s3-prod
 resources:
   - ../base
 
-patches:
+patchesStrategicMerge:
   - namespace-patch.yaml
   - environment-patch.yaml
   - resource-limits.yaml
