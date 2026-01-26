@@ -22,8 +22,28 @@ jobs:
       - name: Configure kubectl
         run: |
           mkdir -p ~/.kube
-          echo "${{ secrets.KUBECONFIG }}" | base64 -d > ~/.kube/config
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
           chmod 600 ~/.kube/config
+
+          # Verify kubeconfig was written
+          if [ ! -s ~/.kube/config ]; then
+            echo "Error: kubeconfig file is empty"
+            exit 1
+          fi
+
+          # Debug: show kubeconfig structure (without credentials)
+          echo "Kubeconfig clusters:"
+          kubectl config get-clusters
+
+          echo "Kubeconfig contexts:"
+          kubectl config get-contexts
+
+          # Set current context if not set
+          CONTEXT=$(kubectl config current-context 2>/dev/null || kubectl config get-contexts -o name | head -1)
+          if [ -n "$CONTEXT" ]; then
+            kubectl config use-context "$CONTEXT"
+          fi
+
           kubectl version --client
 
       - name: Verify cluster connection
