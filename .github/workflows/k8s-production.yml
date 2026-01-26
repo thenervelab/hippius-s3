@@ -90,9 +90,14 @@ jobs:
             --namespace=hippius-s3-prod \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Configure backup endpoint
+      - name: Configure backup settings
         run: |
+          sed -i "s|BACKUP_BUCKET_PLACEHOLDER|${{ secrets.OVH_BACKUP_BUCKET }}|g" k8s/production/postgres-backup.yaml
           sed -i "s|BACKUP_ENDPOINT_PLACEHOLDER|${{ secrets.OVH_BACKUP_ENDPOINT_URL }}|g" k8s/production/postgres-backup.yaml
+
+          # Show what was configured (without secrets)
+          echo "Backup configuration:"
+          grep -A 5 "barmanObjectStore:" k8s/production/postgres-backup.yaml || true
 
       - name: Deploy with Kustomize
         run: |

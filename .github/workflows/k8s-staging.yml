@@ -90,9 +90,14 @@ jobs:
             --namespace=hippius-s3-staging \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Configure backup endpoint
+      - name: Configure backup settings
         run: |
+          sed -i "s|BACKUP_BUCKET_PLACEHOLDER|${{ secrets.OVH_BACKUP_BUCKET }}|g" k8s/staging/postgres-backup.yaml
           sed -i "s|BACKUP_ENDPOINT_PLACEHOLDER|${{ secrets.OVH_BACKUP_ENDPOINT_URL }}|g" k8s/staging/postgres-backup.yaml
+
+          # Show what was configured (without secrets)
+          echo "Backup configuration:"
+          grep -A 5 "barmanObjectStore:" k8s/staging/postgres-backup.yaml || true
 
       - name: Deploy with Kustomize
         run: |
@@ -153,16 +158,31 @@ jobs:
           # Show pod status
           kubectl get pods -n hippius-s3-staging -l job-name=db-migrations || true
 
-          # Get migration pod logs (init container first)
-          MIGRATION_POD=$(kubectl get pods -n hippius-s3-staging -l job-name=db-migrations -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+          # Get migration pod logs (try all pods, including failed ones)
+          echo "=== Looking for migration pods ==="
+          kubectl get pods -n hippius-s3-staging -l job-name=db-migrations --show-labels || true
 
-          if [ -n "$MIGRATION_POD" ]; then
-            echo "=== Init container logs (wait-for-postgres) ==="
-            kubectl logs -n hippius-s3-staging "$MIGRATION_POD" -c wait-for-postgres --tail=50 || true
+          # Try to get logs from any pod (current or previous)
+          for POD in $(kubectl get pods -n hippius-s3-staging -l job-name=db-migrations -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            echo -e "\n=== Pod: $POD ==="
 
-            echo -e "\n=== Main container logs (migrations) ==="
-            kubectl logs -n hippius-s3-staging "$MIGRATION_POD" -c migrations --tail=50 || true
-          fi
+            echo "Init container logs (wait-for-postgres):"
+            kubectl logs -n hippius-s3-staging "$POD" -c wait-for-postgres --tail=100 2>/dev/null || \
+              kubectl logs -n hippius-s3-staging "$POD" -c wait-for-postgres --previous --tail=100 2>/dev/null || \
+              echo "No logs available"
+
+            echo -e "\nMain container logs (migrations):"
+            kubectl logs -n hippius-s3-staging "$POD" -c migrations --tail=100 2>/dev/null || \
+              kubectl logs -n hippius-s3-staging "$POD" -c migrations --previous --tail=100 2>/dev/null || \
+              echo "No logs available"
+
+            echo -e "\nPod events:"
+            kubectl describe pod "$POD" -n hippius-s3-staging | grep -A 20 "Events:" || true
+          done
+
+          # Check for events related to the job
+          echo -e "\n=== Recent Events for Migration Job ==="
+          kubectl get events -n hippius-s3-staging --sort-by='.lastTimestamp' | grep -i "db-migration" | tail -20 || true
 
           # Check PostgreSQL services
           echo -e "\n=== PostgreSQL Services ==="
