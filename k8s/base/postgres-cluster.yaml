@@ -1,0 +1,72 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: postgres
+spec:
+  instances: 1
+  primaryUpdateStrategy: unsupervised
+
+  storage:
+    storageClass: ceph-filesystem
+    size: 50Gi
+
+  postgresql:
+    parameters:
+      max_connections: "200"
+      shared_buffers: "512MB"
+      effective_cache_size: "2GB"
+      work_mem: "64MB"
+      maintenance_work_mem: "512MB"
+      checkpoint_completion_target: "0.9"
+      wal_buffers: "16MB"
+      random_page_cost: "1.1"
+      effective_io_concurrency: "200"
+      max_worker_processes: "4"
+      max_parallel_workers_per_gather: "2"
+      max_parallel_workers: "4"
+      max_parallel_maintenance_workers: "2"
+      wal_level: "replica"
+      max_wal_size: "2GB"
+      min_wal_size: "512MB"
+      checkpoint_timeout: "15min"
+
+  bootstrap:
+    initdb:
+      database: hippius
+      owner: postgres
+      secret:
+        name: postgres-superuser
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      cpu: 4000m
+      memory: 12Gi
+
+  monitoring:
+    enablePodMonitor: false
+
+  backup:
+    barmanObjectStore:
+      destinationPath: ""
+      endpointURL: ""
+      s3Credentials:
+        accessKeyId:
+          name: postgres-backup-creds
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: postgres-backup-creds
+          key: ACCESS_KEY_SECRET
+      wal:
+        compression: gzip
+        maxParallel: 2
+    retentionPolicy: "30d"
+
+scheduledBackups:
+  - name: daily-backup
+    schedule: "0 2 * * *"
+    backupOwnerReference: self
+    method: barmanObjectStore
+    target: primary

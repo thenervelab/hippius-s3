@@ -22,7 +22,7 @@ spec:
           command:
             - sh
             - -c
-            - until nc -z postgres 5432 && nc -z redis 6379 && nc -z redis-queues 6379 && nc -z ipfs 5001; do echo waiting for services; sleep 5; done
+            - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379 && nc -z ipfs 5001; do echo waiting for services; sleep 5; done
       containers:
         - name: uploader
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
@@ -111,7 +111,7 @@ spec:
           command:
             - sh
             - -c
-            - until nc -z postgres 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
+            - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
       containers:
         - name: downloader
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
@@ -193,7 +193,7 @@ spec:
           command:
             - sh
             - -c
-            - until nc -z postgres 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
+            - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
       containers:
         - name: unpinner
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
@@ -270,7 +270,7 @@ spec:
           command:
             - sh
             - -c
-            - until nc -z postgres 5432 && nc -z redis 6379; do echo waiting for services; sleep 5; done
+            - until nc -z postgres-rw 5432 && nc -z redis 6379; do echo waiting for services; sleep 5; done
       containers:
         - name: janitor
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
@@ -413,7 +413,7 @@ spec:
           command:
             - sh
             - -c
-            - until nc -z postgres 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
+            - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
       containers:
         - name: orphan-checker
           image: ghcr.io/thenervelab/hippius-s3/workers:latest

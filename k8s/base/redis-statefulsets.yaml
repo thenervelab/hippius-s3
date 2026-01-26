@@ -163,7 +163,7 @@ spec:
       spec:
         accessModes:
           - ReadWriteOnce
-        storageClassName: longhorn
+        storageClassName: ceph-filesystem
         resources:
           requests:
             storage: 10Gi
@@ -257,7 +257,7 @@ spec:
       spec:
         accessModes:
           - ReadWriteOnce
-        storageClassName: longhorn
+        storageClassName: ceph-filesystem
         resources:
           requests:
             storage: 10Gi
@@ -342,7 +342,7 @@ spec:
       spec:
         accessModes:
           - ReadWriteOnce
-        storageClassName: longhorn
+        storageClassName: ceph-filesystem
         resources:
           requests:
             storage: 10Gi

@@ -1,54 +1,28 @@
-apiVersion: apps/v1
-kind: StatefulSet
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
 metadata:
   name: postgres
 spec:
-  template:
-    spec:
-      containers:
-        - name: postgres
-          command:
-            - postgres
-            - -c
-            - max_connections=1000
-            - -c
-            - shared_buffers=8GB
-            - -c
-            - effective_cache_size=24GB
-            - -c
-            - work_mem=64MB
-            - -c
-            - maintenance_work_mem=2GB
-            - -c
-            - checkpoint_completion_target=0.9
-            - -c
-            - wal_buffers=64MB
-            - -c
-            - default_statistics_target=500
-            - -c
-            - random_page_cost=1.1
-            - -c
-            - effective_io_concurrency=200
-            - -c
-            - max_worker_processes=48
-            - -c
-            - max_parallel_workers_per_gather=8
-            - -c
-            - max_parallel_workers=24
-            - -c
-            - max_parallel_maintenance_workers=8
-            - -c
-            - wal_level=replica
-            - -c
-            - max_wal_size=4GB
-            - -c
-            - min_wal_size=1GB
-            - -c
-            - checkpoint_timeout=15min
-  volumeClaimTemplates:
-    - metadata:
-        name: postgres-data
-      spec:
-        resources:
-          requests:
-            storage: 100Gi
+  storage:
+    size: 100Gi
+
+  postgresql:
+    parameters:
+      max_connections: "1000"
+      shared_buffers: "8GB"
+      effective_cache_size: "24GB"
+      work_mem: "64MB"
+      maintenance_work_mem: "2GB"
+      checkpoint_completion_target: "0.9"
+      wal_buffers: "64MB"
+      default_statistics_target: "500"
+      random_page_cost: "1.1"
+      effective_io_concurrency: "200"
+      max_worker_processes: "48"
+      max_parallel_workers_per_gather: "8"
+      max_parallel_workers: "24"
+      max_parallel_maintenance_workers: "8"
+      wal_level: "replica"
+      max_wal_size: "4GB"
+      min_wal_size: "1GB"
+      checkpoint_timeout: "15min"

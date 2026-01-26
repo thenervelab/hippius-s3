@@ -1,0 +1,146 @@
+name: Deploy to K8s Staging
+
+on:
+  push:
+    branches: [k8s-staging]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+          kubectl version --client
+
+      - name: Verify cluster connection
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Create namespace
+        run: |
+          kubectl create namespace hippius-s3-staging --dry-run=client -o yaml | kubectl apply -f -
+          kubectl label namespace hippius-s3-staging environment=staging --overwrite
+
+      - name: Create postgres-superuser secret
+        run: |
+          kubectl create secret generic postgres-superuser \
+            --from-literal=username=postgres \
+            --from-literal=password='${{ secrets.DATABASE_PASSWORD }}' \
+            --namespace=hippius-s3-staging \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Create postgres-backup-creds secret
+        run: |
+          kubectl create secret generic postgres-backup-creds \
+            --from-literal=ACCESS_KEY_ID='${{ secrets.OVH_BACKUP_ACCESS_KEY_ID }}' \
+            --from-literal=ACCESS_KEY_SECRET='${{ secrets.OVH_BACKUP_SECRET_ACCESS_KEY }}' \
+            --namespace=hippius-s3-staging \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Create hippius-s3-secrets
+        run: |
+          kubectl create secret generic hippius-s3-secrets \
+            --from-literal=DATABASE_PASSWORD='${{ secrets.DATABASE_PASSWORD }}' \
+            --from-literal=DATABASE_URL='${{ secrets.STAGING_DATABASE_URL }}' \
+            --from-literal=HIPPIUS_KEYSTORE_DATABASE_URL='${{ secrets.STAGING_DATABASE_URL }}' \
+            --from-literal=REDIS_URL='redis://redis:6379' \
+            --from-literal=REDIS_ACCOUNTS_URL='redis://redis-accounts:6379' \
+            --from-literal=REDIS_CHAIN_URL='redis://redis-chain:6379' \
+            --from-literal=REDIS_QUEUES_URL='redis://redis-queues:6379' \
+            --from-literal=REDIS_RATE_LIMITING_URL='redis://redis-rate-limiting:6379' \
+            --from-literal=REDIS_ACL_URL='redis://redis-acl:6379' \
+            --from-literal=HIPPIUS_SERVICE_KEY='${{ secrets.HIPPIUS_SERVICE_KEY }}' \
+            --from-literal=HIPPIUS_AUTH_ENCRYPTION_KEY='${{ secrets.HIPPIUS_AUTH_ENCRYPTION_KEY }}' \
+            --from-literal=HIPPIUS_IPFS_API_URLS='http://ipfs:5001' \
+            --namespace=hippius-s3-staging \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Configure backup endpoint
+        run: |
+          sed -i "s|BACKUP_ENDPOINT_PLACEHOLDER|${{ secrets.OVH_BACKUP_ENDPOINT_URL }}|g" k8s/staging/postgres-backup.yaml
+
+      - name: Deploy with Kustomize
+        run: |
+          kubectl apply -k k8s/staging
+
+      - name: Wait for PostgreSQL cluster
+        run: |
+          echo "Waiting for PostgreSQL cluster to be ready..."
+          kubectl wait --for=condition=Ready cluster/postgres \
+            -n hippius-s3-staging \
+            --timeout=600s || true
+          kubectl get cluster postgres -n hippius-s3-staging
+
+      - name: Check migration job
+        run: |
+          echo "Checking database migration job..."
+          kubectl wait --for=condition=complete job/db-migrations \
+            -n hippius-s3-staging \
+            --timeout=300s || true
+          kubectl logs -n hippius-s3-staging job/db-migrations --tail=50 || true
+
+      - name: Wait for deployments
+        run: |
+          echo "Waiting for API deployment..."
+          kubectl rollout status deployment/api -n hippius-s3-staging --timeout=300s || true
+
+          echo "Waiting for Gateway deployment..."
+          kubectl rollout status deployment/gateway -n hippius-s3-staging --timeout=300s || true
+
+          echo "Waiting for worker deployments..."
+          kubectl rollout status deployment/uploader -n hippius-s3-staging --timeout=300s || true
+          kubectl rollout status deployment/downloader -n hippius-s3-staging --timeout=300s || true
+
+      - name: Verify deployment
+        run: |
+          echo "=== Cluster Status ==="
+          kubectl get cluster -n hippius-s3-staging
+
+          echo -e "\n=== Services ==="
+          kubectl get svc -n hippius-s3-staging
+
+          echo -e "\n=== PVCs ==="
+          kubectl get pvc -n hippius-s3-staging
+
+          echo -e "\n=== Pods ==="
+          kubectl get pods -n hippius-s3-staging
+
+          echo -e "\n=== Scheduled Backups ==="
+          kubectl get scheduledbackups -n hippius-s3-staging || true
+
+      - name: Check pod health
+        run: |
+          echo "Checking for unhealthy pods..."
+          kubectl get pods -n hippius-s3-staging -o json | \
+            jq -r '.items[] | select(.status.phase != "Running" and .status.phase != "Succeeded") | .metadata.name' || true
+
+      - name: Notify Discord on success
+        if: success()
+        run: |
+          curl -H "Content-Type: application/json" \
+            -X POST \
+            -d "{\"content\":\"✅ K8s Staging deployment successful\"}" \
+            ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+      - name: Notify Discord on failure
+        if: failure()
+        run: |
+          curl -H "Content-Type: application/json" \
+            -X POST \
+            -d "{\"content\":\"❌ K8s Staging deployment failed - check GitHub Actions logs\"}" \
+            ${{ secrets.DISCORD_WEBHOOK_URL }}

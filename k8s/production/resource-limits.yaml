@@ -33,7 +33,7 @@ metadata:
 spec:
   resources:
     requests:
-      storage: 1000Gi
+      storage: 9728Gi
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

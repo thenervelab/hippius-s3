@@ -13,11 +13,11 @@ spec:
       restartPolicy: OnFailure
       initContainers:
         - name: wait-for-postgres
-          image: busybox:1.35
+          image: postgres:15
           command:
             - sh
             - -c
-            - until nc -z postgres 5432; do echo waiting for postgres; sleep 5; done
+            - until pg_isready -h postgres-rw -p 5432 -U postgres; do echo waiting for postgres; sleep 5; done
       containers:
         - name: migrations
           image: ghcr.io/thenervelab/hippius-s3/api:latest

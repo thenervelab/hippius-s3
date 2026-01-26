@@ -10,6 +10,7 @@ patches:
   - path: namespace-patch.yaml
   - path: environment-patch.yaml
   - path: resource-limits.yaml
+  - path: postgres-backup.yaml
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api

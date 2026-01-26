@@ -81,7 +81,7 @@ spec:
       spec:
         accessModes:
           - ReadWriteOnce
-        storageClassName: longhorn
+        storageClassName: ceph-filesystem
         resources:
           requests:
             storage: 100Gi

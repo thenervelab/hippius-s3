@@ -7,7 +7,7 @@ resources:
   - configmap-redis.yaml
   - configmap-environment.yaml
   - pvc-shared.yaml
-  - postgres-statefulset.yaml
+  - postgres-cluster.yaml
   - redis-statefulsets.yaml
   - ipfs-statefulset.yaml
   - migration-job.yaml
