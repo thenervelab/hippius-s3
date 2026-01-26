@@ -214,6 +214,48 @@ class TestKEKServiceRequiredMode:
             # Verify cached KEK returned
             assert result == cached_kek
 
+    async def test_cache_sliding_window_refreshes_ttl(self, mock_kms_client, required_mode_config):
+        """Cache TTL is refreshed on access (sliding window)."""
+        import hippius_s3.services.kek_service as kek_service
+
+        kek_service._POOL = None
+        kek_service._POOL_DSN = None
+        kek_service._KMS_CLIENT = mock_kms_client
+        kek_service._KEK_CACHE.clear()
+
+        bucket_id = str(uuid.uuid4())
+        kek_id = uuid.uuid4()
+        cached_kek = os.urandom(32)
+
+        ttl = required_mode_config.kek_cache_ttl_seconds  # 300s
+        t0 = 1000.0
+
+        with patch("hippius_s3.services.kek_service.get_config", return_value=required_mode_config):
+            # T=0: Cache the KEK
+            with patch("hippius_s3.services.kek_service.time") as mock_time:
+                mock_time.monotonic.return_value = t0
+                await kek_service._set_cached_kek(bucket_id, kek_id, cached_kek)
+
+            # T=280s: Access within TTL → hit, TTL refreshed
+            with patch("hippius_s3.services.kek_service.time") as mock_time:
+                mock_time.monotonic.return_value = t0 + 280
+                result = await kek_service._get_cached_kek(bucket_id, kek_id)
+                assert result == cached_kek
+
+            # T=560s: 560s from original cache, but only 280s from last access
+            # Without sliding window this would be a miss (560 > 300)
+            # With sliding window this is a hit (280 < 300)
+            with patch("hippius_s3.services.kek_service.time") as mock_time:
+                mock_time.monotonic.return_value = t0 + 560
+                result = await kek_service._get_cached_kek(bucket_id, kek_id)
+                assert result == cached_kek
+
+            # T=870s: 310s since last access → expired
+            with patch("hippius_s3.services.kek_service.time") as mock_time:
+                mock_time.monotonic.return_value = t0 + 870
+                result = await kek_service._get_cached_kek(bucket_id, kek_id)
+                assert result is None
+
     async def test_kms_unavailable_fails_closed(self, required_mode_config):
         """KMS outage blocks operations (fail-closed)."""
         import hippius_s3.services.kek_service as kek_service
