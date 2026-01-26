@@ -13,9 +13,6 @@ from hippius_s3.services.copy_service_v5 import copy_chunk_cids
 from hippius_s3.services.copy_service_v5 import rewrap_encryption_envelope
 
 
-d
-
-
 @pytest.mark.skip(reason="Complex mocking with many nested DB calls; covered by E2E tests")
 async def test_create_destination_objects_missing_dest_part():
     """Test error when destination part is not created.
