@@ -291,9 +291,13 @@ async def migrate_one(
                 object_version=ctx.object_version,
                 plan=part_plan,
                 sleep_seconds=config.http_download_sleep_loop,
+                storage_version=ctx.storage_version,
+                key_bytes=ctx.key_bytes,
+                suite_id=ctx.suite_id,
+                bucket_id=ctx.bucket_id,
+                upload_id=ctx.upload_id,
                 address=address,
                 bucket_name=bucket_name,
-                storage_version=ctx.storage_version,
             )
             # Accumulate bytes for this part
             buf = bytearray()
@@ -473,8 +477,10 @@ async def main_async(args: argparse.Namespace) -> int:
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
 
     from hippius_s3.queue import initialize_queue_client
+    from hippius_s3.services.kek_service import init_kms_client
 
     initialize_queue_client(redis_queues_client)
+    await init_kms_client(config)
     try:
         target = config.target_storage_version
 
@@ -757,6 +763,9 @@ async def main_async(args: argparse.Namespace) -> int:
             if callable(close_q):
                 await close_q()
         finally:
+            from hippius_s3.services.kek_service import close_kek_pool
+
+            await close_kek_pool()
             await db.close()
 
 

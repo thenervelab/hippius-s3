@@ -7,12 +7,11 @@ import logging
 import re
 import time
 import uuid
-from datetime import UTC
 from datetime import datetime
+from datetime import timezone
 from typing import Any
 from urllib.parse import unquote
 
-import lxml.etree as _ET  # type: ignore[import-untyped]
 from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import Request
@@ -33,6 +32,9 @@ from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 from hippius_s3.writer.object_writer import ObjectWriter
+from hippius_s3.xml_helpers import add_subelement
+from hippius_s3.xml_helpers import create_element
+from hippius_s3.xml_helpers import to_xml_bytes
 
 
 logger = logging.getLogger(__name__)
@@ -40,10 +42,6 @@ router = APIRouter(tags=["s3-multipart"])
 
 config = get_config()
 tracer = trace.get_tracer(__name__)
-
-# Type checkers don't understand lxml.etree's runtime API well (Element/SubElement/tostring kwargs).
-# Treat the module as Any to avoid hundreds of noisy type errors.
-ET: Any = _ET
 
 
 async def get_request_body(request: Request) -> bytes:
@@ -132,7 +130,7 @@ async def list_parts_internal(
         return s3_error_response("InvalidRequest", "Object key does not match upload", status_code=400)
 
     _ = await db.fetchrow(
-        get_query("get_or_create_user_by_main_account"), request.state.account.main_account, datetime.now(UTC)
+        get_query("get_or_create_user_by_main_account"), request.state.account.main_account, datetime.now(timezone.utc)
     )
     bucket = await db.fetchrow(get_query("get_bucket_by_name"), bucket_name)
     if not bucket or bucket["bucket_id"] != mpu["bucket_id"]:
@@ -162,26 +160,26 @@ async def list_parts_internal(
     next_part_marker = visible_parts[-1]["part_number"] if visible_parts else part_marker
 
     # Build XML per S3 ListParts
-    root = ET.Element("ListPartsResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
-    ET.SubElement(root, "Bucket").text = bucket_name
-    ET.SubElement(root, "Key").text = object_key
-    ET.SubElement(root, "UploadId").text = upload_id
-    ET.SubElement(root, "PartNumberMarker").text = str(part_marker)
-    ET.SubElement(root, "NextPartNumberMarker").text = str(next_part_marker)
-    ET.SubElement(root, "MaxParts").text = str(max_parts)
-    ET.SubElement(root, "IsTruncated").text = "true" if is_truncated else "false"
+    root = create_element("ListPartsResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+    add_subelement(root, "Bucket", bucket_name)
+    add_subelement(root, "Key", object_key)
+    add_subelement(root, "UploadId", upload_id)
+    add_subelement(root, "PartNumberMarker", str(part_marker))
+    add_subelement(root, "NextPartNumberMarker", str(next_part_marker))
+    add_subelement(root, "MaxParts", str(max_parts))
+    add_subelement(root, "IsTruncated", "true" if is_truncated else "false")
 
     for part in visible_parts:
-        p = ET.SubElement(root, "Part")
-        ET.SubElement(p, "PartNumber").text = str(part["part_number"])
-        ET.SubElement(p, "ETag").text = f'"{part["etag"]}"'
-        ET.SubElement(p, "Size").text = str(part["size_bytes"])
+        p = add_subelement(root, "Part")
+        add_subelement(p, "PartNumber", str(part["part_number"]))
+        add_subelement(p, "ETag", f'"{part["etag"]}"')
+        add_subelement(p, "Size", str(part["size_bytes"]))
         # Use CreatedAt as LastModified if available
         ts = part.get("created_at")
         if ts:
-            ET.SubElement(p, "LastModified").text = ts.isoformat()
+            add_subelement(p, "LastModified", ts.isoformat())
 
-    xml_content = ET.tostring(root, encoding="UTF-8", xml_declaration=True, pretty_print=True)
+    xml_content = to_xml_bytes(root)
     return Response(
         content=xml_content,
         media_type="application/xml",
@@ -205,7 +203,7 @@ async def initiate_multipart_upload(
         _ = await db.fetchrow(
             get_query("get_or_create_user_by_main_account"),
             request.state.account.main_account,
-            datetime.now(UTC),
+            datetime.now(timezone.utc),
         )
 
         # Check if bucket exists
@@ -223,7 +221,7 @@ async def initiate_multipart_upload(
         # Create a new multipart upload
         upload_id = str(uuid.uuid4())
         object_id = str(uuid.uuid4())  # Create object_id immediately
-        initiated_at = datetime.now(UTC)
+        initiated_at = datetime.now(timezone.utc)
         content_type = request.headers.get(
             "Content-Type",
             "application/octet-stream",
@@ -284,7 +282,7 @@ async def initiate_multipart_upload(
             initiated_at,
             content_type,
             json.dumps(metadata),
-            datetime.fromtimestamp(file_mtime, UTC) if file_mtime is not None else None,
+            datetime.fromtimestamp(file_mtime, timezone.utc) if file_mtime is not None else None,
             uuid.UUID(object_id),
         )
 
@@ -330,8 +328,8 @@ async def initiate_multipart_upload(
 
 async def get_all_cached_chunks(
     object_id: str,
-    redis_client: Redis,
-):
+    redis_client: Redis,  # type: ignore[type-arg]
+) -> list[Any]:
     """Find all cached part meta keys for an object using non-blocking SCAN."""
     try:
         keys_pattern = f"obj:{object_id}:part:*:meta"
@@ -425,7 +423,9 @@ async def upload_part(
 
         # Resolve source object and fetch bytes from IPFS (require CID available)
         _ = await db.fetchrow(
-            get_query("get_or_create_user_by_main_account"), request.state.account.main_account, datetime.now(UTC)
+            get_query("get_or_create_user_by_main_account"),
+            request.state.account.main_account,
+            datetime.now(timezone.utc),
         )
         source_bucket = await db.fetchrow(get_query("get_bucket_by_name"), source_bucket_name)
         if not source_bucket:
@@ -512,16 +512,57 @@ async def upload_part(
                 await enqueue_download_request(req)
 
             # Stream plaintext bytes
-            source_storage_version = require_supported_storage_version(int(source_obj["storage_version"]))
+            raw_storage_version = source_obj.get("storage_version")
+            if raw_storage_version is None:
+                return s3_error_response("InternalError", "Missing storage version", status_code=500)
+            storage_version = require_supported_storage_version(int(raw_storage_version))
+            bucket_id = str(source_obj.get("bucket_id") or "")
+            suite_id = str(
+                source_obj.get("enc_suite_id") or ("hip-enc/aes256gcm" if storage_version >= 5 else "hip-enc/legacy")
+            )
+            key_bytes: bytes | None = None
+            expected_size = (
+                int(range_end - range_start + 1)
+                if range_start is not None and range_end is not None
+                else int(source_obj.get("size_bytes") or 0)
+            )
+            if expected_size > int(config.max_multipart_part_size):
+                return s3_error_response(
+                    "EntityTooLarge",
+                    "UploadPartCopy source is too large to buffer in memory",
+                    status_code=413,
+                )
+            if storage_version >= 5:
+                from hippius_s3.services.envelope_service import unwrap_dek
+                from hippius_s3.services.kek_service import get_bucket_kek_bytes
+
+                kek_id = source_obj.get("kek_id")
+                wrapped_dek = source_obj.get("wrapped_dek")
+                if not bucket_id or not kek_id or not wrapped_dek:
+                    return s3_error_response("InternalError", "Missing v5 envelope metadata", status_code=500)
+                kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
+                aad = f"hippius-dek:{bucket_id}:{object_id_str}:{src_ver}".encode("utf-8")
+                key_bytes = unwrap_dek(kek=kek_bytes, wrapped_dek=bytes(wrapped_dek), aad=aad)
+            else:
+                from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
+
+                key_bytes = await get_or_create_encryption_key_bytes(
+                    main_account_id=request.state.account.main_account,
+                    bucket_name=source_bucket_name,
+                )
             chunks_iter = stream_plan(
                 obj_cache=obj_cache,
                 object_id=object_id_str,
                 object_version=src_ver,
                 plan=plan,
                 sleep_seconds=config.http_download_sleep_loop,
+                storage_version=storage_version,
+                key_bytes=key_bytes,
+                suite_id=suite_id,
+                bucket_id=bucket_id,
+                upload_id="",
                 address=request.state.account.main_account,
                 bucket_name=source_bucket_name,
-                storage_version=source_storage_version,
             )
             try:
                 source_bytes = b"".join([piece async for piece in chunks_iter])
@@ -697,7 +738,7 @@ async def upload_part(
             xml = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <CopyPartResult>
   <ETag>\"{part_result["etag"]}\"</ETag>
-  <LastModified>{datetime.now(UTC).isoformat()}</LastModified>
+  <LastModified>{datetime.now(timezone.utc).isoformat()}</LastModified>
 </CopyPartResult>
 """.encode("utf-8")
             return Response(content=xml, media_type="application/xml", status_code=200)
@@ -812,7 +853,7 @@ async def list_multipart_uploads(
         _ = await db.fetchrow(
             get_query("get_or_create_user_by_main_account"),
             request.state.account.main_account,
-            datetime.now(UTC),
+            datetime.now(timezone.utc),
         )
 
         bucket = await db.fetchrow(
@@ -846,34 +887,33 @@ async def list_multipart_uploads(
             pass
 
         # Generate the response XML
-        root = ET.Element("ListMultipartUploadsResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
-        ET.SubElement(root, "Bucket").text = bucket_name
-        ET.SubElement(root, "KeyMarker").text = ""
-        ET.SubElement(root, "UploadIdMarker").text = ""
-        ET.SubElement(root, "NextKeyMarker").text = ""
-        ET.SubElement(root, "NextUploadIdMarker").text = ""
-        ET.SubElement(root, "MaxUploads").text = "1000"
-        ET.SubElement(root, "IsTruncated").text = "false"
+        root = create_element("ListMultipartUploadsResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+        add_subelement(root, "Bucket", bucket_name)
+        add_subelement(root, "KeyMarker", "")
+        add_subelement(root, "UploadIdMarker", "")
+        add_subelement(root, "NextKeyMarker", "")
+        add_subelement(root, "NextUploadIdMarker", "")
+        add_subelement(root, "MaxUploads", "1000")
+        add_subelement(root, "IsTruncated", "false")
 
         # Add Upload elements
         for upload in uploads:
-            upload_elem = ET.SubElement(root, "Upload")
-            ET.SubElement(upload_elem, "Key").text = (
-                str(upload["object_key"]) if upload.get("object_key") is not None else ""
+            upload_elem = add_subelement(root, "Upload")
+            add_subelement(
+                upload_elem,
+                "Key",
+                str(upload["object_key"]) if upload.get("object_key") is not None else "",
             )
             # Ensure UploadId is a string (DB may return uuid.UUID)
-            ET.SubElement(upload_elem, "UploadId").text = (
-                str(upload["upload_id"]) if upload.get("upload_id") is not None else ""
+            add_subelement(
+                upload_elem,
+                "UploadId",
+                str(upload["upload_id"]) if upload.get("upload_id") is not None else "",
             )
-            ET.SubElement(upload_elem, "Initiated").text = upload["initiated_at"].isoformat()
+            add_subelement(upload_elem, "Initiated", upload["initiated_at"].isoformat())
 
         # Generate XML with proper declaration
-        xml_content = ET.tostring(
-            root,
-            encoding="UTF-8",
-            xml_declaration=True,
-            pretty_print=True,
-        )
+        xml_content = to_xml_bytes(root)
 
         # Return with proper headers
         return Response(

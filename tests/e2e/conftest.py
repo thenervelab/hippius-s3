@@ -26,6 +26,7 @@ from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 from botocore.exceptions import ReadTimeoutError  # type: ignore[import-untyped]
 
 from .support.compose import enable_ipfs_proxy
+from .support.compose import enable_kms_proxy
 from .support.compose import wait_for_toxiproxy
 
 
@@ -275,6 +276,21 @@ def _init_ipfs_proxies(docker_services: None) -> Iterator[None]:
         return
     assert wait_for_toxiproxy(), "Toxiproxy API not available"
     enable_ipfs_proxy()
+    yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _init_kms_proxy(docker_services: None) -> Iterator[None]:
+    """Ensure Toxiproxy KMS proxy exists and is enabled before any tests run.
+
+    Routes KMS traffic through toxiproxy to allow fault injection testing.
+    No-op when running against real AWS.
+    """
+    if os.getenv("RUN_REAL_AWS") == "1" or os.getenv("AWS") == "1":
+        yield
+        return
+    assert wait_for_toxiproxy(), "Toxiproxy API not available"
+    enable_kms_proxy()
     yield
 
 
