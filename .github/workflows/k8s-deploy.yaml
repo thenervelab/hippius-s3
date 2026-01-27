@@ -154,11 +154,12 @@ jobs:
 
       - name: Update image tags
         run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
           cd k8s/staging
           kustomize edit set image \
-            ghcr.io/thenervelab/hippius-s3/api:${{ github.sha }} \
-            ghcr.io/thenervelab/hippius-s3/gateway:${{ github.sha }} \
-            ghcr.io/thenervelab/hippius-s3/workers:${{ github.sha }}
+            ghcr.io/thenervelab/hippius-s3/api:${SHORT_SHA} \
+            ghcr.io/thenervelab/hippius-s3/gateway:${SHORT_SHA} \
+            ghcr.io/thenervelab/hippius-s3/workers:${SHORT_SHA}
 
       - name: Delete old migration job
         run: |
@@ -221,11 +222,12 @@ jobs:
 
       - name: Update image tags
         run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
           cd k8s/production
           kustomize edit set image \
-            ghcr.io/thenervelab/hippius-s3/api:${{ github.sha }} \
-            ghcr.io/thenervelab/hippius-s3/gateway:${{ github.sha }} \
-            ghcr.io/thenervelab/hippius-s3/workers:${{ github.sha }}
+            ghcr.io/thenervelab/hippius-s3/api:${SHORT_SHA} \
+            ghcr.io/thenervelab/hippius-s3/gateway:${SHORT_SHA} \
+            ghcr.io/thenervelab/hippius-s3/workers:${SHORT_SHA}
 
       - name: Deploy to production
         run: |
