@@ -5,6 +5,8 @@ on:
     branches:
       - staging
       - production
+      - k8s-staging
+      - k8s-production
 
 permissions:
   contents: read
