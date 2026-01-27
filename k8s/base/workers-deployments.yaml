@@ -307,6 +307,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: REDIS_URL
+            - name: HIPPIUS_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_KEY
             - name: HIPPIUS_IPFS_API_URLS
               valueFrom:
                 secretKeyRef:
@@ -391,6 +396,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_SERVICE_KEY
+            - name: HIPPIUS_AUTH_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_AUTH_ENCRYPTION_KEY
             - name: HIPPIUS_IPFS_API_URLS
               valueFrom:
                 secretKeyRef:
