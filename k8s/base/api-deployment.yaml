@@ -89,7 +89,7 @@ spec:
               mountPath: /tmp/hippius_dlq
           startupProbe:
             httpGet:
-              path: /
+              path: /health
               port: 8000
             initialDelaySeconds: 120
             periodSeconds: 10
@@ -97,14 +97,14 @@ spec:
             failureThreshold: 20
           livenessProbe:
             httpGet:
-              path: /
+              path: /health
               port: 8000
             periodSeconds: 60
             timeoutSeconds: 5
             failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /
+              path: /health
               port: 8000
             periodSeconds: 10
             timeoutSeconds: 3
