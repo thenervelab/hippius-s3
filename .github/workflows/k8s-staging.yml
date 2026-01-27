@@ -18,6 +18,68 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker images
+        run: |
+          IMAGE_TAG=latest
+          COMMIT_SHA=${{ github.sha }}
+
+          echo "Building images with tag: $IMAGE_TAG"
+
+          docker buildx build \
+            --platform linux/amd64 \
+            --target base \
+            --tag ghcr.io/thenervelab/hippius-s3/base:$IMAGE_TAG \
+            --tag ghcr.io/thenervelab/hippius-s3/base:$COMMIT_SHA \
+            --cache-from type=registry,ref=ghcr.io/thenervelab/hippius-s3/base:latest \
+            --cache-to type=inline \
+            --push \
+            .
+
+          docker buildx build \
+            --platform linux/amd64 \
+            --target api \
+            --tag ghcr.io/thenervelab/hippius-s3/api:$IMAGE_TAG \
+            --tag ghcr.io/thenervelab/hippius-s3/api:$COMMIT_SHA \
+            --cache-from type=registry,ref=ghcr.io/thenervelab/hippius-s3/base:latest \
+            --cache-from type=registry,ref=ghcr.io/thenervelab/hippius-s3/api:latest \
+            --cache-to type=inline \
+            --push \
+            .
+
+          docker buildx build \
+            --platform linux/amd64 \
+            --target gateway \
+            --tag ghcr.io/thenervelab/hippius-s3/gateway:$IMAGE_TAG \
+            --tag ghcr.io/thenervelab/hippius-s3/gateway:$COMMIT_SHA \
+            --cache-from type=registry,ref=ghcr.io/thenervelab/hippius-s3/base:latest \
+            --cache-from type=registry,ref=ghcr.io/thenervelab/hippius-s3/gateway:latest \
+            --cache-to type=inline \
+            --push \
+            .
+
+          docker buildx build \
+            --platform linux/amd64 \
+            --target workers \
+            --tag ghcr.io/thenervelab/hippius-s3/workers:$IMAGE_TAG \
+            --tag ghcr.io/thenervelab/hippius-s3/workers:$COMMIT_SHA \
+            --cache-from type=registry,ref=ghcr.io/thenervelab/hippius-s3/base:latest \
+            --cache-from type=registry,ref=ghcr.io/thenervelab/hippius-s3/workers:latest \
+            --cache-to type=inline \
+            --push \
+            .
+
+          echo "All images built and pushed successfully"
+
       - name: Set up kubectl
         uses: azure/setup-kubectl@v3
         with:
@@ -223,6 +285,18 @@ jobs:
           kubectl wait --for=condition=complete job/db-migrations \
             -n hippius-s3-staging \
             --timeout=300s || echo "Migration job did not complete in time"
+
+      - name: Restart all deployments
+        run: |
+          echo "Restarting all deployments to pick up latest code..."
+          kubectl rollout restart deployment/api -n hippius-s3-staging
+          kubectl rollout restart deployment/gateway -n hippius-s3-staging
+          kubectl rollout restart deployment/uploader -n hippius-s3-staging
+          kubectl rollout restart deployment/downloader -n hippius-s3-staging
+          kubectl rollout restart deployment/unpinner -n hippius-s3-staging
+          kubectl rollout restart deployment/janitor -n hippius-s3-staging
+          kubectl rollout restart deployment/account-cacher -n hippius-s3-staging
+          echo "All deployments restarted"
 
       - name: Wait for deployments
         run: |

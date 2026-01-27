@@ -26,6 +26,7 @@ spec:
       containers:
         - name: uploader
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          imagePullPolicy: Always
           envFrom:
             - configMapRef:
                 name: hippius-s3-defaults
@@ -115,6 +116,7 @@ spec:
       containers:
         - name: downloader
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          imagePullPolicy: Always
           envFrom:
             - configMapRef:
                 name: hippius-s3-defaults
@@ -207,6 +209,7 @@ spec:
       containers:
         - name: unpinner
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          imagePullPolicy: Always
           envFrom:
             - configMapRef:
                 name: hippius-s3-defaults
@@ -289,6 +292,7 @@ spec:
       containers:
         - name: janitor
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          imagePullPolicy: Always
           envFrom:
             - configMapRef:
                 name: hippius-s3-defaults
@@ -373,6 +377,7 @@ spec:
       containers:
         - name: account-cacher
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          imagePullPolicy: Always
           envFrom:
             - configMapRef:
                 name: hippius-s3-defaults
@@ -457,6 +462,7 @@ spec:
       containers:
         - name: orphan-checker
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          imagePullPolicy: Always
           envFrom:
             - configMapRef:
                 name: hippius-s3-defaults
