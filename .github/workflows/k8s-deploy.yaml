@@ -134,19 +134,21 @@ jobs:
 
       - name: Update secrets
         run: |
+          DATABASE_URL="postgresql://postgres:${{ secrets.DATABASE_PASSWORD }}@postgres-rw:5432/hippius?sslmode=disable"
+
           kubectl create secret generic hippius-s3-secrets \
-            --from-literal=DATABASE_URL="${{ secrets.STAGING_DATABASE_URL }}" \
-            --from-literal=HIPPIUS_KEYSTORE_DATABASE_URL="${{ secrets.STAGING_DATABASE_URL }}" \
-            --from-literal=REDIS_URL="redis://redis:6379/0" \
-            --from-literal=REDIS_ACCOUNTS_URL="redis://redis-accounts:6379/0" \
-            --from-literal=REDIS_CHAIN_URL="redis://redis-chain:6379/0" \
-            --from-literal=REDIS_QUEUES_URL="redis://redis-queues:6379/0" \
-            --from-literal=REDIS_RATE_LIMITING_URL="redis://redis-rate-limiting:6379/0" \
-            --from-literal=REDIS_ACL_URL="redis://redis-acl:6379/0" \
-            --from-literal=HIPPIUS_SERVICE_KEY="${{ secrets.STAGING_HIPPIUS_SERVICE_KEY }}" \
-            --from-literal=HIPPIUS_AUTH_ENCRYPTION_KEY="${{ secrets.STAGING_HIPPIUS_AUTH_ENCRYPTION_KEY }}" \
-            --from-literal=HIPPIUS_IPFS_API_URLS="http://ipfs:5001" \
-            --from-literal=DATABASE_PASSWORD="${{ secrets.STAGING_DATABASE_PASSWORD }}" \
+            --from-literal=DATABASE_PASSWORD='${{ secrets.DATABASE_PASSWORD }}' \
+            --from-literal=DATABASE_URL="${DATABASE_URL}" \
+            --from-literal=HIPPIUS_KEYSTORE_DATABASE_URL="${DATABASE_URL}" \
+            --from-literal=REDIS_URL='redis://redis:6379' \
+            --from-literal=REDIS_ACCOUNTS_URL='redis://redis-accounts:6379' \
+            --from-literal=REDIS_CHAIN_URL='redis://redis-chain:6379' \
+            --from-literal=REDIS_QUEUES_URL='redis://redis-queues:6379' \
+            --from-literal=REDIS_RATE_LIMITING_URL='redis://redis-rate-limiting:6379' \
+            --from-literal=REDIS_ACL_URL='redis://redis-acl:6379' \
+            --from-literal=HIPPIUS_SERVICE_KEY='${{ secrets.HIPPIUS_SERVICE_KEY }}' \
+            --from-literal=HIPPIUS_AUTH_ENCRYPTION_KEY='${{ secrets.HIPPIUS_AUTH_ENCRYPTION_KEY }}' \
+            --from-literal=HIPPIUS_IPFS_API_URLS='${{ secrets.HIPPIUS_IPFS_API_URLS }}' \
             --namespace=hippius-s3-staging \
             --dry-run=client -o yaml | kubectl apply -f -
 
@@ -157,6 +159,10 @@ jobs:
             ghcr.io/thenervelab/hippius-s3/api:${{ github.sha }} \
             ghcr.io/thenervelab/hippius-s3/gateway:${{ github.sha }} \
             ghcr.io/thenervelab/hippius-s3/workers:${{ github.sha }}
+
+      - name: Delete old migration job
+        run: |
+          kubectl delete job db-migrations -n hippius-s3-staging --ignore-not-found=true
 
       - name: Deploy to staging
         run: |
