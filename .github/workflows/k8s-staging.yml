@@ -78,6 +78,9 @@ jobs:
 
       - name: Create hippius-s3-secrets
         run: |
+          # Debug: Show what DATABASE_URL we're using (mask password)
+          echo "DATABASE_URL from secret: ${{ secrets.STAGING_DATABASE_URL }}" | sed 's/:.*@/:****@/'
+
           kubectl create secret generic hippius-s3-secrets \
             --from-literal=DATABASE_PASSWORD='${{ secrets.DATABASE_PASSWORD }}' \
             --from-literal=DATABASE_URL='${{ secrets.STAGING_DATABASE_URL }}' \
@@ -93,6 +96,10 @@ jobs:
             --from-literal=HIPPIUS_IPFS_API_URLS='http://ipfs:5001' \
             --namespace=hippius-s3-staging \
             --dry-run=client -o yaml | kubectl apply -f -
+
+          # Verify secret was created and show keys
+          echo -e "\nSecret keys created:"
+          kubectl get secret hippius-s3-secrets -n hippius-s3-staging -o jsonpath='{.data}' | jq -r 'keys[]'
 
       - name: Configure backup settings
         run: |
@@ -158,6 +165,15 @@ jobs:
           echo -e "\n=== PostgreSQL Services ==="
           kubectl get svc -n hippius-s3-staging | grep postgres
 
+          echo -e "\n=== Testing Database Connectivity ==="
+          # Test if we can connect to postgres-rw from within the cluster
+          kubectl run test-db-connection --rm -i --restart=Never \
+            --image=postgres:15 \
+            --namespace=hippius-s3-staging \
+            --env="PGPASSWORD=${{ secrets.DATABASE_PASSWORD }}" \
+            --command -- psql -h postgres-rw -U postgres -d hippius -c "SELECT version();" 2>&1 || \
+            echo "Failed to connect to database"
+
       - name: Check migration job
         run: |
           echo "Checking database migration job..."
@@ -210,14 +226,43 @@ jobs:
       - name: Wait for deployments
         run: |
           echo "Waiting for API deployment..."
-          kubectl rollout status deployment/api -n hippius-s3-staging --timeout=300s || true
+          kubectl rollout status deployment/api -n hippius-s3-staging --timeout=300s || echo "API deployment failed"
 
           echo "Waiting for Gateway deployment..."
-          kubectl rollout status deployment/gateway -n hippius-s3-staging --timeout=300s || true
+          kubectl rollout status deployment/gateway -n hippius-s3-staging --timeout=300s || echo "Gateway deployment failed"
 
           echo "Waiting for worker deployments..."
-          kubectl rollout status deployment/uploader -n hippius-s3-staging --timeout=300s || true
-          kubectl rollout status deployment/downloader -n hippius-s3-staging --timeout=300s || true
+          kubectl rollout status deployment/uploader -n hippius-s3-staging --timeout=300s || echo "Uploader deployment failed"
+          kubectl rollout status deployment/downloader -n hippius-s3-staging --timeout=300s || echo "Downloader deployment failed"
+
+      - name: Debug deployment failures
+        if: always()
+        run: |
+          echo "=== Deployment Status ==="
+          kubectl get deployments -n hippius-s3-staging
+
+          echo -e "\n=== Pod Status ==="
+          kubectl get pods -n hippius-s3-staging -o wide
+
+          echo -e "\n=== Failed/Crashing Pods ==="
+          for POD in $(kubectl get pods -n hippius-s3-staging --field-selector=status.phase!=Running,status.phase!=Succeeded -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            echo -e "\n--- Pod: $POD ---"
+            kubectl describe pod "$POD" -n hippius-s3-staging | tail -30
+
+            echo -e "\nLogs:"
+            kubectl logs "$POD" -n hippius-s3-staging --tail=50 --all-containers=true 2>&1 || \
+              kubectl logs "$POD" -n hippius-s3-staging --previous --tail=50 --all-containers=true 2>&1 || \
+              echo "No logs available"
+          done
+
+          echo -e "\n=== API Pod Logs (if running) ==="
+          kubectl logs -n hippius-s3-staging -l app=api --tail=50 --all-containers=true 2>&1 || echo "No API pods found"
+
+          echo -e "\n=== Gateway Pod Logs (if running) ==="
+          kubectl logs -n hippius-s3-staging -l app=gateway --tail=50 --all-containers=true 2>&1 || echo "No Gateway pods found"
+
+          echo -e "\n=== Recent Events ==="
+          kubectl get events -n hippius-s3-staging --sort-by='.lastTimestamp' | tail -30
 
       - name: Verify deployment
         run: |
