@@ -173,9 +173,20 @@ async def is_replicated_on_all_backends(
         part_number: Part number
 
     Returns:
-        True if ALL chunks have storage_backends_uploaded >= total_number_of_storage_backends,
+        True if ALL chunks have storage_backends_uploaded >= required_backends,
         False otherwise (including if no chunks exist)
     """
+    # Check if this is a migration version (only needs 1 backend)
+    version_type = await db.fetchval(
+        """
+        SELECT version_type FROM object_versions
+        WHERE object_id = $1 AND object_version = $2
+        """,
+        object_id,
+        object_version,
+    )
+    required_backends = 1 if version_type == "migration" else config.total_number_of_storage_backends
+
     result = await db.fetchrow(
         """
         SELECT COUNT(*) as total_chunks,
@@ -189,7 +200,7 @@ async def is_replicated_on_all_backends(
         object_id,
         object_version,
         part_number,
-        config.total_number_of_storage_backends,
+        required_backends,
     )
 
     if not result or result["total_chunks"] == 0:
