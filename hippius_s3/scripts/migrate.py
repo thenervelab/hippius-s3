@@ -180,7 +180,8 @@ def main() -> None:
 
     # Run application database migrations
     logger.info("Running application database migrations")
-    run_command(["dbmate", "up"])
+    migrations_dir = Path(__file__).parent.parent / "sql" / "migrations"
+    run_command(["dbmate", f"--migrations-dir={str(migrations_dir)}", "up"])
 
     # Set up keystore (unless skipped)
     if not skip_keystore:
