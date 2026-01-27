@@ -376,6 +376,11 @@ spec:
           env:
             - name: WORKER_SCRIPT
               value: "workers/run_account_cacher_in_loop.py"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
             - name: REDIS_ACCOUNTS_URL
               valueFrom:
                 secretKeyRef:
