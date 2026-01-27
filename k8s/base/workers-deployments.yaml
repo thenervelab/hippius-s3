@@ -386,6 +386,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_URL
             - name: REDIS_ACCOUNTS_URL
               valueFrom:
                 secretKeyRef:
