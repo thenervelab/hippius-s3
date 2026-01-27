@@ -174,9 +174,9 @@ async def is_replicated_on_all_backends(
 
     Returns:
         True if ALL chunks have storage_backends_uploaded >= required_backends,
-        False otherwise (including if no chunks exist)
+        False otherwise (including if no chunks exist or chunk count doesn't match expected)
     """
-    # Check if this is a migration version (only needs 1 backend)
+    # Migration versions only need 1 backend (data already replicated from original version)
     version_type = await db.fetchval(
         """
         SELECT version_type FROM object_versions
@@ -189,13 +189,16 @@ async def is_replicated_on_all_backends(
 
     result = await db.fetchrow(
         """
-        SELECT COUNT(*) as total_chunks,
-               COUNT(*) FILTER (WHERE pc.storage_backends_uploaded >= $4) as replicated_chunks
-        FROM part_chunks pc
-        JOIN parts p ON pc.part_id = p.part_id
+        SELECT
+            COUNT(*) as total_chunks,
+            COUNT(*) FILTER (WHERE pc.storage_backends_uploaded >= $4) as replicated_chunks,
+            CEIL(p.size_bytes::float / 4194304)::int as expected_chunks
+        FROM parts p
+        LEFT JOIN part_chunks pc ON pc.part_id = p.part_id
         WHERE p.object_id = $1
           AND p.object_version = $2
           AND p.part_number = $3
+        GROUP BY p.part_id, p.size_bytes
         """,
         object_id,
         object_version,
@@ -204,6 +207,11 @@ async def is_replicated_on_all_backends(
     )
 
     if not result or result["total_chunks"] == 0:
+        return False
+
+    # Ensure all expected chunks exist and are replicated
+    expected = result["expected_chunks"] or 0
+    if result["total_chunks"] < expected:
         return False
 
     return result["total_chunks"] == result["replicated_chunks"]
