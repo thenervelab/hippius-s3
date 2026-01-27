@@ -70,9 +70,9 @@ spec:
           livenessProbe:
             exec:
               command:
-                - pgrep
-                - -f
-                - python
+                - sh
+                - -c
+                - "test -d /proc/1 && grep -q python /proc/1/cmdline"
             initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 5
@@ -160,9 +160,9 @@ spec:
           livenessProbe:
             exec:
               command:
-                - pgrep
-                - -f
-                - python
+                - sh
+                - -c
+                - "test -d /proc/1 && grep -q python /proc/1/cmdline"
             initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 5
@@ -248,9 +248,9 @@ spec:
           livenessProbe:
             exec:
               command:
-                - pgrep
-                - -f
-                - python
+                - sh
+                - -c
+                - "test -d /proc/1 && grep -q python /proc/1/cmdline"
             initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 5
@@ -323,9 +323,9 @@ spec:
           livenessProbe:
             exec:
               command:
-                - pgrep
-                - -f
-                - python
+                - sh
+                - -c
+                - "test -d /proc/1 && grep -q python /proc/1/cmdline"
             initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 5
@@ -394,9 +394,9 @@ spec:
           livenessProbe:
             exec:
               command:
-                - pgrep
-                - -f
-                - python
+                - sh
+                - -c
+                - "test -d /proc/1 && grep -q python /proc/1/cmdline"
             initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 5
@@ -468,9 +468,9 @@ spec:
           livenessProbe:
             exec:
               command:
-                - pgrep
-                - -f
-                - python
+                - sh
+                - -c
+                - "test -d /proc/1 && grep -q python /proc/1/cmdline"
             initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 5
