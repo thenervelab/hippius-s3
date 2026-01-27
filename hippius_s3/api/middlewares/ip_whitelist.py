@@ -20,7 +20,13 @@ async def ip_whitelist_middleware(
 
     This is a security measure to prevent direct access to the backend API.
     Only requests from Docker internal networks (172.x, 10.x) or localhost are allowed.
+
+    /health endpoint is exempted to allow Kubernetes health probes from node IPs.
     """
+    # Allow health checks from anywhere in the cluster (including kubelet on nodes)
+    if request.url.path == "/health":
+        return await call_next(request)
+
     client_ip = request.client.host if request.client else None
 
     if not client_ip:
