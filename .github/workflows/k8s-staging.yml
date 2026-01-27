@@ -35,9 +35,10 @@ jobs:
 
           echo "Building images with tag: $IMAGE_TAG"
 
+          # Build base image
           docker buildx build \
             --platform linux/amd64 \
-            --target base \
+            --file Dockerfile.base \
             --tag ghcr.io/thenervelab/hippius-s3/base:$IMAGE_TAG \
             --tag ghcr.io/thenervelab/hippius-s3/base:$COMMIT_SHA \
             --cache-from type=registry,ref=ghcr.io/thenervelab/hippius-s3/base:latest \
@@ -45,9 +46,11 @@ jobs:
             --push \
             .
 
+          # Build API image
           docker buildx build \
             --platform linux/amd64 \
-            --target api \
+            --file Dockerfile \
+            --build-arg BASE_IMAGE=ghcr.io/thenervelab/hippius-s3/base:$IMAGE_TAG \
             --tag ghcr.io/thenervelab/hippius-s3/api:$IMAGE_TAG \
             --tag ghcr.io/thenervelab/hippius-s3/api:$COMMIT_SHA \
             --cache-from type=registry,ref=ghcr.io/thenervelab/hippius-s3/base:latest \
@@ -56,9 +59,11 @@ jobs:
             --push \
             .
 
+          # Build Gateway image
           docker buildx build \
             --platform linux/amd64 \
-            --target gateway \
+            --file gateway/Dockerfile \
+            --build-arg BASE_IMAGE=ghcr.io/thenervelab/hippius-s3/base:$IMAGE_TAG \
             --tag ghcr.io/thenervelab/hippius-s3/gateway:$IMAGE_TAG \
             --tag ghcr.io/thenervelab/hippius-s3/gateway:$COMMIT_SHA \
             --cache-from type=registry,ref=ghcr.io/thenervelab/hippius-s3/base:latest \
@@ -67,9 +72,11 @@ jobs:
             --push \
             .
 
+          # Build Workers image
           docker buildx build \
             --platform linux/amd64 \
-            --target workers \
+            --file workers/Dockerfile \
+            --build-arg BASE_IMAGE=ghcr.io/thenervelab/hippius-s3/base:$IMAGE_TAG \
             --tag ghcr.io/thenervelab/hippius-s3/workers:$IMAGE_TAG \
             --tag ghcr.io/thenervelab/hippius-s3/workers:$COMMIT_SHA \
             --cache-from type=registry,ref=ghcr.io/thenervelab/hippius-s3/base:latest \
