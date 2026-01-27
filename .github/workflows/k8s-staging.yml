@@ -94,7 +94,7 @@ jobs:
             --from-literal=REDIS_ACL_URL='redis://redis-acl:6379' \
             --from-literal=HIPPIUS_SERVICE_KEY='${{ secrets.HIPPIUS_SERVICE_KEY }}' \
             --from-literal=HIPPIUS_AUTH_ENCRYPTION_KEY='${{ secrets.HIPPIUS_AUTH_ENCRYPTION_KEY }}' \
-            --from-literal=HIPPIUS_IPFS_API_URLS='http://ipfs:5001' \
+            --from-literal=HIPPIUS_IPFS_API_URLS='${{ secrets.HIPPIUS_IPFS_API_URLS }}' \
             --namespace=hippius-s3-staging \
             --dry-run=client -o yaml | kubectl apply -f -
 
