@@ -5,6 +5,7 @@ namespace: hippius-s3-staging
 
 resources:
   - ../base
+  - gateway-nodeport.yaml
 
 patchesStrategicMerge:
   - namespace-patch.yaml
