@@ -152,6 +152,9 @@ class Config:
     # Download queue configuration
     download_queue_names: str = env("HIPPIUS_DOWNLOAD_QUEUE_NAMES:download_requests", convert=str)
 
+    # Unpin queue configuration (broadcast to multiple consumers)
+    unpin_queue_names: str = env("HIPPIUS_UNPIN_QUEUE_NAMES:unpin_requests", convert=str)
+
     # Cache TTL (shared across components)
     cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:259200", convert=int)
     # Unified object part chunk size (bytes) for cache and range math
