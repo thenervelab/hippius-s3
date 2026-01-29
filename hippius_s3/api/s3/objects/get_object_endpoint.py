@@ -62,6 +62,20 @@ async def handle_get_object(
 
             return await list_parts_internal(bucket_name, object_key, request, db)
 
+    # Parse versionId query parameter
+    version_id = None
+    if "versionId" in request.query_params:
+        try:
+            version_id = int(request.query_params["versionId"])
+            if version_id <= 0:
+                raise ValueError("Version must be positive")
+        except (ValueError, TypeError):
+            return errors.s3_error_response(
+                code="InvalidArgument",
+                message=f"Invalid version ID: {request.query_params.get('versionId')}",
+                status_code=400,
+            )
+
     # Parse read mode and range
     hdr_mode = parse_read_mode(request)
     rng_obj, range_header = parse_range(request, total_size=10**12)
@@ -70,9 +84,12 @@ async def handle_get_object(
         attributes={
             "read_mode": hdr_mode or "auto",
             "has_range_header": bool(range_header),
+            "has_version_id": version_id is not None,
         },
     ):
-        logger.info(f"GET start {bucket_name}/{object_key} read_mode={hdr_mode or 'auto'} range={bool(range_header)}")
+        logger.info(
+            f"GET start {bucket_name}/{object_key} read_mode={hdr_mode or 'auto'} range={bool(range_header)} version={version_id or 'current'}"
+        )
 
     try:
         # Gateway now handles all ACL/permission checks
@@ -96,13 +113,53 @@ async def handle_get_object(
         # Get object info for download (gateway already checked permissions)
         with tracer.start_as_current_span(
             "get_object.get_object_info",
-            attributes={"main_account_id": account_id},
+            attributes={"main_account_id": account_id, "has_version_id": version_id is not None},
         ) as span:
-            object_info = await db.fetchrow(
-                get_query("get_object_for_download_with_permissions"),
-                bucket_name,
-                object_key,
-            )
+            if version_id is not None:
+                object_info = await db.fetchrow(
+                    get_query("get_object_for_download_with_permissions_by_version"),
+                    bucket_name,
+                    object_key,
+                    version_id,
+                )
+                if not object_info:
+                    object_exists = await db.fetchval(
+                        """
+                        SELECT 1 FROM objects o
+                        JOIN buckets b ON o.bucket_id = b.bucket_id
+                        WHERE b.bucket_name = $1 AND o.object_key = $2
+                        """,
+                        bucket_name,
+                        object_key,
+                    )
+                    if object_exists:
+                        return errors.s3_error_response(
+                            code="NoSuchVersion",
+                            message=f"The specified version does not exist: {version_id}",
+                            status_code=404,
+                            Key=object_key,
+                            VersionId=str(version_id),
+                        )
+                    return errors.s3_error_response(
+                        code="NoSuchKey",
+                        message=f"The specified key {object_key} does not exist",
+                        status_code=404,
+                        Key=object_key,
+                    )
+            else:
+                object_info = await db.fetchrow(
+                    get_query("get_object_for_download_with_permissions"),
+                    bucket_name,
+                    object_key,
+                )
+                if not object_info:
+                    return errors.s3_error_response(
+                        code="NoSuchKey",
+                        message=f"The specified key {object_key} does not exist or you don't have permission to access it",
+                        status_code=404,
+                        Key=object_key,
+                    )
+
             if object_info:
                 set_span_attributes(
                     span,
@@ -113,16 +170,9 @@ async def handle_get_object(
                         "multipart": bool(object_info.get("multipart")),
                         "storage_version": int(object_info["storage_version"]),
                         "is_public": bool(object_info.get("is_public")),
+                        "object_version": int(object_info.get("object_version") or 1),
                     },
                 )
-
-        if not object_info:
-            return errors.s3_error_response(
-                code="NoSuchKey",
-                message=f"The specified key {object_key} does not exist or you don't have permission to access it",
-                status_code=404,
-                Key=object_key,
-            )
 
         # Build manifest purely from DB parts, 0-based
         request.state.object_size = int(object_info.get("size_bytes") or 0)
@@ -268,6 +318,9 @@ async def handle_get_object(
             set_span_attributes(span, {"http.status_code": int(response.status_code)})
 
         if response.status_code in (200, 206):
+            object_version = int(object_info.get("object_version") or 1)
+            response.headers["x-amz-version-id"] = str(object_version)
+
             bytes_transferred = int(object_info["size_bytes"])
             if range_header and start_byte is not None and end_byte is not None:
                 bytes_transferred = end_byte - start_byte + 1

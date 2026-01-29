@@ -25,6 +25,7 @@ async def _get_object_with_permissions_min(
     object_key: str,
     db: Any,
     main_account_id: Optional[str],
+    version: Optional[int] = None,
 ) -> Any:
     """Lightweight existence and metadata check (HEAD). Gateway handles permissions."""
     # Ensure user exists
@@ -32,13 +33,39 @@ async def _get_object_with_permissions_min(
         await UserRepository(db).ensure_by_main_account(main_account_id)
 
     # Gateway already checked permissions, just fetch the object
-    row = await ObjectRepository(db).get_for_download_with_permissions(bucket_name, object_key, main_account_id)
-    if not row:
-        raise errors.S3Error(
-            code="NoSuchKey",
-            status_code=404,
-            message=f"The specified key {object_key} does not exist",
+    if version is not None:
+        row = await ObjectRepository(db).get_for_download_with_permissions_by_version(
+            bucket_name, object_key, version, main_account_id
         )
+        if not row:
+            object_exists = await db.fetchval(
+                """
+                SELECT 1 FROM objects o
+                JOIN buckets b ON o.bucket_id = b.bucket_id
+                WHERE b.bucket_name = $1 AND o.object_key = $2
+                """,
+                bucket_name,
+                object_key,
+            )
+            if object_exists:
+                raise errors.S3Error(
+                    code="NoSuchVersion",
+                    status_code=404,
+                    message=f"The specified version does not exist: {version}",
+                )
+            raise errors.S3Error(
+                code="NoSuchKey",
+                status_code=404,
+                message=f"The specified key {object_key} does not exist",
+            )
+    else:
+        row = await ObjectRepository(db).get_for_download_with_permissions(bucket_name, object_key, main_account_id)
+        if not row:
+            raise errors.S3Error(
+                code="NoSuchKey",
+                status_code=404,
+                message=f"The specified key {object_key} does not exist",
+            )
     return row
 
 
@@ -54,11 +81,27 @@ async def handle_head_object(
 
     main_account_id = account.main_account if account else "anonymous"
 
+    # Parse versionId query parameter
+    version_id = None
+    if "versionId" in request.query_params:
+        try:
+            version_id = int(request.query_params["versionId"])
+            if version_id <= 0:
+                raise ValueError("Version must be positive")
+        except (ValueError, TypeError):
+            return Response(
+                status_code=400,
+                headers={
+                    "x-amz-error-code": "InvalidArgument",
+                    "x-amz-error-message": f"Invalid version ID: {request.query_params.get('versionId')}",
+                },
+            )
+
     # Tagging HEAD: only verify existence
     if "tagging" in request.query_params:
         with tracer.start_as_current_span("head_object.check_tagging_request"):
             try:
-                await _get_object_with_permissions_min(bucket_name, object_key, db, main_account_id)
+                await _get_object_with_permissions_min(bucket_name, object_key, db, main_account_id, version_id)
                 return Response(status_code=200)
             except errors.S3Error as e:
                 return Response(status_code=e.status_code)
@@ -68,7 +111,7 @@ async def handle_head_object(
 
     try:
         with tracer.start_as_current_span("head_object.get_object_metadata") as span:
-            row = await _get_object_with_permissions_min(bucket_name, object_key, db, main_account_id)
+            row = await _get_object_with_permissions_min(bucket_name, object_key, db, main_account_id, version_id)
             set_span_attributes(
                 span,
                 {
@@ -123,6 +166,10 @@ async def handle_head_object(
             except Exception:
                 headers["x-hippius-source"] = "pipeline"
             set_span_attributes(span, {"source": source})
+
+        # Add x-amz-version-id header
+        object_version = int(row.get("object_version") or 1)
+        headers["x-amz-version-id"] = str(object_version)
 
         # Append version header if present
         with tracer.start_as_current_span("head_object.fetch_append_version") as span:

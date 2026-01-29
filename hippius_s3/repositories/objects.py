@@ -19,6 +19,16 @@ class ObjectRepository:
             object_key,
         )
 
+    async def get_for_download_with_permissions_by_version(
+        self, bucket_name: str, object_key: str, version: int, main_account_id: Optional[str]
+    ) -> Any:
+        return await self._db.fetchrow(
+            get_query("get_object_for_download_with_permissions_by_version"),
+            bucket_name,
+            object_key,
+            version,
+        )
+
     async def get_by_path(self, bucket_id: str, object_key: str) -> Any:
         return await self._db.fetchrow(get_query("get_object_by_path"), bucket_id, object_key)
 
