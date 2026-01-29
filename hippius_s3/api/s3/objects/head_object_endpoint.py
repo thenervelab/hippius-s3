@@ -104,7 +104,13 @@ async def handle_head_object(
                 await _get_object_with_permissions_min(bucket_name, object_key, db, main_account_id, version_id)
                 return Response(status_code=200)
             except errors.S3Error as e:
-                return Response(status_code=e.status_code)
+                return Response(
+                    status_code=e.status_code,
+                    headers={
+                        "x-amz-error-code": e.code,
+                        "x-amz-error-message": e.message,
+                    },
+                )
             except Exception:
                 logger.exception("Error in HEAD tagging request")
                 return Response(status_code=500)
@@ -209,7 +215,13 @@ async def handle_head_object(
         return Response(status_code=200, headers=headers)
 
     except errors.S3Error as e:
-        return Response(status_code=e.status_code)
+        return Response(
+            status_code=e.status_code,
+            headers={
+                "x-amz-error-code": e.code,
+                "x-amz-error-message": e.message,
+            },
+        )
     except Exception as e:
         logger.exception(f"Error getting object metadata: {e}")
         return Response(status_code=500)
