@@ -19,13 +19,6 @@ metadata:
 spec:
   replicas: 10
 ---
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: orphan-checker
-spec:
-  replicas: 1
----
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
