@@ -4,6 +4,8 @@ import asyncio
 import hashlib
 import json
 import uuid
+from datetime import datetime
+from datetime import timezone
 from typing import Any
 from typing import AsyncIterator
 
@@ -164,7 +166,13 @@ class ObjectWriter:
             object_version=int(object_version),
         )
 
-        return PutResult(etag=md5_hash, size_bytes=len(body_bytes), upload_id=str(upload_id))
+        return PutResult(
+            object_id=str(object_id),
+            etag=md5_hash,
+            size_bytes=len(body_bytes),
+            upload_id=str(upload_id),
+            object_version=int(object_version),
+        )
 
     async def put_simple_stream_full(
         self,
@@ -197,19 +205,38 @@ class ObjectWriter:
         wrapped_dek = None
 
         part_number = 1
-        # Resolve current object_version for this object_id if exists; default to 1 for new objects
-        try:
-            row = await self.db.fetchrow(
-                "SELECT current_object_version FROM objects WHERE object_id = $1",
-                object_id,
+
+        # Reserve the version upfront by upserting with placeholder values
+        # This ensures we write chunks to the correct version from the start
+        with tracer.start_as_current_span(
+            "put_simple_stream_full.reserve_version",
+            attributes={
+                "object_id": object_id,
+                "has_object_id": True,
+            },
+        ):
+            reserve_row = await upsert_object_basic(
+                self.db,
+                object_id=object_id,
+                bucket_id=bucket_id,
+                object_key=object_key,
+                content_type=content_type,
+                metadata=metadata,
+                md5_hash="",
+                size_bytes=0,
+                storage_version=resolved_storage_version,
             )
-            object_version = int(row["current_object_version"]) if row and row.get("current_object_version") else 1
-        except Exception:
-            object_version = 1
+            # IMPORTANT: `object_id` is authoritative from DB. Under concurrent creates,
+            # our candidate UUID may conflict with an existing (bucket_id, object_key).
+            # We must use the DB-returned object_id for cache keys, crypto binding, and enqueue.
+            if reserve_row and reserve_row.get("object_id") is None:
+                raise RuntimeError("reserve_version_missing_object_id")
+            object_id = str(reserve_row.get("object_id") or object_id) if reserve_row else str(object_id)
+            object_version = int(reserve_row.get("current_object_version") or 1) if reserve_row else 1
 
         if resolved_storage_version >= 5:
             suite_id = "hip-enc/aes256gcm"
-            # New DEK per overwrite/write (object_version is not bumped on overwrite)
+            # New DEK per overwrite/write (this code path reserves a new object_version upfront)
             from hippius_s3.services.envelope_service import generate_dek
             from hippius_s3.services.envelope_service import wrap_dek
             from hippius_s3.services.kek_service import get_or_create_active_bucket_kek
@@ -306,31 +333,31 @@ class ObjectWriter:
                 },
             )
 
-        # Upsert DB row with final md5/size and storage version
+        # Update the reserved object_versions row with final md5/size
         with tracer.start_as_current_span(
-            "put_simple_stream_full.upsert_metadata",
+            "put_simple_stream_full.update_metadata",
             attributes={
                 "object_id": object_id,
                 "has_object_id": True,
                 "size_bytes": int(total_size),
                 "md5_hash": md5_hash,
+                "object_version": object_version,
                 "storage_version": resolved_storage_version,
             },
         ):
-            row = await upsert_object_basic(
-                self.db,
-                object_id=object_id,
-                bucket_id=bucket_id,
-                object_key=object_key,
-                content_type=content_type,
-                metadata=metadata,
-                md5_hash=md5_hash,
-                size_bytes=int(total_size),
-                storage_version=resolved_storage_version,
+            await self.db.execute(
+                get_query("update_object_version_metadata"),
+                int(total_size),
+                md5_hash,
+                content_type,
+                json.dumps(metadata),
+                datetime.now(timezone.utc),
+                object_id,
+                int(object_version),
             )
-            if row and resolved_storage_version >= 5 and kek_id and wrapped_dek:
-                ov = int(row.get("current_object_version") or object_version or 1)
-                aad = f"hippius-dek:{bucket_id}:{object_id}:{ov}".encode("utf-8")
+
+            if resolved_storage_version >= 5 and kek_id and wrapped_dek:
+                aad = f"hippius-dek:{bucket_id}:{object_id}:{object_version}".encode("utf-8")
                 # Re-wrap with correct object_version AAD (in case object_version differs)
                 from hippius_s3.services.envelope_service import wrap_dek
                 from hippius_s3.services.kek_service import get_bucket_kek_bytes
@@ -352,7 +379,7 @@ class ObjectWriter:
                     kek_id,
                     wrapped_dek,
                     object_id,
-                    int(ov),
+                    int(object_version),
                 )
 
         # Now that we know counts and sizes, write meta last using exact chunk count
@@ -377,21 +404,24 @@ class ObjectWriter:
         )
 
         # Ensure parts table has placeholder for base part (part 1) so append/read paths see it
-        import contextlib
+        await upsert_part_placeholder(
+            self.db,
+            object_id=object_id,
+            upload_id=str(upload_id),
+            part_number=int(part_number),
+            size_bytes=int(total_size),
+            etag=md5_hash,
+            chunk_size_bytes=int(chunk_size),
+            object_version=int(object_version),
+        )
 
-        with contextlib.suppress(Exception):
-            await upsert_part_placeholder(
-                self.db,
-                object_id=object_id,
-                upload_id=str(upload_id),
-                part_number=int(part_number),
-                size_bytes=int(total_size),
-                etag=md5_hash,
-                chunk_size_bytes=int(chunk_size),
-                object_version=int(object_version),
-            )
-
-        return PutResult(etag=md5_hash, size_bytes=int(total_size), upload_id=str(upload_id))
+        return PutResult(
+            object_id=str(object_id),
+            etag=md5_hash,
+            size_bytes=int(total_size),
+            upload_id=str(upload_id),
+            object_version=int(object_version),
+        )
 
     async def _ensure_and_get_v5_dek(
         self,

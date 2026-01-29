@@ -21,6 +21,9 @@ def build_headers(
     if rng is not None and not range_was_invalid:
         start, end = rng
         headers["Content-Range"] = f"bytes {start}-{end}/{info['size_bytes']}"
+        headers["Content-Length"] = str(end - start + 1)
+    else:
+        headers["Content-Length"] = str(info["size_bytes"])
     if metadata:
         if isinstance(metadata, str):
             try:

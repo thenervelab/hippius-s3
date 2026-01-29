@@ -24,9 +24,11 @@ class PutContext:
 
 @dataclass
 class PutResult:
+    object_id: str
     etag: str
     size_bytes: int
     upload_id: str
+    object_version: int
 
 
 @dataclass
