@@ -343,8 +343,11 @@ def test_get_nonexistent_version_returns_404(
     with pytest.raises(ClientError) as exc_info:
         boto3_client.head_object(Bucket=bucket_name, Key=key, VersionId="999")
 
-    error = exc_info.value.response["Error"]
-    assert error["Code"] == "NoSuchVersion"
+    status = exc_info.value.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    assert status == 404
+    headers = exc_info.value.response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+    assert headers.get("x-amz-error-code") == "NoSuchVersion"
+    assert headers.get("x-amz-error-message") and "999" in headers.get("x-amz-error-message")
 
 
 @pytest.mark.local
