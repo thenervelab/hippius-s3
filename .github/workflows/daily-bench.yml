@@ -1,0 +1,41 @@
+name: Daily S3 Benchmark
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # 6 AM UTC daily
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    name: Run Daily Benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install boto3 matplotlib
+
+      - name: Run benchmark
+        env:
+          AWS_ACCESS_KEY: ${{ secrets.HIPPIUS_PROD_ACCESS_KEY }}
+          AWS_SECRET_KEY: ${{ secrets.HIPPIUS_PROD_SECRET_KEY }}
+          HIPPIUS_ENDPOINT: https://s3.hippius.com
+        run: |
+          python benchmark/daily_bench.py
+
+      - name: Generate and upload chart
+        env:
+          AWS_ACCESS_KEY: ${{ secrets.HIPPIUS_PROD_ACCESS_KEY }}
+          AWS_SECRET_KEY: ${{ secrets.HIPPIUS_PROD_SECRET_KEY }}
+          HIPPIUS_ENDPOINT: https://s3.hippius.com
+        run: |
+          python benchmark/plot_results.py
