@@ -263,6 +263,12 @@ The monitoring stack provides comprehensive observability:
 - Direct Prometheus metrics endpoint
 
 
+## Daily S3 Benchmark (last 30 days)
+
+![Daily benchmark](https://s3.hippius.com/hippius-benchmarks/daily.svg)
+
+Automated daily benchmark measuring PUT/GET throughput for 100MB objects against production.
+
 ## License
 
 See [LICENSE](LICENSE) file.
