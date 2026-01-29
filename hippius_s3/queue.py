@@ -206,17 +206,29 @@ async def move_due_retries_to_primary(
 
 
 async def enqueue_unpin_request(payload: UnpinChainRequest) -> None:
-    """Add an unpin request to the Redis queue for processing by unpinner."""
+    """Add an unpin request to the Redis queue(s) for processing by unpinner and other consumers."""
     client = get_queue_client()
-    await client.lpush("unpin_requests", payload.model_dump_json())
-    logger.info(f"Enqueued unpin request for {payload.name=}")
+    if payload.request_id is None:
+        payload.request_id = uuid.uuid4().hex
+    if payload.first_enqueued_at is None:
+        payload.first_enqueued_at = time.time()
+    if payload.attempts is None:
+        payload.attempts = 0
+
+    config = get_config()
+    raw = payload.model_dump_json()
+    queue_names_str: str = config.unpin_queue_names
+
+    queue_names: List[str] = [_normalize_queue_name(q) for q in queue_names_str.split(",") if _normalize_queue_name(q)]
+    for qname in queue_names:
+        await client.lpush(qname, raw)
+    logger.info(f"Enqueued unpin request {payload.name=} queues={queue_names}")
 
 
 async def dequeue_unpin_request() -> Union[UnpinChainRequest, None]:
     """Get the next unpin request from the Redis queue."""
     client = get_queue_client()
-    queue_name = "unpin_requests"
-    result = await client.brpop(queue_name, timeout=3)
+    result = await client.brpop("unpin_requests", timeout=3)
     if result:
         _, queue_data = result
         return UnpinChainRequest.model_validate_json(queue_data)
