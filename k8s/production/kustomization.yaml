@@ -13,7 +13,9 @@ patchesStrategicMerge:
   - postgres-tuning.yaml
   - postgres-backup.yaml
   - redis-tuning.yaml
-  - redis-cluster-patch.yaml
+  - redis-cluster-configmap-patch.yaml
+  - redis-cluster-statefulset-patch.yaml
+  - redis-cluster-init-job-patch.yaml
   - ingress-patch.yaml
 
 images:
