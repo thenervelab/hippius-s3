@@ -28,6 +28,12 @@ def _parse_csv_urls(value: str | None) -> list[str]:
     return deduped
 
 
+def _parse_expected_backends(value: str | None) -> list[str]:
+    """Parse comma-separated list of expected storage backend names."""
+    value = value or "ipfs"
+    return [b.strip() for b in value.split(",") if b.strip()]
+
+
 def _parse_account_whitelist() -> list[str]:
     """Parse comma-separated account whitelist from environment variable."""
     import os
@@ -220,7 +226,7 @@ class Config:
     object_cache_dir: str = env("HIPPIUS_OBJECT_CACHE_DIR:/var/lib/hippius/object_cache")
     fs_cache_gc_max_age_seconds: int = env("HIPPIUS_FS_CACHE_GC_MAX_AGE_SECONDS:604800", convert=int)  # 7 days
     mpu_stale_seconds: int = env("HIPPIUS_MPU_STALE_SECONDS:86400", convert=int)  # 1 day
-    total_number_of_storage_backends: int = env("HIPPIUS_TOTAL_NUMBER_OF_STORAGE_BACKENDS:2", convert=int)
+    expected_backends: list[str] = env("HIPPIUS_EXPECTED_BACKENDS:ipfs", convert=_parse_expected_backends)
 
     # Filesystem cache disk-pressure backoff (ingress control).
     # Threshold can be expressed as either absolute bytes or ratio; we trigger if ANY threshold is hit.

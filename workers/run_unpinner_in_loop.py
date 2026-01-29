@@ -5,6 +5,7 @@ import sys
 import time
 from pathlib import Path
 
+import asyncpg
 import redis.asyncio as async_redis
 
 
@@ -23,6 +24,7 @@ from hippius_s3.redis_utils import with_redis_retry
 from hippius_s3.services.hippius_api_service import HippiusApiClient
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 from hippius_s3.services.ray_id_service import ray_id_context
+from hippius_s3.utils import get_query
 from hippius_s3.workers.error_classifier import classify_unpin_error
 from hippius_s3.workers.uploader import compute_backoff_ms
 
@@ -34,7 +36,10 @@ logger = logging.getLogger(__name__)
 
 
 async def process_unpin_request(
-    request: UnpinChainRequest, worker_logger: logging.LoggerAdapter, dlq_manager: UnpinDLQManager
+    request: UnpinChainRequest,
+    worker_logger: logging.LoggerAdapter,
+    dlq_manager: UnpinDLQManager,
+    db_pool: asyncpg.Pool,
 ) -> None:
     """Process a single unpin request."""
     try:
@@ -45,6 +50,16 @@ async def process_unpin_request(
                 account_ss58=request.address,
             )
         worker_logger.info(f"Successfully unpinned CID via API: {unpin_result=}")
+
+        # Soft-delete the IPFS backend row for this CID
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.fetchval(
+                    get_query("soft_delete_chunk_backend"),
+                    "ipfs", request.cid,
+                )
+        except Exception as db_err:
+            worker_logger.warning(f"Failed to soft-delete chunk_backend row for CID {request.cid}: {db_err}")
 
         get_metrics_collector().record_unpinner_operation(
             main_account=request.address,
@@ -97,6 +112,11 @@ async def process_unpin_request(
 async def run_unpinner_loop() -> None:
     redis_client = async_redis.from_url(config.redis_url)
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
+    db_pool = await asyncpg.create_pool(
+        dsn=config.database_url,
+        min_size=1,
+        max_size=3,
+    )
 
     from hippius_s3.queue import initialize_queue_client
     from hippius_s3.redis_cache import initialize_cache_client
@@ -110,25 +130,30 @@ async def run_unpinner_loop() -> None:
     logger.info("Starting unpinner service...")
     logger.info(f"Redis URL: {config.redis_url}")
     logger.info(f"Redis Queues URL: {config.redis_queues_url}")
+    logger.info(f"Database: {config.database_url}")
 
-    while True:
-        await move_due_unpin_retries_to_primary()
+    try:
+        while True:
+            await move_due_unpin_retries_to_primary()
 
-        unpin_request, redis_queues_client = await with_redis_retry(
-            lambda rc: dequeue_unpin_request(),
-            redis_queues_client,
-            config.redis_queues_url,
-            "dequeue unpin request",
-        )
+            unpin_request, redis_queues_client = await with_redis_retry(
+                lambda rc: dequeue_unpin_request(),
+                redis_queues_client,
+                config.redis_queues_url,
+                "dequeue unpin request",
+            )
 
-        if not unpin_request:
-            await asyncio.sleep(1)
-            continue
+            if not unpin_request:
+                await asyncio.sleep(1)
+                continue
 
-        ray_id = unpin_request.ray_id or "no-ray-id"
-        ray_id_context.set(ray_id)
-        worker_logger = get_logger_with_ray_id(__name__, ray_id)
-        await process_unpin_request(unpin_request, worker_logger, dlq_manager)
+            ray_id = unpin_request.ray_id or "no-ray-id"
+            ray_id_context.set(ray_id)
+            worker_logger = get_logger_with_ray_id(__name__, ray_id)
+            await process_unpin_request(unpin_request, worker_logger, dlq_manager, db_pool)
+    finally:
+        if db_pool:
+            await db_pool.close()
 
 
 if __name__ == "__main__":

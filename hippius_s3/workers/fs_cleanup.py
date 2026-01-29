@@ -2,7 +2,7 @@
 
 DEPRECATED: This module is being phased out in favor of chunk-level cleanup in janitor.
 The cleanup_pinned_object_parts() function should no longer be called from uploader.
-Cleanup is now handled by janitor based on storage_backends_uploaded counter.
+Cleanup is now handled by janitor based on chunk_backend table replication checks.
 
 This module remains for backward compatibility and manual cleanup operations.
 """
@@ -25,7 +25,7 @@ async def cleanup_pinned_object_parts(
     """Delete all parts for an object/version from FS after confirming all chunks are pinned.
 
     DEPRECATED: This function should no longer be called. Cleanup is now handled by janitor
-    based on storage_backends_uploaded counter.
+    based on chunk_backend table replication checks.
 
     This is called by the substrate pinner after successful pin submission and verification.
     It verifies that all chunk CIDs for all parts in the object are present in the DB

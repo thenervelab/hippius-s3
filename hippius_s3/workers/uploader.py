@@ -334,15 +334,13 @@ class Uploader:
                         piece_file_id,
                     )
 
-                    # Increment storage backend counter after successful upload
-                    backend_count = await conn.fetchval(
-                        get_query("increment_chunk_backend_count"),
+                    # Register IPFS backend for this chunk
+                    await conn.fetchval(
+                        get_query("insert_chunk_backend"),
                         part_id,
                         int(ci),
-                    )
-                    logger.debug(
-                        f"Incremented backend count to {backend_count}: "
-                        f"object_id={object_id} part={part_number} chunk={ci}"
+                        "ipfs",
+                        piece_cid,
                     )
 
             # Set parts.ipfs_cid to first chunk CID for manifest compatibility
