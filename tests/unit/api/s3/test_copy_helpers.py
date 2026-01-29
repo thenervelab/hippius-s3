@@ -150,7 +150,7 @@ def test_build_copy_success_response_empty_etag():
 
 
 @pytest.mark.asyncio
-async def test_should_use_v5_fast_path_eligible():
+async def test_should_use_v5_fast_path_disabled():
     from hippius_s3.api.s3.copy_helpers import should_use_v5_fast_path
 
     db = AsyncMock()
@@ -172,9 +172,9 @@ async def test_should_use_v5_fast_path_eligible():
         src_multipart=False,
     )
 
-    assert eligible is True
-    assert len(chunk_rows) == 2
-    assert reason == "fast_path_eligible"
+    assert eligible is False
+    assert chunk_rows is None
+    assert reason == "v5_fast_path_disabled_object_id_binding"
 
 
 @pytest.mark.asyncio
@@ -194,7 +194,7 @@ async def test_should_use_v5_fast_path_storage_version_too_old():
 
     assert eligible is False
     assert chunk_rows is None
-    assert reason == "storage_version < 5"
+    assert reason == "v5_fast_path_disabled_object_id_binding"
 
 
 @pytest.mark.asyncio
@@ -214,7 +214,7 @@ async def test_should_use_v5_fast_path_multipart_not_supported():
 
     assert eligible is False
     assert chunk_rows is None
-    assert reason == "multipart not supported"
+    assert reason == "v5_fast_path_disabled_object_id_binding"
 
 
 @pytest.mark.asyncio
@@ -235,7 +235,7 @@ async def test_should_use_v5_fast_path_destination_exists():
 
     assert eligible is False
     assert chunk_rows is None
-    assert reason == "destination exists (new version), AAD mismatch"
+    assert reason == "v5_fast_path_disabled_object_id_binding"
 
 
 @pytest.mark.asyncio
@@ -257,7 +257,7 @@ async def test_should_use_v5_fast_path_missing_chunks():
 
     assert eligible is False
     assert chunk_rows is None
-    assert reason == "missing part_chunks metadata"
+    assert reason == "v5_fast_path_disabled_object_id_binding"
 
 
 @pytest.mark.asyncio
@@ -283,4 +283,4 @@ async def test_should_use_v5_fast_path_pending_cids():
 
     assert eligible is False
     assert chunk_rows is None
-    assert "missing chunk CID(s) indices=[1]" in reason
+    assert reason == "v5_fast_path_disabled_object_id_binding"

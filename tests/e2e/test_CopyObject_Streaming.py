@@ -48,7 +48,7 @@ def test_copy_to_existing_replaces_object(
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
 ) -> None:
-    """Test that copying to an existing destination replaces the object.
+    """Test that copying to an existing destination key succeeds.
 
     When copying to an existing key, the system replaces the object
     with the source content via streaming fallback (required when
@@ -57,7 +57,7 @@ def test_copy_to_existing_replaces_object(
     Expected behavior:
     - Copy should succeed
     - Destination should have the source object's content
-    - Object is replaced, not versioned
+    - A new object version may be created depending on storage/versioning mode
     """
     bucket = unique_bucket_name("copy-replace")
     cleanup_buckets(bucket)

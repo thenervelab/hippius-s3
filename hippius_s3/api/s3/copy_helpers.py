@@ -122,6 +122,16 @@ async def should_use_v5_fast_path(
     src_storage_version: int,
     src_multipart: bool,
 ) -> tuple[bool, list | None, str]:
+    # NOTE: Disabled for now.
+    #
+    # For storage_version>=5, ciphertext chunks are bound to identifiers (at least bucket_id/object_id)
+    # via deterministic nonce/AAD (see `hippius_s3/services/crypto_service.py`).
+    #
+    # That means "CID reuse" copy across different destination `object_id`s is not decryptable
+    # even if we rewrap the DEK. We'll revisit in a future storage version (e.g. v6) with a
+    # copy-friendly binding scheme.
+    return False, None, "v5_fast_path_disabled_object_id_binding"
+
     if src_storage_version < 5:
         return False, None, "storage_version < 5"
 

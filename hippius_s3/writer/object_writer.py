@@ -166,7 +166,13 @@ class ObjectWriter:
             object_version=int(object_version),
         )
 
-        return PutResult(etag=md5_hash, size_bytes=len(body_bytes), upload_id=str(upload_id))
+        return PutResult(
+            object_id=str(object_id),
+            etag=md5_hash,
+            size_bytes=len(body_bytes),
+            upload_id=str(upload_id),
+            object_version=int(object_version),
+        )
 
     async def put_simple_stream_full(
         self,
@@ -220,11 +226,17 @@ class ObjectWriter:
                 size_bytes=0,
                 storage_version=resolved_storage_version,
             )
+            # IMPORTANT: `object_id` is authoritative from DB. Under concurrent creates,
+            # our candidate UUID may conflict with an existing (bucket_id, object_key).
+            # We must use the DB-returned object_id for cache keys, crypto binding, and enqueue.
+            if reserve_row and reserve_row.get("object_id") is None:
+                raise RuntimeError("reserve_version_missing_object_id")
+            object_id = str(reserve_row.get("object_id") or object_id) if reserve_row else str(object_id)
             object_version = int(reserve_row.get("current_object_version") or 1) if reserve_row else 1
 
         if resolved_storage_version >= 5:
             suite_id = "hip-enc/aes256gcm"
-            # New DEK per overwrite/write (object_version is not bumped on overwrite)
+            # New DEK per overwrite/write (this code path reserves a new object_version upfront)
             from hippius_s3.services.envelope_service import generate_dek
             from hippius_s3.services.envelope_service import wrap_dek
             from hippius_s3.services.kek_service import get_or_create_active_bucket_kek
@@ -403,7 +415,13 @@ class ObjectWriter:
             object_version=int(object_version),
         )
 
-        return PutResult(etag=md5_hash, size_bytes=int(total_size), upload_id=str(upload_id))
+        return PutResult(
+            object_id=str(object_id),
+            etag=md5_hash,
+            size_bytes=int(total_size),
+            upload_id=str(upload_id),
+            object_version=int(object_version),
+        )
 
     async def _ensure_and_get_v5_dek(
         self,

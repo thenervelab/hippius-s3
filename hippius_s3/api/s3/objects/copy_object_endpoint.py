@@ -43,13 +43,6 @@ async def handle_copy_object(
             dest_bucket_name=bucket_name,
         )
 
-        if is_multipart_object(source_object):
-            return errors.s3_error_response(
-                "NotImplemented",
-                "Copying multipart objects is not currently supported",
-                status_code=501,
-            )
-
         existing_dest = await ObjectRepository(db).get_by_path(dest_bucket["bucket_id"], object_key)
         object_id = str(existing_dest["object_id"]) if existing_dest else str(uuid.uuid4())
         copy_created_at = datetime.now(timezone.utc)
@@ -65,6 +58,25 @@ async def handle_copy_object(
                 status_code=500,
             )
         src_storage_version = require_supported_storage_version(int(raw_storage_version))
+
+        # Multipart objects are supported via the streaming copy fallback (copy-by-bytes).
+        # The v5 fast-path reuses chunk CIDs, which is currently incompatible with v5 chunk
+        # crypto binding (bucket/object identifiers).
+        if src_multipart:
+            logger.info("CopyObject multipart source: forcing streaming fallback")
+            return await handle_streaming_copy(
+                db=db,
+                redis_client=redis_client,
+                request=request,
+                source_bucket=source_bucket,
+                dest_bucket=dest_bucket,
+                source_object=source_object,
+                src_obj_row=src_obj_row,
+                object_id=object_id,
+                object_key=object_key,
+                copy_created_at=copy_created_at,
+                config=config,
+            )
 
         eligible, chunk_rows, reason = await should_use_v5_fast_path(
             db=db,
