@@ -1,8 +1,8 @@
 import logging
 import os
 from typing import Optional
+from typing import Union
 
-import redis.asyncio as async_redis
 from fastapi import Request
 from fastapi import Response
 from opentelemetry import metrics
@@ -11,6 +11,8 @@ from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExp
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
+from redis.asyncio import Redis
+from redis.asyncio.cluster import RedisCluster
 
 
 logger = logging.getLogger(__name__)
@@ -18,7 +20,7 @@ tracer = trace.get_tracer(__name__)
 
 
 class MetricsCollector:
-    def __init__(self, redis_client: async_redis.Redis):
+    def __init__(self, redis_client: Union[Redis, RedisCluster]):
         self.redis_client = redis_client
         self.meter = metrics.get_meter(__name__)
         self._upload_len = 0
@@ -798,7 +800,7 @@ def set_metrics_collector(collector: MetricsCollector | NullMetricsCollector) ->
     _metrics_collector = collector
 
 
-def initialize_metrics_collector(redis_client: async_redis.Redis) -> MetricsCollector | NullMetricsCollector:
+def initialize_metrics_collector(redis_client: Union[Redis, RedisCluster]) -> MetricsCollector | NullMetricsCollector:
     if os.getenv("ENABLE_MONITORING", "false").lower() not in ("true", "1", "yes"):
         logger.info("Monitoring disabled, using NullMetricsCollector")
         null_collector = NullMetricsCollector()

@@ -15,7 +15,6 @@ import time
 from pathlib import Path
 
 import asyncpg
-import redis.asyncio as async_redis
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -313,9 +312,11 @@ async def cleanup_old_parts_by_mtime(
 
 async def run_janitor_loop():
     """Main janitor loop: periodically clean stale and old parts."""
+    from redis.asyncio import Redis
+
     db = await asyncpg.connect(config.database_url)
     fs_store = FileSystemPartsStore(config.object_cache_dir)
-    redis_client = async_redis.from_url(config.redis_queues_url)
+    redis_client = Redis.from_url(config.redis_queues_url)
 
     # Initialize metrics
     try:

@@ -6,7 +6,6 @@ import sys
 import time
 from pathlib import Path
 
-import redis.asyncio as async_redis
 from redis.exceptions import BusyLoadingError
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
@@ -36,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 async def process_download_request(
     download_request: DownloadChainRequest,
-    redis_client: async_redis.Redis,
+    redis_client,
 ) -> bool:
     """Process a download request by downloading each chunk and storing in Redis."""
 
@@ -243,11 +242,14 @@ async def process_download_request(
 
 async def run_downloader_loop():
     """Main loop for downloader service."""
-    redis_client = async_redis.from_url(config.redis_url)
-    redis_queues_client = async_redis.from_url(config.redis_queues_url)
-
     from hippius_s3.queue import initialize_queue_client
     from hippius_s3.redis_cache import initialize_cache_client
+    from hippius_s3.redis_utils import create_redis_client
+
+    redis_client = create_redis_client(config.redis_url)
+    from redis.asyncio import Redis
+
+    redis_queues_client = Redis.from_url(config.redis_queues_url)
 
     initialize_queue_client(redis_queues_client)
     initialize_cache_client(redis_client)
@@ -262,11 +264,13 @@ async def run_downloader_loop():
             try:
                 download_request = await dequeue_download_request()
             except (BusyLoadingError, RedisConnectionError, RedisTimeoutError) as e:
+                from redis.asyncio import Redis
+
                 logger.warning(f"Redis error while dequeuing download request: {e}. Reconnecting in 2s...")
                 with contextlib.suppress(Exception):
                     await redis_queues_client.aclose()  # type: ignore[attr-defined]
                 await asyncio.sleep(2)
-                redis_queues_client = async_redis.from_url(config.redis_queues_url)
+                redis_queues_client = Redis.from_url(config.redis_queues_url)
                 initialize_queue_client(redis_queues_client)
                 continue
             except Exception as e:
@@ -294,12 +298,14 @@ async def run_downloader_loop():
                             f"Failed to process download request {download_request.bucket_name}/{download_request.object_key}"
                         )
                 except (RedisConnectionError, RedisTimeoutError, BusyLoadingError) as e:
+                    from hippius_s3.redis_utils import create_redis_client
+
                     logger.warning(
                         f"Redis connection issue during processing: {e}. Reconnecting in 2s and continuing..."
                     )
                     with contextlib.suppress(Exception):
                         await redis_client.aclose()  # type: ignore[attr-defined]
-                    redis_client = async_redis.from_url(config.redis_url)
+                    redis_client = create_redis_client(config.redis_url)
                     initialize_cache_client(redis_client)
                     continue
             else:

@@ -3,7 +3,6 @@ from typing import Callable
 from typing import Dict
 
 import asyncpg
-import redis.asyncio as redis
 from fastapi import FastAPI
 from fastapi import Request
 from fastapi import Response
@@ -48,6 +47,8 @@ def factory() -> FastAPI:
 
     @app.on_event("startup")
     async def startup() -> None:
+        from hippius_s3.redis_utils import create_redis_client
+
         logger.info("Starting Hippius S3 Gateway...")
 
         app.state.postgres_pool = await asyncpg.create_pool(
@@ -61,19 +62,21 @@ def factory() -> FastAPI:
         )
         logger.info(f"PostgreSQL pool created: min={config.db_pool_min_size}, max={config.db_pool_max_size}")
 
-        app.state.redis_client = redis.from_url(config.redis_url, decode_responses=False)
+        app.state.redis_client = create_redis_client(config.redis_url)
         logger.info("Connected to Redis")
 
-        app.state.redis_accounts = redis.from_url(config.redis_accounts_url, decode_responses=False)
+        from redis.asyncio import Redis
+
+        app.state.redis_accounts = Redis.from_url(config.redis_accounts_url, decode_responses=False)
         logger.info("Connected to Redis (accounts)")
 
-        app.state.redis_chain = redis.from_url(config.redis_chain_url, decode_responses=False)
+        app.state.redis_chain = Redis.from_url(config.redis_chain_url, decode_responses=False)
         logger.info("Connected to Redis (chain)")
 
-        app.state.redis_rate_limiting = redis.from_url(config.redis_rate_limiting_url, decode_responses=False)
+        app.state.redis_rate_limiting = Redis.from_url(config.redis_rate_limiting_url, decode_responses=False)
         logger.info("Connected to Redis (rate limiting)")
 
-        app.state.redis_acl = redis.from_url(config.redis_acl_url, decode_responses=True)
+        app.state.redis_acl = Redis.from_url(config.redis_acl_url, decode_responses=True)
         logger.info("Connected to Redis (ACL cache)")
 
         app.state.metrics_collector = MetricsCollector(app.state.redis_client)

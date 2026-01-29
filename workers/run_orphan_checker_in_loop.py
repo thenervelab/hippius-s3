@@ -6,7 +6,6 @@ import time
 from pathlib import Path
 
 import asyncpg
-import redis.asyncio as async_redis
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -109,11 +108,13 @@ async def check_for_orphans(
 
 async def run_orphan_checker_loop() -> None:
     """Main loop for orphan checker worker."""
-    redis_client = async_redis.from_url(config.redis_url)
-    redis_queues_client = async_redis.from_url(config.redis_queues_url)
-    db = await asyncpg.connect(config.database_url)
-
     from hippius_s3.redis_cache import initialize_cache_client
+    from hippius_s3.redis_utils import create_redis_client
+    from redis.asyncio import Redis
+
+    redis_client = create_redis_client(config.redis_url)
+    redis_queues_client = Redis.from_url(config.redis_queues_url)
+    db = await asyncpg.connect(config.database_url)
 
     initialize_queue_client(redis_queues_client)
     initialize_cache_client(redis_client)

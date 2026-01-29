@@ -6,7 +6,6 @@ import time
 from pathlib import Path
 
 import asyncpg
-import redis.asyncio as async_redis
 from pydantic import ValidationError
 
 
@@ -34,12 +33,14 @@ logger = logging.getLogger(__name__)
 
 
 async def run_uploader_loop():
-    db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=10)
-    redis_client = async_redis.from_url(config.redis_url)
-    redis_queues_client = async_redis.from_url(config.redis_queues_url)
-
     from hippius_s3.queue import initialize_queue_client
     from hippius_s3.redis_cache import initialize_cache_client
+    from hippius_s3.redis_utils import create_redis_client
+    from redis.asyncio import Redis
+
+    db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=10)
+    redis_client = create_redis_client(config.redis_url)
+    redis_queues_client = Redis.from_url(config.redis_queues_url)
 
     initialize_queue_client(redis_queues_client)
     initialize_cache_client(redis_client)

@@ -1,23 +1,25 @@
 import logging
 from typing import Optional
+from typing import Union
 
-import redis.asyncio as async_redis
+from redis.asyncio import Redis
+from redis.asyncio.cluster import RedisCluster
 
 
 logger = logging.getLogger(__name__)
 
 
-_cache_client: Optional[async_redis.Redis] = None
+_cache_client: Optional[Union[Redis, RedisCluster]] = None
 
 
-def initialize_cache_client(redis_client: async_redis.Redis) -> None:
+def initialize_cache_client(redis_client: Union[Redis, RedisCluster]) -> None:
     """Initialize the cache Redis client singleton. Call once during app/worker startup."""
     global _cache_client
     _cache_client = redis_client
     logger.info("Cache Redis client initialized")
 
 
-def get_cache_client() -> async_redis.Redis:
+def get_cache_client() -> Union[Redis, RedisCluster]:
     """Get the initialized cache Redis client."""
     if _cache_client is None:
         raise RuntimeError(
