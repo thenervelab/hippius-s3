@@ -6,12 +6,19 @@ services:
     environment:
       - HIPPIUS_BYPASS_CREDIT_CHECK=true
       - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
+      - HIPPIUS_UPLOAD_BACKENDS=ipfs,arion
+      - HIPPIUS_DOWNLOAD_BACKENDS=ipfs,arion
+      - HIPPIUS_DELETE_BACKENDS=ipfs,arion
     depends_on:
       api:
         condition: service_started
-      uploader:
+      ipfs-uploader:
         condition: service_started
-      downloader:
+      arion-uploader:
+        condition: service_started
+      ipfs-downloader:
+        condition: service_started
+      arion-downloader:
         condition: service_started
 
   api:
@@ -22,6 +29,9 @@ services:
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
       - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
+      - HIPPIUS_UPLOAD_BACKENDS=ipfs,arion
+      - HIPPIUS_DOWNLOAD_BACKENDS=ipfs,arion
+      - HIPPIUS_DELETE_BACKENDS=ipfs,arion
     depends_on:
       db:
         condition: service_healthy
@@ -47,13 +57,16 @@ services:
     networks:
       - hippius_net
 
-  uploader:
+  ipfs-uploader:
     env_file:
       - .env.defaults
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
       - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
+      - HIPPIUS_UPLOAD_BACKENDS=ipfs,arion
+      - HIPPIUS_DOWNLOAD_BACKENDS=ipfs,arion
+      - HIPPIUS_DELETE_BACKENDS=ipfs,arion
     volumes:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
@@ -65,23 +78,50 @@ services:
       mock-kms:
         condition: service_healthy
 
-  unpinner:
+  arion-uploader:
     env_file:
       - .env.defaults
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
       - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
+      - HIPPIUS_ARION_BASE_URL=http://toxiproxy:19090
+      - HIPPIUS_UPLOAD_BACKENDS=ipfs,arion
+      - HIPPIUS_DOWNLOAD_BACKENDS=ipfs,arion
+      - HIPPIUS_DELETE_BACKENDS=ipfs,arion
     volumes:
       - .:/app
+      - ./.e2e/dlq:/tmp/hippius_dlq
+      - ./.e2e/dlq_archive:/tmp/hippius_dlq_archive
+      - kms_certs:/kms_certs:ro
+    depends_on:
+      mock-kms:
+        condition: service_healthy
+      mock-arion:
+        condition: service_healthy
 
-  downloader:
+  ipfs-downloader:
     env_file:
       - .env.defaults
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
       - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
+      - HIPPIUS_UPLOAD_BACKENDS=ipfs,arion
+      - HIPPIUS_DOWNLOAD_BACKENDS=ipfs,arion
+      - HIPPIUS_DELETE_BACKENDS=ipfs,arion
+
+  arion-downloader:
+    env_file:
+      - .env.defaults
+      - .env.test-docker
+    environment:
+      - HIPPIUS_KEY=${HIPPIUS_KEY}
+      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
+      - HIPPIUS_ARION_BASE_URL=http://toxiproxy:19090
+      - HIPPIUS_UPLOAD_BACKENDS=ipfs,arion
+      - HIPPIUS_DOWNLOAD_BACKENDS=ipfs,arion
+      - HIPPIUS_DELETE_BACKENDS=ipfs,arion
 
   mock-hippius-api:
     build:
@@ -101,6 +141,24 @@ services:
         [
           "CMD-SHELL",
           'python -c ''import httpx; httpx.get("http://localhost:8001/health", timeout=1).raise_for_status()'' || exit 1',
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mock-arion:
+    build:
+      context: .
+      dockerfile: tests/e2e/Dockerfile.mock-arion
+    ports:
+      - "127.0.0.1:8002:8002"
+    networks:
+      - hippius_net
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'python -c ''import httpx; httpx.get("http://localhost:8002/health", timeout=1).raise_for_status()'' || exit 1',
         ]
       interval: 5s
       timeout: 3s
@@ -140,6 +198,7 @@ services:
       - "8474:8474"
     depends_on:
       - ipfs
+      - mock-arion
     networks:
       - hippius_net
 
@@ -150,6 +209,9 @@ services:
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
       - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
+      - HIPPIUS_UPLOAD_BACKENDS=ipfs,arion
+      - HIPPIUS_DOWNLOAD_BACKENDS=ipfs,arion
+      - HIPPIUS_DELETE_BACKENDS=ipfs,arion
     volumes:
       - .:/app
 
@@ -160,6 +222,9 @@ services:
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
       - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
+      - HIPPIUS_UPLOAD_BACKENDS=ipfs,arion
+      - HIPPIUS_DOWNLOAD_BACKENDS=ipfs,arion
+      - HIPPIUS_DELETE_BACKENDS=ipfs,arion
     volumes:
       - .:/app
 

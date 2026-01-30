@@ -70,7 +70,7 @@ async def seed_object_to_dlq(object_id: str) -> bool:
             "last_error": "seeded for test",
             "error_type": "transient",
         }
-        await redis.lpush("upload_requests:dlq", json.dumps(dlq_entry))
+        await redis.lpush("ipfs_upload_requests:dlq", json.dumps(dlq_entry))
         logger.info(f"Seeded DLQ for object_id={object_id} with parts={part_numbers}")
         return True
     finally:

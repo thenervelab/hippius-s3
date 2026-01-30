@@ -173,6 +173,13 @@ async def handle_put_object(
                 ray_id=getattr(request.state, "ray_id", "no-ray-id"),
             )
 
+        # Mark upload completed to prevent CASCADE deletion of chunk_backend on DELETE
+        # Maintains parity with append (sets TRUE immediately) and multipart (sets TRUE in mpu_complete)
+        await db.execute(
+            "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
+            put_res.upload_id,
+        )
+
         get_metrics_collector().record_s3_operation(
             operation="put_object",
             bucket_name=bucket_name,

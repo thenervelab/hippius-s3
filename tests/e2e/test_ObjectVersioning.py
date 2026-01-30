@@ -3,7 +3,7 @@ from typing import Callable
 
 import pytest
 
-from .support.cache import wait_for_parts_cids
+from .support.cache import wait_for_all_backends_ready
 from .support.db import get_object_versioning_info
 
 
@@ -188,7 +188,7 @@ def test_copy_over_existing_key_creates_new_version(
     )
 
     # Wait for source to be published before copying
-    assert wait_for_parts_cids(bucket_name, source_key, min_count=1), "Source object not ready for copy"
+    assert wait_for_all_backends_ready(bucket_name, source_key, min_count=1), "Source object not ready for copy"
 
     # Create destination object (v1)
     dest_key = "destination.txt"

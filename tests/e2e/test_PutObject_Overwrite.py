@@ -2,7 +2,7 @@ from typing import Any
 from typing import Callable
 
 from .conftest import is_real_aws
-from .support.cache import wait_for_parts_cids
+from .support.cache import wait_for_all_backends_ready
 
 
 def test_put_object_overwrite_twice(
@@ -28,7 +28,7 @@ def test_put_object_overwrite_twice(
 
     # Ensure background uploader had a chance to run (local stack only)
     if not is_real_aws():
-        assert wait_for_parts_cids(bucket_name, key, min_count=1, timeout_seconds=20.0)
+        assert wait_for_all_backends_ready(bucket_name, key, min_count=1, timeout_seconds=20.0)
 
     # Second PUT to same key should succeed (idempotent upload row)
     resp2 = boto3_client.put_object(
@@ -62,7 +62,7 @@ def test_put_object_overwrite_manifest_pruned(
     assert resp1["ResponseMetadata"]["HTTPStatusCode"] in (200, 204)
 
     if not is_real_aws():
-        assert wait_for_parts_cids(bucket_name, key, min_count=1, timeout_seconds=20.0)
+        assert wait_for_all_backends_ready(bucket_name, key, min_count=1, timeout_seconds=20.0)
 
     resp2 = boto3_client.put_object(
         Bucket=bucket_name,

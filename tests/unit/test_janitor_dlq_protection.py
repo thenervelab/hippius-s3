@@ -55,7 +55,7 @@ async def populate_dlq(redis_with_dlq):
                 "last_error": "connection timeout",
                 "error_type": "transient",
             }
-            await redis_with_dlq.lpush("upload_requests:dlq", json.dumps(entry))
+            await redis_with_dlq.lpush("ipfs_upload_requests:dlq", json.dumps(entry))
 
     return _populate
 
@@ -93,16 +93,16 @@ class TestGetAllDlqObjectIds:
     @pytest.mark.asyncio
     async def test_invalid_json_entry_skipped(self, redis_with_dlq):
         """Test that invalid JSON entries are skipped."""
-        await redis_with_dlq.lpush("upload_requests:dlq", "invalid-json{")
-        await redis_with_dlq.lpush("upload_requests:dlq", json.dumps({"object_id": "obj-123"}))
+        await redis_with_dlq.lpush("ipfs_upload_requests:dlq", "invalid-json{")
+        await redis_with_dlq.lpush("ipfs_upload_requests:dlq", json.dumps({"object_id": "obj-123"}))
         result = await get_all_dlq_object_ids(redis_with_dlq)
         assert result == {"obj-123"}
 
     @pytest.mark.asyncio
     async def test_missing_object_id_skipped(self, redis_with_dlq):
         """Test that entries without object_id are skipped."""
-        await redis_with_dlq.lpush("upload_requests:dlq", json.dumps({"upload_id": "upload-123"}))
-        await redis_with_dlq.lpush("upload_requests:dlq", json.dumps({"object_id": "obj-123"}))
+        await redis_with_dlq.lpush("ipfs_upload_requests:dlq", json.dumps({"upload_id": "upload-123"}))
+        await redis_with_dlq.lpush("ipfs_upload_requests:dlq", json.dumps({"object_id": "obj-123"}))
         result = await get_all_dlq_object_ids(redis_with_dlq)
         assert result == {"obj-123"}
 
@@ -133,7 +133,7 @@ class TestGetAllDlqObjectIds:
             "attempts": 3,
             "error_type": "transient",
         }
-        await redis_with_dlq.lpush("upload_requests:dlq", json.dumps(upload_entry))
+        await redis_with_dlq.lpush("ipfs_upload_requests:dlq", json.dumps(upload_entry))
 
         unpin_entry = {
             "object_id": "obj-unpin-456",

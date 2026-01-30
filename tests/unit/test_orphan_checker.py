@@ -65,10 +65,13 @@ async def test_orphan_file_queued_for_unpinning(mock_db, mock_redis_queues):
 
         await check_for_orphans(mock_db)
 
-        queued_items = await mock_redis_queues.lrange("unpin_requests", 0, -1)
-        assert len(queued_items) == 1
+        # Fan-out enqueues to all configured unpin queues (ipfs + arion)
+        ipfs_items = await mock_redis_queues.lrange("ipfs_unpin_requests", 0, -1)
+        arion_items = await mock_redis_queues.lrange("arion_unpin_requests", 0, -1)
+        assert len(ipfs_items) == 1
+        assert len(arion_items) == 1
 
-        request = json.loads(queued_items[0])
+        request = json.loads(ipfs_items[0])
         assert request["cid"] == "QmOrphanFile123"
         assert request["address"] == "5TestAccount"
         assert request["object_id"] == "00000000-0000-0000-0000-000000000000"
@@ -112,8 +115,10 @@ async def test_non_orphan_file_not_queued(mock_db, mock_redis_queues):
 
         await check_for_orphans(mock_db)
 
-        queued_items = await mock_redis_queues.lrange("unpin_requests", 0, -1)
-        assert len(queued_items) == 0
+        ipfs_items = await mock_redis_queues.lrange("ipfs_unpin_requests", 0, -1)
+        arion_items = await mock_redis_queues.lrange("arion_unpin_requests", 0, -1)
+        assert len(ipfs_items) == 0
+        assert len(arion_items) == 0
 
 
 @pytest.mark.asyncio
@@ -174,10 +179,11 @@ async def test_pagination_processes_all_pages(mock_db, mock_redis_queues):
 
         await check_for_orphans(mock_db)
 
-        queued_items = await mock_redis_queues.lrange("unpin_requests", 0, -1)
-        assert len(queued_items) == 2
+        # Fan-out enqueues to all configured unpin queues
+        ipfs_items = await mock_redis_queues.lrange("ipfs_unpin_requests", 0, -1)
+        assert len(ipfs_items) == 2
 
-        cids = [json.loads(item)["cid"] for item in queued_items]
+        cids = [json.loads(item)["cid"] for item in ipfs_items]
         assert "QmPage1File1" in cids
         assert "QmPage2File1" in cids
 
@@ -219,8 +225,10 @@ async def test_chunk_cid_in_part_chunks_not_orphaned(mock_db, mock_redis_queues)
 
         await check_for_orphans(mock_db)
 
-        queued_items = await mock_redis_queues.lrange("unpin_requests", 0, -1)
-        assert len(queued_items) == 0
+        ipfs_items = await mock_redis_queues.lrange("ipfs_unpin_requests", 0, -1)
+        arion_items = await mock_redis_queues.lrange("arion_unpin_requests", 0, -1)
+        assert len(ipfs_items) == 0
+        assert len(arion_items) == 0
 
 
 @pytest.mark.asyncio
@@ -260,9 +268,9 @@ async def test_orphan_chunk_cid_queued_for_unpinning(mock_db, mock_redis_queues)
 
         await check_for_orphans(mock_db)
 
-        queued_items = await mock_redis_queues.lrange("unpin_requests", 0, -1)
-        assert len(queued_items) == 1
+        ipfs_items = await mock_redis_queues.lrange("ipfs_unpin_requests", 0, -1)
+        assert len(ipfs_items) == 1
 
-        request = json.loads(queued_items[0])
+        request = json.loads(ipfs_items[0])
         assert request["cid"] == "QmOrphanChunk999"
         assert request["address"] == "5TestAccount"

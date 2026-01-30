@@ -115,6 +115,10 @@ _TOXI_UPSTREAM_CTL = os.environ.get("TOXI_UPSTREAM_CTL", "ipfs:5001")
 _TOXI_LISTEN_KMS = os.environ.get("TOXI_LISTEN_KMS", "0.0.0.0:18443")
 _TOXI_UPSTREAM_KMS = os.environ.get("TOXI_UPSTREAM_KMS", "mock-kms:8443")
 
+# Arion proxy config
+_TOXI_LISTEN_ARION = os.environ.get("TOXI_LISTEN_ARION", "0.0.0.0:19090")
+_TOXI_UPSTREAM_ARION = os.environ.get("TOXI_UPSTREAM_ARION", "mock-arion:8002")
+
 
 def _toxiproxy_get(name: str) -> requests.Response:
     return requests.get(f"{_TOXI_BASE}/proxies/{name}", timeout=2)
@@ -130,41 +134,20 @@ def _toxiproxy_create(name: str, listen: str, upstream: str) -> bool:
 
 
 def _toxiproxy_set_enabled(name: str, enabled: bool) -> bool:
-    # Toxiproxy API requires POSTing the full proxy config to update (not PUT)
+    """Toggle a toxiproxy proxy on/off without deleting it."""
     url = f"{_TOXI_BASE}/proxies/{name}"
-    print(f"DEBUG: Setting proxy {name} enabled={enabled}")
 
-    # First get current proxy config
     get_resp = requests.get(url, timeout=3)
     if get_resp.status_code != 200:
-        print(f"DEBUG: Failed to get proxy config: {get_resp.status_code}, {get_resp.text}")
         return False
 
     proxy_config = get_resp.json()
-    print(f"DEBUG: Current proxy config: {proxy_config}")
-
-    # If already in desired state, skip the update
     if proxy_config.get("enabled") == enabled:
-        print(f"DEBUG: Proxy already in desired state (enabled={enabled})")
         return True
 
-    # Update enabled field
     proxy_config["enabled"] = enabled
-
-    # POST back the full config (Toxiproxy uses POST for updates, not PUT)
-    post_resp = requests.post(
-        url,
-        json=proxy_config,
-        timeout=3,
-    )
-    print(f"DEBUG: POST response status: {post_resp.status_code}, content: {post_resp.text}")
+    post_resp = requests.post(url, json=proxy_config, timeout=3)
     return post_resp.status_code in (200, 201)
-
-
-def _toxiproxy_delete(name: str) -> bool:
-    url = f"{_TOXI_BASE}/proxies/{name}"
-    resp = requests.delete(url, timeout=3)
-    return resp.status_code in (200, 204)
 
 
 def _ensure_ipfs_proxies() -> None:
@@ -195,16 +178,18 @@ def _ensure_ipfs_proxies() -> None:
 
 
 def disable_ipfs_proxy() -> None:
-    # Hard-disable by deleting proxies so no listener is bound
-    # Best-effort deletes; 404 means already absent
+    """Disable IPFS proxies by setting enabled=false (refuses new connections)."""
     with suppress(Exception):
-        _toxiproxy_delete("ipfs_get")
+        _toxiproxy_set_enabled("ipfs_get", False)
     with suppress(Exception):
-        _toxiproxy_delete("ipfs_store")
+        _toxiproxy_set_enabled("ipfs_store", False)
 
 
 def enable_ipfs_proxy() -> None:
+    """Ensure IPFS proxies exist and are enabled."""
     _ensure_ipfs_proxies()
+    _toxiproxy_set_enabled("ipfs_get", True)
+    _toxiproxy_set_enabled("ipfs_store", True)
 
 
 def wait_for_toxiproxy(timeout_seconds: float = 10.0, poll_seconds: float = 0.5) -> bool:
@@ -243,46 +228,72 @@ def _ensure_kms_proxy() -> None:
 
 
 def disable_kms_proxy() -> None:
-    """Disable KMS proxy to simulate KMS outage.
-
-    Uses delete approach (like IPFS proxies) rather than enabled=false,
-    because enabled=false only refuses new connections but doesn't
-    break existing ones immediately.
-    """
-    print("DEBUG: Disabling KMS proxy by deleting it")
-    try:
-        ok = _toxiproxy_delete("kms")
-        print(f"DEBUG: Delete result: {ok}")
-    except Exception as e:
-        print(f"DEBUG: Delete failed with exception: {e}")
+    """Disable KMS proxy to simulate KMS outage."""
+    with suppress(Exception):
+        _toxiproxy_set_enabled("kms", False)
 
 
 def enable_kms_proxy() -> None:
-    """Enable KMS proxy to restore KMS connectivity."""
+    """Ensure KMS proxy exists and is enabled."""
     _ensure_kms_proxy()
+    _toxiproxy_set_enabled("kms", True)
+
+
+# ---- Arion Toxiproxy helpers ----
+
+
+def _ensure_arion_proxy() -> None:
+    """Ensure the Arion proxy exists in toxiproxy."""
+    try:
+        r = _toxiproxy_get("arion")
+        if r.status_code == 404:
+            print(f"DEBUG: Creating arion proxy: {_TOXI_LISTEN_ARION} -> {_TOXI_UPSTREAM_ARION}")
+            ok = _toxiproxy_create("arion", _TOXI_LISTEN_ARION, _TOXI_UPSTREAM_ARION)
+            if not ok:
+                raise RuntimeError("failed to create toxiproxy arion")
+            print("DEBUG: Created arion proxy")
+    except Exception as e:
+        print(f"DEBUG: Error ensuring Arion proxy: {e}")
+        raise
+
+
+def disable_arion_proxy() -> None:
+    """Disable Arion proxy to simulate Arion outage."""
+    with suppress(Exception):
+        _toxiproxy_set_enabled("arion", False)
+
+
+def enable_arion_proxy() -> None:
+    """Ensure Arion proxy exists and is enabled."""
+    _ensure_arion_proxy()
+    _toxiproxy_set_enabled("arion", True)
 
 
 def pause_service(service: str) -> None:
     """Pause a service by disabling its toxiproxy.
 
-    Supported services: 'mock-kms', 'ipfs'
+    Supported services: 'mock-kms', 'ipfs', 'arion'
     """
     if service == "mock-kms":
         disable_kms_proxy()
     elif service == "ipfs":
         disable_ipfs_proxy()
+    elif service == "arion":
+        disable_arion_proxy()
     else:
-        raise ValueError(f"Unknown service: {service}. Supported: mock-kms, ipfs")
+        raise ValueError(f"Unknown service: {service}. Supported: mock-kms, ipfs, arion")
 
 
 def unpause_service(service: str) -> None:
     """Unpause a service by enabling its toxiproxy.
 
-    Supported services: 'mock-kms', 'ipfs'
+    Supported services: 'mock-kms', 'ipfs', 'arion'
     """
     if service == "mock-kms":
         enable_kms_proxy()
     elif service == "ipfs":
         enable_ipfs_proxy()
+    elif service == "arion":
+        enable_arion_proxy()
     else:
-        raise ValueError(f"Unknown service: {service}. Supported: mock-kms, ipfs")
+        raise ValueError(f"Unknown service: {service}. Supported: mock-kms, ipfs, arion")

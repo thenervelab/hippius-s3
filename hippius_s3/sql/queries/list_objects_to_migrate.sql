@@ -20,7 +20,8 @@ WITH cur AS (
   LEFT JOIN cids c
     ON c.id = ov.cid_id
   JOIN buckets b ON b.bucket_id = o.bucket_id
-  WHERE ov.storage_version < $1
+  WHERE o.deleted_at IS NULL
+    AND ov.storage_version < $1
     AND (c.cid IS NULL OR LOWER(TRIM(c.cid)) <> 'pending')
     AND NOT EXISTS (
       SELECT 1

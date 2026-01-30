@@ -10,7 +10,7 @@ except Exception:  # pragma: no cover - allow skipping if unavailable
     redis = None  # type: ignore[assignment]
 
 from .support.cache import clear_object_cache
-from .support.cache import wait_for_parts_cids
+from .support.cache import wait_for_all_backends_ready
 
 
 def _put_object(boto3_client: Any, bucket: str, key: str, data: bytes, metadata: dict[str, str] | None = None) -> None:
@@ -66,7 +66,7 @@ def test_get_partial_cache_fallbacks(
     time.sleep(0.1)
 
     # Wait until at least 2 parts have CIDs in DB
-    assert wait_for_parts_cids(bucket, key, min_count=2), "parts not ready with CIDs"
+    assert wait_for_all_backends_ready(bucket, key, min_count=2), "parts not ready with CIDs"
 
     # Get object_id and clear appended part from obj: cache to simulate partial cache
     from .support.cache import get_object_id_and_version
