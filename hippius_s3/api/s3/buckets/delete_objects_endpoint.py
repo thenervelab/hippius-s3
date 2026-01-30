@@ -8,6 +8,7 @@ from fastapi import Response
 from lxml import etree as ET
 
 from hippius_s3.api.s3 import errors
+from hippius_s3.backend_routing import resolve_object_backends
 from hippius_s3.config import get_config
 from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import enqueue_unpin_request
@@ -18,11 +19,6 @@ from hippius_s3.utils import get_query
 
 logger = logging.getLogger(__name__)
 config = get_config()
-
-
-def _unpin_queue_names() -> list[str]:
-    """Derive unpin queue names from configured delete backends."""
-    return [f"{b}_unpin_requests" for b in config.delete_backends]
 
 
 async def handle_delete_objects(bucket_name: str, request: Request, db: Any, redis_client: Any) -> Response:
@@ -84,7 +80,6 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
         bucket_id = bucket["bucket_id"]
         deleted_keys: list[str] = []
         errors_list: list[dict[str, str]] = []
-        unpin_queues = _unpin_queue_names()
 
         for obj in object_elems:
             key_nodes = obj.xpath("./s3:Key", namespaces=ns)  # type: ignore[attr-defined]
@@ -116,14 +111,15 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                 ray_id = getattr(request.state, "ray_id", None)
                 object_id = str(deleted["object_id"])
                 object_version = int(deleted["current_object_version"])
+                db_backends = await resolve_object_backends(db, object_id, object_version)
                 unpin_payload = UnpinChainRequest(
                     address=request.state.account.main_account,
                     object_id=object_id,
                     object_version=object_version,
                     ray_id=ray_id,
+                    delete_backends=db_backends if db_backends else None,
                 )
-                for qname in unpin_queues:
-                    await enqueue_unpin_request(payload=unpin_payload, queue_name=qname)
+                await enqueue_unpin_request(payload=unpin_payload)
 
             # S3 semantics: even if not found, include as Deleted (unless Quiet)
             deleted_keys.append(key)

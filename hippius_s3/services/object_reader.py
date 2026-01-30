@@ -8,6 +8,7 @@ from fastapi import Response
 from fastapi.responses import StreamingResponse
 
 from hippius_s3.api.s3.common import build_headers
+from hippius_s3.backend_routing import resolve_object_backends
 from hippius_s3.config import get_config
 from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import PartChunkSpec
@@ -207,6 +208,7 @@ async def build_stream_context(
                     f"Parts not ready: missing chunk metadata for parts {sorted(set(missing_meta_parts))}"
                 )
         if dl_parts:
+            db_backends = await resolve_object_backends(db, info["object_id"], ov)
             req = DownloadChainRequest(
                 request_id=f"{info['object_id']}::shared",
                 object_id=info["object_id"],
@@ -222,6 +224,7 @@ async def build_stream_context(
                 multipart=bool(info.get("multipart")),
                 chunks=dl_parts,
                 ray_id=info.get("ray_id"),
+                download_backends=db_backends if db_backends else None,
             )
             await enqueue_download_request(req)
 

@@ -9,6 +9,7 @@ import redis.asyncio as async_redis
 from pydantic import BaseModel
 from pydantic import ConfigDict
 
+from hippius_s3.backend_routing import compute_effective_backends
 from hippius_s3.config import get_config
 
 
@@ -90,7 +91,7 @@ class UnpinChainRequest(RetryableRequest):
     object_id: str
     object_version: int | None = None  # None = all versions
     cid: str | None = None  # DEPRECATED — transitional, for in-flight queue compat only
-    # NO backend field. Payload is backend-agnostic.
+    delete_backends: list[str] | None = None  # Set by API at enqueue time
 
     @property
     def name(self) -> str:
@@ -135,9 +136,20 @@ async def enqueue_upload_to_backends(request: UploadChainRequest) -> None:
     if request.attempts is None:
         request.attempts = 0
 
-    if not request.upload_backends:
-        config = get_config()
-        request.upload_backends = config.upload_backends
+    config = get_config()
+    effective = compute_effective_backends(
+        request.upload_backends,
+        config.upload_backends,
+        context={
+            "request_id": request.request_id,
+            "object_id": request.object_id,
+            "object_version": request.object_version,
+            "bucket_name": request.bucket_name,
+            "object_key": request.object_key,
+        },
+        raise_on_empty=True,
+    )
+    request.upload_backends = effective or config.upload_backends
 
     raw = request.model_dump_json()
     for backend in request.upload_backends:
@@ -240,7 +252,30 @@ async def enqueue_unpin_request(payload: UnpinChainRequest, *, queue_name: str |
         logger.info(f"Enqueued unpin request {payload.name=} queue={queue_name}")
     else:
         config = get_config()
-        queue_names = [f"{b}_unpin_requests" for b in config.delete_backends]
+        effective = compute_effective_backends(
+            payload.delete_backends,
+            config.delete_backends,
+            context={
+                "request_id": payload.request_id,
+                "object_id": payload.object_id,
+                "object_version": payload.object_version,
+            },
+            raise_on_empty=False,
+        )
+        if payload.delete_backends is not None and effective is None:
+            logger.error(
+                "All requested delete backends disallowed by config; not enqueuing. requested=%s allowed=%s context=%s",
+                payload.delete_backends,
+                config.delete_backends,
+                {
+                    "request_id": payload.request_id,
+                    "object_id": payload.object_id,
+                    "object_version": payload.object_version,
+                },
+            )
+            return
+        backends = effective or config.delete_backends
+        queue_names = [f"{b}_unpin_requests" for b in backends]
         for qname in queue_names:
             await client.lpush(qname, raw)
         logger.info(f"Enqueued unpin request {payload.name=} queues={queue_names}")
@@ -313,9 +348,32 @@ async def enqueue_download_request(payload: DownloadChainRequest) -> None:
     """Add a download request to per-backend download queues."""
     client = get_queue_client()
 
-    if not payload.download_backends:
-        config = get_config()
-        payload.download_backends = config.download_backends
+    config = get_config()
+    effective = compute_effective_backends(
+        payload.download_backends,
+        config.download_backends,
+        context={
+            "request_id": payload.request_id,
+            "object_id": payload.object_id,
+            "object_version": payload.object_version,
+            "bucket_name": payload.bucket_name,
+            "object_key": payload.object_key,
+        },
+        raise_on_empty=False,
+    )
+    if payload.download_backends is not None and effective is None:
+        logger.error(
+            "All requested download backends disallowed by config; not enqueuing. requested=%s allowed=%s context=%s",
+            payload.download_backends,
+            config.download_backends,
+            {
+                "request_id": payload.request_id,
+                "object_id": payload.object_id,
+                "object_version": payload.object_version,
+            },
+        )
+        return
+    payload.download_backends = effective or config.download_backends
 
     raw = payload.model_dump_json()
     queue_names = [f"{b}_download_requests" for b in payload.download_backends]

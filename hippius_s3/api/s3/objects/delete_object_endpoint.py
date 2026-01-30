@@ -9,6 +9,7 @@ from opentelemetry import trace
 
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
+from hippius_s3.backend_routing import resolve_object_backends
 from hippius_s3.config import get_config
 from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import enqueue_unpin_request
@@ -21,11 +22,6 @@ from hippius_s3.utils import get_query
 logger = logging.getLogger(__name__)
 config = get_config()
 tracer = trace.get_tracer(__name__)
-
-
-def _unpin_queue_names() -> list[str]:
-    """Derive unpin queue names from configured delete backends."""
-    return [f"{b}_unpin_requests" for b in config.delete_backends]
 
 
 async def handle_delete_object(
@@ -88,13 +84,15 @@ async def handle_delete_object(
             except Exception:
                 logger.debug("Failed to cleanup provisional multipart uploads on object delete", exc_info=True)
 
-        # Fan out unpin requests to all per-backend unpin queues
+        # Resolve which backends actually hold data for this object
+        db_backends = await resolve_object_backends(db, object_id, object_version)
         ray_id = getattr(request.state, "ray_id", None)
         unpin_payload = UnpinChainRequest(
             address=request.state.account.main_account,
             object_id=object_id,
             object_version=object_version,
             ray_id=ray_id,
+            delete_backends=db_backends if db_backends else None,
         )
         with tracer.start_as_current_span(
             "delete_object.enqueue_unpin",
@@ -104,8 +102,7 @@ async def handle_delete_object(
                 "object_version": object_version,
             },
         ):
-            for qname in _unpin_queue_names():
-                await enqueue_unpin_request(payload=unpin_payload, queue_name=qname)
+            await enqueue_unpin_request(payload=unpin_payload)
 
         return Response(status_code=204)
 
