@@ -54,17 +54,14 @@ Configure the following secrets in your GitHub repository:
 ### Kubernetes Access
 - `KUBE_CONFIG`: Base64-encoded kubeconfig (used for both staging and production namespaces)
 
-### Staging Secrets
-- `STAGING_DATABASE_URL`: PostgreSQL connection string
-- `STAGING_DATABASE_PASSWORD`: PostgreSQL password
-- `STAGING_HIPPIUS_SERVICE_KEY`: Hippius service seed phrase
-- `STAGING_HIPPIUS_AUTH_ENCRYPTION_KEY`: Encryption key
+### Database URLs (Environment-Specific)
+- `STAGING_DATABASE_URL`: PostgreSQL connection string for staging (e.g., `postgresql://postgres:PASSWORD@postgres:5432/hippius`)
+- `PRODUCTION_DATABASE_URL`: PostgreSQL connection string for production (e.g., `postgresql://postgres:PASSWORD@postgres:5432/hippius`)
 
-### Production Secrets
-- `PRODUCTION_DATABASE_URL`: PostgreSQL connection string
-- `PRODUCTION_DATABASE_PASSWORD`: PostgreSQL password
-- `PRODUCTION_HIPPIUS_SERVICE_KEY`: Hippius service seed phrase
-- `PRODUCTION_HIPPIUS_AUTH_ENCRYPTION_KEY`: Encryption key
+### Shared Secrets (Used by Both Staging and Production)
+- `DATABASE_PASSWORD`: PostgreSQL password
+- `HIPPIUS_SERVICE_KEY`: Hippius service seed phrase (12 words)
+- `HIPPIUS_AUTH_ENCRYPTION_KEY`: Encryption key (generate with `openssl rand -base64 32`)
 
 ## Deployment
 

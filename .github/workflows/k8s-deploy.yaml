@@ -143,10 +143,10 @@ jobs:
             --from-literal=REDIS_QUEUES_URL="redis://redis-queues:6379/0" \
             --from-literal=REDIS_RATE_LIMITING_URL="redis://redis-rate-limiting:6379/0" \
             --from-literal=REDIS_ACL_URL="redis://redis-acl:6379/0" \
-            --from-literal=HIPPIUS_SERVICE_KEY="${{ secrets.STAGING_HIPPIUS_SERVICE_KEY }}" \
-            --from-literal=HIPPIUS_AUTH_ENCRYPTION_KEY="${{ secrets.STAGING_HIPPIUS_AUTH_ENCRYPTION_KEY }}" \
+            --from-literal=HIPPIUS_SERVICE_KEY="${{ secrets.HIPPIUS_SERVICE_KEY }}" \
+            --from-literal=HIPPIUS_AUTH_ENCRYPTION_KEY="${{ secrets.HIPPIUS_AUTH_ENCRYPTION_KEY }}" \
             --from-literal=HIPPIUS_IPFS_API_URLS="http://ipfs:5001" \
-            --from-literal=DATABASE_PASSWORD="${{ secrets.STAGING_DATABASE_PASSWORD }}" \
+            --from-literal=DATABASE_PASSWORD="${{ secrets.DATABASE_PASSWORD }}" \
             --namespace=hippius-s3-staging \
             --dry-run=client -o yaml | kubectl apply -f -
 
@@ -157,6 +157,10 @@ jobs:
             ghcr.io/thenervelab/hippius-s3/api:${{ github.sha }} \
             ghcr.io/thenervelab/hippius-s3/gateway:${{ github.sha }} \
             ghcr.io/thenervelab/hippius-s3/workers:${{ github.sha }}
+
+      - name: Delete old migration job if exists
+        run: |
+          kubectl delete job db-migrations -n hippius-s3-staging --ignore-not-found=true
 
       - name: Deploy to staging
         run: |
@@ -206,10 +210,10 @@ jobs:
             --from-literal=REDIS_QUEUES_URL="redis://redis-queues:6379/0" \
             --from-literal=REDIS_RATE_LIMITING_URL="redis://redis-rate-limiting:6379/0" \
             --from-literal=REDIS_ACL_URL="redis://redis-acl:6379/0" \
-            --from-literal=HIPPIUS_SERVICE_KEY="${{ secrets.PRODUCTION_HIPPIUS_SERVICE_KEY }}" \
-            --from-literal=HIPPIUS_AUTH_ENCRYPTION_KEY="${{ secrets.PRODUCTION_HIPPIUS_AUTH_ENCRYPTION_KEY }}" \
+            --from-literal=HIPPIUS_SERVICE_KEY="${{ secrets.HIPPIUS_SERVICE_KEY }}" \
+            --from-literal=HIPPIUS_AUTH_ENCRYPTION_KEY="${{ secrets.HIPPIUS_AUTH_ENCRYPTION_KEY }}" \
             --from-literal=HIPPIUS_IPFS_API_URLS="http://ipfs:5001" \
-            --from-literal=DATABASE_PASSWORD="${{ secrets.PRODUCTION_DATABASE_PASSWORD }}" \
+            --from-literal=DATABASE_PASSWORD="${{ secrets.DATABASE_PASSWORD }}" \
             --namespace=hippius-s3-prod \
             --dry-run=client -o yaml | kubectl apply -f -
 
@@ -220,6 +224,10 @@ jobs:
             ghcr.io/thenervelab/hippius-s3/api:${{ github.sha }} \
             ghcr.io/thenervelab/hippius-s3/gateway:${{ github.sha }} \
             ghcr.io/thenervelab/hippius-s3/workers:${{ github.sha }}
+
+      - name: Delete old migration job if exists
+        run: |
+          kubectl delete job db-migrations -n hippius-s3-prod --ignore-not-found=true
 
       - name: Deploy to production
         run: |

@@ -8,6 +8,8 @@ from pathlib import Path
 import asyncpg
 import redis.asyncio as async_redis
 
+from hippius_s3.services import arion_service
+
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -21,7 +23,6 @@ from hippius_s3.queue import dequeue_unpin_request
 from hippius_s3.queue import enqueue_unpin_retry_request
 from hippius_s3.queue import move_due_unpin_retries_to_primary
 from hippius_s3.redis_utils import with_redis_retry
-from hippius_s3.services.hippius_api_service import HippiusApiClient
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 from hippius_s3.services.ray_id_service import ray_id_context
 from hippius_s3.utils import get_query
@@ -44,10 +45,9 @@ async def process_unpin_request(
     """Process a single unpin request."""
     try:
         worker_logger.info(f"Processing unpin request: {request.name}")
-        async with HippiusApiClient() as api_client:
+        async with arion_service.ArionClient() as api_client:
             unpin_result = await api_client.unpin_file(
                 request.cid,
-                account_ss58=request.address,
             )
         worker_logger.info(f"Successfully unpinned CID via API: {unpin_result=}")
 
