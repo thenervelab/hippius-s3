@@ -10,7 +10,7 @@ from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.queue import initialize_queue_client
-from hippius_s3.queue import move_due_retries_to_primary
+from hippius_s3.queue import move_due_upload_retries
 
 
 @pytest.mark.asyncio
@@ -35,10 +35,10 @@ async def test_enqueue_retry_request_sets_attempts_and_schedules() -> None:
         request_id="req-456",
     )
 
-    await enqueue_retry_request(payload, delay_seconds=10.0, last_error="test error")
+    await enqueue_retry_request(payload, backend_name="ipfs", delay_seconds=10.0, last_error="test error")
 
-    # Check ZSET has the item
-    members = await redis.zrange("upload_retries", 0, -1, withscores=True)
+    # Check ZSET has the item (per-backend key)
+    members = await redis.zrange("ipfs_upload_retries", 0, -1, withscores=True)
     assert len(members) == 1
 
     stored_payload = members[0][0]
@@ -57,36 +57,36 @@ async def test_enqueue_retry_request_sets_attempts_and_schedules() -> None:
 
 
 @pytest.mark.asyncio
-async def test_move_due_retries_to_primary() -> None:
-    """Test that due retries are moved to primary queue."""
+async def test_move_due_upload_retries() -> None:
+    """Test that due retries are moved to the backend's upload queue."""
     redis = FakeRedis()
     initialize_queue_client(redis)
 
     # Add a due retry (score = past time)
     past_time = time.time() - 10
     payload_data = {"test": "data", "attempts": 1}
-    await redis.zadd("upload_retries", {json.dumps(payload_data): past_time})
+    await redis.zadd("ipfs_upload_retries", {json.dumps(payload_data): past_time})
 
     # Add a not-due retry (score = future time)
     future_time = time.time() + 100
-    await redis.zadd("upload_retries", {json.dumps({"not_due": True}): future_time})
+    await redis.zadd("ipfs_upload_retries", {json.dumps({"not_due": True}): future_time})
 
-    moved = await move_due_retries_to_primary(now_ts=time.time())
+    moved = await move_due_upload_retries(backend_name="ipfs", now_ts=time.time())
 
     assert moved == 1  # Only the due one moved
 
-    # Check primary queue has the item
-    primary_item = await redis.lpop("upload_requests")
+    # Check backend queue has the item
+    primary_item = await redis.lpop("ipfs_upload_requests")
     assert json.loads(primary_item) == payload_data
 
     # Check ZSET still has the not-due item
-    remaining = await redis.zcard("upload_retries")
+    remaining = await redis.zcard("ipfs_upload_retries")
     assert remaining == 1
 
 
 @pytest.mark.asyncio
-async def test_move_due_retries_respects_max_items() -> None:
-    """Test that move_due_retries_to_primary respects max_items limit."""
+async def test_move_due_upload_retries_respects_max_items() -> None:
+    """Test that move_due_upload_retries respects max_items limit."""
     redis = FakeRedis()
     initialize_queue_client(redis)
 
@@ -94,22 +94,22 @@ async def test_move_due_retries_respects_max_items() -> None:
     past_time = time.time() - 10
     for i in range(5):
         payload_data = {"item": i}
-        await redis.zadd("upload_retries", {json.dumps(payload_data): past_time})
+        await redis.zadd("ipfs_upload_retries", {json.dumps(payload_data): past_time})
 
     # Move with limit
-    moved = await move_due_retries_to_primary(max_items=2)
+    moved = await move_due_upload_retries(backend_name="ipfs", max_items=2)
 
     assert moved == 2
 
-    # Check primary queue has exactly 2 items
+    # Check backend queue has exactly 2 items
     primary_items = []
     for _ in range(3):  # Try to pop 3, but only 2 should exist
-        item = await redis.lpop("upload_requests")
+        item = await redis.lpop("ipfs_upload_requests")
         if item:
             primary_items.append(item)
 
     assert len(primary_items) == 2
 
     # Check ZSET has remaining items
-    remaining = await redis.zcard("upload_retries")
+    remaining = await redis.zcard("ipfs_upload_retries")
     assert remaining == 3

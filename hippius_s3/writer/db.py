@@ -20,6 +20,7 @@ async def upsert_object_basic(
     md5_hash: str,
     size_bytes: int,
     storage_version: int,
+    upload_backends: list[str] | None = None,
 ) -> Any:
     return await db.fetchrow(
         get_query("upsert_object_basic"),
@@ -32,6 +33,7 @@ async def upsert_object_basic(
         size_bytes,
         datetime.now(timezone.utc),
         int(storage_version),
+        upload_backends,
     )
 
 

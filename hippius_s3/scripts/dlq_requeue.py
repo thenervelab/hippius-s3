@@ -236,6 +236,12 @@ async def main() -> None:
         default="upload",
         help="Worker type: upload or unpin (default: upload)",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["ipfs", "arion"],
+        default="ipfs",
+        help="Backend name for upload worker (default: ipfs)",
+    )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     # peek command
@@ -287,7 +293,7 @@ async def main() -> None:
         if args.worker == "upload":
             from hippius_s3.dlq.upload_dlq import UploadDLQManager
 
-            dlq_manager = UploadDLQManager(redis_queues_client)
+            dlq_manager = UploadDLQManager(redis_queues_client, backend_name=args.backend)
         else:
             from hippius_s3.dlq.unpin_dlq import UnpinDLQManager
 
@@ -299,11 +305,15 @@ async def main() -> None:
                 print("DLQ is empty")
                 return
 
-            print(f"DLQ entries for {args.worker} worker (showing {len(entries)}):")
+            worker_desc = f"{args.worker} worker"
+            if args.worker == "upload":
+                worker_desc = f"{args.backend} backend {args.worker} worker"
+            print(f"DLQ entries for {worker_desc} (showing {len(entries)}):")
             for i, entry in enumerate(entries, 1):
                 print(f"\n--- Entry {i} ---")
                 print(f"Object ID: {entry.get('object_id')}")
                 if args.worker == "upload":
+                    print(f"Backend: {args.backend}")
                     print(f"Upload ID: {entry.get('upload_id')}")
                     print(f"Bucket: {entry.get('bucket_name')}")
                     print(f"Key: {entry.get('object_key')}")

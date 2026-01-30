@@ -100,17 +100,9 @@ async def create_destination_objects(
         md5_hash=md5_hash,
         size_bytes=size_bytes,
         storage_version=src_storage_version,
+        upload_backends=config.upload_backends,
     )
     dest_object_version = int(row.get("current_object_version") or 1) if row else 1
-
-    src_object_id = str(src_obj_row.get("object_id"))
-    src_object_version = int(src_obj_row.get("object_version") or 1)
-    src_part = await db.fetchrow(
-        get_query("get_source_part_for_copy"),
-        src_object_id,
-        src_object_version,
-    )
-    src_part_cid = str(src_part["ipfs_cid"]) if src_part and src_part["ipfs_cid"] else "pending"
 
     upload_id = await ensure_upload_row(
         db,
@@ -129,7 +121,6 @@ async def create_destination_objects(
         part_number=1,
         size_bytes=size_bytes,
         etag=md5_hash or "",
-        placeholder_cid=src_part_cid,
         chunk_size_bytes=chunk_size_bytes,
         object_version=dest_object_version,
     )

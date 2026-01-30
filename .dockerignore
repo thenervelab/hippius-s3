@@ -61,6 +61,7 @@ test_*.py
 *_test.py
 tests/
 !tests/e2e/mock_hippius_api.py
+!tests/e2e/mock_arion_api.py
 !tests/e2e/mock_kms_server.py
 !tests/e2e/certs/
 

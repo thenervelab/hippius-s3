@@ -8,6 +8,7 @@ from fastapi import Response
 from lxml import etree as ET
 
 from hippius_s3.api.s3 import errors
+from hippius_s3.backend_routing import resolve_object_backends
 from hippius_s3.config import get_config
 from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import enqueue_unpin_request
@@ -95,31 +96,30 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                 errors_list.append({"Key": key, "Code": "NotImplemented", "Message": "Versioning not supported"})
                 continue
 
-            # Perform permission-aware delete; non-existent counts as success
+            # Soft-delete the object
             try:
-                deleted_object = await db.fetchrow(
-                    get_query("delete_object"),
+                deleted = await db.fetchrow(
+                    get_query("soft_delete_object"),
                     bucket_id,
                     key,
                 )
             except Exception:
-                logger.exception("Delete query failed for key %s", key)
-                deleted_object = None
+                logger.exception("Soft-delete query failed for key %s", key)
+                deleted = None
 
-            all_cids = deleted_object.get("all_cids") or [] if deleted_object else []
-            if deleted_object:
+            if deleted:
                 ray_id = getattr(request.state, "ray_id", None)
-                obj_version = deleted_object.get("object_version") or deleted_object.get("current_object_version") or 1
-                for cid in all_cids:
-                    await enqueue_unpin_request(
-                        payload=UnpinChainRequest(
-                            address=request.state.account.main_account,
-                            object_id=str(deleted_object["object_id"]),
-                            object_version=int(obj_version),
-                            cid=cid,
-                            ray_id=ray_id,
-                        ),
-                    )
+                object_id = str(deleted["object_id"])
+                object_version = int(deleted["current_object_version"])
+                db_backends = await resolve_object_backends(db, object_id, object_version)
+                unpin_payload = UnpinChainRequest(
+                    address=request.state.account.main_account,
+                    object_id=object_id,
+                    object_version=object_version,
+                    ray_id=ray_id,
+                    delete_backends=db_backends if db_backends else None,
+                )
+                await enqueue_unpin_request(payload=unpin_payload)
 
             # S3 semantics: even if not found, include as Deleted (unless Quiet)
             deleted_keys.append(key)

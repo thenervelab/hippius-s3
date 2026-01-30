@@ -91,7 +91,7 @@ class GatewayConfig:
     loki_enabled: bool = dataclasses.field(default_factory=lambda: os.getenv("LOKI_ENABLED", "false").lower() == "true")
     environment: str = dataclasses.field(default_factory=lambda: os.getenv("ENVIRONMENT", "development"))
     hippius_api_base_url: str = dataclasses.field(
-        default_factory=lambda: os.getenv("HIPPIUS_API_BASE_URL", "https://api.hippius.com/api")
+        default_factory=lambda: os.getenv("HIPPIUS_API_BASE_URL", "https://arion.hippius.com/")
     )
     hippius_service_key: str = dataclasses.field(default_factory=lambda: os.getenv("HIPPIUS_SERVICE_KEY", ""))
     hippius_secret_decryption_material: str = dataclasses.field(

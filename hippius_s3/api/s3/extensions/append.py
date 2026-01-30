@@ -63,7 +63,7 @@ async def handle_append(
     expected_version_header = request.headers.get("x-amz-meta-append-if-version")
     append_id = request.headers.get("x-amz-meta-append-id")
 
-    # Reject empty append deltas to avoid bloating manifests
+    # Reject empty append deltas
     if not incoming_bytes:
         return errors.s3_error_response(
             code="InvalidRequest",

@@ -61,10 +61,10 @@ def test_append_single_writer(
     # Second GET: simulate pipeline by clearing cache
     from .support.cache import clear_object_cache
     from .support.cache import get_object_id
-    from .support.cache import wait_for_parts_cids
+    from .support.cache import wait_for_all_backends_ready
 
     # Wait until both parts have CIDs to ensure pipeline-readable
-    assert wait_for_parts_cids(bucket, key, min_count=2, timeout_seconds=25.0)
+    assert wait_for_all_backends_ready(bucket, key, min_count=2, timeout_seconds=25.0)
 
     object_id = get_object_id(bucket, key)
     clear_object_cache(object_id)

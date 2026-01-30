@@ -32,7 +32,7 @@ def test_kek_stored_wrapped_not_plaintext(
     - wrapped_kek_bytes: The KMS-encrypted KEK (not raw 32 bytes)
     - kms_key_id: The KMS key ID used for wrapping
     """
-    from .support.cache import wait_for_parts_cids
+    from .support.cache import wait_for_all_backends_ready
     from .support.db import query_bucket_keks
 
     bucket = unique_bucket_name("kms-wrap")
@@ -42,7 +42,7 @@ def test_kek_stored_wrapped_not_plaintext(
     boto3_client.put_object(Bucket=bucket, Key="test.txt", Body=b"hello world")
 
     # Wait for async processing
-    assert wait_for_parts_cids(bucket, "test.txt", min_count=1, timeout_seconds=30)
+    assert wait_for_all_backends_ready(bucket, "test.txt", min_count=1, timeout_seconds=30)
 
     # Query keystore DB directly
     kek_row = query_bucket_keks(bucket)
@@ -74,7 +74,7 @@ def test_object_readable_after_kek_wrapped(
     2. Write object → uses plaintext KEK (from unwrap) → encrypts DEK → encrypts data
     3. Read object → fetches wrapped KEK → unwraps via KMS → decrypts DEK → decrypts data
     """
-    from .support.cache import wait_for_parts_cids
+    from .support.cache import wait_for_all_backends_ready
 
     bucket = unique_bucket_name("kms-roundtrip")
     cleanup_buckets(bucket)
@@ -83,7 +83,7 @@ def test_object_readable_after_kek_wrapped(
     boto3_client.create_bucket(Bucket=bucket)
     boto3_client.put_object(Bucket=bucket, Key="data.bin", Body=content)
 
-    assert wait_for_parts_cids(bucket, "data.bin", min_count=1, timeout_seconds=30)
+    assert wait_for_all_backends_ready(bucket, "data.bin", min_count=1, timeout_seconds=30)
 
     # Read should work (KMS unwraps KEK → unwrap DEK → decrypt)
     response = boto3_client.get_object(Bucket=bucket, Key="data.bin")
@@ -99,7 +99,7 @@ def test_large_object_with_kms_wrapped_kek(
     cleanup_buckets: Callable[[str], None],
 ) -> None:
     """Test larger object (multiple chunks) with KMS-wrapped KEK."""
-    from .support.cache import wait_for_parts_cids
+    from .support.cache import wait_for_all_backends_ready
 
     bucket = unique_bucket_name("kms-large")
     cleanup_buckets(bucket)
@@ -110,7 +110,7 @@ def test_large_object_with_kms_wrapped_kek(
     boto3_client.create_bucket(Bucket=bucket)
     boto3_client.put_object(Bucket=bucket, Key="large.bin", Body=content)
 
-    assert wait_for_parts_cids(bucket, "large.bin", min_count=1, timeout_seconds=60)
+    assert wait_for_all_backends_ready(bucket, "large.bin", min_count=1, timeout_seconds=60)
 
     # Read back and verify
     response = boto3_client.get_object(Bucket=bucket, Key="large.bin")
@@ -126,7 +126,7 @@ def test_multiple_buckets_different_keks(
     cleanup_buckets: Callable[[str], None],
 ) -> None:
     """Each bucket gets its own KEK, all wrapped by same KMS key."""
-    from .support.cache import wait_for_parts_cids
+    from .support.cache import wait_for_all_backends_ready
     from .support.db import query_bucket_keks
 
     bucket1 = unique_bucket_name("kms-multi-1")
@@ -140,8 +140,8 @@ def test_multiple_buckets_different_keks(
     boto3_client.put_object(Bucket=bucket1, Key="file1.txt", Body=b"bucket1 content")
     boto3_client.put_object(Bucket=bucket2, Key="file2.txt", Body=b"bucket2 content")
 
-    assert wait_for_parts_cids(bucket1, "file1.txt", min_count=1, timeout_seconds=30)
-    assert wait_for_parts_cids(bucket2, "file2.txt", min_count=1, timeout_seconds=30)
+    assert wait_for_all_backends_ready(bucket1, "file1.txt", min_count=1, timeout_seconds=30)
+    assert wait_for_all_backends_ready(bucket2, "file2.txt", min_count=1, timeout_seconds=30)
 
     # Get KEKs for both buckets
     kek1 = query_bucket_keks(bucket1)
@@ -169,7 +169,7 @@ def test_overwrite_object_reuses_kek(
     cleanup_buckets: Callable[[str], None],
 ) -> None:
     """Overwriting an object in same bucket reuses the same KEK."""
-    from .support.cache import wait_for_parts_cids
+    from .support.cache import wait_for_all_backends_ready
     from .support.db import query_bucket_keks
 
     bucket = unique_bucket_name("kms-overwrite")
@@ -179,12 +179,12 @@ def test_overwrite_object_reuses_kek(
 
     # First write
     boto3_client.put_object(Bucket=bucket, Key="data.txt", Body=b"version 1")
-    assert wait_for_parts_cids(bucket, "data.txt", min_count=1, timeout_seconds=30)
+    assert wait_for_all_backends_ready(bucket, "data.txt", min_count=1, timeout_seconds=30)
     kek_before = query_bucket_keks(bucket)
 
     # Overwrite
     boto3_client.put_object(Bucket=bucket, Key="data.txt", Body=b"version 2")
-    assert wait_for_parts_cids(bucket, "data.txt", min_count=1, timeout_seconds=30)
+    assert wait_for_all_backends_ready(bucket, "data.txt", min_count=1, timeout_seconds=30)
     kek_after = query_bucket_keks(bucket)
 
     # Same KEK should be used
@@ -271,7 +271,7 @@ def test_cached_kek_survives_brief_kms_outage(
     """
     import time
 
-    from .support.cache import wait_for_parts_cids
+    from .support.cache import wait_for_all_backends_ready
     from .support.compose import pause_service
     from .support.compose import unpause_service
 
@@ -281,7 +281,7 @@ def test_cached_kek_survives_brief_kms_outage(
     # Upload while KMS is up (this caches the KEK)
     boto3_client.create_bucket(Bucket=bucket)
     boto3_client.put_object(Bucket=bucket, Key="cached.txt", Body=b"cached content")
-    assert wait_for_parts_cids(bucket, "cached.txt", min_count=1, timeout_seconds=30)
+    assert wait_for_all_backends_ready(bucket, "cached.txt", min_count=1, timeout_seconds=30)
 
     # First read (ensures KEK is in cache)
     response = boto3_client.get_object(Bucket=bucket, Key="cached.txt")

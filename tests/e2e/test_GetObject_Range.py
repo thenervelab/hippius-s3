@@ -8,7 +8,7 @@ import pytest
 from botocore.exceptions import ClientError
 
 from .support.cache import clear_object_cache
-from .support.cache import wait_for_parts_cids
+from .support.cache import wait_for_all_backends_ready
 
 
 def test_get_object_range_valid(
@@ -74,7 +74,7 @@ def test_range_downloads_only_needed_chunks(
     boto3_client.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/octet-stream")
 
     # Ensure server processed it
-    assert wait_for_parts_cids(bucket, key, min_count=1, timeout_seconds=20.0)
+    assert wait_for_all_backends_ready(bucket, key, min_count=1, timeout_seconds=20.0)
 
     # Clear all cache for this object
     from .support.cache import get_object_id_and_version
@@ -623,7 +623,7 @@ def test_get_object_range_cache_invalidation_during_request(
     assert r1.headers.get("x-hippius-source") == "cache"
 
     # Wait for object to be processed and cached
-    assert wait_for_parts_cids(bucket, key, min_count=1, timeout_seconds=20.0)
+    assert wait_for_all_backends_ready(bucket, key, min_count=1, timeout_seconds=20.0)
 
     # Clear cache for the part that contains our range (base is part 1 under 1-based indexing)
     object_id = get_object_id(bucket, key)

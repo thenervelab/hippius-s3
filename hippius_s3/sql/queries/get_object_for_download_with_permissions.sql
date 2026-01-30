@@ -31,6 +31,7 @@ WITH object_info AS (
     LEFT JOIN cids c ON ov.cid_id = c.id
     WHERE b.bucket_name = $1
       AND o.object_key = $2
+      AND o.deleted_at IS NULL
 ),
 multipart_chunks AS (
     -- CIDs are optional: allow cid_id NULL by falling back to parts.ipfs_cid; may still be NULL

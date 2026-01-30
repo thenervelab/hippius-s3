@@ -10,17 +10,21 @@ import requests
 
 @pytest.fixture
 def s3_base_url(boto3_client: Any) -> str:
-    """Get the S3 service base URL (match boto3 endpoint unless overridden)."""
-    env_url = os.getenv("S3_ENDPOINT_URL")
-    if env_url and env_url.strip():
-        return env_url.strip()
-    try:
-        endpoint = getattr(getattr(boto3_client, "meta", None), "endpoint_url", None)
-        if endpoint:
-            return str(endpoint)
-    except Exception:
-        pass
-    # Default local gateway port (8080) for ACL enforcement
+    """Get the S3 service base URL for anonymous HTTP requests.
+
+    For local e2e tests, always uses the local gateway (http://localhost:8080)
+    to avoid picking up stale S3_ENDPOINT_URL env vars pointing at staging/prod.
+    """
+    if os.getenv("RUN_REAL_AWS") == "1" or os.getenv("AWS") == "1":
+        env_url = os.getenv("S3_ENDPOINT_URL")
+        if env_url and env_url.strip():
+            return env_url.strip()
+        try:
+            endpoint = getattr(getattr(boto3_client, "meta", None), "endpoint_url", None)
+            if endpoint:
+                return str(endpoint)
+        except Exception:
+            pass
     return "http://localhost:8080"
 
 

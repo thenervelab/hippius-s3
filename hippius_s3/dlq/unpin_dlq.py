@@ -22,7 +22,8 @@ class UnpinDLQManager(BaseDLQManager[UnpinChainRequest]):
         )
 
     def _get_identifier(self, payload: UnpinChainRequest) -> str:
-        return payload.cid
+        # cid is optional during transition; use object_id as a stable fallback.
+        return payload.cid or payload.object_id
 
     def _create_entry(self, payload: UnpinChainRequest, last_error: str, error_type: str) -> Dict[str, Any]:
         entry = super()._create_entry(payload, last_error, error_type)

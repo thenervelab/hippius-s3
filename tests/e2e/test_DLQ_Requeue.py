@@ -65,7 +65,7 @@ def test_dlq_requeue_multipart_upload(
     else:
         assert resp.status_code == 404, f"Unexpected status from toxiproxy: {resp.status_code} {resp.text}"
     # Verify IPFS is truly down from inside the uploader container before proceeding
-    assert wait_for_ipfs_state(False, service="uploader"), "IPFS still reachable after break"
+    assert wait_for_ipfs_state(False, service="ipfs-uploader"), "IPFS still reachable after break"
 
     try:
         # Attempt to complete multipart upload - API should return 200 even if uploader later fails
@@ -89,7 +89,7 @@ def test_dlq_requeue_multipart_upload(
         r_queues = _redis.Redis.from_url("redis://localhost:6382/0")
         found = False
         for _ in range(130):
-            entries = list(r_queues.lrange("upload_requests:dlq", 0, -1))  # type: ignore[arg-type]
+            entries = list(r_queues.lrange("ipfs_upload_requests:dlq", 0, -1))  # type: ignore[arg-type]
             for entry_json in entries:
                 import json as _json
 
@@ -103,7 +103,7 @@ def test_dlq_requeue_multipart_upload(
         assert found, "DLQ entry not found after waiting for uploader to fail"
 
         # Verify DLQ entry exists in redis-queues
-        dlq_entries = list(r_queues.lrange("upload_requests:dlq", 0, -1))  # type: ignore[arg-type]
+        dlq_entries = list(r_queues.lrange("ipfs_upload_requests:dlq", 0, -1))  # type: ignore[arg-type]
 
         assert len(dlq_entries) > 0, "No DLQ entries found"
 
@@ -132,11 +132,11 @@ def test_dlq_requeue_multipart_upload(
 
         # Heal IPFS before requeue so uploader can complete successfully
         enable_ipfs_proxy()
-        assert wait_for_ipfs_state(True, service="uploader"), "IPFS did not come back after heal"
+        assert wait_for_ipfs_state(True, service="ipfs-uploader"), "IPFS did not come back after heal"
 
         # Run the requeue CLI command inside the api container (mounted /app)
         code, out, err = exec_python_module(
-            "api", "hippius_s3.scripts.dlq_requeue", ["requeue", "--object-id", object_id]
+            "api", "hippius_s3.scripts.dlq_requeue", ["--backend", "ipfs", "requeue", "--object-id", object_id]
         )
         assert code == 0, f"Requeue command failed: {err}\n{out}"
         assert f"Successfully requeued object_id: {object_id}" in out

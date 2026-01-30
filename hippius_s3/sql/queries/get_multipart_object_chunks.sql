@@ -10,4 +10,5 @@ WHERE b.bucket_name = $1
   AND o.object_key = $2
   AND b.main_account_id = $3
   AND ov.multipart = TRUE
+  AND o.deleted_at IS NULL
 ORDER BY p.part_number ASC

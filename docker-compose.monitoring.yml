@@ -10,7 +10,11 @@ services:
     environment:
       <<: *monitoring-enabled
 
-  uploader:
+  api-uploader:
+    environment:
+      <<: *monitoring-enabled
+
+  arion-uploader:
     environment:
       <<: *monitoring-enabled
 

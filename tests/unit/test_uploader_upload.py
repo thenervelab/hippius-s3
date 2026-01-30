@@ -8,7 +8,6 @@ from fakeredis.aioredis import FakeRedis
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
-from hippius_s3.services.hippius_api_service import FileStatusResponse
 from hippius_s3.services.hippius_api_service import UploadResponse
 from hippius_s3.workers.uploader import Uploader
 
@@ -47,12 +46,21 @@ def mock_fs_store():
     return store
 
 
+class MockRow(dict):
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            keys = list(self.keys())
+            return self[keys[key]]
+        return super().__getitem__(key)
+
+
 @pytest.mark.asyncio
 async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock_fs_store):
     redis = FakeRedis()
     redis_queues = FakeRedis()
 
-    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config)
+    mock_backend_client = MagicMock()
+    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
     uploader.fs_store = mock_fs_store
 
     mock_upload_response = UploadResponse(
@@ -68,13 +76,56 @@ async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock
         updated_at="2025-11-27T12:00:00Z",
     )
 
-    mock_status_response = FileStatusResponse(
-        id="file-uuid-123",
-        original_name="test.part1.chunk0",
+    mock_conn = AsyncMock()
+    mock_conn.fetchrow = AsyncMock(
+        return_value=MockRow({"part_id": "part-uuid"}),
+    )
+    mock_conn.fetchval = AsyncMock(return_value=1)
+
+    mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
+
+    # The backend client is injected — set up mock methods on it
+    mock_api_instance = AsyncMock()
+    mock_api_instance.upload_file_and_get_cid = AsyncMock(return_value=mock_upload_response)
+    mock_api_instance.__aenter__ = AsyncMock(return_value=mock_api_instance)
+    mock_api_instance.__aexit__ = AsyncMock()
+    uploader.backend_client = mock_api_instance
+
+    result = await uploader._upload_single_chunk(
+        object_id="obj-123",
+        object_key="test-key",
+        chunk=Chunk(id=1),
+        upload_id="upload-123",
+        object_version=1,
+        account_ss58="5FakeTestAccountAddress123456789012345678901234",
+    )
+
+    assert mock_api_instance.upload_file_and_get_cid.call_count == 1
+    call_args = mock_api_instance.upload_file_and_get_cid.call_args
+    assert call_args.kwargs["file_data"] == b"encrypted_chunk_data_123"
+    assert call_args.kwargs["file_name"].startswith("s3-")
+    assert call_args.kwargs["content_type"] == "application/octet-stream"
+    assert call_args.kwargs["account_ss58"] == "5FakeTestAccountAddress123456789012345678901234"
+
+    assert mock_conn.fetchval.call_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_upload_stores_backend_identifier_in_chunk_backend(mock_config, mock_db_pool, mock_fs_store):
+    redis = FakeRedis()
+    redis_queues = FakeRedis()
+
+    mock_backend_client = MagicMock()
+    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
+    uploader.fs_store = mock_fs_store
+
+    mock_upload_response = UploadResponse(
+        id="file-uuid-999",
+        original_name="test.chunk",
         content_type="application/octet-stream",
         size_bytes=1024,
-        sha256_hex="abc123",
-        cid="QmChunk123",
+        sha256_hex="xyz789",
+        cid="QmTestCID",
         status="completed",
         file_url="https://example.com/file",
         created_at="2025-11-27T12:00:00Z",
@@ -82,34 +133,24 @@ async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock
     )
 
     mock_conn = AsyncMock()
-
-    class MockRow(dict):
-        def __getitem__(self, key):
-            if isinstance(key, int):
-                keys = list(self.keys())
-                return self[keys[key]]
-            return super().__getitem__(key)
-
     mock_conn.fetchrow = AsyncMock(
-        side_effect=[
-            MockRow({"part_id": "part-uuid", "chunk_size_bytes": 1024, "size_bytes": 1024}),
-            MockRow({"id": "cid-uuid-123"}),
-        ]
+        return_value=MockRow({"part_id": "part-uuid"}),
     )
-    mock_conn.execute = AsyncMock()
-    mock_conn.fetch = AsyncMock(return_value=[])
+    mock_conn.fetchval = AsyncMock(return_value=1)
 
     mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
 
-    with patch("hippius_s3.workers.uploader.HippiusApiClient") as mock_api_client_class:
-        mock_api_instance = AsyncMock()
-        mock_api_instance.upload_file_and_get_cid = AsyncMock(return_value=mock_upload_response)
-        mock_api_instance.__aenter__ = AsyncMock(return_value=mock_api_instance)
-        mock_api_instance.__aexit__ = AsyncMock()
+    # The backend client is injected
+    mock_api_instance = AsyncMock()
+    mock_api_instance.upload_file_and_get_cid = AsyncMock(return_value=mock_upload_response)
+    mock_api_instance.__aenter__ = AsyncMock(return_value=mock_api_instance)
+    mock_api_instance.__aexit__ = AsyncMock()
+    uploader.backend_client = mock_api_instance
 
-        mock_api_client_class.return_value = mock_api_instance
+    with patch("hippius_s3.workers.uploader.get_query") as mock_get_query:
+        mock_get_query.return_value = "MOCKED_QUERY"
 
-        result = await uploader._upload_single_chunk(
+        await uploader._upload_single_chunk(
             object_id="obj-123",
             object_key="test-key",
             chunk=Chunk(id=1),
@@ -118,191 +159,19 @@ async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock
             account_ss58="5FakeTestAccountAddress123456789012345678901234",
         )
 
-        assert mock_api_instance.upload_file_and_get_cid.call_count == 1
-        call_args = mock_api_instance.upload_file_and_get_cid.call_args
-        assert call_args.kwargs["file_data"] == b"encrypted_chunk_data_123"
-        assert call_args.kwargs["file_name"].startswith("s3-")
-        assert call_args.kwargs["content_type"] == "application/octet-stream"
-        assert call_args.kwargs["account_ss58"] == "5FakeTestAccountAddress123456789012345678901234"
+        fetchval_calls = mock_conn.fetchval.call_args_list
+        insert_call = None
+        for call in fetchval_calls:
+            if call.args[0] == "MOCKED_QUERY":
+                insert_call = call
+                break
 
-        assert mock_conn.execute.call_count >= 1
-
-
-@pytest.mark.asyncio
-async def test_build_and_upload_manifest_uses_new_api(mock_config, mock_db_pool, mock_fs_store):
-    redis = FakeRedis()
-    redis_queues = FakeRedis()
-
-    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config)
-
-    mock_upload_response = UploadResponse(
-        id="manifest-uuid-456",
-        original_name="test.manifest",
-        content_type="application/json",
-        size_bytes=512,
-        sha256_hex="def456",
-        cid="QmManifest456",
-        status="completed",
-        file_url="https://example.com/manifest",
-        created_at="2025-11-27T12:00:00Z",
-        updated_at="2025-11-27T12:00:00Z",
-    )
-
-    mock_status_response = FileStatusResponse(
-        id="manifest-uuid-456",
-        original_name="test.manifest",
-        content_type="application/json",
-        size_bytes=512,
-        sha256_hex="def456",
-        cid="QmManifest456",
-        status="completed",
-        file_url="https://example.com/manifest",
-        created_at="2025-11-27T12:00:00Z",
-        updated_at="2025-11-27T12:00:00Z",
-    )
-
-    mock_conn = AsyncMock()
-
-    class MockRow(dict):
-        def __getitem__(self, key):
-            if isinstance(key, int):
-                keys = list(self.keys())
-                return self[keys[key]]
-            return super().__getitem__(key)
-
-    mock_conn.fetch = AsyncMock(
-        return_value=[
-            MockRow({"part_number": 1, "cid": "QmPart1", "size_bytes": 1024}),
-            MockRow({"part_number": 2, "cid": "QmPart2", "size_bytes": 2048}),
-        ]
-    )
-    mock_conn.fetchrow = AsyncMock(
-        side_effect=[
-            MockRow({"content_type": "application/octet-stream"}),
-            MockRow({"id": "cid-uuid-123"}),
-        ]
-    )
-    mock_conn.execute = AsyncMock()
-
-    mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
-
-    with patch("hippius_s3.workers.uploader.HippiusApiClient") as mock_api_client_class:
-        mock_api_instance = AsyncMock()
-        mock_api_instance.upload_file_and_get_cid = AsyncMock(return_value=mock_upload_response)
-        mock_api_instance.__aenter__ = AsyncMock(return_value=mock_api_instance)
-        mock_api_instance.__aexit__ = AsyncMock()
-
-        mock_api_client_class.return_value = mock_api_instance
-
-        result = await uploader._build_and_upload_manifest(
-            object_id="obj-123",
-            object_key="test-key",
-            object_version=1,
-            account_ss58="5FakeTestAccountAddress123456789012345678901234",
-        )
-
-        assert result["manifest_cid"] == "QmManifest456"
-        assert result["manifest_size_bytes"] == 512
-
-        assert mock_api_instance.upload_file_and_get_cid.call_count == 1
-        call_args = mock_api_instance.upload_file_and_get_cid.call_args
-        assert call_args.kwargs["file_name"].startswith("s3-")
-        assert call_args.kwargs["content_type"] == "application/json"
-        assert call_args.kwargs["account_ss58"] == "5FakeTestAccountAddress123456789012345678901234"
-        assert b"QmPart1" in call_args.kwargs["file_data"]
-        assert b"QmPart2" in call_args.kwargs["file_data"]
-
-        execute_calls = [call.args for call in mock_conn.execute.call_args_list]
-        update_call = [call for call in execute_calls if "UPDATE object_versions" in call[0]]
-        assert len(update_call) == 1
-        assert update_call[0][3] == "QmManifest456"
-        assert update_call[0][5] == "manifest-uuid-456"
-
-
-@pytest.mark.asyncio
-async def test_upload_stores_api_file_id_in_database(mock_config, mock_db_pool, mock_fs_store):
-    redis = FakeRedis()
-    redis_queues = FakeRedis()
-
-    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config)
-    uploader.fs_store = mock_fs_store
-
-    mock_upload_response = UploadResponse(
-        id="file-uuid-999",
-        original_name="test.chunk",
-        content_type="application/octet-stream",
-        size_bytes=1024,
-        sha256_hex="xyz789",
-        cid="QmTestCID",
-        status="completed",
-        file_url="https://example.com/file",
-        created_at="2025-11-27T12:00:00Z",
-        updated_at="2025-11-27T12:00:00Z",
-    )
-
-    mock_status_response = FileStatusResponse(
-        id="file-uuid-999",
-        original_name="test.chunk",
-        content_type="application/octet-stream",
-        size_bytes=1024,
-        sha256_hex="xyz789",
-        cid="QmTestCID",
-        status="completed",
-        file_url="https://example.com/file",
-        created_at="2025-11-27T12:00:00Z",
-        updated_at="2025-11-27T12:00:00Z",
-    )
-
-    mock_conn = AsyncMock()
-
-    class MockRow(dict):
-        def __getitem__(self, key):
-            if isinstance(key, int):
-                keys = list(self.keys())
-                return self[keys[key]]
-            return super().__getitem__(key)
-
-    mock_conn.fetchrow = AsyncMock(
-        side_effect=[
-            MockRow({"part_id": "part-uuid", "chunk_size_bytes": 1024, "size_bytes": 1024}),
-            MockRow({"id": "cid-uuid-123"}),
-        ]
-    )
-    mock_conn.execute = AsyncMock()
-
-    mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
-
-    with patch("hippius_s3.workers.uploader.HippiusApiClient") as mock_api_client_class:
-        mock_api_instance = AsyncMock()
-        mock_api_instance.upload_file_and_get_cid = AsyncMock(return_value=mock_upload_response)
-        mock_api_instance.__aenter__ = AsyncMock(return_value=mock_api_instance)
-        mock_api_instance.__aexit__ = AsyncMock()
-
-        mock_api_client_class.return_value = mock_api_instance
-
-        with patch("hippius_s3.workers.uploader.get_query") as mock_get_query:
-            mock_get_query.return_value = "MOCKED_QUERY"
-
-            await uploader._upload_single_chunk(
-                object_id="obj-123",
-                object_key="test-key",
-                chunk=Chunk(id=1),
-                upload_id="upload-123",
-                object_version=1,
-                account_ss58="5FakeTestAccountAddress123456789012345678901234",
-            )
-
-            execute_calls = mock_conn.execute.call_args_list
-            upsert_call = None
-            for call in execute_calls:
-                if call.args[0] == "MOCKED_QUERY":
-                    upsert_call = call
-                    break
-
-            assert upsert_call is not None
-            args = upsert_call.args
-            assert len(args) == 8
-            assert args[7] == "file-uuid-999"
+        assert insert_call is not None
+        args = insert_call.args
+        # insert_chunk_backend takes: query, part_id, chunk_index, backend, backend_identifier
+        assert len(args) == 5
+        assert args[3] == "ipfs"
+        assert args[4] == "QmTestCID"
 
 
 @pytest.mark.asyncio
@@ -311,7 +180,8 @@ async def test_process_upload_no_longer_calls_pin_on_api(mock_config, mock_db_po
     redis_queues = FakeRedis()
     mock_config.publish_to_chain = True
 
-    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config)
+    mock_backend_client = MagicMock()
+    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
 
     mock_conn = AsyncMock()
     mock_conn.execute = AsyncMock()
@@ -334,20 +204,10 @@ async def test_process_upload_no_longer_calls_pin_on_api(mock_config, mock_db_po
         request_id="req-456",
     )
 
-    with (
-        patch.object(uploader, "_upload_chunks", new_callable=AsyncMock) as mock_upload_chunks,
-        patch.object(uploader, "_build_and_upload_manifest", new_callable=AsyncMock) as mock_build_manifest,
-    ):
+    with patch.object(uploader, "_upload_chunks", new_callable=AsyncMock) as mock_upload_chunks:
         mock_upload_chunks.return_value = ["QmCID1"]
-        mock_build_manifest.return_value = {
-            "parts": [{"cid": "QmCID1", "size_bytes": 1024}],
-            "manifest_cid": "QmManifest",
-            "manifest_size_bytes": 512,
-        }
 
         result = await uploader.process_upload(payload)
 
         assert "QmCID1" in result
-        assert "QmManifest" in result
-
         assert not hasattr(uploader, "pin_on_api")

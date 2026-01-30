@@ -25,6 +25,7 @@ from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.monitoring import initialize_metrics_collector
+from hippius_s3.utils import get_query
 
 
 config = get_config()
@@ -40,7 +41,7 @@ async def get_all_dlq_object_ids(redis_client: async_redis.Redis) -> set[str]:
     """
     object_ids = set()
 
-    for dlq_key in ["upload_requests:dlq", "unpin_requests:dlq"]:
+    for dlq_key in ["ipfs_upload_requests:dlq", "arion_upload_requests:dlq", "unpin_requests:dlq"]:
         try:
             dlq_entries = await asyncio.wait_for(redis_client.lrange(dlq_key, 0, -1), timeout=5.0)
             for entry_json in dlq_entries:
@@ -164,7 +165,10 @@ async def is_replicated_on_all_backends(
     object_version: int,
     part_number: int,
 ) -> bool:
-    """Check if all chunks for a given part are replicated on all backends.
+    """Check if all chunks for a given part are replicated on all expected backends.
+
+    Uses the chunk_backend table to verify that every chunk has rows for all
+    expected backends (e.g. ["ipfs", "arion"]).
 
     Args:
         db: Database connection
@@ -173,47 +177,34 @@ async def is_replicated_on_all_backends(
         part_number: Part number
 
     Returns:
-        True if ALL chunks have storage_backends_uploaded >= required_backends,
+        True if ALL chunks have all expected backends registered in chunk_backend,
         False otherwise (including if no chunks exist or chunk count doesn't match expected)
     """
-    # Migration versions only need 1 backend (data already replicated from original version)
-    version_type = await db.fetchval(
-        """
-        SELECT version_type FROM object_versions
-        WHERE object_id = $1 AND object_version = $2
-        """,
+    # Read the upload_backends persisted at version-creation time.
+    # Falls back to config.upload_backends for rows created before the column existed.
+    row = await db.fetchrow(
+        """SELECT version_type, upload_backends FROM object_versions
+           WHERE object_id = $1 AND object_version = $2""",
         object_id,
         object_version,
     )
-    required_backends = 1 if version_type == "migration" else config.total_number_of_storage_backends
+    version_type = row["version_type"] if row else None
+    if version_type == "migration":
+        expected = ["ipfs"]
+    elif row and row["upload_backends"]:
+        expected = list(row["upload_backends"])
+    else:
+        expected = config.upload_backends
 
     result = await db.fetchrow(
-        """
-        SELECT
-            COUNT(*) as total_chunks,
-            COUNT(*) FILTER (WHERE pc.storage_backends_uploaded >= $4) as replicated_chunks,
-            CEIL(p.size_bytes::float / 4194304)::int as expected_chunks
-        FROM parts p
-        LEFT JOIN part_chunks pc ON pc.part_id = p.part_id
-        WHERE p.object_id = $1
-          AND p.object_version = $2
-          AND p.part_number = $3
-        GROUP BY p.part_id, p.size_bytes
-        """,
-        object_id,
-        object_version,
-        part_number,
-        required_backends,
+        get_query("count_chunk_backends"),
+        object_id, object_version, part_number, expected,
     )
-
     if not result or result["total_chunks"] == 0:
         return False
-
-    # Ensure all expected chunks exist and are replicated
-    expected = result["expected_chunks"] or 0
-    if result["total_chunks"] < expected:
+    expected_count = result["expected_chunks"] or 0
+    if result["total_chunks"] < expected_count:
         return False
-
     return result["total_chunks"] == result["replicated_chunks"]
 
 
@@ -330,6 +321,20 @@ async def cleanup_old_parts_by_mtime(
     return parts_cleaned
 
 
+async def gc_soft_deleted_objects(db: asyncpg.Connection) -> int:
+    """Hard-delete objects where all backends have confirmed unpin."""
+    rows = await db.fetch(get_query("find_objects_ready_for_hard_delete"))
+    deleted = 0
+    for row in rows:
+        try:
+            await db.execute("DELETE FROM objects WHERE object_id = $1", row["object_id"])
+            deleted += 1
+            logger.info(f"Hard-deleted soft-deleted object: object_id={row['object_id']}")
+        except Exception as e:
+            logger.warning(f"Failed to hard-delete object {row['object_id']}: {e}")
+    return deleted
+
+
 async def run_janitor_loop():
     """Main janitor loop: periodically clean stale and old parts."""
     db = await asyncpg.connect(config.database_url)
@@ -363,7 +368,10 @@ async def run_janitor_loop():
                 # Phase 2: GC old parts by mtime (safety net for pre-migration chunks)
                 gc_count = await cleanup_old_parts_by_mtime(db, fs_store, redis_client)
 
-                logger.info(f"Janitor cycle complete: stale={stale_count} gc={gc_count}")
+                # Phase 3: Hard-delete soft-deleted objects where all unpins are confirmed
+                hard_deleted = await gc_soft_deleted_objects(db)
+
+                logger.info(f"Janitor cycle complete: stale={stale_count} gc={gc_count} hard_deleted={hard_deleted}")
 
             except Exception as e:
                 logger.error(f"Janitor cycle error: {e}", exc_info=True)

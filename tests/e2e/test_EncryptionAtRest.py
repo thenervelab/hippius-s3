@@ -6,7 +6,7 @@ from typing import Callable
 
 import pytest
 
-from .support.cache import wait_for_parts_cids
+from .support.cache import wait_for_all_backends_ready
 from .support.chunks import get_first_chunk_cid
 from .support.ipfs import fetch_raw_cid
 
@@ -30,7 +30,7 @@ def test_private_single_part_encrypted_at_rest(
     boto3_client.put_object(Bucket=bucket, Key=key, Body=content, ContentType="application/octet-stream")
 
     # Wait for at least one part to have a CID and chunk rows to exist
-    assert wait_for_parts_cids(bucket, key, min_count=1, timeout_seconds=30.0)
+    assert wait_for_all_backends_ready(bucket, key, min_count=1, timeout_seconds=30.0)
 
     # Fetch first chunk CID for part 1 and compare raw bytes to plaintext
     cid = get_first_chunk_cid(bucket, key)
@@ -79,7 +79,7 @@ def test_public_single_part_encrypted_at_rest(
 
     boto3_client.put_object(Bucket=bucket, Key=key, Body=content, ContentType="application/octet-stream")
 
-    assert wait_for_parts_cids(bucket, key, min_count=1, timeout_seconds=30.0)
+    assert wait_for_all_backends_ready(bucket, key, min_count=1, timeout_seconds=30.0)
 
     cid = get_first_chunk_cid(bucket, key)
     assert cid is not None

@@ -215,7 +215,7 @@ async def test_upload_file_encrypted_data():
 
 
 @pytest.mark.asyncio
-async def test_upload_file_manifest_json():
+async def test_upload_file_json_content():
     client = HippiusApiClient()
     mock_response = MagicMock()
     mock_response.status_code = 200

@@ -8,16 +8,15 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-class ManifestService:
+class PartsCatalog:
     @staticmethod
     async def build_initial_download_chunks(db: Any, object_info: dict) -> list[dict]:
         """
-        Build manifest from parts table only.
+        Build download chunk list from parts table.
         All objects (simple, append, MPU) are represented by parts rows.
-        No object-level CID fallback used for streaming.
         """
         try:
-            logger.debug(f"MANIFEST build_initial_download_chunks called for object_id={object_info['object_id']}")
+            logger.debug(f"build_initial_download_chunks called for object_id={object_info['object_id']}")
             # Safely coerce optional object_version to int or None for SQL param $2
             ov_raw = object_info.get("object_version")
             try:
@@ -46,13 +45,13 @@ class ManifestService:
             # Avoid exploding logs for large multipart objects.
             preview = [(r[0], r[1], r[2]) for r in rows[:25]]
             logger.debug(
-                "MANIFEST found %s parts rows (preview=%s%s)",
+                "Found %s parts rows (preview=%s%s)",
                 len(rows),
                 preview,
-                "" if len(rows) <= 25 else "…",
+                "" if len(rows) <= 25 else "...",
             )
 
-            manifest: list[dict] = []
+            parts: list[dict] = []
             for r in rows:
                 pn = int(r[0])
                 cid_raw = r[1]
@@ -64,10 +63,10 @@ class ManifestService:
                         cid = cid_str
 
                 size = int(r[2] or 0)
-                manifest.append({"part_number": pn, "cid": cid, "size_bytes": size})
+                parts.append({"part_number": pn, "cid": cid, "size_bytes": size})
 
-            logger.debug(f"MANIFEST built manifest: {manifest}")
-            return manifest
+            logger.debug(f"Built parts catalog: {parts}")
+            return parts
 
         except Exception:
             return []
@@ -122,3 +121,7 @@ class ManifestService:
                 pass
             await asyncio.sleep(interval_sec)
         return []
+
+
+# Backwards-compat alias
+ManifestService = PartsCatalog
