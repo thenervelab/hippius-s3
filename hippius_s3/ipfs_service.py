@@ -6,11 +6,11 @@ import time
 from collections.abc import AsyncIterator
 
 import asyncpg
+import httpx
 import nacl.secret
 from pydantic import BaseModel
 
 from hippius_s3.config import get_config
-from hippius_s3.services import arion_service
 
 
 logger = logging.getLogger(__name__)
@@ -101,11 +101,57 @@ async def get_all_encryption_keys(identifier: str) -> list[str]:
         await conn.close()
 
 
-async def _stream_cid(cid: str, account_address: str) -> AsyncIterator[bytes]:
+async def _stream_cid(cid: str) -> AsyncIterator[bytes]:
     cid_norm = _ensure_concrete_cid(cid)
-    async with arion_service.ArionClient() as api_client:
-        async for chunk in api_client.download_file(cid_norm, account_address):
-            yield chunk
+    candidates = _ipfs_api_candidates()
+    if not candidates:
+        raise RuntimeError("No IPFS API URL configured (HIPPIUS_IPFS_API_URLS)")
+
+    last_err: Exception | None = None
+    yielded_any = False
+    async with httpx.AsyncClient(timeout=config.httpx_ipfs_api_timeout) as client:  # noqa: SIM117
+        for idx, base in enumerate(candidates, 1):
+            download_url = f"{base}/api/v0/cat"
+            try:
+                logger.debug(
+                    "IPFS cat attempt %s/%s cid=%s base=%s",
+                    idx,
+                    len(candidates),
+                    cid_norm,
+                    base,
+                )
+                async with client.stream("POST", download_url, params={"arg": cid_norm}) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes(chunk_size=8192):
+                        yielded_any = True
+                        yield chunk
+                return
+            except Exception as e:
+                last_err = e
+                if yielded_any:
+                    # Correctness: once we've yielded any bytes, we must not fail over to another node,
+                    # otherwise the consumer will see duplicated/restarted stream content.
+                    logger.error(
+                        "IPFS cat failed after yielding bytes (no failover) cid=%s base=%s err=%s",
+                        cid_norm,
+                        base,
+                        repr(e),
+                    )
+                    raise
+
+                # Safe to fail over before any bytes have been yielded.
+                logger.warning(
+                    "IPFS cat failed attempt %s/%s (will failover) cid=%s base=%s err=%s",
+                    idx,
+                    len(candidates),
+                    cid_norm,
+                    base,
+                    repr(e),
+                )
+                continue
+
+    assert last_err is not None
+    raise last_err
 
 
 async def s3_download(
@@ -119,7 +165,7 @@ async def s3_download(
     start_time = time.time()
     try:
         raw_data = bytearray()
-        async for chunk in _stream_cid(cid, account_address):
+        async for chunk in _stream_cid(cid):
             raw_data.extend(chunk)
         raw_data_bytes = bytes(raw_data)
     except asyncio.TimeoutError:

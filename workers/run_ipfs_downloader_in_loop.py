@@ -14,9 +14,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hippius_s3.config import get_config
-from hippius_s3.ipfs_service import _ensure_concrete_cid
+from hippius_s3.ipfs_service import _stream_cid
 from hippius_s3.logging_config import setup_loki_logging
-from hippius_s3.services.arion_service import ArionClient
 from hippius_s3.workers.downloader import run_downloader_loop
 
 
@@ -30,11 +29,9 @@ QUEUE_NAME = "ipfs_download_requests"
 
 async def ipfs_fetch(identifier: str, account_address: str) -> bytes:
     """Download raw ciphertext from IPFS by CID."""
-    cid = _ensure_concrete_cid(identifier)
-    async with ArionClient() as client:
-        chunks: list[bytes] = []
-        async for chunk in client.download_file(cid, account_address):
-            chunks.append(chunk)
+    chunks: list[bytes] = []
+    async for chunk in _stream_cid(identifier):
+        chunks.append(chunk)
     return b"".join(chunks)
 
 

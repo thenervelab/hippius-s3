@@ -1,4 +1,4 @@
--- Parameters: $1 object_id, $2 object_version, $3 part_number, $4 expected_backends TEXT[]
+-- Parameters: $1 object_id, $2 object_version, $3 part_number, $4 upload_backends TEXT[]
 WITH relevant_chunks AS (
     SELECT pc.id
     FROM parts p

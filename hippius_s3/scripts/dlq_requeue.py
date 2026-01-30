@@ -238,9 +238,9 @@ async def main() -> None:
     )
     parser.add_argument(
         "--backend",
-        choices=["api", "arion"],
-        default="api",
-        help="Backend name for upload worker (default: api)",
+        choices=["ipfs", "arion"],
+        default="ipfs",
+        help="Backend name for upload worker (default: ipfs)",
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
