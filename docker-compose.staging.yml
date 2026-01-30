@@ -12,8 +12,8 @@ services:
 
   ipfs-downloader:
     deploy:
-      replicas: 3
+      replicas: 1
 
   arion-downloader:
     deploy:
-      replicas: 3
+      replicas: 1
