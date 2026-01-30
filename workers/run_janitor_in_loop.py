@@ -180,14 +180,21 @@ async def is_replicated_on_all_backends(
         True if ALL chunks have all expected backends registered in chunk_backend,
         False otherwise (including if no chunks exist or chunk count doesn't match expected)
     """
-    # Migration versions only need ipfs (data already replicated from original version)
-    version_type = await db.fetchval(
-        """SELECT version_type FROM object_versions
+    # Read the upload_backends persisted at version-creation time.
+    # Falls back to config.upload_backends for rows created before the column existed.
+    row = await db.fetchrow(
+        """SELECT version_type, upload_backends FROM object_versions
            WHERE object_id = $1 AND object_version = $2""",
         object_id,
         object_version,
     )
-    expected = ["ipfs"] if version_type == "migration" else config.expected_backends
+    version_type = row["version_type"] if row else None
+    if version_type == "migration":
+        expected = ["ipfs"]
+    elif row and row["upload_backends"]:
+        expected = list(row["upload_backends"])
+    else:
+        expected = config.upload_backends
 
     result = await db.fetchrow(
         get_query("count_chunk_backends"),

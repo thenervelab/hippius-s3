@@ -28,9 +28,9 @@ def _parse_csv_urls(value: str | None) -> list[str]:
     return deduped
 
 
-def _parse_expected_backends(value: str | None) -> list[str]:
-    """Parse comma-separated list of expected storage backend names."""
-    value = value or "ipfs"
+def _parse_backends(value: str | None, default: str = "ipfs") -> list[str]:
+    """Parse comma-separated list of backend names."""
+    value = value or default
     return [b.strip() for b in value.split(",") if b.strip()]
 
 
@@ -153,18 +153,10 @@ class Config:
     unpinner_backoff_base_ms: int = env("HIPPIUS_UNPINNER_BACKOFF_BASE_MS:1000", convert=int)
     unpinner_backoff_max_ms: int = env("HIPPIUS_UNPINNER_BACKOFF_MAX_MS:60000", convert=int)
 
-    # Upload queue configuration
-    upload_queue_names: str = env("HIPPIUS_UPLOAD_QUEUE_NAMES:ipfs_upload_requests,arion_upload_requests", convert=str)
-    ipfs_upload_queue: str = env("HIPPIUS_IPFS_UPLOAD_QUEUE:ipfs_upload_requests", convert=str)
-    arion_upload_queue: str = env("HIPPIUS_ARION_UPLOAD_QUEUE:arion_upload_requests", convert=str)
-
-    # Download queue configuration
-    download_queue_names: str = env("HIPPIUS_DOWNLOAD_QUEUE_NAMES:download_requests", convert=str)
-
-    # Unpin queue configuration (per-backend unpinner workers)
-    ipfs_unpin_queue: str = env("HIPPIUS_IPFS_UNPIN_QUEUE:ipfs_unpin_requests", convert=str)
-    arion_unpin_queue: str = env("HIPPIUS_ARION_UNPIN_QUEUE:arion_unpin_requests", convert=str)
-    unpin_queue_names: str = env("HIPPIUS_UNPIN_QUEUE_NAMES:ipfs_unpin_requests,arion_unpin_requests", convert=str)
+    # Per-operation backend lists (queue names derived as {backend}_{op}_requests)
+    upload_backends: list[str] = env("HIPPIUS_UPLOAD_BACKENDS:ipfs,arion", convert=_parse_backends)
+    download_backends: list[str] = env("HIPPIUS_DOWNLOAD_BACKENDS:ipfs,arion", convert=_parse_backends)
+    delete_backends: list[str] = env("HIPPIUS_DELETE_BACKENDS:ipfs,arion", convert=_parse_backends)
 
     # Cache TTL (shared across components)
     cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:259200", convert=int)
@@ -175,7 +167,7 @@ class Config:
         "DOWNLOADER_ALLOW_PART_BACKFILL:false", convert=lambda x: x.lower() == "true"
     )
 
-    # Downloader retry tuning (used by workers/run_downloader_in_loop.py)
+    # Downloader retry tuning (used by per-backend downloader workers)
     downloader_chunk_retries: int = env("DOWNLOADER_CHUNK_RETRIES:3", convert=int)
     downloader_retry_base_seconds: float = env("DOWNLOADER_RETRY_BASE_SECONDS:0.1", convert=float)
     downloader_retry_jitter_seconds: float = env("DOWNLOADER_RETRY_JITTER_SECONDS:0.1", convert=float)
@@ -231,7 +223,6 @@ class Config:
     object_cache_dir: str = env("HIPPIUS_OBJECT_CACHE_DIR:/var/lib/hippius/object_cache")
     fs_cache_gc_max_age_seconds: int = env("HIPPIUS_FS_CACHE_GC_MAX_AGE_SECONDS:604800", convert=int)  # 7 days
     mpu_stale_seconds: int = env("HIPPIUS_MPU_STALE_SECONDS:86400", convert=int)  # 1 day
-    expected_backends: list[str] = env("HIPPIUS_EXPECTED_BACKENDS:ipfs", convert=_parse_expected_backends)
 
     # Filesystem cache disk-pressure backoff (ingress control).
     # Threshold can be expressed as either absolute bytes or ratio; we trigger if ANY threshold is hit.

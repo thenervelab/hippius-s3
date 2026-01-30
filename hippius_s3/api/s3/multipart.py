@@ -268,6 +268,7 @@ async def initiate_multipart_upload(
             0,  # initial size_bytes (will be updated on completion)
             initiated_at,  # created_at
             config.target_storage_version,
+            config.upload_backends,
         )
 
         # Use the returned object_id (will be existing one if conflict occurred)
@@ -1107,6 +1108,7 @@ async def complete_multipart_upload(
                 ],
                 upload_id=upload_id,
                 ray_id=ray_id,
+                upload_backends=get_config().upload_backends,
             ),
         )
 

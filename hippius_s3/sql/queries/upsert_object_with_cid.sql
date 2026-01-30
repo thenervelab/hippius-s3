@@ -30,7 +30,8 @@ WITH upserted AS (
   append_version,
   last_append_at,
   last_modified,
-  created_at
+  created_at,
+  upload_backends
   )
   SELECT
     u.object_id,
@@ -48,7 +49,8 @@ WITH upserted AS (
     0,
     $7,
     $7,
-    $7
+    $7,
+    $11::text[]
   FROM upserted u
   RETURNING object_id, object_version
 )

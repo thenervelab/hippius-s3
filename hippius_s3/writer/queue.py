@@ -19,6 +19,7 @@ async def enqueue_upload(
     chunk_ids: Iterable[int],
     ray_id: str,
 ) -> None:
+    config = get_config()
     payload = UploadChainRequest(
         address=address,
         bucket_name=bucket_name,
@@ -28,8 +29,7 @@ async def enqueue_upload(
         chunks=[Chunk(id=int(i)) for i in chunk_ids],
         upload_id=str(upload_id),
         ray_id=ray_id,
+        upload_backends=config.upload_backends,
     )
 
-    config = get_config()
-    backends = config.expected_backends
-    await enqueue_upload_to_backends(payload, backends)
+    await enqueue_upload_to_backends(payload)

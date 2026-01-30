@@ -50,6 +50,7 @@ class ObjectWriter:
         content_type: str,
         metadata: dict[str, Any],
         storage_version_target: int,
+        upload_backends: list[str],
     ) -> int:
         row = await self.db.fetchrow(
             get_query("create_migration_version"),
@@ -57,6 +58,7 @@ class ObjectWriter:
             content_type,
             json.dumps(metadata),
             int(storage_version_target),
+            upload_backends,
         )
         if not row:
             raise RuntimeError("Failed to create migration version")
@@ -226,6 +228,7 @@ class ObjectWriter:
                 md5_hash="",
                 size_bytes=0,
                 storage_version=resolved_storage_version,
+                upload_backends=self.config.upload_backends,
             )
             # IMPORTANT: `object_id` is authoritative from DB. Under concurrent creates,
             # our candidate UUID may conflict with an existing (bucket_id, object_key).

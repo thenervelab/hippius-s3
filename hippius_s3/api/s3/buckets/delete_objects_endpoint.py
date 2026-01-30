@@ -21,8 +21,8 @@ config = get_config()
 
 
 def _unpin_queue_names() -> list[str]:
-    """Parse configured unpin queue names."""
-    return [q.strip() for q in config.unpin_queue_names.split(",") if q.strip()]
+    """Derive unpin queue names from configured delete backends."""
+    return [f"{b}_unpin_requests" for b in config.delete_backends]
 
 
 async def handle_delete_objects(bucket_name: str, request: Request, db: Any, redis_client: Any) -> Response:

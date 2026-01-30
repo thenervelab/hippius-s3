@@ -24,8 +24,8 @@ tracer = trace.get_tracer(__name__)
 
 
 def _unpin_queue_names() -> list[str]:
-    """Parse configured unpin queue names."""
-    return [q.strip() for q in config.unpin_queue_names.split(",") if q.strip()]
+    """Derive unpin queue names from configured delete backends."""
+    return [f"{b}_unpin_requests" for b in config.delete_backends]
 
 
 async def handle_delete_object(

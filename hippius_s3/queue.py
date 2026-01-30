@@ -2,7 +2,6 @@ import json
 import logging
 import time
 import uuid
-from typing import List
 from typing import Optional
 from typing import Union
 
@@ -77,6 +76,7 @@ class UploadChainRequest(RetryableRequest):
     object_version: int
     chunks: list[Chunk]
     upload_id: str | None = None
+    upload_backends: list[str] | None = None  # Set by API at enqueue time
 
     @property
     def name(self) -> str:
@@ -114,34 +114,19 @@ class DownloadChainRequest(RetryableRequest):
     multipart: bool
     chunks: list[PartToDownload]
     expire_at: float | None = None
+    download_backends: list[str] | None = None  # Set by API at enqueue time
 
     @property
     def name(self) -> str:
         return f"download::{self.request_id}::{self.object_id}::{self.address}"
 
 
-async def enqueue_upload_request(payload: UploadChainRequest) -> None:
-    """Add an upload request to the Redis queue for processing by workers."""
-    client = get_queue_client()
-    if payload.request_id is None:
-        payload.request_id = uuid.uuid4().hex
-    if payload.first_enqueued_at is None:
-        payload.first_enqueued_at = time.time()
-    if payload.attempts is None:
-        payload.attempts = 0
+async def enqueue_upload_to_backends(request: UploadChainRequest) -> None:
+    """Enqueue upload request to per-backend upload queues.
 
-    config = get_config()
-    raw = payload.model_dump_json()
-    queue_names_str: str = config.upload_queue_names
-
-    queue_names: List[str] = [_normalize_queue_name(q) for q in queue_names_str.split(",") if _normalize_queue_name(q)]
-    for qname in queue_names:
-        await client.lpush(qname, raw)
-    logger.info(f"Enqueued upload request {payload.name=} queues={queue_names}")
-
-
-async def enqueue_upload_to_backends(request: UploadChainRequest, backends: list[str]) -> None:
-    """Enqueue upload request to multiple backend queues in parallel."""
+    Reads backends from ``request.upload_backends``; falls back to
+    ``config.upload_backends`` when the field is not set.
+    """
     client = get_queue_client()
     if request.request_id is None:
         request.request_id = uuid.uuid4().hex
@@ -150,26 +135,27 @@ async def enqueue_upload_to_backends(request: UploadChainRequest, backends: list
     if request.attempts is None:
         request.attempts = 0
 
+    if not request.upload_backends:
+        config = get_config()
+        request.upload_backends = config.upload_backends
+
     raw = request.model_dump_json()
-    for backend in backends:
+    for backend in request.upload_backends:
         queue_name = f"{backend}_upload_requests"
         await client.lpush(queue_name, raw)
-    logger.info(f"Enqueued upload request {request.name=} backends={backends}")
+    logger.info(f"Enqueued upload request {request.name=} backends={request.upload_backends}")
 
 
-async def dequeue_upload_request(queue_name: str | None = None) -> UploadChainRequest | None:
+async def enqueue_upload_request(payload: UploadChainRequest) -> None:
+    """Convenience wrapper — delegates to enqueue_upload_to_backends."""
+    await enqueue_upload_to_backends(payload)
+
+
+async def dequeue_upload_request(queue_name: str) -> UploadChainRequest | None:
     """Get the next upload request from the Redis queue."""
     client = get_queue_client()
-    config = get_config()
 
-    if queue_name is None:
-        queue_names_str: str = config.upload_queue_names
-        queue_names: List[str] = [
-            _normalize_queue_name(q) for q in queue_names_str.split(",") if _normalize_queue_name(q)
-        ]
-        queue_name = queue_names[0] if queue_names else "upload_requests"
-
-    result = await client.brpop(queue_name, timeout=0.5)
+    result = await client.brpop(_normalize_queue_name(queue_name), timeout=0.5)
     if result:
         _, queue_data = result
         queue_data = json.loads(queue_data)
@@ -254,10 +240,7 @@ async def enqueue_unpin_request(payload: UnpinChainRequest, *, queue_name: str |
         logger.info(f"Enqueued unpin request {payload.name=} queue={queue_name}")
     else:
         config = get_config()
-        queue_names_str: str = config.unpin_queue_names
-        queue_names: List[str] = [
-            _normalize_queue_name(q) for q in queue_names_str.split(",") if _normalize_queue_name(q)
-        ]
+        queue_names = [f"{b}_unpin_requests" for b in config.delete_backends]
         for qname in queue_names:
             await client.lpush(qname, raw)
         logger.info(f"Enqueued unpin request {payload.name=} queues={queue_names}")
@@ -327,18 +310,15 @@ async def move_due_unpin_retries(
 
 
 async def enqueue_download_request(payload: DownloadChainRequest) -> None:
-    """Add a download request to the Redis queue for processing by downloader."""
+    """Add a download request to per-backend download queues."""
     client = get_queue_client()
+
+    if not payload.download_backends:
+        config = get_config()
+        payload.download_backends = config.download_backends
+
     raw = payload.model_dump_json()
-
-    from hippius_s3.config import get_config  # local import to avoid cycles
-
-    config = get_config()
-    queue_names_str: str = config.download_queue_names
-
-    queue_names: list[str] = [_normalize_queue_name(q) for q in queue_names_str.split(",") if _normalize_queue_name(q)]
-    if not queue_names:
-        queue_names = ["download_requests"]
+    queue_names = [f"{b}_download_requests" for b in payload.download_backends]
 
     for qname in queue_names:
         await client.lpush(qname, raw)
@@ -346,10 +326,10 @@ async def enqueue_download_request(payload: DownloadChainRequest) -> None:
     logger.info(f"Enqueued download request {payload.name=} queues={queue_names}")
 
 
-async def dequeue_download_request() -> Union[DownloadChainRequest, None]:
-    """Get the next download request from the Redis queue."""
+async def dequeue_download_request(queue_name: str) -> Union[DownloadChainRequest, None]:
+    """Get the next download request from a backend-specific download queue."""
     client = get_queue_client()
-    result = await client.brpop("download_requests", timeout=5)
+    result = await client.brpop(_normalize_queue_name(queue_name), timeout=5)
     if result:
         _, queue_data = result
         return DownloadChainRequest.model_validate_json(queue_data)

@@ -13,7 +13,9 @@ services:
         condition: service_started
       arion-uploader:
         condition: service_started
-      downloader:
+      ipfs-downloader:
+        condition: service_started
+      arion-downloader:
         condition: service_started
 
   api:
@@ -56,7 +58,6 @@ services:
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
       - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
-      - HIPPIUS_EXPECTED_BACKENDS=ipfs,arion
     volumes:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
@@ -74,7 +75,6 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
-      - HIPPIUS_EXPECTED_BACKENDS=ipfs,arion
     volumes:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
@@ -84,13 +84,20 @@ services:
       mock-kms:
         condition: service_healthy
 
-  downloader:
+  ipfs-downloader:
     env_file:
       - .env.defaults
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
       - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
+
+  arion-downloader:
+    env_file:
+      - .env.defaults
+      - .env.test-docker
+    environment:
+      - HIPPIUS_KEY=${HIPPIUS_KEY}
 
   mock-hippius-api:
     build:

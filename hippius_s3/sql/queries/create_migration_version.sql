@@ -4,6 +4,7 @@
 --   $2: content_type (text)
 --   $3: metadata (jsonb)
 --   $4: storage_version_target (int)
+--   $5: upload_backends (text[])
 -- Returns: object_version (bigint)
 WITH lock AS (
   SELECT pg_advisory_xact_lock(hashtext($1::text))
@@ -30,7 +31,8 @@ WITH lock AS (
     append_version,
     last_append_at,
     last_modified,
-    created_at
+    created_at,
+    upload_backends
   )
   SELECT $1::uuid,
          (SELECT last_ver FROM last) + 1 AS v,
@@ -47,7 +49,8 @@ WITH lock AS (
          0,
          NOW(),
          NOW(),
-         NOW()
+         NOW(),
+         $5::text[]
   RETURNING object_version
 )
 SELECT object_version FROM ins;

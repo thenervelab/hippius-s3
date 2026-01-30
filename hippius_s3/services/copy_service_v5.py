@@ -100,6 +100,7 @@ async def create_destination_objects(
         md5_hash=md5_hash,
         size_bytes=size_bytes,
         storage_version=src_storage_version,
+        upload_backends=config.upload_backends,
     )
     dest_object_version = int(row.get("current_object_version") or 1) if row else 1
 
