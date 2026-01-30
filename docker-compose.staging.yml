@@ -4,6 +4,10 @@ include:
   - docker-compose.utilities.yml
 
 services:
-  downloader:
+  ipfs-downloader:
     deploy:
-      replicas: 5
+      replicas: 3
+
+  arion-downloader:
+    deploy:
+      replicas: 3
