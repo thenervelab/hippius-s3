@@ -334,13 +334,13 @@ class ArionClient:
 
         headers = self._get_headers(account_ss58)
         hex_user = hashlib.sha256(account_ss58.encode("utf-8")).hexdigest()
+        download_path = f"/download/{hex_user}/{file_id}"
 
         async with self._client.stream(
             "GET",
-            f"/download/{hex_user}/{file_id}",
+            download_path,
             headers=headers,
         ) as response:
-            logger.info(f"Download response status: {response.status_code}")
             response.raise_for_status()
             async for chunk in response.aiter_bytes(chunk_size):
                 yield chunk
