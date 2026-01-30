@@ -1,9 +1,16 @@
-WITH upsert_object AS (
+WITH upserted AS (
   INSERT INTO objects (object_id, bucket_id, object_key, created_at, current_object_version)
   VALUES ($1, $2, $3, $8, 1)
   ON CONFLICT (bucket_id, object_key)
   DO UPDATE SET
-    current_object_version = COALESCE(objects.current_object_version, 1)
+    object_key = EXCLUDED.object_key,
+    -- Allocate a fresh object_version for each MPU initiation.
+    -- Atomic MAX()+1 under the row lock taken by the ON CONFLICT update.
+    current_object_version = (
+      SELECT COALESCE(MAX(ov.object_version), 0) + 1
+      FROM object_versions ov
+      WHERE ov.object_id = objects.object_id
+    )
   RETURNING object_id, bucket_id, object_key, created_at, current_object_version
 ), ins_version AS (
   INSERT INTO object_versions (
@@ -28,8 +35,8 @@ WITH upsert_object AS (
     created_at
   )
   SELECT
-    uo.object_id,
-    uo.current_object_version,
+    u.object_id,
+    u.current_object_version,
     'user'::version_type,
     $9,
     $7,
@@ -47,30 +54,21 @@ WITH upsert_object AS (
     $8,
     $8,
     $8
-  FROM upsert_object uo
-  ON CONFLICT (object_id, object_version)
-  DO UPDATE SET
-    storage_version = EXCLUDED.storage_version,
-    size_bytes = EXCLUDED.size_bytes,
-    content_type = EXCLUDED.content_type,
-    metadata = EXCLUDED.metadata,
-    md5_hash = EXCLUDED.md5_hash,
-    multipart = EXCLUDED.multipart,
-    status = EXCLUDED.status,
-    last_append_at = EXCLUDED.last_append_at,
-    last_modified = EXCLUDED.last_modified
+  FROM upserted u
   RETURNING object_id, object_version, content_type, metadata, md5_hash, size_bytes, status, multipart, storage_version
 )
-SELECT uo.object_id,
-       uo.bucket_id,
-       uo.object_key,
-       iv.content_type,
-       iv.metadata,
-       iv.md5_hash,
-       iv.size_bytes,
-       uo.created_at,
-       iv.status,
-       iv.multipart,
-       iv.storage_version
-FROM upsert_object uo
-JOIN ins_version iv ON iv.object_id = uo.object_id AND iv.object_version = uo.current_object_version
+SELECT
+  u.object_id,
+  u.bucket_id,
+  u.object_key,
+  u.current_object_version,
+  iv.content_type,
+  iv.metadata,
+  iv.md5_hash,
+  iv.size_bytes,
+  u.created_at,
+  iv.status,
+  iv.multipart,
+  iv.storage_version
+FROM upserted u
+JOIN ins_version iv ON iv.object_id = u.object_id AND iv.object_version = u.current_object_version
