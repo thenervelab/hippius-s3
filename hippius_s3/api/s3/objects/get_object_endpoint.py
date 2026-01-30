@@ -18,8 +18,8 @@ from hippius_s3.api.s3.common import parse_read_mode
 from hippius_s3.api.s3.range_utils import parse_range_header
 from hippius_s3.config import get_config
 from hippius_s3.monitoring import get_metrics_collector
-from hippius_s3.services.manifest_service import ManifestService
 from hippius_s3.services.object_reader import DownloadNotReadyError
+from hippius_s3.services.parts_catalog import PartsCatalog
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 
@@ -174,32 +174,32 @@ async def handle_get_object(
                     },
                 )
 
-        # Build manifest purely from DB parts, 0-based
+        # Build download chunk list from DB parts
         request.state.object_size = int(object_info.get("size_bytes") or 0)
-        with tracer.start_as_current_span("get_object.build_manifest") as span:
+        with tracer.start_as_current_span("get_object.build_parts_catalog") as span:
             download_chunks = json.loads(object_info["download_chunks"]) if object_info.get("download_chunks") else []
             try:
-                built_chunks = await ManifestService.build_initial_download_chunks(
+                built_chunks = await PartsCatalog.build_initial_download_chunks(
                     db, object_info if isinstance(object_info, dict) else dict(object_info)
                 )
                 if built_chunks:
                     download_chunks = built_chunks
-                    manifest_source = "db"
+                    parts_source = "db"
                 else:
-                    manifest_source = "cached"
+                    parts_source = "cached"
             except Exception:
-                logger.debug("Failed to build manifest from ManifestService", exc_info=True)
-                manifest_source = "cached_fallback"
+                logger.debug("Failed to build parts catalog", exc_info=True)
+                parts_source = "cached_fallback"
 
             set_span_attributes(
                 span,
                 {
-                    "manifest_source": manifest_source,
+                    "parts_source": parts_source,
                     "num_download_chunks": len(download_chunks),
                 },
             )
 
-            # Attach manifest to object_info for cache assembly
+            # Attach parts to object_info for cache assembly
             try:
                 if not isinstance(object_info, dict):
                     object_info = dict(object_info)
@@ -254,7 +254,7 @@ async def handle_get_object(
 
         with contextlib.suppress(Exception):
             logger.debug(
-                f"GET manifest-built multipart={object_info.get('multipart')} parts={[c if isinstance(c, dict) else c for c in download_chunks]}"
+                f"GET multipart={object_info.get('multipart')} parts={[c if isinstance(c, dict) else c for c in download_chunks]}"
             )
 
         # Use new reader (flat chunk plan; blocks between parts; no downloader meta dependency)

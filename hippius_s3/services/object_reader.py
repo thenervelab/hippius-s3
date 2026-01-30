@@ -13,7 +13,7 @@ from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import PartChunkSpec
 from hippius_s3.queue import PartToDownload
 from hippius_s3.queue import enqueue_download_request
-from hippius_s3.reader.db_meta import read_parts_manifest
+from hippius_s3.reader.db_meta import read_parts_list
 from hippius_s3.reader.planner import build_chunk_plan
 from hippius_s3.reader.streamer import stream_plan
 from hippius_s3.reader.types import ChunkPlanItem
@@ -55,7 +55,7 @@ async def build_stream_context(
     # v4-only policy: always decrypt at read time.
 
     ov = int(info.get("object_version") or info.get("current_object_version") or 1)
-    parts = await read_parts_manifest(db, info["object_id"], ov)
+    parts = await read_parts_list(db, info["object_id"], ov)
     plan = await build_chunk_plan(db, info["object_id"], parts, rng, object_version=ov)
 
     source = "cache"
@@ -329,7 +329,7 @@ async def stream_object(
     """Return an async iterator of plaintext bytes for the requested object.
 
     This wraps build_stream_context and stream_plan so callers don't need to know
-    about manifests, chunk plans, or downloader details.
+    about parts catalogs, chunk plans, or downloader details.
     """
     cfg = get_config()
     ctx = await build_stream_context(

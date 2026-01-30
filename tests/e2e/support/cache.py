@@ -46,9 +46,9 @@ def get_object_cids(
     *,
     dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
 ) -> tuple[str, int, str, list[str], Optional[str]]:
-    """Get all CIDs for an object including parts, chunks, and manifest.
+    """Get all CIDs for an object including parts, chunks, and object-level CID.
 
-    Returns: (object_id, object_version, main_account_id, part_cids, manifest_cid)
+    Returns: (object_id, object_version, main_account_id, part_cids, object_cid)
     """
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
         cur.execute(
@@ -104,10 +104,10 @@ def get_object_cids(
             """,
             (object_id, object_version),
         )
-        manifest_row = cur.fetchone()
-        manifest_cid = str(manifest_row[0]) if manifest_row else None
+        obj_cid_row = cur.fetchone()
+        object_cid = str(obj_cid_row[0]) if obj_cid_row else None
 
-        return object_id, object_version, main_account_id, part_cids + chunk_cids, manifest_cid
+        return object_id, object_version, main_account_id, part_cids + chunk_cids, object_cid
 
 
 essentially_all_parts = range(0, 256)

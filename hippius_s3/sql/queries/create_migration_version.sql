@@ -28,9 +28,6 @@ WITH lock AS (
     multipart,
     status,
     append_version,
-    manifest_cid,
-    manifest_built_for_version,
-    manifest_built_at,
     last_append_at,
     last_modified,
     created_at
@@ -48,9 +45,6 @@ WITH lock AS (
          FALSE,
          'publishing',
          0,
-         NULL,
-         NULL,
-         NULL,
          NOW(),
          NOW(),
          NOW()

@@ -23,6 +23,11 @@ config = get_config()
 tracer = trace.get_tracer(__name__)
 
 
+def _unpin_queue_names() -> list[str]:
+    """Parse configured unpin queue names."""
+    return [q.strip() for q in config.unpin_queue_names.split(",") if q.strip()]
+
+
 async def handle_delete_object(
     bucket_name: str,
     object_key: str,
@@ -55,24 +60,20 @@ async def handle_delete_object(
             if not result:
                 return Response(status_code=204)
 
-        # Permission-aware delete (gateway handles permissions)
-        with tracer.start_as_current_span("delete_object.permission_aware_delete") as span:
-            deleted_object = await db.fetchrow(get_query("delete_object"), bucket_id, object_key)
-            if not deleted_object:
-                return errors.s3_error_response(
-                    "AccessDenied",
-                    f"You do not have permission to delete object {object_key}",
-                    status_code=403,
-                    Key=object_key,
-                )
+        # Soft-delete the object (sets deleted_at, does NOT cascade-delete rows)
+        with tracer.start_as_current_span("delete_object.soft_delete") as span:
+            deleted = await db.fetchrow(get_query("soft_delete_object"), bucket_id, object_key)
+            if not deleted:
+                # Already deleted or permission issue — idempotent 204
+                return Response(status_code=204)
+            object_id = str(deleted["object_id"])
+            object_version = int(deleted["current_object_version"])
             set_span_attributes(
                 span,
                 {
-                    "object_id": str(deleted_object["object_id"]),
+                    "object_id": object_id,
                     "has_object_id": True,
-                    "object_version": int(
-                        deleted_object.get("object_version") or deleted_object.get("current_object_version") or 1
-                    ),
+                    "object_version": object_version,
                 },
             )
 
@@ -87,31 +88,25 @@ async def handle_delete_object(
             except Exception:
                 logger.debug("Failed to cleanup provisional multipart uploads on object delete", exc_info=True)
 
-        # Enqueue unpin requests (one per CID)
-        all_cids = deleted_object.get("all_cids") or []
-        if all_cids:
-            obj_version = deleted_object.get("object_version") or deleted_object.get("current_object_version") or 1
-            with tracer.start_as_current_span(
-                "delete_object.enqueue_unpin",
-                attributes={
-                    "num_cids": len(all_cids),
-                    "has_cids": True,
-                    "object_id": str(deleted_object["object_id"]),
-                    "has_object_id": True,
-                    "object_version": int(obj_version),
-                },
-            ):
-                ray_id = getattr(request.state, "ray_id", None)
-                for cid in all_cids:
-                    await enqueue_unpin_request(
-                        payload=UnpinChainRequest(
-                            address=request.state.account.main_account,
-                            object_id=str(deleted_object["object_id"]),
-                            object_version=int(obj_version),
-                            cid=cid,
-                            ray_id=ray_id,
-                        ),
-                    )
+        # Fan out unpin requests to all per-backend unpin queues
+        ray_id = getattr(request.state, "ray_id", None)
+        unpin_payload = UnpinChainRequest(
+            address=request.state.account.main_account,
+            object_id=object_id,
+            object_version=object_version,
+            ray_id=ray_id,
+        )
+        with tracer.start_as_current_span(
+            "delete_object.enqueue_unpin",
+            attributes={
+                "object_id": object_id,
+                "has_object_id": True,
+                "object_version": object_version,
+            },
+        ):
+            for qname in _unpin_queue_names():
+                await enqueue_unpin_request(payload=unpin_payload, queue_name=qname)
+
         return Response(status_code=204)
 
     except Exception:

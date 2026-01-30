@@ -154,15 +154,17 @@ class Config:
     unpinner_backoff_max_ms: int = env("HIPPIUS_UNPINNER_BACKOFF_MAX_MS:60000", convert=int)
 
     # Upload queue configuration
-    upload_queue_names: str = env("HIPPIUS_UPLOAD_QUEUE_NAMES:upload_requests", convert=str)
-    api_upload_queue: str = env("HIPPIUS_API_UPLOAD_QUEUE:api_upload_requests", convert=str)
+    upload_queue_names: str = env("HIPPIUS_UPLOAD_QUEUE_NAMES:ipfs_upload_requests,arion_upload_requests", convert=str)
+    ipfs_upload_queue: str = env("HIPPIUS_IPFS_UPLOAD_QUEUE:ipfs_upload_requests", convert=str)
     arion_upload_queue: str = env("HIPPIUS_ARION_UPLOAD_QUEUE:arion_upload_requests", convert=str)
 
     # Download queue configuration
     download_queue_names: str = env("HIPPIUS_DOWNLOAD_QUEUE_NAMES:download_requests", convert=str)
 
-    # Unpin queue configuration (broadcast to multiple consumers)
-    unpin_queue_names: str = env("HIPPIUS_UNPIN_QUEUE_NAMES:unpin_requests", convert=str)
+    # Unpin queue configuration (per-backend unpinner workers)
+    ipfs_unpin_queue: str = env("HIPPIUS_IPFS_UNPIN_QUEUE:ipfs_unpin_requests", convert=str)
+    arion_unpin_queue: str = env("HIPPIUS_ARION_UNPIN_QUEUE:arion_unpin_requests", convert=str)
+    unpin_queue_names: str = env("HIPPIUS_UNPIN_QUEUE_NAMES:ipfs_unpin_requests,arion_unpin_requests", convert=str)
 
     # Cache TTL (shared across components)
     cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:259200", convert=int)

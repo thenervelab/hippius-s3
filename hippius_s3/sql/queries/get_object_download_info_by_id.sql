@@ -13,7 +13,7 @@ WITH object_info AS (
     JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
     JOIN buckets b ON o.bucket_id = b.bucket_id
     LEFT JOIN cids c ON ov.cid_id = c.id
-    WHERE o.object_id = $1
+    WHERE o.object_id = $1 AND o.deleted_at IS NULL
 ),
 multipart_chunks AS (
     -- CIDs are optional: allow cid_id NULL by falling back to parts.ipfs_cid; may still be NULL

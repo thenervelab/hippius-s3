@@ -63,9 +63,9 @@ async def async_timing_context(
         Timing dict with 'start' field, will have 'duration_ms' on exit
 
     Example:
-        async with async_timing_context("fetch_manifest", extra={"object_id": oid}) as t:
-            manifest = await build_manifest(db, oid)
-        # Logs: "TIMING fetch_manifest duration_ms=42.3 object_id=abc-123"
+        async with async_timing_context("fetch_parts", extra={"object_id": oid}) as t:
+            parts = await fetch_parts(db, oid)
+        # Logs: "TIMING fetch_parts duration_ms=42.3 object_id=abc-123"
     """
     ctx: dict[str, Any] = {"start": time.perf_counter()}
     if extra:

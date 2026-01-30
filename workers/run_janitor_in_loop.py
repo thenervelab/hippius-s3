@@ -314,6 +314,20 @@ async def cleanup_old_parts_by_mtime(
     return parts_cleaned
 
 
+async def gc_soft_deleted_objects(db: asyncpg.Connection) -> int:
+    """Hard-delete objects where all backends have confirmed unpin."""
+    rows = await db.fetch(get_query("find_objects_ready_for_hard_delete"))
+    deleted = 0
+    for row in rows:
+        try:
+            await db.execute("DELETE FROM objects WHERE object_id = $1", row["object_id"])
+            deleted += 1
+            logger.info(f"Hard-deleted soft-deleted object: object_id={row['object_id']}")
+        except Exception as e:
+            logger.warning(f"Failed to hard-delete object {row['object_id']}: {e}")
+    return deleted
+
+
 async def run_janitor_loop():
     """Main janitor loop: periodically clean stale and old parts."""
     db = await asyncpg.connect(config.database_url)
@@ -347,7 +361,10 @@ async def run_janitor_loop():
                 # Phase 2: GC old parts by mtime (safety net for pre-migration chunks)
                 gc_count = await cleanup_old_parts_by_mtime(db, fs_store, redis_client)
 
-                logger.info(f"Janitor cycle complete: stale={stale_count} gc={gc_count}")
+                # Phase 3: Hard-delete soft-deleted objects where all unpins are confirmed
+                hard_deleted = await gc_soft_deleted_objects(db)
+
+                logger.info(f"Janitor cycle complete: stale={stale_count} gc={gc_count} hard_deleted={hard_deleted}")
 
             except Exception as e:
                 logger.error(f"Janitor cycle error: {e}", exc_info=True)

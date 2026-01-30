@@ -88,12 +88,14 @@ class UploadChainRequest(RetryableRequest):
 class UnpinChainRequest(RetryableRequest):
     address: str
     object_id: str
-    object_version: int
-    cid: str
+    object_version: int | None = None  # None = all versions
+    cid: str | None = None  # DEPRECATED — transitional, for in-flight queue compat only
+    # NO backend field. Payload is backend-agnostic.
 
     @property
     def name(self) -> str:
-        return f"unpin::{self.cid}::{self.address}::{self.object_id}"
+        ident = self.cid or self.object_id
+        return f"unpin::{ident}::{self.address}::{self.object_id}"
 
 
 class DownloadChainRequest(RetryableRequest):
@@ -175,13 +177,17 @@ async def dequeue_upload_request(queue_name: str | None = None) -> UploadChainRe
     return None
 
 
-# Retry handling (ZSET with score = next_attempt_unix_ts)
-RETRY_ZSET = "upload_retries"
+# Per-backend retry handling (ZSET with score = next_attempt_unix_ts)
+
+
+def _upload_retry_zset(backend: str) -> str:
+    return f"{backend}_upload_retries"
 
 
 async def enqueue_retry_request(
     payload: UploadChainRequest,
     *,
+    backend_name: str,
     delay_seconds: float,
     last_error: str | None = None,
 ) -> None:
@@ -194,40 +200,45 @@ async def enqueue_retry_request(
         payload.first_enqueued_at = time.time()
     next_ts = time.time() + max(0.0, float(delay_seconds))
     member = payload.model_dump_json()
-    await client.zadd(RETRY_ZSET, {member: next_ts})
-    logger.info(f"Scheduled retry for {payload.name=} attempts={payload.attempts} next_at={int(next_ts)}")
+    zset_key = _upload_retry_zset(backend_name)
+    await client.zadd(zset_key, {member: next_ts})
+    logger.info(
+        f"Scheduled retry for {payload.name=} backend={backend_name} attempts={payload.attempts} next_at={int(next_ts)}"
+    )
 
 
-async def move_due_retries_to_primary(
+async def move_due_upload_retries(
     *,
+    backend_name: str,
     now_ts: float | None = None,
     max_items: int = 64,
 ) -> int:
-    """Move due retry items back to the primary queue. Returns number moved."""
+    """Move due retry items back to the backend's upload queue. Returns number moved."""
     client = get_queue_client()
-    config = get_config()
-    queue_names_str: str = config.upload_queue_names
-
-    queue_names: List[str] = [_normalize_queue_name(q) for q in queue_names_str.split(",") if _normalize_queue_name(q)]
-    primary_queue: str = queue_names[0] if queue_names else "upload_requests"
+    target_queue = f"{backend_name}_upload_requests"
+    zset_key = _upload_retry_zset(backend_name)
 
     now_ts = time.time() if now_ts is None else now_ts
-    members = await client.zrangebyscore(RETRY_ZSET, min="-inf", max=now_ts, start=0, num=max_items)
+    members = await client.zrangebyscore(zset_key, min="-inf", max=now_ts, start=0, num=max_items)
     moved = 0
     for m in members:
         try:
             async with client.pipeline(transaction=True) as pipe:
-                pipe.zrem(RETRY_ZSET, m)
-                pipe.lpush(primary_queue, m)
+                pipe.zrem(zset_key, m)
+                pipe.lpush(target_queue, m)
                 await pipe.execute()
             moved += 1
         except Exception:
-            logger.exception("Failed to move retry item back to primary queue")
+            logger.exception(f"Failed to move retry item back to {target_queue}")
     return moved
 
 
-async def enqueue_unpin_request(payload: UnpinChainRequest) -> None:
-    """Add an unpin request to the Redis queue(s) for processing by unpinner and other consumers."""
+async def enqueue_unpin_request(payload: UnpinChainRequest, *, queue_name: str | None = None) -> None:
+    """Add an unpin request to the Redis queue(s) for processing by unpinner workers.
+
+    If queue_name is provided, enqueue to that single queue only.
+    Otherwise fan out to all configured unpin queues.
+    """
     client = get_queue_client()
     if payload.request_id is None:
         payload.request_id = uuid.uuid4().hex
@@ -236,32 +247,40 @@ async def enqueue_unpin_request(payload: UnpinChainRequest) -> None:
     if payload.attempts is None:
         payload.attempts = 0
 
-    config = get_config()
     raw = payload.model_dump_json()
-    queue_names_str: str = config.unpin_queue_names
 
-    queue_names: List[str] = [_normalize_queue_name(q) for q in queue_names_str.split(",") if _normalize_queue_name(q)]
-    for qname in queue_names:
-        await client.lpush(qname, raw)
-    logger.info(f"Enqueued unpin request {payload.name=} queues={queue_names}")
+    if queue_name is not None:
+        await client.lpush(_normalize_queue_name(queue_name), raw)
+        logger.info(f"Enqueued unpin request {payload.name=} queue={queue_name}")
+    else:
+        config = get_config()
+        queue_names_str: str = config.unpin_queue_names
+        queue_names: List[str] = [
+            _normalize_queue_name(q) for q in queue_names_str.split(",") if _normalize_queue_name(q)
+        ]
+        for qname in queue_names:
+            await client.lpush(qname, raw)
+        logger.info(f"Enqueued unpin request {payload.name=} queues={queue_names}")
 
 
-async def dequeue_unpin_request() -> Union[UnpinChainRequest, None]:
+async def dequeue_unpin_request(queue_name: str = "unpin_requests") -> Union[UnpinChainRequest, None]:
     """Get the next unpin request from the Redis queue."""
     client = get_queue_client()
-    result = await client.brpop("unpin_requests", timeout=3)
+    result = await client.brpop(_normalize_queue_name(queue_name), timeout=3)
     if result:
         _, queue_data = result
         return UnpinChainRequest.model_validate_json(queue_data)
     return None
 
 
-UNPIN_RETRY_ZSET = "unpin_retries"
+def _unpin_retry_zset(backend: str) -> str:
+    return f"{backend}_unpin_retries"
 
 
 async def enqueue_unpin_retry_request(
     payload: UnpinChainRequest,
     *,
+    backend_name: str,
     delay_seconds: float,
     last_error: str | None = None,
 ) -> None:
@@ -274,29 +293,36 @@ async def enqueue_unpin_retry_request(
         payload.first_enqueued_at = time.time()
     next_ts = time.time() + max(0.0, float(delay_seconds))
     member = payload.model_dump_json()
-    await client.zadd(UNPIN_RETRY_ZSET, {member: next_ts})
-    logger.info(f"Scheduled unpin retry for {payload.name=} attempts={payload.attempts} next_at={int(next_ts)}")
+    zset_key = _unpin_retry_zset(backend_name)
+    await client.zadd(zset_key, {member: next_ts})
+    logger.info(
+        f"Scheduled unpin retry for {payload.name=} backend={backend_name} attempts={payload.attempts} next_at={int(next_ts)}"
+    )
 
 
-async def move_due_unpin_retries_to_primary(
+async def move_due_unpin_retries(
     *,
+    backend_name: str,
     now_ts: float | None = None,
     max_items: int = 64,
 ) -> int:
-    """Move due unpin retry items back to the primary queue. Returns number moved."""
+    """Move due unpin retry items back to the backend's unpin queue. Returns number moved."""
     client = get_queue_client()
+    target_queue = f"{backend_name}_unpin_requests"
+    zset_key = _unpin_retry_zset(backend_name)
+
     now_ts = time.time() if now_ts is None else now_ts
-    members = await client.zrangebyscore(UNPIN_RETRY_ZSET, min="-inf", max=now_ts, start=0, num=max_items)
+    members = await client.zrangebyscore(zset_key, min="-inf", max=now_ts, start=0, num=max_items)
     moved = 0
     for m in members:
         try:
             async with client.pipeline(transaction=True) as pipe:
-                pipe.zrem(UNPIN_RETRY_ZSET, m)
-                pipe.lpush("unpin_requests", m)
+                pipe.zrem(zset_key, m)
+                pipe.lpush(target_queue, m)
                 await pipe.execute()
             moved += 1
         except Exception:
-            logger.exception("Failed to move unpin retry item back to primary queue")
+            logger.exception(f"Failed to move unpin retry item back to {target_queue}")
     return moved
 
 

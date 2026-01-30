@@ -1,27 +1,27 @@
-#!/usr/bin/env python3
+"""Shared unpinner logic parameterized by backend_name and backend_client.
+
+Each per-backend entry point (run_ipfs_unpinner_in_loop.py, run_arion_unpinner_in_loop.py)
+instantiates the correct client and calls run_unpinner_loop from here.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import logging
-import sys
-import time
-from pathlib import Path
+from typing import Any
+from typing import Protocol
 
 import asyncpg
 import redis.asyncio as async_redis
 
-from hippius_s3.services import arion_service
-
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 from hippius_s3.config import get_config
 from hippius_s3.dlq.unpin_dlq import UnpinDLQManager
-from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import dequeue_unpin_request
 from hippius_s3.queue import enqueue_unpin_retry_request
-from hippius_s3.queue import move_due_unpin_retries_to_primary
+from hippius_s3.queue import move_due_unpin_retries
 from hippius_s3.redis_utils import with_redis_retry
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 from hippius_s3.services.ray_id_service import ray_id_context
@@ -30,36 +30,79 @@ from hippius_s3.workers.error_classifier import classify_unpin_error
 from hippius_s3.workers.uploader import compute_backoff_ms
 
 
-config = get_config()
-
-setup_loki_logging(config, "unpinner")
 logger = logging.getLogger(__name__)
+
+
+class UnpinBackendClient(Protocol):
+    """Protocol for backend clients that can unpin files."""
+
+    async def unpin_file(self, identifier: str, **kwargs: Any) -> Any: ...
+
+    async def __aenter__(self) -> Any: ...
+
+    async def __aexit__(self, *args: Any) -> Any: ...
 
 
 async def process_unpin_request(
     request: UnpinChainRequest,
+    *,
+    backend_name: str,
+    backend_client_factory: Any,
     worker_logger: logging.LoggerAdapter,
     dlq_manager: UnpinDLQManager,
     db_pool: asyncpg.Pool,
 ) -> None:
-    """Process a single unpin request."""
-    try:
-        worker_logger.info(f"Processing unpin request: {request.name}")
-        async with arion_service.ArionClient() as api_client:
-            unpin_result = await api_client.unpin_file(
-                request.cid,
-            )
-        worker_logger.info(f"Successfully unpinned CID via API: {unpin_result=}")
+    """Process a single unpin request for a specific backend."""
+    config = get_config()
 
-        # Soft-delete the IPFS backend row for this CID
-        try:
-            async with db_pool.acquire() as conn:
-                await conn.fetchval(
-                    get_query("soft_delete_chunk_backend"),
-                    "ipfs", request.cid,
-                )
-        except Exception as db_err:
-            worker_logger.warning(f"Failed to soft-delete chunk_backend row for CID {request.cid}: {db_err}")
+    try:
+        # Query chunk_backend for identifiers belonging to this backend
+        async with db_pool.acquire() as conn:
+            obj_version = request.object_version
+            rows = await conn.fetch(
+                get_query("get_chunk_backend_identifiers"),
+                backend_name,
+                request.object_id,
+                obj_version,
+            )
+
+        if not rows:
+            worker_logger.info(
+                f"No {backend_name} identifiers found for object_id={request.object_id} "
+                f"version={request.object_version}, nothing to unpin"
+            )
+            return
+
+        worker_logger.info(
+            f"Processing unpin for {backend_name}: object_id={request.object_id} identifiers={len(rows)}"
+        )
+
+        # Unpin each identifier via the backend client
+        async with backend_client_factory() as client:
+            for row in rows:
+                identifier = row["backend_identifier"]
+                chunk_id = row["chunk_id"]
+                try:
+                    if backend_name == "ipfs":
+                        await client.unpin_file(identifier, account_ss58=request.address)
+                    else:
+                        await client.unpin_file(identifier)
+                    worker_logger.info(f"Unpinned {backend_name} identifier={identifier}")
+                except Exception as unpin_err:
+                    worker_logger.warning(f"Failed to unpin {backend_name} identifier={identifier}: {unpin_err}")
+                    # Continue to soft-delete the row anyway — the backend may have
+                    # already removed it, or it will be retried via the DLQ.
+
+                # Soft-delete the chunk_backend row
+                try:
+                    async with db_pool.acquire() as conn:
+                        await conn.fetchval(
+                            get_query("soft_delete_chunk_backend_by_chunk_id"),
+                            backend_name,
+                            chunk_id,
+                        )
+                except Exception as db_err:
+                    worker_logger.warning(f"Failed to soft-delete chunk_backend row chunk_id={chunk_id}: {db_err}")
 
         get_metrics_collector().record_unpinner_operation(
             main_account=request.address,
@@ -86,6 +129,7 @@ async def process_unpin_request(
 
             await enqueue_unpin_retry_request(
                 request,
+                backend_name=backend_name,
                 delay_seconds=delay_sec,
                 last_error=str(e),
             )
@@ -109,7 +153,15 @@ async def process_unpin_request(
             )
 
 
-async def run_unpinner_loop() -> None:
+async def run_unpinner_loop(
+    *,
+    backend_name: str,
+    backend_client_factory: Any,
+    queue_name: str,
+) -> None:
+    """Main loop for a per-backend unpinner worker."""
+    config = get_config()
+
     redis_client = async_redis.from_url(config.redis_url)
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
     db_pool = await asyncpg.create_pool(
@@ -127,20 +179,21 @@ async def run_unpinner_loop() -> None:
 
     dlq_manager = UnpinDLQManager(redis_queues_client)
 
-    logger.info("Starting unpinner service...")
+    logger.info(f"Starting {backend_name} unpinner service...")
+    logger.info(f"Queue: {queue_name}")
     logger.info(f"Redis URL: {config.redis_url}")
     logger.info(f"Redis Queues URL: {config.redis_queues_url}")
     logger.info(f"Database: {config.database_url}")
 
     try:
         while True:
-            await move_due_unpin_retries_to_primary()
+            await move_due_unpin_retries(backend_name=backend_name)
 
             unpin_request, redis_queues_client = await with_redis_retry(
-                lambda rc: dequeue_unpin_request(),
+                lambda rc: dequeue_unpin_request(queue_name),
                 redis_queues_client,
                 config.redis_queues_url,
-                "dequeue unpin request",
+                f"dequeue {backend_name} unpin request",
             )
 
             if not unpin_request:
@@ -150,19 +203,14 @@ async def run_unpinner_loop() -> None:
             ray_id = unpin_request.ray_id or "no-ray-id"
             ray_id_context.set(ray_id)
             worker_logger = get_logger_with_ray_id(__name__, ray_id)
-            await process_unpin_request(unpin_request, worker_logger, dlq_manager, db_pool)
+            await process_unpin_request(
+                unpin_request,
+                backend_name=backend_name,
+                backend_client_factory=backend_client_factory,
+                worker_logger=worker_logger,
+                dlq_manager=dlq_manager,
+                db_pool=db_pool,
+            )
     finally:
         if db_pool:
             await db_pool.close()
-
-
-if __name__ == "__main__":
-    while True:
-        try:
-            asyncio.run(run_unpinner_loop())
-        except KeyboardInterrupt:
-            logger.info("Unpinner service stopped by user")
-            break
-        except Exception as e:
-            logger.error(f"Unpinner crashed, restarting in 5 seconds: {e}", exc_info=True)
-            time.sleep(5)

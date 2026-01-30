@@ -20,6 +20,11 @@ logger = logging.getLogger(__name__)
 config = get_config()
 
 
+def _unpin_queue_names() -> list[str]:
+    """Parse configured unpin queue names."""
+    return [q.strip() for q in config.unpin_queue_names.split(",") if q.strip()]
+
+
 async def handle_delete_objects(bucket_name: str, request: Request, db: Any, redis_client: Any) -> Response:
     """Implements S3 DeleteObjects: POST /{bucket}?delete
 
@@ -79,6 +84,7 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
         bucket_id = bucket["bucket_id"]
         deleted_keys: list[str] = []
         errors_list: list[dict[str, str]] = []
+        unpin_queues = _unpin_queue_names()
 
         for obj in object_elems:
             key_nodes = obj.xpath("./s3:Key", namespaces=ns)  # type: ignore[attr-defined]
@@ -95,31 +101,29 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                 errors_list.append({"Key": key, "Code": "NotImplemented", "Message": "Versioning not supported"})
                 continue
 
-            # Perform permission-aware delete; non-existent counts as success
+            # Soft-delete the object
             try:
-                deleted_object = await db.fetchrow(
-                    get_query("delete_object"),
+                deleted = await db.fetchrow(
+                    get_query("soft_delete_object"),
                     bucket_id,
                     key,
                 )
             except Exception:
-                logger.exception("Delete query failed for key %s", key)
-                deleted_object = None
+                logger.exception("Soft-delete query failed for key %s", key)
+                deleted = None
 
-            all_cids = deleted_object.get("all_cids") or [] if deleted_object else []
-            if deleted_object:
+            if deleted:
                 ray_id = getattr(request.state, "ray_id", None)
-                obj_version = deleted_object.get("object_version") or deleted_object.get("current_object_version") or 1
-                for cid in all_cids:
-                    await enqueue_unpin_request(
-                        payload=UnpinChainRequest(
-                            address=request.state.account.main_account,
-                            object_id=str(deleted_object["object_id"]),
-                            object_version=int(obj_version),
-                            cid=cid,
-                            ray_id=ray_id,
-                        ),
-                    )
+                object_id = str(deleted["object_id"])
+                object_version = int(deleted["current_object_version"])
+                unpin_payload = UnpinChainRequest(
+                    address=request.state.account.main_account,
+                    object_id=object_id,
+                    object_version=object_version,
+                    ray_id=ray_id,
+                )
+                for qname in unpin_queues:
+                    await enqueue_unpin_request(payload=unpin_payload, queue_name=qname)
 
             # S3 semantics: even if not found, include as Deleted (unless Quiet)
             deleted_keys.append(key)

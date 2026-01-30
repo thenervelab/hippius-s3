@@ -17,5 +17,5 @@ FROM objects o
 JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
 JOIN buckets b ON o.bucket_id = b.bucket_id
 LEFT JOIN cids c ON ov.cid_id = c.id
-WHERE o.bucket_id = $1 AND o.object_key = $2
+WHERE o.bucket_id = $1 AND o.object_key = $2 AND o.deleted_at IS NULL
 ORDER BY o.created_at DESC LIMIT 1

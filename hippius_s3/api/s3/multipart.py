@@ -439,12 +439,12 @@ async def upload_part(
         source_bytes = None
 
         if source_bytes is None:
-            # Read plaintext via reader pipeline (manifest → plan → stream decrypt)
+            # Read plaintext via reader pipeline (parts → plan → stream decrypt)
             try:
                 from hippius_s3.queue import DownloadChainRequest  # local import
                 from hippius_s3.queue import PartToDownload  # local import
                 from hippius_s3.queue import enqueue_download_request  # local import
-                from hippius_s3.reader.db_meta import read_parts_manifest  # local import to avoid cycles
+                from hippius_s3.reader.db_meta import read_parts_list  # local import to avoid cycles
                 from hippius_s3.reader.planner import build_chunk_plan  # local import
                 from hippius_s3.reader.streamer import stream_plan  # local import
             except Exception:
@@ -452,8 +452,8 @@ async def upload_part(
 
             object_id_str = str(source_obj["object_id"])  # type: ignore[index]
             src_ver = int(source_obj.get("object_version") or 1)
-            manifest = await read_parts_manifest(db, object_id_str, src_ver)
-            plan = await build_chunk_plan(db, object_id_str, manifest, None, object_version=src_ver)
+            parts = await read_parts_list(db, object_id_str, src_ver)
+            plan = await build_chunk_plan(db, object_id_str, parts, None, object_version=src_ver)
 
             # Enqueue downloader for any missing chunk indices in cache
             obj_cache = RedisObjectPartsCache(request.app.state.redis_client)

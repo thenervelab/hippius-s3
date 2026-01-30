@@ -18,7 +18,7 @@ from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.queue import dequeue_upload_request
 from hippius_s3.queue import enqueue_retry_request
-from hippius_s3.queue import move_due_retries_to_primary
+from hippius_s3.queue import move_due_upload_retries
 from hippius_s3.redis_utils import with_redis_retry
 from hippius_s3.services.arion_service import ArionClient
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
@@ -69,13 +69,13 @@ async def run_arion_uploader_loop():
     while True:
         try:
             moved, redis_queues_client = await with_redis_retry(
-                lambda rc: move_due_retries_to_primary(now_ts=time.time(), max_items=64),
+                lambda rc: move_due_upload_retries(backend_name="arion", now_ts=time.time(), max_items=64),
                 redis_queues_client,
                 config.redis_queues_url,
                 "move due retries",
             )
             if moved:
-                logger.info(f"Moved {moved} due retry requests back to primary queue")
+                logger.info(f"Moved {moved} due retry requests back to arion queue")
         except Exception as e:
             logger.error(f"Error moving retry requests: {e}")
             await asyncio.sleep(1)
@@ -114,7 +114,7 @@ async def run_arion_uploader_loop():
                     delay_ms = compute_backoff_ms(
                         attempts_next, config.uploader_backoff_base_ms, config.uploader_backoff_max_ms
                     )
-                    await enqueue_retry_request(upload_request, delay_seconds=delay_ms / 1000.0, last_error=err_str)
+                    await enqueue_retry_request(upload_request, backend_name="arion", delay_seconds=delay_ms / 1000.0, last_error=err_str)
                     get_metrics_collector().record_uploader_operation(
                         main_account=upload_request.address,
                         success=False,

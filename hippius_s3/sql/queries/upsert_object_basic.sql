@@ -11,6 +11,7 @@ WITH upserted AS (
   ON CONFLICT (bucket_id, object_key)
   DO UPDATE SET
     object_key = EXCLUDED.object_key,
+    deleted_at = NULL,
     -- Atomic MAX()+1 under the row lock taken by the ON CONFLICT update.
     current_object_version = (
       SELECT COALESCE(MAX(ov.object_version), 0) + 1
@@ -33,9 +34,6 @@ WITH upserted AS (
     multipart,
     status,
     append_version,
-    manifest_cid,
-    manifest_built_for_version,
-    manifest_built_at,
     last_append_at,
     last_modified,
     created_at
@@ -54,9 +52,6 @@ WITH upserted AS (
     FALSE,
     'publishing',
     0,
-    NULL,
-    NULL,
-    NULL,
     $8,
     $8,
     $8

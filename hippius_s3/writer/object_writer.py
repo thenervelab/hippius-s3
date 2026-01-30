@@ -164,6 +164,7 @@ class ObjectWriter:
             etag=md5_hash,
             chunk_size_bytes=int(chunk_size),
             object_version=int(object_version),
+            chunk_cipher_sizes=[len(ct) for ct in ct_chunks],
         )
 
         return PutResult(
@@ -265,6 +266,7 @@ class ObjectWriter:
 
         pt_buf = bytearray()
         next_chunk_index = 0
+        chunk_cipher_sizes: list[int] = []
 
         async def _encrypt_and_write(buf: bytes) -> None:
             nonlocal total_size, next_chunk_index
@@ -284,6 +286,7 @@ class ObjectWriter:
                 chunk_index=int(next_chunk_index),
                 upload_id="",
             )
+            chunk_cipher_sizes.append(len(ct))
             # Write-through: FS first (fatal), then Redis (best-effort)
             await self.fs_store.set_chunk(
                 object_id,
@@ -413,6 +416,7 @@ class ObjectWriter:
             etag=md5_hash,
             chunk_size_bytes=int(chunk_size),
             object_version=int(object_version),
+            chunk_cipher_sizes=chunk_cipher_sizes,
         )
 
         return PutResult(
@@ -572,6 +576,7 @@ class ObjectWriter:
             etag=str(md5_hash),
             chunk_size_bytes=int(chunk_size),
             object_version=int(object_version),
+            chunk_cipher_sizes=[len(ct) for ct in ct_chunks],
         )
 
         return PartResult(etag=md5_hash, size_bytes=file_size, part_number=int(part_number))
@@ -670,6 +675,30 @@ class ObjectWriter:
         upload_id = None
         composite_etag = None
         new_append_version_val = None
+        # Resolve encryption key before acquiring the transaction lock to minimize lock duration
+        chunk_size = self.config.object_chunk_size_bytes
+        sv_row = await self.db.fetchrow(
+            "SELECT storage_version FROM object_versions WHERE object_id=$1 AND object_version=$2",
+            object_id,
+            int(cov),
+        )
+        storage_version = int(sv_row["storage_version"]) if sv_row and sv_row.get("storage_version") is not None else 2
+        suite_id: str | None = "hip-enc/aes256gcm" if storage_version >= 5 else "hip-enc/legacy"
+        if storage_version >= 5:
+            key_bytes = await self._ensure_and_get_v5_dek(
+                bucket_id=bucket_id,
+                object_id=object_id,
+                object_version=int(cov),
+                chunk_size=int(chunk_size),
+                suite_id=str(suite_id),
+                rotate=False,
+            )
+        else:
+            key_bytes = await get_or_create_encryption_key_bytes(
+                main_account_id=account_address, bucket_name=bucket_name
+            )
+
+        ct_chunks: list[bytes] = []
         async with self.db.transaction():
             # 1) Lock the current version row and re-check CAS atomically
             locked = await self.db.fetchrow(
@@ -717,6 +746,18 @@ class ObjectWriter:
                     object_key,
                     object_id,
                 )
+            # Encrypt before inserting part so cipher sizes are available for part_chunks
+            ct_chunks = CryptoService.encrypt_part_to_chunks(
+                incoming_bytes,
+                object_id=object_id,
+                part_number=int(next_part),
+                seed_phrase=seed_phrase,
+                chunk_size=chunk_size,
+                key=key_bytes,
+                suite_id=suite_id,
+                bucket_id=str(bucket_id),
+                upload_id=str(upload_id or ""),
+            )
             await upsert_part_placeholder(
                 self.db,
                 object_id=object_id,
@@ -724,8 +765,9 @@ class ObjectWriter:
                 part_number=int(next_part),
                 size_bytes=int(delta_size),
                 etag=delta_md5,
-                chunk_size_bytes=self.config.object_chunk_size_bytes,
+                chunk_size_bytes=chunk_size,
                 object_version=int(cov),
+                chunk_cipher_sizes=[len(ct) for ct in ct_chunks],
             )
 
             # Recompute composite ETag
@@ -784,39 +826,7 @@ class ObjectWriter:
                 raise AppendPreconditionFailed(int(fresh or 0))
             new_append_version_val = int(updated["append_version"])  # type: ignore
 
-        # Cache write-through
-        chunk_size = self.config.object_chunk_size_bytes
-        sv_row = await self.db.fetchrow(
-            "SELECT storage_version FROM object_versions WHERE object_id=$1 AND object_version=$2",
-            object_id,
-            int(cov),
-        )
-        storage_version = int(sv_row["storage_version"]) if sv_row and sv_row.get("storage_version") is not None else 2
-        suite_id: str | None = "hip-enc/aes256gcm" if storage_version >= 5 else "hip-enc/legacy"
-        if storage_version >= 5:
-            key_bytes = await self._ensure_and_get_v5_dek(
-                bucket_id=bucket_id,
-                object_id=object_id,
-                object_version=int(cov),
-                chunk_size=int(chunk_size),
-                suite_id=str(suite_id),
-                rotate=False,
-            )
-        else:
-            key_bytes = await get_or_create_encryption_key_bytes(
-                main_account_id=account_address, bucket_name=bucket_name
-            )
-        ct_chunks = CryptoService.encrypt_part_to_chunks(
-            incoming_bytes,
-            object_id=object_id,
-            part_number=int(next_part),
-            seed_phrase=seed_phrase,
-            chunk_size=chunk_size,
-            key=key_bytes,
-            suite_id=suite_id,
-            bucket_id=str(bucket_id),
-            upload_id=str(upload_id or ""),
-        )
+        # Cache write-through (outside transaction)
         ttl = self.config.cache_ttl_seconds
         writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
         await writer.write_chunks(object_id, int(cov), int(next_part), ct_chunks)

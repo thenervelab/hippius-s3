@@ -93,7 +93,6 @@ def classify_error(error: Exception) -> str:
             "unavailable",
             "throttled",
             "rate limit",
-            "manifest_pending",
             "part_meta_not_ready",
             "part_row_missing",
         ]
