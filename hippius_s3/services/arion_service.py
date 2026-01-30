@@ -25,7 +25,6 @@ from hippius_s3.config import get_config
 
 
 logger = logging.getLogger(__name__)
-config = get_config()
 
 T = TypeVar("T")
 
@@ -238,7 +237,8 @@ class ArionClient:
         """
         Initialize the Arion API client.
         """
-        self.api_url = config.arion_base_url
+        self._config = get_config()
+        self.api_url = self._config.arion_base_url
         self._client = httpx.AsyncClient(
             base_url=self.api_url,
             timeout=httpx.Timeout(
@@ -260,8 +260,7 @@ class ArionClient:
         """Close the HTTP client."""
         await self._client.aclose()
 
-    @staticmethod
-    def _get_headers(account_ss58: str) -> Dict[str, str]:
+    def _get_headers(self, account_ss58: str) -> Dict[str, str]:
         """
         Get HTTP headers with authentication.
 
@@ -271,7 +270,7 @@ class ArionClient:
 
         hex_account = hashlib.sha256(account_ss58.encode("utf-8")).hexdigest()
         return {
-            "X-API-Key": config.arion_service_key,
+            "X-API-Key": self._config.arion_service_key,
             "Authorization": f"Bearer {hex_account}",
         }
 

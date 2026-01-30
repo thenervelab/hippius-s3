@@ -24,7 +24,6 @@ from hippius_s3.config import get_config
 
 
 logger = logging.getLogger(__name__)
-config = get_config()
 
 T = TypeVar("T")
 
@@ -213,7 +212,8 @@ class HippiusApiClient:
         """
         Initialize the Hippius API client.
         """
-        self.api_url = config.hippius_api_base_url
+        self._config = get_config()
+        self.api_url = self._config.hippius_api_base_url
         self._client = httpx.AsyncClient(
             base_url=self.api_url,
             timeout=httpx.Timeout(
@@ -235,8 +235,7 @@ class HippiusApiClient:
         """Close the HTTP client."""
         await self._client.aclose()
 
-    @staticmethod
-    def _get_headers(content_type: str = "application/json") -> Dict[str, str]:
+    def _get_headers(self, content_type: str = "application/json") -> Dict[str, str]:
         """
         Get HTTP headers with authentication.
 
@@ -244,7 +243,7 @@ class HippiusApiClient:
             Dict[str, str]: Headers with authentication token
         """
         return {
-            "Authorization": f"ServiceToken {config.hippius_service_key}",
+            "Authorization": f"ServiceToken {self._config.hippius_service_key}",
             "Accept": "application/json",
             "Content-Type": content_type,
         }

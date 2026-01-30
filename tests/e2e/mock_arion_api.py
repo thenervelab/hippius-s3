@@ -18,6 +18,7 @@ _store: dict[str, dict] = {}
 
 class UploadResult(BaseModel):
     upload_id: str
+    file_id: str
     timestamp: int
     size_bytes: int
 
@@ -33,6 +34,7 @@ async def upload(file: UploadFile = File(...), account_ss58: str = Form(...)) ->
     _store[file_id] = {"bytes": content, "account_ss58": account_ss58}
     return UploadResult(
         upload_id=file_id,
+        file_id=file_id,
         timestamp=int(time.time()),
         size_bytes=len(content),
     )
@@ -48,12 +50,12 @@ async def download(account_ss58: str, file_id: str):
     return StreamingResponse(io.BytesIO(entry["bytes"]), media_type="application/octet-stream")
 
 
-@app.delete("/delete/{file_id}")
-async def delete(file_id: str) -> DeleteResult:
+@app.delete("/delete/{user_id}/{file_id}")
+async def delete(user_id: str, file_id: str) -> DeleteResult:
     entry = _store.pop(file_id, None)
     account = entry["account_ss58"] if entry else "unknown"
     return DeleteResult(
-        Success={"status": "deleted", "file_id": file_id, "user_id": account}
+        Success={"status": "deleted", "file_id": file_id, "user_id": user_id}
     )
 
 
