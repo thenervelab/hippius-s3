@@ -12,7 +12,7 @@ from .conftest import is_real_aws
 from .support.cache import clear_object_cache
 from .support.cache import get_object_id
 from .support.cache import make_all_object_parts_pending
-from .support.cache import wait_for_parts_cids
+from .support.cache import wait_for_all_backends_ready
 
 
 def test_get_object_downloads_and_matches_headers(
@@ -50,7 +50,7 @@ def test_get_object_downloads_and_matches_headers(
 
     if not is_real_aws():
         # Wait until object has at least 1 part fully registered in chunk_backend (pipeline readiness)
-        assert wait_for_parts_cids(bucket_name, key, min_count=1, timeout_seconds=20.0)
+        assert wait_for_all_backends_ready(bucket_name, key, min_count=1, timeout_seconds=20.0)
 
         # Simulate pipeline path by clearing obj: cache, then GET should still succeed
         object_id = get_object_id(bucket_name, key)
@@ -113,7 +113,7 @@ def test_get_object_eventual_consistency(
     assert head_resp["ContentLength"] == 2 * 1024 * 1024
 
     # Wait for object to be processed and cached
-    assert wait_for_parts_cids(bucket_name, key, min_count=2, timeout_seconds=20.0)
+    assert wait_for_all_backends_ready(bucket_name, key, min_count=2, timeout_seconds=20.0)
 
     # Step 3: Get object_id and verify cache exists
     from .support.cache import get_object_id_and_version

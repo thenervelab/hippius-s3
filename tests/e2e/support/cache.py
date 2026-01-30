@@ -229,6 +229,7 @@ def wait_for_parts_cids(
     min_count: int,
     backend: str = "ipfs",
     timeout_seconds: float = 20.0,
+    deadline: float | None = None,
     dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
 ) -> bool:
     """Wait until at least min_count parts for the object have backend identifiers in chunk_backend.
@@ -237,13 +238,16 @@ def wait_for_parts_cids(
     therefore treats an object as "pipeline-ready" when enough parts have *all* their
     chunk_backend rows present for the given backend.
 
+    If *deadline* is given it takes precedence over *timeout_seconds*.
+
     Returns True if ready within timeout, False otherwise.
     """
     print(
         f"DEBUG: wait_for_parts_cids called for {bucket_name}/{object_key}, "
         f"backend={backend} expecting min_count={min_count}"
     )
-    deadline = time.time() + timeout_seconds
+    if deadline is None:
+        deadline = time.time() + timeout_seconds
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
         while time.time() < deadline:
             cur.execute(
@@ -265,8 +269,8 @@ def wait_for_parts_cids(
                 per_part AS (
                     SELECT
                         c.part_number,
-                        COUNT(*) AS total_chunks,
-                        COUNT(cb.chunk_id) FILTER (
+                        COUNT(DISTINCT c.chunk_id) AS total_chunks,
+                        COUNT(DISTINCT c.chunk_id) FILTER (
                             WHERE cb.backend = %s
                               AND NOT cb.deleted
                               AND cb.backend_identifier IS NOT NULL
@@ -292,6 +296,35 @@ def wait_for_parts_cids(
             time.sleep(0.3)
     print(f"DEBUG: wait_for_parts_cids TIMEOUT - only found {count} non-pending parts after {timeout_seconds}s")
     return False
+
+
+def wait_for_all_backends_ready(
+    bucket_name: str,
+    object_key: str,
+    *,
+    min_count: int,
+    backends: list[str] | None = None,
+    timeout_seconds: float = 30.0,
+    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+) -> bool:
+    """Wait until min_count parts are fully backed on ALL specified backends.
+
+    Uses a single shared deadline so total wait is at most *timeout_seconds*.
+    """
+    if backends is None:
+        backends = ["ipfs", "arion"]
+    shared_deadline = time.time() + timeout_seconds
+    for backend in backends:
+        if not wait_for_parts_cids(
+            bucket_name,
+            object_key,
+            min_count=min_count,
+            backend=backend,
+            deadline=shared_deadline,
+            dsn=dsn,
+        ):
+            return False
+    return True
 
 
 def make_all_object_parts_pending(
