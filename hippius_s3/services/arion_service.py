@@ -236,9 +236,9 @@ class ArionClient:
         self,
     ) -> None:
         """
-        Initialize the Hippius API client.
+        Initialize the Arion API client.
         """
-        self.api_url = config.hippius_api_base_url
+        self.api_url = config.arion_base_url
         self._client = httpx.AsyncClient(
             base_url=self.api_url,
             timeout=httpx.Timeout(

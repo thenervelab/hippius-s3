@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from hippius_s3.config import get_config
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
-from hippius_s3.queue import enqueue_upload_request
+from hippius_s3.queue import enqueue_upload_to_backends
 
 
 async def enqueue_upload(
@@ -28,4 +29,7 @@ async def enqueue_upload(
         upload_id=str(upload_id),
         ray_id=ray_id,
     )
-    await enqueue_upload_request(payload)
+
+    config = get_config()
+    backends = config.expected_backends
+    await enqueue_upload_to_backends(payload, backends)

@@ -9,7 +9,9 @@ services:
     depends_on:
       api:
         condition: service_started
-      uploader:
+      api-uploader:
+        condition: service_started
+      arion-uploader:
         condition: service_started
       downloader:
         condition: service_started
@@ -47,13 +49,14 @@ services:
     networks:
       - hippius_net
 
-  uploader:
+  api-uploader:
     env_file:
       - .env.defaults
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
       - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://toxiproxy:15001}
+      - HIPPIUS_EXPECTED_BACKENDS=api,arion
     volumes:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
@@ -62,6 +65,22 @@ services:
     depends_on:
       mock-hippius-api:
         condition: service_healthy
+      mock-kms:
+        condition: service_healthy
+
+  arion-uploader:
+    env_file:
+      - .env.defaults
+      - .env.test-docker
+    environment:
+      - HIPPIUS_KEY=${HIPPIUS_KEY}
+      - HIPPIUS_EXPECTED_BACKENDS=api,arion
+    volumes:
+      - .:/app
+      - ./.e2e/dlq:/tmp/hippius_dlq
+      - ./.e2e/dlq_archive:/tmp/hippius_dlq_archive
+      - kms_certs:/kms_certs:ro
+    depends_on:
       mock-kms:
         condition: service_healthy
 

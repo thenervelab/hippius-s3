@@ -20,6 +20,7 @@ from hippius_s3.queue import dequeue_upload_request
 from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.queue import move_due_retries_to_primary
 from hippius_s3.redis_utils import with_redis_retry
+from hippius_s3.services.hippius_api_service import HippiusApiClient
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 from hippius_s3.services.ray_id_service import ray_id_context
 from hippius_s3.workers.uploader import Uploader
@@ -29,11 +30,11 @@ from hippius_s3.workers.uploader import compute_backoff_ms
 
 config = get_config()
 
-setup_loki_logging(config, "uploader")
+setup_loki_logging(config, "api-uploader")
 logger = logging.getLogger(__name__)
 
 
-async def run_uploader_loop():
+async def run_api_uploader_loop():
     db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=10)
     redis_client = async_redis.from_url(config.redis_url)
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
@@ -45,7 +46,10 @@ async def run_uploader_loop():
     initialize_cache_client(redis_client)
     initialize_metrics_collector(redis_client)
 
-    logger.info("Starting uploader service...")
+    api_client = HippiusApiClient()
+
+    logger.info("Starting API uploader service...")
+    logger.info("Backend: api")
     logger.info(f"Redis URL: {config.redis_url}")
     logger.info(f"Redis Queues URL: {config.redis_queues_url}")
     logger.info(f"Database pool created: {config.database_url}")
@@ -55,7 +59,11 @@ async def run_uploader_loop():
         redis_client,
         redis_queues_client,
         config,
+        backend_name="api",
+        backend_client=api_client,
     )
+
+    queue_name = "api_upload_requests"
 
     while True:
         try:
@@ -74,7 +82,7 @@ async def run_uploader_loop():
 
         try:
             upload_request, redis_queues_client = await with_redis_retry(
-                lambda rc: dequeue_upload_request(),
+                lambda rc: dequeue_upload_request(queue_name),
                 redis_queues_client,
                 config.redis_queues_url,
                 "dequeue upload request",
@@ -90,13 +98,13 @@ async def run_uploader_loop():
             worker_logger = get_logger_with_ray_id(__name__, ray_id)
 
             worker_logger.info(
-                f"Processing upload request object_id={upload_request.object_id} chunks={len(upload_request.chunks)} attempts={upload_request.attempts or 0}"
+                f"Processing API upload request object_id={upload_request.object_id} chunks={len(upload_request.chunks)} attempts={upload_request.attempts or 0}"
             )
 
             try:
                 await uploader.process_upload(upload_request)
             except Exception as e:
-                worker_logger.exception(f"Upload failed object_id={upload_request.object_id}")
+                worker_logger.exception(f"API upload failed object_id={upload_request.object_id}")
                 err_str = str(e)
                 error_type = classify_error(e)
                 attempts_next = (upload_request.attempts or 0) + 1
@@ -124,4 +132,4 @@ async def run_uploader_loop():
 
 
 if __name__ == "__main__":
-    asyncio.run(run_uploader_loop())
+    asyncio.run(run_api_uploader_loop())

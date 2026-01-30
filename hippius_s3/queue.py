@@ -138,14 +138,35 @@ async def enqueue_upload_request(payload: UploadChainRequest) -> None:
     logger.info(f"Enqueued upload request {payload.name=} queues={queue_names}")
 
 
-async def dequeue_upload_request() -> UploadChainRequest | None:
+async def enqueue_upload_to_backends(request: UploadChainRequest, backends: list[str]) -> None:
+    """Enqueue upload request to multiple backend queues in parallel."""
+    client = get_queue_client()
+    if request.request_id is None:
+        request.request_id = uuid.uuid4().hex
+    if request.first_enqueued_at is None:
+        request.first_enqueued_at = time.time()
+    if request.attempts is None:
+        request.attempts = 0
+
+    raw = request.model_dump_json()
+    for backend in backends:
+        queue_name = f"{backend}_upload_requests"
+        await client.lpush(queue_name, raw)
+    logger.info(f"Enqueued upload request {request.name=} backends={backends}")
+
+
+async def dequeue_upload_request(queue_name: str | None = None) -> UploadChainRequest | None:
     """Get the next upload request from the Redis queue."""
     client = get_queue_client()
     config = get_config()
-    queue_names_str: str = config.upload_queue_names
 
-    queue_names: List[str] = [_normalize_queue_name(q) for q in queue_names_str.split(",") if _normalize_queue_name(q)]
-    queue_name: str = queue_names[0] if queue_names else "upload_requests"
+    if queue_name is None:
+        queue_names_str: str = config.upload_queue_names
+        queue_names: List[str] = [
+            _normalize_queue_name(q) for q in queue_names_str.split(",") if _normalize_queue_name(q)
+        ]
+        queue_name = queue_names[0] if queue_names else "upload_requests"
+
     result = await client.brpop(queue_name, timeout=0.5)
     if result:
         _, queue_data = result

@@ -7,17 +7,26 @@ import redis.asyncio as async_redis
 
 from hippius_s3.dlq.base import BaseDLQManager
 from hippius_s3.queue import UploadChainRequest
-from hippius_s3.queue import enqueue_upload_request
+from hippius_s3.queue import get_queue_client
 
 
 class UploadDLQManager(BaseDLQManager[UploadChainRequest]):
     """DLQ manager for upload operations."""
 
-    def __init__(self, redis_client: async_redis.Redis):
+    def __init__(self, redis_client: async_redis.Redis, backend_name: str = "upload"):
+        self.backend_name = backend_name
+
+        async def enqueue_to_backend(payload: UploadChainRequest) -> None:
+            """Enqueue upload request to specific backend queue."""
+            client = get_queue_client()
+            queue_name = f"{backend_name}_upload_requests"
+            raw = payload.model_dump_json()
+            await client.lpush(queue_name, raw)
+
         super().__init__(
             redis_client=redis_client,
-            dlq_key="upload_requests:dlq",
-            enqueue_func=enqueue_upload_request,
+            dlq_key=f"{backend_name}_upload_requests:dlq",
+            enqueue_func=enqueue_to_backend,
             request_class=UploadChainRequest,
         )
 

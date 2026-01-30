@@ -10,7 +10,12 @@ services:
       - /cache/hippius/object_cache:/var/lib/hippius/object_cache
       - /cache/hippius/persist:/var/lib/hippius/persist
 
-  uploader:
+  api-uploader:
+    volumes:
+      - .:/app
+      - /cache/hippius/object_cache:/var/lib/hippius/object_cache
+
+  arion-uploader:
     volumes:
       - .:/app
       - /cache/hippius/object_cache:/var/lib/hippius/object_cache
@@ -28,74 +33,65 @@ services:
 
   db:
     shm_size: 2g
-    command:
-      [
-        "postgres",
-        "-c",
-        "max_connections=1000",
-        "-c",
-        "shared_buffers=8GB",
-        "-c",
-        "effective_cache_size=24GB",
-        "-c",
-        "work_mem=64MB",
-        "-c",
-        "maintenance_work_mem=2GB",
-        "-c",
-        "checkpoint_completion_target=0.9",
-        "-c",
-        "wal_buffers=64MB",
-        "-c",
-        "default_statistics_target=500",
-        "-c",
-        "random_page_cost=1.1",
-        "-c",
-        "effective_io_concurrency=200",
-        "-c",
-        "max_worker_processes=48",
-        "-c",
-        "max_parallel_workers_per_gather=8",
-        "-c",
-        "max_parallel_workers=24",
-        "-c",
-        "max_parallel_maintenance_workers=8",
-        "-c",
-        "wal_level=replica",
-        "-c",
-        "max_wal_size=4GB",
-        "-c",
-        "min_wal_size=1GB",
-        "-c",
-        "checkpoint_timeout=15min",
-      ]
+    command: [ "postgres",
+               "-c",
+               "max_connections=1000",
+               "-c",
+               "shared_buffers=8GB",
+               "-c",
+               "effective_cache_size=24GB",
+               "-c",
+               "work_mem=64MB",
+               "-c",
+               "maintenance_work_mem=2GB",
+               "-c",
+               "checkpoint_completion_target=0.9",
+               "-c",
+               "wal_buffers=64MB",
+               "-c",
+               "default_statistics_target=500",
+               "-c",
+               "random_page_cost=1.1",
+               "-c",
+               "effective_io_concurrency=200",
+               "-c",
+               "max_worker_processes=48",
+               "-c",
+               "max_parallel_workers_per_gather=8",
+               "-c",
+               "max_parallel_workers=24",
+               "-c",
+               "max_parallel_maintenance_workers=8",
+               "-c",
+               "wal_level=replica",
+               "-c",
+               "max_wal_size=4GB",
+               "-c",
+               "min_wal_size=1GB",
+               "-c",
+               "checkpoint_timeout=15min", ]
 
   redis:
-    command:
-      [
-        "redis-server",
-        "/usr/local/etc/redis/redis.conf",
-        "--maxmemory",
-        "200gb",
-      ]
+    command: [ "redis-server",
+               "/usr/local/etc/redis/redis.conf",
+               "--maxmemory",
+               "200gb", ]
     deploy:
       resources:
         limits:
           cpus: "4"
 
   redis-acl:
-    command:
-      [
-        "redis-server",
-        "/usr/local/etc/redis/redis.conf",
-        "--maxmemory",
-        "4gb",
-        "--maxmemory-policy",
-        "allkeys-lru",
-        "--save",
-        "",
-        "--appendonly",
-        "no",
-      ]
+    command: [ "redis-server",
+               "/usr/local/etc/redis/redis.conf",
+               "--maxmemory",
+               "4gb",
+               "--maxmemory-policy",
+               "allkeys-lru",
+               "--save",
+               "",
+               "--appendonly",
+               "no", ]
 
 
   orphan-checker:

@@ -155,6 +155,8 @@ class Config:
 
     # Upload queue configuration
     upload_queue_names: str = env("HIPPIUS_UPLOAD_QUEUE_NAMES:upload_requests", convert=str)
+    api_upload_queue: str = env("HIPPIUS_API_UPLOAD_QUEUE:api_upload_requests", convert=str)
+    arion_upload_queue: str = env("HIPPIUS_ARION_UPLOAD_QUEUE:arion_upload_requests", convert=str)
 
     # Download queue configuration
     download_queue_names: str = env("HIPPIUS_DOWNLOAD_QUEUE_NAMES:download_requests", convert=str)
