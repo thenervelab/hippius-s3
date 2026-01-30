@@ -83,10 +83,7 @@ async def process_unpin_request(
                 identifier = row["backend_identifier"]
                 chunk_id = row["chunk_id"]
                 try:
-                    if backend_name == "ipfs":
-                        await client.unpin_file(identifier, account_ss58=request.address)
-                    else:
-                        await client.unpin_file(identifier)
+                    await client.unpin_file(identifier, account_ss58=request.address)
                     worker_logger.info(f"Unpinned {backend_name} identifier={identifier}")
                 except Exception as unpin_err:
                     worker_logger.warning(f"Failed to unpin {backend_name} identifier={identifier}: {unpin_err}")

@@ -9,14 +9,13 @@ API Documentation: https://api.hippius.com/?format=openapi
 
 import asyncio
 import functools
+import hashlib
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
 from typing import Callable
 from typing import Coroutine
 from typing import Dict
-from typing import Sequence
-from typing import Tuple
 from typing import TypeVar
 
 import httpx
@@ -80,14 +79,15 @@ class UploadResponse(BaseModel):
     upload_id: str
     timestamp: int
     size_bytes: int = 0
+    file_id: str
 
     @property
     def cid(self) -> str:
-        return self.upload_id
+        return self.file_id
 
     @property
     def id(self) -> str:
-        return self.upload_id
+        return self.file_id
 
     @property
     def status(self) -> str:
@@ -261,22 +261,25 @@ class ArionClient:
         await self._client.aclose()
 
     @staticmethod
-    def _get_headers() -> Dict[str, str]:
+    def _get_headers(account_ss58: str) -> Dict[str, str]:
         """
         Get HTTP headers with authentication.
 
         Returns:
             Dict[str, str]: Headers with authentication token
         """
+
+        hex_account = hashlib.sha256(account_ss58.encode("utf-8")).hexdigest()
         return {
-            "X-API-Key": "Arion",
-            "Authorization": f"Bearer {config.hippius_service_key}",
+            "X-API-Key": config.arion_service_key,
+            "Authorization": f"Bearer {hex_account}",
         }
 
     @retry_on_error(retries=3, backoff=5.0)
     async def unpin_file(
         self,
         file_id: str,
+        account_ss58: str,
     ) -> DeleteSuccessResponse:
         """
         Delete a file from storage (HCFS endpoint).
@@ -285,6 +288,7 @@ class ArionClient:
 
         Args:
             file_id: File identifier (64-character hex-encoded SHA-256 path hash)
+            account_ss58: Account SS58 hash
 
         Returns:
             DeleteSuccessResponse: Response with deletion status
@@ -293,12 +297,13 @@ class ArionClient:
             HippiusAPIError: If the API request fails
         """
 
-        headers = self._get_headers()
-
+        headers = self._get_headers(account_ss58)
+        hex_user = hashlib.sha256(account_ss58.encode("utf-8")).hexdigest()
         response = await self._client.delete(
-            f"/delete/{file_id}",
+            f"/delete/{hex_user}/{file_id}",
             headers=headers,
         )
+
         response_json = response.json()
         response.raise_for_status()
 
@@ -327,11 +332,12 @@ class ArionClient:
             HippiusAPIError: If the API request fails
         """
 
-        headers = self._get_headers()
+        headers = self._get_headers(account_ss58)
+        hex_user = hashlib.sha256(account_ss58.encode("utf-8")).hexdigest()
 
         async with self._client.stream(
             "GET",
-            f"/download/{account_ss58}/{file_id}",
+            f"/download/{hex_user}/{file_id}",
             headers=headers,
         ) as response:
             logger.info(f"Download response status: {response.status_code}")
@@ -365,8 +371,9 @@ class ArionClient:
             HippiusAPIError: If the API request fails
         """
 
-        files: Sequence[Tuple[str, Tuple[None, str] | Tuple[str, bytes, str, Dict[str, str]]]] = [
-            ("account_ss58", (None, account_ss58)),
+        hex_user = hashlib.sha256(account_ss58.encode("utf-8")).hexdigest()
+        files = [
+            ("account_ss58", hex_user),
             (
                 "file",
                 (
@@ -378,8 +385,7 @@ class ArionClient:
             ),
         ]
 
-        headers = self._get_headers()
-
+        headers = self._get_headers(account_ss58)
         response = await self._client.post(
             "/upload",
             files=files,  # type: ignore[arg-type]
