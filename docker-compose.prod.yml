@@ -10,7 +10,7 @@ services:
       - /cache/hippius/object_cache:/var/lib/hippius/object_cache
       - /cache/hippius/persist:/var/lib/hippius/persist
 
-  api-uploader:
+  ipfs-uploader:
     volumes:
       - .:/app
       - /cache/hippius/object_cache:/var/lib/hippius/object_cache
@@ -20,11 +20,17 @@ services:
       - .:/app
       - /cache/hippius/object_cache:/var/lib/hippius/object_cache
 
-  downloader:
+  ipfs-downloader:
     volumes:
       - /cache/hippius/object_cache:/var/lib/hippius/object_cache
     deploy:
-      replicas: 10
+      replicas: 5
+
+  arion-downloader:
+    volumes:
+      - /cache/hippius/object_cache:/var/lib/hippius/object_cache
+    deploy:
+      replicas: 5
 
   janitor:
     volumes:
