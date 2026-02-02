@@ -1,12 +1,20 @@
--- Upsert object and set cid_id on latest version
-WITH upsert_object AS (
+-- Allocate a new version and set cid_id on that version (promotes it live).
+WITH upserted AS (
   INSERT INTO objects (object_id, bucket_id, object_key, created_at, current_object_version)
   VALUES ($1, $2, $3, $7, 1)
   ON CONFLICT (bucket_id, object_key)
-  DO UPDATE SET object_id = EXCLUDED.object_id, current_object_version = COALESCE(objects.current_object_version, 1)
-  RETURNING object_id, current_object_version
-)
-INSERT INTO object_versions (
+  DO UPDATE SET
+    object_key = EXCLUDED.object_key,
+    deleted_at = NULL,
+    -- Atomic MAX()+1 under the row lock taken by the ON CONFLICT update.
+    current_object_version = (
+      SELECT COALESCE(MAX(ov.object_version), 0) + 1
+      FROM object_versions ov
+      WHERE ov.object_id = objects.object_id
+    )
+  RETURNING object_id, bucket_id, object_key, created_at, current_object_version
+), ins_version AS (
+  INSERT INTO object_versions (
   object_id,
   object_version,
   version_type,
@@ -20,41 +28,41 @@ INSERT INTO object_versions (
   multipart,
   status,
   append_version,
-  manifest_cid,
-  manifest_built_for_version,
-  manifest_built_at,
   last_append_at,
   last_modified,
-  created_at
+  created_at,
+  upload_backends
+  )
+  SELECT
+    u.object_id,
+    u.current_object_version,
+    'user',
+    $10,
+    $5,
+    $6,
+    $8::jsonb,
+    $9,
+    NULL,
+    $4,
+    FALSE,
+    'publishing',
+    0,
+    $7,
+    $7,
+    $7,
+    $11::text[]
+  FROM upserted u
+  RETURNING object_id, object_version
 )
 SELECT
-  uo.object_id,
-  uo.current_object_version,
-  'user',
-  $10,
-  $5,
-  $6,
-  $8::jsonb,
-  $9,
-  NULL,
-  $4,
-  FALSE,
-  'publishing',
-  0,
-  NULL,
-  NULL,
-  NULL,
-  $7,
-  $7,
-  $7
-FROM upsert_object uo
-ON CONFLICT (object_id, object_version)
-DO UPDATE SET
-  storage_version = EXCLUDED.storage_version,
-  size_bytes = EXCLUDED.size_bytes,
-  content_type = EXCLUDED.content_type,
-  metadata = EXCLUDED.metadata,
-  md5_hash = EXCLUDED.md5_hash,
-  cid_id = EXCLUDED.cid_id,
-  last_modified = EXCLUDED.last_modified
-RETURNING $1 AS object_id, $2 AS bucket_id, $3 AS object_key, $4 AS cid_id, $5 AS size_bytes, $6 AS content_type, $7 AS created_at, $8 AS metadata, $9 AS md5_hash
+  u.object_id,
+  u.bucket_id,
+  u.object_key,
+  $4 AS cid_id,
+  $5 AS size_bytes,
+  $6 AS content_type,
+  $7 AS created_at,
+  $8 AS metadata,
+  $9 AS md5_hash
+FROM upserted u
+JOIN ins_version iv ON iv.object_id = u.object_id AND iv.object_version = u.current_object_version

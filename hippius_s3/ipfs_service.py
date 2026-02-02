@@ -3,7 +3,7 @@ import base64
 import hashlib
 import logging
 import time
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 import asyncpg
 import httpx

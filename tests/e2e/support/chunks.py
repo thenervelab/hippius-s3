@@ -21,24 +21,29 @@ def get_part_chunks(
     part_number: int = 1,
     *,
     dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+    backend: str = "ipfs",
 ) -> List[ChunkRow]:
-    """Return chunk rows for a given object's part, ordered by chunk_index."""
+    """Return chunk rows for a given object's part, ordered by chunk_index.
+
+    Reads the CID from ``chunk_backend.backend_identifier`` for the specified backend.
+    """
     sql = (
-        "SELECT pc.chunk_index, pc.cid, pc.cipher_size_bytes, pc.plain_size_bytes\n"
+        "SELECT pc.chunk_index, cb.backend_identifier, pc.cipher_size_bytes, pc.plain_size_bytes\n"
         "FROM objects o\n"
         "JOIN buckets b ON b.bucket_id = o.bucket_id\n"
         "JOIN parts p ON p.object_id = o.object_id AND p.part_number = %s\n"
         "JOIN part_chunks pc ON pc.part_id = p.part_id\n"
+        "LEFT JOIN chunk_backend cb ON cb.chunk_id = pc.id AND cb.backend = %s AND NOT cb.deleted\n"
         "WHERE b.bucket_name = %s AND o.object_key = %s\n"
         "ORDER BY pc.chunk_index ASC"
     )
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
-        cur.execute(sql, (int(part_number), bucket_name, object_key))
+        cur.execute(sql, (int(part_number), backend, bucket_name, object_key))
         rows = cur.fetchall()
         result: List[ChunkRow] = [
             ChunkRow(
                 chunk_index=int(r[0]),
-                cid=str(r[1]),
+                cid=str(r[1]) if r[1] is not None else "",
                 cipher_size_bytes=int(r[2]) if r[2] is not None else 0,
                 plain_size_bytes=int(r[3]) if r[3] is not None else 0,
             )
@@ -57,4 +62,4 @@ def get_first_chunk_cid(
     rows = get_part_chunks(bucket_name, object_key, part_number=1, dsn=dsn)
     if not rows:
         return None
-    return rows[0].cid
+    return rows[0].cid or None

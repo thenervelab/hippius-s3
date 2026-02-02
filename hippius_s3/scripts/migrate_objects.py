@@ -228,6 +228,7 @@ async def migrate_one(
         content_type=content_type,
         metadata=metadata,
         storage_version_target=config.target_storage_version,
+        upload_backends=config.upload_backends,
     )
 
     obj_cache = RedisObjectPartsCache(redis_client)

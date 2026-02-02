@@ -107,19 +107,22 @@ async def handle_put_object(
             )
             set_span_attributes(span, {"is_overwrite": prev is not None})
 
-        # Generate object_id or reuse existing one
+        # Candidate object_id: DB may override on (bucket_id, object_key) conflict
+        # TODO: Make object identity/version allocation fully DB-atomic by removing this
+        #       pre-check and always passing a generated candidate UUID. The writer already
+        #       treats the DB-returned object_id/object_version as authoritative.
         if prev:
-            object_id = str(prev["object_id"])
-            logger.debug(f"Reusing existing object_id {object_id} for overwrite")
+            candidate_object_id = str(prev["object_id"])
+            logger.debug(f"Reusing existing object_id {candidate_object_id} for overwrite")
         else:
-            object_id = str(uuid.uuid4())
+            candidate_object_id = str(uuid.uuid4())
 
         async with db.transaction():
             # Use ObjectWriter streaming upsert/write (single-part)
             with tracer.start_as_current_span(
                 "put_object.stream_and_upsert",
                 attributes={
-                    "object_id": object_id,
+                    "object_id": candidate_object_id,
                     "has_object_id": True,
                     "file_size_bytes": file_size,
                     "content_type": content_type,
@@ -134,7 +137,7 @@ async def handle_put_object(
                 put_res = await writer.put_simple_stream_full(
                     bucket_id=bucket_id,
                     bucket_name=bucket_name,
-                    object_id=object_id,
+                    object_id=candidate_object_id,
                     object_key=object_key,
                     account_address=request.state.account.main_account,
                     content_type=content_type,
@@ -149,22 +152,10 @@ async def handle_put_object(
                         "upload_id": put_res.upload_id,
                         "has_upload_id": True,
                         "etag": put_res.etag,
+                        "object_id_db": put_res.object_id,
                         "returned_size_bytes": put_res.size_bytes,
                     },
                 )
-
-            # Fetch current version to enqueue background publish
-            with tracer.start_as_current_span(
-                "put_object.fetch_current_version",
-                attributes={"object_id": object_id, "has_object_id": True},
-            ) as span:
-                object_row = await db.fetchrow(
-                    get_query("get_object_by_path"),
-                    bucket_id,
-                    object_key,
-                )
-                current_object_version = int(object_row["object_version"] or 1) if object_row else 1
-                set_span_attributes(span, {"current_object_version": current_object_version})
 
         # Only enqueue after DB state is persisted; use writer queue helper
         with tracer.start_as_current_span(
@@ -175,12 +166,19 @@ async def handle_put_object(
                 address=request.state.account.main_account,
                 bucket_name=bucket_name,
                 object_key=object_key,
-                object_id=object_id,
-                object_version=int(current_object_version),
+                object_id=str(put_res.object_id),
+                object_version=int(put_res.object_version),
                 upload_id=str(put_res.upload_id),
                 chunk_ids=[1],
                 ray_id=getattr(request.state, "ray_id", "no-ray-id"),
             )
+
+        # Mark upload completed to prevent CASCADE deletion of chunk_backend on DELETE
+        # Maintains parity with append (sets TRUE immediately) and multipart (sets TRUE in mpu_complete)
+        await db.execute(
+            "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
+            put_res.upload_id,
+        )
 
         get_metrics_collector().record_s3_operation(
             operation="put_object",

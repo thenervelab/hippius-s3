@@ -46,9 +46,9 @@ def get_object_cids(
     *,
     dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
 ) -> tuple[str, int, str, list[str], Optional[str]]:
-    """Get all CIDs for an object including parts, chunks, and manifest.
+    """Get all CIDs for an object including parts, chunks, and object-level CID.
 
-    Returns: (object_id, object_version, main_account_id, part_cids, manifest_cid)
+    Returns: (object_id, object_version, main_account_id, part_cids, object_cid)
     """
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
         cur.execute(
@@ -104,10 +104,10 @@ def get_object_cids(
             """,
             (object_id, object_version),
         )
-        manifest_row = cur.fetchone()
-        manifest_cid = str(manifest_row[0]) if manifest_row else None
+        obj_cid_row = cur.fetchone()
+        object_cid = str(obj_cid_row[0]) if obj_cid_row else None
 
-        return object_id, object_version, main_account_id, part_cids + chunk_cids, manifest_cid
+        return object_id, object_version, main_account_id, part_cids + chunk_cids, object_cid
 
 
 essentially_all_parts = range(0, 256)
@@ -227,85 +227,104 @@ def wait_for_parts_cids(
     object_key: str,
     *,
     min_count: int,
+    backend: str = "ipfs",
     timeout_seconds: float = 20.0,
+    deadline: float | None = None,
     dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
 ) -> bool:
-    """Wait until at least min_count parts for the object have non-pending ipfs_cid values.
+    """Wait until at least min_count parts for the object have backend identifiers in chunk_backend.
 
-    This includes both the base part (from objects table) and appended parts (from parts table).
+    In the multi-backend design, upload workers only write to chunk_backend. This helper
+    therefore treats an object as "pipeline-ready" when enough parts have *all* their
+    chunk_backend rows present for the given backend.
+
+    If *deadline* is given it takes precedence over *timeout_seconds*.
 
     Returns True if ready within timeout, False otherwise.
     """
-    print(f"DEBUG: wait_for_parts_cids called for {bucket_name}/{object_key}, expecting min_count={min_count}")
-    deadline = time.time() + timeout_seconds
+    print(
+        f"DEBUG: wait_for_parts_cids called for {bucket_name}/{object_key}, "
+        f"backend={backend} expecting min_count={min_count}"
+    )
+    if deadline is None:
+        deadline = time.time() + timeout_seconds
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
         while time.time() < deadline:
-            # First, get object_id for debugging
             cur.execute(
                 """
-                SELECT o.object_id, ov.ipfs_cid, c.cid as object_cid
-                FROM objects o
-                JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
-                LEFT JOIN cids c ON ov.cid_id = c.id
-                JOIN buckets b ON b.bucket_id = o.bucket_id
-                WHERE b.bucket_name = %s AND o.object_key = %s
+                WITH chunks AS (
+                    SELECT
+                        o.object_id,
+                        o.current_object_version AS object_version,
+                        p.part_number,
+                        pc.id AS chunk_id
+                    FROM objects o
+                    JOIN buckets b ON b.bucket_id = o.bucket_id
+                    JOIN parts p ON p.object_id = o.object_id AND p.object_version = o.current_object_version
+                    JOIN part_chunks pc ON pc.part_id = p.part_id
+                    WHERE b.bucket_name = %s
+                      AND o.object_key = %s
+                      AND o.deleted_at IS NULL
+                ),
+                per_part AS (
+                    SELECT
+                        c.part_number,
+                        COUNT(DISTINCT c.chunk_id) AS total_chunks,
+                        COUNT(DISTINCT c.chunk_id) FILTER (
+                            WHERE cb.backend = %s
+                              AND NOT cb.deleted
+                              AND cb.backend_identifier IS NOT NULL
+                        ) AS backend_chunks
+                    FROM chunks c
+                    LEFT JOIN chunk_backend cb ON cb.chunk_id = c.chunk_id
+                    GROUP BY c.part_number
+                )
+                SELECT COUNT(*)
+                FROM per_part
+                WHERE total_chunks > 0
+                  AND backend_chunks = total_chunks
                 """,
-                (bucket_name, object_key),
-            )
-            obj_row = cur.fetchone()
-            print(f"DEBUG: Object row: {obj_row}")
-
-            # Get parts for debugging
-            cur.execute(
-                """
-                SELECT p.part_number, p.ipfs_cid, p.size_bytes, p.etag, c.cid as part_cid
-                FROM parts p
-                LEFT JOIN cids c ON p.cid_id = c.id
-                JOIN object_versions ov ON p.object_version = ov.object_version AND ov.object_id = p.object_id
-                JOIN objects o ON o.object_id = ov.object_id
-                JOIN buckets b ON b.bucket_id = o.bucket_id
-                WHERE b.bucket_name = %s AND o.object_key = %s
-                ORDER BY p.part_number
-                """,
-                (bucket_name, object_key),
-            )
-            parts_rows = cur.fetchall()
-            print(f"DEBUG: Parts rows: {parts_rows}")
-
-            cur.execute(
-                """
-                    SELECT COUNT(*)
-                    FROM (
-                        SELECT COALESCE(c.cid, ov.ipfs_cid) as cid
-                        FROM objects o
-                        JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
-                        LEFT JOIN cids c ON ov.cid_id = c.id
-                        JOIN buckets b ON b.bucket_id = o.bucket_id
-                        WHERE b.bucket_name = %s AND o.object_key = %s
-
-                        UNION ALL
-
-                        SELECT COALESCE(c.cid, p.ipfs_cid) as cid
-                        FROM parts p
-                        LEFT JOIN cids c ON p.cid_id = c.id
-                        JOIN objects o ON o.object_id = p.object_id
-                        JOIN buckets b ON b.bucket_id = o.bucket_id
-                        WHERE b.bucket_name = %s AND o.object_key = %s
-                    ) AS all_parts
-                    WHERE COALESCE(NULLIF(TRIM(cid), ''), 'pending') <> 'pending'
-                    """,
-                (bucket_name, object_key, bucket_name, object_key),
+                (bucket_name, object_key, backend),
             )
             row = cur.fetchone()
             count = int(row[0]) if row else 0
-            print(f"DEBUG: Non-pending parts count: {count} (need {min_count})")
+            print(f"DEBUG: Fully-backed parts count: {count} (need {min_count})")
             if count >= min_count:
-                print(f"DEBUG: wait_for_parts_cids SUCCESS - found {count} non-pending parts")
+                print(f"DEBUG: wait_for_parts_cids SUCCESS - found {count} fully-backed parts")
                 return True
             print(f"DEBUG: wait_for_parts_cids still waiting... ({count}/{min_count})")
             time.sleep(0.3)
     print(f"DEBUG: wait_for_parts_cids TIMEOUT - only found {count} non-pending parts after {timeout_seconds}s")
     return False
+
+
+def wait_for_all_backends_ready(
+    bucket_name: str,
+    object_key: str,
+    *,
+    min_count: int,
+    backends: list[str] | None = None,
+    timeout_seconds: float = 30.0,
+    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+) -> bool:
+    """Wait until min_count parts are fully backed on ALL specified backends.
+
+    Uses a single shared deadline so total wait is at most *timeout_seconds*.
+    """
+    if backends is None:
+        backends = ["ipfs", "arion"]
+    shared_deadline = time.time() + timeout_seconds
+    for backend in backends:
+        if not wait_for_parts_cids(
+            bucket_name,
+            object_key,
+            min_count=min_count,
+            backend=backend,
+            deadline=shared_deadline,
+            dsn=dsn,
+        ):
+            return False
+    return True
 
 
 def make_all_object_parts_pending(
@@ -314,7 +333,7 @@ def make_all_object_parts_pending(
     *,
     dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
 ) -> str:
-    """Set all parts for an object to pending state (both base and appended parts).
+    """Simulate "not yet processed by workers" by clearing backend registrations.
 
     Returns the object_id of the affected object.
     """
@@ -334,28 +353,21 @@ def make_all_object_parts_pending(
             raise RuntimeError(f"Object {bucket_name}/{object_key} not found")
         object_id = str(row[0])
 
-        # Set all parts to pending (both base and appended)
+        # Mark all backend registrations as deleted so pipeline hydration cannot use them.
+        # This models a state where the content is still readable from cache, but workers
+        # have not yet registered backend identifiers.
         cur.execute(
             """
-            UPDATE parts
-            SET cid_id = NULL, ipfs_cid = 'pending'
-            WHERE object_id = %s
+            UPDATE chunk_backend cb
+               SET deleted = true,
+                   deleted_at = now()
+              FROM part_chunks pc
+              JOIN parts p ON p.part_id = pc.part_id
+             WHERE cb.chunk_id = pc.id
+               AND p.object_id = %s
+               AND NOT cb.deleted
             """,
             (object_id,),
-        )
-
-        # Also set object-level CID to pending (in object_versions table) for current version
-        cur.execute(
-            """
-            UPDATE object_versions ov
-               SET cid_id = NULL, ipfs_cid = 'pending'
-            FROM objects o
-            WHERE ov.object_id = o.object_id
-              AND ov.object_id = %s
-              AND o.object_id = %s
-              AND ov.object_version = o.current_object_version
-            """,
-            (object_id, object_id),
         )
 
         conn.commit()

@@ -1,9 +1,10 @@
 import asyncio
-import hashlib
-import json
 import logging
 import random
 import time
+from abc import ABC
+from abc import abstractmethod
+from collections.abc import AsyncIterator
 from types import TracebackType
 from typing import Any
 from typing import List
@@ -18,11 +19,45 @@ from hippius_s3.dlq.upload_dlq import UploadDLQManager
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
-from hippius_s3.services.hippius_api_service import HippiusApiClient
 from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
+
+
+class UploadResponse(BaseModel):
+    id: str
+    cid: str
+    status: str
+    size_bytes: int = 0
+
+
+class BackendClient(ABC):
+    @abstractmethod
+    async def upload_file_and_get_cid(
+        self,
+        file_data: bytes,
+        file_name: str,
+        content_type: str,
+        account_ss58: str,
+    ) -> UploadResponse:
+        pass
+
+    @abstractmethod
+    async def download_file(
+        self,
+        file_id: str,
+        account_ss58: str,
+        chunk_size: int = 65536,
+    ) -> AsyncIterator[bytes]:
+        pass
+
+    @abstractmethod
+    async def delete_file(
+        self,
+        file_id: str,
+    ) -> Any:
+        pass
 
 
 class ChunkUploadResult(BaseModel):
@@ -57,7 +92,6 @@ def classify_error(error: Exception) -> str:
             "unavailable",
             "throttled",
             "rate limit",
-            "manifest_pending",
             "part_meta_not_ready",
             "part_row_missing",
         ]
@@ -81,16 +115,18 @@ class Uploader:
         redis_client: async_redis.Redis,  # type: ignore[type-arg]
         redis_queues_client: async_redis.Redis,  # type: ignore[type-arg]
         config: Any,
+        backend_name: str,
+        backend_client: BackendClient,
     ) -> None:
-        # Support either a Pool (has acquire) or a single Connection
         self.db = db_pool
         self.redis_client = redis_client
         self.redis_queues_client = redis_queues_client
         self.config = config
+        self.backend_name = backend_name
+        self.backend_client = backend_client
         self.obj_cache = RedisObjectPartsCache(redis_client)
-        # Primary source: filesystem store (authoritative, survives Redis eviction)
         self.fs_store = FileSystemPartsStore(config.object_cache_dir)
-        self.dlq_manager = UploadDLQManager(redis_queues_client)
+        self.dlq_manager = UploadDLQManager(redis_queues_client, backend_name=backend_name)
 
     class _ConnCtx:
         def __init__(self, conn: Any) -> None:
@@ -119,10 +155,11 @@ class Uploader:
 
     async def process_upload(self, payload: UploadChainRequest) -> List[str]:
         start_time = time.time()
-        logger.info(f"Processing upload object_id={payload.object_id} chunks={len(payload.chunks)}")
+        logger.info(
+            f"Processing upload backend={self.backend_name} object_id={payload.object_id} chunks={len(payload.chunks)}"
+        )
 
-        chunk_start = time.time()
-        _ = await self._upload_chunks(
+        all_chunk_cids = await self._upload_chunks(
             object_id=payload.object_id,
             object_key=payload.object_key,
             chunks=payload.chunks,
@@ -130,40 +167,11 @@ class Uploader:
             object_version=int(payload.object_version or 1),
             account_ss58=payload.address,
         )
-        chunk_duration = time.time() - chunk_start
-
-        manifest_start = time.time()
-        manifest_data = await self._build_and_upload_manifest(
-            object_id=payload.object_id,
-            object_key=payload.object_key,
-            object_version=int(payload.object_version or 1),
-            account_ss58=payload.address,
-        )
-        manifest_duration = time.time() - manifest_start
-
-        if manifest_data.get("status") == "pending":
-            logger.warning(f"Manifest pending for object_id={payload.object_id}, parts missing CIDs - will retry")
-            raise RuntimeError(f"manifest_pending_missing_cids: object_id={payload.object_id}")
-
-        cids_and_sizes = {part["cid"]: part["size_bytes"] for part in manifest_data["parts"]}  # noqa: C416
-        cids_and_sizes[manifest_data["manifest_cid"]] = manifest_data["manifest_size_bytes"]
-
-        logger.info(
-            f"All uploads complete for object_id={payload.object_id}, {len(cids_and_sizes)} CIDs uploaded and pinned"
-        )
-
-        async with self._acquire_conn() as conn:
-            await conn.execute(
-                "UPDATE object_versions SET status = 'uploaded' WHERE object_id = $1 AND object_version = $2",
-                payload.object_id,
-                int(payload.object_version or 1),
-            )
-        logger.info(f"Updated object status to 'uploaded' object_id={payload.object_id}")
 
         total_duration = time.time() - start_time
         logger.info(
-            f"Upload complete object_id={payload.object_id} cids={len(cids_and_sizes)} "
-            f"chunks={chunk_duration:.2f}s manifest={manifest_duration:.2f}s total={total_duration:.2f}s"
+            f"Upload complete backend={self.backend_name} object_id={payload.object_id} "
+            f"chunks={len(all_chunk_cids)} duration={total_duration:.2f}s"
         )
 
         get_metrics_collector().record_uploader_operation(
@@ -173,7 +181,7 @@ class Uploader:
             duration=total_duration,
         )
 
-        return list(cids_and_sizes.keys())
+        return all_chunk_cids
 
     async def _upload_chunks(
         self,
@@ -258,13 +266,11 @@ class Uploader:
             )
             resolved_upload_id = object_id
 
-        # Look up part_id and sizing metadata for part_chunks upsert
+        # Look up part_id for chunk_backend insert
         async with self._acquire_conn() as conn:
             part_row = await conn.fetchrow(
                 """
-                SELECT p.part_id,
-                       COALESCE(p.chunk_size_bytes, 0) AS chunk_size_bytes,
-                       COALESCE(p.size_bytes, 0) AS size_bytes
+                SELECT p.part_id
                 FROM parts p
                 WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = $3
                 LIMIT 1
@@ -274,8 +280,6 @@ class Uploader:
                 int(object_version),
             )
         part_id: Optional[str] = str(part_row[0]) if part_row else None
-        part_chunk_size: int = int(part_row[1] or 0) if part_row else 0
-        part_plain_size: int = int(part_row[2] or 0) if part_row else 0
 
         if num_chunks_meta > 0 and not part_id:
             logger.warning(
@@ -291,188 +295,52 @@ class Uploader:
         if num_chunks_meta > 0 and part_id:
             all_chunk_cids: list[str] = []
             for ci in range(num_chunks_meta):
-                # Read from FS store (authoritative source)
                 piece = await self.fs_store.get_chunk(object_id, int(object_version), part_number, ci)
                 if not isinstance(piece, (bytes, bytearray)):
                     raise RuntimeError("missing_cipher_chunk")
-                async with HippiusApiClient() as api_client:
-                    mangled_file_name = f"{object_id}.part{part_number}.chunk{ci}"
-                    mangled_file_name = hashlib.md5(mangled_file_name.encode()).hexdigest()
 
-                    chunk_upload_result = await api_client.upload_file_and_get_cid(
-                        file_data=bytes(piece),
-                        file_name=f"s3-{mangled_file_name}",
-                        content_type="application/octet-stream",
-                        account_ss58=account_ss58,
+                # Look up the chunk UUID from part_chunks so Arion can address it
+                async with self._acquire_conn() as conn:
+                    chunk_id = await conn.fetchval(
+                        "SELECT id FROM part_chunks WHERE part_id = $1 AND chunk_index = $2",
+                        part_id,
+                        int(ci),
                     )
+                if not chunk_id:
+                    raise RuntimeError("part_chunk_row_missing")
+
+                chunk_upload_result = await self.backend_client.upload_file_and_get_cid(
+                    file_data=bytes(piece),
+                    file_name=str(chunk_id),
+                    content_type="application/octet-stream",
+                    account_ss58=account_ss58,
+                )
+
                 piece_cid = str(chunk_upload_result.cid)
                 piece_file_id = str(chunk_upload_result.id)
                 all_chunk_cids.append(piece_cid)
 
                 logger.info(
-                    f"Uploaded chunk: object_id={object_id} part={part_number} chunk={ci} "
-                    f"file_id={piece_file_id} cid={piece_cid} status={chunk_upload_result.status}"
+                    f"Uploaded chunk: backend={self.backend_name} object_id={object_id} part={part_number} "
+                    f"chunk={ci} file_id={piece_file_id} cid={piece_cid} status={chunk_upload_result.status}"
                 )
-
-                if part_chunk_size > 0 and part_plain_size > 0 and num_chunks_meta > 0:
-                    if ci < num_chunks_meta - 1:
-                        pt_len = int(part_chunk_size)
-                    else:
-                        pt_len = max(0, int(part_plain_size) - int(part_chunk_size) * int(num_chunks_meta - 1))
-                else:
-                    pt_len = None
 
                 async with self._acquire_conn() as conn:
-                    await conn.execute(
-                        get_query("upsert_part_chunk"),
+                    await conn.fetchval(
+                        get_query("insert_chunk_backend"),
                         part_id,
                         int(ci),
+                        self.backend_name,
                         piece_cid,
-                        int(len(piece)),
-                        int(pt_len) if isinstance(pt_len, int) else None,
-                        None,
-                        piece_file_id,
                     )
-
-                    # Increment storage backend counter after successful upload
-                    backend_count = await conn.fetchval(
-                        get_query("increment_chunk_backend_count"),
-                        part_id,
-                        int(ci),
-                    )
-                    logger.debug(
-                        f"Incremented backend count to {backend_count}: "
-                        f"object_id={object_id} part={part_number} chunk={ci}"
-                    )
-
-            # Set parts.ipfs_cid to first chunk CID for manifest compatibility
-            first_chunk_cid = all_chunk_cids[0] if all_chunk_cids else ""
-            async with self._acquire_conn() as conn:
-                cid_row = await conn.fetchrow(get_query("upsert_cid"), first_chunk_cid) if first_chunk_cid else None
-            cid_id = cid_row["id"] if cid_row else None
-            async with self._acquire_conn() as conn:
-                await conn.execute(
-                    """
-                    UPDATE parts p
-                    SET ipfs_cid = $3, cid_id = COALESCE($4, cid_id)
-                    WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = $5
-                    """,
-                    object_id,
-                    part_number,
-                    first_chunk_cid,
-                    cid_id,
-                    int(object_version),
-                )
 
             logger.debug(
-                f"Uploaded {num_chunks_meta} chunk pieces for object_id={object_id} part={part_number}; all_cids={len(all_chunk_cids)}"
+                f"Uploaded {num_chunks_meta} chunks backend={self.backend_name} object_id={object_id} "
+                f"part={part_number} cids={len(all_chunk_cids)}"
             )
             return ChunkUploadResult(cids=all_chunk_cids, part_number=part_number)
 
         raise RuntimeError("part_meta_not_ready")
-
-    async def _build_and_upload_manifest(
-        self,
-        object_id: str,
-        object_key: str,
-        object_version: int,
-        account_ss58: str,
-    ) -> dict:
-        async with self._acquire_conn() as conn:
-            logger.debug(f"Building manifest for object_id={object_id}")
-
-            rows = await conn.fetch(
-                """
-                SELECT p.part_number,
-                       COALESCE(c.cid, p.ipfs_cid) AS cid,
-                       p.size_bytes::bigint AS size_bytes
-                FROM parts p
-                LEFT JOIN cids c ON p.cid_id = c.id
-                WHERE p.object_id = $1 AND p.object_version = $2
-                ORDER BY p.part_number
-                """,
-                object_id,
-                object_version,
-            )
-            parts_data = []
-            for r in rows:
-                part_number = int(r[0])
-                cid_raw = r[1]
-                cid = str(cid_raw).strip() if cid_raw else None
-                size = int(r[2] or 0)
-                if size == 0:
-                    cid = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
-                elif not cid or cid.lower() in {"", "none", "pending"}:
-                    logger.debug(f"Manifest deferred: missing CID for part {part_number} (object_id={object_id})")
-                    return {"status": "pending"}
-                parts_data.append({"part_number": part_number, "cid": cid, "size_bytes": size})
-
-            obj_row = await conn.fetchrow(
-                """
-                SELECT content_type
-                FROM object_versions
-                WHERE object_id = $1 AND object_version = $2
-                """,
-                object_id,
-                object_version,
-            )
-            content_type = obj_row["content_type"] if obj_row else "application/octet-stream"
-
-            manifest_data = {
-                "object_id": object_id,
-                "object_key": object_key,
-                "appendable": True,
-                "content_type": content_type,
-                "parts": parts_data,
-            }
-
-            manifest_json = json.dumps(manifest_data)
-            logger.debug(f"Manifest built with {len(parts_data)} parts for object_id={object_id}")
-
-            async with HippiusApiClient() as api_client:
-                mangled_file_name = f"{object_id}.manifest"
-                mangled_file_name = hashlib.md5(mangled_file_name.encode()).hexdigest()
-
-                manifest_upload_result = await api_client.upload_file_and_get_cid(
-                    file_data=manifest_json.encode(),
-                    file_name=f"s3-{mangled_file_name}",
-                    content_type="application/json",
-                    account_ss58=account_ss58,
-                )
-            if not manifest_upload_result.cid:
-                raise ValueError("manifest_publish_missing_cid")
-
-            manifest_cid = str(manifest_upload_result.cid)
-            manifest_file_id = str(manifest_upload_result.id)
-
-            logger.info(
-                f"Uploaded manifest: object_id={object_id} file_id={manifest_file_id} "
-                f"cid={manifest_cid} status={manifest_upload_result.status}"
-            )
-
-            cid_row = await conn.fetchrow(get_query("upsert_cid"), manifest_cid)
-            cid_id = cid_row["id"] if cid_row else None
-
-            await conn.execute(
-                """
-                UPDATE object_versions
-                SET ipfs_cid = $3,
-                    cid_id = COALESCE($4, cid_id),
-                    manifest_api_file_id = $5,
-                    status = 'pinning'
-                WHERE object_id = $1 AND object_version = $2
-                """,
-                object_id,
-                object_version,
-                manifest_cid,
-                cid_id,
-                manifest_file_id,
-            )
-
-            manifest_data["manifest_cid"] = manifest_cid
-            manifest_data["manifest_size_bytes"] = manifest_upload_result.size_bytes
-
-            return manifest_data
 
     async def _push_to_dlq(self, payload: UploadChainRequest, last_error: str, error_type: str) -> None:
         """Push a failed request to the Dead-Letter Queue."""

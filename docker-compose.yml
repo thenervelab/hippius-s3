@@ -19,9 +19,13 @@ services:
     depends_on:
       api:
         condition: service_healthy
-      uploader:
+      ipfs-uploader:
         condition: service_healthy
-      downloader:
+      arion-uploader:
+        condition: service_healthy
+      ipfs-downloader:
+        condition: service_healthy
+      arion-downloader:
         condition: service_healthy
       db:
         condition: service_healthy
@@ -299,7 +303,7 @@ services:
     networks:
       - hippius_net
 
-  uploader:
+  ipfs-uploader:
     build:
       context: .
       dockerfile: workers/Dockerfile
@@ -318,14 +322,12 @@ services:
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
-      - WORKER_SCRIPT=workers/run_uploader_in_loop.py
+      - WORKER_SCRIPT=workers/run_ipfs_uploader_in_loop.py
       - ENABLE_WATCHFILES=true
       - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
     volumes:
       - .:/app
-      # Shared object parts FS store (authoritative for uploader reads)
       - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
-      # KMS certificates for KEK wrapping (mTLS)
       - /var/lib/hippius/kms:/kms_certs:ro
     healthcheck:
       test: ["CMD-SHELL", "exit 0"]
@@ -336,7 +338,40 @@ services:
     networks:
       - hippius_net
 
-  unpinner:
+  arion-uploader:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    env_file:
+      - .env.defaults
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-queues:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - WORKER_SCRIPT=workers/run_arion_uploader_in_loop.py
+      - ENABLE_WATCHFILES=true
+      - HIPPIUS_ARION_BASE_URL=${HIPPIUS_ARION_BASE_URL:-https://arion.hippius.com/}
+    volumes:
+      - .:/app
+      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
+      - /var/lib/hippius/kms:/kms_certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exit 0"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    networks:
+      - hippius_net
+
+  ipfs-unpinner:
     build:
       context: .
       dockerfile: workers/Dockerfile
@@ -361,13 +396,43 @@ services:
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
-      - WORKER_SCRIPT=workers/run_unpinner_in_loop.py
+      - WORKER_SCRIPT=workers/run_ipfs_unpinner_in_loop.py
       - ENABLE_WATCHFILES=true
       - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
     networks:
       - hippius_net
 
-  downloader:
+  arion-unpinner:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    env_file:
+      - .env.defaults
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-queues:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD-SHELL", "exit 0" ]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    deploy:
+      replicas: 1
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - WORKER_SCRIPT=workers/run_arion_unpinner_in_loop.py
+      - ENABLE_WATCHFILES=true
+    networks:
+      - hippius_net
+
+  ipfs-downloader:
     build:
       context: .
       dockerfile: workers/Dockerfile
@@ -386,16 +451,48 @@ services:
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
-      - WORKER_SCRIPT=workers/run_downloader_in_loop.py
+      - WORKER_SCRIPT=workers/run_ipfs_downloader_in_loop.py
       - ENABLE_WATCHFILES=true
       - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
     volumes:
-      # Shared object parts FS store (not required for downloader, but harmless)
       - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
-      # KMS certificates for KEK wrapping (mTLS)
       - /var/lib/hippius/kms:/kms_certs:ro
     healthcheck:
-      test: [ "CMD-SHELL", "exit 0" ]
+      test: ["CMD-SHELL", "exit 0"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    networks:
+      - hippius_net
+
+  arion-downloader:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    env_file:
+      - .env.defaults
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-queues:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - WORKER_SCRIPT=workers/run_arion_downloader_in_loop.py
+      - ENABLE_WATCHFILES=true
+      - HIPPIUS_ARION_BASE_URL=${HIPPIUS_ARION_BASE_URL:-https://arion.hippius.com/}
+    volumes:
+      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
+      - /var/lib/hippius/kms:/kms_certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exit 0"]
       interval: 5s
       timeout: 3s
       retries: 3

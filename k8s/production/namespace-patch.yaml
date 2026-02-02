@@ -1,7 +1,0 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: hippius-s3-prod
-  labels:
-    app: hippius-s3
-    environment: production

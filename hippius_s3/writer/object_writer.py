@@ -4,6 +4,8 @@ import asyncio
 import hashlib
 import json
 import uuid
+from datetime import datetime
+from datetime import timezone
 from typing import Any
 from typing import AsyncIterator
 
@@ -48,6 +50,7 @@ class ObjectWriter:
         content_type: str,
         metadata: dict[str, Any],
         storage_version_target: int,
+        upload_backends: list[str],
     ) -> int:
         row = await self.db.fetchrow(
             get_query("create_migration_version"),
@@ -55,6 +58,7 @@ class ObjectWriter:
             content_type,
             json.dumps(metadata),
             int(storage_version_target),
+            upload_backends,
         )
         if not row:
             raise RuntimeError("Failed to create migration version")
@@ -162,9 +166,16 @@ class ObjectWriter:
             etag=md5_hash,
             chunk_size_bytes=int(chunk_size),
             object_version=int(object_version),
+            chunk_cipher_sizes=[len(ct) for ct in ct_chunks],
         )
 
-        return PutResult(etag=md5_hash, size_bytes=len(body_bytes), upload_id=str(upload_id))
+        return PutResult(
+            object_id=str(object_id),
+            etag=md5_hash,
+            size_bytes=len(body_bytes),
+            upload_id=str(upload_id),
+            object_version=int(object_version),
+        )
 
     async def put_simple_stream_full(
         self,
@@ -197,19 +208,39 @@ class ObjectWriter:
         wrapped_dek = None
 
         part_number = 1
-        # Resolve current object_version for this object_id if exists; default to 1 for new objects
-        try:
-            row = await self.db.fetchrow(
-                "SELECT current_object_version FROM objects WHERE object_id = $1",
-                object_id,
+
+        # Reserve the version upfront by upserting with placeholder values
+        # This ensures we write chunks to the correct version from the start
+        with tracer.start_as_current_span(
+            "put_simple_stream_full.reserve_version",
+            attributes={
+                "object_id": object_id,
+                "has_object_id": True,
+            },
+        ):
+            reserve_row = await upsert_object_basic(
+                self.db,
+                object_id=object_id,
+                bucket_id=bucket_id,
+                object_key=object_key,
+                content_type=content_type,
+                metadata=metadata,
+                md5_hash="",
+                size_bytes=0,
+                storage_version=resolved_storage_version,
+                upload_backends=self.config.upload_backends,
             )
-            object_version = int(row["current_object_version"]) if row and row.get("current_object_version") else 1
-        except Exception:
-            object_version = 1
+            # IMPORTANT: `object_id` is authoritative from DB. Under concurrent creates,
+            # our candidate UUID may conflict with an existing (bucket_id, object_key).
+            # We must use the DB-returned object_id for cache keys, crypto binding, and enqueue.
+            if reserve_row and reserve_row.get("object_id") is None:
+                raise RuntimeError("reserve_version_missing_object_id")
+            object_id = str(reserve_row.get("object_id") or object_id) if reserve_row else str(object_id)
+            object_version = int(reserve_row.get("current_object_version") or 1) if reserve_row else 1
 
         if resolved_storage_version >= 5:
             suite_id = "hip-enc/aes256gcm"
-            # New DEK per overwrite/write (object_version is not bumped on overwrite)
+            # New DEK per overwrite/write (this code path reserves a new object_version upfront)
             from hippius_s3.services.envelope_service import generate_dek
             from hippius_s3.services.envelope_service import wrap_dek
             from hippius_s3.services.kek_service import get_or_create_active_bucket_kek
@@ -238,6 +269,7 @@ class ObjectWriter:
 
         pt_buf = bytearray()
         next_chunk_index = 0
+        chunk_cipher_sizes: list[int] = []
 
         async def _encrypt_and_write(buf: bytes) -> None:
             nonlocal total_size, next_chunk_index
@@ -257,6 +289,7 @@ class ObjectWriter:
                 chunk_index=int(next_chunk_index),
                 upload_id="",
             )
+            chunk_cipher_sizes.append(len(ct))
             # Write-through: FS first (fatal), then Redis (best-effort)
             await self.fs_store.set_chunk(
                 object_id,
@@ -306,31 +339,31 @@ class ObjectWriter:
                 },
             )
 
-        # Upsert DB row with final md5/size and storage version
+        # Update the reserved object_versions row with final md5/size
         with tracer.start_as_current_span(
-            "put_simple_stream_full.upsert_metadata",
+            "put_simple_stream_full.update_metadata",
             attributes={
                 "object_id": object_id,
                 "has_object_id": True,
                 "size_bytes": int(total_size),
                 "md5_hash": md5_hash,
+                "object_version": object_version,
                 "storage_version": resolved_storage_version,
             },
         ):
-            row = await upsert_object_basic(
-                self.db,
-                object_id=object_id,
-                bucket_id=bucket_id,
-                object_key=object_key,
-                content_type=content_type,
-                metadata=metadata,
-                md5_hash=md5_hash,
-                size_bytes=int(total_size),
-                storage_version=resolved_storage_version,
+            await self.db.execute(
+                get_query("update_object_version_metadata"),
+                int(total_size),
+                md5_hash,
+                content_type,
+                json.dumps(metadata),
+                datetime.now(timezone.utc),
+                object_id,
+                int(object_version),
             )
-            if row and resolved_storage_version >= 5 and kek_id and wrapped_dek:
-                ov = int(row.get("current_object_version") or object_version or 1)
-                aad = f"hippius-dek:{bucket_id}:{object_id}:{ov}".encode("utf-8")
+
+            if resolved_storage_version >= 5 and kek_id and wrapped_dek:
+                aad = f"hippius-dek:{bucket_id}:{object_id}:{object_version}".encode("utf-8")
                 # Re-wrap with correct object_version AAD (in case object_version differs)
                 from hippius_s3.services.envelope_service import wrap_dek
                 from hippius_s3.services.kek_service import get_bucket_kek_bytes
@@ -352,7 +385,7 @@ class ObjectWriter:
                     kek_id,
                     wrapped_dek,
                     object_id,
-                    int(ov),
+                    int(object_version),
                 )
 
         # Now that we know counts and sizes, write meta last using exact chunk count
@@ -377,21 +410,25 @@ class ObjectWriter:
         )
 
         # Ensure parts table has placeholder for base part (part 1) so append/read paths see it
-        import contextlib
+        await upsert_part_placeholder(
+            self.db,
+            object_id=object_id,
+            upload_id=str(upload_id),
+            part_number=int(part_number),
+            size_bytes=int(total_size),
+            etag=md5_hash,
+            chunk_size_bytes=int(chunk_size),
+            object_version=int(object_version),
+            chunk_cipher_sizes=chunk_cipher_sizes,
+        )
 
-        with contextlib.suppress(Exception):
-            await upsert_part_placeholder(
-                self.db,
-                object_id=object_id,
-                upload_id=str(upload_id),
-                part_number=int(part_number),
-                size_bytes=int(total_size),
-                etag=md5_hash,
-                chunk_size_bytes=int(chunk_size),
-                object_version=int(object_version),
-            )
-
-        return PutResult(etag=md5_hash, size_bytes=int(total_size), upload_id=str(upload_id))
+        return PutResult(
+            object_id=str(object_id),
+            etag=md5_hash,
+            size_bytes=int(total_size),
+            upload_id=str(upload_id),
+            object_version=int(object_version),
+        )
 
     async def _ensure_and_get_v5_dek(
         self,
@@ -542,6 +579,7 @@ class ObjectWriter:
             etag=str(md5_hash),
             chunk_size_bytes=int(chunk_size),
             object_version=int(object_version),
+            chunk_cipher_sizes=[len(ct) for ct in ct_chunks],
         )
 
         return PartResult(etag=md5_hash, size_bytes=file_size, part_number=int(part_number))
@@ -640,6 +678,30 @@ class ObjectWriter:
         upload_id = None
         composite_etag = None
         new_append_version_val = None
+        # Resolve encryption key before acquiring the transaction lock to minimize lock duration
+        chunk_size = self.config.object_chunk_size_bytes
+        sv_row = await self.db.fetchrow(
+            "SELECT storage_version FROM object_versions WHERE object_id=$1 AND object_version=$2",
+            object_id,
+            int(cov),
+        )
+        storage_version = int(sv_row["storage_version"]) if sv_row and sv_row.get("storage_version") is not None else 2
+        suite_id: str | None = "hip-enc/aes256gcm" if storage_version >= 5 else "hip-enc/legacy"
+        if storage_version >= 5:
+            key_bytes = await self._ensure_and_get_v5_dek(
+                bucket_id=bucket_id,
+                object_id=object_id,
+                object_version=int(cov),
+                chunk_size=int(chunk_size),
+                suite_id=str(suite_id),
+                rotate=False,
+            )
+        else:
+            key_bytes = await get_or_create_encryption_key_bytes(
+                main_account_id=account_address, bucket_name=bucket_name
+            )
+
+        ct_chunks: list[bytes] = []
         async with self.db.transaction():
             # 1) Lock the current version row and re-check CAS atomically
             locked = await self.db.fetchrow(
@@ -687,6 +749,18 @@ class ObjectWriter:
                     object_key,
                     object_id,
                 )
+            # Encrypt before inserting part so cipher sizes are available for part_chunks
+            ct_chunks = CryptoService.encrypt_part_to_chunks(
+                incoming_bytes,
+                object_id=object_id,
+                part_number=int(next_part),
+                seed_phrase=seed_phrase,
+                chunk_size=chunk_size,
+                key=key_bytes,
+                suite_id=suite_id,
+                bucket_id=str(bucket_id),
+                upload_id=str(upload_id or ""),
+            )
             await upsert_part_placeholder(
                 self.db,
                 object_id=object_id,
@@ -694,8 +768,9 @@ class ObjectWriter:
                 part_number=int(next_part),
                 size_bytes=int(delta_size),
                 etag=delta_md5,
-                chunk_size_bytes=self.config.object_chunk_size_bytes,
+                chunk_size_bytes=chunk_size,
                 object_version=int(cov),
+                chunk_cipher_sizes=[len(ct) for ct in ct_chunks],
             )
 
             # Recompute composite ETag
@@ -754,39 +829,7 @@ class ObjectWriter:
                 raise AppendPreconditionFailed(int(fresh or 0))
             new_append_version_val = int(updated["append_version"])  # type: ignore
 
-        # Cache write-through
-        chunk_size = self.config.object_chunk_size_bytes
-        sv_row = await self.db.fetchrow(
-            "SELECT storage_version FROM object_versions WHERE object_id=$1 AND object_version=$2",
-            object_id,
-            int(cov),
-        )
-        storage_version = int(sv_row["storage_version"]) if sv_row and sv_row.get("storage_version") is not None else 2
-        suite_id: str | None = "hip-enc/aes256gcm" if storage_version >= 5 else "hip-enc/legacy"
-        if storage_version >= 5:
-            key_bytes = await self._ensure_and_get_v5_dek(
-                bucket_id=bucket_id,
-                object_id=object_id,
-                object_version=int(cov),
-                chunk_size=int(chunk_size),
-                suite_id=str(suite_id),
-                rotate=False,
-            )
-        else:
-            key_bytes = await get_or_create_encryption_key_bytes(
-                main_account_id=account_address, bucket_name=bucket_name
-            )
-        ct_chunks = CryptoService.encrypt_part_to_chunks(
-            incoming_bytes,
-            object_id=object_id,
-            part_number=int(next_part),
-            seed_phrase=seed_phrase,
-            chunk_size=chunk_size,
-            key=key_bytes,
-            suite_id=suite_id,
-            bucket_id=str(bucket_id),
-            upload_id=str(upload_id or ""),
-        )
+        # Cache write-through (outside transaction)
         ttl = self.config.cache_ttl_seconds
         writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
         await writer.write_chunks(object_id, int(cov), int(next_part), ct_chunks)

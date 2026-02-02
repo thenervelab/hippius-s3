@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from hippius_s3.config import get_config
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
-from hippius_s3.queue import enqueue_upload_request
+from hippius_s3.queue import enqueue_upload_to_backends
 
 
 async def enqueue_upload(
@@ -18,6 +19,7 @@ async def enqueue_upload(
     chunk_ids: Iterable[int],
     ray_id: str,
 ) -> None:
+    config = get_config()
     payload = UploadChainRequest(
         address=address,
         bucket_name=bucket_name,
@@ -27,5 +29,7 @@ async def enqueue_upload(
         chunks=[Chunk(id=int(i)) for i in chunk_ids],
         upload_id=str(upload_id),
         ray_id=ray_id,
+        upload_backends=config.upload_backends,
     )
-    await enqueue_upload_request(payload)
+
+    await enqueue_upload_to_backends(payload)

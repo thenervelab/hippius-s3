@@ -91,3 +91,52 @@ def clear_kek_cache() -> None:
     # 2. Restart the service
     # 3. Use a very short TTL in test config
     pass
+
+
+def get_object_versioning_info(bucket_name: str, object_key: str, *, dsn: str | None = None) -> dict[str, Any]:
+    """Get object versioning information for testing.
+
+    Returns dict with keys:
+      - object_id: UUID of the object
+      - current_object_version: Current version number
+      - versions: List of tuples (object_version, size_bytes, md5_hash)
+      - part_counts: List of tuples (object_version, part_count)
+    """
+    dsn = dsn or get_main_dsn()
+    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        # Get object_id and current version
+        cur.execute(
+            """
+            SELECT object_id, current_object_version
+            FROM objects
+            WHERE bucket_id = (SELECT bucket_id FROM buckets WHERE bucket_name = %s)
+              AND object_key = %s
+            """,
+            (bucket_name, object_key),
+        )
+        obj_row = cur.fetchone()
+        if not obj_row:
+            raise RuntimeError(f"Object {bucket_name}/{object_key} not found")
+
+        object_id, current_version = obj_row
+
+        # Get all versions
+        cur.execute(
+            "SELECT object_version, size_bytes, md5_hash FROM object_versions WHERE object_id = %s ORDER BY object_version",
+            (object_id,),
+        )
+        versions = cur.fetchall()
+
+        # Get part counts per version
+        cur.execute(
+            "SELECT object_version, COUNT(*) FROM parts WHERE object_id = %s GROUP BY object_version ORDER BY object_version",
+            (object_id,),
+        )
+        part_counts = cur.fetchall()
+
+        return {
+            "object_id": str(object_id),
+            "current_object_version": int(current_version),
+            "versions": versions,
+            "part_counts": part_counts,
+        }
