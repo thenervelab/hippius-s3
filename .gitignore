@@ -73,3 +73,5 @@ schema.sql
 tests/e2e/certs/*.key
 tests/e2e/certs/*.crt
 tests/e2e/certs/*.srl
+
+CLAUDE.md

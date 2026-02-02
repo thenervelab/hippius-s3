@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-"""Migration script for Hippius S3 database setup.
-
-Handles both application database migrations and Hippius SDK keystore initialization.
-"""
+"""Migration script for Hippius S3 database setup."""
 
 import logging
 import os
 import subprocess
 import sys
 import time
-from pathlib import Path
 from typing import Optional
 
 
@@ -129,34 +125,6 @@ def parse_database_url(url: str) -> dict[str, str]:
     }
 
 
-def setup_keystore(key_store_url: str) -> None:
-    """Set up Hippius SDK keystore."""
-    logger.info(f"Setting up keystore with database: {mask_database_url(key_store_url)}")
-
-    # Configure keystore
-    run_command(["hippius", "config", "set", "key_storage", "enabled", "True"])
-    run_command(["hippius", "config", "set", "key_storage", "database_url", key_store_url])
-
-    # Initialize keystore schema via dbmate directly
-    logger.info("Initializing keystore schema with dbmate")
-
-    try:
-        import hippius_sdk  # type: ignore
-
-        migrations_dir = Path(hippius_sdk.__file__).parent / "db" / "migrations"
-        if not migrations_dir.exists():
-            raise FileNotFoundError(f"Keystore migrations directory not found at {migrations_dir}")
-
-        # Run dbmate against the keystore migrations using the keystore DATABASE_URL
-        env = os.environ.copy()
-        env["DATABASE_URL"] = key_store_url
-        run_command(["dbmate", f"--migrations-dir={str(migrations_dir)}", "up"], env=env)
-        logger.info("Keystore migrations applied successfully")
-    except Exception as e:
-        logger.error(f"Keystore migration failed: {e}")
-        raise
-
-
 def main() -> None:
     """Main migration function."""
     logger.info("Starting Hippius S3 migration process")
@@ -167,13 +135,8 @@ def main() -> None:
         logger.error("DATABASE_URL environment variable is required")
         sys.exit(1)
 
-    key_store_url = os.environ.get("HIPPIUS_KEYSTORE_DATABASE_URL") or database_url
-    skip_keystore = os.environ.get("SKIP_KEYSTORE_SETUP", "false").lower() == "true"
-
     # Log configuration
     logger.info(f"App database: {mask_database_url(database_url)}")
-    logger.info(f"Keystore database: {mask_database_url(key_store_url)}")
-    logger.info(f"Skip keystore setup: {skip_keystore}")
 
     # Wait for database
     wait_for_database(database_url)
@@ -181,19 +144,6 @@ def main() -> None:
     # Run application database migrations
     logger.info("Running application database migrations")
     run_command(["dbmate", "up"])
-
-    # Set up keystore (unless skipped)
-    if not skip_keystore:
-        setup_keystore(key_store_url)
-    else:
-        logger.info("Skipping keystore setup as requested")
-
-    # Configure IPFS if environment variables are set
-    ipfs_api_urls = (os.environ.get("HIPPIUS_IPFS_API_URLS") or "").strip()
-    if ipfs_api_urls:
-        first_api_url = ipfs_api_urls.split(",", 1)[0].strip()
-        logger.info(f"Setting IPFS API URL (first of HIPPIUS_IPFS_API_URLS): {first_api_url}")
-        run_command(["hippius", "config", "set", "ipfs", "api_url", first_api_url])
 
     logger.info("Migration process completed successfully")
 
