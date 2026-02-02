@@ -128,6 +128,9 @@ spec:
           volumeMounts:
             - name: object-cache
               mountPath: /var/lib/hippius/object_cache
+            - name: kms-certs
+              mountPath: /kms_certs
+              readOnly: true
           livenessProbe:
             exec:
               command:
@@ -149,6 +152,10 @@ spec:
         - name: object-cache
           persistentVolumeClaim:
             claimName: object-cache-pvc
+        - name: kms-certs
+          secret:
+            secretName: ovh-kms-certs
+            defaultMode: 0400
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -274,6 +281,9 @@ spec:
             - name: object-cache
               mountPath: /var/lib/hippius/object_cache
               readOnly: false
+            - name: kms-certs
+              mountPath: /kms_certs
+              readOnly: true
           livenessProbe:
             exec:
               command:
@@ -295,6 +305,10 @@ spec:
         - name: object-cache
           persistentVolumeClaim:
             claimName: object-cache-pvc
+        - name: kms-certs
+          secret:
+            secretName: ovh-kms-certs
+            defaultMode: 0400
 ---
 apiVersion: apps/v1
 kind: Deployment

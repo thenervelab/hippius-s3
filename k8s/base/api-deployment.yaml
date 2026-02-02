@@ -136,6 +136,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_OVH_KMS_OKMS_ID
+            - name: FRONTEND_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: FRONTEND_HMAC_SECRET
           volumeMounts:
             - name: object-cache
               mountPath: /var/lib/hippius/object_cache
@@ -143,6 +148,9 @@ spec:
               mountPath: /var/lib/hippius/persist
             - name: dlq
               mountPath: /tmp/hippius_dlq
+            - name: kms-certs
+              mountPath: /kms_certs
+              readOnly: true
           startupProbe:
             httpGet:
               path: /health
@@ -182,3 +190,7 @@ spec:
         - name: dlq
           persistentVolumeClaim:
             claimName: dlq-pvc
+        - name: kms-certs
+          secret:
+            secretName: ovh-kms-certs
+            defaultMode: 0400
