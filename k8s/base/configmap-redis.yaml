@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+data:
+  redis.conf: |
+    maxmemory 512mb
+    maxmemory-policy allkeys-lru
+    appendonly no
+    save ""
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-queues-config
+data:
+  redis.conf: |
+    maxmemory 1gb
+    maxmemory-policy allkeys-lru
+    appendonly yes
+    appendfsync everysec
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-accounts-config
+data:
+  redis.conf: |
+    maxmemory 512mb
+    maxmemory-policy noeviction
+    appendonly yes
+    appendfsync everysec
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-chain-config
+data:
+  redis.conf: |
+    maxmemory 512mb
+    maxmemory-policy noeviction
+    appendonly yes
+    appendfsync everysec
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-rate-limiting-config
+data:
+  redis.conf: |
+    maxmemory 1gb
+    maxmemory-policy allkeys-lru
+    appendonly no
+    save ""
