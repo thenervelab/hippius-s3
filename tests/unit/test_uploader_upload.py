@@ -181,6 +181,79 @@ async def test_upload_stores_backend_identifier_in_chunk_backend(mock_config, mo
 
 
 @pytest.mark.asyncio
+async def test_process_upload_skips_deleted_object(mock_config, mock_db_pool):
+    redis = FakeRedis()
+    redis_queues = FakeRedis()
+
+    mock_backend_client = MagicMock()
+    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
+
+    mock_conn = AsyncMock()
+    mock_conn.fetchval = AsyncMock(return_value=True)
+    mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
+
+    payload = UploadChainRequest(
+        substrate_url="http://test",
+        address="user1",
+        subaccount="user1",
+        subaccount_seed_phrase="test-seed",
+        bucket_name="test-bucket",
+        object_key="test-key",
+        should_encrypt=False,
+        object_id="obj-123",
+        object_version=1,
+        chunks=[Chunk(id=1)],
+        upload_id="upload-123",
+        attempts=1,
+        first_enqueued_at=1234567890.0,
+        request_id="req-456",
+    )
+
+    with patch.object(uploader, "_upload_chunks", new_callable=AsyncMock) as mock_upload_chunks:
+        result = await uploader.process_upload(payload)
+
+        assert result == []
+        mock_upload_chunks.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_process_upload_skips_when_object_row_missing(mock_config, mock_db_pool):
+    redis = FakeRedis()
+    redis_queues = FakeRedis()
+
+    mock_backend_client = MagicMock()
+    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
+
+    mock_conn = AsyncMock()
+    # Query returns True when the objects row doesn't exist (outer COALESCE defaults to TRUE)
+    mock_conn.fetchval = AsyncMock(return_value=True)
+    mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
+
+    payload = UploadChainRequest(
+        substrate_url="http://test",
+        address="user1",
+        subaccount="user1",
+        subaccount_seed_phrase="test-seed",
+        bucket_name="test-bucket",
+        object_key="test-key",
+        should_encrypt=False,
+        object_id="obj-123",
+        object_version=1,
+        chunks=[Chunk(id=1)],
+        upload_id="upload-123",
+        attempts=1,
+        first_enqueued_at=1234567890.0,
+        request_id="req-456",
+    )
+
+    with patch.object(uploader, "_upload_chunks", new_callable=AsyncMock) as mock_upload_chunks:
+        result = await uploader.process_upload(payload)
+
+        assert result == []
+        mock_upload_chunks.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_process_upload_no_longer_calls_pin_on_api(mock_config, mock_db_pool):
     redis = FakeRedis()
     redis_queues = FakeRedis()
@@ -191,6 +264,7 @@ async def test_process_upload_no_longer_calls_pin_on_api(mock_config, mock_db_po
 
     mock_conn = AsyncMock()
     mock_conn.execute = AsyncMock()
+    mock_conn.fetchval = AsyncMock(return_value=False)
     mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
 
     payload = UploadChainRequest(
