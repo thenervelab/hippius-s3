@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import logging
 import random
 import time
@@ -300,12 +299,19 @@ class Uploader:
                 if not isinstance(piece, (bytes, bytearray)):
                     raise RuntimeError("missing_cipher_chunk")
 
-                mangled_file_name = f"{object_id}.part{part_number}.chunk{ci}"
-                mangled_file_name = hashlib.md5(mangled_file_name.encode()).hexdigest()
+                # Look up the chunk UUID from part_chunks so Arion can address it
+                async with self._acquire_conn() as conn:
+                    chunk_id = await conn.fetchval(
+                        "SELECT id FROM part_chunks WHERE part_id = $1 AND chunk_index = $2",
+                        part_id,
+                        int(ci),
+                    )
+                if not chunk_id:
+                    raise RuntimeError("part_chunk_row_missing")
 
                 chunk_upload_result = await self.backend_client.upload_file_and_get_cid(
                     file_data=bytes(piece),
-                    file_name=f"s3-{mangled_file_name}",
+                    file_name=str(chunk_id),
                     content_type="application/octet-stream",
                     account_ss58=account_ss58,
                 )
