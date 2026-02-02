@@ -7,8 +7,10 @@ import pytest
 from fakeredis.aioredis import FakeRedis
 
 from hippius_s3.queue import Chunk
+from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_retry_request
+from hippius_s3.queue import enqueue_unpin_retry_request
 from hippius_s3.queue import initialize_queue_client
 from hippius_s3.queue import move_due_upload_retries
 
@@ -113,3 +115,38 @@ async def test_move_due_upload_retries_respects_max_items() -> None:
     # Check ZSET has remaining items
     remaining = await redis.zcard("ipfs_upload_retries")
     assert remaining == 3
+
+
+@pytest.mark.asyncio
+async def test_enqueue_unpin_retry_request_increments_attempts() -> None:
+    """Test that enqueue_unpin_retry_request increments attempts and stores correctly."""
+    redis = FakeRedis()
+    initialize_queue_client(redis)
+
+    payload = UnpinChainRequest(
+        address="5FakeAddress",
+        object_id="obj-123",
+        object_version=1,
+        attempts=0,
+        request_id="req-unpin-001",
+        first_enqueued_at=time.time(),
+    )
+
+    t0 = time.time()
+    await enqueue_unpin_retry_request(
+        payload, backend_name="arion", delay_seconds=5.0, last_error="no_chunk_backend_rows"
+    )
+
+    members = await redis.zrange("arion_unpin_retries", 0, -1, withscores=True)
+    assert len(members) == 1
+
+    stored_payload = members[0][0]
+    if isinstance(stored_payload, (bytes, bytearray)):
+        stored_payload = stored_payload.decode()
+    score = members[0][1]
+    assert score >= t0 + 4.5  # delay_seconds=5.0 minus small tolerance
+
+    data = json.loads(stored_payload)
+    assert data["attempts"] == 1  # incremented from 0
+    assert data["last_error"] == "no_chunk_backend_rows"
+    assert data["request_id"] == "req-unpin-001"
