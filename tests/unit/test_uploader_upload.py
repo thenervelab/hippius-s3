@@ -76,11 +76,14 @@ async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock
         updated_at="2025-11-27T12:00:00Z",
     )
 
+    chunk_uuid = "aaaabbbb-cccc-dddd-eeee-ffffffffffff"
+
     mock_conn = AsyncMock()
     mock_conn.fetchrow = AsyncMock(
         return_value=MockRow({"part_id": "part-uuid"}),
     )
-    mock_conn.fetchval = AsyncMock(return_value=1)
+    # First fetchval call returns chunk_id (UUID), second is insert_chunk_backend
+    mock_conn.fetchval = AsyncMock(side_effect=[chunk_uuid, 1])
 
     mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
 
@@ -103,11 +106,11 @@ async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock
     assert mock_api_instance.upload_file_and_get_cid.call_count == 1
     call_args = mock_api_instance.upload_file_and_get_cid.call_args
     assert call_args.kwargs["file_data"] == b"encrypted_chunk_data_123"
-    assert call_args.kwargs["file_name"].startswith("s3-")
+    assert call_args.kwargs["file_name"] == chunk_uuid
     assert call_args.kwargs["content_type"] == "application/octet-stream"
     assert call_args.kwargs["account_ss58"] == "5FakeTestAccountAddress123456789012345678901234"
 
-    assert mock_conn.fetchval.call_count >= 1
+    assert mock_conn.fetchval.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -132,11 +135,14 @@ async def test_upload_stores_backend_identifier_in_chunk_backend(mock_config, mo
         updated_at="2025-11-27T12:00:00Z",
     )
 
+    chunk_uuid = "aaaabbbb-cccc-dddd-eeee-ffffffffffff"
+
     mock_conn = AsyncMock()
     mock_conn.fetchrow = AsyncMock(
         return_value=MockRow({"part_id": "part-uuid"}),
     )
-    mock_conn.fetchval = AsyncMock(return_value=1)
+    # First fetchval call returns chunk_id (UUID), second is insert_chunk_backend
+    mock_conn.fetchval = AsyncMock(side_effect=[chunk_uuid, 1])
 
     mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
 

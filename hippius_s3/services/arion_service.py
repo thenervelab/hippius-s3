@@ -371,23 +371,21 @@ class ArionClient:
         """
 
         hex_user = hashlib.sha256(account_ss58.encode("utf-8")).hexdigest()
-        files = [
-            ("account_ss58", hex_user),
-            (
-                "file",
-                (
-                    file_name,
-                    file_data,
-                    "application/octet-stream",
-                    {"Content-Length": str(len(file_data))},
-                ),
+        files = {
+            "file": (
+                file_name,
+                file_data,
+                "application/octet-stream",
+                {"Content-Length": str(len(file_data))},
             ),
-        ]
+        }
+        data = {"account_ss58": hex_user}
 
         headers = self._get_headers(account_ss58)
         response = await self._client.post(
             "/upload",
-            files=files,  # type: ignore[arg-type]
+            files=files,
+            data=data,
             headers=headers,
         )
         response_json = response.json()
