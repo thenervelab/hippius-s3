@@ -348,8 +348,6 @@ async def run_janitor_loop():
         logger.debug("Metrics initialization failed; continuing without metrics", exc_info=True)
 
     logger.info("Starting janitor service...")
-    logger.info(f"Database: {config.database_url}")
-    logger.info(f"Redis (for DLQ checks): {config.redis_queues_url}")
     logger.info(f"FS store root: {config.object_cache_dir}")
     logger.info(f"MPU stale threshold: {config.mpu_stale_seconds}s")
     logger.info(f"FS GC max age: {config.fs_cache_gc_max_age_seconds}s")

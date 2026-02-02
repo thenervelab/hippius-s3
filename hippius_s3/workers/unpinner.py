@@ -179,9 +179,6 @@ async def run_unpinner_loop(
 
     logger.info(f"Starting {backend_name} unpinner service...")
     logger.info(f"Queue: {queue_name}")
-    logger.info(f"Redis URL: {config.redis_url}")
-    logger.info(f"Redis Queues URL: {config.redis_queues_url}")
-    logger.info(f"Database: {config.database_url}")
 
     try:
         while True:

@@ -53,10 +53,6 @@ async def run_arion_uploader_loop():
 
     logger.info("Starting Arion uploader service...")
     logger.info("Backend: arion")
-    logger.info(f"Arion base URL: {config.arion_base_url}")
-    logger.info(f"Redis URL: {config.redis_url}")
-    logger.info(f"Redis Queues URL: {config.redis_queues_url}")
-    logger.info(f"Database pool created: {config.database_url}")
 
     uploader = Uploader(
         db_pool,

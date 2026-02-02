@@ -120,9 +120,6 @@ async def run_orphan_checker_loop() -> None:
     initialize_cache_client(redis_client)
 
     logger.info("Starting orphan checker service...")
-    logger.info(f"Database URL: {config.database_url}")
-    logger.info(f"Redis URL: {config.redis_url}")
-    logger.info(f"Redis Queues URL: {config.redis_queues_url}")
     logger.info(f"Check interval: {config.orphan_checker_loop_sleep} seconds")
     logger.info(f"Batch size: {config.orphan_checker_batch_size} files")
     if config.orphan_checker_account_whitelist:

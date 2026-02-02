@@ -52,9 +52,6 @@ async def run_ipfs_uploader_loop():
 
     logger.info("Starting IPFS uploader service...")
     logger.info(f"Backend: {BACKEND_NAME}")
-    logger.info(f"Redis URL: {config.redis_url}")
-    logger.info(f"Redis Queues URL: {config.redis_queues_url}")
-    logger.info(f"Database pool created: {config.database_url}")
 
     uploader = Uploader(
         db_pool,
