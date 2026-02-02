@@ -28,66 +28,7 @@ metadata:
   name: redis
 spec:
   selector:
-    app: redis
+    app: redis-acl
   ports:
     - port: 6379
       targetPort: 6379
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: redis-queues
-spec:
-  selector:
-    app: redis-queues
-  ports:
-    - port: 6379
-      targetPort: 6379
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: redis-accounts
-spec:
-  selector:
-    app: redis-accounts
-  ports:
-    - port: 6379
-      targetPort: 6379
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: redis-chain
-spec:
-  selector:
-    app: redis-chain
-  ports:
-    - port: 6379
-      targetPort: 6379
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: redis-rate-limiting
-spec:
-  selector:
-    app: redis-rate-limiting
-  ports:
-    - port: 6379
-      targetPort: 6379
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: ipfs
-spec:
-  selector:
-    app: ipfs
-  ports:
-    - port: 5001
-      targetPort: 5001
-      name: api
-    - port: 8080
-      targetPort: 8080
-      name: gateway

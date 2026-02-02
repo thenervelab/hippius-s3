@@ -8,10 +8,10 @@ resources:
   - gateway-nodeport.yaml
   - postgres-objectstore.yaml
 
-patchesStrategicMerge:
-  - namespace-patch.yaml
-  - environment-patch.yaml
-  - resource-limits.yaml
+patches:
+  - path: namespace-patch.yaml
+  - path: environment-patch.yaml
+  - path: resource-limits.yaml
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api
