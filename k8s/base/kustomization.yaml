@@ -18,4 +18,5 @@ resources:
   - services.yaml
   - ingress.yaml
   - networkpolicy.yaml
-  # - servicemonitor.yaml  # Uncomment when Prometheus Operator is installed
+  - otel-collector.yaml
+  - servicemonitor.yaml

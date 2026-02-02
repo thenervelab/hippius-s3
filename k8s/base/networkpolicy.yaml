@@ -14,6 +14,13 @@ spec:
             matchLabels:
               kubernetes.io/metadata.name: ingress-nginx
     - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cattle-monitoring-system
+      ports:
+        - port: 8889
+          protocol: TCP
+    - from:
         - ipBlock:
             cidr: 0.0.0.0/0
       ports:

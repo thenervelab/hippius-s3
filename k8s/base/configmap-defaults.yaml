@@ -59,3 +59,5 @@ data:
   HIPPIUS_KMS_MODE: "required"
   HIPPIUS_OVH_KMS_CERT_PATH: "/kms_certs/client.crt"
   HIPPIUS_OVH_KMS_KEY_PATH: "/kms_certs/client.key"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+  OTEL_SERVICE_NAME: "hippius-s3"
