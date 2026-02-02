@@ -37,6 +37,8 @@ spec:
       secret:
         name: postgres-superuser
 
+  enableSuperuserAccess: true
+
   resources:
     requests:
       cpu: 500m
@@ -48,18 +50,8 @@ spec:
   monitoring:
     enablePodMonitor: false
 
-  backup:
-    barmanObjectStore:
-      destinationPath: ""
-      endpointURL: ""
-      s3Credentials:
-        accessKeyId:
-          name: postgres-backup-creds
-          key: ACCESS_KEY_ID
-        secretAccessKey:
-          name: postgres-backup-creds
-          key: ACCESS_KEY_SECRET
-      wal:
-        compression: gzip
-        maxParallel: 2
-    retentionPolicy: "30d"
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: ovh-postgres-backup

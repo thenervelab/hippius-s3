@@ -170,6 +170,19 @@ jobs:
             --namespace=hippius-s3-staging \
             --dry-run=client -o yaml | kubectl apply -f -
 
+      - name: Create postgres backup credentials
+        run: |
+          kubectl create secret generic postgres-backup-creds \
+            --from-literal=ACCESS_KEY_ID='${{ secrets.OVH_BACKUP_ACCESS_KEY_ID }}' \
+            --from-literal=ACCESS_KEY_SECRET='${{ secrets.OVH_BACKUP_SECRET_ACCESS_KEY }}' \
+            --namespace=hippius-s3-staging \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Substitute backup configuration values
+        run: |
+          sed -i "s|OVH_BACKUP_BUCKET_PLACEHOLDER|${{ secrets.OVH_BACKUP_BUCKET }}|g" k8s/staging/postgres-objectstore.yaml
+          sed -i "s|OVH_BACKUP_ENDPOINT_URL_PLACEHOLDER|${{ secrets.OVH_BACKUP_ENDPOINT_URL }}|g" k8s/staging/postgres-objectstore.yaml
+
       - name: Update image tags
         run: |
           SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)

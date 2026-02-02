@@ -5,5 +5,6 @@ metadata:
 spec:
   schedule: "0 2 * * *"
   backupOwnerReference: self
+  method: barmanObjectStore
   cluster:
     name: postgres

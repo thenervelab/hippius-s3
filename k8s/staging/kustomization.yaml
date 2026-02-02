@@ -6,12 +6,12 @@ namespace: hippius-s3-staging
 resources:
   - ../base
   - gateway-nodeport.yaml
+  - postgres-objectstore.yaml
 
 patchesStrategicMerge:
   - namespace-patch.yaml
   - environment-patch.yaml
   - resource-limits.yaml
-  - postgres-backup.yaml
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api
