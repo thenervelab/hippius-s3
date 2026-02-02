@@ -67,9 +67,32 @@ async def process_unpin_request(
             )
 
         if not rows:
+            max_empty_retries = 6
+            attempts = request.attempts or 0
+            if attempts < max_empty_retries:
+                next_attempt = attempts + 1
+                delay_ms = compute_backoff_ms(
+                    next_attempt,
+                    base_ms=config.unpinner_backoff_base_ms,
+                    max_ms=config.unpinner_backoff_max_ms,
+                )
+                worker_logger.info(
+                    f"No {backend_name} identifiers found for object_id={request.object_id} "
+                    f"version={request.object_version}, scheduling retry "
+                    f"(attempt {next_attempt}/{max_empty_retries}, "
+                    f"delay={delay_ms / 1000.0:.1f}s)"
+                )
+                await enqueue_unpin_retry_request(
+                    request,
+                    backend_name=backend_name,
+                    delay_seconds=delay_ms / 1000.0,
+                    last_error="no_chunk_backend_rows",
+                )
+                return
             worker_logger.info(
                 f"No {backend_name} identifiers found for object_id={request.object_id} "
-                f"version={request.object_version}, nothing to unpin"
+                f"version={request.object_version} after {max_empty_retries} retry attempts, "
+                f"nothing to unpin"
             )
             return
 

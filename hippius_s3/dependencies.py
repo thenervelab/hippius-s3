@@ -5,10 +5,8 @@ from typing import Any
 from typing import AsyncGenerator
 
 import redis.asyncio as async_redis
-from cachetools import TTLCache
 from fastapi import HTTPException
 from fastapi import Request
-from hippius_sdk.substrate import SubstrateClient
 from starlette import status
 
 from hippius_s3.config import Config
@@ -18,9 +16,6 @@ from hippius_s3.repositories import UserRepository
 
 
 logger = logging.getLogger(__name__)
-
-# maxsize=1000 allows caching up to 1000 different main accounts
-credit_cache: TTLCache[str, bool] = TTLCache(maxsize=1000, ttl=60)
 
 
 class DBConnection:
@@ -121,58 +116,3 @@ async def extract_seed_phrase(request: Request) -> str:
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Seed phrase not found in request state - HMAC middleware may not be configured",
     )
-
-
-async def check_account_has_credit(
-    subaccount: str,
-    main_account: str,
-    seed_phrase: str,
-    substrate_url: str,
-) -> bool:
-    """
-    Check if the account associated with the seed phrase has enough credit.
-
-    Results are cached for 60 seconds to improve performance and reduce
-    substrate network calls.
-
-    Args:
-        subaccount: Substrate account name.
-        main_account: The main account to check for enough credit
-        seed_phrase: The seed phrase of the account to check
-        substrate_url: the substrate url to use for the credit check.
-
-    Returns:
-        bool: True if the account has credit, False otherwise
-    """
-    # Check cache first
-    if subaccount in credit_cache:
-        logger.debug(f"credit_check_cache_hit {subaccount=}")
-        return bool(credit_cache[subaccount])
-
-    logger.debug(f"credit_check_cache_miss {subaccount=}")
-
-    try:
-        substrate_client = SubstrateClient(
-            url=substrate_url,
-            password=None,
-            account_name=None,
-        )
-        substrate_client.connect(seed_phrase=seed_phrase)
-        credit = await substrate_client.get_free_credits(
-            account_address=main_account,
-            seed_phrase=seed_phrase,
-        )
-
-        has_credit = bool(credit > 0)
-
-        # Cache the result for 60 seconds
-        credit_cache[subaccount] = has_credit
-        logger.debug(f"Cached credit result for subaccount={subaccount} {main_account=} {has_credit} {int(credit)=}")
-
-        return has_credit
-
-    except Exception as e:
-        logger.exception(f"Error in account credit verification: {e}")
-        # Cache negative result for shorter time to allow retries
-        credit_cache[subaccount] = False
-        return False

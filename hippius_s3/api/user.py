@@ -11,13 +11,13 @@ from fastapi import HTTPException
 from fastapi import Query
 from fastapi import Request
 from fastapi.responses import JSONResponse
-from hippius_sdk.substrate import SubstrateClient
 from starlette import status
 
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import DBConnection
 from hippius_s3.dependencies import get_postgres
 from hippius_s3.services.acl_helper import has_public_read_acl
+from hippius_s3.substrate_client import SubstrateClient
 from hippius_s3.utils import get_query
 
 
@@ -132,6 +132,7 @@ async def credits(
             url=config.substrate_url,
         )
         substrate_client.connect(seed_phrase=subaccount_seed)
+        assert substrate_client._account_address is not None
 
         main_account = substrate_client.query_sub_account(
             substrate_client._account_address,

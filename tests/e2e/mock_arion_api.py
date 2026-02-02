@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-# In-memory store keyed by upload_id -> {"bytes": bytes, "account_ss58": str, "file_id": str}
+# In-memory store keyed by file_id (SHA256 of filename) -> {"bytes": bytes, "account_ss58": str, "upload_id": str}
 _store: dict[str, dict] = {}
 
 
@@ -34,7 +34,7 @@ async def upload(file: UploadFile = File(...), account_ss58: str = Form(...)) ->
     # Mirror real Arion: file_id = SHA256(filename)
     file_name = file.filename or "unknown"
     file_id = hashlib.sha256(file_name.encode()).hexdigest()
-    _store[upload_id] = {"bytes": content, "account_ss58": account_ss58, "file_id": file_id}
+    _store[file_id] = {"bytes": content, "account_ss58": account_ss58, "upload_id": upload_id}
     return UploadResult(
         upload_id=upload_id,
         file_id=file_id,
@@ -45,7 +45,7 @@ async def upload(file: UploadFile = File(...), account_ss58: str = Form(...)) ->
 
 @app.get("/download/{account_ss58}/{file_id}")
 async def download(account_ss58: str, file_id: str):
-    # file_id here is actually the upload_id (Arion CID) used as backend_identifier
+    # file_id = SHA256(filename) — same value stored as backend_identifier in chunk_backend
     entry = _store.get(file_id)
     if entry is None:
         raise HTTPException(status_code=404, detail="not found")
