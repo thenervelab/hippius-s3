@@ -909,6 +909,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: REDIS_URL
+            - name: REDIS_QUEUES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_QUEUES_URL
             - name: HIPPIUS_SERVICE_KEY
               valueFrom:
                 secretKeyRef:
