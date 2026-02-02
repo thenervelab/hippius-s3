@@ -56,6 +56,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_SERVICE_KEY
+            - name: ARION_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_SERVICE_KEY
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
@@ -206,11 +211,21 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_SERVICE_KEY
+            - name: ARION_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_SERVICE_KEY
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_AUTH_ENCRYPTION_KEY
+            - name: HIPPIUS_IPFS_API_URLS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_IPFS_API_URLS
             - name: HIPPIUS_ARION_BASE_URL
               value: "https://arion.hippius.com/"
             - name: CACHET_API_KEY
@@ -291,7 +306,7 @@ metadata:
   name: ipfs-downloader
 
 spec:
-  replicas: 5
+  replicas: 1
   selector:
     matchLabels:
       app: ipfs-downloader
@@ -346,6 +361,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_SERVICE_KEY
+            - name: ARION_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_SERVICE_KEY
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
@@ -440,7 +460,7 @@ metadata:
   name: arion-downloader
 
 spec:
-  replicas: 5
+  replicas: 1
   selector:
     matchLabels:
       app: arion-downloader
@@ -490,11 +510,21 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_SERVICE_KEY
+            - name: ARION_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_SERVICE_KEY
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_AUTH_ENCRYPTION_KEY
+            - name: HIPPIUS_IPFS_API_URLS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_IPFS_API_URLS
             - name: HIPPIUS_ARION_BASE_URL
               value: "https://arion.hippius.com/"
             - name: CACHET_API_KEY
@@ -628,6 +658,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_SERVICE_KEY
+            - name: ARION_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_SERVICE_KEY
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
@@ -759,11 +794,21 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_SERVICE_KEY
+            - name: ARION_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_SERVICE_KEY
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_AUTH_ENCRYPTION_KEY
+            - name: HIPPIUS_IPFS_API_URLS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_IPFS_API_URLS
             - name: HIPPIUS_ARION_BASE_URL
               value: "https://arion.hippius.com/"
             - name: FRONTEND_HMAC_SECRET
@@ -869,6 +914,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_SERVICE_KEY
+            - name: ARION_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_SERVICE_KEY
             - name: HIPPIUS_IPFS_API_URLS
               valueFrom:
                 secretKeyRef:
@@ -1004,6 +1054,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_SERVICE_KEY
+            - name: ARION_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_SERVICE_KEY
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:

@@ -9,9 +9,7 @@ spec:
     - Egress
   ingress:
     - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: hippius-s3
+        - podSelector: {}
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: ingress-nginx

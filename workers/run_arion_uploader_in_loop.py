@@ -8,6 +8,8 @@ from pathlib import Path
 import asyncpg
 from pydantic import ValidationError
 
+from hippius_s3.redis_cache import initialize_cache_client
+
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -34,10 +36,6 @@ logger = logging.getLogger(__name__)
 
 
 async def run_arion_uploader_loop():
-    db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=10)
-    redis_client = async_redis.from_url(config.redis_url)
-    redis_queues_client = async_redis.from_url(config.redis_queues_url)
-
     from redis.asyncio import Redis
 
     from hippius_s3.queue import initialize_queue_client
