@@ -1,7 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: uploader
+  name: ipfs-uploader
 
 spec:
   replicas: 1
@@ -9,12 +9,13 @@ spec:
     type: Recreate
   selector:
     matchLabels:
-      app: uploader
+      app: ipfs-uploader
   template:
     metadata:
       labels:
-        app: uploader
+        app: ipfs-uploader
         worker-type: uploader
+        backend: ipfs
     spec:
       initContainers:
         - name: wait-for-services
@@ -24,7 +25,7 @@ spec:
             - -c
             - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379 && nc -z ipfs 5001; do echo waiting for services; sleep 5; done
       containers:
-        - name: uploader
+        - name: ipfs-uploader
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
           imagePullPolicy: Always
           envFrom:
@@ -34,7 +35,7 @@ spec:
                 name: hippius-s3-environment
           env:
             - name: WORKER_SCRIPT
-              value: "workers/run_uploader_in_loop.py"
+              value: "workers/run_ipfs_uploader_in_loop.py"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -65,16 +66,6 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_IPFS_API_URLS
-            - name: HIPPIUS_UPLOAD_QUEUE_NAMES
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: HIPPIUS_UPLOAD_QUEUE_NAMES
-            - name: HIPPIUS_DOWNLOAD_QUEUE_NAMES
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: HIPPIUS_DOWNLOAD_QUEUE_NAMES
             - name: HIPPIUS_IPFS_GET_URL
               valueFrom:
                 secretKeyRef:
@@ -160,18 +151,21 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: downloader
+  name: arion-uploader
 
 spec:
-  replicas: 5
+  replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
-      app: downloader
+      app: arion-uploader
   template:
     metadata:
       labels:
-        app: downloader
-        worker-type: downloader
+        app: arion-uploader
+        worker-type: uploader
+        backend: arion
     spec:
       initContainers:
         - name: wait-for-services
@@ -181,7 +175,7 @@ spec:
             - -c
             - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
       containers:
-        - name: downloader
+        - name: arion-uploader
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
           imagePullPolicy: Always
           envFrom:
@@ -191,7 +185,142 @@ spec:
                 name: hippius-s3-environment
           env:
             - name: WORKER_SCRIPT
-              value: "workers/run_downloader_in_loop.py"
+              value: "workers/run_arion_uploader_in_loop.py"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_URL
+            - name: REDIS_QUEUES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_QUEUES_URL
+            - name: HIPPIUS_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_KEY
+            - name: HIPPIUS_AUTH_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_AUTH_ENCRYPTION_KEY
+            - name: HIPPIUS_ARION_BASE_URL
+              value: "https://arion.hippius.com/"
+            - name: CACHET_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: CACHET_API_KEY
+            - name: CACHET_COMPONENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: CACHET_COMPONENT_ID
+            - name: DISCORD_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DISCORD_WEBHOOK_URL
+            - name: RESUBMISSION_SEED_PHRASE
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: RESUBMISSION_SEED_PHRASE
+            - name: HIPPIUS_OVH_KMS_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_ENDPOINT
+            - name: HIPPIUS_OVH_KMS_DEFAULT_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_DEFAULT_KEY_ID
+            - name: HIPPIUS_OVH_KMS_OKMS_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_OKMS_ID
+            - name: FRONTEND_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: FRONTEND_HMAC_SECRET
+          volumeMounts:
+            - name: object-cache
+              mountPath: /var/lib/hippius/object_cache
+            - name: kms-certs
+              mountPath: /kms_certs
+              readOnly: true
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "test -d /proc/1 && grep -q python /proc/1/cmdline"
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 2000m
+              memory: 4Gi
+      volumes:
+        - name: object-cache
+          persistentVolumeClaim:
+            claimName: object-cache-pvc
+        - name: kms-certs
+          secret:
+            secretName: ovh-kms-certs
+            defaultMode: 0400
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ipfs-downloader
+
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: ipfs-downloader
+  template:
+    metadata:
+      labels:
+        app: ipfs-downloader
+        worker-type: downloader
+        backend: ipfs
+    spec:
+      initContainers:
+        - name: wait-for-services
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
+      containers:
+        - name: ipfs-downloader
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: hippius-s3-defaults
+            - configMapRef:
+                name: hippius-s3-environment
+          env:
+            - name: WORKER_SCRIPT
+              value: "workers/run_ipfs_downloader_in_loop.py"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -222,11 +351,6 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_AUTH_ENCRYPTION_KEY
-            - name: HIPPIUS_DOWNLOAD_QUEUE_NAMES
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: HIPPIUS_DOWNLOAD_QUEUE_NAMES
             - name: HIPPIUS_IPFS_GET_URL
               valueFrom:
                 secretKeyRef:
@@ -313,20 +437,19 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: unpinner
+  name: arion-downloader
 
 spec:
-  replicas: 1
-  strategy:
-    type: Recreate
+  replicas: 5
   selector:
     matchLabels:
-      app: unpinner
+      app: arion-downloader
   template:
     metadata:
       labels:
-        app: unpinner
-        worker-type: unpinner
+        app: arion-downloader
+        worker-type: downloader
+        backend: arion
     spec:
       initContainers:
         - name: wait-for-services
@@ -336,7 +459,7 @@ spec:
             - -c
             - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
       containers:
-        - name: unpinner
+        - name: arion-downloader
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
           imagePullPolicy: Always
           envFrom:
@@ -346,7 +469,145 @@ spec:
                 name: hippius-s3-environment
           env:
             - name: WORKER_SCRIPT
-              value: "workers/run_unpinner_in_loop.py"
+              value: "workers/run_arion_downloader_in_loop.py"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_URL
+            - name: REDIS_QUEUES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_QUEUES_URL
+            - name: HIPPIUS_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_KEY
+            - name: HIPPIUS_AUTH_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_AUTH_ENCRYPTION_KEY
+            - name: HIPPIUS_ARION_BASE_URL
+              value: "https://arion.hippius.com/"
+            - name: CACHET_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: CACHET_API_KEY
+            - name: CACHET_COMPONENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: CACHET_COMPONENT_ID
+            - name: DISCORD_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DISCORD_WEBHOOK_URL
+            - name: RESUBMISSION_SEED_PHRASE
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: RESUBMISSION_SEED_PHRASE
+            - name: HIPPIUS_OVH_KMS_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_ENDPOINT
+            - name: HIPPIUS_OVH_KMS_DEFAULT_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_DEFAULT_KEY_ID
+            - name: HIPPIUS_OVH_KMS_OKMS_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_OKMS_ID
+            - name: FRONTEND_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: FRONTEND_HMAC_SECRET
+          volumeMounts:
+            - name: object-cache
+              mountPath: /var/lib/hippius/object_cache
+              readOnly: false
+            - name: kms-certs
+              mountPath: /kms_certs
+              readOnly: true
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "test -d /proc/1 && grep -q python /proc/1/cmdline"
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+      volumes:
+        - name: object-cache
+          persistentVolumeClaim:
+            claimName: object-cache-pvc
+        - name: kms-certs
+          secret:
+            secretName: ovh-kms-certs
+            defaultMode: 0400
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ipfs-unpinner
+
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ipfs-unpinner
+  template:
+    metadata:
+      labels:
+        app: ipfs-unpinner
+        worker-type: unpinner
+        backend: ipfs
+    spec:
+      initContainers:
+        - name: wait-for-services
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
+      containers:
+        - name: ipfs-unpinner
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: hippius-s3-defaults
+            - configMapRef:
+                name: hippius-s3-environment
+          env:
+            - name: WORKER_SCRIPT
+              value: "workers/run_ipfs_unpinner_in_loop.py"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -407,6 +668,124 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_IPFS_STORE_URL
+            - name: HIPPIUS_OVH_KMS_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_ENDPOINT
+            - name: HIPPIUS_OVH_KMS_DEFAULT_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_DEFAULT_KEY_ID
+            - name: HIPPIUS_OVH_KMS_OKMS_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_OKMS_ID
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "test -d /proc/1 && grep -q python /proc/1/cmdline"
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arion-unpinner
+
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: arion-unpinner
+  template:
+    metadata:
+      labels:
+        app: arion-unpinner
+        worker-type: unpinner
+        backend: arion
+    spec:
+      initContainers:
+        - name: wait-for-services
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
+      containers:
+        - name: arion-unpinner
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: hippius-s3-defaults
+            - configMapRef:
+                name: hippius-s3-environment
+          env:
+            - name: WORKER_SCRIPT
+              value: "workers/run_arion_unpinner_in_loop.py"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_URL
+            - name: REDIS_QUEUES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_QUEUES_URL
+            - name: HIPPIUS_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_KEY
+            - name: HIPPIUS_AUTH_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_AUTH_ENCRYPTION_KEY
+            - name: HIPPIUS_ARION_BASE_URL
+              value: "https://arion.hippius.com/"
+            - name: FRONTEND_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: FRONTEND_HMAC_SECRET
+            - name: CACHET_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: CACHET_API_KEY
+            - name: CACHET_COMPONENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: CACHET_COMPONENT_ID
+            - name: DISCORD_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DISCORD_WEBHOOK_URL
             - name: HIPPIUS_OVH_KMS_ENDPOINT
               valueFrom:
                 secretKeyRef:
