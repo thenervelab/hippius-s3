@@ -27,8 +27,5 @@ kind: Service
 metadata:
   name: redis
 spec:
-  selector:
-    app: redis-acl
-  ports:
-    - port: 6379
-      targetPort: 6379
+  type: ExternalName
+  externalName: redis.redis.svc.cluster.local

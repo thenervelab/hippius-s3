@@ -128,12 +128,6 @@ jobs:
           mkdir -p $HOME/.kube
           echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
 
-      - name: Deploy Redis cluster
-        run: |
-          kubectl apply -f k8s/staging/redis-cluster.yaml
-          kubectl wait --for=condition=ready pod -l app=redis -n redis-staging --timeout=5m
-          kubectl wait --for=condition=complete job/redis-cluster-init -n redis-staging --timeout=5m
-
       - name: Create namespace if needed
         run: |
           kubectl create namespace hippius-s3-staging --dry-run=client -o yaml | kubectl apply -f -
@@ -146,7 +140,7 @@ jobs:
             --from-literal=DATABASE_PASSWORD='${{ secrets.DATABASE_PASSWORD }}' \
             --from-literal=DATABASE_URL="${DATABASE_URL}" \
             --from-literal=HIPPIUS_KEYSTORE_DATABASE_URL="${DATABASE_URL}" \
-            --from-literal=REDIS_URL='redis://redis.redis-staging.svc.cluster.local:6379?cluster=true' \
+            --from-literal=REDIS_URL='redis://redis.redis.svc.cluster.local:6379?cluster=true' \
             --from-literal=REDIS_ACCOUNTS_URL='redis://redis-accounts:6379' \
             --from-literal=REDIS_CHAIN_URL='redis://redis-chain:6379' \
             --from-literal=REDIS_QUEUES_URL='redis://redis-queues:6379' \
@@ -204,7 +198,10 @@ jobs:
         run: |
           kubectl rollout status deployment/gateway -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/api -n hippius-s3-staging --timeout=10m
-          kubectl rollout status deployment/downloader -n hippius-s3-staging --timeout=10m
+          kubectl rollout status deployment/ipfs-downloader -n hippius-s3-staging --timeout=10m
+          kubectl rollout status deployment/arion-downloader -n hippius-s3-staging --timeout=10m
+          kubectl rollout status deployment/ipfs-uploader -n hippius-s3-staging --timeout=10m
+          kubectl rollout status deployment/arion-uploader -n hippius-s3-staging --timeout=10m
 
       - name: Verify deployment
         run: |
