@@ -33,6 +33,10 @@ data:
         enable_open_metrics: true
         resource_to_telemetry_conversion:
           enabled: true
+      debug:
+        verbosity: basic
+        sampling_initial: 0
+        sampling_thereafter: 0
 
     extensions:
       health_check:
@@ -45,6 +49,10 @@ data:
           receivers: [otlp]
           processors: [memory_limiter, resource, batch]
           exporters: [prometheus]
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [debug]
 ---
 apiVersion: apps/v1
 kind: Deployment
