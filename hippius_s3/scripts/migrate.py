@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Optional
 
 
@@ -143,7 +144,11 @@ def main() -> None:
 
     # Run application database migrations
     logger.info("Running application database migrations")
-    run_command(["dbmate", "up"])
+    env = dict(os.environ)
+    if not env.get("DBMATE_MIGRATIONS_DIR"):
+        migrations_dir = Path(__file__).resolve().parent.parent / "sql" / "migrations"
+        env["DBMATE_MIGRATIONS_DIR"] = str(migrations_dir)
+    run_command(["dbmate", "up"], env=env)
 
     logger.info("Migration process completed successfully")
 

@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 import uuid
 from datetime import datetime
 from datetime import timezone
 from typing import Any
-from typing import AsyncIterator
 
 from fastapi import Request
 from fastapi import Response
@@ -64,10 +62,6 @@ async def handle_put_object(
 
         bucket_id = bucket["bucket_id"]
 
-        # Read request body properly handling chunked encoding
-        with tracer.start_as_current_span("put_object.read_request_body") as span:
-            incoming_bytes = await utils.get_request_body(request)
-            set_span_attributes(span, {"body_size_bytes": len(incoming_bytes)})
         content_type = request.headers.get("Content-Type", "application/octet-stream")
 
         # Detect S4 append semantics via metadata
@@ -81,14 +75,15 @@ async def handle_put_object(
                 bucket_id=bucket_id,
                 bucket_name=bucket_name,
                 object_key=object_key,
-                incoming_bytes=incoming_bytes,
+                body_iter=utils.iter_request_body(request),
             )
 
-        # Regular non-append PutObject path
-        file_data = incoming_bytes
-        file_size = len(file_data)
-        md5_hash = hashlib.md5(file_data).hexdigest()
-        logger.info(f"PUT {bucket_name}/{object_key}: size={len(file_data)}, md5={md5_hash}")
+        # Regular non-append PutObject path (streamed)
+        content_length = request.headers.get("content-length")
+        try:
+            hinted_size = int(content_length) if content_length is not None else 0
+        except Exception:
+            hinted_size = 0
 
         metadata: dict[str, Any] = {}
         for key, value in request.headers.items():
@@ -124,15 +119,12 @@ async def handle_put_object(
                 attributes={
                     "object_id": candidate_object_id,
                     "has_object_id": True,
-                    "file_size_bytes": file_size,
+                    "file_size_bytes": hinted_size,
                     "content_type": content_type,
                     "storage_version": config.target_storage_version,
                 },
             ) as span:
                 writer = ObjectWriter(db=db, redis_client=redis_client, fs_store=request.app.state.fs_store)
-
-                async def _iter_once() -> AsyncIterator[bytes]:
-                    yield file_data
 
                 put_res = await writer.put_simple_stream_full(
                     bucket_id=bucket_id,
@@ -143,7 +135,7 @@ async def handle_put_object(
                     content_type=content_type,
                     metadata=metadata,
                     storage_version=config.target_storage_version,
-                    body_iter=_iter_once(),
+                    body_iter=utils.iter_request_body(request),
                 )
 
                 set_span_attributes(
@@ -156,6 +148,8 @@ async def handle_put_object(
                         "returned_size_bytes": put_res.size_bytes,
                     },
                 )
+
+        logger.info(f"PUT {bucket_name}/{object_key}: size={put_res.size_bytes}, md5={put_res.etag}")
 
         # Only enqueue after DB state is persisted; use writer queue helper
         with tracer.start_as_current_span(
@@ -189,7 +183,7 @@ async def handle_put_object(
         )
         get_metrics_collector().record_data_transfer(
             operation="put_object",
-            bytes_transferred=file_size,
+            bytes_transferred=int(put_res.size_bytes),
             bucket_name=bucket_name,
             main_account=main_account_id,
             subaccount_id=request.state.account.id,
