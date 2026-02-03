@@ -11,6 +11,7 @@ from typing import List
 from typing import Optional
 
 import redis.asyncio as async_redis
+from opentelemetry import trace
 from pydantic import BaseModel
 
 from hippius_s3.cache import FileSystemPartsStore
@@ -23,6 +24,7 @@ from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
+tracer = trace.get_tracer(__name__)
 
 
 class UploadResponse(BaseModel):
@@ -154,48 +156,62 @@ class Uploader:
         return Uploader._ConnCtx(self.db)
 
     async def process_upload(self, payload: UploadChainRequest) -> List[str]:
-        # Skip upload if object or version was deleted
-        async with self._acquire_conn() as conn:
-            is_deleted = await conn.fetchval(
-                get_query("is_object_deleted"),
-                payload.object_id,
-                payload.object_version,
-            )
-        if is_deleted:
+        with tracer.start_as_current_span(
+            "uploader.process_upload",
+            attributes={
+                "object_id": payload.object_id,
+                "object_key": payload.object_key,
+                "object_version": str(payload.object_version or 1),
+                "backend": self.backend_name,
+                "num_chunks": len(payload.chunks),
+                "account": payload.address,
+            },
+        ) as span:
+            async with self._acquire_conn() as conn:
+                is_deleted = await conn.fetchval(
+                    get_query("is_object_deleted"),
+                    payload.object_id,
+                    payload.object_version,
+                )
+            if is_deleted:
+                logger.info(
+                    f"Skipping upload for deleted object/version: backend={self.backend_name} "
+                    f"object_id={payload.object_id} version={payload.object_version}"
+                )
+                span.set_attribute("skipped", True)
+                return []
+
+            start_time = time.time()
             logger.info(
-                f"Skipping upload for deleted object/version: backend={self.backend_name} "
-                f"object_id={payload.object_id} version={payload.object_version}"
+                f"Processing upload backend={self.backend_name} object_id={payload.object_id} chunks={len(payload.chunks)}"
             )
-            return []
 
-        start_time = time.time()
-        logger.info(
-            f"Processing upload backend={self.backend_name} object_id={payload.object_id} chunks={len(payload.chunks)}"
-        )
+            all_chunk_cids = await self._upload_chunks(
+                object_id=payload.object_id,
+                object_key=payload.object_key,
+                chunks=payload.chunks,
+                upload_id=payload.upload_id,
+                object_version=int(payload.object_version or 1),
+                account_ss58=payload.address,
+            )
 
-        all_chunk_cids = await self._upload_chunks(
-            object_id=payload.object_id,
-            object_key=payload.object_key,
-            chunks=payload.chunks,
-            upload_id=payload.upload_id,
-            object_version=int(payload.object_version or 1),
-            account_ss58=payload.address,
-        )
+            total_duration = time.time() - start_time
+            logger.info(
+                f"Upload complete backend={self.backend_name} object_id={payload.object_id} "
+                f"chunks={len(all_chunk_cids)} duration={total_duration:.2f}s"
+            )
 
-        total_duration = time.time() - start_time
-        logger.info(
-            f"Upload complete backend={self.backend_name} object_id={payload.object_id} "
-            f"chunks={len(all_chunk_cids)} duration={total_duration:.2f}s"
-        )
+            span.set_attribute("result.chunks_uploaded", len(all_chunk_cids))
+            span.set_attribute("result.duration_s", total_duration)
 
-        get_metrics_collector().record_uploader_operation(
-            main_account=payload.address,
-            success=True,
-            num_chunks=len(payload.chunks),
-            duration=total_duration,
-        )
+            get_metrics_collector().record_uploader_operation(
+                main_account=payload.address,
+                success=True,
+                num_chunks=len(payload.chunks),
+                duration=total_duration,
+            )
 
-        return all_chunk_cids
+            return all_chunk_cids
 
     async def _upload_chunks(
         self,
@@ -206,45 +222,53 @@ class Uploader:
         object_version: int,
         account_ss58: str,
     ) -> List[str]:
-        logger.debug(f"Uploading {len(chunks)} chunks for object_id={object_id}")
-
         concurrency = self.config.uploader_multipart_max_concurrency
-        semaphore = asyncio.Semaphore(concurrency)
+        with tracer.start_as_current_span(
+            "uploader.upload_chunks",
+            attributes={
+                "object_id": object_id,
+                "num_chunks": len(chunks),
+                "concurrency": concurrency,
+            },
+        ):
+            logger.debug(f"Uploading {len(chunks)} chunks for object_id={object_id}")
 
-        async def upload_chunk(chunk: Chunk) -> ChunkUploadResult:
-            async with semaphore:
-                return await self._upload_single_chunk(
-                    object_id=object_id,
-                    object_key=object_key,
-                    chunk=chunk,
-                    upload_id=upload_id,
-                    object_version=int(object_version),
-                    account_ss58=account_ss58,
+            semaphore = asyncio.Semaphore(concurrency)
+
+            async def upload_chunk(chunk: Chunk) -> ChunkUploadResult:
+                async with semaphore:
+                    return await self._upload_single_chunk(
+                        object_id=object_id,
+                        object_key=object_key,
+                        chunk=chunk,
+                        upload_id=upload_id,
+                        object_version=int(object_version),
+                        account_ss58=account_ss58,
+                    )
+
+            chunks_sorted = sorted(chunks, key=lambda c: c.id)
+
+            if not chunks_sorted:
+                logger.info(f"No chunks for object_id={object_id}; skipping upload")
+                return []
+
+            first_result = await upload_chunk(chunks_sorted[0])
+
+            if len(chunks_sorted) > 1:
+                remaining_results = await asyncio.gather(*[upload_chunk(c) for c in chunks_sorted[1:]])
+                all_results = [first_result] + list(remaining_results)
+            else:
+                all_results = [first_result]
+
+            for result in all_results:
+                await self.obj_cache.expire(
+                    object_id, int(object_version), result.part_number, ttl=self.config.cache_ttl_seconds
                 )
 
-        chunks_sorted = sorted(chunks, key=lambda c: c.id)
-
-        if not chunks_sorted:
-            logger.info(f"No chunks for object_id={object_id}; skipping upload")
-            return []
-
-        first_result = await upload_chunk(chunks_sorted[0])
-
-        if len(chunks_sorted) > 1:
-            remaining_results = await asyncio.gather(*[upload_chunk(c) for c in chunks_sorted[1:]])
-            all_results = [first_result] + list(remaining_results)
-        else:
-            all_results = [first_result]
-
-        for result in all_results:
-            await self.obj_cache.expire(
-                object_id, int(object_version), result.part_number, ttl=self.config.cache_ttl_seconds
-            )
-
-        all_cids = []
-        for result in all_results:
-            all_cids.extend(result.cids)
-        return all_cids
+            all_cids = []
+            for result in all_results:
+                all_cids.extend(result.cids)
+            return all_cids
 
     async def _upload_single_chunk(
         self,
@@ -256,105 +280,111 @@ class Uploader:
         account_ss58: str,
     ) -> ChunkUploadResult:
         part_number = int(chunk.id)
-        logger.debug(f"Uploading chunk object_id={object_id} part={part_number}")
-        # Read from FS store (authoritative source that survives Redis eviction)
-        meta = await self.fs_store.get_meta(object_id, int(object_version), part_number)
-        num_chunks_meta = int(meta.get("num_chunks", 0)) if isinstance(meta, dict) else 0
+        with tracer.start_as_current_span(
+            "uploader.upload_chunk",
+            attributes={
+                "object_id": object_id,
+                "part_number": part_number,
+            },
+        ) as span:
+            logger.debug(f"Uploading chunk object_id={object_id} part={part_number}")
+            meta = await self.fs_store.get_meta(object_id, int(object_version), part_number)
+            num_chunks_meta = int(meta.get("num_chunks", 0)) if isinstance(meta, dict) else 0
 
-        # Ensure we have a non-null upload_id for parts table operations
-        resolved_upload_id: Optional[str] = upload_id
-        if not resolved_upload_id:
-            try:
-                async with self._acquire_conn() as conn:
-                    row = await conn.fetchrow(
-                        "SELECT upload_id FROM multipart_uploads WHERE object_id = $1 ORDER BY initiated_at DESC LIMIT 1",
-                        object_id,
-                    )
-                if row and row[0] is not None:
-                    resolved_upload_id = str(row[0])
-            except Exception:
-                resolved_upload_id = None
-        if not resolved_upload_id or (isinstance(resolved_upload_id, str) and resolved_upload_id.strip() == ""):
-            logger.warning(
-                f"uploader: missing upload_id; using object_id as fallback (object_id={object_id} part={part_number})"
-            )
-            resolved_upload_id = object_id
-
-        # Look up part_id for chunk_backend insert
-        async with self._acquire_conn() as conn:
-            part_row = await conn.fetchrow(
-                """
-                SELECT p.part_id
-                FROM parts p
-                WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = $3
-                LIMIT 1
-                """,
-                object_id,
-                part_number,
-                int(object_version),
-            )
-        part_id: Optional[str] = str(part_row[0]) if part_row else None
-
-        if num_chunks_meta > 0 and not part_id:
-            logger.warning(
-                f"Chunked upload meta indicates {num_chunks_meta} pieces but no part_id found "
-                f"(object_id={object_id} part={part_number} object_version={object_version}); requeue"
-            )
-            raise RuntimeError("part_row_missing_for_chunked_upload")
-
-        if num_chunks_meta == 0:
-            logger.debug(f"Empty file upload: object_id={object_id} part={part_number}")
-            return ChunkUploadResult(cids=[], part_number=part_number)
-
-        if num_chunks_meta > 0 and part_id:
-            all_chunk_cids: list[str] = []
-            for ci in range(num_chunks_meta):
-                piece = await self.fs_store.get_chunk(object_id, int(object_version), part_number, ci)
-                if not isinstance(piece, (bytes, bytearray)):
-                    raise RuntimeError("missing_cipher_chunk")
-
-                # Look up the chunk UUID from part_chunks so Arion can address it
-                async with self._acquire_conn() as conn:
-                    chunk_id = await conn.fetchval(
-                        "SELECT id FROM part_chunks WHERE part_id = $1 AND chunk_index = $2",
-                        part_id,
-                        int(ci),
-                    )
-                if not chunk_id:
-                    raise RuntimeError("part_chunk_row_missing")
-
-                chunk_upload_result = await self.backend_client.upload_file_and_get_cid(
-                    file_data=bytes(piece),
-                    file_name=str(chunk_id),
-                    content_type="application/octet-stream",
-                    account_ss58=account_ss58,
+            resolved_upload_id: Optional[str] = upload_id
+            if not resolved_upload_id:
+                try:
+                    async with self._acquire_conn() as conn:
+                        row = await conn.fetchrow(
+                            "SELECT upload_id FROM multipart_uploads WHERE object_id = $1 ORDER BY initiated_at DESC LIMIT 1",
+                            object_id,
+                        )
+                    if row and row[0] is not None:
+                        resolved_upload_id = str(row[0])
+                except Exception:
+                    resolved_upload_id = None
+            if not resolved_upload_id or (isinstance(resolved_upload_id, str) and resolved_upload_id.strip() == ""):
+                logger.warning(
+                    f"uploader: missing upload_id; using object_id as fallback (object_id={object_id} part={part_number})"
                 )
+                resolved_upload_id = object_id
 
-                piece_cid = str(chunk_upload_result.cid)
-                piece_file_id = str(chunk_upload_result.id)
-                all_chunk_cids.append(piece_cid)
-
-                logger.info(
-                    f"Uploaded chunk: backend={self.backend_name} object_id={object_id} part={part_number} "
-                    f"chunk={ci} file_id={piece_file_id} cid={piece_cid} status={chunk_upload_result.status}"
+            async with self._acquire_conn() as conn:
+                part_row = await conn.fetchrow(
+                    """
+                    SELECT p.part_id
+                    FROM parts p
+                    WHERE p.object_id = $1 AND p.part_number = $2 AND p.object_version = $3
+                    LIMIT 1
+                    """,
+                    object_id,
+                    part_number,
+                    int(object_version),
                 )
+            part_id: Optional[str] = str(part_row[0]) if part_row else None
 
-                async with self._acquire_conn() as conn:
-                    await conn.fetchval(
-                        get_query("insert_chunk_backend"),
-                        part_id,
-                        int(ci),
-                        self.backend_name,
-                        piece_cid,
+            if num_chunks_meta > 0 and not part_id:
+                logger.warning(
+                    f"Chunked upload meta indicates {num_chunks_meta} pieces but no part_id found "
+                    f"(object_id={object_id} part={part_number} object_version={object_version}); requeue"
+                )
+                raise RuntimeError("part_row_missing_for_chunked_upload")
+
+            if num_chunks_meta == 0:
+                logger.debug(f"Empty file upload: object_id={object_id} part={part_number}")
+                return ChunkUploadResult(cids=[], part_number=part_number)
+
+            if num_chunks_meta > 0 and part_id:
+                all_chunk_cids: list[str] = []
+                for ci in range(num_chunks_meta):
+                    piece = await self.fs_store.get_chunk(object_id, int(object_version), part_number, ci)
+                    if not isinstance(piece, (bytes, bytearray)):
+                        raise RuntimeError("missing_cipher_chunk")
+
+                    async with self._acquire_conn() as conn:
+                        chunk_id = await conn.fetchval(
+                            "SELECT id FROM part_chunks WHERE part_id = $1 AND chunk_index = $2",
+                            part_id,
+                            int(ci),
+                        )
+                    if not chunk_id:
+                        raise RuntimeError("part_chunk_row_missing")
+
+                    chunk_upload_result = await self.backend_client.upload_file_and_get_cid(
+                        file_data=bytes(piece),
+                        file_name=str(chunk_id),
+                        content_type="application/octet-stream",
+                        account_ss58=account_ss58,
                     )
 
-            logger.debug(
-                f"Uploaded {num_chunks_meta} chunks backend={self.backend_name} object_id={object_id} "
-                f"part={part_number} cids={len(all_chunk_cids)}"
-            )
-            return ChunkUploadResult(cids=all_chunk_cids, part_number=part_number)
+                    piece_cid = str(chunk_upload_result.cid)
+                    piece_file_id = str(chunk_upload_result.id)
+                    all_chunk_cids.append(piece_cid)
 
-        raise RuntimeError("part_meta_not_ready")
+                    logger.info(
+                        f"Uploaded chunk: backend={self.backend_name} object_id={object_id} part={part_number} "
+                        f"chunk={ci} file_id={piece_file_id} cid={piece_cid} status={chunk_upload_result.status}"
+                    )
+
+                    async with self._acquire_conn() as conn:
+                        await conn.fetchval(
+                            get_query("insert_chunk_backend"),
+                            part_id,
+                            int(ci),
+                            self.backend_name,
+                            piece_cid,
+                        )
+
+                span.set_attribute("result.num_piece_cids", len(all_chunk_cids))
+                span.set_attribute("result.cids", ",".join(all_chunk_cids))
+
+                logger.debug(
+                    f"Uploaded {num_chunks_meta} chunks backend={self.backend_name} object_id={object_id} "
+                    f"part={part_number} cids={len(all_chunk_cids)}"
+                )
+                return ChunkUploadResult(cids=all_chunk_cids, part_number=part_number)
+
+            raise RuntimeError("part_meta_not_ready")
 
     async def _push_to_dlq(self, payload: UploadChainRequest, last_error: str, error_type: str) -> None:
         """Push a failed request to the Dead-Letter Queue."""
