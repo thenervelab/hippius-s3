@@ -7,9 +7,9 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import AsyncIterator
 from datetime import datetime
 from datetime import timezone
-from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import unquote
 
