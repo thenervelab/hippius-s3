@@ -9,6 +9,7 @@ import time
 import uuid
 from datetime import datetime
 from datetime import timezone
+from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import unquote
 
@@ -572,7 +573,7 @@ async def upload_part(
             address=request.state.account.main_account,
             bucket_name=source_bucket_name,
         )
-        body_iter = chunks_iter
+        body_iter: AsyncIterator[bytes] = chunks_iter
     else:
         # Stream request body for regular UploadPart
         body_iter = utils.iter_request_body(request)

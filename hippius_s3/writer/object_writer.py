@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import hashlib
 import json
+import logging
 import uuid
 from datetime import datetime
 from datetime import timezone
@@ -983,7 +983,7 @@ class ObjectWriter:
         except ValueError as exc:
             await _delete_part_row()
             if "Zero-length part" in str(exc):
-                raise EmptyAppendError("Empty append not allowed")
+                raise EmptyAppendError("Empty append not allowed") from exc
             raise
         except Exception:
             await _delete_part_row()
