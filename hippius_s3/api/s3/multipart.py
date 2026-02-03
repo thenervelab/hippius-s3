@@ -482,9 +482,7 @@ async def upload_part(
                         src_ver,
                         int(pn),
                     )
-                    all_entries = [
-                        (int(r[0]), str(r[1]), int(r[2]) if r[2] is not None else None) for r in rows or []
-                    ]
+                    all_entries = [(int(r[0]), str(r[1]), int(r[2]) if r[2] is not None else None) for r in rows or []]
                     chunk_specs = []
                     include = {int(i) for i in idxs}
                     for ci, cid, clen in all_entries:

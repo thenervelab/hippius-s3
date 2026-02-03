@@ -660,9 +660,7 @@ class ObjectWriter:
             if written_chunk_indices:
                 try:
                     keys = [
-                        self.obj_cache.build_chunk_key(
-                            str(object_id), int(object_version), int(part_number), int(idx)
-                        )
+                        self.obj_cache.build_chunk_key(str(object_id), int(object_version), int(part_number), int(idx))
                         for idx in written_chunk_indices
                     ]
                     keys.append(self.obj_cache.build_meta_key(str(object_id), int(object_version), int(part_number)))
