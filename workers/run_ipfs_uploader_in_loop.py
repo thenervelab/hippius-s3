@@ -107,7 +107,7 @@ async def run_ipfs_uploader_loop():
                 "uploader.job",
                 attributes={
                     "object_id": upload_request.object_id,
-                    "ray_id": ray_id,
+                    "hippius.ray_id": ray_id,
                     "backend": BACKEND_NAME,
                     "attempts": upload_request.attempts or 0,
                 },

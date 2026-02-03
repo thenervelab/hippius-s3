@@ -40,7 +40,7 @@ async def handle_put_object(
         main_account_id = request.state.account.main_account
 
         with tracer.start_as_current_span(
-            "put_object.get_or_create_user", attributes={"main_account_id": main_account_id}
+            "put_object.get_or_create_user", attributes={"hippius.account.main": main_account_id}
         ):
             await db.fetchrow(
                 get_query("get_or_create_user_by_main_account"),

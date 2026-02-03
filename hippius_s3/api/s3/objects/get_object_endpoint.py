@@ -102,7 +102,7 @@ async def handle_get_object(
         if account and account.main_account != "anonymous":
             with tracer.start_as_current_span(
                 "get_object.get_or_create_user",
-                attributes={"main_account_id": account.main_account},
+                attributes={"hippius.account.main": account.main_account},
             ):
                 await db.fetchrow(
                     get_query("get_or_create_user_by_main_account"),
@@ -113,7 +113,7 @@ async def handle_get_object(
         # Get object info for download (gateway already checked permissions)
         with tracer.start_as_current_span(
             "get_object.get_object_info",
-            attributes={"main_account_id": account_id, "has_version_id": version_id is not None},
+            attributes={"hippius.account.main": account_id, "has_version_id": version_id is not None},
         ) as span:
             if version_id is not None:
                 object_info = await db.fetchrow(

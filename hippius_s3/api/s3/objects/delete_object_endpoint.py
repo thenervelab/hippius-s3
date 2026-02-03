@@ -35,7 +35,7 @@ async def handle_delete_object(
     try:
         with tracer.start_as_current_span("delete_object.ensure_user") as span:
             user = await UserRepository(db).ensure_by_main_account(request.state.account.main_account)
-            set_span_attributes(span, {"main_account_id": user["main_account_id"]})
+            set_span_attributes(span, {"hippius.account.main": user["main_account_id"]})
 
         with tracer.start_as_current_span("delete_object.get_bucket") as span:
             bucket = await BucketRepository(db).get_by_name_and_owner(bucket_name, user["main_account_id"])

@@ -164,7 +164,7 @@ class Uploader:
                 "object_version": str(payload.object_version or 1),
                 "backend": self.backend_name,
                 "num_chunks": len(payload.chunks),
-                "account": payload.address,
+                "hippius.account.main": payload.address,
             },
         ) as span:
             async with self._acquire_conn() as conn:
