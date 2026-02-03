@@ -1,0 +1,32 @@
+alertmanager:
+  enabled: false
+
+kube-state-metrics:
+  enabled: false
+
+prometheus-node-exporter:
+  enabled: false
+
+prometheus-pushgateway:
+  enabled: false
+
+server:
+  retention: "30d"
+  persistentVolume:
+    enabled: true
+    size: 50Gi
+  enableRemoteWriteReceiver: true
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+
+extraScrapeConfigs: |
+  - job_name: 'otel-collector'
+    static_configs:
+      - targets: ['otel-collector.__APP_NAMESPACE__.svc.cluster.local:8889']
+    metrics_path: '/metrics'
+    scrape_interval: 15s

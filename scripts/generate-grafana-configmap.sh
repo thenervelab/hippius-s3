@@ -11,9 +11,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: hippius-s3-dashboards
-  namespace: cattle-monitoring-system
-  labels:
-    grafana_dashboard: "1"
+  namespace: monitoring
 data:
 HEADER
 
