@@ -154,6 +154,20 @@ class Uploader:
         return Uploader._ConnCtx(self.db)
 
     async def process_upload(self, payload: UploadChainRequest) -> List[str]:
+        # Skip upload if object or version was deleted
+        async with self._acquire_conn() as conn:
+            is_deleted = await conn.fetchval(
+                get_query("is_object_deleted"),
+                payload.object_id,
+                payload.object_version,
+            )
+        if is_deleted:
+            logger.info(
+                f"Skipping upload for deleted object/version: backend={self.backend_name} "
+                f"object_id={payload.object_id} version={payload.object_version}"
+            )
+            return []
+
         start_time = time.time()
         logger.info(
             f"Processing upload backend={self.backend_name} object_id={payload.object_id} chunks={len(payload.chunks)}"
