@@ -5,13 +5,14 @@ from typing import Any
 
 import httpx
 from redis.asyncio import Redis
+from redis.asyncio import RedisCluster
 
 
 logger = logging.getLogger(__name__)
 
 
 class DocsProxyService:
-    def __init__(self, backend_url: str, redis_client: Redis, cache_ttl: int = 300):
+    def __init__(self, backend_url: str, redis_client: Redis[Any] | RedisCluster[Any], cache_ttl: int = 300):
         self.backend_url = backend_url
         self.redis_client = redis_client
         self.cache_ttl = cache_ttl
