@@ -10,7 +10,7 @@ services:
     environment:
       <<: *monitoring-enabled
 
-  api-uploader:
+  ipfs-uploader:
     environment:
       <<: *monitoring-enabled
 
@@ -18,11 +18,19 @@ services:
     environment:
       <<: *monitoring-enabled
 
-  downloader:
+  ipfs-downloader:
     environment:
       <<: *monitoring-enabled
 
-  unpinner:
+  arion-downloader:
+    environment:
+      <<: *monitoring-enabled
+
+  ipfs-unpinner:
+    environment:
+      <<: *monitoring-enabled
+
+  arion-unpinner:
     environment:
       <<: *monitoring-enabled
 

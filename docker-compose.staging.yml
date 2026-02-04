@@ -4,6 +4,16 @@ include:
   - docker-compose.utilities.yml
 
 services:
-  downloader:
+  redis:
+    command: [ "redis-server",
+               "/usr/local/etc/redis/redis.conf",
+               "--maxmemory",
+               "5000mb", ]
+
+  ipfs-downloader:
     deploy:
-      replicas: 5
+      replicas: 1
+
+  arion-downloader:
+    deploy:
+      replicas: 1

@@ -19,9 +19,16 @@ CSV_KEY = "daily.csv"
 SVG_KEY = "daily.svg"
 
 
+SCENARIOS = [
+    "put_1mb", "get_1mb",
+    "put_100mb", "get_100mb",
+    "put_1gb", "get_1gb",
+]
+
+
 def load_data(csv_path: Path, days: int = 30) -> dict:
     cutoff = datetime.now() - timedelta(days=days)
-    data = {"put_100mb": [], "get_100mb": []}
+    data = {s: [] for s in SCENARIOS}
 
     with csv_path.open() as f:
         reader = csv.DictReader(f)
@@ -37,24 +44,29 @@ def load_data(csv_path: Path, days: int = 30) -> dict:
 
 
 def plot_chart(data: dict, output_path: Path):
-    fig, ax = plt.subplots(figsize=(10, 4))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+
+    put_ax, get_ax = axes
 
     for scenario, points in data.items():
         if not points:
             continue
         points.sort(key=lambda x: x[0])
         dates, values = zip(*points)
-        label = "PUT 100MB" if "put" in scenario else "GET 100MB"
+        label = scenario.split("_", 1)[1].upper()
+        ax = put_ax if scenario.startswith("put") else get_ax
         ax.plot(dates, values, marker="o", markersize=3, label=label)
 
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Throughput (MB/s)")
-    ax.set_title("Hippius S3 Daily Benchmark (last 30 days)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
-    ax.xaxis.set_major_locator(mdates.DayLocator(interval=5))
+    for ax, title in [(put_ax, "Upload (PUT)"), (get_ax, "Download (GET)")]:
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Throughput (MB/s)")
+        ax.set_title(title)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
+        ax.xaxis.set_major_locator(mdates.DayLocator(interval=5))
 
+    fig.suptitle("Hippius S3 Daily Benchmark (last 30 days)", fontsize=13)
     plt.tight_layout()
     plt.savefig(output_path, format="svg")
     plt.close()

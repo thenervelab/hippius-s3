@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Shared per-backend download module.
 
 Each backend entry point (``run_ipfs_downloader_in_loop.py``,
@@ -43,7 +44,7 @@ async def process_download_request(
     *,
     backend_name: str,
     fetch_fn: Callable[[str, str], Awaitable[bytes]],
-    db: asyncpg.Connection,
+    db_pool: asyncpg.Pool,
     redis_client: async_redis.Redis,
 ) -> bool:
     """Process a single download request for one backend.
@@ -94,6 +95,7 @@ async def process_download_request(
                     for spec in part.chunks:
                         chunk_index = int(spec.index)
 
+                        # Check if already cached
                         cached = await obj_cache.chunk_exists(
                             download_request.object_id,
                             int(download_request.object_version),
@@ -104,14 +106,16 @@ async def process_download_request(
                             logger.debug(f"[{backend_name}] Skipping cached chunk part={part_number} ci={chunk_index}")
                             continue
 
-                        row = await db.fetchrow(
-                            get_query("get_chunk_backend_identifier"),
-                            backend_name,
-                            download_request.object_id,
-                            int(download_request.object_version),
-                            part_number,
-                            chunk_index,
-                        )
+                        # Look up backend_identifier (acquire connection from pool)
+                        async with db_pool.acquire() as conn:
+                            row = await conn.fetchrow(
+                                get_query("get_chunk_backend_identifier"),
+                                backend_name,
+                                download_request.object_id,
+                                int(download_request.object_version),
+                                part_number,
+                                chunk_index,
+                            )
                         if not row or not row["backend_identifier"]:
                             logger.debug(
                                 f"[{backend_name}] No identifier for part={part_number} ci={chunk_index}, skipping"
@@ -120,6 +124,7 @@ async def process_download_request(
 
                         identifier = str(row["backend_identifier"])
 
+                        # Fetch with retries
                         for attempt in range(1, max_attempts + 1):
                             try:
                                 t0 = time.perf_counter()
@@ -212,7 +217,7 @@ async def run_downloader_loop(
 
     redis_client = async_redis.from_url(config.redis_url)
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
-    db = await asyncpg.connect(config.database_url)
+    db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=20)
 
     initialize_queue_client(redis_queues_client)
     initialize_cache_client(redis_client)
@@ -261,7 +266,7 @@ async def run_downloader_loop(
                         request,
                         backend_name=backend_name,
                         fetch_fn=fetch_fn,
-                        db=db,
+                        db_pool=db_pool,
                         redis_client=redis_client,
                     )
                     if ok:
@@ -280,10 +285,10 @@ async def run_downloader_loop(
                 except asyncpg.InterfaceError as exc:
                     job_span.record_exception(exc)
                     job_span.set_status(trace.StatusCode.ERROR, str(exc))
-                    logger.warning(f"[{backend_name}] DB connection lost, reconnecting…")
+                    logger.warning(f"[{backend_name}] DB pool issue, recreating…")
                     with contextlib.suppress(Exception):
-                        await db.close()
-                    db = await asyncpg.connect(config.database_url)
+                        await db_pool.close()
+                    db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=20)
 
     except KeyboardInterrupt:
         logger.info(f"[{backend_name}] Downloader stopping…")
@@ -293,4 +298,4 @@ async def run_downloader_loop(
     finally:
         await redis_client.aclose()  # type: ignore[attr-defined]
         await redis_queues_client.aclose()  # type: ignore[attr-defined]
-        await db.close()
+        await db_pool.close()
