@@ -16,7 +16,7 @@ export OTEL_PYTHON_LOG_CORRELATION=true
 if [ "${ENABLE_MONITORING:-false}" = "true" ]; then
     echo "Starting worker: $WORKER_SCRIPT (service: $OTEL_SERVICE_NAME) with OpenTelemetry instrumentation"
     if [[ "${ENABLE_WATCHFILES:-false}" == "true" ]]; then
-        opentelemetry-instrument \
+        exec opentelemetry-instrument \
             --logs_exporter otlp \
             --traces_exporter otlp \
             --metrics_exporter otlp \
@@ -25,7 +25,7 @@ if [ "${ENABLE_MONITORING:-false}" = "true" ]; then
                 --filter python \
                 "python $WORKER_SCRIPT"
     else
-        opentelemetry-instrument \
+        exec opentelemetry-instrument \
             --logs_exporter otlp \
             --traces_exporter otlp \
             --metrics_exporter otlp \
@@ -35,8 +35,8 @@ if [ "${ENABLE_MONITORING:-false}" = "true" ]; then
 else
     echo "Starting worker: $WORKER_SCRIPT (monitoring disabled)"
     if [[ "${ENABLE_WATCHFILES:-false}" == "true" ]]; then
-        watchfiles --filter python "python $WORKER_SCRIPT"
+        exec watchfiles --filter python "python $WORKER_SCRIPT"
     else
-        python "$WORKER_SCRIPT"
+        exec python "$WORKER_SCRIPT"
     fi
 fi

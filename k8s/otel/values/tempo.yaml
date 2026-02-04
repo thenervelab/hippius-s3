@@ -1,0 +1,32 @@
+tempo:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+  storage:
+    trace:
+      backend: local
+      local:
+        path: /var/tempo/blocks
+      wal:
+        path: /var/tempo/wal
+  metricsGenerator:
+    enabled: true
+    remoteWriteUrl: "http://prometheus-server.monitoring.svc.cluster.local:80/api/v1/write"
+  retention: 72h
+  overrides:
+    defaults:
+      metrics_generator:
+        processors: [service-graphs, span-metrics]
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+
+persistence:
+  enabled: true
+  size: 30Gi

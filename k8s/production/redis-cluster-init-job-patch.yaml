@@ -1,0 +1,31 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: redis-cluster-init
+spec:
+  template:
+    spec:
+      containers:
+        - name: redis-init
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for Redis pods to be ready..."
+              sleep 30
+
+              ENDPOINTS=""
+              for i in $(seq 0 7); do
+                ENDPOINTS="$ENDPOINTS redis-cluster-$i.redis-cluster:6379"
+              done
+
+              echo "Creating Redis Cluster with endpoints: $ENDPOINTS"
+              redis-cli --cluster create $ENDPOINTS \
+                --cluster-replicas 1 \
+                --cluster-yes
+
+              echo "Verifying cluster..."
+              redis-cli -h redis-cluster-0.redis-cluster -p 6379 cluster info
+              redis-cli -h redis-cluster-0.redis-cluster -p 6379 cluster nodes
+
+              echo "Redis Cluster initialization complete!"

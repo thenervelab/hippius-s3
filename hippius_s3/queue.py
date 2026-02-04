@@ -3,7 +3,6 @@ import logging
 import time
 import uuid
 from typing import Optional
-from typing import Union
 
 import redis.asyncio as async_redis
 from pydantic import BaseModel
@@ -281,7 +280,7 @@ async def enqueue_unpin_request(payload: UnpinChainRequest, *, queue_name: str |
         logger.info(f"Enqueued unpin request {payload.name=} queues={queue_names}")
 
 
-async def dequeue_unpin_request(queue_name: str = "unpin_requests") -> Union[UnpinChainRequest, None]:
+async def dequeue_unpin_request(queue_name: str = "unpin_requests") -> UnpinChainRequest | None:
     """Get the next unpin request from the Redis queue."""
     client = get_queue_client()
     result = await client.brpop(_normalize_queue_name(queue_name), timeout=3)
@@ -384,7 +383,7 @@ async def enqueue_download_request(payload: DownloadChainRequest) -> None:
     logger.info(f"Enqueued download request {payload.name=} queues={queue_names}")
 
 
-async def dequeue_download_request(queue_name: str) -> Union[DownloadChainRequest, None]:
+async def dequeue_download_request(queue_name: str) -> DownloadChainRequest | None:
     """Get the next download request from a backend-specific download queue."""
     client = get_queue_client()
     result = await client.brpop(_normalize_queue_name(queue_name), timeout=5)

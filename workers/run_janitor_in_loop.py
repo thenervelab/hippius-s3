@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 import asyncpg
-import redis.asyncio as async_redis
+from redis.asyncio import Redis
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -33,7 +33,7 @@ setup_loki_logging(config, "janitor", include_ray_id=False)
 logger = logging.getLogger(__name__)
 
 
-async def get_all_dlq_object_ids(redis_client: async_redis.Redis) -> set[str]:
+async def get_all_dlq_object_ids(redis_client: Redis) -> set[str]:
     """Fetch all object_ids currently in both upload and unpin DLQs.
 
     Returns:
@@ -62,7 +62,7 @@ async def get_all_dlq_object_ids(redis_client: async_redis.Redis) -> set[str]:
 
 
 async def cleanup_stale_parts(
-    db: asyncpg.Connection, fs_store: FileSystemPartsStore, redis_client: async_redis.Redis
+    db: asyncpg.Connection, fs_store: FileSystemPartsStore, redis_client: Redis
 ) -> int:
     """Conservative cleanup of stale parts: rely on FS mtime only for now.
 
@@ -211,7 +211,7 @@ async def is_replicated_on_all_backends(
 async def cleanup_old_parts_by_mtime(
     db: asyncpg.Connection,
     fs_store: FileSystemPartsStore,
-    redis_client: async_redis.Redis,
+    redis_client: Redis,
 ) -> int:
     """Clean up old parts from FS based on modification time (backup GC).
 
@@ -339,7 +339,7 @@ async def run_janitor_loop():
     """Main janitor loop: periodically clean stale and old parts."""
     db = await asyncpg.connect(config.database_url)
     fs_store = FileSystemPartsStore(config.object_cache_dir)
-    redis_client = async_redis.from_url(config.redis_queues_url)
+    redis_client = Redis.from_url(config.redis_queues_url)
 
     # Initialize metrics
     try:
@@ -348,8 +348,6 @@ async def run_janitor_loop():
         logger.debug("Metrics initialization failed; continuing without metrics", exc_info=True)
 
     logger.info("Starting janitor service...")
-    logger.info(f"Database: {config.database_url}")
-    logger.info(f"Redis (for DLQ checks): {config.redis_queues_url}")
     logger.info(f"FS store root: {config.object_cache_dir}")
     logger.info(f"MPU stale threshold: {config.mpu_stale_seconds}s")
     logger.info(f"FS GC max age: {config.fs_cache_gc_max_age_seconds}s")

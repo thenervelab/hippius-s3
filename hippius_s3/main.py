@@ -99,7 +99,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.postgres_pool = await postgres_create_pool(config.database_url, config)
         logger.info(f"Postgres connection pool created: min={config.db_pool_min_size}, max={config.db_pool_max_size}")
 
-        app.state.redis_client = async_redis.from_url(config.redis_url)
+        from hippius_s3.redis_utils import create_redis_client
+
+        app.state.redis_client = create_redis_client(config.redis_url)
         logger.info("Redis client initialized")
 
         app.state.redis_accounts_client = async_redis.from_url(config.redis_accounts_url)

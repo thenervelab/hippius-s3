@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-acl
+spec:
+  template:
+    spec:
+      containers:
+        - name: redis
+          command:
+            - redis-server
+            - /usr/local/etc/redis/redis.conf
+            - --maxmemory
+            - 4gb
+            - --maxmemory-policy
+            - allkeys-lru
+            - --save
+            - ""
+            - --appendonly
+            - "no"

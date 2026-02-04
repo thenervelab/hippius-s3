@@ -6,11 +6,14 @@ import time
 from pathlib import Path
 
 import asyncpg
-import redis.asyncio as async_redis
 from pydantic import ValidationError
+
+from hippius_s3.redis_cache import initialize_cache_client
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from opentelemetry import trace
 
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
@@ -29,18 +32,21 @@ from hippius_s3.workers.uploader import compute_backoff_ms
 
 
 config = get_config()
+tracer = trace.get_tracer(__name__)
 
 setup_loki_logging(config, "arion-uploader")
 logger = logging.getLogger(__name__)
 
 
 async def run_arion_uploader_loop():
-    db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=10)
-    redis_client = async_redis.from_url(config.redis_url)
-    redis_queues_client = async_redis.from_url(config.redis_queues_url)
+    from redis.asyncio import Redis
 
     from hippius_s3.queue import initialize_queue_client
-    from hippius_s3.redis_cache import initialize_cache_client
+    from hippius_s3.redis_utils import create_redis_client
+
+    db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=10)
+    redis_client = create_redis_client(config.redis_url)
+    redis_queues_client = Redis.from_url(config.redis_queues_url)
 
     initialize_queue_client(redis_queues_client)
     initialize_cache_client(redis_client)
@@ -50,10 +56,6 @@ async def run_arion_uploader_loop():
 
     logger.info("Starting Arion uploader service...")
     logger.info("Backend: arion")
-    logger.info(f"Arion base URL: {config.arion_base_url}")
-    logger.info(f"Redis URL: {config.redis_url}")
-    logger.info(f"Redis Queues URL: {config.redis_queues_url}")
-    logger.info(f"Database pool created: {config.database_url}")
 
     uploader = Uploader(
         db_pool,
@@ -102,32 +104,45 @@ async def run_arion_uploader_loop():
                 f"Processing Arion upload request object_id={upload_request.object_id} chunks={len(upload_request.chunks)} attempts={upload_request.attempts or 0}"
             )
 
-            try:
-                await uploader.process_upload(upload_request)
-            except Exception as e:
-                worker_logger.exception(f"Arion upload failed object_id={upload_request.object_id}")
-                err_str = str(e)
-                error_type = classify_error(e)
-                attempts_next = (upload_request.attempts or 0) + 1
+            with tracer.start_as_current_span(
+                "uploader.job",
+                attributes={
+                    "object_id": upload_request.object_id,
+                    "hippius.ray_id": ray_id,
+                    "backend": "arion",
+                    "attempts": upload_request.attempts or 0,
+                },
+            ) as span:
+                try:
+                    await uploader.process_upload(upload_request)
+                except Exception as e:
+                    span.record_exception(e)
+                    span.set_status(trace.StatusCode.ERROR, str(e))
+                    worker_logger.exception(f"Arion upload failed object_id={upload_request.object_id}")
+                    err_str = str(e)
+                    error_type = classify_error(e)
+                    attempts_next = (upload_request.attempts or 0) + 1
 
-                if error_type == "transient" and attempts_next <= config.uploader_max_attempts:
-                    delay_ms = compute_backoff_ms(
-                        attempts_next, config.uploader_backoff_base_ms, config.uploader_backoff_max_ms
-                    )
-                    await enqueue_retry_request(upload_request, backend_name="arion", delay_seconds=delay_ms / 1000.0, last_error=err_str)
-                    get_metrics_collector().record_uploader_operation(
-                        main_account=upload_request.address,
-                        success=False,
-                        attempt=attempts_next,
-                    )
-                else:
-                    await uploader._push_to_dlq(upload_request, err_str, error_type)
-                    async with db_pool.acquire() as db:
-                        await db.execute(
-                            "UPDATE object_versions SET status = 'failed' WHERE object_id = $1 AND object_version = $2",
-                            upload_request.object_id,
-                            int(getattr(upload_request, "object_version", 1) or 1),
+                    if error_type == "transient" and attempts_next <= config.uploader_max_attempts:
+                        delay_ms = compute_backoff_ms(
+                            attempts_next, config.uploader_backoff_base_ms, config.uploader_backoff_max_ms
                         )
+                        await enqueue_retry_request(
+                            upload_request, backend_name="arion", delay_seconds=delay_ms / 1000.0, last_error=err_str
+                        )
+                        get_metrics_collector().record_uploader_operation(
+                            main_account=upload_request.address,
+                            success=False,
+                            attempt=attempts_next,
+                        )
+                    else:
+                        await uploader._push_to_dlq(upload_request, err_str, error_type)
+                        async with db_pool.acquire() as db:
+                            await db.execute(
+                                "UPDATE object_versions SET status = 'failed' WHERE object_id = $1 AND object_version = $2",
+                                upload_request.object_id,
+                                int(getattr(upload_request, "object_version", 1) or 1),
+                            )
         else:
             await asyncio.sleep(0.1)
 

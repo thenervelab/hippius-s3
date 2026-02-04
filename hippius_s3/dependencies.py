@@ -3,10 +3,12 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 from typing import AsyncGenerator
+from typing import Union
 
-import redis.asyncio as async_redis
 from fastapi import HTTPException
 from fastapi import Request
+from redis.asyncio import Redis
+from redis.asyncio.cluster import RedisCluster
 from starlette import status
 
 from hippius_s3.config import Config
@@ -60,15 +62,15 @@ def get_config(request: Request) -> Config:
     return config
 
 
-def get_redis(request: Request) -> async_redis.Redis:
+def get_redis(request: Request) -> Union[Redis, RedisCluster]:
     """Extract the Redis client from the request."""
-    redis_client: async_redis.Redis = request.app.state.redis_client
+    redis_client: Union[Redis, RedisCluster] = request.app.state.redis_client
     return redis_client
 
 
-def get_redis_accounts(request: Request) -> async_redis.Redis:
+def get_redis_accounts(request: Request) -> Union[Redis, RedisCluster]:
     """Extract the Redis accounts client from the request."""
-    redis_accounts_client: async_redis.Redis = request.app.state.redis_accounts_client
+    redis_accounts_client: Union[Redis, RedisCluster] = request.app.state.redis_accounts_client
     return redis_accounts_client
 
 

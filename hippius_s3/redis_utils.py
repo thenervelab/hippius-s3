@@ -4,8 +4,10 @@ import logging
 from typing import Awaitable
 from typing import Callable
 from typing import TypeVar
+from typing import Union
 
-import redis.asyncio as async_redis
+from redis.asyncio import Redis
+from redis.asyncio.cluster import RedisCluster
 from redis.exceptions import BusyLoadingError
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
@@ -16,14 +18,33 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
+def create_redis_client(redis_url: str) -> Union[Redis, RedisCluster]:
+    """
+    Create a Redis client from URL, automatically detecting cluster vs standalone.
+
+    Args:
+        redis_url: Redis connection URL (redis://host:port or redis://host:port?cluster=true)
+
+    Returns:
+        Redis or RedisCluster client based on URL parameters
+    """
+    if "cluster=true" in redis_url or "redis-cluster" in redis_url:
+        host_port = redis_url.replace("redis://", "").split("?")[0].split("/")[0]
+        host, port = host_port.split(":") if ":" in host_port else (host_port, "6379")
+        logger.info(f"Creating Redis Cluster client for {host}:{port}")
+        return RedisCluster(host=host, port=int(port))
+    logger.info("Creating Redis client")
+    return Redis.from_url(redis_url)
+
+
 async def with_redis_retry(
-    func: Callable[[async_redis.Redis], Awaitable[T]],
-    redis_client: async_redis.Redis,
+    func: Callable[[Union[Redis, RedisCluster]], Awaitable[T]],
+    redis_client: Union[Redis, RedisCluster],
     redis_url: str,
     operation_name: str = "redis operation",
     max_retries: int = 5,
     retry_sleep: float = 2.0,
-) -> tuple[T, async_redis.Redis]:
+) -> tuple[T, Union[Redis, RedisCluster]]:
     """
     Execute a Redis operation with automatic retry and reconnection on transient errors.
 
@@ -66,7 +87,7 @@ async def with_redis_retry(
                 with contextlib.suppress(Exception):
                     await current_client.close()
                 await asyncio.sleep(retry_sleep)
-                current_client = async_redis.from_url(redis_url)
+                current_client = create_redis_client(redis_url)
             else:
                 logger.error(f"Redis error during {operation_name} after {max_retries} attempts: {e}")
 

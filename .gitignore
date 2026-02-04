@@ -1,6 +1,7 @@
 # Environment variables
 .env
 .env.backup
+*.csv
 
 # Python
 __pycache__/

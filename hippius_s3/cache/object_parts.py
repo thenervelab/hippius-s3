@@ -193,17 +193,9 @@ class RedisObjectPartsCache:
             self.build_meta_key(object_id, object_version, part_number),
             int(ttl if ttl is not None else _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS)),
         )
-        # Also expire all chunk keys for this part (scan pattern to catch all indices)
         pattern = f"obj:{object_id}:v:{int(object_version)}:part:{int(part_number)}:chunk:*"
-        cursor = 0
-        while True:
-            cursor, keys = await self.redis.scan(cursor, match=pattern, count=100)
-            if keys:
-                # Expire all found chunk keys
-                for key in keys:
-                    await self.redis.expire(key, ttl)
-            if cursor == 0:
-                break
+        async for key in self.redis.scan_iter(match=pattern, count=100):
+            await self.redis.expire(key, ttl)
 
     # Note: base part policy is 1-based; callers should use get/set directly with part_number=1
 

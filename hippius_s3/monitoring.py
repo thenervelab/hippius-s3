@@ -1,8 +1,8 @@
 import logging
 import os
 from typing import Optional
+from typing import Union
 
-import redis.asyncio as async_redis
 from fastapi import Request
 from fastapi import Response
 from opentelemetry import metrics
@@ -11,6 +11,8 @@ from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExp
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
+from redis.asyncio import Redis
+from redis.asyncio.cluster import RedisCluster
 
 
 logger = logging.getLogger(__name__)
@@ -18,7 +20,7 @@ tracer = trace.get_tracer(__name__)
 
 
 class MetricsCollector:
-    def __init__(self, redis_client: async_redis.Redis):
+    def __init__(self, redis_client: Union[Redis, RedisCluster]):
         self.redis_client = redis_client
         self.meter = metrics.get_meter(__name__)
         self._upload_len = 0
@@ -32,8 +34,6 @@ class MetricsCollector:
         self._rate_limiting_db_size = 0
         self._used_mem = 0
         self._max_mem = 0
-        self._pin_checker_missing_cids: dict[str, int] = {}
-        self._object_status_counts: dict[str, int] = {}
         self._backup_last_success_timestamp = 0.0
         # FS store metrics
         self._fs_store_oldest_age_seconds = 0.0
@@ -72,18 +72,6 @@ class MetricsCollector:
             name="multipart_uploads_active", description="Number of active multipart uploads", unit="1"
         )
 
-        self.ipfs_operations_total = self.meter.create_counter(
-            name="ipfs_operations_total", description="Total IPFS operations", unit="1"
-        )
-
-        self.ipfs_operation_duration = self.meter.create_histogram(
-            name="ipfs_operation_duration_seconds", description="IPFS operation duration in seconds", unit="s"
-        )
-
-        self.cache_downloads_total = self.meter.create_counter(
-            name="cache_downloads_total", description="Total downloads served from Redis cache", unit="1"
-        )
-
         self.s3_bytes_uploaded = self.meter.create_counter(
             name="s3_bytes_uploaded_total", description="Total bytes uploaded to S3", unit="bytes"
         )
@@ -116,30 +104,6 @@ class MetricsCollector:
 
         self.object_size_bytes = self.meter.create_histogram(
             name="object_size_bytes", description="Distribution of object sizes", unit="bytes"
-        )
-
-        self.substrate_requests_total = self.meter.create_counter(
-            name="substrate_requests_total",
-            description="Total substrate blockchain requests processed",
-            unit="1",
-        )
-
-        self.substrate_requests_retried_total = self.meter.create_counter(
-            name="substrate_requests_retried_total",
-            description="Total substrate requests retried",
-            unit="1",
-        )
-
-        self.substrate_batch_duration = self.meter.create_histogram(
-            name="substrate_batch_duration_seconds",
-            description="Duration of substrate batch processing",
-            unit="s",
-        )
-
-        self.substrate_cids_submitted = self.meter.create_counter(
-            name="substrate_cids_submitted_total",
-            description="Total CIDs submitted to substrate blockchain",
-            unit="1",
         )
 
         self.uploader_requests_total = self.meter.create_counter(
@@ -256,18 +220,6 @@ class MetricsCollector:
             description="Total keys in Redis databases (DBSIZE)",
         )
 
-        self.meter.create_observable_gauge(
-            name="pin_checker_missing_cids",
-            callbacks=[self._obs_pin_checker_missing_cids],
-            description="Number of missing CIDs per user (S3 DB vs Chain)",
-        )
-
-        self.meter.create_observable_gauge(
-            name="object_status_counts",
-            callbacks=[self._obs_object_status_counts],
-            description="Total count of objects by status across all users",
-        )
-
         # FS store gauges
         self.meter.create_observable_gauge(
             name="fs_store_oldest_age_seconds",
@@ -354,14 +306,6 @@ class MetricsCollector:
             metrics.Observation(self._rate_limiting_db_size, {"redis_instance": "rate_limiting"}),
         ]
 
-    def _obs_pin_checker_missing_cids(self, _: object) -> list[metrics.Observation]:
-        return [
-            metrics.Observation(count, {"main_account": user}) for user, count in self._pin_checker_missing_cids.items()
-        ]
-
-    def _obs_object_status_counts(self, _: object) -> list[metrics.Observation]:
-        return [metrics.Observation(count, {"status": status}) for status, count in self._object_status_counts.items()]
-
     def _obs_backup_last_success(self, _: object) -> list[metrics.Observation]:
         return [metrics.Observation(self._backup_last_success_timestamp, {})]
 
@@ -447,38 +391,6 @@ class MetricsCollector:
         elif operation in ["put_bucket"]:
             self.s3_buckets_total.add(1, attributes=attributes)
 
-    def record_ipfs_operation(
-        self,
-        operation: str,
-        duration: float,
-        cid: Optional[str] = None,
-        success: bool = True,
-        main_account: Optional[str] = None,
-    ) -> None:
-        attributes = {"operation": operation, "success": str(success).lower()}
-
-        if main_account:
-            attributes["main_account"] = main_account
-
-        self.ipfs_operations_total.add(1, attributes=attributes)
-        self.ipfs_operation_duration.record(duration, attributes=attributes)
-
-    def record_cache_download(
-        self,
-        object_type: str,
-        range_request: bool = False,
-        main_account: Optional[str] = None,
-    ) -> None:
-        attributes = {
-            "object_type": object_type,
-            "range_request": str(range_request).lower(),
-        }
-
-        if main_account:
-            attributes["main_account"] = main_account
-
-        self.cache_downloads_total.add(1, attributes=attributes)
-
     def record_data_transfer(
         self,
         operation: str,
@@ -561,34 +473,6 @@ class MetricsCollector:
         else:
             self.cache_misses.add(1, attributes=attributes)
 
-    def record_substrate_operation(
-        self,
-        main_account: str,
-        success: bool,
-        num_cids: int = 0,
-        duration: Optional[float] = None,
-        attempt: Optional[int] = None,
-    ) -> None:
-        attributes = {
-            "main_account": main_account,
-            "success": str(success).lower(),
-        }
-
-        if attempt is not None:
-            retry_attributes = {
-                "main_account": main_account,
-                "attempt": str(attempt),
-            }
-            self.substrate_requests_retried_total.add(1, attributes=retry_attributes)
-        else:
-            self.substrate_requests_total.add(1, attributes=attributes)
-
-            if num_cids > 0:
-                self.substrate_cids_submitted.add(num_cids, attributes=attributes)
-
-            if duration is not None:
-                self.substrate_batch_duration.record(duration, attributes=attributes)
-
     def record_uploader_operation(
         self,
         main_account: str,
@@ -659,12 +543,6 @@ class MetricsCollector:
             if duration is not None:
                 self.unpinner_duration.record(duration, attributes=attributes)
 
-    def set_pin_checker_missing_cids(self, user: str, count: int) -> None:
-        self._pin_checker_missing_cids[user] = count
-
-    def set_object_status_counts(self, status_counts: dict[str, int]) -> None:
-        self._object_status_counts = status_counts
-
     def record_backup_operation(
         self,
         database_name: str,
@@ -703,11 +581,6 @@ class MetricsCollector:
         attributes = {"database": database_name}
         self.backup_cleanup_deleted_count.add(deleted_count, attributes=attributes)
 
-    def record_orphan_checker_operation(
-        self, orphans_found: int = 0, files_checked: int = 0, success: bool = True
-    ) -> None:
-        pass
-
     def record_performance_metrics(
         self,
         operation: str,
@@ -737,12 +610,6 @@ class NullMetricsCollector:
     def record_s3_operation(self, *args: object, **kwargs: object) -> None:
         pass
 
-    def record_ipfs_operation(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def record_cache_download(self, *args: object, **kwargs: object) -> None:
-        pass
-
     def record_data_transfer(self, *args: object, **kwargs: object) -> None:
         pass
 
@@ -755,19 +622,10 @@ class NullMetricsCollector:
     def record_cache_operation(self, *args: object, **kwargs: object) -> None:
         pass
 
-    def record_substrate_operation(self, *args: object, **kwargs: object) -> None:
-        pass
-
     def record_uploader_operation(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_unpinner_operation(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def set_pin_checker_missing_cids(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def set_object_status_counts(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_backup_operation(self, *args: object, **kwargs: object) -> None:
@@ -777,9 +635,6 @@ class NullMetricsCollector:
         pass
 
     def record_backup_cleanup(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def record_orphan_checker_operation(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_performance_metrics(self, *args: object, **kwargs: object) -> None:
@@ -798,7 +653,7 @@ def set_metrics_collector(collector: MetricsCollector | NullMetricsCollector) ->
     _metrics_collector = collector
 
 
-def initialize_metrics_collector(redis_client: async_redis.Redis) -> MetricsCollector | NullMetricsCollector:
+def initialize_metrics_collector(redis_client: Union[Redis, RedisCluster]) -> MetricsCollector | NullMetricsCollector:
     if os.getenv("ENABLE_MONITORING", "false").lower() not in ("true", "1", "yes"):
         logger.info("Monitoring disabled, using NullMetricsCollector")
         null_collector = NullMetricsCollector()

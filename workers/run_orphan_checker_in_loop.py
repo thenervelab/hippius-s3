@@ -6,14 +6,12 @@ import time
 from pathlib import Path
 
 import asyncpg
-import redis.asyncio as async_redis
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
-from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import enqueue_unpin_request
 from hippius_s3.queue import initialize_queue_client
@@ -102,26 +100,23 @@ async def check_for_orphans(
                 page += 1
 
     logger.info(f"Orphan check complete: checked {total_checked} files, found {total_orphans} orphans")
-    get_metrics_collector().record_orphan_checker_operation(
-        orphans_found=total_orphans, files_checked=total_checked, success=True
-    )
 
 
 async def run_orphan_checker_loop() -> None:
     """Main loop for orphan checker worker."""
-    redis_client = async_redis.from_url(config.redis_url)
-    redis_queues_client = async_redis.from_url(config.redis_queues_url)
-    db = await asyncpg.connect(config.database_url)
+    from redis.asyncio import Redis
 
     from hippius_s3.redis_cache import initialize_cache_client
+    from hippius_s3.redis_utils import create_redis_client
+
+    redis_client = create_redis_client(config.redis_url)
+    redis_queues_client = Redis.from_url(config.redis_queues_url)
+    db = await asyncpg.connect(config.database_url)
 
     initialize_queue_client(redis_queues_client)
     initialize_cache_client(redis_client)
 
     logger.info("Starting orphan checker service...")
-    logger.info(f"Database URL: {config.database_url}")
-    logger.info(f"Redis URL: {config.redis_url}")
-    logger.info(f"Redis Queues URL: {config.redis_queues_url}")
     logger.info(f"Check interval: {config.orphan_checker_loop_sleep} seconds")
     logger.info(f"Batch size: {config.orphan_checker_batch_size} files")
     if config.orphan_checker_account_whitelist:
@@ -136,7 +131,6 @@ async def run_orphan_checker_loop() -> None:
             await asyncio.sleep(config.orphan_checker_loop_sleep)
         except Exception as e:
             logger.error(f"Orphan checker error: {e}", exc_info=True)
-            get_metrics_collector().record_orphan_checker_operation(success=False)
             await asyncio.sleep(60)
 
 

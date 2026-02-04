@@ -50,8 +50,8 @@ async def tracing_middleware(
                 set_span_attributes(
                     span,
                     {
-                        "s3.main_account": request.state.account.main_account,
-                        "s3.subaccount": request.state.account.id,
+                        "hippius.account.main": request.state.account.main_account,
+                        "hippius.account.sub": request.state.account.id,
                     },
                 )
 
