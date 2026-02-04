@@ -7,6 +7,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import AsyncIterator
 from datetime import datetime
 from datetime import timezone
 from typing import Any
@@ -436,235 +437,150 @@ async def upload_part(
         if not source_obj:
             return s3_error_response("NoSuchKey", f"Key {source_object_key} not found", status_code=404)
 
-        # Always read source from IPFS service to obtain plaintext when needed
-        source_bytes = None
+        # Read source via reader pipeline to obtain plaintext when needed
+        # Read plaintext via reader pipeline (parts → plan → stream decrypt)
+        try:
+            from hippius_s3.queue import DownloadChainRequest  # local import
+            from hippius_s3.queue import PartToDownload  # local import
+            from hippius_s3.queue import enqueue_download_request  # local import
+            from hippius_s3.reader.db_meta import read_parts_list  # local import to avoid cycles
+            from hippius_s3.reader.planner import build_chunk_plan  # local import
+            from hippius_s3.reader.streamer import stream_plan  # local import
+        except Exception:
+            return s3_error_response("InternalError", "Reader pipeline unavailable", status_code=500)
 
-        if source_bytes is None:
-            # Read plaintext via reader pipeline (parts → plan → stream decrypt)
-            try:
-                from hippius_s3.queue import DownloadChainRequest  # local import
-                from hippius_s3.queue import PartToDownload  # local import
-                from hippius_s3.queue import enqueue_download_request  # local import
-                from hippius_s3.reader.db_meta import read_parts_list  # local import to avoid cycles
-                from hippius_s3.reader.planner import build_chunk_plan  # local import
-                from hippius_s3.reader.streamer import stream_plan  # local import
-            except Exception:
-                return s3_error_response("InternalError", "Reader pipeline unavailable", status_code=500)
+        object_id_str = str(source_obj["object_id"])  # type: ignore[index]
+        src_ver = int(source_obj.get("object_version") or 1)
+        parts = await read_parts_list(db, object_id_str, src_ver)
+        rng = None
+        source_size = int(source_obj.get("size_bytes") or 0)
+        if range_start is not None and range_end is not None:
+            if range_start < 0 or range_end < range_start:
+                return s3_error_response("InvalidRange", "Copy range invalid", status_code=416)
+            if source_size and range_end >= source_size:
+                return s3_error_response("InvalidRange", "Copy range invalid", status_code=416)
+            from hippius_s3.reader.types import RangeRequest  # local import
 
-            object_id_str = str(source_obj["object_id"])  # type: ignore[index]
-            src_ver = int(source_obj.get("object_version") or 1)
-            parts = await read_parts_list(db, object_id_str, src_ver)
-            plan = await build_chunk_plan(db, object_id_str, parts, None, object_version=src_ver)
+            rng = RangeRequest(start=int(range_start), end=int(range_end))
+        plan = await build_chunk_plan(db, object_id_str, parts, rng, object_version=src_ver)
 
-            # Enqueue downloader for any missing chunk indices in cache
-            obj_cache = RedisObjectPartsCache(request.app.state.redis_client)
-            indices_by_part: dict[int, list[int]] = {}
-            for it in plan:
-                exists = await obj_cache.chunk_exists(object_id_str, src_ver, int(it.part_number), int(it.chunk_index))
-                if not exists:
-                    arr = indices_by_part.setdefault(int(it.part_number), [])
-                    arr.append(int(it.chunk_index))
-            if indices_by_part:
-                dl_parts: list[PartToDownload] = []
-                for pn, idxs in indices_by_part.items():
-                    try:
-                        rows = await db.fetch(
-                            get_query("get_part_chunks_by_object_and_number"),
-                            object_id_str,
-                            src_ver,
-                            int(pn),
-                        )
-                        all_entries = [
-                            (int(r[0]), str(r[1]), int(r[2]) if r[2] is not None else None) for r in rows or []
-                        ]
-                        chunk_specs = []
-                        include = {int(i) for i in idxs}
-                        for ci, cid, clen in all_entries:
-                            if int(ci) in include:
-                                chunk_specs.append(
-                                    {
-                                        "index": int(ci),
-                                        "cid": str(cid),
-                                        "cipher_size_bytes": int(clen) if clen is not None else None,
-                                    }
-                                )
-                        if not chunk_specs:
-                            continue
-                        dl_parts.append(
-                            PartToDownload(part_number=int(pn), chunks=chunk_specs)  # type: ignore[arg-type]
-                        )
-                    except Exception:
+        # Enqueue downloader for any missing chunk indices in cache
+        obj_cache = RedisObjectPartsCache(request.app.state.redis_client)
+        indices_by_part: dict[int, list[int]] = {}
+        for it in plan:
+            exists = await obj_cache.chunk_exists(object_id_str, src_ver, int(it.part_number), int(it.chunk_index))
+            if not exists:
+                arr = indices_by_part.setdefault(int(it.part_number), [])
+                arr.append(int(it.chunk_index))
+        if indices_by_part:
+            dl_parts: list[PartToDownload] = []
+            for pn, idxs in indices_by_part.items():
+                try:
+                    rows = await db.fetch(
+                        get_query("get_part_chunks_by_object_and_number"),
+                        object_id_str,
+                        src_ver,
+                        int(pn),
+                    )
+                    all_entries = [(int(r[0]), str(r[1]), int(r[2]) if r[2] is not None else None) for r in rows or []]
+                    chunk_specs = []
+                    include = {int(i) for i in idxs}
+                    for ci, cid, clen in all_entries:
+                        if int(ci) in include:
+                            chunk_specs.append(
+                                {
+                                    "index": int(ci),
+                                    "cid": str(cid),
+                                    "cipher_size_bytes": int(clen) if clen is not None else None,
+                                }
+                            )
+                    if not chunk_specs:
                         continue
-                req = DownloadChainRequest(
-                    request_id=f"{object_id_str}::upload_part_copy",
-                    object_id=object_id_str,
-                    object_version=src_ver,
-                    object_storage_version=int(source_obj.get("storage_version") or 0),
-                    object_key=source_object_key,
-                    bucket_name=source_bucket_name,
-                    address=request.state.account.main_account,
-                    subaccount=request.state.account.main_account,
-                    subaccount_seed_phrase=request.state.seed_phrase,
-                    substrate_url=config.substrate_url,
-                    size=int(source_obj.get("size_bytes") or 0),
-                    multipart=bool((json.loads(source_obj.get("metadata") or "{}") or {}).get("multipart", False)),
-                    chunks=dl_parts,
-                )
-                await enqueue_download_request(req)
-
-            # Stream plaintext bytes
-            raw_storage_version = source_obj.get("storage_version")
-            if raw_storage_version is None:
-                return s3_error_response("InternalError", "Missing storage version", status_code=500)
-            storage_version = require_supported_storage_version(int(raw_storage_version))
-            bucket_id = str(source_obj.get("bucket_id") or "")
-            suite_id = str(
-                source_obj.get("enc_suite_id") or ("hip-enc/aes256gcm" if storage_version >= 5 else "hip-enc/legacy")
-            )
-            key_bytes: bytes | None = None
-            expected_size = (
-                int(range_end - range_start + 1)
-                if range_start is not None and range_end is not None
-                else int(source_obj.get("size_bytes") or 0)
-            )
-            if expected_size > int(config.max_multipart_part_size):
-                return s3_error_response(
-                    "EntityTooLarge",
-                    "UploadPartCopy source is too large to buffer in memory",
-                    status_code=413,
-                )
-            if storage_version >= 5:
-                from hippius_s3.services.envelope_service import unwrap_dek
-                from hippius_s3.services.kek_service import get_bucket_kek_bytes
-
-                kek_id = source_obj.get("kek_id")
-                wrapped_dek = source_obj.get("wrapped_dek")
-                if not bucket_id or not kek_id or not wrapped_dek:
-                    return s3_error_response("InternalError", "Missing v5 envelope metadata", status_code=500)
-                kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
-                aad = f"hippius-dek:{bucket_id}:{object_id_str}:{src_ver}".encode("utf-8")
-                key_bytes = unwrap_dek(kek=kek_bytes, wrapped_dek=bytes(wrapped_dek), aad=aad)
-            else:
-                from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
-
-                key_bytes = await get_or_create_encryption_key_bytes(
-                    main_account_id=request.state.account.main_account,
-                    bucket_name=source_bucket_name,
-                )
-            chunks_iter = stream_plan(
-                obj_cache=obj_cache,
+                    dl_parts.append(
+                        PartToDownload(part_number=int(pn), chunks=chunk_specs)  # type: ignore[arg-type]
+                    )
+                except Exception:
+                    continue
+            req = DownloadChainRequest(
+                request_id=f"{object_id_str}::upload_part_copy",
                 object_id=object_id_str,
                 object_version=src_ver,
-                plan=plan,
-                sleep_seconds=config.http_download_sleep_loop,
-                storage_version=storage_version,
-                key_bytes=key_bytes,
-                suite_id=suite_id,
-                bucket_id=bucket_id,
-                upload_id="",
+                object_storage_version=int(source_obj.get("storage_version") or 0),
+                object_key=source_object_key,
+                bucket_name=source_bucket_name,
                 address=request.state.account.main_account,
+                subaccount=request.state.account.main_account,
+                subaccount_seed_phrase=request.state.seed_phrase,
+                substrate_url=config.substrate_url,
+                size=int(source_obj.get("size_bytes") or 0),
+                multipart=bool((json.loads(source_obj.get("metadata") or "{}") or {}).get("multipart", False)),
+                chunks=dl_parts,
+            )
+            await enqueue_download_request(req)
+
+        # Stream plaintext bytes
+        raw_storage_version = source_obj.get("storage_version")
+        if raw_storage_version is None:
+            return s3_error_response("InternalError", "Missing storage version", status_code=500)
+        storage_version = require_supported_storage_version(int(raw_storage_version))
+        bucket_id = str(source_obj.get("bucket_id") or "")
+        suite_id = str(
+            source_obj.get("enc_suite_id") or ("hip-enc/aes256gcm" if storage_version >= 5 else "hip-enc/legacy")
+        )
+        key_bytes: bytes | None = None
+        expected_size = (
+            int(range_end - range_start + 1)
+            if range_start is not None and range_end is not None
+            else int(source_obj.get("size_bytes") or 0)
+        )
+        if expected_size > int(config.max_multipart_part_size):
+            return s3_error_response(
+                "EntityTooLarge",
+                "UploadPartCopy source is too large to buffer in memory",
+                status_code=413,
+            )
+        if storage_version >= 5:
+            from hippius_s3.services.envelope_service import unwrap_dek
+            from hippius_s3.services.kek_service import get_bucket_kek_bytes
+
+            kek_id = source_obj.get("kek_id")
+            wrapped_dek = source_obj.get("wrapped_dek")
+            if not bucket_id or not kek_id or not wrapped_dek:
+                return s3_error_response("InternalError", "Missing v5 envelope metadata", status_code=500)
+            kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
+            aad = f"hippius-dek:{bucket_id}:{object_id_str}:{src_ver}".encode("utf-8")
+            key_bytes = unwrap_dek(kek=kek_bytes, wrapped_dek=bytes(wrapped_dek), aad=aad)
+        else:
+            from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
+
+            key_bytes = await get_or_create_encryption_key_bytes(
+                main_account_id=request.state.account.main_account,
                 bucket_name=source_bucket_name,
             )
-            try:
-                source_bytes = b"".join([piece async for piece in chunks_iter])
-            except Exception as e:
-                logger.warning(f"UploadPartCopy failed to stream source via reader: {e}")
-                return s3_error_response("ServiceUnavailable", "Failed to read source", status_code=503)
-
-        if range_start is not None and range_end is not None:
-            if range_start < 0 or range_end < range_start or range_end >= len(source_bytes):
-                return s3_error_response("InvalidRange", "Copy range invalid", status_code=416)
-            part_bytes = source_bytes[range_start : range_end + 1]
-        else:
-            part_bytes = source_bytes
-
-        file_data = part_bytes
-        # Debug: log copy slice info
-        try:
-            md5_copy = hashlib.md5(file_data).hexdigest()
-            logger.info(
-                f"UploadPartCopy slice: upload_id={upload_id} part={part_number} src={source_bucket_name}/{source_object_key} "
-                f"range={range_start}-{range_end} len={len(file_data)} md5={md5_copy}"
-            )
-        except Exception:
-            logger.debug("Failed to compute md5 for copy slice", exc_info=True)
-        # Proceed as normal part write below
+        chunks_iter = stream_plan(
+            obj_cache=obj_cache,
+            object_id=object_id_str,
+            object_version=src_ver,
+            plan=plan,
+            sleep_seconds=config.http_download_sleep_loop,
+            storage_version=storage_version,
+            key_bytes=key_bytes,
+            suite_id=suite_id,
+            bucket_id=bucket_id,
+            upload_id="",
+            address=request.state.account.main_account,
+            bucket_name=source_bucket_name,
+        )
+        body_iter: AsyncIterator[bytes] = chunks_iter
     else:
-        # Read request body for regular UploadPart
-        try:
-            body_start = time.time()
-            file_data = await get_request_body(request)
-            body_time = time.time() - body_start
-            logger.debug(f"Part {part_number}: Got request body in {body_time:.3f}s, size: {len(file_data)} bytes")
-        except ClientDisconnect:
-            logger.warning(f"Client disconnected during part {part_number} upload for upload {upload_id}")
-
-            # Clean up any cached parts for this upload when client disconnects
-            keys = await get_all_cached_chunks(
-                upload_id,
-                request.app.state.redis_client,
-            )
-            if keys:
-                await request.app.state.redis_client.delete(*keys)
-                logger.info(f"Cleaned up {len(keys)} cached parts for disconnected upload {upload_id}")
-
-            return s3_error_response(
-                "RequestTimeout",
-                "Client disconnected during upload",
-                status_code=408,
-            )
-
-    # (file_data is set either by copy path or regular body read)
-
-    # Enforce AWS S3 minimum part size (except for final part)
-    # Allow parts smaller than 5MB - AWS S3 allows this for the final part
-    # We don't have a way to know if this is the final part until completion,
-    # so we'll be permissive here and let completion validation handle it
-    file_size = len(file_data)
-
-    if file_size == 0:
-        return s3_error_response(
-            "InvalidArgument",
-            "Zero-length part not allowed",
-            status_code=400,
-        )
-
-    if file_size > config.max_multipart_part_size:
-        return s3_error_response(
-            "EntityTooLarge",
-            f"Part size {file_size} bytes exceeds maximum {config.max_multipart_part_size} bytes",
-            status_code=400,
-        )
+        # Stream request body for regular UploadPart
+        body_iter = utils.iter_request_body(request)
 
     # Cache part data in chunked layout via ObjectWriter (no IPFS upload for parts)
     redis_client = request.app.state.redis_client
-    obj_cache = RedisObjectPartsCache(redis_client)
 
     try:
-        # Check if client is still connected before proceeding
-        disconnect_start = time.time()
-        if await request.is_disconnected():
-            logger.warning(f"Client disconnected before caching part {part_number} for upload {upload_id}")
-            return s3_error_response(
-                "RequestTimeout",
-                "Client disconnected during upload",
-                status_code=408,
-            )
-        disconnect_time = time.time() - disconnect_start
-        logger.debug(f"Part {part_number}: Disconnect check took {disconnect_time:.3f}s")
-
-        # Store in Redis (debug: log about to cache)
-        try:
-            import hashlib as _hashlib
-
-            md5_pre_cache = _hashlib.md5(file_data).hexdigest()
-            head_hex = file_data[:8].hex() if file_data else ""
-            tail_hex = file_data[-8:].hex() if len(file_data) >= 8 else head_hex
-            logger.debug(
-                f"About to cache part: upload_id={upload_id} part={part_number} len={len(file_data)} md5={md5_pre_cache} head8={head_hex} tail8={tail_hex}"
-            )
-        except Exception:
-            logger.debug("Failed to compute md5 for pre-cache log", exc_info=True)
+        # Store in Redis via chunked cache API (encrypt for private, meta-first for readiness)
         # Resolve destination bucket name for key lookup
         try:
             row = await db.fetchrow(
@@ -684,31 +600,66 @@ async def upload_part(
             return s3_error_response("NoSuchUpload", "The specified upload does not exist.", status_code=404)
         dest_bucket_name = row.get("bucket_name")
 
-        # Store in Redis via chunked cache API (encrypt for private, meta-first for readiness)
         redis_start = time.time()
         # Route through ObjectWriter for standardized behavior
         writer = ObjectWriter(db=db, redis_client=redis_client, fs_store=request.app.state.fs_store)
-        part_res = await writer.mpu_upload_part(
-            upload_id=str(upload_id),
-            object_id=str(object_id),
-            object_version=int(current_object_version),
-            bucket_name=str(dest_bucket_name or ""),
-            account_address=request.state.account.main_account,
-            seed_phrase=request.state.seed_phrase,
-            part_number=int(part_number),
-            body_bytes=file_data,
-        )
+        try:
+            part_res = await writer.mpu_upload_part_stream(
+                upload_id=str(upload_id),
+                object_id=str(object_id),
+                object_version=int(current_object_version),
+                bucket_name=str(dest_bucket_name or ""),
+                account_address=request.state.account.main_account,
+                seed_phrase=request.state.seed_phrase,
+                part_number=int(part_number),
+                body_iter=body_iter,
+            )
+        except ClientDisconnect:
+            logger.warning(f"Client disconnected during part {part_number} upload for upload {upload_id}")
+
+            # Clean up any cached parts for this upload when client disconnects
+            keys = await get_all_cached_chunks(
+                upload_id,
+                request.app.state.redis_client,
+            )
+            if keys:
+                await request.app.state.redis_client.delete(*keys)
+                logger.info(f"Cleaned up {len(keys)} cached parts for disconnected upload {upload_id}")
+
+            return s3_error_response(
+                "RequestTimeout",
+                "Client disconnected during upload",
+                status_code=408,
+            )
+        except ValueError as exc:
+            if "part_size_exceeds_max" in str(exc):
+                return s3_error_response(
+                    "EntityTooLarge",
+                    f"Part size exceeds maximum {config.max_multipart_part_size} bytes",
+                    status_code=400,
+                )
+            if "Zero-length part" in str(exc):
+                return s3_error_response(
+                    "InvalidArgument",
+                    "Zero-length part not allowed",
+                    status_code=400,
+                )
+            raise
         redis_time = time.time() - redis_start
         logger.debug(
             f"Part {part_number}: Cached via RedisObjectPartsCache in {redis_time:.3f}s (object_id={object_id}, encrypted=True)"
         )
 
-        # Create mock part result (no IPFS upload needed for individual parts)
-        etag = part_res.etag
-
+        file_size = int(part_res.size_bytes)
+        if copy_source:
+            with contextlib.suppress(Exception):
+                logger.info(
+                    f"UploadPartCopy slice: upload_id={upload_id} part={part_number} src={source_bucket_name}/{source_object_key} "
+                    f"range={range_start}-{range_end} len={file_size} md5={part_res.etag}"
+                )
         part_result = {
             "size_bytes": file_size,
-            "etag": etag,
+            "etag": part_res.etag,
             "part_number": part_number,
         }
 

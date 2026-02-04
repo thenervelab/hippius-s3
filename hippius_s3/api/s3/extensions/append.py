@@ -14,6 +14,7 @@ import json
 import logging
 import uuid
 from typing import Any
+from typing import AsyncIterator
 from typing import cast
 
 from fastapi import Request
@@ -42,7 +43,7 @@ async def handle_append(
     bucket_id: str,
     bucket_name: str,
     object_key: str,
-    incoming_bytes: bytes,
+    body_iter: AsyncIterator[bytes],
 ) -> Response:
     """Handle append PUT with ETag CAS and atomic update.
 
@@ -62,14 +63,6 @@ async def handle_append(
     # Version-based CAS for append
     expected_version_header = request.headers.get("x-amz-meta-append-if-version")
     append_id = request.headers.get("x-amz-meta-append-id")
-
-    # Reject empty append deltas
-    if not incoming_bytes:
-        return errors.s3_error_response(
-            code="InvalidRequest",
-            message="Empty append not allowed",
-            status_code=400,
-        )
 
     # Idempotency: if append-id is provided and we've seen it for this object, return stored result
     if append_id and append_id.strip():
@@ -109,14 +102,14 @@ async def handle_append(
     # PHASE 2 (out-of-DB): delegate to ObjectWriter to append, cache, and update version
     writer = ObjectWriter(db=db, redis_client=redis_client, fs_store=request.app.state.fs_store)
     try:
-        result = await writer.append(
+        result = await writer.append_stream(
             bucket_id=bucket_id,
             bucket_name=bucket_name,
             object_key=object_key,
             expected_version=int(expected_version),
             account_address=request.state.account.main_account,
             seed_phrase=request.state.seed_phrase,
-            incoming_bytes=incoming_bytes,
+            body_iter=body_iter,
         )
     except AppendPreconditionFailed as exc:
         return errors.s3_error_response(
@@ -176,7 +169,7 @@ async def handle_append(
     )
     with contextlib.suppress(Exception):
         logger.info(
-            f"APPEND success bucket={bucket_name} key={object_key} new_version={new_append_version} next_part={int(next_part)} size_delta={len(incoming_bytes)}"
+            f"APPEND success bucket={bucket_name} key={object_key} new_version={new_append_version} next_part={int(next_part)} size_delta={int(result.get('size_bytes', 0))}"
         )
 
     # Record idempotency result for future retries (best-effort)

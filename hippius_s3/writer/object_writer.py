@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import uuid
 from datetime import datetime
 from datetime import timezone
@@ -584,6 +585,188 @@ class ObjectWriter:
 
         return PartResult(etag=md5_hash, size_bytes=file_size, part_number=int(part_number))
 
+    async def mpu_upload_part_stream(
+        self,
+        *,
+        upload_id: str,
+        object_id: str,
+        object_version: int,
+        bucket_name: str,
+        account_address: str,
+        seed_phrase: str,
+        part_number: int,
+        body_iter: AsyncIterator[bytes],
+        max_size_bytes: int | None = None,
+    ) -> PartResult:
+        chunk_size = self.config.object_chunk_size_bytes
+        ttl = self.config.cache_ttl_seconds
+        max_size = int(self.config.max_multipart_part_size)
+        if max_size_bytes is not None:
+            max_size = int(max_size_bytes)
+        if max_size <= 0:
+            max_size = 0
+
+        # Resolve bucket_id and storage_version for this version
+        meta = await self.db.fetchrow(
+            """
+            SELECT o.bucket_id, ov.storage_version
+              FROM objects o
+              JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = $2
+             WHERE o.object_id = $1
+             LIMIT 1
+            """,
+            object_id,
+            int(object_version),
+        )
+        bucket_id = str(meta["bucket_id"]) if meta and meta.get("bucket_id") else ""
+        storage_version = int(meta["storage_version"]) if meta and meta.get("storage_version") is not None else 2
+        suite_id: str | None = "hip-enc/aes256gcm" if storage_version >= 5 else "hip-enc/legacy"
+        if storage_version >= 5:
+            key_bytes = await self._ensure_and_get_v5_dek(
+                bucket_id=bucket_id,
+                object_id=str(object_id),
+                object_version=int(object_version),
+                chunk_size=int(chunk_size),
+                suite_id=str(suite_id),
+                rotate=False,
+            )
+        else:
+            key_bytes = await get_or_create_encryption_key_bytes(
+                main_account_id=account_address, bucket_name=bucket_name
+            )
+
+        writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
+        adapter = CryptoService.get_adapter(suite_id)
+
+        hasher = hashlib.md5()
+        total_size = 0
+        next_chunk_index = 0
+        chunk_cipher_sizes: list[int] = []
+        pt_buf = bytearray()
+        written_chunk_indices: list[int] = []
+        meta_written = False
+
+        async def _cleanup_partial() -> None:
+            try:
+                await self.fs_store.delete_part(str(object_id), int(object_version), int(part_number))
+            except Exception:
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    "Failed to cleanup partial part on FS: object_id=%s v=%s part=%s",
+                    object_id,
+                    int(object_version),
+                    int(part_number),
+                )
+            if written_chunk_indices:
+                try:
+                    keys = [
+                        self.obj_cache.build_chunk_key(str(object_id), int(object_version), int(part_number), int(idx))
+                        for idx in written_chunk_indices
+                    ]
+                    keys.append(self.obj_cache.build_meta_key(str(object_id), int(object_version), int(part_number)))
+                    await self.redis_client.delete(*keys)
+                except Exception:
+                    logger = logging.getLogger(__name__)
+                    logger.warning(
+                        "Failed to cleanup partial part in Redis: object_id=%s v=%s part=%s",
+                        object_id,
+                        int(object_version),
+                        int(part_number),
+                    )
+
+        async def _encrypt_and_write(buf: bytes) -> None:
+            nonlocal total_size, next_chunk_index
+            if not buf:
+                return
+            hasher.update(buf)
+            total_size += len(buf)
+            ct = adapter.encrypt_chunk(
+                buf,
+                key=key_bytes,
+                bucket_id=bucket_id,
+                object_id=str(object_id),
+                part_number=int(part_number),
+                chunk_index=int(next_chunk_index),
+                upload_id=str(upload_id),
+            )
+            chunk_cipher_sizes.append(len(ct))
+            await self.fs_store.set_chunk(
+                str(object_id),
+                int(object_version),
+                int(part_number),
+                int(next_chunk_index),
+                ct,
+            )
+            try:
+                await self.obj_cache.set_chunk(
+                    str(object_id),
+                    int(object_version),
+                    int(part_number),
+                    int(next_chunk_index),
+                    ct,
+                    ttl=ttl,
+                )
+            except Exception:
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    "Redis chunk write failed (best-effort) in mpu stream: object_id=%s v=%s part=%s chunk=%s",
+                    object_id,
+                    int(object_version),
+                    int(part_number),
+                    int(next_chunk_index),
+                )
+            written_chunk_indices.append(int(next_chunk_index))
+            next_chunk_index += 1
+
+        try:
+            async for piece in body_iter:
+                if not piece:
+                    continue
+                pt_buf.extend(piece)
+                if max_size and total_size + len(pt_buf) > int(max_size):
+                    raise ValueError("part_size_exceeds_max")
+                while len(pt_buf) >= chunk_size:
+                    to_write = bytes(pt_buf[:chunk_size])
+                    del pt_buf[:chunk_size]
+                    await _encrypt_and_write(to_write)
+
+            if pt_buf:
+                await _encrypt_and_write(bytes(pt_buf))
+                pt_buf.clear()
+
+            if total_size == 0:
+                raise ValueError("Zero-length part not allowed")
+
+            await writer.write_meta(
+                str(object_id),
+                int(object_version),
+                int(part_number),
+                chunk_size=chunk_size,
+                num_chunks=int(next_chunk_index),
+                plain_size=int(total_size),
+            )
+            meta_written = True
+        except Exception:
+            if not meta_written:
+                await _cleanup_partial()
+            raise
+
+        md5_hash = hasher.hexdigest()
+
+        await upsert_part_placeholder(
+            self.db,
+            object_id=str(object_id),
+            upload_id=str(upload_id),
+            part_number=int(part_number),
+            size_bytes=int(total_size),
+            etag=str(md5_hash),
+            chunk_size_bytes=int(chunk_size),
+            object_version=int(object_version),
+            chunk_cipher_sizes=chunk_cipher_sizes,
+        )
+
+        return PartResult(etag=md5_hash, size_bytes=int(total_size), part_number=int(part_number))
+
     async def mpu_complete(
         self,
         *,
@@ -638,7 +821,7 @@ class ObjectWriter:
 
         return CompleteResult(etag=final_md5, size_bytes=int(total_size))
 
-    async def append(
+    async def append_stream(
         self,
         *,
         bucket_id: str,
@@ -647,15 +830,9 @@ class ObjectWriter:
         expected_version: int,
         account_address: str,
         seed_phrase: str,
-        incoming_bytes: bytes,
+        body_iter: AsyncIterator[bytes],
     ) -> dict:
-        """Append bytes with CAS, cache write-through, and enqueue.
-
-        Returns: {"object_id", "new_append_version", "etag", "part_number"}
-        """
-        if not incoming_bytes:
-            raise EmptyAppendError("Empty append not allowed")
-
+        """Append bytes with CAS, cache write-through, and enqueue (streaming)."""
         row = await self.db.fetchrow(
             """
             SELECT o.object_id, o.current_object_version AS cov
@@ -670,40 +847,12 @@ class ObjectWriter:
 
         object_id = str(row["object_id"])  # type: ignore
         cov = int(row["cov"])  # type: ignore
+        chunk_size = self.config.object_chunk_size_bytes
 
-        # Reserve part and update version state
-        delta_md5 = hashlib.md5(incoming_bytes).hexdigest()
-        delta_size = len(incoming_bytes)
         next_part = None
         upload_id = None
-        composite_etag = None
-        new_append_version_val = None
-        # Resolve encryption key before acquiring the transaction lock to minimize lock duration
-        chunk_size = self.config.object_chunk_size_bytes
-        sv_row = await self.db.fetchrow(
-            "SELECT storage_version FROM object_versions WHERE object_id=$1 AND object_version=$2",
-            object_id,
-            int(cov),
-        )
-        storage_version = int(sv_row["storage_version"]) if sv_row and sv_row.get("storage_version") is not None else 2
-        suite_id: str | None = "hip-enc/aes256gcm" if storage_version >= 5 else "hip-enc/legacy"
-        if storage_version >= 5:
-            key_bytes = await self._ensure_and_get_v5_dek(
-                bucket_id=bucket_id,
-                object_id=object_id,
-                object_version=int(cov),
-                chunk_size=int(chunk_size),
-                suite_id=str(suite_id),
-                rotate=False,
-            )
-        else:
-            key_bytes = await get_or_create_encryption_key_bytes(
-                main_account_id=account_address, bucket_name=bucket_name
-            )
 
-        ct_chunks: list[bytes] = []
         async with self.db.transaction():
-            # 1) Lock the current version row and re-check CAS atomically
             locked = await self.db.fetchrow(
                 """
                 SELECT append_version
@@ -720,7 +869,6 @@ class ObjectWriter:
             if expected_version != current_version:
                 raise AppendPreconditionFailed(current_version)
 
-            # 2) Compute next part number AFTER holding the lock
             next_part = await self.db.fetchval(
                 """
                 SELECT COALESCE(MAX(part_number), 0) + 1
@@ -749,104 +897,228 @@ class ObjectWriter:
                     object_key,
                     object_id,
                 )
-            # Encrypt before inserting part so cipher sizes are available for part_chunks
-            ct_chunks = CryptoService.encrypt_part_to_chunks(
-                incoming_bytes,
-                object_id=object_id,
-                part_number=int(next_part),
-                seed_phrase=seed_phrase,
-                chunk_size=chunk_size,
-                key=key_bytes,
-                suite_id=suite_id,
-                bucket_id=str(bucket_id),
-                upload_id=str(upload_id or ""),
-            )
-            await upsert_part_placeholder(
-                self.db,
-                object_id=object_id,
-                upload_id=str(upload_id),
-                part_number=int(next_part),
-                size_bytes=int(delta_size),
-                etag=delta_md5,
-                chunk_size_bytes=chunk_size,
-                object_version=int(cov),
-                chunk_cipher_sizes=[len(ct) for ct in ct_chunks],
-            )
 
-            # Recompute composite ETag
-            parts = await self.db.fetch(
-                "SELECT part_number, etag FROM parts WHERE object_id = $1 AND object_version = $2 ORDER BY part_number",
-                object_id,
-                cov,
-            )
-            # Prefer DB md5_hash for current version; fallback to cache base part
-            base_md5_row = await self.db.fetchrow(
-                "SELECT md5_hash FROM object_versions WHERE object_id = $1 AND object_version = $2",
-                object_id,
-                cov,
-            )
-            base_md5 = (base_md5_row and (base_md5_row["md5_hash"] or "").strip()) or ""
-            if len(base_md5) != 32:
-                try:
-                    base_bytes = await self.obj_cache.get(object_id, int(cov), 1)
-                    # If no base bytes, use MD5 of empty content for correctness
-                    base_md5 = hashlib.md5(base_bytes or b"").hexdigest()
-                except Exception:
-                    # As a last resort, treat as empty content
-                    base_md5 = hashlib.md5(b"").hexdigest()
-            md5s = [bytes.fromhex(base_md5)]
-            for p in parts:
-                e = str(p["etag"]).strip('"').split("-")[0]  # type: ignore
-                if len(e) == 32:
-                    md5s.append(bytes.fromhex(e))
-            composite_etag = hashlib.md5(b"".join(md5s)).hexdigest() + f"-{len(md5s)}"
-
-            # 3) CAS update on append_version to ensure no other writer slipped in
-            updated = await self.db.fetchrow(
+            await self.db.execute(
                 """
-                UPDATE object_versions
-                   SET size_bytes     = size_bytes + $3,
-                       md5_hash       = $4,
-                       multipart      = TRUE,
-                       append_version = append_version + 1,
-                       last_modified  = NOW(),
-                       last_append_at = NOW()
-                 WHERE object_id = $1 AND object_version = $2 AND append_version = $5
-                RETURNING append_version
+                INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, object_version, chunk_size_bytes)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (object_id, object_version, part_number) DO NOTHING
                 """,
+                str(uuid.uuid4()),
+                str(upload_id),
+                int(next_part),
+                None,
+                0,
+                "pending",
+                datetime.now(timezone.utc),
                 object_id,
-                cov,
-                int(delta_size),
-                composite_etag,
-                current_version,
+                int(cov),
+                int(chunk_size),
             )
-            if not updated:
-                fresh = await self.db.fetchval(
-                    "SELECT append_version FROM object_versions WHERE object_id = $1 AND object_version = $2",
+
+        if next_part is None or upload_id is None:
+            raise RuntimeError("append_reservation_failed")
+
+        async def _delete_part_row() -> None:
+            await self.db.execute(
+                "DELETE FROM parts WHERE object_id = $1 AND object_version = $2 AND part_number = $3",
+                object_id,
+                int(cov),
+                int(next_part),
+            )
+
+        async def _cleanup_part(num_chunks: int | None) -> None:
+            try:
+                await self.fs_store.delete_part(str(object_id), int(cov), int(next_part))
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "Failed to cleanup append part on FS: object_id=%s v=%s part=%s",
+                    object_id,
+                    int(cov),
+                    int(next_part),
+                )
+            try:
+                meta_key = self.obj_cache.build_meta_key(str(object_id), int(cov), int(next_part))
+                keys = [meta_key]
+                if num_chunks is not None:
+                    keys.extend(
+                        [
+                            self.obj_cache.build_chunk_key(str(object_id), int(cov), int(next_part), int(i))
+                            for i in range(int(num_chunks))
+                        ]
+                    )
+                    await self.redis_client.delete(*keys)
+                else:
+                    await self.redis_client.delete(*keys)
+                    pattern = f"obj:{object_id}:v:{int(cov)}:part:{int(next_part)}:chunk:*"
+                    cursor = 0
+                    while True:
+                        cursor, found = await self.redis_client.scan(cursor, match=pattern, count=100)
+                        if found:
+                            await self.redis_client.delete(*found)
+                        if cursor == 0:
+                            break
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "Failed to cleanup append part in Redis: object_id=%s v=%s part=%s",
+                    object_id,
+                    int(cov),
+                    int(next_part),
+                )
+
+        try:
+            part_res = await self.mpu_upload_part_stream(
+                upload_id=str(upload_id),
+                object_id=str(object_id),
+                object_version=int(cov),
+                bucket_name=str(bucket_name),
+                account_address=account_address,
+                seed_phrase=seed_phrase,
+                part_number=int(next_part),
+                body_iter=body_iter,
+                max_size_bytes=0,
+            )
+        except ValueError as exc:
+            await _delete_part_row()
+            if "Zero-length part" in str(exc):
+                raise EmptyAppendError("Empty append not allowed") from exc
+            raise
+        except Exception:
+            await _delete_part_row()
+            raise
+
+        delta_size = int(part_res.size_bytes)
+        meta = await self.fs_store.get_meta(str(object_id), int(cov), int(next_part))
+        num_chunks = int(meta.get("num_chunks", 0)) if meta else None
+
+        try:
+            async with self.db.transaction():
+                locked = await self.db.fetchrow(
+                    """
+                    SELECT append_version,
+                           md5_hash,
+                           (append_etag_md5s IS NOT NULL AND octet_length(append_etag_md5s) > 0) AS has_etag_md5s
+                      FROM object_versions
+                     WHERE object_id = $1 AND object_version = $2
+                     FOR UPDATE
+                    """,
                     object_id,
                     cov,
                 )
-                raise AppendPreconditionFailed(int(fresh or 0))
-            new_append_version_val = int(updated["append_version"])  # type: ignore
+                if not locked:
+                    raise ObjectNotFound("NoSuchKey")
+                current_version = int(locked["append_version"])  # type: ignore
+                if expected_version != current_version:
+                    raise AppendPreconditionFailed(current_version)
 
-        # Cache write-through (outside transaction)
-        ttl = self.config.cache_ttl_seconds
-        writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
-        await writer.write_chunks(object_id, int(cov), int(next_part), ct_chunks)
-        await writer.write_meta(
-            object_id,
-            int(cov),
-            int(next_part),
-            chunk_size=chunk_size,
-            num_chunks=len(ct_chunks),
-            plain_size=int(delta_size),
-        )
+                seed_md5s = b""
+                if not bool(locked.get("has_etag_md5s")):
+                    parts = await self.db.fetch(
+                        "SELECT part_number, etag FROM parts WHERE object_id = $1 AND object_version = $2 ORDER BY part_number",
+                        object_id,
+                        cov,
+                    )
+                    base_md5 = str((locked.get("md5_hash") or "")).strip()
+                    if len(base_md5) != 32:
+                        try:
+                            base_bytes = await self.obj_cache.get(object_id, int(cov), 1)
+                            base_md5 = hashlib.md5(base_bytes or b"").hexdigest()
+                        except Exception:
+                            base_md5 = hashlib.md5(b"").hexdigest()
+                    md5s = [bytes.fromhex(base_md5)]
+                    for p in parts:
+                        if int(p.get("part_number") or 0) == int(next_part):
+                            continue
+                        e = str(p["etag"]).strip('"').split("-")[0]  # type: ignore
+                        if len(e) == 32:
+                            md5s.append(bytes.fromhex(e))
+                    seed_md5s = b"".join(md5s)
+
+                updated = await self.db.fetchrow(
+                    """
+                    UPDATE object_versions
+                       SET size_bytes     = size_bytes + $3,
+                           md5_hash       = md5(
+                               (CASE
+                                  WHEN append_etag_md5s IS NULL OR octet_length(append_etag_md5s) = 0
+                                  THEN $5
+                                  ELSE append_etag_md5s
+                                END) || decode($6, 'hex')
+                           ) || '-' || (
+                               (octet_length(
+                                  CASE
+                                    WHEN append_etag_md5s IS NULL OR octet_length(append_etag_md5s) = 0
+                                    THEN $5
+                                    ELSE append_etag_md5s
+                                  END
+                               ) + 16) / 16
+                           )::text,
+                           append_etag_md5s = (
+                               CASE
+                                  WHEN append_etag_md5s IS NULL OR octet_length(append_etag_md5s) = 0
+                                  THEN $5
+                                  ELSE append_etag_md5s
+                               END
+                           ) || decode($6, 'hex'),
+                           multipart      = TRUE,
+                           append_version = append_version + 1,
+                           last_modified  = NOW(),
+                           last_append_at = NOW()
+                     WHERE object_id = $1 AND object_version = $2 AND append_version = $4
+                    RETURNING append_version, md5_hash
+                    """,
+                    object_id,
+                    cov,
+                    int(delta_size),
+                    current_version,
+                    seed_md5s,
+                    str(part_res.etag),
+                )
+                if not updated:
+                    fresh = await self.db.fetchval(
+                        "SELECT append_version FROM object_versions WHERE object_id = $1 AND object_version = $2",
+                        object_id,
+                        cov,
+                    )
+                    raise AppendPreconditionFailed(int(fresh or 0))
+                new_append_version_val = int(updated["append_version"])  # type: ignore
+                composite_etag = str(updated.get("md5_hash") or "")
+        except AppendPreconditionFailed:
+            await _cleanup_part(num_chunks)
+            await _delete_part_row()
+            raise
 
         return {
             "object_id": object_id,
             "object_version": int(cov),
             "upload_id": str(upload_id),
-            "new_append_version": int(new_append_version_val) if new_append_version_val is not None else 0,
+            "new_append_version": int(new_append_version_val),
             "etag": composite_etag,
             "part_number": int(next_part),
+            "size_bytes": int(delta_size),
         }
+
+    async def append(
+        self,
+        *,
+        bucket_id: str,
+        bucket_name: str,
+        object_key: str,
+        expected_version: int,
+        account_address: str,
+        seed_phrase: str,
+        incoming_bytes: bytes,
+    ) -> dict:
+        async def _iter_once() -> AsyncIterator[bytes]:
+            if incoming_bytes:
+                yield incoming_bytes
+
+        return await self.append_stream(
+            bucket_id=bucket_id,
+            bucket_name=bucket_name,
+            object_key=object_key,
+            expected_version=int(expected_version),
+            account_address=account_address,
+            seed_phrase=seed_phrase,
+            body_iter=_iter_once(),
+        )

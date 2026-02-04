@@ -9,6 +9,7 @@ import re
 import time
 import typing
 from typing import Any
+from typing import AsyncIterator
 from typing import Callable
 from typing import Dict
 from typing import Tuple
@@ -23,37 +24,119 @@ T = TypeVar("T")
 logger = logging.getLogger(__name__)
 
 
-async def get_request_body(request: Request) -> bytes:
+async def iter_request_body(request: Request) -> AsyncIterator[bytes]:
     """
-    Get request body properly handling AWS chunked encoding from HAProxy.
+    Stream request body with optional AWS chunked decoding.
 
     AWS CLI sends data in aws-chunked format even through proxies:
-    Format: [chunk-size-hex]\r\n[chunk-data]\r\n...[0]\r\n[optional-trailers]\r\n\r\n
+    Format: [chunk-size-hex]\\r\\n[chunk-data]\\r\\n...[0]\\r\\n[optional-trailers]\\r\\n\\r\\n
+    """
+    content_encoding = request.headers.get("content-encoding", "").lower()
+    force_chunked = "aws-chunked" in content_encoding
+    if not force_chunked:
+        decoded_length = request.headers.get("x-amz-decoded-content-length")
+        sha256 = request.headers.get("x-amz-content-sha256", "").upper()
+        if decoded_length or "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" in sha256:
+            force_chunked = True
+
+    stream_iter = request.stream().__aiter__()
+    buffer = bytearray()
+    eof = False
+
+    async def _read_next() -> bool:
+        nonlocal eof
+        try:
+            chunk = await stream_iter.__anext__()
+        except StopAsyncIteration:
+            eof = True
+            return False
+        if chunk:
+            buffer.extend(chunk)
+        return True
+
+    def _parse_chunk_size(line: bytes) -> int | None:
+        try:
+            text = line.decode("ascii", errors="ignore").strip()
+            if ";" in text:
+                text = text.split(";", 1)[0]
+            if not text:
+                return None
+            return int(text, 16)
+        except Exception:
+            return None
+
+    async def _drain_trailers() -> None:
+        while True:
+            marker = buffer.find(b"\r\n\r\n")
+            if marker != -1:
+                return
+            if eof:
+                return
+            await _read_next()
+
+    # Prime the buffer once for streaming mode
+    await _read_next()
+
+    if not force_chunked:
+        if buffer:
+            yield bytes(buffer)
+            buffer.clear()
+        async for chunk in stream_iter:
+            if chunk:
+                yield chunk
+        return
+
+    # AWS chunked decode
+    while True:
+        # Read chunk size line
+        line_end = buffer.find(b"\r\n")
+        while line_end == -1:
+            if eof:
+                return
+            await _read_next()
+            line_end = buffer.find(b"\r\n")
+
+        line = bytes(buffer[:line_end])
+        del buffer[: line_end + 2]
+        size = _parse_chunk_size(line)
+        if size is None:
+            raise ValueError(f"invalid_chunk_size_line:{line!r}")
+        if size == 0:
+            await _drain_trailers()
+            return
+
+        # Ensure we have full chunk + trailing CRLF
+        while len(buffer) < size + 2:
+            if eof:
+                raise ValueError("incomplete_chunk_body")
+            await _read_next()
+
+        data = bytes(buffer[:size])
+        del buffer[:size]
+        if buffer[:2] != b"\r\n":
+            raise ValueError("invalid_chunk_terminator")
+        del buffer[:2]
+        if data:
+            yield data
+
+
+async def get_request_body(request: Request) -> bytes:
+    """
+    Get request body (fully buffered) while honoring AWS chunked encoding.
+
+    Prefer iter_request_body() for streaming workloads.
     """
     start_time = time.time()
-
-    # Use streaming instead of request.body() to avoid blocking
-    chunks = []
+    chunks: list[bytes] = []
     chunk_count = 0
 
-    async for chunk in request.stream():
+    async for chunk in iter_request_body(request):
         chunks.append(chunk)
         chunk_count += 1
 
     raw_body = b"".join(chunks)
     body_time = time.time() - start_time
     logger.debug(f"Streaming read took {body_time:.3f}s, {chunk_count} chunks, size: {len(raw_body)} bytes")
-
-    # Check if body needs de-chunking
-    if _is_aws_chunked_body(raw_body, request):
-        decode_start = time.time()
-        decoded_body, trailers = _decode_aws_chunked_body(raw_body)
-        decode_time = time.time() - decode_start
-        logger.debug(f"AWS chunked decode took {decode_time:.3f}s: {len(raw_body)} -> {len(decoded_body)} bytes")
-        if trailers:
-            logger.debug(f"Found trailers: {trailers}")
-        return decoded_body
-
     return raw_body
 
 
