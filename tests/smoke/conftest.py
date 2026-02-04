@@ -16,9 +16,11 @@ def production_s3_client():
     access_key = os.environ["AWS_ACCESS_KEY"]
     secret_key = os.environ["AWS_SECRET_KEY"]
 
+    endpoint = os.environ.get("HIPPIUS_ENDPOINT", "https://s3.hippius.com")
+
     return boto3.client(
         "s3",
-        endpoint_url="https://s3.hippius.com",
+        endpoint_url=endpoint,
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
         region_name="us-east-1",

@@ -1,0 +1,57 @@
+name: "Staging: Smoke Tests"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-tests:
+    name: Smoke Tests (s3-staging.hippius.com)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: staging-smoke-tests
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r tests/smoke/requirements.txt
+
+      - name: Run smoke tests
+        env:
+          AWS_ACCESS_KEY: ${{ secrets.HIPPIUS_PROD_ACCESS_KEY }}
+          AWS_SECRET_KEY: ${{ secrets.HIPPIUS_PROD_SECRET_KEY }}
+          HIPPIUS_ENDPOINT: https://s3-staging.hippius.com
+        run: |
+          mkdir -p reports
+          pytest tests/smoke/ \
+            -v \
+            --tb=short \
+            --json-report \
+            --json-report-file=reports/smoke-tests.json
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-smoke-test-results-${{ github.run_id }}
+          path: reports/
+          retention-days: 90
+
+      - name: Check test status
+        if: failure()
+        run: |
+          echo "Staging smoke tests failed - check artifacts"
+          echo "Run ID: ${{ github.run_id }}"
