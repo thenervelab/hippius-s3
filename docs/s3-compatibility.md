@@ -72,7 +72,7 @@ Notes:
 | GetObjectTorrent                                |           |                                                             |                                               |                                                                      |
 | GetPublicAccessBlock                            |           |                                                             |                                               |                                                                      |
 | HeadBucket                                      | ✔         | 200 if exists, 404 if not (empty body)                      | HEAD /{bucket}                                | test_CreateBucket.py                                                 |
-| HeadObject                                      | ✔         | Returns metadata headers; pending status header             | HEAD /{bucket}/{key}                          | test_HeadObject.py, test_HeadObject_Pending.py                       |
+| HeadObject                                      | ✔         | Returns metadata headers (size, content type, ETag, CID)    | HEAD /{bucket}/{key}                          | test_HeadObject.py, test_HeadObject_Pending.py                       |
 | ListBucketAnalyticsConfigurations               |           |                                                             |                                               |                                                                      |
 | ListBucketIntelligentTieringConfigurations      |           |                                                             |                                               |                                                                      |
 | ListBucketInventoryConfigurations               |           |                                                             |                                               |                                                                      |
@@ -117,7 +117,7 @@ Notes:
 | UpdateBucketMetadataInventoryTableConfiguration |           |                                                             |                                               |                                                                      |
 | UpdateBucketMetadataJournalTableConfiguration   |           |                                                             |                                               |                                                                      |
 | UploadPart                                      | ✔         | Returns part ETag                                           | PUT /{bucket}/{key}?uploadId=...&partNumber=N | test_UploadPart.py                                                   |
-| UploadPartCopy                                  | ✔         | Not supported for encrypted sources (temporary limitation)  | PUT /{bucket}/{key}?uploadId=...&partNumber=N | test_UploadPartCopy.py                                               |
+| UploadPartCopy                                  | ✔         | Supports cross-bucket and encrypted sources                 | PUT /{bucket}/{key}?uploadId=...&partNumber=N | test_UploadPartCopy.py                                               |
 | WriteGetObjectResponse                          |           |                                                             |                                               |                                                                      |
 
 ### Supported
@@ -156,19 +156,14 @@ Notes:
 
 - **Bucket lifecycle (minimal support)**
 
-  - `GET /{bucket}?lifecycle` — Returns a minimal default lifecycle XML (placeholder)
-  - `PUT /{bucket}?lifecycle` — Accepts lifecycle XML (acknowledged; not persisted yet)
+  - `GET /{bucket}?lifecycle` — Returns 404 NoSuchLifecycleConfiguration (lifecycle not persisted)
+  - `PUT /{bucket}?lifecycle` — Accepts lifecycle XML (acknowledged; not persisted)
 
 - **Object operations (simple uploads)**
 
   - `PUT /{bucket}/{key}` — Upload object (stores metadata, content type, MD5 as ETag)
   - `GET /{bucket}/{key}` — Download object (supports Range requests; returns S3-like headers)
   - `HEAD /{bucket}/{key}` — Object metadata (size, content type, ETag, Last-Modified)
-  - `x-amz-object-status` on HEAD (if present):
-    - `uploaded` — object uploaded and available
-    - `pinning` — publishing/pinning in progress
-    - `publishing` — being published to IPFS
-    - `pending` — accepted, status not finalized yet
   - `DELETE /{bucket}/{key}` — Delete object (idempotent 204)
   - `POST /{bucket}?delete` — Delete multiple objects (XML body). Idempotent; supports `Quiet`. Response includes `Deleted` and optional `Errors`.
   - User metadata: `x-amz-meta-*` stored and returned on HEAD/GET
@@ -231,6 +226,6 @@ Notes:
 
 - **Headers returned**
   - `Content-Type`, `Content-Length`, `ETag` (quoted), `Last-Modified`
-  - `x-amz-ipfs-cid` with CID or `pending`
-  - `x-hippius-source`: `cache` or `pipeline` (diagnostic; indicates serving source and cache fallback)
+  - `x-amz-ipfs-cid` on HEAD responses: CID or `pending`
+  - `x-hippius-source`: `cache` or `pipeline` (diagnostic; indicates serving source)
   - `Accept-Ranges: bytes` on GETs
