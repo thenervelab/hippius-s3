@@ -6,6 +6,14 @@ spec:
   storage:
     size: 100Gi
 
+  resources:
+    requests:
+      cpu: 500m
+      memory: 10Gi
+    limits:
+      cpu: 8000m
+      memory: 32Gi
+
   postgresql:
     parameters:
       max_connections: "1000"

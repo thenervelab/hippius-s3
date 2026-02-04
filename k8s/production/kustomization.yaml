@@ -12,7 +12,6 @@ patches:
   - path: environment-patch.yaml
   - path: resource-limits.yaml
   - path: postgres-tuning.yaml
-  - path: postgres-backup.yaml
   - path: redis-tuning.yaml
   - path: ingress-patch.yaml
   - path: services-patch.yaml
