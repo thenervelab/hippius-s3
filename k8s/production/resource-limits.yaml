@@ -3,14 +3,14 @@ kind: Deployment
 metadata:
   name: gateway
 spec:
-  replicas: 4
+  replicas: 1
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: api
 spec:
-  replicas: 4
+  replicas: 1
 ---
 apiVersion: apps/v1
 kind: Deployment
