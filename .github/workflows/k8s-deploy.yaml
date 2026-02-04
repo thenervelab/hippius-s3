@@ -140,7 +140,7 @@ jobs:
             --from-literal=DATABASE_PASSWORD='${{ secrets.DATABASE_PASSWORD }}' \
             --from-literal=DATABASE_URL="${DATABASE_URL}" \
             --from-literal=HIPPIUS_KEYSTORE_DATABASE_URL="${DATABASE_URL}" \
-            --from-literal=REDIS_URL='redis://redis.redis.svc.cluster.local:6379?cluster=true' \
+            --from-literal=REDIS_URL='redis://redis.redis-staging.svc.cluster.local:6379?cluster=true' \
             --from-literal=REDIS_ACCOUNTS_URL='redis://redis-accounts:6379' \
             --from-literal=REDIS_CHAIN_URL='redis://redis-chain:6379' \
             --from-literal=REDIS_QUEUES_URL='redis://redis-queues:6379' \
@@ -236,7 +236,7 @@ jobs:
           kubectl create secret generic hippius-s3-secrets \
             --from-literal=DATABASE_URL="${{ secrets.PRODUCTION_DATABASE_URL }}" \
             --from-literal=HIPPIUS_KEYSTORE_DATABASE_URL="${{ secrets.PRODUCTION_DATABASE_URL }}" \
-            --from-literal=REDIS_URL="redis://redis-cluster:6379/0" \
+            --from-literal=REDIS_URL="redis://redis.redis.svc.cluster.local:6379?cluster=true" \
             --from-literal=REDIS_ACCOUNTS_URL="redis://redis-accounts:6379/0" \
             --from-literal=REDIS_CHAIN_URL="redis://redis-chain:6379/0" \
             --from-literal=REDIS_QUEUES_URL="redis://redis-queues:6379/0" \
@@ -262,6 +262,19 @@ jobs:
             --namespace=hippius-s3-prod \
             --dry-run=client -o yaml | kubectl apply -f -
 
+      - name: Create postgres backup credentials
+        run: |
+          kubectl create secret generic postgres-backup-creds \
+            --from-literal=ACCESS_KEY_ID='${{ secrets.OVH_BACKUP_ACCESS_KEY_ID }}' \
+            --from-literal=ACCESS_KEY_SECRET='${{ secrets.OVH_BACKUP_SECRET_ACCESS_KEY }}' \
+            --namespace=hippius-s3-prod \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Substitute backup configuration values
+        run: |
+          sed -i "s|OVH_BACKUP_BUCKET_PLACEHOLDER|${{ secrets.OVH_BACKUP_BUCKET }}|g" k8s/production/postgres-objectstore.yaml
+          sed -i "s|OVH_BACKUP_ENDPOINT_URL_PLACEHOLDER|${{ secrets.OVH_BACKUP_ENDPOINT_URL }}|g" k8s/production/postgres-objectstore.yaml
+
       - name: Update image tags
         run: |
           SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
@@ -271,6 +284,10 @@ jobs:
             ghcr.io/thenervelab/hippius-s3/gateway:${SHORT_SHA} \
             ghcr.io/thenervelab/hippius-s3/workers:${SHORT_SHA}
 
+      - name: Delete old migration job
+        run: |
+          kubectl delete job db-migrations -n hippius-s3-prod --ignore-not-found=true
+
       - name: Deploy to production
         run: |
           kubectl apply -k k8s/production
@@ -279,7 +296,10 @@ jobs:
         run: |
           kubectl rollout status deployment/gateway -n hippius-s3-prod --timeout=10m
           kubectl rollout status deployment/api -n hippius-s3-prod --timeout=10m
-          kubectl rollout status deployment/downloader -n hippius-s3-prod --timeout=10m
+          kubectl rollout status deployment/ipfs-downloader -n hippius-s3-prod --timeout=10m
+          kubectl rollout status deployment/arion-downloader -n hippius-s3-prod --timeout=10m
+          kubectl rollout status deployment/ipfs-uploader -n hippius-s3-prod --timeout=10m
+          kubectl rollout status deployment/arion-uploader -n hippius-s3-prod --timeout=10m
 
       - name: Verify deployment
         run: |
