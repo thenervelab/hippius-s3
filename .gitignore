@@ -1,5 +1,6 @@
 # Environment variables
 .env
+.env.backup
 
 # Python
 __pycache__/
@@ -73,3 +74,9 @@ schema.sql
 tests/e2e/certs/*.key
 tests/e2e/certs/*.crt
 tests/e2e/certs/*.srl
+
+# Node
+node_modules/
+package-lock.json
+
+CLAUDE.md
