@@ -3,7 +3,7 @@ name: Build and Deploy to Kubernetes
 on:
   push:
     branches:
-      - k8s-staging
+      - staging
       - k8s-production
 
 permissions:
@@ -114,7 +114,7 @@ jobs:
   deploy-staging:
     runs-on: ubuntu-latest
     needs: build-images
-    if: github.ref == 'refs/heads/k8s-staging'
+    if: github.ref == 'refs/heads/staging'
     environment: staging
     steps:
       - name: Checkout code
