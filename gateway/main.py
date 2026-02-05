@@ -112,7 +112,7 @@ def factory() -> FastAPI:
 
         app.state.docs_proxy_service = DocsProxyService(
             backend_url=config.backend_url,
-            redis_client=app.state.redis_client,
+            redis_client=app.state.redis_client,  # type: ignore[arg-type]
             cache_ttl=config.docs_cache_ttl_seconds,
         )
         logger.info("DocsProxyService initialized")
