@@ -236,9 +236,11 @@ jobs:
 
       - name: Update secrets
         run: |
+          DATABASE_URL="postgresql://postgres:${{ secrets.PRODUCTION_DATABASE_PASSWORD }}@postgres-rw:5432/hippius?sslmode=disable"
+
           kubectl create secret generic hippius-s3-secrets \
-            --from-literal=DATABASE_URL="${{ secrets.PRODUCTION_DATABASE_URL }}" \
-            --from-literal=HIPPIUS_KEYSTORE_DATABASE_URL="${{ secrets.PRODUCTION_DATABASE_URL }}" \
+            --from-literal=DATABASE_URL="${DATABASE_URL}" \
+            --from-literal=HIPPIUS_KEYSTORE_DATABASE_URL="${DATABASE_URL}" \
             --from-literal=REDIS_URL="redis://redis.redis.svc.cluster.local:6379?cluster=true" \
             --from-literal=REDIS_ACCOUNTS_URL="redis://redis-accounts:6379/0" \
             --from-literal=REDIS_CHAIN_URL="redis://redis-chain:6379/0" \
