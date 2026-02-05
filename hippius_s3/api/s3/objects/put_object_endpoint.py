@@ -112,42 +112,45 @@ async def handle_put_object(
         else:
             candidate_object_id = str(uuid.uuid4())
 
-        async with db.transaction():
-            # Use ObjectWriter streaming upsert/write (single-part)
-            with tracer.start_as_current_span(
-                "put_object.stream_and_upsert",
-                attributes={
-                    "object_id": candidate_object_id,
-                    "has_object_id": True,
-                    "file_size_bytes": hinted_size,
-                    "content_type": content_type,
-                    "storage_version": config.target_storage_version,
+        # Use ObjectWriter streaming upsert/write (single-part)
+        # Note: No transaction wrapper needed here. The upsert_object_basic query is atomic
+        # (uses CTEs). Holding a transaction open during the entire upload would cause lock
+        # contention under concurrent uploads. If chunk writing fails after the upsert, the
+        # object remains with status='publishing' which prevents serving and gets cleaned up.
+        with tracer.start_as_current_span(
+            "put_object.stream_and_upsert",
+            attributes={
+                "object_id": candidate_object_id,
+                "has_object_id": True,
+                "file_size_bytes": hinted_size,
+                "content_type": content_type,
+                "storage_version": config.target_storage_version,
+            },
+        ) as span:
+            writer = ObjectWriter(db=db, redis_client=redis_client, fs_store=request.app.state.fs_store)
+
+            put_res = await writer.put_simple_stream_full(
+                bucket_id=bucket_id,
+                bucket_name=bucket_name,
+                object_id=candidate_object_id,
+                object_key=object_key,
+                account_address=request.state.account.main_account,
+                content_type=content_type,
+                metadata=metadata,
+                storage_version=config.target_storage_version,
+                body_iter=utils.iter_request_body(request),
+            )
+
+            set_span_attributes(
+                span,
+                {
+                    "upload_id": put_res.upload_id,
+                    "has_upload_id": True,
+                    "etag": put_res.etag,
+                    "object_id_db": put_res.object_id,
+                    "returned_size_bytes": put_res.size_bytes,
                 },
-            ) as span:
-                writer = ObjectWriter(db=db, redis_client=redis_client, fs_store=request.app.state.fs_store)
-
-                put_res = await writer.put_simple_stream_full(
-                    bucket_id=bucket_id,
-                    bucket_name=bucket_name,
-                    object_id=candidate_object_id,
-                    object_key=object_key,
-                    account_address=request.state.account.main_account,
-                    content_type=content_type,
-                    metadata=metadata,
-                    storage_version=config.target_storage_version,
-                    body_iter=utils.iter_request_body(request),
-                )
-
-                set_span_attributes(
-                    span,
-                    {
-                        "upload_id": put_res.upload_id,
-                        "has_upload_id": True,
-                        "etag": put_res.etag,
-                        "object_id_db": put_res.object_id,
-                        "returned_size_bytes": put_res.size_bytes,
-                    },
-                )
+            )
 
         logger.info(f"PUT {bucket_name}/{object_key}: size={put_res.size_bytes}, md5={put_res.etag}")
 

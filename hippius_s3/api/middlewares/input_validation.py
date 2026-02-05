@@ -4,10 +4,10 @@ import re
 from typing import Awaitable
 from typing import Callable
 
-from fastapi import HTTPException
 from fastapi import Request
 from fastapi import Response
 
+from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.config import get_config
 
 
@@ -55,51 +55,58 @@ async def input_validation_middleware(
 
         # Length check
         if len(bucket_name) < config.min_bucket_name_length:
-            raise HTTPException(
+            return s3_error_response(
+                code="InvalidBucketName",
+                message=f"Bucket name too short (minimum {config.min_bucket_name_length} characters)",
                 status_code=400,
-                detail=f"Bucket name too short (minimum {config.min_bucket_name_length} characters)",
             )
         if len(bucket_name) > config.max_bucket_name_length:
-            raise HTTPException(
+            return s3_error_response(
+                code="InvalidBucketName",
+                message=f"Bucket name too long (maximum {config.max_bucket_name_length} characters)",
                 status_code=400,
-                detail=f"Bucket name too long (maximum {config.max_bucket_name_length} characters)",
             )
 
         # Character and format validation
         if not BUCKET_NAME_PATTERN.match(bucket_name):
-            raise HTTPException(
+            return s3_error_response(
+                code="InvalidBucketName",
+                message="Bucket name contains invalid characters or format",
                 status_code=400,
-                detail="Bucket name contains invalid characters or format",
             )
 
         # Check for adjacent periods
         if ".." in bucket_name:
-            raise HTTPException(
+            return s3_error_response(
+                code="InvalidBucketName",
+                message="Bucket name cannot contain adjacent periods",
                 status_code=400,
-                detail="Bucket name cannot contain adjacent periods",
             )
 
         # Check if formatted like IP address
         if IP_ADDRESS_PATTERN.match(bucket_name):
-            raise HTTPException(
+            return s3_error_response(
+                code="InvalidBucketName",
+                message="Bucket name cannot be formatted like an IP address",
                 status_code=400,
-                detail="Bucket name cannot be formatted like an IP address",
             )
 
         # Check prohibited prefixes
         for prefix in PROHIBITED_BUCKET_PREFIXES:
             if bucket_name.startswith(prefix):
-                raise HTTPException(
+                return s3_error_response(
+                    code="InvalidBucketName",
+                    message=f"Bucket name cannot start with '{prefix}'",
                     status_code=400,
-                    detail=f"Bucket name cannot start with '{prefix}'",
                 )
 
         # Check prohibited suffixes
         for suffix in PROHIBITED_BUCKET_SUFFIXES:
             if bucket_name.endswith(suffix):
-                raise HTTPException(
+                return s3_error_response(
+                    code="InvalidBucketName",
+                    message=f"Bucket name cannot end with '{suffix}'",
                     status_code=400,
-                    detail=f"Bucket name cannot end with '{suffix}'",
                 )
 
     # Validate object key if present
@@ -108,23 +115,29 @@ async def input_validation_middleware(
 
         # Length check (max 1024 bytes for UTF-8)
         if len(object_key.encode("utf-8")) > config.max_object_key_length:
-            raise HTTPException(
+            return s3_error_response(
+                code="KeyTooLongError",
+                message="Object key too long (maximum 1024 bytes)",
                 status_code=400,
-                detail="Object key too long (maximum 1024 bytes)",
             )
 
         # Check for characters to avoid (strongly discouraged by AWS)
         for char in OBJECT_KEY_AVOID_CHARS:
             if char in object_key:
                 char_desc = repr(char) if ord(char) >= 32 else f"ASCII-{ord(char)}"
-                raise HTTPException(status_code=400, detail=f"Object key contains discouraged character: {char_desc}")
+                return s3_error_response(
+                    code="InvalidArgument",
+                    message=f"Object key contains discouraged character: {char_desc}",
+                    status_code=400,
+                )
 
     # Validate metadata headers
     for header_name, header_value in request.headers.items():
         if header_name.lower().startswith("x-amz-meta-") and len(header_value) > config.max_metadata_size:
-            raise HTTPException(
+            return s3_error_response(
+                code="MetadataTooLarge",
+                message="Metadata value too large",
                 status_code=400,
-                detail="Metadata value too large",
             )
 
     return await call_next(request)
