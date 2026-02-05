@@ -146,6 +146,21 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: FRONTEND_HMAC_SECRET
+            - name: HIPPIUS_UPLOAD_BACKENDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_UPLOAD_BACKENDS
+            - name: HIPPIUS_DOWNLOAD_BACKENDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_DOWNLOAD_BACKENDS
+            - name: HIPPIUS_DELETE_BACKENDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_DELETE_BACKENDS
           volumeMounts:
             - name: object-cache
               mountPath: /var/lib/hippius/object_cache

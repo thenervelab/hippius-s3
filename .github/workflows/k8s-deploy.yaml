@@ -162,6 +162,9 @@ jobs:
             --from-literal=HIPPIUS_OVH_KMS_DEFAULT_KEY_ID='${{ secrets.HIPPIUS_OVH_KMS_DEFAULT_KEY_ID }}' \
             --from-literal=HIPPIUS_OVH_KMS_OKMS_ID='${{ secrets.HIPPIUS_OVH_KMS_OKMS_ID }}' \
             --from-literal=RESUBMISSION_SEED_PHRASE='${{ secrets.RESUBMISSION_SEED_PHRASE }}' \
+            --from-literal=HIPPIUS_UPLOAD_BACKENDS='${{ secrets.HIPPIUS_UPLOAD_BACKENDS }}' \
+            --from-literal=HIPPIUS_DOWNLOAD_BACKENDS='${{ secrets.HIPPIUS_DOWNLOAD_BACKENDS }}' \
+            --from-literal=HIPPIUS_DELETE_BACKENDS='${{ secrets.HIPPIUS_DELETE_BACKENDS }}' \
             --namespace=hippius-s3-staging \
             --dry-run=client -o yaml | kubectl apply -f -
 
@@ -259,6 +262,9 @@ jobs:
             --from-literal=HIPPIUS_OVH_KMS_DEFAULT_KEY_ID="${{ secrets.HIPPIUS_OVH_KMS_DEFAULT_KEY_ID }}" \
             --from-literal=HIPPIUS_OVH_KMS_OKMS_ID="${{ secrets.HIPPIUS_OVH_KMS_OKMS_ID }}" \
             --from-literal=RESUBMISSION_SEED_PHRASE="${{ secrets.RESUBMISSION_SEED_PHRASE }}" \
+            --from-literal=HIPPIUS_UPLOAD_BACKENDS="${{ secrets.HIPPIUS_UPLOAD_BACKENDS }}" \
+            --from-literal=HIPPIUS_DOWNLOAD_BACKENDS="${{ secrets.HIPPIUS_DOWNLOAD_BACKENDS }}" \
+            --from-literal=HIPPIUS_DELETE_BACKENDS="${{ secrets.HIPPIUS_DELETE_BACKENDS }}" \
             --namespace=hippius-s3-prod \
             --dry-run=client -o yaml | kubectl apply -f -
 
