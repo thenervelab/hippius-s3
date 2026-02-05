@@ -12,6 +12,7 @@ patches:
   - path: namespace-patch.yaml
   - path: environment-patch.yaml
   - path: resource-limits.yaml
+  - path: services-patch.yaml
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api

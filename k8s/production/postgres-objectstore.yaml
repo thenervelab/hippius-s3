@@ -1,0 +1,22 @@
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: ovh-postgres-backup
+spec:
+  configuration:
+    destinationPath: s3://OVH_BACKUP_BUCKET_PLACEHOLDER/production/postgres/
+    endpointURL: OVH_BACKUP_ENDPOINT_URL_PLACEHOLDER
+    s3Credentials:
+      accessKeyId:
+        name: postgres-backup-creds
+        key: ACCESS_KEY_ID
+      secretAccessKey:
+        name: postgres-backup-creds
+        key: ACCESS_KEY_SECRET
+    wal:
+      compression: gzip
+      maxParallel: 2
+    data:
+      compression: gzip
+      jobs: 2
+  retentionPolicy: "30d"

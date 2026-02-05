@@ -126,6 +126,21 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_OVH_KMS_OKMS_ID
+            - name: HIPPIUS_UPLOAD_BACKENDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_UPLOAD_BACKENDS
+            - name: HIPPIUS_DOWNLOAD_BACKENDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_DOWNLOAD_BACKENDS
+            - name: HIPPIUS_DELETE_BACKENDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_DELETE_BACKENDS
           startupProbe:
             httpGet:
               path: /health

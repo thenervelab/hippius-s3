@@ -5,18 +5,16 @@ namespace: hippius-s3-prod
 
 resources:
   - ../base
+  - postgres-objectstore.yaml
 
-patchesStrategicMerge:
-  - namespace-patch.yaml
-  - environment-patch.yaml
-  - resource-limits.yaml
-  - postgres-tuning.yaml
-  - postgres-backup.yaml
-  - redis-tuning.yaml
-  - redis-cluster-configmap-patch.yaml
-  - redis-cluster-statefulset-patch.yaml
-  - redis-cluster-init-job-patch.yaml
-  - ingress-patch.yaml
+patches:
+  - path: namespace-patch.yaml
+  - path: environment-patch.yaml
+  - path: resource-limits.yaml
+  - path: postgres-tuning.yaml
+  - path: redis-tuning.yaml
+  - path: ingress-patch.yaml
+  - path: services-patch.yaml
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api
