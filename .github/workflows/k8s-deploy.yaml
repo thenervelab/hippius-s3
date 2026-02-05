@@ -236,7 +236,7 @@ jobs:
 
       - name: Update secrets
         run: |
-          DATABASE_URL="postgresql://postgres:${{ secrets.PRODUCTION_DATABASE_PASSWORD }}@postgres-rw:5432/hippius?sslmode=disable"
+          DATABASE_URL="postgresql://postgres:${{ secrets.DATABASE_PASSWORD }}@postgres-rw:5432/hippius?sslmode=disable"
 
           kubectl create secret generic hippius-s3-secrets \
             --from-literal=DATABASE_URL="${DATABASE_URL}" \
@@ -253,7 +253,7 @@ jobs:
             --from-literal=HIPPIUS_IPFS_API_URLS="http://ipfs:5001" \
             --from-literal=HIPPIUS_IPFS_GET_URL="${{ secrets.HIPPIUS_IPFS_GET_URL }}" \
             --from-literal=HIPPIUS_IPFS_STORE_URL="${{ secrets.HIPPIUS_IPFS_STORE_URL }}" \
-            --from-literal=DATABASE_PASSWORD="${{ secrets.PRODUCTION_DATABASE_PASSWORD }}" \
+            --from-literal=DATABASE_PASSWORD="${{ secrets.DATABASE_PASSWORD }}" \
             --from-literal=HIPPIUS_UPLOAD_QUEUE_NAMES="${{ secrets.HIPPIUS_UPLOAD_QUEUE_NAMES }}" \
             --from-literal=HIPPIUS_DOWNLOAD_QUEUE_NAMES="${{ secrets.HIPPIUS_DOWNLOAD_QUEUE_NAMES }}" \
             --from-literal=FRONTEND_HMAC_SECRET="${{ secrets.FRONTEND_HMAC_SECRET }}" \
