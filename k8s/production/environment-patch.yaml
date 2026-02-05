@@ -4,3 +4,4 @@ metadata:
   name: hippius-s3-environment
 data:
   ENVIRONMENT: "production"
+  OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=production,service.namespace=hippius-s3-prod"

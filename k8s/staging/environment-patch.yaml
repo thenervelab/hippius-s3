@@ -4,3 +4,4 @@ metadata:
   name: hippius-s3-environment
 data:
   ENVIRONMENT: "staging"
+  OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=staging,service.namespace=hippius-s3-staging"
