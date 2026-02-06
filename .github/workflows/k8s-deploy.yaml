@@ -245,13 +245,13 @@ jobs:
             --from-literal=REDIS_QUEUES_URL="redis://redis-queues:6379/0" \
             --from-literal=REDIS_RATE_LIMITING_URL="redis://redis-rate-limiting:6379/0" \
             --from-literal=REDIS_ACL_URL="redis://redis-acl:6379/0" \
-            --from-literal=HIPPIUS_SERVICE_KEY="${{ secrets.PRODUCTION_HIPPIUS_SERVICE_KEY }}" \
+            --from-literal=HIPPIUS_SERVICE_KEY="${{ secrets.HIPPIUS_SERVICE_KEY }}" \
             --from-literal=ARION_SERVICE_KEY="${{ secrets.ARION_SERVICE_KEY }}" \
-            --from-literal=HIPPIUS_AUTH_ENCRYPTION_KEY="${{ secrets.PRODUCTION_HIPPIUS_AUTH_ENCRYPTION_KEY }}" \
+            --from-literal=HIPPIUS_AUTH_ENCRYPTION_KEY="${{ secrets.HIPPIUS_AUTH_ENCRYPTION_KEY }}" \
             --from-literal=HIPPIUS_IPFS_API_URLS="http://ipfs:5001" \
             --from-literal=HIPPIUS_IPFS_GET_URL="${{ secrets.HIPPIUS_IPFS_GET_URL }}" \
             --from-literal=HIPPIUS_IPFS_STORE_URL="${{ secrets.HIPPIUS_IPFS_STORE_URL }}" \
-            --from-literal=DATABASE_PASSWORD="${{ secrets.PRODUCTION_DATABASE_PASSWORD }}" \
+            --from-literal=DATABASE_PASSWORD="${{ secrets.DATABASE_PASSWORD }}" \
             --from-literal=HIPPIUS_UPLOAD_QUEUE_NAMES="${{ secrets.HIPPIUS_UPLOAD_QUEUE_NAMES }}" \
             --from-literal=HIPPIUS_DOWNLOAD_QUEUE_NAMES="${{ secrets.HIPPIUS_DOWNLOAD_QUEUE_NAMES }}" \
             --from-literal=FRONTEND_HMAC_SECRET="${{ secrets.FRONTEND_HMAC_SECRET }}" \
