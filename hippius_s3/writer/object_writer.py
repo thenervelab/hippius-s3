@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 import uuid
 from datetime import datetime
 from datetime import timezone
@@ -33,6 +34,7 @@ from hippius_s3.writer.write_through_writer import WriteThroughPartsWriter
 
 
 tracer = trace.get_tracer(__name__)
+logger = logging.getLogger(__name__)
 
 
 class ObjectWriter:
@@ -272,65 +274,120 @@ class ObjectWriter:
         next_chunk_index = 0
         chunk_cipher_sizes: list[int] = []
 
-        async def _encrypt_and_write(buf: bytes) -> None:
-            nonlocal total_size, next_chunk_index
-            if not buf:
-                return
-            hasher.update(buf)
-            total_size += len(buf)
-            # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
-            # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
-            adapter = CryptoService.get_adapter(suite_id)
-            ct = adapter.encrypt_chunk(
-                buf,
-                key=key_bytes,
-                bucket_id=str(bucket_id),
-                object_id=object_id,
-                part_number=int(part_number),
-                chunk_index=int(next_chunk_index),
-                upload_id="",
-            )
-            chunk_cipher_sizes.append(len(ct))
-            # Write-through: FS first (fatal), then Redis (best-effort)
-            await self.fs_store.set_chunk(
-                object_id,
-                int(object_version),
-                int(part_number),
-                int(next_chunk_index),
-                ct,
-            )
-            try:
-                await self.obj_cache.set_chunk(
+        perf_encrypt_ms = 0.0
+        perf_fs_ms = 0.0
+        perf_queue_wait_ms = 0.0
+        perf_stream_start = time.monotonic()
+
+        adapter = CryptoService.get_adapter(suite_id)
+        write_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(maxsize=2)
+        consumer_error: BaseException | None = None
+
+        # Write-through: FS first (fatal), then Redis (best-effort)
+        async def _consumer() -> None:
+            nonlocal consumer_error, perf_fs_ms
+            while True:
+                item = await write_queue.get()
+                if item is None:
+                    break
+                chunk_idx, ct = item
+                t_io_start = time.monotonic()
+                fs_coro = self.fs_store.set_chunk(
                     object_id,
                     int(object_version),
                     int(part_number),
-                    int(next_chunk_index),
+                    chunk_idx,
+                    ct,
+                )
+                redis_coro = self.obj_cache.set_chunk(
+                    object_id,
+                    int(object_version),
+                    int(part_number),
+                    chunk_idx,
                     ct,
                     ttl=ttl,
                 )
-            except Exception as e:
-                import logging
-
-                logging.getLogger(__name__).warning(
-                    f"Redis chunk write failed (best-effort) in streaming: object_id={object_id} v={object_version} part={part_number} chunk={next_chunk_index}: {e}"
-                )
-            next_chunk_index += 1
+                results = await asyncio.gather(fs_coro, redis_coro, return_exceptions=True)
+                t_io_end = time.monotonic()
+                io_ms = (t_io_end - t_io_start) * 1000
+                if isinstance(results[0], BaseException):
+                    consumer_error = results[0]
+                    break
+                if isinstance(results[1], BaseException):
+                    logger.warning(
+                        f"Redis chunk write failed (best-effort) in streaming: object_id={object_id} v={object_version} part={part_number} chunk={chunk_idx}: {results[1]}"
+                    )
+                perf_fs_ms += io_ms
+                logger.debug(f"PERF chunk {chunk_idx}: io={io_ms:.1f}ms (parallel fs+redis) size={len(ct)}")
 
         with tracer.start_as_current_span("put_simple_stream_full.encrypt_and_cache") as span:
+            consumer_task = asyncio.create_task(_consumer())
+
             async for piece in body_iter:
+                if consumer_error:
+                    raise consumer_error
                 if not piece:
                     continue
                 pt_buf.extend(piece)
                 while len(pt_buf) >= chunk_size:
-                    to_write = bytes(pt_buf[:chunk_size])
+                    buf = bytes(pt_buf[:chunk_size])
                     del pt_buf[:chunk_size]
-                    await _encrypt_and_write(to_write)
+                    hasher.update(buf)
+                    total_size += len(buf)
+                    # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
+                    # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
+                    t0 = time.monotonic()
+                    ct = adapter.encrypt_chunk(
+                        buf,
+                        key=key_bytes,
+                        bucket_id=str(bucket_id),
+                        object_id=object_id,
+                        part_number=int(part_number),
+                        chunk_index=int(next_chunk_index),
+                        upload_id="",
+                    )
+                    t1 = time.monotonic()
+                    perf_encrypt_ms += (t1 - t0) * 1000
+                    chunk_cipher_sizes.append(len(ct))
+                    tq0 = time.monotonic()
+                    await write_queue.put((next_chunk_index, ct))
+                    perf_queue_wait_ms += (time.monotonic() - tq0) * 1000
+                    next_chunk_index += 1
 
             if pt_buf:
-                await _encrypt_and_write(bytes(pt_buf))
+                if consumer_error:
+                    raise consumer_error
+                buf = bytes(pt_buf)
                 pt_buf.clear()
+                hasher.update(buf)
+                total_size += len(buf)
+                # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
+                # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
+                t0 = time.monotonic()
+                ct = adapter.encrypt_chunk(
+                    buf,
+                    key=key_bytes,
+                    bucket_id=str(bucket_id),
+                    object_id=object_id,
+                    part_number=int(part_number),
+                    chunk_index=int(next_chunk_index),
+                    upload_id="",
+                )
+                t1 = time.monotonic()
+                perf_encrypt_ms += (t1 - t0) * 1000
+                chunk_cipher_sizes.append(len(ct))
+                tq0 = time.monotonic()
+                await write_queue.put((next_chunk_index, ct))
+                perf_queue_wait_ms += (time.monotonic() - tq0) * 1000
+                next_chunk_index += 1
+
+            await write_queue.put(None)
+            await consumer_task
+            if consumer_error:
+                raise consumer_error
 
             md5_hash = hasher.hexdigest()
+            perf_stream_total_ms = (time.monotonic() - perf_stream_start) * 1000
             set_span_attributes(
                 span,
                 {
@@ -341,6 +398,7 @@ class ObjectWriter:
             )
 
         # Update the reserved object_versions row with final md5/size
+        perf_post_start = time.monotonic()
         with tracer.start_as_current_span(
             "put_simple_stream_full.update_metadata",
             attributes={
@@ -421,6 +479,16 @@ class ObjectWriter:
             chunk_size_bytes=int(chunk_size),
             object_version=int(object_version),
             chunk_cipher_sizes=chunk_cipher_sizes,
+        )
+        perf_post_ms = (time.monotonic() - perf_post_start) * 1000
+
+        throughput_mbps = (
+            (total_size / (1024 * 1024)) / (perf_stream_total_ms / 1000) if perf_stream_total_ms > 0 else 0
+        )
+        logger.info(
+            f"PERF put_simple object_id={object_id} size={total_size} chunks={num_chunks} "
+            f"stream={perf_stream_total_ms:.0f}ms (enc={perf_encrypt_ms:.0f}ms io={perf_fs_ms:.0f}ms queue_wait={perf_queue_wait_ms:.0f}ms) "
+            f"post_db={perf_post_ms:.0f}ms throughput={throughput_mbps:.1f}MB/s"
         )
 
         return PutResult(
@@ -646,6 +714,14 @@ class ObjectWriter:
         written_chunk_indices: list[int] = []
         meta_written = False
 
+        perf_encrypt_ms = 0.0
+        perf_fs_ms = 0.0
+        perf_queue_wait_ms = 0.0
+        perf_stream_start = time.monotonic()
+
+        write_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(maxsize=2)
+        consumer_error: BaseException | None = None
+
         async def _cleanup_partial() -> None:
             try:
                 await self.fs_store.delete_part(str(object_id), int(object_version), int(part_number))
@@ -674,68 +750,122 @@ class ObjectWriter:
                         int(part_number),
                     )
 
-        async def _encrypt_and_write(buf: bytes) -> None:
-            nonlocal total_size, next_chunk_index
-            if not buf:
-                return
-            hasher.update(buf)
-            total_size += len(buf)
-            ct = adapter.encrypt_chunk(
-                buf,
-                key=key_bytes,
-                bucket_id=bucket_id,
-                object_id=str(object_id),
-                part_number=int(part_number),
-                chunk_index=int(next_chunk_index),
-                upload_id=str(upload_id),
-            )
-            chunk_cipher_sizes.append(len(ct))
-            await self.fs_store.set_chunk(
-                str(object_id),
-                int(object_version),
-                int(part_number),
-                int(next_chunk_index),
-                ct,
-            )
-            try:
-                await self.obj_cache.set_chunk(
+        # Write-through: FS first (fatal), then Redis (best-effort)
+        async def _consumer() -> None:
+            nonlocal consumer_error, perf_fs_ms
+            while True:
+                item = await write_queue.get()
+                if item is None:
+                    break
+                chunk_idx, ct = item
+                t_io_start = time.monotonic()
+                fs_coro = self.fs_store.set_chunk(
                     str(object_id),
                     int(object_version),
                     int(part_number),
-                    int(next_chunk_index),
+                    chunk_idx,
+                    ct,
+                )
+                redis_coro = self.obj_cache.set_chunk(
+                    str(object_id),
+                    int(object_version),
+                    int(part_number),
+                    chunk_idx,
                     ct,
                     ttl=ttl,
                 )
-            except Exception:
-                logger = logging.getLogger(__name__)
-                logger.warning(
-                    "Redis chunk write failed (best-effort) in mpu stream: object_id=%s v=%s part=%s chunk=%s",
-                    object_id,
-                    int(object_version),
-                    int(part_number),
-                    int(next_chunk_index),
-                )
-            written_chunk_indices.append(int(next_chunk_index))
-            next_chunk_index += 1
+                results = await asyncio.gather(fs_coro, redis_coro, return_exceptions=True)
+                t_io_end = time.monotonic()
+                io_ms = (t_io_end - t_io_start) * 1000
+                if isinstance(results[0], BaseException):
+                    consumer_error = results[0]
+                    break
+                if isinstance(results[1], BaseException):
+                    logger.warning(
+                        "Redis chunk write failed (best-effort) in mpu stream: object_id=%s v=%s part=%s chunk=%s",
+                        object_id,
+                        int(object_version),
+                        int(part_number),
+                        chunk_idx,
+                    )
+                written_chunk_indices.append(chunk_idx)
+                perf_fs_ms += io_ms
+                logger.debug(f"PERF mpu chunk {chunk_idx}: io={io_ms:.1f}ms (parallel fs+redis) size={len(ct)}")
 
         try:
+            consumer_task = asyncio.create_task(_consumer())
+
             async for piece in body_iter:
+                if consumer_error:
+                    raise consumer_error
                 if not piece:
                     continue
                 pt_buf.extend(piece)
                 if max_size and total_size + len(pt_buf) > int(max_size):
+                    await write_queue.put(None)
+                    await consumer_task
                     raise ValueError("part_size_exceeds_max")
                 while len(pt_buf) >= chunk_size:
-                    to_write = bytes(pt_buf[:chunk_size])
+                    buf = bytes(pt_buf[:chunk_size])
                     del pt_buf[:chunk_size]
-                    await _encrypt_and_write(to_write)
+                    hasher.update(buf)
+                    total_size += len(buf)
+                    # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
+                    # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
+                    t0 = time.monotonic()
+                    ct = adapter.encrypt_chunk(
+                        buf,
+                        key=key_bytes,
+                        bucket_id=bucket_id,
+                        object_id=str(object_id),
+                        part_number=int(part_number),
+                        chunk_index=int(next_chunk_index),
+                        upload_id=str(upload_id),
+                    )
+                    t1 = time.monotonic()
+                    perf_encrypt_ms += (t1 - t0) * 1000
+                    chunk_cipher_sizes.append(len(ct))
+                    tq0 = time.monotonic()
+                    await write_queue.put((next_chunk_index, ct))
+                    perf_queue_wait_ms += (time.monotonic() - tq0) * 1000
+                    next_chunk_index += 1
 
             if pt_buf:
-                await _encrypt_and_write(bytes(pt_buf))
+                if consumer_error:
+                    raise consumer_error
+                buf = bytes(pt_buf)
                 pt_buf.clear()
+                hasher.update(buf)
+                total_size += len(buf)
+                # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
+                # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
+                t0 = time.monotonic()
+                ct = adapter.encrypt_chunk(
+                    buf,
+                    key=key_bytes,
+                    bucket_id=bucket_id,
+                    object_id=str(object_id),
+                    part_number=int(part_number),
+                    chunk_index=int(next_chunk_index),
+                    upload_id=str(upload_id),
+                )
+                t1 = time.monotonic()
+                perf_encrypt_ms += (t1 - t0) * 1000
+                chunk_cipher_sizes.append(len(ct))
+                tq0 = time.monotonic()
+                await write_queue.put((next_chunk_index, ct))
+                perf_queue_wait_ms += (time.monotonic() - tq0) * 1000
+                next_chunk_index += 1
 
             if total_size == 0:
+                await write_queue.put(None)
+                await consumer_task
                 raise ValueError("Zero-length part not allowed")
+
+            await write_queue.put(None)
+            await consumer_task
+            if consumer_error:
+                raise consumer_error
 
             await writer.write_meta(
                 str(object_id),
@@ -751,8 +881,10 @@ class ObjectWriter:
                 await _cleanup_partial()
             raise
 
+        perf_stream_total_ms = (time.monotonic() - perf_stream_start) * 1000
         md5_hash = hasher.hexdigest()
 
+        perf_post_start = time.monotonic()
         await upsert_part_placeholder(
             self.db,
             object_id=str(object_id),
@@ -763,6 +895,16 @@ class ObjectWriter:
             chunk_size_bytes=int(chunk_size),
             object_version=int(object_version),
             chunk_cipher_sizes=chunk_cipher_sizes,
+        )
+        perf_post_ms = (time.monotonic() - perf_post_start) * 1000
+
+        throughput_mbps = (
+            (total_size / (1024 * 1024)) / (perf_stream_total_ms / 1000) if perf_stream_total_ms > 0 else 0
+        )
+        logger.info(
+            f"PERF mpu_part object_id={object_id} part={part_number} size={total_size} chunks={next_chunk_index} "
+            f"stream={perf_stream_total_ms:.0f}ms (enc={perf_encrypt_ms:.0f}ms io={perf_fs_ms:.0f}ms queue_wait={perf_queue_wait_ms:.0f}ms) "
+            f"post_db={perf_post_ms:.0f}ms throughput={throughput_mbps:.1f}MB/s"
         )
 
         return PartResult(etag=md5_hash, size_bytes=int(total_size), part_number=int(part_number))

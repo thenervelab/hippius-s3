@@ -139,7 +139,7 @@ services:
 
   # Redis exporter for main Redis metrics
   redis-exporter:
-    image: oliver006/redis_exporter:v1.76.0
+    image: oliver006/redis_exporter:v1.80.2
     container_name: hippius-redis-exporter
     ports:
       - "127.0.0.1:9121:9121"
@@ -153,7 +153,7 @@ services:
 
   # Redis exporter for accounts cache
   redis-accounts-exporter:
-    image: oliver006/redis_exporter:v1.76.0
+    image: oliver006/redis_exporter:v1.80.2
     container_name: hippius-redis-accounts-exporter
     ports:
       - "127.0.0.1:9122:9121"
@@ -171,7 +171,7 @@ services:
 
   # Redis exporter for chain cache
   redis-chain-exporter:
-    image: oliver006/redis_exporter:v1.76.0
+    image: oliver006/redis_exporter:v1.80.2
     container_name: hippius-redis-chain-exporter
     ports:
       - "127.0.0.1:9123:9121"
