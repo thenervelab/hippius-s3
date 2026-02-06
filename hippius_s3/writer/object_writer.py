@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 import uuid
 from datetime import datetime
 from datetime import timezone
@@ -33,6 +34,7 @@ from hippius_s3.writer.write_through_writer import WriteThroughPartsWriter
 
 
 tracer = trace.get_tracer(__name__)
+logger = logging.getLogger(__name__)
 
 
 class ObjectWriter:
@@ -272,14 +274,18 @@ class ObjectWriter:
         next_chunk_index = 0
         chunk_cipher_sizes: list[int] = []
 
+        perf_encrypt_ms = 0.0
+        perf_fs_ms = 0.0
+        perf_redis_ms = 0.0
+        perf_stream_start = time.monotonic()
+
         async def _encrypt_and_write(buf: bytes) -> None:
-            nonlocal total_size, next_chunk_index
+            nonlocal total_size, next_chunk_index, perf_encrypt_ms, perf_fs_ms, perf_redis_ms
             if not buf:
                 return
             hasher.update(buf)
             total_size += len(buf)
-            # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
-            # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
+            t0 = time.monotonic()
             adapter = CryptoService.get_adapter(suite_id)
             ct = adapter.encrypt_chunk(
                 buf,
@@ -290,8 +296,8 @@ class ObjectWriter:
                 chunk_index=int(next_chunk_index),
                 upload_id="",
             )
+            t1 = time.monotonic()
             chunk_cipher_sizes.append(len(ct))
-            # Write-through: FS first (fatal), then Redis (best-effort)
             await self.fs_store.set_chunk(
                 object_id,
                 int(object_version),
@@ -299,6 +305,7 @@ class ObjectWriter:
                 int(next_chunk_index),
                 ct,
             )
+            t2 = time.monotonic()
             try:
                 await self.obj_cache.set_chunk(
                     object_id,
@@ -309,11 +316,19 @@ class ObjectWriter:
                     ttl=ttl,
                 )
             except Exception as e:
-                import logging
-
-                logging.getLogger(__name__).warning(
+                logger.warning(
                     f"Redis chunk write failed (best-effort) in streaming: object_id={object_id} v={object_version} part={part_number} chunk={next_chunk_index}: {e}"
                 )
+            t3 = time.monotonic()
+            enc_ms = (t1 - t0) * 1000
+            fs_ms = (t2 - t1) * 1000
+            redis_ms = (t3 - t2) * 1000
+            perf_encrypt_ms += enc_ms
+            perf_fs_ms += fs_ms
+            perf_redis_ms += redis_ms
+            logger.debug(
+                f"PERF chunk {next_chunk_index}: enc={enc_ms:.1f}ms fs={fs_ms:.1f}ms redis={redis_ms:.1f}ms size={len(buf)}"
+            )
             next_chunk_index += 1
 
         with tracer.start_as_current_span("put_simple_stream_full.encrypt_and_cache") as span:
@@ -331,6 +346,7 @@ class ObjectWriter:
                 pt_buf.clear()
 
             md5_hash = hasher.hexdigest()
+            perf_stream_total_ms = (time.monotonic() - perf_stream_start) * 1000
             set_span_attributes(
                 span,
                 {
@@ -341,6 +357,7 @@ class ObjectWriter:
             )
 
         # Update the reserved object_versions row with final md5/size
+        perf_post_start = time.monotonic()
         with tracer.start_as_current_span(
             "put_simple_stream_full.update_metadata",
             attributes={
@@ -365,7 +382,6 @@ class ObjectWriter:
 
             if resolved_storage_version >= 5 and kek_id and wrapped_dek:
                 aad = f"hippius-dek:{bucket_id}:{object_id}:{object_version}".encode("utf-8")
-                # Re-wrap with correct object_version AAD (in case object_version differs)
                 from hippius_s3.services.envelope_service import wrap_dek
                 from hippius_s3.services.kek_service import get_bucket_kek_bytes
 
@@ -389,7 +405,6 @@ class ObjectWriter:
                     int(object_version),
                 )
 
-        # Now that we know counts and sizes, write meta last using exact chunk count
         num_chunks = int(next_chunk_index)
         await writer.write_meta(
             object_id,
@@ -400,7 +415,6 @@ class ObjectWriter:
             plain_size=int(total_size),
         )
 
-        # Ensure upload row and return PutResult-compatible values
         upload_id = await ensure_upload_row(
             self.db,
             object_id=object_id,
@@ -410,7 +424,6 @@ class ObjectWriter:
             metadata=metadata,
         )
 
-        # Ensure parts table has placeholder for base part (part 1) so append/read paths see it
         await upsert_part_placeholder(
             self.db,
             object_id=object_id,
@@ -421,6 +434,16 @@ class ObjectWriter:
             chunk_size_bytes=int(chunk_size),
             object_version=int(object_version),
             chunk_cipher_sizes=chunk_cipher_sizes,
+        )
+        perf_post_ms = (time.monotonic() - perf_post_start) * 1000
+
+        throughput_mbps = (
+            (total_size / (1024 * 1024)) / (perf_stream_total_ms / 1000) if perf_stream_total_ms > 0 else 0
+        )
+        logger.info(
+            f"PERF put_simple object_id={object_id} size={total_size} chunks={num_chunks} "
+            f"stream={perf_stream_total_ms:.0f}ms (enc={perf_encrypt_ms:.0f}ms fs={perf_fs_ms:.0f}ms redis={perf_redis_ms:.0f}ms) "
+            f"post_db={perf_post_ms:.0f}ms throughput={throughput_mbps:.1f}MB/s"
         )
 
         return PutResult(
@@ -646,11 +669,15 @@ class ObjectWriter:
         written_chunk_indices: list[int] = []
         meta_written = False
 
+        perf_encrypt_ms = 0.0
+        perf_fs_ms = 0.0
+        perf_redis_ms = 0.0
+        perf_stream_start = time.monotonic()
+
         async def _cleanup_partial() -> None:
             try:
                 await self.fs_store.delete_part(str(object_id), int(object_version), int(part_number))
             except Exception:
-                logger = logging.getLogger(__name__)
                 logger.warning(
                     "Failed to cleanup partial part on FS: object_id=%s v=%s part=%s",
                     object_id,
@@ -666,7 +693,6 @@ class ObjectWriter:
                     keys.append(self.obj_cache.build_meta_key(str(object_id), int(object_version), int(part_number)))
                     await self.redis_client.delete(*keys)
                 except Exception:
-                    logger = logging.getLogger(__name__)
                     logger.warning(
                         "Failed to cleanup partial part in Redis: object_id=%s v=%s part=%s",
                         object_id,
@@ -675,11 +701,12 @@ class ObjectWriter:
                     )
 
         async def _encrypt_and_write(buf: bytes) -> None:
-            nonlocal total_size, next_chunk_index
+            nonlocal total_size, next_chunk_index, perf_encrypt_ms, perf_fs_ms, perf_redis_ms
             if not buf:
                 return
             hasher.update(buf)
             total_size += len(buf)
+            t0 = time.monotonic()
             ct = adapter.encrypt_chunk(
                 buf,
                 key=key_bytes,
@@ -689,6 +716,7 @@ class ObjectWriter:
                 chunk_index=int(next_chunk_index),
                 upload_id=str(upload_id),
             )
+            t1 = time.monotonic()
             chunk_cipher_sizes.append(len(ct))
             await self.fs_store.set_chunk(
                 str(object_id),
@@ -697,6 +725,7 @@ class ObjectWriter:
                 int(next_chunk_index),
                 ct,
             )
+            t2 = time.monotonic()
             try:
                 await self.obj_cache.set_chunk(
                     str(object_id),
@@ -707,7 +736,6 @@ class ObjectWriter:
                     ttl=ttl,
                 )
             except Exception:
-                logger = logging.getLogger(__name__)
                 logger.warning(
                     "Redis chunk write failed (best-effort) in mpu stream: object_id=%s v=%s part=%s chunk=%s",
                     object_id,
@@ -715,6 +743,16 @@ class ObjectWriter:
                     int(part_number),
                     int(next_chunk_index),
                 )
+            t3 = time.monotonic()
+            enc_ms = (t1 - t0) * 1000
+            fs_ms = (t2 - t1) * 1000
+            redis_ms = (t3 - t2) * 1000
+            perf_encrypt_ms += enc_ms
+            perf_fs_ms += fs_ms
+            perf_redis_ms += redis_ms
+            logger.debug(
+                f"PERF mpu chunk {next_chunk_index}: enc={enc_ms:.1f}ms fs={fs_ms:.1f}ms redis={redis_ms:.1f}ms size={len(buf)}"
+            )
             written_chunk_indices.append(int(next_chunk_index))
             next_chunk_index += 1
 
@@ -751,8 +789,10 @@ class ObjectWriter:
                 await _cleanup_partial()
             raise
 
+        perf_stream_total_ms = (time.monotonic() - perf_stream_start) * 1000
         md5_hash = hasher.hexdigest()
 
+        perf_post_start = time.monotonic()
         await upsert_part_placeholder(
             self.db,
             object_id=str(object_id),
@@ -763,6 +803,16 @@ class ObjectWriter:
             chunk_size_bytes=int(chunk_size),
             object_version=int(object_version),
             chunk_cipher_sizes=chunk_cipher_sizes,
+        )
+        perf_post_ms = (time.monotonic() - perf_post_start) * 1000
+
+        throughput_mbps = (
+            (total_size / (1024 * 1024)) / (perf_stream_total_ms / 1000) if perf_stream_total_ms > 0 else 0
+        )
+        logger.info(
+            f"PERF mpu_part object_id={object_id} part={part_number} size={total_size} chunks={next_chunk_index} "
+            f"stream={perf_stream_total_ms:.0f}ms (enc={perf_encrypt_ms:.0f}ms fs={perf_fs_ms:.0f}ms redis={perf_redis_ms:.0f}ms) "
+            f"post_db={perf_post_ms:.0f}ms throughput={throughput_mbps:.1f}MB/s"
         )
 
         return PartResult(etag=md5_hash, size_bytes=int(total_size), part_number=int(part_number))
