@@ -283,6 +283,7 @@ class ObjectWriter:
         write_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(maxsize=2)
         consumer_error: BaseException | None = None
 
+        # Write-through: FS first (fatal), then Redis (best-effort)
         async def _consumer() -> None:
             nonlocal consumer_error, perf_fs_ms
             while True:
@@ -333,6 +334,8 @@ class ObjectWriter:
                     del pt_buf[:chunk_size]
                     hasher.update(buf)
                     total_size += len(buf)
+                    # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
+                    # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
                     t0 = time.monotonic()
                     ct = adapter.encrypt_chunk(
                         buf,
@@ -358,6 +361,8 @@ class ObjectWriter:
                 pt_buf.clear()
                 hasher.update(buf)
                 total_size += len(buf)
+                # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
+                # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
                 t0 = time.monotonic()
                 ct = adapter.encrypt_chunk(
                     buf,
@@ -745,6 +750,7 @@ class ObjectWriter:
                         int(part_number),
                     )
 
+        # Write-through: FS first (fatal), then Redis (best-effort)
         async def _consumer() -> None:
             nonlocal consumer_error, perf_fs_ms
             while True:
@@ -804,6 +810,8 @@ class ObjectWriter:
                     del pt_buf[:chunk_size]
                     hasher.update(buf)
                     total_size += len(buf)
+                    # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
+                    # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
                     t0 = time.monotonic()
                     ct = adapter.encrypt_chunk(
                         buf,
@@ -829,6 +837,8 @@ class ObjectWriter:
                 pt_buf.clear()
                 hasher.update(buf)
                 total_size += len(buf)
+                # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
+                # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
                 t0 = time.monotonic()
                 ct = adapter.encrypt_chunk(
                     buf,
