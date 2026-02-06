@@ -2,6 +2,7 @@
 .env
 .env.backup
 *.csv
+.aws.cli.env
 
 # Python
 __pycache__/
