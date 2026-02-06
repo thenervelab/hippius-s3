@@ -204,7 +204,7 @@ class Config:
 
     # endpoint chunk download settings, quite aggressive
     redis_read_chunk_timeout: int = 60
-    http_download_sleep_loop: float = 0.1
+    http_download_sleep_loop: float = 0.02
     http_redis_get_retries: int = int(redis_read_chunk_timeout / http_download_sleep_loop)
 
     # initial stream timeout (seconds) before sending first byte
