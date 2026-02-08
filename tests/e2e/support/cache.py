@@ -8,6 +8,20 @@ from typing import Optional
 
 import psycopg  # type: ignore[import-untyped]
 
+from .compose import compose_exec
+
+
+def _rmtree(path: Path) -> None:
+    """Remove a directory tree, falling back to docker exec when local removal
+    fails due to Docker root-owned file permissions on CI."""
+    if not path.exists():
+        return
+    shutil.rmtree(path, ignore_errors=True)
+    if not path.exists():
+        return
+    # Local rmtree failed (Docker root-owned files on CI) — exec rm as root inside container
+    compose_exec("api", ["rm", "-rf", str(path)])
+
 
 def get_object_id_and_version(
     bucket_name: str, object_key: str, *, dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius"
@@ -129,7 +143,7 @@ def clear_object_cache(
         return
 
     if parts is None:
-        shutil.rmtree(obj_dir, ignore_errors=True)
+        _rmtree(obj_dir)
         return
 
     # Determine current object_version for namespacing
@@ -149,8 +163,7 @@ def clear_object_cache(
     version_dir = obj_dir / f"v{object_version}"
     for pn in parts:
         part_dir = version_dir / f"part_{pn}"
-        if part_dir.exists():
-            shutil.rmtree(part_dir, ignore_errors=True)
+        _rmtree(part_dir)
 
 
 def read_part_from_cache(
