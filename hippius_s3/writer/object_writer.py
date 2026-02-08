@@ -285,13 +285,17 @@ class ObjectWriter:
                     break
                 chunk_idx, ct = item
                 t_io_start = time.monotonic()
-                await self.fs_store.set_chunk(
-                    object_id,
-                    int(object_version),
-                    int(part_number),
-                    chunk_idx,
-                    ct,
-                )
+                try:
+                    await self.fs_store.set_chunk(
+                        object_id,
+                        int(object_version),
+                        int(part_number),
+                        chunk_idx,
+                        ct,
+                    )
+                except BaseException as exc:
+                    consumer_error = exc
+                    break
                 t_io_end = time.monotonic()
                 io_ms = (t_io_end - t_io_start) * 1000
                 perf_fs_ms += io_ms
@@ -711,13 +715,17 @@ class ObjectWriter:
                     break
                 chunk_idx, ct = item
                 t_io_start = time.monotonic()
-                await self.fs_store.set_chunk(
-                    str(object_id),
-                    int(object_version),
-                    int(part_number),
-                    chunk_idx,
-                    ct,
-                )
+                try:
+                    await self.fs_store.set_chunk(
+                        str(object_id),
+                        int(object_version),
+                        int(part_number),
+                        chunk_idx,
+                        ct,
+                    )
+                except BaseException as exc:
+                    consumer_error = exc
+                    break
                 t_io_end = time.monotonic()
                 io_ms = (t_io_end - t_io_start) * 1000
                 perf_fs_ms += io_ms

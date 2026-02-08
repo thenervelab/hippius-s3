@@ -218,7 +218,6 @@ async def gateway_app(
     app = factory()
 
     app.state.postgres_pool = gateway_db_pool
-    app.state.redis_client = gateway_redis_clients["redis"]
     app.state.redis_accounts = gateway_redis_clients["redis_accounts"]
     app.state.redis_chain = gateway_redis_clients["redis_chain"]
     app.state.redis_rate_limiting = gateway_redis_clients["redis_rate_limiting"]
@@ -270,7 +269,6 @@ async def gateway_app_no_auth(
     app = FastAPI()
 
     app.state.postgres_pool = gateway_db_pool
-    app.state.redis_client = gateway_redis_clients["redis"]
     app.state.redis_accounts = gateway_redis_clients["redis_accounts"]
     app.state.redis_chain = gateway_redis_clients["redis_chain"]
     app.state.redis_rate_limiting = gateway_redis_clients["redis_rate_limiting"]

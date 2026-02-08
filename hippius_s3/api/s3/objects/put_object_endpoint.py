@@ -31,7 +31,6 @@ async def handle_put_object(
     object_key: str,
     request: Request,
     db: Any,
-    redis_client: Any,
 ) -> Response:
     try:
         # Get or create user and bucket for this main account
@@ -70,7 +69,7 @@ async def handle_put_object(
             return await handle_append(
                 request,
                 db,
-                redis_client,
+                request.app.state.redis_queues_client,
                 bucket=bucket,
                 bucket_id=bucket_id,
                 bucket_name=bucket_name,

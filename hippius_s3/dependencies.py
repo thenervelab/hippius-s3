@@ -62,12 +62,6 @@ def get_config(request: Request) -> Config:
     return config
 
 
-def get_redis(request: Request) -> Union[Redis, RedisCluster]:
-    """Extract the Redis client from the request."""
-    redis_client: Union[Redis, RedisCluster] = request.app.state.redis_client
-    return redis_client
-
-
 def get_redis_accounts(request: Request) -> Union[Redis, RedisCluster]:
     """Extract the Redis accounts client from the request."""
     redis_accounts_client: Union[Redis, RedisCluster] = request.app.state.redis_accounts_client

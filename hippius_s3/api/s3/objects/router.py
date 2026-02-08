@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
-
 from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import Request
@@ -58,7 +56,6 @@ async def put_object(
     object_key: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    redis_client: Any = Depends(dependencies.get_redis),
 ) -> Response:
     upload_id = request.query_params.get("uploadId")
     part_number = request.query_params.get("partNumber")
@@ -70,7 +67,7 @@ async def put_object(
         )
     if request.headers.get("x-amz-copy-source"):
         return await handle_copy_object(bucket_name, object_key, request, db)
-    return await handle_put_object(bucket_name, object_key, request, db, redis_client)
+    return await handle_put_object(bucket_name, object_key, request, db)
 
 
 @router.delete("/{bucket_name}/{object_key:path}", status_code=204)

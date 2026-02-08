@@ -10,7 +10,6 @@ import uuid
 from collections.abc import AsyncIterator
 from datetime import datetime
 from datetime import timezone
-from typing import Any
 from urllib.parse import unquote
 
 from fastapi import APIRouter
@@ -18,7 +17,6 @@ from fastapi import Depends
 from fastapi import Request
 from fastapi import Response
 from opentelemetry import trace
-from redis.asyncio import Redis
 from starlette.requests import ClientDisconnect
 
 from hippius_s3 import dependencies
@@ -327,19 +325,6 @@ async def initiate_multipart_upload(
         )
 
 
-async def get_all_cached_chunks(
-    object_id: str,
-    redis_client: Redis,  # type: ignore[type-arg]
-) -> list[Any]:
-    """Find all cached part meta keys for an object using non-blocking SCAN."""
-    try:
-        keys_pattern = f"obj:{object_id}:part:*:meta"
-        return [key async for key in redis_client.scan_iter(keys_pattern, count=1000)]
-    except Exception as e:
-        logger.error(f"Failed to find any cached parts for {object_id=}: {e}")
-        return []
-
-
 async def upload_part(
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
@@ -597,7 +582,7 @@ async def upload_part(
             return s3_error_response("NoSuchUpload", "The specified upload does not exist.", status_code=404)
         dest_bucket_name = row.get("bucket_name")
 
-        redis_start = time.time()
+        cache_start = time.time()
         # Route through ObjectWriter for standardized behavior
         writer = ObjectWriter(db=db, fs_store=request.app.state.fs_store)
         try:
@@ -613,16 +598,6 @@ async def upload_part(
             )
         except ClientDisconnect:
             logger.warning(f"Client disconnected during part {part_number} upload for upload {upload_id}")
-
-            # Clean up any cached parts for this upload when client disconnects
-            keys = await get_all_cached_chunks(
-                upload_id,
-                request.app.state.redis_client,
-            )
-            if keys:
-                await request.app.state.redis_client.delete(*keys)
-                logger.info(f"Cleaned up {len(keys)} cached parts for disconnected upload {upload_id}")
-
             return s3_error_response(
                 "RequestTimeout",
                 "Client disconnected during upload",
@@ -642,9 +617,9 @@ async def upload_part(
                     status_code=400,
                 )
             raise
-        redis_time = time.time() - redis_start
+        cache_time = time.time() - cache_start
         logger.debug(
-            f"Part {part_number}: Cached via FS store in {redis_time:.3f}s (object_id={object_id}, encrypted=True)"
+            f"Part {part_number}: Cached via FS store in {cache_time:.3f}s (object_id={object_id}, encrypted=True)"
         )
 
         file_size = int(part_res.size_bytes)
@@ -734,9 +709,6 @@ async def abort_multipart_upload(
                 get_query("abort_multipart_upload"),
                 upload_id,
             )
-        # Mark aborted in Redis so listings immediately hide this upload (defensive against read lag)
-        with contextlib.suppress(Exception):
-            await request.app.state.redis_client.setex(f"aborted_mpu:{upload_id}", 300, "1")
         return Response(status_code=204)
 
     except Exception as e:
@@ -782,20 +754,6 @@ async def list_multipart_uploads(
         uploads = await db.fetch(
             get_query("list_multipart_uploads"), bucket["bucket_id"], request.query_params.get("prefix")
         )
-
-        # Filter out any uploads that were very recently aborted (defensive cache for race conditions)
-        try:
-            redis_client: Redis = request.app.state.redis_client
-            filtered_uploads = []
-            for upload in uploads:
-                aborted_flag = await redis_client.get(f"aborted_mpu:{str(upload['upload_id'])}")
-                if aborted_flag:
-                    continue
-                filtered_uploads.append(upload)
-            uploads = filtered_uploads
-        except Exception as _:
-            # If Redis not available, proceed with DB results
-            pass
 
         # Generate the response XML
         root = create_element("ListMultipartUploadsResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
