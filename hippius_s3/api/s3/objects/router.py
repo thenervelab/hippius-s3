@@ -40,7 +40,6 @@ async def get_object(
     object_key: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    redis_client: Any = Depends(dependencies.get_redis),
 ) -> Response:
     # Handle query variants by delegation
     if "tagging" in request.query_params:
@@ -49,7 +48,7 @@ async def get_object(
         )
     if "uploadId" in request.query_params:
         return await list_parts_internal(bucket_name, object_key, request, db)
-    return await handle_get_object(bucket_name, object_key, request, db, redis_client)
+    return await handle_get_object(bucket_name, object_key, request, db)
 
 
 @router.put("/{bucket_name}/{object_key:path}/", status_code=200, include_in_schema=False)
@@ -70,7 +69,7 @@ async def put_object(
             bucket_name, object_key, request, db, request.state.seed_phrase, request.state.account.main_account
         )
     if request.headers.get("x-amz-copy-source"):
-        return await handle_copy_object(bucket_name, object_key, request, db, redis_client)
+        return await handle_copy_object(bucket_name, object_key, request, db)
     return await handle_put_object(bucket_name, object_key, request, db, redis_client)
 
 
@@ -80,7 +79,6 @@ async def delete_object(
     object_key: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    redis_client: Any = Depends(dependencies.get_redis),
 ) -> Response:
     if "uploadId" in request.query_params:
         return await abort_multipart_upload(bucket_name, object_key, request, db)
@@ -88,4 +86,4 @@ async def delete_object(
         return await tags_delete_object_tags(
             bucket_name, object_key, db, request.state.seed_phrase, request.state.account.main_account
         )
-    return await handle_delete_object(bucket_name, object_key, request, db, redis_client)
+    return await handle_delete_object(bucket_name, object_key, request, db)

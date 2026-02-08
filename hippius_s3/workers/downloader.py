@@ -10,7 +10,7 @@ Each backend entry point (``run_ipfs_downloader_in_loop.py``,
 
 This module dequeues download requests, looks up the backend-specific
 identifier for each chunk, fetches the ciphertext, and stores it in the
-Redis chunk cache.
+filesystem chunk cache.
 """
 
 from __future__ import annotations
@@ -24,10 +24,9 @@ from collections.abc import Awaitable
 from collections.abc import Callable
 
 import asyncpg
-import redis.asyncio as async_redis
 from opentelemetry import trace
 
-from hippius_s3.cache import RedisObjectPartsCache
+from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.config import get_config
 from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import PartToDownload
@@ -45,16 +44,16 @@ async def process_download_request(
     backend_name: str,
     fetch_fn: Callable[[str, str], Awaitable[bytes]],
     db_pool: asyncpg.Pool,
-    redis_client: async_redis.Redis,
+    fs_store: FileSystemPartsStore,
 ) -> bool:
     """Process a single download request for one backend.
 
     For each part/chunk in the request:
     1. Look up ``backend_identifier`` from the ``chunk_backend`` table.
     2. Skip if no identifier (this backend doesn't hold the chunk).
-    3. Skip if already cached.
+    3. Skip if already cached on FS.
     4. Call *fetch_fn(identifier, account_address)* to obtain ciphertext bytes.
-    5. Store in the Redis chunk cache.
+    5. Store in the filesystem chunk cache.
     """
     with tracer.start_as_current_span(
         "downloader.process_download",
@@ -67,7 +66,6 @@ async def process_download_request(
         },
     ) as span:
         config = get_config()
-        obj_cache = RedisObjectPartsCache(redis_client)
 
         short_id = f"{download_request.bucket_name}/{download_request.object_key}"
         logger.info(
@@ -92,19 +90,18 @@ async def process_download_request(
                 },
             ):
                 async with semaphore:
+                    # Check if meta already exists (all chunks already cached)
+                    existing_meta = await fs_store.get_meta(
+                        download_request.object_id,
+                        int(download_request.object_version),
+                        part_number,
+                    )
+                    if existing_meta:
+                        logger.debug(f"[{backend_name}] Part already cached part={part_number}")
+                        return True
+
                     for spec in part.chunks:
                         chunk_index = int(spec.index)
-
-                        # Check if already cached
-                        cached = await obj_cache.chunk_exists(
-                            download_request.object_id,
-                            int(download_request.object_version),
-                            part_number,
-                            chunk_index,
-                        )
-                        if cached:
-                            logger.debug(f"[{backend_name}] Skipping cached chunk part={part_number} ci={chunk_index}")
-                            continue
 
                         # Look up backend_identifier (acquire connection from pool)
                         async with db_pool.acquire() as conn:
@@ -131,7 +128,7 @@ async def process_download_request(
                                 data = await fetch_fn(identifier, download_request.subaccount)
                                 elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-                                await obj_cache.set_chunk(
+                                await fs_store.set_chunk(
                                     download_request.object_id,
                                     int(download_request.object_version),
                                     part_number,
@@ -175,9 +172,31 @@ async def process_download_request(
                                 )
                                 await asyncio.sleep(sleep_for)
 
-                # Clear in-progress flag
-                with contextlib.suppress(Exception):
-                    await redis_client.delete(f"download_in_progress:{download_request.object_id}:{part_number}")
+                    # Write meta.json to mark part as complete on FS
+                    # Query DB for part metadata (size_bytes, chunk_size_bytes)
+                    async with db_pool.acquire() as conn:
+                        part_row = await conn.fetchrow(
+                            "SELECT size_bytes, chunk_size_bytes FROM parts "
+                            "WHERE object_id = $1 AND object_version = $2 AND part_number = $3",
+                            download_request.object_id,
+                            int(download_request.object_version),
+                            part_number,
+                        )
+                    part_size = int(part_row["size_bytes"]) if part_row else 0
+                    chunk_size = (
+                        int(part_row["chunk_size_bytes"])
+                        if part_row and part_row["chunk_size_bytes"]
+                        else config.object_chunk_size_bytes
+                    )
+                    await fs_store.set_meta(
+                        download_request.object_id,
+                        int(download_request.object_version),
+                        part_number,
+                        chunk_size=chunk_size,
+                        num_chunks=len(part.chunks),
+                        size_bytes=part_size,
+                    )
+
                 return True
 
         try:
@@ -203,24 +222,23 @@ async def run_downloader_loop(
     fetch_fn: Callable[[str, str], Awaitable[bytes]],
 ) -> None:
     """Main loop: dequeue from *queue_name* and process via *fetch_fn*."""
+    import redis.asyncio as async_redis
     from redis.exceptions import BusyLoadingError
     from redis.exceptions import ConnectionError as RedisConnectionError
     from redis.exceptions import TimeoutError as RedisTimeoutError
 
     from hippius_s3.queue import dequeue_download_request
     from hippius_s3.queue import initialize_queue_client
-    from hippius_s3.redis_cache import initialize_cache_client
     from hippius_s3.services.ray_id_service import get_logger_with_ray_id
     from hippius_s3.services.ray_id_service import ray_id_context
 
     config = get_config()
 
-    redis_client = async_redis.from_url(config.redis_url)
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
     db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=20)
+    fs_store = FileSystemPartsStore(config.object_cache_dir)
 
     initialize_queue_client(redis_queues_client)
-    initialize_cache_client(redis_client)
 
     logger.info(f"[{backend_name}] Starting downloader, queue={queue_name}")
 
@@ -267,21 +285,13 @@ async def run_downloader_loop(
                         backend_name=backend_name,
                         fetch_fn=fetch_fn,
                         db_pool=db_pool,
-                        redis_client=redis_client,
+                        fs_store=fs_store,
                     )
                     if ok:
                         worker_logger.info(f"[{backend_name}] Done: {request.bucket_name}/{request.object_key}")
                     else:
                         job_span.set_status(trace.StatusCode.ERROR, "partial failure")
                         worker_logger.error(f"[{backend_name}] Failed: {request.bucket_name}/{request.object_key}")
-                except (RedisConnectionError, RedisTimeoutError, BusyLoadingError) as exc:
-                    job_span.record_exception(exc)
-                    job_span.set_status(trace.StatusCode.ERROR, str(exc))
-                    logger.warning(f"[{backend_name}] Redis issue during processing: {exc}. Reconnecting…")
-                    with contextlib.suppress(Exception):
-                        await redis_client.aclose()  # type: ignore[attr-defined]
-                    redis_client = async_redis.from_url(config.redis_url)
-                    initialize_cache_client(redis_client)
                 except asyncpg.InterfaceError as exc:
                     job_span.record_exception(exc)
                     job_span.set_status(trace.StatusCode.ERROR, str(exc))
@@ -296,6 +306,5 @@ async def run_downloader_loop(
         logger.error(f"[{backend_name}] Fatal loop error: {exc}", exc_info=True)
         raise
     finally:
-        await redis_client.aclose()  # type: ignore[attr-defined]
         await redis_queues_client.aclose()  # type: ignore[attr-defined]
         await db_pool.close()

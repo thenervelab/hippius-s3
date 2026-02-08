@@ -15,7 +15,6 @@ from opentelemetry import trace
 from pydantic import BaseModel
 
 from hippius_s3.cache import FileSystemPartsStore
-from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.dlq.upload_dlq import UploadDLQManager
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
@@ -114,19 +113,16 @@ class Uploader:
     def __init__(
         self,
         db_pool: Any,
-        redis_client: async_redis.Redis,  # type: ignore[type-arg]
         redis_queues_client: async_redis.Redis,  # type: ignore[type-arg]
         config: Any,
         backend_name: str,
         backend_client: BackendClient,
     ) -> None:
         self.db = db_pool
-        self.redis_client = redis_client
         self.redis_queues_client = redis_queues_client
         self.config = config
         self.backend_name = backend_name
         self.backend_client = backend_client
-        self.obj_cache = RedisObjectPartsCache(redis_client)
         self.fs_store = FileSystemPartsStore(config.object_cache_dir)
         self.dlq_manager = UploadDLQManager(redis_queues_client, backend_name=backend_name)
 
@@ -259,11 +255,6 @@ class Uploader:
                 all_results = [first_result] + list(remaining_results)
             else:
                 all_results = [first_result]
-
-            for result in all_results:
-                await self.obj_cache.expire(
-                    object_id, int(object_version), result.part_number, ttl=self.config.cache_ttl_seconds
-                )
 
             all_cids = []
             for result in all_results:

@@ -44,12 +44,11 @@ class StreamContext:
 
 async def build_stream_context(
     db: Any,
-    redis: Any,
-    obj_cache: Any,
     info: dict,
     *,
     rng: RangeRequest | None,
     address: str,
+    fs_store: Any,
 ) -> StreamContext:
     cfg = get_config()
     storage_version = require_supported_storage_version(int(info["storage_version"]))
@@ -62,12 +61,12 @@ async def build_stream_context(
     source = "cache"
     try:
         for item in plan:
-            exists = await obj_cache.chunk_exists(
+            exists = await fs_store.chunk_exists(
                 info["object_id"],
                 int(info.get("object_version") or info.get("current_object_version") or 1),
                 int(item.part_number),
                 int(item.chunk_index),
-            )  # type: ignore[attr-defined]
+            )
             if not exists:
                 source = "pipeline"
                 break
@@ -86,12 +85,12 @@ async def build_stream_context(
                 continue
         indices_by_part: dict[int, set[int]] = {}
         for item in plan:
-            ok = await obj_cache.chunk_exists(
+            ok = await fs_store.chunk_exists(
                 info["object_id"],
                 int(info.get("object_version") or info.get("current_object_version") or 1),
                 int(item.part_number),
                 int(item.chunk_index),
-            )  # type: ignore[attr-defined]
+            )
             if ok:
                 continue
             idx_set = indices_by_part.setdefault(int(item.part_number), set())
@@ -271,26 +270,23 @@ async def build_stream_context(
 
 async def read_response(
     db: Any,
-    redis: Any,
-    obj_cache: Any,
     info: dict,
     *,
     read_mode: str,
     rng: RangeRequest | None,
     address: str,
     range_was_invalid: bool = False,
+    fs_store: Any,
 ) -> Response:
     cfg = get_config()
     ctx = await build_stream_context(
         db,
-        redis,
-        obj_cache,
         info,
         rng=rng,
         address=address,
+        fs_store=fs_store,
     )
     gen = stream_plan(
-        obj_cache=obj_cache,
         object_id=info["object_id"],
         object_version=ctx.object_version,
         plan=ctx.plan,
@@ -303,6 +299,7 @@ async def read_response(
         address=address,
         bucket_name=str(info.get("bucket_name", "")),
         prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
+        fs_store=fs_store,
     )
     headers = build_headers(
         info,
@@ -322,12 +319,11 @@ async def read_response(
 
 async def stream_object(
     db: Any,
-    redis: Any,
-    obj_cache: Any,
     info: dict,
     *,
     rng: RangeRequest | None,
     address: str,
+    fs_store: Any,
 ) -> Any:
     """Return an async iterator of plaintext bytes for the requested object.
 
@@ -337,14 +333,12 @@ async def stream_object(
     cfg = get_config()
     ctx = await build_stream_context(
         db,
-        redis,
-        obj_cache,
         info,
         rng=rng,
         address=address,
+        fs_store=fs_store,
     )
     return stream_plan(
-        obj_cache=obj_cache,
         object_id=info["object_id"],
         object_version=ctx.object_version,
         plan=ctx.plan,
@@ -357,4 +351,5 @@ async def stream_object(
         address=address,
         bucket_name=str(info.get("bucket_name", "")),
         prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
+        fs_store=fs_store,
     )

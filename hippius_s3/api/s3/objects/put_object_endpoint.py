@@ -127,7 +127,7 @@ async def handle_put_object(
                 "storage_version": config.target_storage_version,
             },
         ) as span:
-            writer = ObjectWriter(db=db, redis_client=redis_client, fs_store=request.app.state.fs_store)
+            writer = ObjectWriter(db=db, fs_store=request.app.state.fs_store)
 
             put_res = await writer.put_simple_stream_full(
                 bucket_id=bucket_id,

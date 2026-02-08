@@ -44,49 +44,34 @@ async def main_async(args: argparse.Namespace) -> int:
             print(f"Would delete {len(rows)} migration versions")
             return 0
 
-        redis_client = async_redis.from_url(config.redis_url)
         deleted = 0
-        try:
-            for r in rows:
-                cid = r["ipfs_cid"]
-                if cid:
-                    from contextlib import suppress
+        for r in rows:
+            cid = r["ipfs_cid"]
+            if cid:
+                from contextlib import suppress
 
-                    with suppress(Exception):
-                        await enqueue_unpin_request(
-                            payload=UnpinChainRequest(
-                                address=r["main_account_id"],
-                                object_id=str(r["object_id"]),
-                                object_version=int(r["object_version"]),
-                                cid=str(cid),
-                            ),
-                        )
-                await db.execute(
-                    """
-                    WITH del_parts AS (
-                        DELETE FROM parts WHERE object_id = $1 AND object_version = $2 RETURNING 1
-                    ), del_ver AS (
-                        DELETE FROM object_versions WHERE object_id = $1 AND object_version = $2 RETURNING 1
-                    )
-                    SELECT 1
-                    """,
-                    r["object_id"],
-                    r["object_version"],
-                )
-                deleted += 1
-        finally:
-            from contextlib import suppress
-
-            # Close redis client compatibly across versions
-            close_coro = getattr(redis_client, "aclose", None)
-            if callable(close_coro):
                 with suppress(Exception):
-                    await close_coro()
-            else:
-                close_fn = getattr(redis_client, "close", None)
-                if callable(close_fn):
-                    with suppress(Exception):
-                        close_fn()
+                    await enqueue_unpin_request(
+                        payload=UnpinChainRequest(
+                            address=r["main_account_id"],
+                            object_id=str(r["object_id"]),
+                            object_version=int(r["object_version"]),
+                            cid=str(cid),
+                        ),
+                    )
+            await db.execute(
+                """
+                WITH del_parts AS (
+                    DELETE FROM parts WHERE object_id = $1 AND object_version = $2 RETURNING 1
+                ), del_ver AS (
+                    DELETE FROM object_versions WHERE object_id = $1 AND object_version = $2 RETURNING 1
+                )
+                SELECT 1
+                """,
+                r["object_id"],
+                r["object_version"],
+            )
+            deleted += 1
         print(f"Deleted {deleted} migration versions")
         return 0
     finally:

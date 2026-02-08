@@ -14,7 +14,6 @@ from typing import AsyncGenerator
 import asyncpg  # type: ignore[import-untyped]
 import redis.asyncio as async_redis  # type: ignore[import-untyped]
 
-from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
@@ -202,7 +201,6 @@ async def _fetch_current_markers(db: Any, object_id: str) -> tuple[str, int, flo
 async def migrate_one(
     *,
     db: Any,
-    redis_client: Any,
     object_id: str,
     bucket_id: str,
     bucket_name: str,
@@ -222,7 +220,7 @@ async def migrate_one(
     from hippius_s3.cache import FileSystemPartsStore  # local import
 
     fs_store = FileSystemPartsStore(config.object_cache_dir)
-    writer = ObjectWriter(db=db, redis_client=redis_client, fs_store=fs_store)
+    writer = ObjectWriter(db=db, fs_store=fs_store)
     new_version = await writer.create_version_for_migration(
         object_id=object_id,
         content_type=content_type,
@@ -231,7 +229,6 @@ async def migrate_one(
         upload_backends=config.upload_backends,
     )
 
-    obj_cache = RedisObjectPartsCache(redis_client)
     # Build common context via reader (version-aware and cache-aware)
     info = {
         "object_id": object_id,
@@ -245,11 +242,10 @@ async def migrate_one(
     }
     ctx = await build_stream_context(
         db,
-        redis_client,
-        obj_cache,
         info,
         rng=None,
         address=address,
+        fs_store=fs_store,
     )
     plan = ctx.plan
 
@@ -287,7 +283,6 @@ async def migrate_one(
         part_plan = by_part[int(part_number)]
         try:
             gen = stream_plan(
-                obj_cache=obj_cache,
                 object_id=object_id,
                 object_version=ctx.object_version,
                 plan=part_plan,
@@ -299,6 +294,7 @@ async def migrate_one(
                 upload_id=ctx.upload_id,
                 address=address,
                 bucket_name=bucket_name,
+                fs_store=fs_store,
             )
             # Accumulate bytes for this part
             buf = bytearray()
@@ -474,7 +470,6 @@ async def main_async(args: argparse.Namespace) -> int:
 
     config = get_config()
     db = await asyncpg.connect(config.database_url)  # type: ignore[arg-type]
-    redis_client = async_redis.from_url(config.redis_url)
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
 
     from hippius_s3.queue import initialize_queue_client
@@ -627,7 +622,6 @@ async def main_async(args: argparse.Namespace) -> int:
                 try:
                     coro = migrate_one(
                         db=task_db,
-                        redis_client=redis_client,
                         object_id=o["object_id"],
                         bucket_id=o["bucket_id"],
                         bucket_name=o["bucket_name"],
@@ -752,14 +746,6 @@ async def main_async(args: argparse.Namespace) -> int:
             with suppress(asyncio.CancelledError):
                 await state_writer_task
         try:
-            # redis.asyncio client exposes aclose(); if unavailable, fall back
-            close = getattr(redis_client, "aclose", None)
-            if callable(close):
-                await close()
-            else:
-                close2 = getattr(redis_client, "close", None)
-                if callable(close2):
-                    close2()
             close_q = getattr(redis_queues_client, "aclose", None)
             if callable(close_q):
                 await close_q()

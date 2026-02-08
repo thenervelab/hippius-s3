@@ -10,7 +10,7 @@ from typing import Any
 import asyncpg
 import redis.asyncio as async_redis
 
-from hippius_s3.cache import RedisObjectPartsCache
+from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.config import get_config
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
@@ -56,13 +56,12 @@ async def main() -> None:
 
     config = get_config()
     db = await asyncpg.connect(config.database_url)
-    redis_client = async_redis.from_url(config.redis_url)
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
 
     from hippius_s3.queue import initialize_queue_client
 
     initialize_queue_client(redis_queues_client)
-    obj_cache = RedisObjectPartsCache(redis_client)
+    fs_store = FileSystemPartsStore(config.object_cache_dir)
 
     try:
         candidates = await fetch_failed_simple_objects(db, args.hours, include_pinning=args.include_pinning)
@@ -87,7 +86,7 @@ async def main() -> None:
                 continue
 
             # Ensure part 0 is still in cache (assume current version = 1 for legacy script)
-            if not await obj_cache.exists(object_id, 1, 1):
+            if not await fs_store.chunk_exists(object_id, 1, 1, 0):
                 skipped_no_cache += 1
                 continue
 
@@ -120,8 +119,6 @@ async def main() -> None:
         )
 
     finally:
-        with contextlib.suppress(Exception):
-            await redis_client.close()
         with contextlib.suppress(Exception):
             await redis_queues_client.close()
         with contextlib.suppress(Exception):

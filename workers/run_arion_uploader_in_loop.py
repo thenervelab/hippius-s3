@@ -8,9 +8,6 @@ from pathlib import Path
 import asyncpg
 from pydantic import ValidationError
 
-from hippius_s3.redis_cache import initialize_cache_client
-
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from opentelemetry import trace
@@ -42,15 +39,12 @@ async def run_arion_uploader_loop():
     from redis.asyncio import Redis
 
     from hippius_s3.queue import initialize_queue_client
-    from hippius_s3.redis_utils import create_redis_client
 
     db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=10)
-    redis_client = create_redis_client(config.redis_url)
     redis_queues_client = Redis.from_url(config.redis_queues_url)
 
     initialize_queue_client(redis_queues_client)
-    initialize_cache_client(redis_client)
-    initialize_metrics_collector(redis_client)
+    initialize_metrics_collector()
 
     arion_client = ArionClient()
 
@@ -59,7 +53,6 @@ async def run_arion_uploader_loop():
 
     uploader = Uploader(
         db_pool,
-        redis_client,
         redis_queues_client,
         config,
         backend_name="arion",

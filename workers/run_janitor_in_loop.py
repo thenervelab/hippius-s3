@@ -208,25 +208,33 @@ async def is_replicated_on_all_backends(
     return result["total_chunks"] == result["replicated_chunks"]
 
 
+def _get_used_ratio(cache_dir: str) -> float:
+    """Return the fraction of disk space currently used (0.0–1.0)."""
+    usage = shutil.disk_usage(cache_dir)
+    return (usage.total - usage.free) / usage.total if usage.total > 0 else 0.0
+
+
 async def cleanup_old_parts_by_mtime(
     db: asyncpg.Connection,
     fs_store: FileSystemPartsStore,
     redis_client: Redis,
 ) -> int:
-    """Clean up old parts from FS based on modification time (backup GC).
+    """Backup-aware two-tier eviction of cached parts.
 
-    This is a safety net to remove orphaned parts that weren't caught by the
-    stale MPU cleanup (e.g., parts without DB entries).
+    Tier 1 (TTL): Delete parts that are fully replicated on all backends
+    and older than fs_cache_gc_max_age_seconds (2 days default).
 
-    Args:
-        fs_store: FileSystemPartsStore instance
-        redis_client: Redis client for DLQ checks
+    Tier 2 (pressure): If disk usage exceeds fs_cache_max_used_ratio (60%),
+    evict replicated parts oldest-first until usage drops below the threshold.
+
+    Un-backed-up parts are NEVER deleted regardless of age or disk pressure.
 
     Returns:
         Number of parts cleaned up
     """
     max_age_seconds = config.fs_cache_gc_max_age_seconds
-    logger.info(f"Scanning for orphaned FS parts older than {max_age_seconds}s")
+    max_used_ratio = config.fs_cache_max_used_ratio
+    logger.info(f"Scanning FS parts (TTL={max_age_seconds}s, max_used_ratio={max_used_ratio})")
 
     dlq_object_ids = await get_all_dlq_object_ids(redis_client)
     if dlq_object_ids:
@@ -239,9 +247,13 @@ async def cleanup_old_parts_by_mtime(
     parts_cleaned = 0
     cutoff_time = time.time() - max_age_seconds
 
+    # Pressure candidates: replicated parts within TTL window, eligible for aggressive eviction
+    pressure_candidates: list[tuple[float, Path, Path, Path, str]] = []  # (mtime, part_dir, version_dir, object_dir, log_label)
+
     # Walk the FS hierarchy: <root>/<object_id>/v<version>/part_<n>/
     oldest_mtime = None
     parts_seen = 0
+    skipped_not_replicated = 0
     for object_dir in root.iterdir():
         if not object_dir.is_dir():
             continue
@@ -278,33 +290,72 @@ async def cleanup_old_parts_by_mtime(
 
                 try:
                     mtime = check_path.stat().st_mtime
-                    if oldest_mtime is None or mtime < oldest_mtime:
-                        oldest_mtime = mtime
+                except Exception:
+                    continue
 
-                    old_enough = mtime < cutoff_time
-                    fully_replicated = await is_replicated_on_all_backends(
-                        db,
-                        object_id,
-                        object_version,
-                        part_number,
+                if oldest_mtime is None or mtime < oldest_mtime:
+                    oldest_mtime = mtime
+
+                fully_replicated = await is_replicated_on_all_backends(
+                    db, object_id, object_version, part_number,
+                )
+
+                if not fully_replicated:
+                    skipped_not_replicated += 1
+                    age_h = (time.time() - mtime) / 3600
+                    logger.debug(
+                        f"Skipping un-backed-up part: {object_id} v{object_version} part={part_number} (age={age_h:.1f}h)"
                     )
+                    continue
 
-                    if old_enough or fully_replicated:
-                        shutil.rmtree(part_dir)
-                        parts_cleaned += 1
-                        age = (time.time() - mtime) / 3600
-                        logger.info(
-                            f"GC cleaned part: {part_dir} {old_enough=} {fully_replicated=} (mtime {age=:.1f}h)"
-                        )
+                # Tier 1: TTL eviction for replicated parts older than max_age
+                if mtime < cutoff_time:
+                    shutil.rmtree(part_dir)
+                    parts_cleaned += 1
+                    age_h = (time.time() - mtime) / 3600
+                    logger.info(
+                        f"GC TTL evicted: {part_dir} (age={age_h:.1f}h, replicated=True)"
+                    )
+                    # Try to prune empty parents
+                    try:
+                        version_dir.rmdir()
+                        object_dir.rmdir()
+                    except OSError:
+                        pass  # Not empty; ignore
+                else:
+                    # Replicated but within TTL — candidate for pressure eviction
+                    pressure_candidates.append((mtime, part_dir, version_dir, object_dir, f"{object_id}/v{object_version}/part_{part_number}"))
 
-                        # Try to prune empty parents
-                        try:
-                            version_dir.rmdir()
-                            object_dir.rmdir()
-                        except OSError:
-                            pass  # Not empty; ignore
-                except Exception as e:
-                    logger.warning(f"Failed to clean part {part_dir}: {e}")
+    # Tier 2: Disk pressure eviction
+    used_ratio = _get_used_ratio(config.object_cache_dir)
+    pressure_evicted = 0
+    if used_ratio > max_used_ratio and pressure_candidates:
+        logger.warning(
+            f"Disk pressure detected: {used_ratio:.1%} used (threshold {max_used_ratio:.0%}), "
+            f"{len(pressure_candidates)} pressure candidates available"
+        )
+        # Sort oldest-first
+        pressure_candidates.sort(key=lambda x: x[0])
+        for mtime, part_dir, version_dir, object_dir, label in pressure_candidates:
+            if _get_used_ratio(config.object_cache_dir) <= max_used_ratio:
+                logger.info(f"Disk pressure relieved at {_get_used_ratio(config.object_cache_dir):.1%} used")
+                break
+            if not part_dir.exists():
+                continue
+            shutil.rmtree(part_dir)
+            parts_cleaned += 1
+            pressure_evicted += 1
+            age_h = (time.time() - mtime) / 3600
+            logger.info(f"GC pressure evicted: {label} (age={age_h:.1f}h)")
+            # Try to prune empty parents
+            try:
+                version_dir.rmdir()
+                object_dir.rmdir()
+            except OSError:
+                pass  # Not empty; ignore
+
+    if pressure_evicted:
+        logger.info(f"Pressure eviction: removed {pressure_evicted} parts, disk now {_get_used_ratio(config.object_cache_dir):.1%} used")
 
     # Record metrics
     try:
@@ -317,7 +368,10 @@ async def cleanup_old_parts_by_mtime(
     except Exception:
         logger.debug("Failed to record FS metrics", exc_info=True)
 
-    logger.info(f"GC cleaned {parts_cleaned=}")
+    logger.info(
+        f"GC complete: cleaned={parts_cleaned} (TTL={parts_cleaned - pressure_evicted}, pressure={pressure_evicted}), "
+        f"skipped_not_replicated={skipped_not_replicated}, disk={_get_used_ratio(config.object_cache_dir):.1%} used"
+    )
     return parts_cleaned
 
 
@@ -343,7 +397,7 @@ async def run_janitor_loop():
 
     # Initialize metrics
     try:
-        initialize_metrics_collector(None)  # type: ignore[arg-type]
+        initialize_metrics_collector()
     except Exception:
         logger.debug("Metrics initialization failed; continuing without metrics", exc_info=True)
 
@@ -351,9 +405,10 @@ async def run_janitor_loop():
     logger.info(f"FS store root: {config.object_cache_dir}")
     logger.info(f"MPU stale threshold: {config.mpu_stale_seconds}s")
     logger.info(f"FS GC max age: {config.fs_cache_gc_max_age_seconds}s")
+    logger.info(f"FS max used ratio: {config.fs_cache_max_used_ratio:.0%}")
 
     # Run immediately on start, then periodically
-    sleep_interval = 600  # 10m
+    sleep_interval = 60  # 1m
 
     try:
         while True:

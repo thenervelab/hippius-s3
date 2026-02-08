@@ -15,7 +15,6 @@ from opentelemetry import trace  # type: ignore[import-not-found]
 
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.cache import FileSystemPartsStore
-from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
@@ -38,12 +37,9 @@ logger = logging.getLogger(__name__)
 
 
 class ObjectWriter:
-    def __init__(self, *, db: Any, redis_client: Any, fs_store: FileSystemPartsStore | None = None) -> None:
+    def __init__(self, *, db: Any, fs_store: FileSystemPartsStore | None = None) -> None:
         self.db = db
-        self.redis_client = redis_client
         self.config = get_config()
-        self.obj_cache = RedisObjectPartsCache(redis_client)
-        # Initialize FS store for write-through (optional for backward compat during rollout)
         self.fs_store = fs_store or FileSystemPartsStore(self.config.object_cache_dir)
 
     async def create_version_for_migration(
@@ -137,8 +133,7 @@ class ObjectWriter:
             upload_id="",
         )
 
-        ttl = self.config.cache_ttl_seconds
-        writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
+        writer = WriteThroughPartsWriter(self.fs_store)
         await writer.write_chunks(object_id, int(object_version), 1, ct_chunks)
         await writer.write_meta(
             object_id,
@@ -200,7 +195,6 @@ class ObjectWriter:
         - Uses server-side keys; seed phrases are not required.
         """
         chunk_size = self.config.object_chunk_size_bytes
-        ttl = self.config.cache_ttl_seconds
 
         resolved_storage_version = int(
             storage_version if storage_version is not None else self.config.target_storage_version
@@ -268,7 +262,7 @@ class ObjectWriter:
 
         hasher = hashlib.md5()
         total_size = 0
-        writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
+        writer = WriteThroughPartsWriter(self.fs_store)
 
         pt_buf = bytearray()
         next_chunk_index = 0
@@ -283,7 +277,6 @@ class ObjectWriter:
         write_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(maxsize=2)
         consumer_error: BaseException | None = None
 
-        # Write-through: FS first (fatal), then Redis (best-effort)
         async def _consumer() -> None:
             nonlocal consumer_error, perf_fs_ms
             while True:
@@ -292,33 +285,17 @@ class ObjectWriter:
                     break
                 chunk_idx, ct = item
                 t_io_start = time.monotonic()
-                fs_coro = self.fs_store.set_chunk(
+                await self.fs_store.set_chunk(
                     object_id,
                     int(object_version),
                     int(part_number),
                     chunk_idx,
                     ct,
                 )
-                redis_coro = self.obj_cache.set_chunk(
-                    object_id,
-                    int(object_version),
-                    int(part_number),
-                    chunk_idx,
-                    ct,
-                    ttl=ttl,
-                )
-                results = await asyncio.gather(fs_coro, redis_coro, return_exceptions=True)
                 t_io_end = time.monotonic()
                 io_ms = (t_io_end - t_io_start) * 1000
-                if isinstance(results[0], BaseException):
-                    consumer_error = results[0]
-                    break
-                if isinstance(results[1], BaseException):
-                    logger.warning(
-                        f"Redis chunk write failed (best-effort) in streaming: object_id={object_id} v={object_version} part={part_number} chunk={chunk_idx}: {results[1]}"
-                    )
                 perf_fs_ms += io_ms
-                logger.debug(f"PERF chunk {chunk_idx}: io={io_ms:.1f}ms (parallel fs+redis) size={len(ct)}")
+                logger.debug(f"PERF chunk {chunk_idx}: io={io_ms:.1f}ms fs size={len(ct)}")
 
         with tracer.start_as_current_span("put_simple_stream_full.encrypt_and_cache") as span:
             consumer_task = asyncio.create_task(_consumer())
@@ -619,8 +596,7 @@ class ObjectWriter:
             upload_id=str(upload_id),
         )
 
-        ttl = self.config.cache_ttl_seconds
-        writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
+        writer = WriteThroughPartsWriter(self.fs_store)
         await writer.write_chunks(str(object_id), int(object_version), int(part_number), ct_chunks)
         await writer.write_meta(
             str(object_id),
@@ -663,7 +639,6 @@ class ObjectWriter:
         max_size_bytes: int | None = None,
     ) -> PartResult:
         chunk_size = self.config.object_chunk_size_bytes
-        ttl = self.config.cache_ttl_seconds
         max_size = int(self.config.max_multipart_part_size)
         if max_size_bytes is not None:
             max_size = int(max_size_bytes)
@@ -699,7 +674,7 @@ class ObjectWriter:
                 main_account_id=account_address, bucket_name=bucket_name
             )
 
-        writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
+        writer = WriteThroughPartsWriter(self.fs_store)
         adapter = CryptoService.get_adapter(suite_id)
 
         hasher = hashlib.md5()
@@ -707,7 +682,6 @@ class ObjectWriter:
         next_chunk_index = 0
         chunk_cipher_sizes: list[int] = []
         pt_buf = bytearray()
-        written_chunk_indices: list[int] = []
         meta_written = False
 
         perf_encrypt_ms = 0.0
@@ -728,23 +702,7 @@ class ObjectWriter:
                     int(object_version),
                     int(part_number),
                 )
-            if written_chunk_indices:
-                try:
-                    keys = [
-                        self.obj_cache.build_chunk_key(str(object_id), int(object_version), int(part_number), int(idx))
-                        for idx in written_chunk_indices
-                    ]
-                    keys.append(self.obj_cache.build_meta_key(str(object_id), int(object_version), int(part_number)))
-                    await self.redis_client.delete(*keys)
-                except Exception:
-                    logger.warning(
-                        "Failed to cleanup partial part in Redis: object_id=%s v=%s part=%s",
-                        object_id,
-                        int(object_version),
-                        int(part_number),
-                    )
 
-        # Write-through: FS first (fatal), then Redis (best-effort)
         async def _consumer() -> None:
             nonlocal consumer_error, perf_fs_ms
             while True:
@@ -753,38 +711,17 @@ class ObjectWriter:
                     break
                 chunk_idx, ct = item
                 t_io_start = time.monotonic()
-                fs_coro = self.fs_store.set_chunk(
+                await self.fs_store.set_chunk(
                     str(object_id),
                     int(object_version),
                     int(part_number),
                     chunk_idx,
                     ct,
                 )
-                redis_coro = self.obj_cache.set_chunk(
-                    str(object_id),
-                    int(object_version),
-                    int(part_number),
-                    chunk_idx,
-                    ct,
-                    ttl=ttl,
-                )
-                results = await asyncio.gather(fs_coro, redis_coro, return_exceptions=True)
                 t_io_end = time.monotonic()
                 io_ms = (t_io_end - t_io_start) * 1000
-                if isinstance(results[0], BaseException):
-                    consumer_error = results[0]
-                    break
-                if isinstance(results[1], BaseException):
-                    logger.warning(
-                        "Redis chunk write failed (best-effort) in mpu stream: object_id=%s v=%s part=%s chunk=%s",
-                        object_id,
-                        int(object_version),
-                        int(part_number),
-                        chunk_idx,
-                    )
-                written_chunk_indices.append(chunk_idx)
                 perf_fs_ms += io_ms
-                logger.debug(f"PERF mpu chunk {chunk_idx}: io={io_ms:.1f}ms (parallel fs+redis) size={len(ct)}")
+                logger.debug(f"PERF mpu chunk {chunk_idx}: io={io_ms:.1f}ms fs size={len(ct)}")
 
         try:
             consumer_task = asyncio.create_task(_consumer())
@@ -1073,34 +1010,6 @@ class ObjectWriter:
                     int(cov),
                     int(next_part),
                 )
-            try:
-                meta_key = self.obj_cache.build_meta_key(str(object_id), int(cov), int(next_part))
-                keys = [meta_key]
-                if num_chunks is not None:
-                    keys.extend(
-                        [
-                            self.obj_cache.build_chunk_key(str(object_id), int(cov), int(next_part), int(i))
-                            for i in range(int(num_chunks))
-                        ]
-                    )
-                    await self.redis_client.delete(*keys)
-                else:
-                    await self.redis_client.delete(*keys)
-                    pattern = f"obj:{object_id}:v:{int(cov)}:part:{int(next_part)}:chunk:*"
-                    cursor = 0
-                    while True:
-                        cursor, found = await self.redis_client.scan(cursor, match=pattern, count=100)
-                        if found:
-                            await self.redis_client.delete(*found)
-                        if cursor == 0:
-                            break
-            except Exception:
-                logging.getLogger(__name__).warning(
-                    "Failed to cleanup append part in Redis: object_id=%s v=%s part=%s",
-                    object_id,
-                    int(cov),
-                    int(next_part),
-                )
 
         try:
             part_res = await self.mpu_upload_part_stream(
@@ -1156,11 +1065,7 @@ class ObjectWriter:
                     )
                     base_md5 = str((locked.get("md5_hash") or "")).strip()
                     if len(base_md5) != 32:
-                        try:
-                            base_bytes = await self.obj_cache.get(object_id, int(cov), 1)
-                            base_md5 = hashlib.md5(base_bytes or b"").hexdigest()
-                        except Exception:
-                            base_md5 = hashlib.md5(b"").hexdigest()
+                        base_md5 = hashlib.md5(b"").hexdigest()
                     md5s = [bytes.fromhex(base_md5)]
                     for p in parts:
                         if int(p.get("part_number") or 0) == int(next_part):

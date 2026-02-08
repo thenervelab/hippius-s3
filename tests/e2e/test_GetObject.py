@@ -5,7 +5,7 @@ import time
 from typing import Any
 from typing import Callable
 
-import redis
+from pathlib import Path
 
 from .conftest import assert_hippius_source
 from .conftest import is_real_aws
@@ -121,14 +121,9 @@ def test_get_object_eventual_consistency(
     object_id, _ = get_object_id_and_version(bucket_name, key)
     object_id, object_version = get_object_id_and_version(bucket_name, key)
 
-    # Verify Redis has cached part chunk meta
-    redis_client = redis.Redis.from_url("redis://localhost:6379/0")
-    # Use versioned cache keys (fetch current_object_version)
-    # object_version already resolved above
-    # Count meta keys via cache helper (no raw key construction)
-    from hippius_s3.cache import RedisObjectPartsCache
-
-    roc = RedisObjectPartsCache(redis_client)
+    # Verify FS cache has part data
+    cache_dir = Path("/var/lib/hippius/object_cache")
+    version_dir = cache_dir / object_id / f"v{object_version}"
     import psycopg  # type: ignore[import-untyped]
 
     with psycopg.connect("postgresql://postgres:postgres@localhost:5432/hippius") as conn, conn.cursor() as cur:
@@ -144,17 +139,17 @@ def test_get_object_eventual_consistency(
         part_numbers = [int(row[0]) for row in cur.fetchall()]
     present = 0
     for pn in part_numbers:
-        meta_key = roc.build_meta_key(object_id, object_version, pn)
-        if redis_client.exists(meta_key):
+        meta_file = version_dir / f"part_{pn}" / "meta.json"
+        if meta_file.exists():
             present += 1
-    assert present >= 2, f"Expected at least 2 cached parts, found {present}"
+    assert present >= 2, f"Expected at least 2 cached parts in FS, found {present}"
 
     # Step 4: Simulate eventual consistency issue - force all CIDs to 'pending'
     # This simulates the state where upload succeeded but background processing hasn't completed
     object_id = make_all_object_parts_pending(bucket_name, key)
 
     # With our cache fallback implementation, GET should now succeed
-    # even when CIDs are pending, by falling back to Redis cache
+    # even when CIDs are pending, by falling back to FS cache
     get_resp = boto3_client.get_object(Bucket=bucket_name, Key=key)
     actual_content = get_resp["Body"].read()
     assert actual_content == expected_content

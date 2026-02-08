@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 
 async def stream_plan(
     *,
-    obj_cache: Any,
     object_id: str,
     object_version: int,
     plan: Iterable[ChunkPlanItem],
@@ -31,6 +30,7 @@ async def stream_plan(
     address: str = "",
     bucket_name: str = "",
     prefetch_chunks: int = 0,
+    fs_store: Any,
 ) -> AsyncGenerator[bytes, None]:
     prefetch = max(0, int(prefetch_chunks))
 
@@ -39,12 +39,12 @@ async def stream_plan(
     if prefetch == 0:
         for item in plan:
             c = await fetch_chunk_blocking(
-                obj_cache,
                 object_id,
                 int(object_version),
                 int(item.part_number),
                 int(item.chunk_index),
                 sleep_seconds=sleep_seconds,
+                fs_store=fs_store,
             )
             pt = await decrypt_chunk_if_needed(
                 c,
@@ -66,15 +66,15 @@ async def stream_plan(
 
     async def _fetch(item: ChunkPlanItem) -> bytes:
         return await fetch_chunk_blocking(
-            obj_cache,
             object_id,
             int(object_version),
             int(item.part_number),
             int(item.chunk_index),
             sleep_seconds=sleep_seconds,
+            fs_store=fs_store,
         )
 
-    # A small lookahead window to overlap Redis fetch with decrypt + response IO.
+    # A small lookahead window to overlap FS fetch with decrypt + response IO.
     pending: deque[tuple[ChunkPlanItem, asyncio.Task[bytes]]] = deque()
 
     def _schedule_one() -> bool:

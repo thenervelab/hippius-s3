@@ -1,13 +1,12 @@
 from __future__ import annotations
 
+import shutil
 import time
+from pathlib import Path
 from typing import Iterable
 from typing import Optional
 
 import psycopg  # type: ignore[import-untyped]
-import redis  # type: ignore[import-untyped]
-
-from hippius_s3.cache import RedisObjectPartsCache
 
 
 def get_object_id_and_version(
@@ -117,34 +116,21 @@ def clear_object_cache(
     object_id: str,
     parts: Iterable[int] | None = None,
     *,
-    redis_url: str = "redis://localhost:6379/0",
+    cache_dir: str = "/var/lib/hippius/object_cache",
     dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
 ) -> None:
-    """Delete chunked obj:{object_id}:part:{n}:chunk:* and meta keys in Redis for the given parts.
+    """Delete FS cache entries for an object's parts.
 
-    If parts is None, queries DB to find actual parts for this object (much faster than scanning 256).
+    If parts is None, removes the entire object directory.
+    Otherwise removes specific part directories for the current version.
     """
-    import psycopg
+    obj_dir = Path(cache_dir) / object_id
+    if not obj_dir.exists():
+        return
 
-    r = redis.Redis.from_url(redis_url)
-
-    # If no parts specified, query DB for actual part numbers to avoid scanning 256 empty parts
     if parts is None:
-        with psycopg.connect(dsn) as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT DISTINCT part_number
-                FROM parts
-                WHERE object_id = %s
-                ORDER BY part_number
-                """,
-                (object_id,),
-            )
-            parts_list = [row[0] for row in cur.fetchall()]
-            # Always include part 1 (the base object part)
-            if 1 not in parts_list:
-                parts_list.insert(0, 1)
-            parts = parts_list
+        shutil.rmtree(obj_dir, ignore_errors=True)
+        return
 
     # Determine current object_version for namespacing
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
@@ -160,30 +146,21 @@ def clear_object_cache(
         row = cur.fetchone()
         object_version = int(row[0]) if row and row[0] is not None else 1
 
-    roc = RedisObjectPartsCache(r)
+    version_dir = obj_dir / f"v{object_version}"
     for pn in parts:
-        # Delete meta first, then all chunk keys (versioned namespace)
-        meta_key = roc.build_meta_key(object_id, int(object_version), int(pn))
-        r.delete(meta_key)
-        # Scan and delete chunk keys using cache key prefix
-        base_key = roc.build_key(object_id, int(object_version), int(pn))
-        for k in r.scan_iter(match=f"{base_key}:chunk:*"):
-            r.delete(k)
-    # Sanity: assert no meta remains for requested parts
-    for pn in parts:
-        meta_key = roc.build_meta_key(object_id, int(object_version), int(pn))
-        assert not r.exists(meta_key), f"Part {pn} cache not cleared"
+        part_dir = version_dir / f"part_{pn}"
+        if part_dir.exists():
+            shutil.rmtree(part_dir, ignore_errors=True)
 
 
 def read_part_from_cache(
     object_id: str,
     part_number: int,
     *,
-    redis_url: str = "redis://localhost:6379/0",
+    cache_dir: str = "/var/lib/hippius/object_cache",
     dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
 ) -> Optional[bytes]:
-    """Assemble part bytes from chunked cache if present; returns None if missing."""
-    r = redis.Redis.from_url(redis_url)
+    """Assemble part bytes from FS cache if present; returns None if missing."""
     # Fetch current object_version
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
         cur.execute(
@@ -198,27 +175,23 @@ def read_part_from_cache(
         row = cur.fetchone()
         object_version = int(row[0]) if row and row[0] is not None else 1
 
-    roc = RedisObjectPartsCache(r)
-    meta_key = roc.build_meta_key(object_id, int(object_version), int(part_number))
-    meta = r.get(meta_key)
-    if not meta:
+    part_dir = Path(cache_dir) / object_id / f"v{object_version}" / f"part_{part_number}"
+    meta_file = part_dir / "meta.json"
+    if not meta_file.exists():
         return None
+
     import json as _json
 
-    try:
-        m = _json.loads(meta)
-    except Exception:
-        return None
-    num_chunks = int(m.get("num_chunks", 0))
+    meta = _json.loads(meta_file.read_text())
+    num_chunks = int(meta.get("num_chunks", 0))
     if num_chunks <= 0:
         return b""
     chunks: list[bytes] = []
     for i in range(num_chunks):
-        chunk_key = roc.build_chunk_key(object_id, int(object_version), int(part_number), i)
-        c = r.get(chunk_key)
-        if not isinstance(c, (bytes, bytearray)):
+        chunk_file = part_dir / f"chunk_{i}.bin"
+        if not chunk_file.exists():
             return None
-        chunks.append(bytes(c))
+        chunks.append(chunk_file.read_bytes())
     return b"".join(chunks)
 
 

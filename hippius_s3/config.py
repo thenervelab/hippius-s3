@@ -222,7 +222,8 @@ class Config:
 
     # Object parts filesystem cache configuration
     object_cache_dir: str = env("HIPPIUS_OBJECT_CACHE_DIR:/var/lib/hippius/object_cache")
-    fs_cache_gc_max_age_seconds: int = env("HIPPIUS_FS_CACHE_GC_MAX_AGE_SECONDS:604800", convert=int)  # 7 days
+    fs_cache_gc_max_age_seconds: int = env("HIPPIUS_FS_CACHE_GC_MAX_AGE_SECONDS:172800", convert=int)  # 2 days
+    fs_cache_max_used_ratio: float = env("HIPPIUS_FS_CACHE_MAX_USED_RATIO:0.60", convert=float)
     mpu_stale_seconds: int = env("HIPPIUS_MPU_STALE_SECONDS:86400", convert=int)  # 1 day
 
     # Filesystem cache disk-pressure backoff (ingress control).

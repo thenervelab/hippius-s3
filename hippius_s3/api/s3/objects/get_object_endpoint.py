@@ -34,7 +34,6 @@ async def handle_get_object(
     object_key: str,
     request: Request,
     db: Any,
-    redis_client: Any,
 ) -> Response:
     """Isolated GET object endpoint handler."""
     # If tagging is in query params, handle object tags request
@@ -307,13 +306,12 @@ async def handle_get_object(
         ) as span:
             response = await read_response(
                 db=db,
-                redis=request.app.state.redis_client,
-                obj_cache=request.app.state.obj_cache,
                 info=info_dict,
                 read_mode=hdr_mode or "auto",
                 rng=v2_rng,
                 address=resolved_address,
                 range_was_invalid=range_was_invalid,
+                fs_store=request.app.state.fs_store,
             )
             set_span_attributes(span, {"http.status_code": int(response.status_code)})
 

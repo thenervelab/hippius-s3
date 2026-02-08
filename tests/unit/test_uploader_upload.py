@@ -56,11 +56,10 @@ class MockRow(dict):
 
 @pytest.mark.asyncio
 async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock_fs_store):
-    redis = FakeRedis()
     redis_queues = FakeRedis()
 
     mock_backend_client = MagicMock()
-    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
+    uploader = Uploader(mock_db_pool, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
     uploader.fs_store = mock_fs_store
 
     mock_upload_response = UploadResponse(
@@ -115,11 +114,10 @@ async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock
 
 @pytest.mark.asyncio
 async def test_upload_stores_backend_identifier_in_chunk_backend(mock_config, mock_db_pool, mock_fs_store):
-    redis = FakeRedis()
     redis_queues = FakeRedis()
 
     mock_backend_client = MagicMock()
-    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
+    uploader = Uploader(mock_db_pool, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
     uploader.fs_store = mock_fs_store
 
     mock_upload_response = UploadResponse(
@@ -182,11 +180,10 @@ async def test_upload_stores_backend_identifier_in_chunk_backend(mock_config, mo
 
 @pytest.mark.asyncio
 async def test_process_upload_skips_deleted_object(mock_config, mock_db_pool):
-    redis = FakeRedis()
     redis_queues = FakeRedis()
 
     mock_backend_client = MagicMock()
-    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
+    uploader = Uploader(mock_db_pool, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
 
     mock_conn = AsyncMock()
     mock_conn.fetchval = AsyncMock(return_value=True)
@@ -218,11 +215,10 @@ async def test_process_upload_skips_deleted_object(mock_config, mock_db_pool):
 
 @pytest.mark.asyncio
 async def test_process_upload_skips_when_object_row_missing(mock_config, mock_db_pool):
-    redis = FakeRedis()
     redis_queues = FakeRedis()
 
     mock_backend_client = MagicMock()
-    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
+    uploader = Uploader(mock_db_pool, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
 
     mock_conn = AsyncMock()
     # Query returns True when the objects row doesn't exist (outer COALESCE defaults to TRUE)
@@ -255,12 +251,11 @@ async def test_process_upload_skips_when_object_row_missing(mock_config, mock_db
 
 @pytest.mark.asyncio
 async def test_process_upload_no_longer_calls_pin_on_api(mock_config, mock_db_pool):
-    redis = FakeRedis()
     redis_queues = FakeRedis()
     mock_config.publish_to_chain = True
 
     mock_backend_client = MagicMock()
-    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
+    uploader = Uploader(mock_db_pool, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
 
     mock_conn = AsyncMock()
     mock_conn.execute = AsyncMock()

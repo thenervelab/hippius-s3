@@ -29,7 +29,6 @@ async def handle_delete_object(
     object_key: str,
     request: Request,
     db: Any,
-    redis_client: Any,
 ) -> Response:
     # Abort multipart upload path is handled in the router before delegating to us
     try:

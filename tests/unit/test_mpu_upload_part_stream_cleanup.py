@@ -39,18 +39,11 @@ async def test_mpu_upload_part_stream_cleans_up_on_oversize(tmp_path, monkeypatc
         async def execute(self, *_args, **_kwargs):
             return None
 
-    class DummyRedis:
-        async def delete(self, *_args, **_kwargs):
-            return 1
-
-        async def setex(self, *_args, **_kwargs):
-            return None
-
     async def body_iter() -> AsyncIterator[bytes]:
         yield b"abcd"
         yield b"ef"
 
-    writer = ObjectWriter(db=DummyDB(), redis_client=DummyRedis(), fs_store=fs_store)
+    writer = ObjectWriter(db=DummyDB(), fs_store=fs_store)
 
     try:
         with pytest.raises(ValueError, match="part_size_exceeds_max"):

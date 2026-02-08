@@ -30,7 +30,6 @@ async def handle_copy_object(
     object_key: str,
     request: Request,
     db: Any,
-    redis_client: Any,
 ) -> Response:
     try:
         source_bucket_name, source_object_key = parse_copy_source(request.headers.get("x-amz-copy-source"))
@@ -66,7 +65,6 @@ async def handle_copy_object(
             logger.info("CopyObject multipart source: forcing streaming fallback")
             return await handle_streaming_copy(
                 db=db,
-                redis_client=redis_client,
                 request=request,
                 source_bucket=source_bucket,
                 dest_bucket=dest_bucket,
@@ -105,7 +103,6 @@ async def handle_copy_object(
         logger.info(f"CopyObject using streaming fallback: {reason}")
         return await handle_streaming_copy(
             db=db,
-            redis_client=redis_client,
             request=request,
             source_bucket=source_bucket,
             dest_bucket=dest_bucket,
