@@ -229,7 +229,7 @@ def test_range_cache_source_when_irrelevant_part_missing(
         from .support.cache import clear_object_cache  # type: ignore[import-not-found]
         from .support.cache import get_object_id  # type: ignore[import-not-found]
     except Exception:
-        pytest.skip("redis test helpers unavailable")
+        pytest.skip("cache test helpers unavailable")
 
     bucket = unique_bucket_name("range-cache-src")
     cleanup_buckets(bucket)
@@ -599,7 +599,7 @@ def test_get_object_range_cache_invalidation_during_request(
         from .support.cache import clear_object_cache  # type: ignore[import-not-found]
         from .support.cache import get_object_id  # type: ignore[import-not-found]
     except Exception:
-        pytest.skip("redis test helpers unavailable")
+        pytest.skip("cache test helpers unavailable")
 
     bucket = unique_bucket_name("range-cache-inval")
     cleanup_buckets(bucket)
