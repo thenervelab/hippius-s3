@@ -129,7 +129,7 @@ def clear_object_cache(
         return
 
     if parts is None:
-        shutil.rmtree(obj_dir, ignore_errors=True)
+        shutil.rmtree(obj_dir)
         return
 
     # Determine current object_version for namespacing
@@ -147,10 +147,12 @@ def clear_object_cache(
         object_version = int(row[0]) if row and row[0] is not None else 1
 
     version_dir = obj_dir / f"v{object_version}"
+    print(f"DEBUG clear_object_cache: object_id={object_id} db_version={object_version} version_dir={version_dir}")
     for pn in parts:
         part_dir = version_dir / f"part_{pn}"
+        print(f"DEBUG clear_object_cache: part_{pn} exists={part_dir.exists()} path={part_dir}")
         if part_dir.exists():
-            shutil.rmtree(part_dir, ignore_errors=True)
+            shutil.rmtree(part_dir)
 
 
 def read_part_from_cache(
