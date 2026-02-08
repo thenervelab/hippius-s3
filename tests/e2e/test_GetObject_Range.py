@@ -58,10 +58,7 @@ def test_range_downloads_only_needed_chunks(
     signed_http_get: Any,
 ) -> None:
     """After clearing cache, a small range should only materialize the in-range chunk(s)."""
-    try:
-        import redis  # type: ignore[import-untyped]
-    except Exception:
-        pytest.skip("redis client unavailable")
+    from pathlib import Path
 
     bucket = unique_bucket_name("range-chunk-only")
     cleanup_buckets(bucket)
@@ -87,22 +84,17 @@ def test_range_downloads_only_needed_chunks(
     assert r.status_code == 206
     assert r.headers.get("x-hippius-source") in {"pipeline", "cache"}
 
-    # Inspect Redis for which chunk keys were created (versioned namespace)
-    rcli = redis.Redis.from_url("redis://localhost:6379/0")
-    # version already fetched above
-    keys = sorted(
-        [
-            k.decode()
-            for k in rcli.scan_iter(match=f"obj:{object_id}:v:{ov}:part:1:chunk:*", count=1000)  # 1-based part number
-        ]
-    )
-    # Expect at minimum chunk:0 exists for the first-range request
+    # Inspect FS cache for which chunk files were created
+    cache_dir = Path("/var/lib/hippius/object_cache")
+    part_dir = cache_dir / object_id / f"v{ov}" / "part_1"
+    chunk_files = sorted(part_dir.glob("chunk_*.bin")) if part_dir.exists() else []
+    chunk_indices = [int(f.stem.split("_")[1]) for f in chunk_files]
+    # Expect at minimum chunk_0 exists for the first-range request
     # (downloader may prefetch additional chunks, but the in-range chunk must be present)
-    expected_chunk = f"obj:{object_id}:v:{ov}:part:1:chunk:0"
-    assert expected_chunk in keys, f"expected chunk {expected_chunk} not found in {keys}"
+    assert 0 in chunk_indices, f"expected chunk_0 not found in {chunk_indices}"
     # Verify minimal hydration: should not have fetched chunks far outside the range
     # (allow adjacent chunks due to prefetch, but not all chunks)
-    assert len(keys) <= 3, f"too many chunks hydrated: {keys}"
+    assert len(chunk_files) <= 3, f"too many chunks hydrated: {chunk_files}"
 
     # Clear cache again and request middle of the second chunk
     clear_object_cache(object_id)
@@ -110,11 +102,11 @@ def test_range_downloads_only_needed_chunks(
     end = start + 128 * 1024 - 1
     r2 = signed_http_get(bucket, key, {"Range": f"bytes={start}-{end}"})
     assert r2.status_code == 206
-    keys2 = sorted([k.decode() for k in rcli.scan_iter(match=f"obj:{object_id}:v:{ov}:part:1:chunk:*", count=1000)])
-    expected_chunk2 = f"obj:{object_id}:v:{ov}:part:1:chunk:1"
-    assert expected_chunk2 in keys2, f"expected chunk {expected_chunk2} not found in {keys2}"
+    chunk_files2 = sorted(part_dir.glob("chunk_*.bin")) if part_dir.exists() else []
+    chunk_indices2 = [int(f.stem.split("_")[1]) for f in chunk_files2]
+    assert 1 in chunk_indices2, f"expected chunk_1 not found in {chunk_indices2}"
     # Verify minimal hydration: should not have fetched all chunks
-    assert len(keys2) <= 3, f"too many chunks hydrated: {keys2}"
+    assert len(chunk_files2) <= 3, f"too many chunks hydrated: {chunk_files2}"
 
 
 def test_get_object_range_invalid(
