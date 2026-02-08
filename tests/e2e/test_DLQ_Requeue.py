@@ -8,7 +8,6 @@ from typing import Callable
 
 import pytest
 
-from .support.cache import clear_object_cache
 from .support.cache import wait_for_parts_cids
 from .support.compose import disable_ipfs_proxy
 from .support.compose import enable_ipfs_proxy
@@ -119,9 +118,7 @@ def test_dlq_requeue_multipart_upload(
 
         # Note: We no longer persist DLQ bytes to a separate filesystem area.
         # The uploader reads chunks from the FS store written during upload, so no dlq-fs checks are needed here.
-
-        # Clear FS cache to simulate cache eviction (may silently fail on CI due to Docker root-owned files)
-        clear_object_cache(object_id, parts=[0, 1])
+        # Do NOT clear FS cache here — the uploader needs the cached chunks to re-upload after requeue.
 
         # Heal IPFS before requeue so uploader can complete successfully
         enable_ipfs_proxy()
