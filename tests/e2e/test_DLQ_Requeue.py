@@ -48,7 +48,7 @@ def test_dlq_requeue_multipart_upload(
     # Get object_id for later use (no need to wait for parts yet)
     from .support.cache import get_object_id_and_version
 
-    object_id, ov = get_object_id_and_version(bucket, key)
+    object_id, _ov = get_object_id_and_version(bucket, key)
 
     # Break IPFS at the docker layer for a deterministic window
     disable_ipfs_proxy()
@@ -120,19 +120,7 @@ def test_dlq_requeue_multipart_upload(
         # Note: We no longer persist DLQ bytes to a separate filesystem area.
         # The uploader reads chunks from the FS store written during upload, so no dlq-fs checks are needed here.
 
-        # Clear FS cache to simulate cache eviction
-        # Log version captured before complete vs current DB version to detect mismatch
-        _, ov_now = get_object_id_and_version(bucket, key)
-        print(f"DEBUG DLQ: ov_before_complete={ov} ov_after_complete={ov_now} object_id={object_id}")
-        from pathlib import Path
-
-        cache_dir = Path("/var/lib/hippius/object_cache") / object_id
-        if cache_dir.exists():
-            import os
-
-            for root, dirs, files in os.walk(cache_dir):
-                for f in files:
-                    print(f"DEBUG DLQ cache tree: {os.path.join(root, f)}")
+        # Clear FS cache to simulate cache eviction (may silently fail on CI due to Docker root-owned files)
         clear_object_cache(object_id, parts=[0, 1])
 
         # Heal IPFS before requeue so uploader can complete successfully
