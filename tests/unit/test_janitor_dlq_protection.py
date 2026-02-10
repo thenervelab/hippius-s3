@@ -25,7 +25,8 @@ from run_janitor_in_loop import get_all_dlq_object_ids  # noqa: E402
 def mock_config():
     config = MagicMock()
     config.mpu_stale_seconds = 86400  # 1 day
-    config.fs_cache_gc_max_age_seconds = 604800  # 7 days
+    config.fs_cache_gc_max_age_seconds = 172800  # 2 days
+    config.fs_cache_max_used_ratio = 0.60
     config.object_cache_dir = "/tmp/test_janitor_cache"
     return config
 
@@ -255,7 +256,9 @@ class TestJanitorDlqProtection:
         part_dir.__truediv__ = lambda self, x: meta_file
 
         # Run cleanup
-        with patch("run_janitor_in_loop.config", mock_config):
+        mock_disk_usage = MagicMock(return_value=MagicMock(total=100, free=80, used=20))
+        with patch("run_janitor_in_loop.config", mock_config), \
+             patch("run_janitor_in_loop.shutil.disk_usage", mock_disk_usage):
             result = await cleanup_old_parts_by_mtime(mock_db, mock_fs_store, redis_with_dlq)
 
         # Should be 0 because object is protected

@@ -11,7 +11,6 @@ from fastapi import Response
 from lxml import etree as ET
 
 from hippius_s3.api.s3 import errors
-from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import Config
 from hippius_s3.repositories.buckets import BucketRepository
 from hippius_s3.repositories.objects import ObjectRepository
@@ -187,7 +186,6 @@ def build_copy_success_response(etag: str, last_modified: datetime) -> Response:
 
 async def handle_streaming_copy(
     db: Any,
-    redis_client: Any,
     request: Request,
     source_bucket: dict,
     dest_bucket: dict,
@@ -203,7 +201,6 @@ async def handle_streaming_copy(
     metadata = parse_object_metadata(src_obj_row.get("metadata"))
     src_multipart = is_multipart_object(src_obj_row)
 
-    obj_cache = RedisObjectPartsCache(redis_client)
     storage_version = require_supported_storage_version(int(src_obj_row.get("storage_version")))
 
     src_object_id = str(src_obj_row.get("object_id"))
@@ -212,8 +209,6 @@ async def handle_streaming_copy(
 
     chunks_iter = await stream_object(
         db,
-        redis_client,
-        obj_cache,
         {
             "object_id": src_object_id,
             "bucket_id": str(src_obj_row.get("bucket_id") or source_bucket["bucket_id"]),
@@ -233,10 +228,11 @@ async def handle_streaming_copy(
         },
         rng=None,
         address=request.state.account.main_account,
+        fs_store=request.app.state.fs_store,
     )
 
     content_type = str(source_object["content_type"])
-    ow = ObjectWriter(db=db, redis_client=redis_client, fs_store=request.app.state.fs_store)
+    ow = ObjectWriter(db=db, fs_store=request.app.state.fs_store)
     put_res = await ow.put_simple_stream_full(
         bucket_id=str(dest_bucket["bucket_id"]),
         bucket_name=dest_bucket["bucket_name"],

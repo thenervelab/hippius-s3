@@ -3,12 +3,6 @@ from typing import Any
 
 import pytest
 
-
-try:
-    import redis  # type: ignore[import-untyped]
-except Exception:  # pragma: no cover - allow skipping if unavailable
-    redis = None  # type: ignore[assignment]
-
 from .support.cache import clear_object_cache
 from .support.cache import wait_for_all_backends_ready
 
@@ -31,9 +25,6 @@ def test_get_partial_cache_fallbacks(
     cleanup_buckets: Any,
     signed_http_get: Any,
 ) -> None:
-    if redis is None:
-        pytest.skip("redis python client not available in test environment")
-
     bucket = unique_bucket_name("partial-cache")
     boto3_client.create_bucket(Bucket=bucket)
     cleanup_buckets(bucket)
@@ -74,18 +65,13 @@ def test_get_partial_cache_fallbacks(
     object_id, ov = get_object_id_and_version(bucket, key)
     clear_object_cache(object_id, parts=[1])
 
-    # Diagnostic: verify chunked cache presence before first GET
-    try:
-        import redis as _redis  # type: ignore[import-untyped]
+    # Diagnostic: verify FS cache presence before first GET
+    from pathlib import Path
 
-        r = _redis.Redis.from_url("redis://localhost:6379/0")
-        # Fetch current_object_version for versioned cache keys
-        # version already fetched above
-        has1 = bool(r.exists(f"obj:{object_id}:v:{ov}:part:1:meta"))
-        has2 = bool(r.exists(f"obj:{object_id}:v:{ov}:part:2:meta"))
-        print(f"DEBUG cache before GET: object_id={object_id} part1meta={has1} part2meta={has2}")
-    except Exception as _e:  # pragma: no cover
-        print(f"DEBUG cache probe failed: {_e}")
+    cache_dir = Path("/var/lib/hippius/object_cache")
+    has1 = (cache_dir / object_id / f"v{ov}" / "part_1" / "meta.json").exists()
+    has2 = (cache_dir / object_id / f"v{ov}" / "part_2" / "meta.json").exists()
+    print(f"DEBUG cache before GET: object_id={object_id} part1meta={has1} part2meta={has2}")
 
     # GET auto: should succeed and return full content
     expected = base + delta

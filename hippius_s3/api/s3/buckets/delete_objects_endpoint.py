@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 config = get_config()
 
 
-async def handle_delete_objects(bucket_name: str, request: Request, db: Any, redis_client: Any) -> Response:
+async def handle_delete_objects(bucket_name: str, request: Request, db: Any) -> Response:
     """Implements S3 DeleteObjects: POST /{bucket}?delete
 
     - Accepts XML body with up to 1000 <Object><Key>...</Key></Object> entries

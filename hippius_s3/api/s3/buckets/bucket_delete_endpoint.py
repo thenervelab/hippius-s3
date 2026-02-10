@@ -7,7 +7,6 @@ from fastapi import Request
 from fastapi import Response
 
 from hippius_s3.api.s3 import errors
-from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import enqueue_unpin_request
@@ -18,7 +17,7 @@ logger = logging.getLogger(__name__)
 config = get_config()
 
 
-async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redis_client: Any) -> Response:
+async def handle_delete_bucket(bucket_name: str, request: Request, db: Any) -> Response:
     """
     Delete a bucket using S3 protocol (DELETE /{bucket_name}).
     Also handles removing bucket tags (DELETE /{bucket_name}?tagging).
@@ -133,16 +132,6 @@ async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redi
                 )
             except Exception:
                 logger.debug("Failed to enqueue unpin for object during bucket delete", exc_info=True)
-
-        # Clean up cache keys under versioned obj namespace (best effort)
-        try:
-            roc = RedisObjectPartsCache(redis_client)
-            for obj in objects:
-                # probe a small set of parts to expire keys
-                for pn in range(0, 4):
-                    await roc.expire(str(obj["object_id"]), int(obj.get("current_object_version") or 1), pn, ttl=1)
-        except Exception:
-            logger.debug("Failed to expire object part cache during bucket delete", exc_info=True)
 
         return Response(status_code=204)
 

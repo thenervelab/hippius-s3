@@ -163,14 +163,12 @@ async def handle_head_object(
         # Source hint: cache vs pipeline
         with tracer.start_as_current_span("head_object.check_cache_status") as span:
             source = "pipeline"
-            try:
-                obj_id_str = str(row["object_id"])
-                oc = request.app.state.obj_cache
-                has1 = await oc.exists(obj_id_str, 1)
-                source = "cache" if has1 else "pipeline"
-                headers["x-hippius-source"] = source
-            except Exception:
-                headers["x-hippius-source"] = "pipeline"
+            obj_id_str = str(row["object_id"])
+            obj_version = int(row.get("object_version") or 1)
+            fs_store = request.app.state.fs_store
+            has1 = await fs_store.chunk_exists(obj_id_str, obj_version, 1, 0)
+            source = "cache" if has1 else "pipeline"
+            headers["x-hippius-source"] = source
             set_span_attributes(span, {"source": source})
 
         # Add x-amz-version-id header

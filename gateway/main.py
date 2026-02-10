@@ -47,8 +47,6 @@ def factory() -> FastAPI:
 
     @app.on_event("startup")
     async def startup() -> None:
-        from hippius_s3.redis_utils import create_redis_client
-
         logger.info("Starting Hippius S3 Gateway...")
 
         app.state.postgres_pool = await asyncpg.create_pool(
@@ -61,9 +59,6 @@ def factory() -> FastAPI:
             timeout=10,
         )
         logger.info(f"PostgreSQL pool created: min={config.db_pool_min_size}, max={config.db_pool_max_size}")
-
-        app.state.redis_client = create_redis_client(config.redis_url)
-        logger.info("Connected to Redis")
 
         from redis.asyncio import Redis
 
@@ -79,7 +74,7 @@ def factory() -> FastAPI:
         app.state.redis_acl = Redis.from_url(config.redis_acl_url, decode_responses=True)
         logger.info("Connected to Redis (ACL cache)")
 
-        app.state.metrics_collector = MetricsCollector(app.state.redis_client)
+        app.state.metrics_collector = MetricsCollector()
         set_metrics_collector(app.state.metrics_collector)
         logger.info("Metrics collector initialized")
         logger.info("Tracing and metrics handled by opentelemetry-instrument wrapper")
@@ -112,7 +107,6 @@ def factory() -> FastAPI:
 
         app.state.docs_proxy_service = DocsProxyService(
             backend_url=config.backend_url,
-            redis_client=app.state.redis_client,  # type: ignore[arg-type]
             cache_ttl=config.docs_cache_ttl_seconds,
         )
         logger.info("DocsProxyService initialized")
@@ -141,10 +135,6 @@ def factory() -> FastAPI:
         if hasattr(app.state, "postgres_pool"):
             await app.state.postgres_pool.close()
             logger.info("PostgreSQL pool closed")
-
-        if hasattr(app.state, "redis_client"):
-            await app.state.redis_client.close()
-            logger.info("Redis client closed")
 
         if hasattr(app.state, "redis_accounts"):
             await app.state.redis_accounts.close()

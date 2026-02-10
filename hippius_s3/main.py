@@ -30,8 +30,6 @@ from hippius_s3.api.s3.public_router import router as public_router
 from hippius_s3.api.s3.router import router as s3_router_new
 from hippius_s3.api.user import router as user_router
 from hippius_s3.cache import FileSystemPartsStore
-from hippius_s3.cache import RedisDownloadChunksCache
-from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import Config
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
@@ -100,11 +98,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.postgres_pool = await postgres_create_pool(config.database_url, config)
         logger.info(f"Postgres connection pool created: min={config.db_pool_min_size}, max={config.db_pool_max_size}")
 
-        from hippius_s3.redis_utils import create_redis_client
-
-        app.state.redis_client = create_redis_client(config.redis_url)
-        logger.info("Redis client initialized")
-
         app.state.redis_accounts_client = async_redis.from_url(config.redis_accounts_url)
         logger.info("Redis accounts client initialized")
 
@@ -118,7 +111,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("Redis queues client initialized")
 
         from hippius_s3.queue import initialize_queue_client
-        from hippius_s3.redis_cache import initialize_cache_client
         from hippius_s3.redis_chain import initialize_chain_client
 
         initialize_queue_client(app.state.redis_queues_client)
@@ -127,21 +119,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         initialize_chain_client(app.state.redis_chain_client)
         logger.info("Chain Redis client initialized")
 
-        initialize_cache_client(app.state.redis_client)
-        logger.info("Cache Redis client initialized")
-
         # IPFS service not needed in API container; workers own IPFS interactions
 
-        # Cache repositories
-        app.state.obj_cache = RedisObjectPartsCache(app.state.redis_client)
-        app.state.dl_cache = RedisDownloadChunksCache(app.state.redis_client)
+        # FS-based cache store
         app.state.fs_store = FileSystemPartsStore(config.object_cache_dir)
-        logger.info("Cache repositories initialized")
+        logger.info("FS store initialized")
 
         from hippius_s3.monitoring import MetricsCollector
         from hippius_s3.monitoring import set_metrics_collector
 
-        app.state.metrics_collector = MetricsCollector(app.state.redis_client)
+        app.state.metrics_collector = MetricsCollector()
         set_metrics_collector(app.state.metrics_collector)
 
         logger.info("Metrics collector initialized")
@@ -150,7 +137,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Start background metrics collection
         app.state.background_metrics_collector = BackgroundMetricsCollector(
             app.state.metrics_collector,
-            app.state.redis_client,
             app.state.redis_accounts_client,
             app.state.redis_chain_client,
             app.state.redis_rate_limiting_client,
@@ -185,12 +171,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 logger.info("Background metrics collection stopped")
         except Exception:
             logger.exception("Error shutting down background metrics collector")
-
-        try:
-            await app.state.redis_client.close()
-            logger.info("Redis client closed")
-        except Exception:
-            logger.exception("Error shutting down Redis client")
 
         try:
             await app.state.redis_accounts_client.close()

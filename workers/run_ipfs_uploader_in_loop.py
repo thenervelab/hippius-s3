@@ -41,15 +41,12 @@ BACKEND_NAME = "ipfs"
 
 async def run_ipfs_uploader_loop():
     db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=10)
-    redis_client = async_redis.from_url(config.redis_url)
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
 
     from hippius_s3.queue import initialize_queue_client
-    from hippius_s3.redis_cache import initialize_cache_client
 
     initialize_queue_client(redis_queues_client)
-    initialize_cache_client(redis_client)
-    initialize_metrics_collector(redis_client)
+    initialize_metrics_collector()
 
     api_client = HippiusApiClient()
 
@@ -58,7 +55,6 @@ async def run_ipfs_uploader_loop():
 
     uploader = Uploader(
         db_pool,
-        redis_client,
         redis_queues_client,
         config,
         backend_name=BACKEND_NAME,

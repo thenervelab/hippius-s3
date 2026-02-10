@@ -23,7 +23,6 @@ from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import dequeue_unpin_request
 from hippius_s3.queue import enqueue_unpin_retry_request
 from hippius_s3.queue import move_due_unpin_retries
-from hippius_s3.redis_utils import create_redis_client
 from hippius_s3.redis_utils import with_redis_retry
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 from hippius_s3.services.ray_id_service import ray_id_context
@@ -193,7 +192,6 @@ async def run_unpinner_loop(
     """Main loop for a per-backend unpinner worker."""
     config = get_config()
 
-    redis_client = create_redis_client(config.redis_url)
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
     db_pool = await asyncpg.create_pool(
         dsn=config.database_url,
@@ -202,11 +200,9 @@ async def run_unpinner_loop(
     )
 
     from hippius_s3.queue import initialize_queue_client
-    from hippius_s3.redis_cache import initialize_cache_client
 
     initialize_queue_client(redis_queues_client)
-    initialize_cache_client(redis_client)
-    initialize_metrics_collector(redis_client)
+    initialize_metrics_collector()
 
     dlq_manager = UnpinDLQManager(redis_queues_client)
 

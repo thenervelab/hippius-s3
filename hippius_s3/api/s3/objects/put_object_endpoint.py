@@ -31,7 +31,6 @@ async def handle_put_object(
     object_key: str,
     request: Request,
     db: Any,
-    redis_client: Any,
 ) -> Response:
     try:
         # Get or create user and bucket for this main account
@@ -70,7 +69,7 @@ async def handle_put_object(
             return await handle_append(
                 request,
                 db,
-                redis_client,
+                request.app.state.redis_queues_client,
                 bucket=bucket,
                 bucket_id=bucket_id,
                 bucket_name=bucket_name,
@@ -127,7 +126,7 @@ async def handle_put_object(
                 "storage_version": config.target_storage_version,
             },
         ) as span:
-            writer = ObjectWriter(db=db, redis_client=redis_client, fs_store=request.app.state.fs_store)
+            writer = ObjectWriter(db=db, fs_store=request.app.state.fs_store)
 
             put_res = await writer.put_simple_stream_full(
                 bucket_id=bucket_id,

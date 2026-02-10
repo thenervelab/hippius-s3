@@ -145,7 +145,9 @@ class FileSystemPartsStore:
 
             def _read_chunk() -> bytes:
                 with chunk_path.open("rb") as f:
-                    return f.read()
+                    data = f.read()
+                os.utime(chunk_path)
+                return data
 
             data = await asyncio.to_thread(_read_chunk)
             logger.debug(

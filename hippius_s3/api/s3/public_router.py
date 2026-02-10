@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from fastapi import APIRouter
 from fastapi import Depends
@@ -25,7 +24,6 @@ async def get_public_object(
     object_key: str,
     request: Request,
     db: dependencies.DBConnection = Depends(dependencies.get_postgres),
-    redis_client: Any = Depends(dependencies.get_redis),
 ) -> Response:
     """Anonymous GET object endpoint for public buckets."""
     # Whitelist: only allow GET with no special query parameters
@@ -37,7 +35,7 @@ async def get_public_object(
             status_code=403,
         )
     # Call the regular get_object handler with anonymous account
-    response = await handle_get_object(bucket_name, object_key, request, db, redis_client)
+    response = await handle_get_object(bucket_name, object_key, request, db)
 
     # Add anonymous access header
     response.headers["x-hippius-access-mode"] = "anon"
