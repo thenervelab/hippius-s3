@@ -31,6 +31,7 @@ from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import PartToDownload
+from hippius_s3.redis_utils import create_redis_client
 from hippius_s3.utils import get_query
 from hippius_s3.utils.timing import log_timing
 
@@ -215,7 +216,7 @@ async def run_downloader_loop(
 
     config = get_config()
 
-    redis_client = async_redis.from_url(config.redis_url)
+    redis_client: async_redis.Redis = create_redis_client(config.redis_url)  # type: ignore[assignment]
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
     db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=20)
 
@@ -267,7 +268,7 @@ async def run_downloader_loop(
                         backend_name=backend_name,
                         fetch_fn=fetch_fn,
                         db_pool=db_pool,
-                        redis_client=redis_client,
+                        redis_client=redis_client,  # type: ignore
                     )
                     if ok:
                         worker_logger.info(f"[{backend_name}] Done: {request.bucket_name}/{request.object_key}")
@@ -279,8 +280,8 @@ async def run_downloader_loop(
                     job_span.set_status(trace.StatusCode.ERROR, str(exc))
                     logger.warning(f"[{backend_name}] Redis issue during processing: {exc}. Reconnecting…")
                     with contextlib.suppress(Exception):
-                        await redis_client.aclose()  # type: ignore[attr-defined]
-                    redis_client = async_redis.from_url(config.redis_url)
+                        await redis_client.aclose()  # type: ignore[union-attr,attr-defined]
+                    redis_client = create_redis_client(config.redis_url)  # type: ignore[assignment]
                     initialize_cache_client(redis_client)
                 except asyncpg.InterfaceError as exc:
                     job_span.record_exception(exc)
@@ -296,6 +297,6 @@ async def run_downloader_loop(
         logger.error(f"[{backend_name}] Fatal loop error: {exc}", exc_info=True)
         raise
     finally:
-        await redis_client.aclose()  # type: ignore[attr-defined]
+        await redis_client.aclose()  # type: ignore[union-attr,attr-defined]
         await redis_queues_client.aclose()  # type: ignore[attr-defined]
         await db_pool.close()
