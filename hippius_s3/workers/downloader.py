@@ -82,7 +82,13 @@ async def process_download_request(
         base_sleep = config.downloader_retry_base_seconds
         jitter = config.downloader_retry_jitter_seconds
 
+        t_request_start = time.perf_counter()
+        ttfb_recorded = False
+        ttfb_ms = 0.0
+        total_bytes_downloaded = 0
+
         async def _process_part(part: PartToDownload) -> bool:
+            nonlocal ttfb_recorded, ttfb_ms, total_bytes_downloaded
             part_number = int(part.part_number)
             with tracer.start_as_current_span(
                 "downloader.download_part",
@@ -130,8 +136,14 @@ async def process_download_request(
                             try:
                                 t0 = time.perf_counter()
                                 data = await fetch_fn(identifier, download_request.subaccount)
-                                elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                                fetch_ms = (time.perf_counter() - t0) * 1000.0
 
+                                if not ttfb_recorded:
+                                    ttfb_ms = (time.perf_counter() - t_request_start) * 1000.0
+                                    ttfb_recorded = True
+                                total_bytes_downloaded += len(data)
+
+                                t_cache = time.perf_counter()
                                 await obj_cache.set_chunk(
                                     download_request.object_id,
                                     int(download_request.object_version),
@@ -139,18 +151,20 @@ async def process_download_request(
                                     chunk_index,
                                     data,
                                 )
+                                cache_ms = (time.perf_counter() - t_cache) * 1000.0
 
-                                with contextlib.suppress(Exception):
-                                    head8 = data[:8].hex() if data else ""
-                                    logger.info(
-                                        f"[{backend_name}] STORED part={part_number} "
-                                        f"ci={chunk_index} id={identifier[:16]}… "
-                                        f"len={len(data)} head8={head8}"
-                                    )
+                                chunk_mb = len(data) / (1024 * 1024)
+                                chunk_throughput = chunk_mb / (fetch_ms / 1000.0) if fetch_ms > 0 else 0
+                                logger.info(
+                                    f"[{backend_name}] CHUNK object_id={download_request.object_id} "
+                                    f"part={part_number} ci={chunk_index} id={identifier} "
+                                    f"fetch={fetch_ms:.0f}ms cache={cache_ms:.0f}ms "
+                                    f"size={chunk_mb:.1f}MB throughput={chunk_throughput:.1f}MB/s"
+                                )
 
                                 log_timing(
                                     "downloader.chunk_download_and_store",
-                                    elapsed_ms,
+                                    fetch_ms + cache_ms,
                                     extra={
                                         "backend": backend_name,
                                         "object_id": download_request.object_id,
@@ -187,8 +201,16 @@ async def process_download_request(
             total = len(download_request.chunks)
             span.set_attribute("result.success_count", success_count)
             span.set_attribute("result.total_parts", total)
+            total_ms = (time.perf_counter() - t_request_start) * 1000.0
+            size_mb = total_bytes_downloaded / (1024 * 1024)
+            throughput = size_mb / (total_ms / 1000.0) if total_ms > 0 else 0
+            logger.info(
+                f"[{backend_name}] PERF download {short_id} "
+                f"total={total_ms:.0f}ms ttfb={ttfb_ms:.0f}ms "
+                f"size={size_mb:.1f}MB throughput={throughput:.1f}MB/s "
+                f"parts={success_count}/{total}"
+            )
             if success_count == total:
-                logger.info(f"[{backend_name}] All {total} parts OK for {short_id}")
                 return True
             logger.error(f"[{backend_name}] {success_count}/{total} parts OK for {short_id}")
             return False
