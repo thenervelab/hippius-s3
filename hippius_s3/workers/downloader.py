@@ -249,7 +249,9 @@ async def run_downloader_loop(
     initialize_queue_client(redis_queues_client)
     initialize_cache_client(redis_client)
 
-    logger.info(f"[{backend_name}] Starting downloader, queue={queue_name}")
+    if backend_name == "arion":
+        backend_info = f" base_url={config.arion_base_url} verify_ssl={config.arion_verify_ssl}"
+        logger.info(f"[{backend_name}] Starting downloader, queue={queue_name}{backend_info}")
 
     try:
         while True:
