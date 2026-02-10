@@ -61,9 +61,7 @@ async def get_all_dlq_object_ids(redis_client: Redis) -> set[str]:
     return object_ids
 
 
-async def cleanup_stale_parts(
-    db: asyncpg.Connection, fs_store: FileSystemPartsStore, redis_client: Redis
-) -> int:
+async def cleanup_stale_parts(db: asyncpg.Connection, fs_store: FileSystemPartsStore, redis_client: Redis) -> int:
     """Conservative cleanup of stale parts: rely on FS mtime only for now.
 
     Rationale: DB schemas for tracking MPU progress vary across deployments.
@@ -198,7 +196,10 @@ async def is_replicated_on_all_backends(
 
     result = await db.fetchrow(
         get_query("count_chunk_backends"),
-        object_id, object_version, part_number, expected,
+        object_id,
+        object_version,
+        part_number,
+        expected,
     )
     if not result or result["total_chunks"] == 0:
         return False
