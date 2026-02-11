@@ -246,6 +246,7 @@ class ArionClient:
                 connect=10.0,
             ),
             follow_redirects=True,
+            verify=self._config.arion_verify_ssl,
         )
 
     async def __aenter__(self) -> "ArionClient":

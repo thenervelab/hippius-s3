@@ -21,6 +21,7 @@ from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.queue import dequeue_upload_request
 from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.queue import move_due_upload_retries
+from hippius_s3.redis_utils import create_redis_client
 from hippius_s3.redis_utils import with_redis_retry
 from hippius_s3.services.hippius_api_service import HippiusApiClient
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
@@ -41,7 +42,7 @@ BACKEND_NAME = "ipfs"
 
 async def run_ipfs_uploader_loop():
     db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=10)
-    redis_client = async_redis.from_url(config.redis_url)
+    redis_client = create_redis_client(config.redis_url)
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
 
     from hippius_s3.queue import initialize_queue_client
