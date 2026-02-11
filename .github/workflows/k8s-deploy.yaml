@@ -168,6 +168,16 @@ jobs:
             --namespace=hippius-s3-staging \
             --dry-run=client -o yaml | kubectl apply -f -
 
+      - name: Create postgres superuser secret
+        run: |
+          kubectl create secret generic postgres-superuser \
+            --from-literal=username=postgres \
+            --from-literal=password='${{ secrets.DATABASE_PASSWORD }}' \
+            --namespace=hippius-s3-staging \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl label secret postgres-superuser cnpg.io/reload=true \
+            --namespace=hippius-s3-staging --overwrite
+
       - name: Create postgres backup credentials
         run: |
           kubectl create secret generic postgres-backup-creds \
@@ -276,6 +286,16 @@ jobs:
             --from-literal=HIPPIUS_DELETE_BACKENDS="${{ secrets.HIPPIUS_DELETE_BACKENDS }}" \
             --namespace=hippius-s3-prod \
             --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Create postgres superuser secret
+        run: |
+          kubectl create secret generic postgres-superuser \
+            --from-literal=username=postgres \
+            --from-literal=password='${{ secrets.DATABASE_PASSWORD }}' \
+            --namespace=hippius-s3-prod \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl label secret postgres-superuser cnpg.io/reload=true \
+            --namespace=hippius-s3-prod --overwrite
 
       - name: Create postgres backup credentials
         run: |
