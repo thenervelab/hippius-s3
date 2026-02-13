@@ -217,7 +217,7 @@ async def run_unpinner_loop(
         while True:
             await move_due_unpin_retries(backend_name=backend_name)
 
-            unpin_request, redis_queues_client = await with_redis_retry(  # type: ignore[assignment]
+            unpin_request, redis_queues_client = await with_redis_retry(
                 lambda rc: dequeue_unpin_request(queue_name),
                 redis_queues_client,
                 config.redis_queues_url,

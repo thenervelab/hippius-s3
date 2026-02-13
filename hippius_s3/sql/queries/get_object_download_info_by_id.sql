@@ -36,26 +36,13 @@ SELECT
     NOT oi.is_public as needs_decryption,
     CASE
         WHEN oi.multipart = FALSE THEN
-            CASE
-                WHEN oi.storage_version >= 4 THEN
-                    JSON_BUILD_ARRAY(
-                        JSON_BUILD_OBJECT(
-                            'part_number', 1,
-                            'cid', NULL,
-                            'size_bytes', NULL
-                        )
-                    )
-                WHEN oi.simple_cid IS NULL THEN
-                    '[]'::json
-                ELSE
-                    JSON_BUILD_ARRAY(
-                        JSON_BUILD_OBJECT(
-                            'part_number', 1,
-                            'cid', oi.simple_cid,
-                            'size_bytes', NULL
-                        )
-                    )
-            END
+            JSON_BUILD_ARRAY(
+                JSON_BUILD_OBJECT(
+                    'part_number', 1,
+                    'cid', NULL,
+                    'size_bytes', NULL
+                )
+            )
         ELSE
             COALESCE(
                 (SELECT JSON_AGG(

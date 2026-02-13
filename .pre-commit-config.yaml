@@ -28,30 +28,20 @@ repos:
       - id: check-toml
         stages: [pre-commit]
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.10.0
+  - repo: local
     hooks:
-      - id: mypy
-        name: mypy (src)
+      - id: ty
+        name: ty (type check)
+        entry: ty check hippius_s3
+        language: system
         stages: [pre-commit]
         pass_filenames: false
-        additional_dependencies:
-          - click
-          - fastapi
-          - rich
-          - starlette
-          - python-dotenv
-          - pyinstrument
-          - pytest
-          - pydantic
-          - pydantic-core
-          - types-redis
-          - types-requests
-          - types-boto3
-          - types-botocore
-          - httpx
-        args:
-          - --config-file=pyproject.toml
-          - --show-error-codes
-          - --pretty
-          - hippius_s3
+        types: [python]
+
+      - id: pip-audit
+        name: pip-audit (dependency scan)
+        entry: pip-audit
+        language: system
+        stages: [pre-commit]
+        pass_filenames: false
+        always_run: true

@@ -31,7 +31,7 @@ import uuid
 from typing import TYPE_CHECKING
 from typing import Optional
 
-import asyncpg  # type: ignore[import-untyped]
+import asyncpg
 
 from hippius_s3.config import get_config
 
@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 KEK_SIZE_BYTES = 32
 
-_POOL: asyncpg.Pool | None = None  # type: ignore[name-defined]
+_POOL: asyncpg.Pool | None = None
 _POOL_DSN: str | None = None
 _POOL_LOCK = asyncio.Lock()
 
@@ -53,7 +53,7 @@ _KEK_CACHE_LOCK = asyncio.Lock()
 
 # KMS client singleton. In "required" mode, set at startup via init_kms_client().
 # In "disabled" mode, always None.
-_KMS_CLIENT: "OVHKMSClient | None" = None  # type: ignore[name-defined]
+_KMS_CLIENT: "OVHKMSClient | None" = None
 _KMS_CLIENT_LOCK = asyncio.Lock()
 
 # Table initialization tracking
@@ -61,7 +61,7 @@ _TABLES_ENSURED = False
 _TABLES_LOCK = asyncio.Lock()
 
 
-async def _get_pool(dsn: str) -> asyncpg.Pool:  # type: ignore[name-defined]
+async def _get_pool(dsn: str) -> asyncpg.Pool:
     global _POOL, _POOL_DSN
     if _POOL is not None and dsn == _POOL_DSN:
         return _POOL
@@ -70,7 +70,7 @@ async def _get_pool(dsn: str) -> asyncpg.Pool:  # type: ignore[name-defined]
             return _POOL
         cfg = get_config()
         _POOL = await asyncpg.create_pool(
-            dsn,  # type: ignore[arg-type]
+            dsn,
             min_size=int(cfg.kek_db_pool_min_size),
             max_size=int(cfg.kek_db_pool_max_size),
         )
@@ -128,7 +128,7 @@ async def init_kms_client(config: "Config | None" = None) -> None:
             raise RuntimeError(f"KMS client creation failed: {e}") from e
 
 
-def _get_kms_client() -> "OVHKMSClient | None":  # type: ignore[name-defined]
+def _get_kms_client() -> "OVHKMSClient | None":
     """Get KMS client singleton.
 
     In "required" mode: Returns the client (must have been initialized via init_kms_client()).
@@ -303,7 +303,7 @@ async def _set_cached_kek(bucket_id: str, kek_id: uuid.UUID, kek_bytes: bytes) -
         _KEK_CACHE[key] = (bytes(kek_bytes), expires_at)
 
 
-async def _ensure_tables(conn: asyncpg.Connection) -> None:  # type: ignore[name-defined]
+async def _ensure_tables(conn: asyncpg.Connection) -> None:
     """Create bucket_keks table.
 
     Schema:
@@ -329,7 +329,7 @@ async def _ensure_tables(conn: asyncpg.Connection) -> None:  # type: ignore[name
     )
 
 
-async def _maybe_ensure_tables(conn: asyncpg.Connection) -> None:  # type: ignore[name-defined]
+async def _maybe_ensure_tables(conn: asyncpg.Connection) -> None:
     """Ensure tables exist (called once per process lifetime)."""
     global _TABLES_ENSURED
     if _TABLES_ENSURED:
@@ -361,7 +361,7 @@ async def get_or_create_active_bucket_kek(
     async with pool.acquire() as conn:
         await _maybe_ensure_tables(conn)
 
-        async def _fetch_active() -> asyncpg.Record | None:  # type: ignore[name-defined]
+        async def _fetch_active() -> asyncpg.Record | None:
             return await conn.fetchrow(
                 """
                 SELECT kek_id, wrapped_kek_bytes, kms_key_id

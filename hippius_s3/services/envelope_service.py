@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # type: ignore[import-not-found]
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 DEK_SIZE_BYTES = 32
