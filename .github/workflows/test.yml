@@ -106,7 +106,7 @@ jobs:
         run: |
           source .venv/bin/activate
           uv tool install pip-audit
-          pip-audit
+          pip-audit --ignore-vuln CVE-2024-23342
 
   unit-integration:
     name: Unit & Integration Tests

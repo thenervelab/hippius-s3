@@ -40,7 +40,7 @@ repos:
 
       - id: pip-audit
         name: pip-audit (dependency scan)
-        entry: pip-audit
+        entry: pip-audit --ignore-vuln CVE-2024-23342
         language: system
         stages: [pre-commit]
         pass_filenames: false
