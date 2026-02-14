@@ -1,5 +1,6 @@
 """E2E tests for CopyObject edge cases and error scenarios."""
 
+import os
 from typing import Any
 from typing import Callable
 
@@ -191,15 +192,17 @@ def test_copy_10mb_object(
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
 ) -> None:
-    """Test copying a 10 MB object (multi-chunk)."""
-    bucket = unique_bucket_name("copy-10mb")
+    """Test copying a multi-chunk object."""
+    bucket = unique_bucket_name("copy-multichunk")
     cleanup_buckets(bucket)
 
     boto3_client.create_bucket(Bucket=bucket)
 
-    src_key = "10mb.bin"
-    dst_key = "10mb-copy.bin"
-    body = b"B" * (10 * 1024 * 1024)
+    # Ensure body spans multiple chunks regardless of configured chunk size
+    chunk_size = int(os.environ.get("HIPPIUS_CHUNK_SIZE_BYTES", 16 * 1024 * 1024))
+    src_key = "multichunk.bin"
+    dst_key = "multichunk-copy.bin"
+    body = b"B" * (chunk_size * 2 + 123)
     boto3_client.put_object(Bucket=bucket, Key=src_key, Body=body)
 
     copy_source = f"/{bucket}/{src_key}"

@@ -30,20 +30,16 @@ def _get_metrics_collector() -> _MetricsLike:
 DEFAULT_OBJ_PART_TTL_SECONDS = 1800
 
 
-def _get_config_value(name: str, default: int) -> int:
-    try:
-        # Local import to avoid triggering httpx and other deps at module import time
-        from hippius_s3.config import get_config  # type: ignore
+def _get_config_value(name: str) -> int:
+    # Local import to avoid triggering httpx and other deps at module import time
+    from hippius_s3.config import get_config
 
-        cfg = get_config()
-        if name == "object_chunk_size_bytes":
-            return cfg.object_chunk_size_bytes
-        if name == "cache_ttl_seconds":
-            return cfg.cache_ttl_seconds
-        # Unknown config keys must not be accessed dynamically.
-        return default
-    except Exception:
-        return default
+    cfg = get_config()
+    if name == "object_chunk_size_bytes":
+        return cfg.object_chunk_size_bytes
+    if name == "cache_ttl_seconds":
+        return cfg.cache_ttl_seconds
+    raise ValueError(f"Unknown config key: {name}")
 
 
 class ObjectPartsCache(Protocol):
@@ -147,7 +143,7 @@ class RedisObjectPartsCache:
         ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
     ) -> None:
         # Split into fixed-size chunks and store meta first (for cheap readiness checks), then chunk keys
-        chunk_size = _get_config_value("object_chunk_size_bytes", 4 * 1024 * 1024)
+        chunk_size = _get_config_value("object_chunk_size_bytes")
         total = len(data) if isinstance(data, (bytes, bytearray)) else 0
         if total == 0:
             # Still write empty meta with zero chunks for consistency
@@ -191,7 +187,7 @@ class RedisObjectPartsCache:
         """Set TTL on meta and all chunk keys for this part to prevent orphaned chunk bytes."""
         await self.redis.expire(
             self.build_meta_key(object_id, object_version, part_number),
-            int(ttl if ttl is not None else _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS)),
+            int(ttl if ttl is not None else _get_config_value("cache_ttl_seconds")),
         )
         pattern = f"obj:{object_id}:v:{int(object_version)}:part:{int(part_number)}:chunk:*"
         async for key in self.redis.scan_iter(match=pattern, count=100):
@@ -223,7 +219,7 @@ class RedisObjectPartsCache:
     ) -> None:
         await self.redis.setex(
             self.build_chunk_key(object_id, object_version, part_number, chunk_index),
-            int(ttl if ttl is not None else _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS)),
+            int(ttl if ttl is not None else _get_config_value("cache_ttl_seconds")),
             data,
         )
 
@@ -251,7 +247,7 @@ class RedisObjectPartsCache:
         payload = {"chunk_size": int(chunk_size), "num_chunks": int(num_chunks), "size_bytes": int(size_bytes)}
         await self.redis.setex(
             self.build_meta_key(object_id, object_version, part_number),
-            int(ttl if ttl is not None else _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS)),
+            int(ttl if ttl is not None else _get_config_value("cache_ttl_seconds")),
             _json.dumps(payload),
         )
 

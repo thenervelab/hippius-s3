@@ -1,5 +1,6 @@
 """E2E tests for GetObject with Range requests."""
 
+import os
 import time
 from typing import Any
 from typing import Callable
@@ -67,8 +68,8 @@ def test_range_downloads_only_needed_chunks(
     cleanup_buckets(bucket)
     boto3_client.create_bucket(Bucket=bucket)
 
-    # Create a single large part (>= 2 chunks with default 4MiB chunk_size)
-    part_size = 4 * 1024 * 1024
+    # Create a single large part (>= 2 chunks at the configured chunk_size)
+    part_size = int(os.environ.get("HIPPIUS_CHUNK_SIZE_BYTES", 16 * 1024 * 1024))
     key = "large/single-part.bin"
     body = b"A" * (part_size * 2 + 123)  # a bit over 2 chunks
     boto3_client.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/octet-stream")

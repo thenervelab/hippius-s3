@@ -10,6 +10,12 @@ from typing import Any
 from typing import TypedDict
 
 
+def _default_chunk_size() -> int:
+    from hippius_s3.config import get_config
+
+    return get_config().object_chunk_size_bytes
+
+
 class DBMeta(TypedDict):
     plain_size: int
     chunk_size_bytes: int | None
@@ -94,7 +100,7 @@ async def read_cache_meta(
         raw = await obj_cache.get_meta(object_id, int(object_version), part_number)
         if isinstance(raw, dict):
             # Back-compat: use legacy size_bytes as plain_size
-            chunk_size = int(raw.get("chunk_size", 4 * 1024 * 1024))
+            chunk_size = int(raw.get("chunk_size", _default_chunk_size()))
             num_chunks = int(raw.get("num_chunks", 0))
             size_bytes = int(raw.get("size_bytes", 0))
             plain_size = size_bytes

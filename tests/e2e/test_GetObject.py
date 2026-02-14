@@ -27,8 +27,9 @@ def test_get_object_downloads_and_matches_headers(
     boto3_client.create_bucket(Bucket=bucket_name)
 
     key = "file.bin"
-    # ~9MB to ensure multi-chunk with default 4MB chunk size
-    content = os.urandom(9 * 1024 * 1024)
+    # Ensure body spans multiple chunks regardless of configured chunk size
+    chunk_size = int(os.environ.get("HIPPIUS_CHUNK_SIZE_BYTES", 16 * 1024 * 1024))
+    content = os.urandom(chunk_size * 2 + 123)
     content_type = "application/octet-stream"
 
     boto3_client.put_object(

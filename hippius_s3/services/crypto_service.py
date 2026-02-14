@@ -626,7 +626,6 @@ class CryptoService:
         suite_id: Optional[str] = None,
         range_start: Optional[int] = None,
         range_end: Optional[int] = None,
-        chunk_size: int = 4 * 1024 * 1024,
     ) -> Iterator[bytes]:
         """Streaming decrypt that yields plaintext slices.
 
@@ -642,7 +641,6 @@ class CryptoService:
             suite_id: Encryption suite
             range_start: Starting byte offset (plaintext)
             range_end: Ending byte offset inclusive (plaintext)
-            chunk_size: Plaintext size per chunk
 
         Yields:
             Plaintext byte slices covering the requested range
@@ -693,7 +691,6 @@ class CryptoService:
         suite_id: Optional[str] = None,
         range_start: Optional[int] = None,
         range_end: Optional[int] = None,
-        chunk_size: int = 4 * 1024 * 1024,
     ) -> AsyncIterator[bytes]:
         """Async version of decrypt_stream for use in async contexts."""
         plaintext_offset = 0
