@@ -140,7 +140,7 @@ jobs:
             --from-literal=DATABASE_PASSWORD='${{ secrets.DATABASE_PASSWORD }}' \
             --from-literal=DATABASE_URL="${DATABASE_URL}" \
             --from-literal=HIPPIUS_KEYSTORE_DATABASE_URL="${DATABASE_URL}" \
-            --from-literal=REDIS_URL='redis://redis.redis-staging.svc.cluster.local:6379?cluster=true' \
+            --from-literal=REDIS_URL='redis://redis-cluster.hippius-s3-staging.svc.cluster.local:6379?cluster=true' \
             --from-literal=REDIS_ACCOUNTS_URL='redis://redis-accounts:6379' \
             --from-literal=REDIS_CHAIN_URL='redis://redis-chain:6379' \
             --from-literal=REDIS_QUEUES_URL='redis://redis-queues:6379' \
@@ -211,6 +211,10 @@ jobs:
         run: |
           kubectl delete job db-migrations -n hippius-s3-staging --ignore-not-found=true
 
+      - name: Deploy Redis cluster
+        run: |
+          kubectl apply -f k8s/redis-cluster/staging.yaml
+
       - name: Deploy to staging
         run: |
           kubectl apply -k k8s/staging
@@ -256,9 +260,9 @@ jobs:
           DATABASE_URL="postgresql://postgres:${{ secrets.DATABASE_PASSWORD }}@postgres-rw:5432/hippius?sslmode=disable"
 
           kubectl create secret generic hippius-s3-secrets \
-            --from-literal=DATABASE_URL="${DATABASE_URL}" \
-            --from-literal=HIPPIUS_KEYSTORE_DATABASE_URL="${DATABASE_URL}" \
-            --from-literal=REDIS_URL="redis://redis.redis.svc.cluster.local:6379?cluster=true" \
+            --from-literal=DATABASE_URL="${{ secrets.PRODUCTION_DATABASE_URL }}" \
+            --from-literal=HIPPIUS_KEYSTORE_DATABASE_URL="${{ secrets.PRODUCTION_DATABASE_URL }}" \
+            --from-literal=REDIS_URL="redis://redis-cluster.hippius-s3-prod.svc.cluster.local:6379?cluster=true" \
             --from-literal=REDIS_ACCOUNTS_URL="redis://redis-accounts:6379/0" \
             --from-literal=REDIS_CHAIN_URL="redis://redis-chain:6379/0" \
             --from-literal=REDIS_QUEUES_URL="redis://redis-queues:6379/0" \
@@ -329,6 +333,10 @@ jobs:
       - name: Delete old migration job
         run: |
           kubectl delete job db-migrations -n hippius-s3-prod --ignore-not-found=true
+
+      - name: Deploy Redis cluster
+        run: |
+          kubectl apply -f k8s/redis-cluster/production.yaml
 
       - name: Deploy to production
         run: |
