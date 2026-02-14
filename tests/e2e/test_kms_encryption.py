@@ -104,8 +104,9 @@ def test_large_object_with_kms_wrapped_kek(
     bucket = unique_bucket_name("kms-large")
     cleanup_buckets(bucket)
 
-    # 5MB object - multiple chunks
-    content = os.urandom(5 * 1024 * 1024)
+    # Ensure body spans multiple chunks regardless of configured chunk size
+    chunk_size = int(os.environ.get("HIPPIUS_CHUNK_SIZE_BYTES", 16 * 1024 * 1024))
+    content = os.urandom(chunk_size * 2 + 123)
 
     boto3_client.create_bucket(Bucket=bucket)
     boto3_client.put_object(Bucket=bucket, Key="large.bin", Body=content)
