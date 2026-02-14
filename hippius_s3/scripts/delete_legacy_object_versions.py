@@ -6,7 +6,7 @@ import json
 from contextlib import suppress
 from dataclasses import dataclass
 
-import asyncpg  # type: ignore[import-untyped]
+import asyncpg
 
 from hippius_s3.config import get_config
 
@@ -23,7 +23,7 @@ class DeleteCandidate:
 
 async def main_async(args: argparse.Namespace) -> int:
     cfg = get_config()
-    db = await asyncpg.connect(cfg.database_url)  # type: ignore[arg-type]
+    db = await asyncpg.connect(cfg.database_url)
     try:
         max_sv = int(args.max_storage_version)
         include_current = bool(args.include_current)

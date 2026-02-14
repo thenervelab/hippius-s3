@@ -214,7 +214,7 @@ async def main_async(args: argparse.Namespace) -> int:
     from hippius_s3.config import get_config
 
     config = get_config()
-    redis_queues_client: async_redis.Redis | None = None  # type: ignore[type-arg]
+    redis_queues_client: async_redis.Redis | None = None
 
     if args.from_json:
         log.info(f"Loading CIDs from JSON file: {args.from_json}")
@@ -244,7 +244,7 @@ async def main_async(args: argparse.Namespace) -> int:
             )
             return 0
         finally:
-            await redis_queues_client.aclose()  # type: ignore[attr-defined]
+            await redis_queues_client.aclose()
 
     db = await asyncpg.connect(config.database_url)
 
@@ -328,7 +328,7 @@ async def main_async(args: argparse.Namespace) -> int:
     finally:
         await db.close()
         if redis_queues_client:
-            await redis_queues_client.aclose()  # type: ignore[attr-defined]
+            await redis_queues_client.aclose()
 
 
 def main() -> None:

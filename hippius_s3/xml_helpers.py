@@ -2,7 +2,7 @@
 
 from typing import Any
 
-import lxml.etree as _ET  # type: ignore[import-untyped]
+import lxml.etree as _ET  # ty: ignore[unresolved-import]
 
 
 # Using Any for Element types since lxml doesn't have proper type stubs

@@ -77,26 +77,13 @@ SELECT
     ) AS upload_id,
     CASE
         WHEN oi.multipart = FALSE THEN
-            CASE
-                WHEN oi.storage_version >= 4 THEN
-                    JSON_BUILD_ARRAY(
-                        JSON_BUILD_OBJECT(
-                            'part_number', 1,
-                            'cid', NULL,
-                            'size_bytes', oi.size_bytes
-                        )
-                    )
-                WHEN oi.simple_cid IS NOT NULL THEN
-                    JSON_BUILD_ARRAY(
-                        JSON_BUILD_OBJECT(
-                            'part_number', 1,
-                            'cid', oi.simple_cid,
-                            'size_bytes', oi.size_bytes
-                        )
-                    )
-                ELSE
-                    '[]'::json
-            END
+            JSON_BUILD_ARRAY(
+                JSON_BUILD_OBJECT(
+                    'part_number', 1,
+                    'cid', NULL,
+                    'size_bytes', oi.size_bytes
+                )
+            )
         ELSE
             COALESCE(
                 (SELECT JSON_AGG(

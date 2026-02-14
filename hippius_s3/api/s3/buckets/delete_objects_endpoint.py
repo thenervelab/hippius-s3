@@ -5,7 +5,7 @@ from typing import Any
 
 from fastapi import Request
 from fastapi import Response
-from lxml import etree as ET
+from lxml import etree as ET  # ty: ignore[unresolved-import]
 
 from hippius_s3.api.s3 import errors
 from hippius_s3.backend_routing import resolve_object_backends
@@ -63,13 +63,13 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
         ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
 
         # Quiet flag
-        quiet_nodes = root.xpath("./s3:Quiet", namespaces=ns)  # type: ignore[attr-defined]
+        quiet_nodes = root.xpath("./s3:Quiet", namespaces=ns)
         quiet = False
         if quiet_nodes and quiet_nodes[0].text:
             quiet = str(quiet_nodes[0].text).strip().lower() == "true"
 
         # Collect objects
-        object_elems = root.xpath(".//s3:Object", namespaces=ns)  # type: ignore[attr-defined]
+        object_elems = root.xpath(".//s3:Object", namespaces=ns)
         if len(object_elems) > 1000:
             return errors.s3_error_response(
                 "MalformedXML",
@@ -82,8 +82,8 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
         errors_list: list[dict[str, str]] = []
 
         for obj in object_elems:
-            key_nodes = obj.xpath("./s3:Key", namespaces=ns)  # type: ignore[attr-defined]
-            version_nodes = obj.xpath("./s3:VersionId", namespaces=ns)  # type: ignore[attr-defined]
+            key_nodes = obj.xpath("./s3:Key", namespaces=ns)
+            version_nodes = obj.xpath("./s3:VersionId", namespaces=ns)
             key = str(key_nodes[0].text) if key_nodes and key_nodes[0].text else ""
             version_id = str(version_nodes[0].text) if version_nodes and version_nodes[0].text else ""
 

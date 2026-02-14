@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import Response
-from lxml import etree as ET
+from lxml import etree as ET  # ty: ignore[unresolved-import]
 
 from hippius_s3.api.s3 import errors
 from hippius_s3.dependencies import RequestContext

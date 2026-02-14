@@ -6,7 +6,7 @@ from typing import Any
 
 from fastapi import Request
 from fastapi import Response
-from lxml import etree as ET
+from lxml import etree as ET  # ty: ignore[unresolved-import]
 
 from hippius_s3.api.s3 import errors
 from hippius_s3.repositories.buckets import BucketRepository
@@ -71,9 +71,9 @@ async def set_bucket_tags(bucket_name: str, request: Request, db: Any, main_acco
             try:
                 root = ET.fromstring(body)
                 ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
-                for tag_elem in root.xpath(".//s3:Tag", namespaces=ns):  # type: ignore[attr-defined]
-                    key_nodes = tag_elem.xpath("./s3:Key", namespaces=ns)  # type: ignore[attr-defined]
-                    value_nodes = tag_elem.xpath("./s3:Value", namespaces=ns)  # type: ignore[attr-defined]
+                for tag_elem in root.xpath(".//s3:Tag", namespaces=ns):
+                    key_nodes = tag_elem.xpath("./s3:Key", namespaces=ns)
+                    value_nodes = tag_elem.xpath("./s3:Value", namespaces=ns)
                     if key_nodes and value_nodes and key_nodes[0].text and value_nodes[0].text:
                         tags[str(key_nodes[0].text)] = str(value_nodes[0].text)
             except Exception:

@@ -9,7 +9,7 @@ from typing import Any
 from typing import Optional
 from typing import TextIO
 
-import asyncpg  # type: ignore[import-untyped]
+import asyncpg
 
 from hippius_s3.config import get_config
 
@@ -54,7 +54,7 @@ def _norm_cid(cid: str | None) -> str:
 
 async def main_async(args: argparse.Namespace, *, out_file: TextIO, output_jsonl: str) -> int:
     cfg = get_config()
-    db = await asyncpg.connect(cfg.database_url)  # type: ignore[arg-type]
+    db = await asyncpg.connect(cfg.database_url)
     try:
         max_sv = int(args.max_storage_version)
         include_current = bool(args.include_current)

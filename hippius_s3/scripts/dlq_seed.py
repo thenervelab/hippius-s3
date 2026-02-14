@@ -16,7 +16,7 @@ import logging
 from typing import Any
 from typing import List
 
-import asyncpg  # type: ignore[import-untyped]
+import asyncpg
 import redis.asyncio as async_redis
 
 from hippius_s3.config import get_config
@@ -25,7 +25,7 @@ from hippius_s3.config import get_config
 logger = logging.getLogger(__name__)
 
 
-async def _list_part_numbers_by_object_id(conn: asyncpg.Connection, object_id: str) -> List[int]:  # type: ignore[name-defined]
+async def _list_part_numbers_by_object_id(conn: asyncpg.Connection, object_id: str) -> List[int]:
     rows = await conn.fetch(
         """
         SELECT part_number
@@ -44,7 +44,7 @@ async def seed_object_to_dlq(object_id: str) -> bool:
 
     try:
         # Determine parts from DB
-        conn = await asyncpg.connect(config.database_url)  # type: ignore[arg-type]
+        conn = await asyncpg.connect(config.database_url)
         try:
             part_numbers = await _list_part_numbers_by_object_id(conn, object_id)
         finally:

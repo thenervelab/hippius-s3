@@ -4,9 +4,9 @@ import base64
 import hashlib
 from typing import Optional
 
-import asyncpg  # type: ignore[import-untyped]
-import nacl.secret  # type: ignore[import-untyped]
-import nacl.utils  # type: ignore[import-untyped]
+import asyncpg
+import nacl.secret
+import nacl.utils
 
 from hippius_s3.config import get_config
 
@@ -29,7 +29,7 @@ async def get_or_create_encryption_key_bytes(
     if not dsn:
         raise RuntimeError("encryption_key_unavailable")
 
-    async def _ensure_tables(conn: asyncpg.Connection) -> None:  # type: ignore[name-defined]
+    async def _ensure_tables(conn: asyncpg.Connection) -> None:
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS encryption_keys (
@@ -43,7 +43,7 @@ async def get_or_create_encryption_key_bytes(
             """
         )
 
-    conn = await asyncpg.connect(dsn)  # type: ignore[arg-type]
+    conn = await asyncpg.connect(dsn)
     try:
         sub_hash = hashlib.sha256(combined_id.encode("utf-8")).hexdigest()
         try:

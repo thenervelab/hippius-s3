@@ -8,7 +8,7 @@ from urllib.parse import unquote
 
 from fastapi import Request
 from fastapi import Response
-from lxml import etree as ET
+from lxml import etree as ET  # ty: ignore[unresolved-import]
 
 from hippius_s3.api.s3 import errors
 from hippius_s3.cache import RedisObjectPartsCache
@@ -18,7 +18,6 @@ from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
 from hippius_s3.services.object_reader import stream_object
 from hippius_s3.storage_version import require_supported_storage_version
-from hippius_s3.utils import get_query
 from hippius_s3.writer.object_writer import ObjectWriter
 
 
@@ -131,35 +130,6 @@ async def should_use_v5_fast_path(
     # even if we rewrap the DEK. We'll revisit in a future storage version (e.g. v6) with a
     # copy-friendly binding scheme.
     return False, None, "v5_fast_path_disabled_object_id_binding"
-
-    if src_storage_version < 5:
-        return False, None, "storage_version < 5"
-
-    if src_multipart:
-        return False, None, "multipart not supported"
-
-    if existing_dest:
-        return False, None, "destination exists (new version), AAD mismatch"
-
-    src_object_id = str(src_obj_row["object_id"])
-    src_object_version = int(src_obj_row.get("object_version") or 1)
-
-    rows = await db.fetch(
-        get_query("get_part_chunks_by_object_and_number"),
-        src_object_id,
-        src_object_version,
-        1,
-    )
-
-    if not rows:
-        return False, None, "missing part_chunks metadata"
-
-    bad_indices = [int(r[0]) for r in rows if not r[1] or str(r[1]).strip().lower() in {"", "none", "pending"}]
-
-    if bad_indices:
-        return False, None, f"missing chunk CID(s) indices={bad_indices}"
-
-    return True, rows, "fast_path_eligible"
 
 
 def build_copy_success_response(etag: str, last_modified: datetime) -> Response:

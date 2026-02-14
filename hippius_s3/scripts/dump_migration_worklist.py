@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-import asyncpg  # type: ignore[import-untyped]
+import asyncpg
 
 from hippius_s3.config import get_config
 from hippius_s3.utils import get_query
@@ -33,7 +33,7 @@ async def dump_worklist_async(args: argparse.Namespace) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     log = logging.getLogger("dump-migration-worklist")
     config = get_config()
-    db = await asyncpg.connect(config.database_url)  # type: ignore[arg-type]
+    db = await asyncpg.connect(config.database_url)
     try:
         target = args.target_storage_version or config.target_storage_version
         rows = await db.fetch(get_query("list_objects_to_migrate"), target, args.bucket or None, args.key or None)

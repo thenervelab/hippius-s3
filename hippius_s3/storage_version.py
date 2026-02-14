@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-MIN_SUPPORTED_STORAGE_VERSION = 4
+MIN_SUPPORTED_STORAGE_VERSION = 5
 
 
 class UnsupportedStorageVersionError(RuntimeError):
@@ -13,7 +13,7 @@ class UnsupportedStorageVersionError(RuntimeError):
 def require_supported_storage_version(storage_version: int) -> int:
     """Validate storage_version is supported by this deployment.
 
-    Hippius S3 has dropped support for legacy storage versions (< v4).
+    Hippius S3 has dropped support for storage versions < v5.
     """
     sv = int(storage_version)
     if sv < MIN_SUPPORTED_STORAGE_VERSION:

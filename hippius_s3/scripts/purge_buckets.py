@@ -273,7 +273,7 @@ async def main_async(args: argparse.Namespace) -> int:
     from hippius_s3.config import get_config
 
     config = get_config()
-    redis_queues_client: async_redis.Redis | None = None  # type: ignore[type-arg]
+    redis_queues_client: async_redis.Redis | None = None
 
     db = await asyncpg.connect(config.database_url)
     try:
@@ -355,7 +355,7 @@ async def main_async(args: argparse.Namespace) -> int:
     finally:
         await db.close()
         if redis_queues_client:
-            await redis_queues_client.aclose()  # type: ignore[attr-defined]
+            await redis_queues_client.aclose()
 
 
 def main() -> None:

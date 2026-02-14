@@ -177,7 +177,7 @@ class BenchmarkRunner:
             2,
             f"[{self._ts()}] [client] endpoint={getattr(client._endpoint, 'host', 'unknown')} mode={self.args.mode} path_style={getattr(client.meta.config, 's3', {})}",
         )
-        return client  # type: ignore
+        return client
 
     def _generate_test_data(self) -> bytes:
         """Generate deterministic test data for validation."""

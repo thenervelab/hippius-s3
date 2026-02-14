@@ -137,10 +137,10 @@ def main() -> None:
         sys.exit(1)
 
     # Log configuration
-    logger.info(f"App database: {mask_database_url(database_url)}")
+    logger.info(f"App database: {mask_database_url(database_url)}")  # ty: ignore[invalid-argument-type]
 
     # Wait for database
-    wait_for_database(database_url)
+    wait_for_database(database_url)  # ty: ignore[invalid-argument-type]
 
     # Run application database migrations
     logger.info("Running application database migrations")

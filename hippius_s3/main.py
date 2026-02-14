@@ -273,7 +273,7 @@ def factory() -> FastAPI:
         app.openapi_schema = openapi_schema
         return app.openapi_schema
 
-    app.openapi = custom_openapi  # type: ignore[method-assign]
+    app.openapi = custom_openapi  # ty: ignore[invalid-assignment]
 
     # Custom middlewares - middleware("http") executes in REVERSE order
     # Backend now relies on gateway for authentication/authorization
@@ -286,7 +286,7 @@ def factory() -> FastAPI:
     app.middleware("http")(fs_cache_pressure_middleware)
     app.middleware("http")(input_validation_middleware)
     if config.enable_request_profiling:
-        app.add_middleware(SpeedscopeProfilerMiddleware)
+        app.add_middleware(SpeedscopeProfilerMiddleware)  # ty: ignore[invalid-argument-type]
 
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception) -> Response:
@@ -299,7 +299,7 @@ def factory() -> FastAPI:
         if isinstance(exc, UnsupportedStorageVersionError):
             return s3_errors.s3_error_response(
                 code="NotImplemented",
-                message=(f"Object uses unsupported storage version (sv={exc.storage_version}). Migrate object to v4."),
+                message=(f"Object uses unsupported storage version (sv={exc.storage_version}). Migrate object to v5."),
                 status_code=501,
             )
         raise exc

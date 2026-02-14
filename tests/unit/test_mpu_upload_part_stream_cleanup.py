@@ -20,10 +20,9 @@ async def test_mpu_upload_part_stream_cleans_up_on_oversize(tmp_path, monkeypatc
     cfg.max_multipart_part_size = 5
     cfg.cache_ttl_seconds = 60
 
-    async def fake_key(*_args, **_kwargs) -> bytes:
+    async def fake_ensure_dek(*_args, **_kwargs) -> bytes:
         return b"\x00" * 32
 
-    monkeypatch.setattr("hippius_s3.writer.object_writer.get_or_create_encryption_key_bytes", fake_key)
     monkeypatch.setattr("hippius_s3.writer.object_writer.get_config", lambda: cfg)
 
     object_id = str(uuid.uuid4())
@@ -31,7 +30,7 @@ async def test_mpu_upload_part_stream_cleans_up_on_oversize(tmp_path, monkeypatc
 
     class DummyDB:
         async def fetchrow(self, *_args, **_kwargs):
-            return {"bucket_id": "bucket", "storage_version": 2}
+            return {"bucket_id": "bucket", "storage_version": 5, "kek_id": "kek-1", "wrapped_dek": b"\x00" * 48}
 
         async def fetchval(self, *_args, **_kwargs):
             return "part-id"
@@ -51,6 +50,7 @@ async def test_mpu_upload_part_stream_cleans_up_on_oversize(tmp_path, monkeypatc
         yield b"ef"
 
     writer = ObjectWriter(db=DummyDB(), redis_client=DummyRedis(), fs_store=fs_store)
+    monkeypatch.setattr(writer, "_ensure_and_get_v5_dek", fake_ensure_dek)
 
     try:
         with pytest.raises(ValueError, match="part_size_exceeds_max"):

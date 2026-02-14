@@ -272,21 +272,6 @@ async def get_object_download_info(db: asyncpg.Pool, object_id: str) -> dict:
 
     storage_version = int(result.get("storage_version") or 0)
     download_chunks = result["download_chunks"]
-    # Defensive: legacy download paths require concrete CIDs. If they're missing, treat as not-ready
-    # so callers can retry instead of failing later with confusing nulls.
-    if storage_version > 0 and storage_version < 4:
-        try:
-            chunks = list(download_chunks) if isinstance(download_chunks, list) else []
-            for c in chunks:
-                cid = c.get("cid") if isinstance(c, dict) else None  # type: ignore[union-attr]
-                cid_norm = str(cid or "").strip().lower()
-                if cid_norm in {"", "none", "pending"}:
-                    raise RuntimeError("download_not_ready_missing_cids")
-        except Exception as e:
-            if str(e) == "download_not_ready_missing_cids":
-                raise RuntimeError(f"download_not_ready_missing_cids: object_id={object_id}") from None
-            # If parsing fails, be conservative and let callers retry.
-            raise RuntimeError(f"download_not_ready_missing_cids: object_id={object_id}") from None
 
     return {
         "object_id": result["object_id"],

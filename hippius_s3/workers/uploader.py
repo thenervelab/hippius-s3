@@ -114,8 +114,8 @@ class Uploader:
     def __init__(
         self,
         db_pool: Any,
-        redis_client: async_redis.Redis,  # type: ignore[type-arg]
-        redis_queues_client: async_redis.Redis,  # type: ignore[type-arg]
+        redis_client: async_redis.Redis,
+        redis_queues_client: async_redis.Redis,
         config: Any,
         backend_name: str,
         backend_client: BackendClient,

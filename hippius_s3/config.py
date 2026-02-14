@@ -240,7 +240,7 @@ class Config:
     ipfs_retry_max_ms: int = env("HIPPIUS_IPFS_RETRY_MAX_MS:5000", convert=int)
 
     # Storage version to assign for newly created/overwritten objects
-    # Defaults to 4 (latest layout)
+    # Only v5 is supported
     target_storage_version: int = env("HIPPIUS_TARGET_STORAGE_VERSION:5", convert=int)
 
     # Cachet health monitoring
