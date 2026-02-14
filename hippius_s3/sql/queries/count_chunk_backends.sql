@@ -1,4 +1,4 @@
--- Parameters: $1 object_id, $2 object_version, $3 part_number, $4 upload_backends TEXT[]
+-- Parameters: $1 object_id, $2 object_version, $3 part_number, $4 upload_backends TEXT[], $5 default_chunk_size INT
 WITH relevant_chunks AS (
     SELECT pc.id
     FROM parts p
@@ -15,7 +15,7 @@ backend_sets AS (
 SELECT
     COUNT(pc.id) AS total_chunks,
     COUNT(pc.id) FILTER (WHERE COALESCE(bs.backends, ARRAY[]::text[]) @> $4) AS replicated_chunks,
-    CEIL(p.size_bytes::float / 4194304)::int AS expected_chunks
+    CEIL(p.size_bytes::float / COALESCE(NULLIF(p.chunk_size_bytes, 0), $5))::int AS expected_chunks
 FROM parts p
 LEFT JOIN part_chunks pc ON pc.part_id = p.part_id
 LEFT JOIN backend_sets bs ON bs.chunk_id = pc.id

@@ -198,7 +198,7 @@ async def is_replicated_on_all_backends(
 
     result = await db.fetchrow(
         get_query("count_chunk_backends"),
-        object_id, object_version, part_number, expected,
+        object_id, object_version, part_number, expected, config.object_chunk_size_bytes,
     )
     if not result or result["total_chunks"] == 0:
         return False

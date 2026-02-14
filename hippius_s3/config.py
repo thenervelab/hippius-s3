@@ -163,7 +163,7 @@ class Config:
     # Cache TTL (shared across components)
     cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:259200", convert=int)
     # Unified object part chunk size (bytes) for cache and range math
-    object_chunk_size_bytes: int = env("HIPPIUS_CHUNK_SIZE_BYTES:4194304", convert=int)
+    object_chunk_size_bytes: int = env("HIPPIUS_CHUNK_SIZE_BYTES:16777216", convert=int)
     # Downloader behavior (default: no whole-part backfill)
     downloader_allow_part_backfill: bool = env(
         "DOWNLOADER_ALLOW_PART_BACKFILL:false", convert=lambda x: x.lower() == "true"
