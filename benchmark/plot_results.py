@@ -5,14 +5,16 @@ import csv
 import os
 import sys
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime
+from datetime import timedelta
 from pathlib import Path
 
 import boto3
-import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
 
 RESULTS_BUCKET = "hippius-benchmarks"
 CSV_KEY = "daily.csv"
@@ -20,9 +22,12 @@ SVG_KEY = "daily.svg"
 
 
 SCENARIOS = [
-    "put_1mb", "get_1mb",
-    "put_100mb", "get_100mb",
-    "put_1gb", "get_1gb",
+    "put_1mb",
+    "get_1mb",
+    "put_100mb",
+    "get_100mb",
+    "put_1gb",
+    "get_1gb",
 ]
 
 

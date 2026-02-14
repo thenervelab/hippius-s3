@@ -8,9 +8,9 @@ from typing import Optional
 
 import redis.asyncio as async_redis
 from dotenv import load_dotenv
-from hippius_s3.substrate_client import SubstrateClient
 
 from hippius_s3.config import get_config
+from hippius_s3.substrate_client import SubstrateClient
 
 
 logging.basicConfig(level=logging.INFO)

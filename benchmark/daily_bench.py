@@ -7,13 +7,15 @@ import os
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 
 import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
 
 FILE_SIZES_MB = [1, 100, 1024]
 ITERATIONS = 3
@@ -163,49 +165,57 @@ def run_benchmark(client, bucket: str) -> list[dict]:
         if put_durations:
             avg_duration = sum(put_durations) / len(put_durations)
             avg_throughput = size_mb / avg_duration
-            results.append({
-                "date": today,
-                "scenario": f"put_{label}",
-                "size_mb": size_mb,
-                "duration_ms": int(avg_duration * 1000),
-                "throughput_mbps": round(avg_throughput, 2),
-                "iterations": len(put_durations),
-                "status": "ok",
-            })
+            results.append(
+                {
+                    "date": today,
+                    "scenario": f"put_{label}",
+                    "size_mb": size_mb,
+                    "duration_ms": int(avg_duration * 1000),
+                    "throughput_mbps": round(avg_throughput, 2),
+                    "iterations": len(put_durations),
+                    "status": "ok",
+                }
+            )
         else:
-            results.append({
-                "date": today,
-                "scenario": f"put_{label}",
-                "size_mb": size_mb,
-                "duration_ms": 0,
-                "throughput_mbps": 0,
-                "iterations": 0,
-                "status": "error",
-            })
+            results.append(
+                {
+                    "date": today,
+                    "scenario": f"put_{label}",
+                    "size_mb": size_mb,
+                    "duration_ms": 0,
+                    "throughput_mbps": 0,
+                    "iterations": 0,
+                    "status": "error",
+                }
+            )
 
         # Record averaged get result
         if get_durations:
             avg_duration = sum(get_durations) / len(get_durations)
             avg_throughput = size_mb / avg_duration
-            results.append({
-                "date": today,
-                "scenario": f"get_{label}",
-                "size_mb": size_mb,
-                "duration_ms": int(avg_duration * 1000),
-                "throughput_mbps": round(avg_throughput, 2),
-                "iterations": len(get_durations),
-                "status": "ok",
-            })
+            results.append(
+                {
+                    "date": today,
+                    "scenario": f"get_{label}",
+                    "size_mb": size_mb,
+                    "duration_ms": int(avg_duration * 1000),
+                    "throughput_mbps": round(avg_throughput, 2),
+                    "iterations": len(get_durations),
+                    "status": "ok",
+                }
+            )
         else:
-            results.append({
-                "date": today,
-                "scenario": f"get_{label}",
-                "size_mb": size_mb,
-                "duration_ms": 0,
-                "throughput_mbps": 0,
-                "iterations": 0,
-                "status": "error",
-            })
+            results.append(
+                {
+                    "date": today,
+                    "scenario": f"get_{label}",
+                    "size_mb": size_mb,
+                    "duration_ms": 0,
+                    "throughput_mbps": 0,
+                    "iterations": 0,
+                    "status": "error",
+                }
+            )
 
     # Clean up bench data
     cleanup_bench_data(client, bucket)
