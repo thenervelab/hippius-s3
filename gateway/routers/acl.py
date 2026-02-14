@@ -234,7 +234,7 @@ async def get_bucket_acl(
     """Get bucket ACL - S3 API compatible. Only matches when ?acl query param is present."""
     if acl is None:
         forward_service = request.app.state.forward_service
-        return await forward_service.forward_request(request)  # type: ignore[no-any-return]
+        return await forward_service.forward_request(request)
 
     acl_service: ACLService = request.app.state.acl_service
 
@@ -259,7 +259,7 @@ async def get_object_acl(
     """Get object ACL - S3 API compatible. Only matches when ?acl query param is present."""
     if acl is None:
         forward_service = request.app.state.forward_service
-        return await forward_service.forward_request(request)  # type: ignore[no-any-return]
+        return await forward_service.forward_request(request)
 
     acl_service: ACLService = request.app.state.acl_service
 

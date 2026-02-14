@@ -195,4 +195,4 @@ async def account_middleware(request: Request, call_next: Callable) -> Response:
             delete=False,
         )
     # Continue with the request
-    return await call_next(request)  # type: ignore[no-any-return]
+    return await call_next(request)

@@ -76,12 +76,12 @@ class BackgroundMetricsCollector:
                     await self.redis_queues_client.llen("download_requests") or 0
                 )
             else:
-                self.metrics_collector._upload_len = int(await self.redis_client.llen("upload_requests") or 0)  # type: ignore[union-attr]
-                self.metrics_collector._unpin_len = int(await self.redis_client.llen("unpin_requests") or 0)  # type: ignore[union-attr]
-                self.metrics_collector._substrate_len = int(await self.redis_client.llen("substrate_requests") or 0)  # type: ignore[union-attr]
-                self.metrics_collector._download_len = int(await self.redis_client.llen("download_requests") or 0)  # type: ignore[union-attr]
+                self.metrics_collector._upload_len = int(await self.redis_client.llen("upload_requests") or 0)  # ty: ignore
+                self.metrics_collector._unpin_len = int(await self.redis_client.llen("unpin_requests") or 0)  # ty: ignore
+                self.metrics_collector._substrate_len = int(await self.redis_client.llen("substrate_requests") or 0)  # ty: ignore
+                self.metrics_collector._download_len = int(await self.redis_client.llen("download_requests") or 0)  # ty: ignore
 
-            self.metrics_collector._main_db_size = int(await self.redis_client.dbsize() or 0)  # type: ignore[union-attr]
+            self.metrics_collector._main_db_size = int(await self.redis_client.dbsize() or 0)  # ty: ignore
             self.metrics_collector._accounts_db_size = int(await self.redis_accounts_client.dbsize() or 0)
 
             if self.redis_chain_client:
@@ -90,7 +90,7 @@ class BackgroundMetricsCollector:
             if self.redis_rate_limiting_client:
                 self.metrics_collector._rate_limiting_db_size = int(await self.redis_rate_limiting_client.dbsize() or 0)
 
-            info = await self.redis_client.info("memory")  # type: ignore[union-attr]
+            info = await self.redis_client.info("memory")  # ty: ignore
             self.metrics_collector._used_mem = info.get("used_memory", 0)
             self.metrics_collector._max_mem = info.get("maxmemory", 0)
 

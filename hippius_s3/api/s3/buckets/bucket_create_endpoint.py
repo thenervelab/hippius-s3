@@ -10,7 +10,7 @@ from typing import Any
 import asyncpg
 from fastapi import Request
 from fastapi import Response
-from lxml import etree as ET
+from lxml import etree as ET  # ty: ignore[unresolved-import]
 from substrateinterface.utils.ss58 import is_valid_ss58_address
 
 from hippius_s3.api.s3 import errors
@@ -68,10 +68,10 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
             try:
                 parsed_xml = ET.fromstring(xml_data)
                 # Accept namespaced and non-namespaced lifecycle XML
-                rules = parsed_xml.xpath(".//*[local-name()='Rule']")  # type: ignore[attr-defined]
+                rules = parsed_xml.xpath(".//*[local-name()='Rule']")
                 rule_ids = []
                 for rule in rules:
-                    id_nodes = rule.xpath("./*[local-name()='ID']")  # type: ignore[attr-defined]
+                    id_nodes = rule.xpath("./*[local-name()='ID']")
                     if id_nodes and id_nodes[0] is not None and id_nodes[0].text:
                         rule_ids.append(id_nodes[0].text)
 
@@ -131,11 +131,11 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
                     ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
 
                     # Namespace-qualified selection
-                    tag_elements = root.xpath(".//s3:Tag", namespaces=ns)  # type: ignore[attr-defined]
+                    tag_elements = root.xpath(".//s3:Tag", namespaces=ns)
 
                     for tag_elem in tag_elements:
-                        key_nodes = tag_elem.xpath("./s3:Key", namespaces=ns)  # type: ignore[attr-defined]
-                        value_nodes = tag_elem.xpath("./s3:Value", namespaces=ns)  # type: ignore[attr-defined]
+                        key_nodes = tag_elem.xpath("./s3:Key", namespaces=ns)
+                        value_nodes = tag_elem.xpath("./s3:Value", namespaces=ns)
                         if (
                             key_nodes
                             and value_nodes

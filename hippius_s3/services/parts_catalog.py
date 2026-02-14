@@ -20,7 +20,7 @@ class PartsCatalog:
             # Safely coerce optional object_version to int or None for SQL param $2
             ov_raw = object_info.get("object_version")
             try:
-                ov_param = int(ov_raw)  # type: ignore[arg-type]
+                ov_param = int(ov_raw)  # ty: ignore[invalid-argument-type]
             except Exception:
                 ov_param = None
 
