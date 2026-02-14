@@ -146,6 +146,9 @@ max-complexity = 13 # TODO: get this down to 8
 "hippius_s3/scripts/*.py" = ["T201", "PTH"]
 "scripts/*.py" = ["T201", "PTH", "SIM105"]
 
+[tool.ty.rules]
+deprecated = "ignore"
+
 [tool.ty.environment]
 python-version = "3.12"
 

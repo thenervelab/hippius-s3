@@ -104,7 +104,7 @@ def factory() -> FastAPI:
         logger.info("BanHammerService initialized")
 
         app.state.acl_service = ACLService(
-            db_pool=app.state.postgres_pool,  # type: ignore[arg-type]
+            db_pool=app.state.postgres_pool,
             redis_client=app.state.redis_acl,
             cache_ttl=config.acl_cache_ttl_seconds,
         )
@@ -174,7 +174,7 @@ def factory() -> FastAPI:
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD", "PATCH"])
     async def forward_all(request: Request, path: str) -> Response:
         forward_service = request.app.state.forward_service
-        return await forward_service.forward_request(request)  # type: ignore[no-any-return]
+        return await forward_service.forward_request(request)
 
     async def rate_limit_wrapper(request: Request, call_next: Callable) -> Response:
         return await rate_limit_middleware(
