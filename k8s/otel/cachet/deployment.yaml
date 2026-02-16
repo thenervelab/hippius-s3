@@ -7,6 +7,8 @@ metadata:
     app: cachet
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: cachet
@@ -15,9 +17,32 @@ spec:
       labels:
         app: cachet
     spec:
+      initContainers:
+        - name: init-sqlite
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              chown -R 1001:0 /data
+              touch /data/database.sqlite
+              chown 1001:0 /data/database.sqlite
+          volumeMounts:
+            - name: cachet-sqlite
+              mountPath: /data
       containers:
         - name: cachet
-          image: cachethq/docker:2.4
+          image: cachethq/docker:2.3.18
+          command:
+            - sh
+            - -c
+            - |
+              ln -sf /data/database.sqlite /var/www/html/database/database.sqlite
+              # PHP 7.3 compat: count() on null throws ErrorException
+              sed -i 's/count(\$query->wheres)/count((array) \$query->wheres)/g' /var/www/html/vendor/laravel/framework/src/Illuminate/Database/Eloquent/Builder.php
+              # Clear stale compiled views
+              rm -rf /var/www/html/storage/framework/views/*.php
+              exec /sbin/entrypoint.sh
           ports:
             - containerPort: 8000
           envFrom:
@@ -27,7 +52,7 @@ spec:
                 name: cachet-secrets
           volumeMounts:
             - name: cachet-sqlite
-              mountPath: /var/www/html/database
+              mountPath: /data
           readinessProbe:
             httpGet:
               path: /

@@ -8,9 +8,10 @@ metadata:
 data:
   APP_ENV: "production"
   APP_DEBUG: "false"
+  APP_LOG: "single"
   APP_URL: "http://cachet.monitoring.svc.cluster.local"
   DB_DRIVER: "sqlite"
-  DB_DATABASE: "/var/www/html/database/database.sqlite"
+  FORCE_MIGRATION: "true"
   CACHE_DRIVER: "file"
   SESSION_DRIVER: "file"
   QUEUE_DRIVER: "sync"
