@@ -9,7 +9,6 @@ API Documentation: https://api.hippius.com/?format=openapi
 
 import asyncio
 import functools
-import hashlib
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
@@ -268,11 +267,9 @@ class ArionClient:
         Returns:
             Dict[str, str]: Headers with authentication token
         """
-
-        hex_account = hashlib.sha256(account_ss58.encode("utf-8")).hexdigest()
         return {
             "X-API-Key": self._config.arion_service_key,
-            "Authorization": f"Bearer {hex_account}",
+            "Authorization": f"Bearer {account_ss58}",
         }
 
     @retry_on_error(retries=3, backoff=5.0)
@@ -298,9 +295,8 @@ class ArionClient:
         """
 
         headers = self._get_headers(account_ss58)
-        hex_user = hashlib.sha256(account_ss58.encode("utf-8")).hexdigest()
         response = await self._client.delete(
-            f"/delete/{hex_user}/{file_id}",
+            f"/delete/{account_ss58}/{file_id}",
             headers=headers,
         )
 
@@ -333,8 +329,7 @@ class ArionClient:
         """
 
         headers = self._get_headers(account_ss58)
-        hex_user = hashlib.sha256(account_ss58.encode("utf-8")).hexdigest()
-        download_path = f"/download/{hex_user}/{file_id}"
+        download_path = f"/download/{account_ss58}/{file_id}"
 
         async with self._client.stream(
             "GET",
@@ -370,8 +365,6 @@ class ArionClient:
         Raises:
             HippiusAPIError: If the API request fails
         """
-
-        hex_user = hashlib.sha256(account_ss58.encode("utf-8")).hexdigest()
         files = {
             "file": (
                 file_name,
@@ -380,7 +373,7 @@ class ArionClient:
                 {"Content-Length": str(len(file_data))},
             ),
         }
-        data = {"account_ss58": hex_user}
+        data = {"account_ss58": account_ss58}
 
         headers = self._get_headers(account_ss58)
         response = await self._client.post(
@@ -389,6 +382,7 @@ class ArionClient:
             data=data,
             headers=headers,
         )
+        logger.info(f"Raw response content {response.content}")
         response_json = response.json()
         response.raise_for_status()
 
