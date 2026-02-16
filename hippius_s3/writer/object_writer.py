@@ -11,14 +11,13 @@ from datetime import timezone
 from typing import Any
 from typing import AsyncIterator
 
-from opentelemetry import trace  # type: ignore[import-not-found]
+from opentelemetry import trace
 
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.services.crypto_service import CryptoService
-from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
 from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
@@ -102,29 +101,15 @@ class ObjectWriter:
         """
         # Encrypt into chunks
         chunk_size = self.config.object_chunk_size_bytes
-        # Resolve per-object key: v5 uses DEK, older versions use per-bucket key.
-        storage_version_row = await self.db.fetchrow(
-            "SELECT storage_version FROM object_versions WHERE object_id=$1 AND object_version=$2",
-            object_id,
-            int(object_version),
+        suite_id = "hip-enc/aes256gcm"
+        key_bytes = await self._ensure_and_get_v5_dek(
+            bucket_id=bucket_id,
+            object_id=object_id,
+            object_version=int(object_version),
+            chunk_size=int(chunk_size),
+            suite_id=suite_id,
+            rotate=True,
         )
-        storage_version = int(storage_version_row["storage_version"]) if storage_version_row else 2
-        suite_id: str | None = None
-        if storage_version >= 5:
-            suite_id = "hip-enc/aes256gcm"
-            key_bytes = await self._ensure_and_get_v5_dek(
-                bucket_id=bucket_id,
-                object_id=object_id,
-                object_version=int(object_version),
-                chunk_size=int(chunk_size),
-                suite_id=suite_id,
-                rotate=True,
-            )
-        else:
-            suite_id = "hip-enc/legacy"
-            key_bytes = await get_or_create_encryption_key_bytes(
-                main_account_id=account_address, bucket_name=bucket_name
-            )
         ct_chunks = CryptoService.encrypt_part_to_chunks(
             body_bytes,
             object_id=object_id,
@@ -241,30 +226,17 @@ class ObjectWriter:
             object_id = str(reserve_row.get("object_id") or object_id) if reserve_row else str(object_id)
             object_version = int(reserve_row.get("current_object_version") or 1) if reserve_row else 1
 
-        if resolved_storage_version >= 5:
-            suite_id = "hip-enc/aes256gcm"
-            # New DEK per overwrite/write (this code path reserves a new object_version upfront)
-            from hippius_s3.services.envelope_service import generate_dek
-            from hippius_s3.services.envelope_service import wrap_dek
-            from hippius_s3.services.kek_service import get_or_create_active_bucket_kek
+        suite_id = "hip-enc/aes256gcm"
+        # New DEK per overwrite/write (this code path reserves a new object_version upfront)
+        from hippius_s3.services.envelope_service import generate_dek
+        from hippius_s3.services.envelope_service import wrap_dek
+        from hippius_s3.services.kek_service import get_or_create_active_bucket_kek
 
-            dek = generate_dek()
-            kek_id, kek_bytes = await get_or_create_active_bucket_kek(bucket_id=bucket_id)
-            aad = f"hippius-dek:{bucket_id}:{object_id}:{int(object_version)}".encode("utf-8")
-            wrapped_dek = wrap_dek(kek=kek_bytes, dek=dek, aad=aad)
-            key_bytes = dek
-        else:
-            suite_id = "hip-enc/legacy"
-            with tracer.start_as_current_span(
-                "put_simple_stream_full.key_retrieval",
-                attributes={
-                    "account_address": account_address,
-                    "bucket_name": bucket_name,
-                },
-            ):
-                key_bytes = await get_or_create_encryption_key_bytes(
-                    main_account_id=account_address, bucket_name=bucket_name
-                )
+        dek = generate_dek()
+        kek_id, kek_bytes = await get_or_create_active_bucket_kek(bucket_id=bucket_id)
+        aad = f"hippius-dek:{bucket_id}:{object_id}:{int(object_version)}".encode("utf-8")
+        wrapped_dek = wrap_dek(kek=kek_bytes, dek=dek, aad=aad)
+        key_bytes = dek
 
         hasher = hashlib.md5()
         total_size = 0
@@ -421,30 +393,29 @@ class ObjectWriter:
                 int(object_version),
             )
 
-            if resolved_storage_version >= 5 and kek_id and wrapped_dek:
-                aad = f"hippius-dek:{bucket_id}:{object_id}:{object_version}".encode("utf-8")
-                from hippius_s3.services.envelope_service import wrap_dek
-                from hippius_s3.services.kek_service import get_bucket_kek_bytes
+            aad = f"hippius-dek:{bucket_id}:{object_id}:{object_version}".encode("utf-8")
+            from hippius_s3.services.envelope_service import wrap_dek
+            from hippius_s3.services.kek_service import get_bucket_kek_bytes
 
-                kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
-                wrapped_dek = wrap_dek(kek=kek_bytes, dek=key_bytes, aad=aad)
-                await self.db.execute(
-                    """
-                    UPDATE object_versions
-                       SET encryption_version = 5,
-                           enc_suite_id = $1,
-                           enc_chunk_size_bytes = $2,
-                           kek_id = $3,
-                           wrapped_dek = $4
-                     WHERE object_id = $5 AND object_version = $6
-                    """,
-                    str(suite_id),
-                    int(chunk_size),
-                    kek_id,
-                    wrapped_dek,
-                    object_id,
-                    int(object_version),
-                )
+            kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
+            wrapped_dek = wrap_dek(kek=kek_bytes, dek=key_bytes, aad=aad)
+            await self.db.execute(
+                """
+                UPDATE object_versions
+                   SET encryption_version = 5,
+                       enc_suite_id = $1,
+                       enc_chunk_size_bytes = $2,
+                       kek_id = $3,
+                       wrapped_dek = $4
+                 WHERE object_id = $5 AND object_version = $6
+                """,
+                str(suite_id),
+                int(chunk_size),
+                kek_id,
+                wrapped_dek,
+                object_id,
+                int(object_version),
+            )
 
         num_chunks = int(next_chunk_index)
         await writer.write_meta(
@@ -579,7 +550,7 @@ class ObjectWriter:
             raise ValueError("Zero-length part not allowed")
 
         chunk_size = self.config.object_chunk_size_bytes
-        # Resolve bucket_id and storage_version for this version
+        # Resolve bucket_id for this version
         meta = await self.db.fetchrow(
             """
             SELECT o.bucket_id, ov.storage_version
@@ -592,21 +563,15 @@ class ObjectWriter:
             int(object_version),
         )
         bucket_id = str(meta["bucket_id"]) if meta and meta.get("bucket_id") else ""
-        storage_version = int(meta["storage_version"]) if meta and meta.get("storage_version") is not None else 2
-        suite_id: str | None = "hip-enc/aes256gcm" if storage_version >= 5 else "hip-enc/legacy"
-        if storage_version >= 5:
-            key_bytes = await self._ensure_and_get_v5_dek(
-                bucket_id=bucket_id,
-                object_id=str(object_id),
-                object_version=int(object_version),
-                chunk_size=int(chunk_size),
-                suite_id=str(suite_id),
-                rotate=False,
-            )
-        else:
-            key_bytes = await get_or_create_encryption_key_bytes(
-                main_account_id=account_address, bucket_name=bucket_name
-            )
+        suite_id = "hip-enc/aes256gcm"
+        key_bytes = await self._ensure_and_get_v5_dek(
+            bucket_id=bucket_id,
+            object_id=str(object_id),
+            object_version=int(object_version),
+            chunk_size=int(chunk_size),
+            suite_id=suite_id,
+            rotate=False,
+        )
         ct_chunks = CryptoService.encrypt_part_to_chunks(
             body_bytes,
             object_id=str(object_id),
@@ -670,7 +635,7 @@ class ObjectWriter:
         if max_size <= 0:
             max_size = 0
 
-        # Resolve bucket_id and storage_version for this version
+        # Resolve bucket_id for this version
         meta = await self.db.fetchrow(
             """
             SELECT o.bucket_id, ov.storage_version
@@ -683,21 +648,15 @@ class ObjectWriter:
             int(object_version),
         )
         bucket_id = str(meta["bucket_id"]) if meta and meta.get("bucket_id") else ""
-        storage_version = int(meta["storage_version"]) if meta and meta.get("storage_version") is not None else 2
-        suite_id: str | None = "hip-enc/aes256gcm" if storage_version >= 5 else "hip-enc/legacy"
-        if storage_version >= 5:
-            key_bytes = await self._ensure_and_get_v5_dek(
-                bucket_id=bucket_id,
-                object_id=str(object_id),
-                object_version=int(object_version),
-                chunk_size=int(chunk_size),
-                suite_id=str(suite_id),
-                rotate=False,
-            )
-        else:
-            key_bytes = await get_or_create_encryption_key_bytes(
-                main_account_id=account_address, bucket_name=bucket_name
-            )
+        suite_id = "hip-enc/aes256gcm"
+        key_bytes = await self._ensure_and_get_v5_dek(
+            bucket_id=bucket_id,
+            object_id=str(object_id),
+            object_version=int(object_version),
+            chunk_size=int(chunk_size),
+            suite_id=suite_id,
+            rotate=False,
+        )
 
         writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
         adapter = CryptoService.get_adapter(suite_id)
@@ -981,8 +940,8 @@ class ObjectWriter:
         if not row:
             raise ObjectNotFound("NoSuchKey")
 
-        object_id = str(row["object_id"])  # type: ignore
-        cov = int(row["cov"])  # type: ignore
+        object_id = str(row["object_id"])
+        cov = int(row["cov"])
         chunk_size = self.config.object_chunk_size_bytes
 
         next_part = None
@@ -1001,7 +960,7 @@ class ObjectWriter:
             )
             if not locked:
                 raise ObjectNotFound("NoSuchKey")
-            current_version = int(locked["append_version"])  # type: ignore
+            current_version = int(locked["append_version"])
             if expected_version != current_version:
                 raise AppendPreconditionFailed(current_version)
 
@@ -1019,7 +978,7 @@ class ObjectWriter:
                 object_id,
             )
             if upload_row:
-                upload_id = str(upload_row["upload_id"])  # type: ignore
+                upload_id = str(upload_row["upload_id"])
             else:
                 upload_id = str(uuid.uuid4())
                 await self.db.execute(
@@ -1079,7 +1038,7 @@ class ObjectWriter:
                 if num_chunks is not None:
                     keys.extend(
                         [
-                            self.obj_cache.build_chunk_key(str(object_id), int(cov), int(next_part), int(i))
+                            self.obj_cache.build_chunk_key(str(object_id), int(cov), int(next_part), int(i))  # ty: ignore[invalid-argument-type]
                             for i in range(int(num_chunks))
                         ]
                     )
@@ -1143,7 +1102,7 @@ class ObjectWriter:
                 )
                 if not locked:
                     raise ObjectNotFound("NoSuchKey")
-                current_version = int(locked["append_version"])  # type: ignore
+                current_version = int(locked["append_version"])
                 if expected_version != current_version:
                     raise AppendPreconditionFailed(current_version)
 
@@ -1165,7 +1124,7 @@ class ObjectWriter:
                     for p in parts:
                         if int(p.get("part_number") or 0) == int(next_part):
                             continue
-                        e = str(p["etag"]).strip('"').split("-")[0]  # type: ignore
+                        e = str(p["etag"]).strip('"').split("-")[0]
                         if len(e) == 32:
                             md5s.append(bytes.fromhex(e))
                     seed_md5s = b"".join(md5s)
@@ -1217,7 +1176,7 @@ class ObjectWriter:
                         cov,
                     )
                     raise AppendPreconditionFailed(int(fresh or 0))
-                new_append_version_val = int(updated["append_version"])  # type: ignore
+                new_append_version_val = int(updated["append_version"])
                 composite_etag = str(updated.get("md5_hash") or "")
         except AppendPreconditionFailed:
             await _cleanup_part(num_chunks)

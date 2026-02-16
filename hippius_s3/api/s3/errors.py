@@ -3,7 +3,7 @@
 import uuid
 
 from fastapi import Response
-from lxml import etree as ET
+from lxml import etree as ET  # ty: ignore[unresolved-import]
 
 
 class S3Error(Exception):

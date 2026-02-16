@@ -135,8 +135,8 @@ async def handle_append(
             status_code=400,
         )
     object_id = result["object_id"]
-    next_part = int(result["part_number"])  # type: ignore[index]
-    composite_etag = str(result["etag"])  # type: ignore[index]
+    next_part = int(result["part_number"])
+    composite_etag = str(result["etag"])
     object_version = int(result.get("object_version", 1))
     new_append_version = int(result.get("new_append_version", 0))
 

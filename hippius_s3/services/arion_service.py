@@ -179,11 +179,11 @@ def retry_on_error(
                     last_exception = e
 
                     # Don't retry on authentication errors (401, 403)
-                    if hasattr(e, "response") and e.response.status_code in [401, 403]:
+                    if hasattr(e, "response") and e.response.status_code in [401, 403]:  # ty: ignore[unresolved-attribute]
                         raise HippiusAuthenticationError(f"Authentication failed: {e}") from None
 
                     # Don't retry on 404 Not Found - resource doesn't exist
-                    if hasattr(e, "response") and e.response.status_code == 404:
+                    if hasattr(e, "response") and e.response.status_code == 404:  # ty: ignore[unresolved-attribute]
                         raise
 
                     # Don't retry if this was the last attempt
@@ -191,7 +191,7 @@ def retry_on_error(
                         break
 
                     # Log retry attempt with response body and function arguments
-                    func_name = func.__name__
+                    func_name = func.__name__  # ty: ignore[unresolved-attribute]
                     args_repr = f"args={args}" if args else ""
 
                     # Filter out large binary data from kwargs to avoid log spam
@@ -209,7 +209,7 @@ def retry_on_error(
                     if args_str:
                         error_msg += f" | Function: {func_name}({args_str})"
                     if hasattr(e, "response"):
-                        error_msg += f" | Response body: {e.response.text}"
+                        error_msg += f" | Response body: {e.response.text}"  # ty: ignore[unresolved-attribute]
                     logger.error(error_msg)
                     await asyncio.sleep(backoff)
                 except Exception:
