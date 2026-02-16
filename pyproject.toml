@@ -61,7 +61,8 @@ dev = [
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
     "ruff>=0.12.0",
-    "mypy==1.10.0",
+    "ty>=0.0.16",
+    "pip-audit>=2.10.0",
     "pre-commit>=3.5.0",
     "minio>=7.1.15",
     "boto3>=1.34.0",
@@ -145,70 +146,11 @@ max-complexity = 13 # TODO: get this down to 8
 "hippius_s3/scripts/*.py" = ["T201", "PTH"]
 "scripts/*.py" = ["T201", "PTH", "SIM105"]
 
-[tool.mypy]
-python_version = "3.10"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
-plugins = [
-    "pydantic.mypy"
-]
-[[tool.mypy.overrides]]
-module = "uvicorn"
-ignore_missing_imports = true
+[tool.ty.rules]
+deprecated = "ignore"
 
-[[tool.mypy.overrides]]
-module = "pytest_asyncio"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "loki_logger_handler.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "nacl.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "aiofiles.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "asyncpg.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "lxml.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "cachetools.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "redis.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "mnemonic.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "psycopg.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "fakeredis.aioredis"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "aiohttp.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "substrateinterface.*"
-ignore_missing_imports = true
+[tool.ty.environment]
+python-version = "3.12"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -219,16 +161,3 @@ markers = [
     "integration: Integration tests (worker logic with real DB/Redis, mocked external services)",
     "e2e: End-to-end tests (full API testing from client perspective)",
 ]
-
-[[tool.mypy.overrides]]
-module = "opentelemetry.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "prometheus_client.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "tests.*"
-disallow_untyped_defs = false
-disable_error_code = ["no-untyped-def", "attr-defined", "arg-type", "return-value", "misc"]

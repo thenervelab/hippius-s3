@@ -18,16 +18,14 @@ import struct
 from abc import ABC
 from abc import abstractmethod
 from typing import AsyncIterator
-from typing import Callable
 from typing import Dict
 from typing import Iterator
 from typing import List
 from typing import Optional
 from typing import Tuple
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # type: ignore[import-not-found]
-from nacl.exceptions import CryptoError  # type: ignore[import-not-found]
-from nacl.secret import SecretBox  # type: ignore[import-not-found]
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from nacl.exceptions import CryptoError
 
 
 class CryptoAdapter(ABC):
@@ -68,203 +66,6 @@ class CryptoAdapter(ABC):
     ) -> bytes:
         """Decrypt a single chunk with AEAD."""
         pass
-
-    @abstractmethod
-    def decrypt_chunk_legacy(
-        self,
-        ciphertext: bytes,
-        *,
-        key: bytes,
-        object_id: str,
-        part_number: int,
-        chunk_index: int,
-    ) -> bytes:
-        """Legacy decrypt path for backward compatibility (no AAD)."""
-        pass
-
-
-class SecretBoxChunkedAdapter(CryptoAdapter):
-    """XSalsa20-Poly1305 adapter using PyNaCl SecretBox with random nonces.
-
-    Suite ID: hip-enc/legacy
-    - Nonce: 24 bytes random (libsodium default, prepended to ciphertext)
-    - MAC: 16 bytes Poly1305
-    - Total overhead: 40 bytes per chunk
-
-    Random nonces prevent nonce reuse on object rewrites without additional state.
-    HKDF/AAD helper methods remain for potential future use with proper AEAD.
-    """
-
-    @property
-    def overhead_per_chunk(self) -> int:
-        return int(SecretBox.NONCE_SIZE + SecretBox.MACBYTES)  # 24 + 16 = 40
-
-    def _derive_nonce_hkdf(
-        self,
-        key: bytes,
-        bucket_id: str,
-        object_id: str,
-        part_number: int,
-        chunk_index: int,
-        upload_id: str,
-    ) -> bytes:
-        """Derive unique nonce via HKDF-like construction using HMAC-SHA256.
-
-        Info string includes all stable identifiers to ensure nonce uniqueness.
-        Uses simple HKDF-Expand-like construction: HMAC(key, info)[0:nonce_size]
-        """
-        info = (
-            f"hippius-chunk:"
-            f"bucket={bucket_id}:"
-            f"object={object_id}:"
-            f"upload={upload_id}:"
-            f"part={part_number}:"
-            f"chunk={chunk_index}"
-        ).encode("utf-8")
-
-        # Simple HKDF-Expand using HMAC-SHA256
-        # PRK=key, Info=info, expand to nonce_size bytes
-        return hmac.new(key, info, hashlib.sha256).digest()[: SecretBox.NONCE_SIZE]
-
-    def _derive_nonce_legacy(
-        self,
-        key: bytes,
-        object_id: str,
-        part_number: int,
-        chunk_index: int,
-    ) -> bytes:
-        """Legacy nonce derivation for backward compatibility."""
-        msg = f"{object_id}:{int(part_number)}:{int(chunk_index)}".encode("utf-8")
-        digest = hmac.new(key, msg, hashlib.sha256).digest()
-        return digest[: SecretBox.NONCE_SIZE]
-
-    def _build_aad(
-        self,
-        bucket_id: str,
-        object_id: str,
-        part_number: int,
-        chunk_index: int,
-        upload_id: str,
-    ) -> bytes:
-        """Build AAD (Additional Authenticated Data) for this chunk.
-
-        AAD is included in MAC computation but not encrypted.
-        Pack as: bucket_id_len | bucket_id | object_id_len | object_id |
-                 upload_id_len | upload_id | part_number (u32) | chunk_index (u32)
-        """
-        parts = []
-        for s in [bucket_id, object_id, upload_id]:
-            s_bytes = s.encode("utf-8")
-            parts.append(struct.pack("<H", len(s_bytes)))
-            parts.append(s_bytes)
-        parts.append(struct.pack("<II", part_number, chunk_index))
-        return b"".join(parts)
-
-    def encrypt_chunk(
-        self,
-        plaintext: bytes,
-        *,
-        key: bytes,
-        bucket_id: str,
-        object_id: str,
-        part_number: int,
-        chunk_index: int,
-        upload_id: str,
-    ) -> bytes:
-        box = SecretBox(key)
-        # Random nonce (prepended to ciphertext automatically by SecretBox)
-        # Prevents nonce reuse on rewrites without any storage overhead
-        ct = box.encrypt(plaintext)
-        return bytes(ct)
-
-    def decrypt_chunk(
-        self,
-        ciphertext: bytes,
-        *,
-        key: bytes,
-        bucket_id: str,
-        object_id: str,
-        part_number: int,
-        chunk_index: int,
-        upload_id: str,
-    ) -> bytes:
-        box = SecretBox(key)
-        # SecretBox.decrypt reads nonce from first 24 bytes, verifies MAC
-        pt = box.decrypt(ciphertext)
-        return bytes(pt)
-
-    def decrypt_chunk_legacy(
-        self,
-        ciphertext: bytes,
-        *,
-        key: bytes,
-        object_id: str,
-        part_number: int,
-        chunk_index: int,
-    ) -> bytes:
-        """Legacy decrypt for data encrypted before HKDF nonces."""
-        box = SecretBox(key)
-        pt = box.decrypt(ciphertext)
-        return bytes(pt)
-
-
-class LegacySecretBoxAdapter(CryptoAdapter):
-    """Legacy whole-part SecretBox adapter.
-
-    Suite ID: hip-enc/legacy
-    """
-
-    @property
-    def overhead_per_chunk(self) -> int:
-        return int(SecretBox.NONCE_SIZE + SecretBox.MACBYTES)
-
-    def encrypt_chunk(
-        self,
-        plaintext: bytes,
-        *,
-        key: bytes,
-        bucket_id: str,
-        object_id: str,
-        part_number: int,
-        chunk_index: int,
-        upload_id: str,
-    ) -> bytes:
-        box = SecretBox(key)
-        ct = box.encrypt(plaintext)
-        return bytes(ct)
-
-    def decrypt_chunk(
-        self,
-        ciphertext: bytes,
-        *,
-        key: bytes,
-        bucket_id: str,
-        object_id: str,
-        part_number: int,
-        chunk_index: int,
-        upload_id: str,
-    ) -> bytes:
-        box = SecretBox(key)
-        return bytes(box.decrypt(ciphertext))
-
-    def decrypt_chunk_legacy(
-        self,
-        ciphertext: bytes,
-        *,
-        key: bytes,
-        object_id: str,
-        part_number: int,
-        chunk_index: int,
-    ) -> bytes:
-        return self.decrypt_chunk(
-            ciphertext,
-            key=key,
-            bucket_id="",
-            object_id=object_id,
-            part_number=part_number,
-            chunk_index=chunk_index,
-            upload_id="",
-        )
 
 
 class AESGCMChunkedAdapter(CryptoAdapter):
@@ -357,18 +158,6 @@ class AESGCMChunkedAdapter(CryptoAdapter):
         aad = self._build_aad(bucket_id, object_id, int(part_number), int(chunk_index), upload_id)
         return bytes(AESGCM(key).decrypt(nonce, body, aad))
 
-    def decrypt_chunk_legacy(
-        self,
-        ciphertext: bytes,
-        *,
-        key: bytes,
-        object_id: str,
-        part_number: int,
-        chunk_index: int,
-    ) -> bytes:
-        # No legacy format for AESGCM suite; keep as strict failure.
-        raise CryptoError("decrypt_failed")
-
 
 class AESGCMChunkedAdapterV2(AESGCMChunkedAdapter):
     """AES-256-GCM adapter variant without upload_id in nonce/AAD.
@@ -423,15 +212,11 @@ class CryptoService:
 
     # Adapter registry
     _ADAPTERS: Dict[str, CryptoAdapter] = {
-        "hip-enc/legacy": LegacySecretBoxAdapter(),
         "hip-enc/aes256gcm": AESGCMChunkedAdapterV2(),
     }
 
     # Default suite for new writes
-    DEFAULT_SUITE_ID = "hip-enc/legacy"
-
-    # Backward compat: exposed for existing code
-    OVERHEAD_PER_CHUNK = SecretBox.NONCE_SIZE + SecretBox.MACBYTES  # 40 bytes
+    DEFAULT_SUITE_ID = "hip-enc/aes256gcm"
 
     @classmethod
     def is_supported_suite_id(cls, suite_id: Optional[str]) -> bool:
@@ -532,86 +317,15 @@ class CryptoService:
         key_bytes = key if key is not None else cls.derive_key_from_seed(seed_phrase)
         adapter = cls.get_adapter(suite_id)
 
-        # Try new path first
-        try:
-            return adapter.decrypt_chunk(
-                ciphertext_chunk,
-                key=key_bytes,
-                bucket_id=bucket_id,
-                object_id=object_id,
-                part_number=part_number,
-                chunk_index=chunk_index,
-                upload_id=upload_id,
-            )
-        except Exception:
-            # Fall back to legacy path
-            try:
-                return adapter.decrypt_chunk_legacy(
-                    ciphertext_chunk,
-                    key=key_bytes,
-                    object_id=object_id,
-                    part_number=part_number,
-                    chunk_index=chunk_index,
-                )
-            except Exception as exc:
-                raise CryptoError("decrypt_failed") from exc
-
-    @classmethod
-    def decrypt_part_auto(
-        cls,
-        ciphertext: bytes,
-        *,
-        seed_phrase: str,
-        object_id: str,
-        part_number: int,
-        chunk_count: Optional[int] = None,
-        chunk_loader: Optional[Callable[[int], bytes]] = None,
-        bucket_id: str = "",
-        upload_id: str = "",
-        suite_id: Optional[str] = None,
-    ) -> bytes:
-        """Decrypt a part that may be whole-part or chunked.
-
-        Tries whole-part decrypt first (legacy), then per-chunk decrypt.
-        """
-        key = cls.derive_key_from_seed(seed_phrase)
-
-        # Try whole-part decrypt first (legacy sealed box)
-        try:
-            legacy_adapter = cls.get_adapter("hip-enc/legacy")
-            return legacy_adapter.decrypt_chunk(
-                ciphertext,
-                key=key,
-                bucket_id=bucket_id,
-                object_id=object_id,
-                part_number=part_number,
-                chunk_index=0,
-                upload_id=upload_id,
-            )
-        except Exception:
-            pass
-
-        # Fall back to per-chunk decrypt if loader provided
-        if chunk_count is not None and chunk_loader is not None:
-            out: list[bytes] = []
-            for ci in range(int(chunk_count)):
-                ct = chunk_loader(ci)
-                if not isinstance(ct, (bytes, bytearray)):
-                    raise CryptoError("missing_chunk")
-                pt = cls.decrypt_chunk(
-                    ct,
-                    seed_phrase=seed_phrase,
-                    object_id=object_id,
-                    part_number=part_number,
-                    chunk_index=ci,
-                    bucket_id=bucket_id,
-                    upload_id=upload_id,
-                    suite_id=suite_id,
-                )
-                out.append(pt)
-            return b"".join(out)
-
-        raise CryptoError("decrypt_failed")
+        return adapter.decrypt_chunk(
+            ciphertext_chunk,
+            key=key_bytes,
+            bucket_id=bucket_id,
+            object_id=object_id,
+            part_number=part_number,
+            chunk_index=chunk_index,
+            upload_id=upload_id,
+        )
 
     @classmethod
     def decrypt_stream(

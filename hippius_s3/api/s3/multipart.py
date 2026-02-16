@@ -330,7 +330,7 @@ async def initiate_multipart_upload(
 
 async def get_all_cached_chunks(
     object_id: str,
-    redis_client: Redis,  # type: ignore[type-arg]
+    redis_client: Redis,
 ) -> list[Any]:
     """Find all cached part meta keys for an object using non-blocking SCAN."""
     try:
@@ -449,7 +449,7 @@ async def upload_part(
         except Exception:
             return s3_error_response("InternalError", "Reader pipeline unavailable", status_code=500)
 
-        object_id_str = str(source_obj["object_id"])  # type: ignore[index]
+        object_id_str = str(source_obj["object_id"])
         src_ver = int(source_obj.get("object_version") or 1)
         parts = await read_parts_list(db, object_id_str, src_ver)
         rng = None
@@ -496,9 +496,7 @@ async def upload_part(
                             )
                     if not chunk_specs:
                         continue
-                    dl_parts.append(
-                        PartToDownload(part_number=int(pn), chunks=chunk_specs)  # type: ignore[arg-type]
-                    )
+                    dl_parts.append(PartToDownload(part_number=int(pn), chunks=chunk_specs))
                 except Exception:
                     continue
             req = DownloadChainRequest(
