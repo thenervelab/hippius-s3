@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cachet
+  namespace: monitoring
+  labels:
+    app: cachet
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cachet
+  template:
+    metadata:
+      labels:
+        app: cachet
+    spec:
+      containers:
+        - name: cachet
+          image: cachethq/docker:2.4
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: cachet-config
+            - secretRef:
+                name: cachet-secrets
+          volumeMounts:
+            - name: cachet-sqlite
+              mountPath: /var/www/html/database
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "250m"
+      volumes:
+        - name: cachet-sqlite
+          persistentVolumeClaim:
+            claimName: cachet-sqlite

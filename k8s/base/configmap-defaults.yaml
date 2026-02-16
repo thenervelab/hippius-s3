@@ -46,7 +46,7 @@ data:
   API_DB_POOL_MAX_QUERIES: "50000"
   API_DB_POOL_MAX_INACTIVE_LIFETIME: "300"
   API_DB_POOL_COMMAND_TIMEOUT: "30"
-  CACHET_API_URL: "https://status.hippius.com"
+  CACHET_API_URL: "http://cachet.monitoring.svc.cluster.local"
   BACKUP_INTERVAL_HOURS: "24"
   BACKUP_RETENTION_COUNT: "30"
   HIPPIUS_API_BASE_URL: "https://api.hippius.com/api"

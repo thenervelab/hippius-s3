@@ -75,6 +75,9 @@ helm upgrade --install grafana grafana/grafana \
   -f "$SCRIPT_DIR/values/grafana.yaml" \
   --set adminPassword="$GRAFANA_ADMIN_PASSWORD"
 
+echo "--- Installing Cachet ---"
+kubectl apply -f "$SCRIPT_DIR/cachet/"
+
 echo ""
 echo "=== Installation complete ==="
 echo ""
@@ -83,6 +86,7 @@ echo "  kubectl -n $NAMESPACE port-forward svc/prometheus-server 9090:80"
 echo "  kubectl -n $NAMESPACE port-forward svc/loki 3100:3100"
 echo "  kubectl -n $NAMESPACE port-forward svc/tempo 3200:3200"
 echo "  kubectl -n $NAMESPACE port-forward svc/grafana 3000:80"
+echo "  kubectl -n $NAMESPACE port-forward svc/cachet 8080:80"
 echo ""
 echo "Don't forget to re-apply kustomize for OTel Collector + NetworkPolicy updates:"
 echo "  kubectl apply -k k8s/staging/"
