@@ -91,9 +91,12 @@ def classify_error(error: Exception) -> str:
             "503",
             "502",
             "504",
+            "404",
+            "not found",
             "unavailable",
             "throttled",
             "rate limit",
+            "429",
             "part_meta_not_ready",
             "part_row_missing",
         ]
