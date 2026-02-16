@@ -83,6 +83,13 @@ spec:
       labels:
         app: redis-cluster
     spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: redis-cluster
       containers:
         - name: redis
           image: redis:7.2
