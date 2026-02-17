@@ -49,8 +49,19 @@ async def input_validation_middleware(
     ]:
         return await call_next(request)
 
-    # Validate bucket name if present
-    if len(path_parts) >= 1 and path_parts[0]:
+    # Validate bucket name only on CreateBucket (PUT /{bucket} with no object key and no
+    # tagging/lifecycle/policy query params). Existing buckets with non-compliant names
+    # (uppercase, SS58 addresses, etc.) must remain accessible for all other operations.
+    is_create_bucket = (
+        request.method == "PUT"
+        and len(path_parts) == 1
+        and path_parts[0]
+        and "tagging" not in request.query_params
+        and "lifecycle" not in request.query_params
+        and "policy" not in request.query_params
+    )
+
+    if is_create_bucket:
         bucket_name = path_parts[0]
 
         # Length check
