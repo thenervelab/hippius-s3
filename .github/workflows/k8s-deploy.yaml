@@ -228,6 +228,11 @@ jobs:
           kubectl rollout status deployment/ipfs-uploader -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/arion-uploader -n hippius-s3-staging --timeout=10m
 
+      - name: Restart external deployments
+        run: |
+          kubectl rollout restart deployment/hydrator -n hippius-s3-staging --ignore-not-found || true
+          kubectl rollout restart deployment/backup -n hippius-s3-staging --ignore-not-found || true
+
       - name: Verify deployment
         run: |
           kubectl get pods -n hippius-s3-staging
@@ -350,6 +355,11 @@ jobs:
           kubectl rollout status deployment/arion-downloader -n hippius-s3-prod --timeout=10m
           kubectl rollout status deployment/ipfs-uploader -n hippius-s3-prod --timeout=10m
           kubectl rollout status deployment/arion-uploader -n hippius-s3-prod --timeout=10m
+
+      - name: Restart external deployments
+        run: |
+          kubectl rollout restart deployment/hydrator -n hippius-s3-prod --ignore-not-found || true
+          kubectl rollout restart deployment/backup -n hippius-s3-prod --ignore-not-found || true
 
       - name: Verify deployment
         run: |
