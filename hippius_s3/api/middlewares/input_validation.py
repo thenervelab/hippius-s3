@@ -6,6 +6,7 @@ from typing import Callable
 
 from fastapi import Request
 from fastapi import Response
+from substrateinterface.utils.ss58 import is_valid_ss58_address
 
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.config import get_config
@@ -78,47 +79,50 @@ async def input_validation_middleware(
                 status_code=400,
             )
 
-        # Character and format validation
-        if not BUCKET_NAME_PATTERN.match(bucket_name):
-            return s3_error_response(
-                code="InvalidBucketName",
-                message="Bucket name contains invalid characters or format",
-                status_code=400,
-            )
-
-        # Check for adjacent periods
-        if ".." in bucket_name:
-            return s3_error_response(
-                code="InvalidBucketName",
-                message="Bucket name cannot contain adjacent periods",
-                status_code=400,
-            )
-
-        # Check if formatted like IP address
-        if IP_ADDRESS_PATTERN.match(bucket_name):
-            return s3_error_response(
-                code="InvalidBucketName",
-                message="Bucket name cannot be formatted like an IP address",
-                status_code=400,
-            )
-
-        # Check prohibited prefixes
-        for prefix in PROHIBITED_BUCKET_PREFIXES:
-            if bucket_name.startswith(prefix):
+        # SS58 addresses bypass format checks — ownership is verified downstream
+        # in bucket_create_endpoint.py
+        if not is_valid_ss58_address(bucket_name):
+            # Character and format validation
+            if not BUCKET_NAME_PATTERN.match(bucket_name):
                 return s3_error_response(
                     code="InvalidBucketName",
-                    message=f"Bucket name cannot start with '{prefix}'",
+                    message="Bucket name contains invalid characters or format",
                     status_code=400,
                 )
 
-        # Check prohibited suffixes
-        for suffix in PROHIBITED_BUCKET_SUFFIXES:
-            if bucket_name.endswith(suffix):
+            # Check for adjacent periods
+            if ".." in bucket_name:
                 return s3_error_response(
                     code="InvalidBucketName",
-                    message=f"Bucket name cannot end with '{suffix}'",
+                    message="Bucket name cannot contain adjacent periods",
                     status_code=400,
                 )
+
+            # Check if formatted like IP address
+            if IP_ADDRESS_PATTERN.match(bucket_name):
+                return s3_error_response(
+                    code="InvalidBucketName",
+                    message="Bucket name cannot be formatted like an IP address",
+                    status_code=400,
+                )
+
+            # Check prohibited prefixes
+            for prefix in PROHIBITED_BUCKET_PREFIXES:
+                if bucket_name.startswith(prefix):
+                    return s3_error_response(
+                        code="InvalidBucketName",
+                        message=f"Bucket name cannot start with '{prefix}'",
+                        status_code=400,
+                    )
+
+            # Check prohibited suffixes
+            for suffix in PROHIBITED_BUCKET_SUFFIXES:
+                if bucket_name.endswith(suffix):
+                    return s3_error_response(
+                        code="InvalidBucketName",
+                        message=f"Bucket name cannot end with '{suffix}'",
+                        status_code=400,
+                    )
 
     # Validate object key if present
     if len(path_parts) >= 2:

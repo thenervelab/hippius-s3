@@ -47,12 +47,48 @@ def bucket_app() -> Any:
 
 
 @pytest.mark.asyncio
-async def test_create_bucket_rejects_ss58_address(bucket_app: Any) -> None:
+async def test_create_bucket_rejects_other_users_ss58_address(bucket_app: Any) -> None:
     ss58_bucket = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 
     async with AsyncClient(transport=ASGITransport(app=bucket_app), base_url="http://test") as client:
         response = await client.put(f"/{ss58_bucket}")
 
-    assert response.status_code == 400
-    assert "InvalidBucketName" in response.text
+    assert response.status_code == 403
+    assert "AccessDenied" in response.text
     assert "SS58" in response.text
+
+
+@pytest.mark.asyncio
+async def test_create_bucket_allows_own_ss58_address() -> None:
+    ss58_bucket = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+
+    app = FastAPI()
+    app.include_router(router)
+
+    @app.middleware("http")
+    async def inject_account(request: Request, call_next: Any) -> Any:
+        request.state.account = HippiusAccount(
+            id="test-subaccount",
+            main_account=ss58_bucket,
+            upload=True,
+            delete=True,
+            has_credits=True,
+        )
+        return await call_next(request)
+
+    @asynccontextmanager
+    async def dummy_transaction() -> Any:
+        yield
+
+    async def override_get_postgres() -> Any:
+        mock_db = AsyncMock()
+        mock_db.transaction = dummy_transaction
+        mock_db.fetchrow = AsyncMock()
+        yield mock_db
+
+    app.dependency_overrides[get_postgres] = override_get_postgres
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put(f"/{ss58_bucket}")
+
+    assert response.status_code == 200

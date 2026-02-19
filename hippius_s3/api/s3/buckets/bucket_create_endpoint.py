@@ -176,12 +176,14 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
     # Handle standard bucket creation if not a tagging, lifecycle, or policy request
     else:
         if is_valid_ss58_address(bucket_name):
-            return errors.s3_error_response(
-                "InvalidBucketName",
-                "Bucket names matching SS58 addresses are reserved",
-                status_code=400,
-                BucketName=bucket_name,
-            )
+            main_account_id = request.state.account.main_account
+            if bucket_name != main_account_id:
+                return errors.s3_error_response(
+                    "AccessDenied",
+                    "You are not allowed to create this bucket, you can only create a bucket of your own SS58 account address",
+                    status_code=403,
+                    BucketName=bucket_name,
+                )
         try:
             bucket_id = str(uuid.uuid4())
             created_at = datetime.now(timezone.utc)
