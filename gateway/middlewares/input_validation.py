@@ -1,5 +1,10 @@
-"""Input validation middleware for S3 operations."""
+"""Input validation middleware for S3 operations.
 
+Validates bucket names, object keys, and metadata headers at the gateway
+level before body streaming begins, saving bandwidth on invalid requests.
+"""
+
+import logging
 import re
 from typing import Awaitable
 from typing import Callable
@@ -8,10 +13,11 @@ from fastapi import Request
 from fastapi import Response
 from substrateinterface.utils.ss58 import is_valid_ss58_address
 
-from hippius_s3.api.s3.errors import s3_error_response
-from hippius_s3.config import get_config
+from gateway.config import get_config
+from gateway.utils.errors import s3_error_response
 
 
+logger = logging.getLogger(__name__)
 config = get_config()
 
 # S3 bucket name validation (AWS S3 compatible)
@@ -25,11 +31,13 @@ OBJECT_KEY_AVOID_CHARS = (
     ["\\", "{", "}", "^", "%", "`", "[", "]", '"', "<", ">", "~", "#", "|"]
     + [chr(i) for i in range(0, 32)]
     + [chr(127)]
-)  # Non-printable ASCII
+)
 
 # Prohibited bucket name prefixes and suffixes (AWS S3 standard)
 PROHIBITED_BUCKET_PREFIXES = ["xn--", "sthree-", "amzn-s3-demo-"]
 PROHIBITED_BUCKET_SUFFIXES = ["-s3alias", "--ol-s3", ".mrap", "--x-s3", "--table-s3"]
+
+SKIP_PREFIXES = {"health", "user", "docs", "robots.txt", "openapi.json"}
 
 
 async def input_validation_middleware(
@@ -41,13 +49,7 @@ async def input_validation_middleware(
     path_parts = request.url.path.strip("/").split("/")
 
     # Skip validation for non-S3 endpoints
-    if path_parts[0] in [
-        "user",
-        "health",
-        "robots.txt",
-        "docs",
-        "openapi.json",
-    ]:
+    if path_parts[0] in SKIP_PREFIXES:
         return await call_next(request)
 
     # Validate bucket name only on CreateBucket (PUT /{bucket} with no object key and no
@@ -128,11 +130,15 @@ async def input_validation_middleware(
     if len(path_parts) >= 2:
         object_key = "/".join(path_parts[1:])
 
-        # Length check (max 1024 bytes for UTF-8)
-        if len(object_key.encode("utf-8")) > config.max_object_key_length:
+        # Length check (max bytes for UTF-8)
+        key_bytes = len(object_key.encode("utf-8"))
+        if key_bytes > config.max_object_key_length:
+            logger.warning(
+                f"Object key rejected at gateway: {key_bytes} bytes exceeds limit of {config.max_object_key_length}"
+            )
             return s3_error_response(
                 code="KeyTooLongError",
-                message="Object key too long (maximum 1024 bytes)",
+                message=f"Object key too long (maximum {config.max_object_key_length} bytes)",
                 status_code=400,
             )
 
@@ -140,6 +146,7 @@ async def input_validation_middleware(
         for char in OBJECT_KEY_AVOID_CHARS:
             if char in object_key:
                 char_desc = repr(char) if ord(char) >= 32 else f"ASCII-{ord(char)}"
+                logger.warning(f"Object key rejected at gateway: contains discouraged character {char_desc}")
                 return s3_error_response(
                     code="InvalidArgument",
                     message=f"Object key contains discouraged character: {char_desc}",
