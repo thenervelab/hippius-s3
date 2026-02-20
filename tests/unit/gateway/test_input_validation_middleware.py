@@ -9,7 +9,7 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from hippius_s3.api.middlewares.input_validation import input_validation_middleware
+from gateway.middlewares.input_validation import input_validation_middleware
 
 
 @pytest.fixture

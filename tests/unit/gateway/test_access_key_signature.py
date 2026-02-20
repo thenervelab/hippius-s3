@@ -35,6 +35,9 @@ def make_request(
     return Request(scope)
 
 
+mock_redis = AsyncMock()
+
+
 @pytest.mark.asyncio
 async def test_access_key_signature_uses_raw_path_for_canonical_path() -> None:
     """
@@ -75,11 +78,6 @@ async def test_access_key_signature_uses_raw_path_for_canonical_path() -> None:
     mock_token_response.encrypted_secret = "enc"
     mock_token_response.nonce = "nonce"
 
-    mock_api_client = AsyncMock()
-    mock_api_client.__aenter__ = AsyncMock(return_value=mock_api_client)
-    mock_api_client.__aexit__ = AsyncMock()
-    mock_api_client.auth = AsyncMock(return_value=mock_token_response)
-
     captured_path: str | None = None
 
     async def fake_create_canonical_request(
@@ -93,17 +91,17 @@ async def test_access_key_signature_uses_raw_path_for_canonical_path() -> None:
         captured_path = path
         return "canonical"
 
-    with patch("gateway.middlewares.access_key_auth.HippiusApiClient", return_value=mock_api_client):
+    with patch(
+        "gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=mock_token_response
+    ):
         with patch("gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"):
             with patch(
                 "gateway.middlewares.access_key_auth.create_canonical_request",
                 new=fake_create_canonical_request,
             ):
-                with patch(
-                    "gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"
-                ):
+                with patch("gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"):
                     is_valid, out_account, out_token_type = await verify_access_key_signature(
-                        request, access_key
+                        request, access_key, mock_redis
                     )
 
     assert is_valid is True
@@ -149,12 +147,9 @@ async def test_access_key_signature_raises_when_raw_path_missing() -> None:
     mock_token_response.encrypted_secret = "enc"
     mock_token_response.nonce = "nonce"
 
-    mock_api_client = AsyncMock()
-    mock_api_client.__aenter__ = AsyncMock(return_value=mock_api_client)
-    mock_api_client.__aexit__ = AsyncMock()
-    mock_api_client.auth = AsyncMock(return_value=mock_token_response)
-
-    with patch("gateway.middlewares.access_key_auth.HippiusApiClient", return_value=mock_api_client):
+    with patch(
+        "gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=mock_token_response
+    ):
         with patch("gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"):
             with pytest.raises(RuntimeError):
-                await verify_access_key_signature(request, access_key)
+                await verify_access_key_signature(request, access_key, mock_redis)

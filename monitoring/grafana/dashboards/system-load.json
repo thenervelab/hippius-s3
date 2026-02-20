@@ -419,25 +419,27 @@
               "thresholds": {
                 "steps": [
                   { "color": "green", "value": null },
-                  { "color": "yellow", "value": 10000 },
-                  { "color": "red", "value": 50000 }
+                  { "color": "yellow", "value": 70 },
+                  { "color": "red", "value": 85 }
                 ]
               },
-              "unit": "short"
+              "min": 0,
+              "max": 100,
+              "unit": "percent"
             },
             "overrides": []
           },
           "gridPos": { "h": 8, "w": 6, "x": 12, "y": 22 },
           "id": 53,
-          "options": { "colorMode": "background", "graphMode": "none", "textMode": "auto" },
+          "options": { "showThresholdLabels": false, "showThresholdMarkers": true },
           "targets": [
             {
-              "expr": "fs_store_parts_on_disk{service_namespace=\"$namespace\"}",
-              "legendFormat": "parts"
+              "expr": "fs_cache_disk_used_bytes{service_namespace=\"$namespace\"} / fs_cache_disk_total_bytes{service_namespace=\"$namespace\"} * 100",
+              "legendFormat": "disk usage"
             }
           ],
-          "title": "FS cache parts",
-          "type": "stat"
+          "title": "Cache disk usage",
+          "type": "gauge"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -447,11 +449,11 @@
               "thresholds": {
                 "steps": [
                   { "color": "green", "value": null },
-                  { "color": "yellow", "value": 24 },
-                  { "color": "red", "value": 72 }
+                  { "color": "yellow", "value": 10000 },
+                  { "color": "red", "value": 50000 }
                 ]
               },
-              "unit": "h"
+              "unit": "short"
             },
             "overrides": []
           },
@@ -460,11 +462,11 @@
           "options": { "colorMode": "background", "graphMode": "none", "textMode": "auto" },
           "targets": [
             {
-              "expr": "fs_store_oldest_age_seconds{service_namespace=\"$namespace\"} / 3600",
-              "legendFormat": "oldest"
+              "expr": "fs_store_parts_on_disk{service_namespace=\"$namespace\"}",
+              "legendFormat": "parts"
             }
           ],
-          "title": "FS cache oldest",
+          "title": "Cache parts on disk",
           "type": "stat"
         }
       ],
@@ -523,44 +525,73 @@
           "fieldConfig": {
             "defaults": {
               "color": { "mode": "palette-classic" },
-              "custom": { "fillOpacity": 10 },
+              "custom": { "fillOpacity": 30, "stacking": { "mode": "normal" } },
               "unit": "short"
             },
-            "overrides": []
+            "overrides": [
+              { "matcher": { "id": "byName", "options": "0-1h" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
+              { "matcher": { "id": "byName", "options": "1-6h" }, "properties": [{ "id": "color", "value": { "fixedColor": "light-green", "mode": "fixed" } }] },
+              { "matcher": { "id": "byName", "options": "6-24h" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] },
+              { "matcher": { "id": "byName", "options": "1-3d" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
+              { "matcher": { "id": "byName", "options": "3-7d" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
+              { "matcher": { "id": "byName", "options": "7d+" }, "properties": [{ "id": "color", "value": { "fixedColor": "dark-red", "mode": "fixed" } }] }
+            ]
           },
           "gridPos": { "h": 8, "w": 8, "x": 8, "y": 23 },
           "id": 62,
-          "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+          "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
           "targets": [
             {
-              "expr": "fs_store_parts_on_disk{service_namespace=\"$namespace\"}",
-              "legendFormat": "parts on disk"
-            },
-            {
-              "expr": "fs_store_oldest_age_seconds{service_namespace=\"$namespace\"} / 3600",
-              "legendFormat": "oldest part (hours)"
+              "expr": "fs_cache_age_bucket_parts{service_namespace=\"$namespace\"}",
+              "legendFormat": "{{age_bucket}}"
             }
           ],
-          "title": "FS cache trend",
+          "title": "Cache age distribution",
           "type": "timeseries"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
           "fieldConfig": {
-            "defaults": { "color": { "mode": "palette-classic" } },
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "fillOpacity": 10 },
+              "unit": "percent"
+            },
             "overrides": []
           },
-          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 23 },
+          "gridPos": { "h": 8, "w": 4, "x": 16, "y": 23 },
           "id": 63,
-          "options": { "legend": { "displayMode": "list", "placement": "right" }, "tooltip": { "mode": "multi" }, "pieType": "donut" },
+          "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
           "targets": [
             {
-              "expr": "sum by (status_code) (increase(http_requests_total{service_namespace=\"$namespace\", handler=~\"gateway.*\"}[1h]))",
-              "legendFormat": "{{status_code}}"
+              "expr": "fs_cache_disk_used_bytes{service_namespace=\"$namespace\"} / fs_cache_disk_total_bytes{service_namespace=\"$namespace\"} * 100",
+              "legendFormat": "disk usage %"
             }
           ],
-          "title": "Gateway status codes (1h)",
-          "type": "piechart"
+          "title": "Cache disk usage trend",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "fillOpacity": 10 },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 4, "x": 20, "y": 23 },
+          "id": 64,
+          "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+          "targets": [
+            {
+              "expr": "rate(fs_janitor_deleted_total{service_namespace=\"$namespace\"}[10m])",
+              "legendFormat": "GC rate"
+            }
+          ],
+          "title": "GC rate",
+          "type": "timeseries"
         }
       ],
       "title": "Service Health",

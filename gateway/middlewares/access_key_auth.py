@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import datetime
 import hashlib
 import hmac
@@ -5,6 +7,7 @@ import logging
 import re
 
 from fastapi import Request
+from redis.asyncio import Redis
 
 from gateway.config import get_config
 from gateway.middlewares.sigv4 import calculate_signature
@@ -13,9 +16,8 @@ from gateway.middlewares.sigv4 import canonicalize_presigned_query_string
 from gateway.middlewares.sigv4 import create_canonical_request
 from gateway.middlewares.sigv4 import extract_signature_from_auth_header
 from gateway.middlewares.sigv4 import extract_signed_headers
+from gateway.services.auth_cache import cached_auth
 from gateway.services.auth_service import decrypt_secret
-from hippius_s3.services.hippius_api_service import HippiusApiClient
-from hippius_s3.services.hippius_api_service import HippiusAPIError
 
 
 logger = logging.getLogger(__name__)
@@ -33,6 +35,7 @@ ACCESS_KEY_PATTERN = re.compile(r"^hip_[a-zA-Z0-9_-]{1,240}$")
 async def verify_access_key_signature(
     request: Request,
     access_key: str,
+    redis_client: "Redis",
 ) -> tuple[bool, str, str]:
     """
     Verify AWS SigV4 signature using access key authentication.
@@ -40,6 +43,7 @@ async def verify_access_key_signature(
     Args:
         request: FastAPI request object
         access_key: Access key ID (starts with hip_)
+        redis_client: Redis client for auth caching
 
     Returns:
         (is_valid, account_address, token_type)
@@ -58,12 +62,7 @@ async def verify_access_key_signature(
     provided_signature = extract_signature_from_auth_header(auth_header)
     signed_headers = extract_signed_headers(auth_header)
 
-    try:
-        async with HippiusApiClient() as api_client:
-            token_response = await api_client.auth(access_key)
-    except HippiusAPIError as e:
-        logger.error(f"Hippius API error during auth: {e}")
-        raise AccessKeyAuthError(f"API authentication failed: {e}") from e
+    token_response = await cached_auth(access_key, redis_client)
 
     if not token_response.valid or token_response.status != "active":
         logger.warning(f"Invalid or inactive access key: {access_key[:8]}***, status={token_response.status}")
@@ -142,6 +141,7 @@ async def verify_access_key_signature(
 async def verify_access_key_presigned_url(
     request: Request,
     access_key: str,
+    redis_client: "Redis",
 ) -> tuple[bool, str, str]:
     """
     Verify AWS SigV4 query-string (presigned URL) signature using access key authentication.
@@ -149,6 +149,7 @@ async def verify_access_key_presigned_url(
     Args:
         request: FastAPI request object
         access_key: Access key ID (starts with hip_)
+        redis_client: Redis client for auth caching
 
     Returns:
         (is_valid, account_address, token_type)
@@ -228,12 +229,7 @@ async def verify_access_key_presigned_url(
         logger.error("Presigned URL missing required 'host' header in X-Amz-SignedHeaders")
         raise AccessKeyAuthError("Invalid signed headers")
 
-    try:
-        async with HippiusApiClient() as api_client:
-            token_response = await api_client.auth(access_key)
-    except HippiusAPIError as e:
-        logger.error(f"Hippius API error during presigned URL auth: {e}")
-        raise AccessKeyAuthError(f"API authentication failed: {e}") from e
+    token_response = await cached_auth(access_key, redis_client)
 
     if not token_response.valid or token_response.status != "active":
         logger.warning(
