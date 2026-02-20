@@ -155,7 +155,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             app.state.redis_chain_client,
             app.state.redis_rate_limiting_client,
             app.state.redis_queues_client,
-            object_cache_dir=config.object_cache_dir,
         )
         await app.state.background_metrics_collector.start()
         logger.info("Background metrics collection started")
