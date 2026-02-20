@@ -1,6 +1,9 @@
 import asyncio
 import contextlib
 import logging
+import os
+import time
+from pathlib import Path
 from typing import Optional
 from typing import Union
 
@@ -24,6 +27,7 @@ class BackgroundMetricsCollector:
         redis_chain_client: Optional[Redis] = None,
         redis_rate_limiting_client: Optional[Redis] = None,
         redis_queues_client: Optional[Redis] = None,
+        object_cache_dir: Optional[str] = None,
     ):
         self.metrics_collector = metrics_collector
         self.redis_client = redis_client
@@ -31,8 +35,10 @@ class BackgroundMetricsCollector:
         self.redis_chain_client = redis_chain_client
         self.redis_rate_limiting_client = redis_rate_limiting_client
         self.redis_queues_client = redis_queues_client
+        self.object_cache_dir = Path(object_cache_dir) if object_cache_dir else None
         self.running = False
         self._task: Optional[asyncio.Task] = None
+        self._fs_collect_counter = 0
 
     async def start(self) -> None:
         """Start the background metrics collection task."""
@@ -57,6 +63,10 @@ class BackgroundMetricsCollector:
         while self.running:
             try:
                 await self._collect_redis_metrics()
+                # Collect FS cache stats every ~60s (every 6th iteration of the 10s loop)
+                self._fs_collect_counter += 1
+                if self._fs_collect_counter % 6 == 0:
+                    await asyncio.to_thread(self._collect_fs_cache_metrics)
                 await asyncio.sleep(10)  # Collect metrics every 10 seconds
             except asyncio.CancelledError:
                 break
@@ -104,3 +114,20 @@ class BackgroundMetricsCollector:
 
         except Exception as e:
             logger.error(f"Failed to collect Redis metrics: {e}")
+
+    def _collect_fs_cache_metrics(self) -> None:
+        """Collect filesystem cache stats (runs in thread to avoid blocking)."""
+        if not self.object_cache_dir or not self.object_cache_dir.is_dir():
+            return
+        parts_count = 0
+        oldest_mtime = None
+        for entry in os.scandir(self.object_cache_dir):
+            if entry.is_dir():
+                parts_count += 1
+                mtime = entry.stat().st_mtime
+                if oldest_mtime is None or mtime < oldest_mtime:
+                    oldest_mtime = mtime
+        self.metrics_collector.set_fs_store_parts_on_disk(parts_count)
+        age = max(0.0, time.time() - oldest_mtime) if oldest_mtime is not None else 0.0
+        self.metrics_collector.set_fs_store_oldest_age_seconds(age)
+        logger.debug(f"FS cache metrics: parts={parts_count} oldest_age={age:.0f}s")

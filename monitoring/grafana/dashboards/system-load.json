@@ -117,29 +117,23 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
-          "thresholds": {
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 1 },
-              { "color": "red", "value": 10 }
-            ]
-          },
+          "color": { "mode": "palette-classic" },
+          "custom": { "fillOpacity": 30, "stacking": { "mode": "normal" } },
           "unit": "ops"
         },
         "overrides": []
       },
       "gridPos": { "h": 8, "w": 6, "x": 18, "y": 1 },
       "id": 5,
-      "options": { "colorMode": "background", "graphMode": "area", "textMode": "auto" },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "targets": [
         {
-          "expr": "sum(rate(s3_errors_total{service_namespace=\"$namespace\"}[5m]))",
-          "legendFormat": "errors/s"
+          "expr": "sum by (error_type) (rate(s3_errors_total{service_namespace=\"$namespace\"}[5m]))",
+          "legendFormat": "{{error_type}}"
         }
       ],
-      "title": "Error rate",
-      "type": "stat"
+      "title": "S3 errors/s (4xx/5xx)",
+      "type": "timeseries"
     },
     {
       "collapsed": false,
@@ -369,29 +363,31 @@
           "datasource": { "type": "prometheus", "uid": "prometheus" },
           "fieldConfig": {
             "defaults": {
-              "color": { "mode": "thresholds" },
-              "thresholds": {
-                "steps": [
-                  { "color": "green", "value": null },
-                  { "color": "yellow", "value": 70 },
-                  { "color": "red", "value": 90 }
-                ]
-              },
-              "unit": "percent"
+              "color": { "mode": "palette-classic" },
+              "custom": { "fillOpacity": 10 },
+              "unit": "short"
             },
             "overrides": []
           },
           "gridPos": { "h": 8, "w": 6, "x": 0, "y": 22 },
           "id": 51,
-          "options": { "colorMode": "background", "graphMode": "area", "textMode": "auto" },
+          "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
           "targets": [
             {
-              "expr": "db_pool_used_connections{service_namespace=\"$namespace\"} / db_pool_size{service_namespace=\"$namespace\"} * 100",
-              "legendFormat": "pool usage %"
+              "expr": "db_pool_size{service_namespace=\"$namespace\"}",
+              "legendFormat": "pool size"
+            },
+            {
+              "expr": "db_pool_used_connections{service_namespace=\"$namespace\"}",
+              "legendFormat": "used"
+            },
+            {
+              "expr": "db_pool_free_connections{service_namespace=\"$namespace\"}",
+              "legendFormat": "free"
             }
           ],
-          "title": "DB pool usage",
-          "type": "gauge"
+          "title": "DB pool connections",
+          "type": "timeseries"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -404,7 +400,7 @@
           "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
           "targets": [
             {
-              "expr": "redis_memory_used_bytes{service_namespace=\"$namespace\"}",
+              "expr": "avg_over_time(redis_memory_used_bytes{service_namespace=\"$namespace\"}[2m])",
               "legendFormat": "used"
             },
             {
@@ -526,29 +522,27 @@
           "datasource": { "type": "prometheus", "uid": "prometheus" },
           "fieldConfig": {
             "defaults": {
-              "color": { "mode": "thresholds" },
-              "thresholds": {
-                "steps": [
-                  { "color": "green", "value": null },
-                  { "color": "yellow", "value": 24 },
-                  { "color": "red", "value": 72 }
-                ]
-              },
-              "unit": "h"
+              "color": { "mode": "palette-classic" },
+              "custom": { "fillOpacity": 10 },
+              "unit": "short"
             },
             "overrides": []
           },
           "gridPos": { "h": 8, "w": 8, "x": 8, "y": 23 },
           "id": 62,
-          "options": { "colorMode": "background", "graphMode": "none", "textMode": "auto" },
+          "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
           "targets": [
             {
-              "expr": "(time() - backup_last_success_timestamp{service_namespace=\"$namespace\"} > 0) / 3600",
-              "legendFormat": "hours ago"
+              "expr": "fs_store_parts_on_disk{service_namespace=\"$namespace\"}",
+              "legendFormat": "parts on disk"
+            },
+            {
+              "expr": "fs_store_oldest_age_seconds{service_namespace=\"$namespace\"} / 3600",
+              "legendFormat": "oldest part (hours)"
             }
           ],
-          "title": "Last backup",
-          "type": "stat"
+          "title": "FS cache trend",
+          "type": "timeseries"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
