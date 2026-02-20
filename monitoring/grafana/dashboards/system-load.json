@@ -17,6 +17,24 @@
   "graphTooltip": 1,
   "id": null,
   "links": [],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": true, "text": "hippius-s3-prod", "value": "hippius-s3-prod" },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Namespace",
+        "multi": false,
+        "name": "namespace",
+        "options": [
+          { "selected": true, "text": "hippius-s3-prod", "value": "hippius-s3-prod" },
+          { "selected": false, "text": "hippius-s3-staging", "value": "hippius-s3-staging" }
+        ],
+        "query": "hippius-s3-prod,hippius-s3-staging",
+        "type": "custom"
+      }
+    ]
+  },
   "panels": [
     {
       "collapsed": false,
@@ -41,7 +59,7 @@
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "targets": [
         {
-          "expr": "sum by (status_code) (rate(http_requests_total{handler=~\"gateway.*\"}[5m]))",
+          "expr": "sum by (status_code) (rate(http_requests_total{service_namespace=\"$namespace\", handler=~\"gateway.*\"}[5m]))",
           "legendFormat": "{{status_code}}"
         }
       ],
@@ -63,7 +81,7 @@
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "targets": [
         {
-          "expr": "sum by (status_code) (rate(http_requests_total{handler!~\"gateway.*\"}[5m]))",
+          "expr": "sum by (status_code) (rate(http_requests_total{service_namespace=\"$namespace\", handler!~\"gateway.*\"}[5m]))",
           "legendFormat": "{{status_code}}"
         }
       ],
@@ -84,11 +102,11 @@
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{handler=~\"gateway.*\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service_namespace=\"$namespace\", handler=~\"gateway.*\"}[5m])))",
           "legendFormat": "p95"
         },
         {
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{handler=~\"gateway.*\"}[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{service_namespace=\"$namespace\", handler=~\"gateway.*\"}[5m])))",
           "legendFormat": "p50"
         }
       ],
@@ -116,7 +134,7 @@
       "options": { "colorMode": "background", "graphMode": "area", "textMode": "auto" },
       "targets": [
         {
-          "expr": "sum(rate(s3_errors_total[5m]))",
+          "expr": "sum(rate(s3_errors_total{service_namespace=\"$namespace\"}[5m]))",
           "legendFormat": "errors/s"
         }
       ],
@@ -146,7 +164,7 @@
       "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] }, "tooltip": { "mode": "multi" } },
       "targets": [
         {
-          "expr": "hippius_queue_length",
+          "expr": "hippius_queue_length{service_namespace=\"$namespace\"}",
           "legendFormat": "{{queue_name}}"
         }
       ],
@@ -169,7 +187,7 @@
           "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
           "targets": [
             {
-              "expr": "sum by (backend) (rate(uploader_requests_total{success=\"true\"}[5m]))",
+              "expr": "sum by (backend) (rate(uploader_requests_total{service_namespace=\"$namespace\", success=\"true\"}[5m]))",
               "legendFormat": "{{backend}}"
             }
           ],
@@ -187,7 +205,7 @@
           "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
           "targets": [
             {
-              "expr": "sum by (backend) (rate(uploader_requests_total{success=\"false\"}[5m]))",
+              "expr": "sum by (backend) (rate(uploader_requests_total{service_namespace=\"$namespace\", success=\"false\"}[5m]))",
               "legendFormat": "{{backend}}"
             }
           ],
@@ -205,7 +223,7 @@
           "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
           "targets": [
             {
-              "expr": "histogram_quantile(0.95, sum by (le, backend) (rate(uploader_duration_seconds_bucket[5m])))",
+              "expr": "histogram_quantile(0.95, sum by (le, backend) (rate(uploader_duration_seconds_bucket{service_namespace=\"$namespace\"}[5m])))",
               "legendFormat": "p95 {{backend}}"
             }
           ],
@@ -223,7 +241,7 @@
           "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
           "targets": [
             {
-              "expr": "sum by (backend) (rate(uploader_dlq_total[5m]))",
+              "expr": "sum by (backend) (rate(uploader_dlq_total{service_namespace=\"$namespace\"}[5m]))",
               "legendFormat": "{{backend}}"
             }
           ],
@@ -250,7 +268,7 @@
           "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
           "targets": [
             {
-              "expr": "sum by (backend) (rate(downloader_requests_total{success=\"true\"}[5m]))",
+              "expr": "sum by (backend) (rate(downloader_requests_total{service_namespace=\"$namespace\", success=\"true\"}[5m]))",
               "legendFormat": "{{backend}}"
             }
           ],
@@ -268,7 +286,7 @@
           "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
           "targets": [
             {
-              "expr": "sum by (backend) (rate(downloader_requests_total{success=\"false\"}[5m]))",
+              "expr": "sum by (backend) (rate(downloader_requests_total{service_namespace=\"$namespace\", success=\"false\"}[5m]))",
               "legendFormat": "{{backend}}"
             }
           ],
@@ -286,7 +304,7 @@
           "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
           "targets": [
             {
-              "expr": "histogram_quantile(0.95, sum by (le, backend) (rate(downloader_duration_seconds_bucket[5m])))",
+              "expr": "histogram_quantile(0.95, sum by (le, backend) (rate(downloader_duration_seconds_bucket{service_namespace=\"$namespace\"}[5m])))",
               "legendFormat": "p95 {{backend}}"
             }
           ],
@@ -313,7 +331,7 @@
           "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
           "targets": [
             {
-              "expr": "sum by (backend) (rate(unpinner_requests_total{success=\"true\"}[5m]))",
+              "expr": "sum by (backend) (rate(unpinner_requests_total{service_namespace=\"$namespace\", success=\"true\"}[5m]))",
               "legendFormat": "{{backend}}"
             }
           ],
@@ -331,7 +349,7 @@
           "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
           "targets": [
             {
-              "expr": "sum by (backend) (rate(unpinner_requests_total{success=\"false\"}[5m]))",
+              "expr": "sum by (backend) (rate(unpinner_requests_total{service_namespace=\"$namespace\", success=\"false\"}[5m]))",
               "legendFormat": "{{backend}}"
             }
           ],
@@ -368,7 +386,7 @@
           "options": { "colorMode": "background", "graphMode": "area", "textMode": "auto" },
           "targets": [
             {
-              "expr": "db_pool_used_connections / db_pool_size * 100",
+              "expr": "db_pool_used_connections{service_namespace=\"$namespace\"} / db_pool_size{service_namespace=\"$namespace\"} * 100",
               "legendFormat": "pool usage %"
             }
           ],
@@ -386,11 +404,11 @@
           "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
           "targets": [
             {
-              "expr": "redis_memory_used_bytes",
+              "expr": "redis_memory_used_bytes{service_namespace=\"$namespace\"}",
               "legendFormat": "used"
             },
             {
-              "expr": "redis_memory_max_bytes",
+              "expr": "redis_memory_max_bytes{service_namespace=\"$namespace\"}",
               "legendFormat": "max"
             }
           ],
@@ -418,7 +436,7 @@
           "options": { "colorMode": "background", "graphMode": "none", "textMode": "auto" },
           "targets": [
             {
-              "expr": "fs_store_parts_on_disk",
+              "expr": "fs_store_parts_on_disk{service_namespace=\"$namespace\"}",
               "legendFormat": "parts"
             }
           ],
@@ -446,7 +464,7 @@
           "options": { "colorMode": "background", "graphMode": "none", "textMode": "auto" },
           "targets": [
             {
-              "expr": "fs_store_oldest_age_seconds / 3600",
+              "expr": "fs_store_oldest_age_seconds{service_namespace=\"$namespace\"} / 3600",
               "legendFormat": "oldest"
             }
           ],
@@ -492,9 +510,9 @@
           "options": { "showHeader": true },
           "targets": [
             {
-              "expr": "sum by (backend) (rate(uploader_requests_total[5m]) + rate(downloader_requests_total[5m]) + rate(unpinner_requests_total[5m]))",
+              "expr": "label_replace(sum(rate(uploader_requests_total{service_namespace=\"$namespace\"}[5m])), \"worker_type\", \"uploader\", \"\", \"\")\nor\nlabel_replace(sum(rate(downloader_requests_total{service_namespace=\"$namespace\"}[5m])), \"worker_type\", \"downloader\", \"\", \"\")\nor\nlabel_replace(sum(rate(unpinner_requests_total{service_namespace=\"$namespace\"}[5m])), \"worker_type\", \"unpinner\", \"\", \"\")",
               "format": "table",
-              "legendFormat": "{{backend}}",
+              "legendFormat": "{{worker_type}}",
               "instant": true
             }
           ],
@@ -512,8 +530,8 @@
               "thresholds": {
                 "steps": [
                   { "color": "green", "value": null },
-                  { "color": "yellow", "value": 3600 },
-                  { "color": "red", "value": 86400 }
+                  { "color": "yellow", "value": 24 },
+                  { "color": "red", "value": 72 }
                 ]
               },
               "unit": "h"
@@ -525,7 +543,7 @@
           "options": { "colorMode": "background", "graphMode": "none", "textMode": "auto" },
           "targets": [
             {
-              "expr": "(time() - backup_last_success_timestamp) / 3600",
+              "expr": "(time() - backup_last_success_timestamp{service_namespace=\"$namespace\"} > 0) / 3600",
               "legendFormat": "hours ago"
             }
           ],
@@ -543,7 +561,7 @@
           "options": { "legend": { "displayMode": "list", "placement": "right" }, "tooltip": { "mode": "multi" }, "pieType": "donut" },
           "targets": [
             {
-              "expr": "sum by (status_code) (increase(http_requests_total{handler=~\"gateway.*\"}[1h]))",
+              "expr": "sum by (status_code) (increase(http_requests_total{service_namespace=\"$namespace\", handler=~\"gateway.*\"}[1h]))",
               "legendFormat": "{{status_code}}"
             }
           ],
@@ -589,7 +607,7 @@
           "options": { "showHeader": true },
           "targets": [
             {
-              "expr": "kube_pod_status_phase{namespace=\"hippius-s3-prod\", phase=~\"Pending|Failed|Unknown\"} == 1",
+              "expr": "kube_pod_status_phase{namespace=\"$namespace\", phase=~\"Pending|Failed|Unknown\"} == 1",
               "format": "table",
               "instant": true
             }
@@ -631,7 +649,7 @@
           "options": { "showHeader": true },
           "targets": [
             {
-              "expr": "increase(kube_pod_container_status_restarts_total{namespace=\"hippius-s3-prod\"}[24h]) > 0",
+              "expr": "increase(kube_pod_container_status_restarts_total{namespace=\"$namespace\"}[24h]) > 0",
               "format": "table",
               "instant": true
             }
@@ -662,7 +680,7 @@
           "options": { "colorMode": "background", "graphMode": "none", "textMode": "auto" },
           "targets": [
             {
-              "expr": "kube_deployment_status_replicas_ready{namespace=\"hippius-s3-prod\"}",
+              "expr": "kube_deployment_status_replicas_ready{namespace=\"$namespace\"}",
               "legendFormat": "{{deployment}}"
             }
           ],
@@ -676,7 +694,6 @@
   ],
   "schemaVersion": 39,
   "tags": ["hippius", "s3", "system-load"],
-  "templating": { "list": [] },
   "time": { "from": "now-1h", "to": "now" },
   "timepicker": {},
   "timezone": "browser",
