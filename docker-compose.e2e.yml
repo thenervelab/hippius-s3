@@ -131,6 +131,7 @@ services:
       - "127.0.0.1:8001:8001"
     environment:
       - IPFS_API_URL=http://toxiproxy:15001
+      - HIPPIUS_AUTH_ENCRYPTION_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
     depends_on:
       toxiproxy:
         condition: service_started

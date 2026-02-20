@@ -5,10 +5,10 @@ from typing import Any
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import patch
+from urllib.parse import urlencode
 
 import pytest
 from fastapi import Request
-from urllib.parse import urlencode
 
 from gateway.middlewares.access_key_auth import AccessKeyAuthError
 from gateway.middlewares.access_key_auth import verify_access_key_presigned_url
@@ -41,6 +41,9 @@ def make_request(
     return Request(scope)
 
 
+mock_redis = AsyncMock()
+
+
 @pytest.mark.asyncio
 async def test_presigned_url_expired_short_circuits_before_api_call() -> None:
     """Expired presigned URL should return (False, '', '') without hitting Hippius API."""
@@ -63,13 +66,10 @@ async def test_presigned_url_expired_short_circuits_before_api_call() -> None:
 
     request = make_request(query_params=query_params)
 
-    # Patch API client and crypto pipeline; they should not be called for expired URL
-    mock_api_client = AsyncMock()
-    mock_api_client.__aenter__ = AsyncMock(return_value=mock_api_client)
-    mock_api_client.__aexit__ = AsyncMock()
-    mock_api_client.auth = AsyncMock()
+    # Patch cached_auth; it should not be called for expired URL
+    mock_cached_auth = AsyncMock()
 
-    with patch("gateway.middlewares.access_key_auth.HippiusApiClient", return_value=mock_api_client):
+    with patch("gateway.middlewares.access_key_auth.cached_auth", mock_cached_auth):
         with patch("gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret") as mock_decrypt:
             with patch(
                 "gateway.middlewares.access_key_auth.create_canonical_request",
@@ -79,13 +79,15 @@ async def test_presigned_url_expired_short_circuits_before_api_call() -> None:
                 with patch(
                     "gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"
                 ) as mock_calc_sig:
-                    is_valid, account, token_type = await verify_access_key_presigned_url(request, access_key)
+                    is_valid, account, token_type = await verify_access_key_presigned_url(
+                        request, access_key, mock_redis
+                    )
 
     assert is_valid is False
     assert account == ""
     assert token_type == ""
 
-    mock_api_client.auth.assert_not_awaited()
+    mock_cached_auth.assert_not_awaited()
     mock_decrypt.assert_not_called()
     mock_canonical.assert_not_awaited()
     mock_calc_sig.assert_not_called()
@@ -122,12 +124,9 @@ async def test_presigned_url_valid_window_verifies_signature() -> None:
     mock_token_response.encrypted_secret = "enc"
     mock_token_response.nonce = "nonce"
 
-    mock_api_client = AsyncMock()
-    mock_api_client.__aenter__ = AsyncMock(return_value=mock_api_client)
-    mock_api_client.__aexit__ = AsyncMock()
-    mock_api_client.auth = AsyncMock(return_value=mock_token_response)
+    mock_cached_auth = AsyncMock(return_value=mock_token_response)
 
-    with patch("gateway.middlewares.access_key_auth.HippiusApiClient", return_value=mock_api_client):
+    with patch("gateway.middlewares.access_key_auth.cached_auth", mock_cached_auth):
         with patch("gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"):
             with patch(
                 "gateway.middlewares.access_key_auth.create_canonical_request",
@@ -137,13 +136,15 @@ async def test_presigned_url_valid_window_verifies_signature() -> None:
                 with patch(
                     "gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"
                 ) as mock_calc_sig:
-                    is_valid, out_account, out_token_type = await verify_access_key_presigned_url(request, access_key)
+                    is_valid, out_account, out_token_type = await verify_access_key_presigned_url(
+                        request, access_key, mock_redis
+                    )
 
     assert is_valid is True
     assert out_account == account_address
     assert out_token_type == token_type
 
-    mock_api_client.auth.assert_awaited()
+    mock_cached_auth.assert_awaited()
     mock_canonical.assert_awaited()
     mock_calc_sig.assert_called()
 
@@ -174,17 +175,10 @@ async def test_canonical_query_for_presigned_excludes_signature() -> None:
     mock_token_response = MagicMock()
     mock_token_response.valid = True
     mock_token_response.status = "active"
-    mock_token_response.account_address = (
-        "5FH2aQUbix3nNatzST4mPM8iuebGvSMFerZLdwvDmAwRDFep"
-    )
+    mock_token_response.account_address = "5FH2aQUbix3nNatzST4mPM8iuebGvSMFerZLdwvDmAwRDFep"
     mock_token_response.token_type = "sub"
     mock_token_response.encrypted_secret = "enc"
     mock_token_response.nonce = "nonce"
-
-    mock_api_client = AsyncMock()
-    mock_api_client.__aenter__ = AsyncMock(return_value=mock_api_client)
-    mock_api_client.__aexit__ = AsyncMock()
-    mock_api_client.auth = AsyncMock(return_value=mock_token_response)
 
     captured_query_string: str | None = None
 
@@ -199,16 +193,16 @@ async def test_canonical_query_for_presigned_excludes_signature() -> None:
         captured_query_string = query_string
         return "canonical"
 
-    with patch("gateway.middlewares.access_key_auth.HippiusApiClient", return_value=mock_api_client):
+    with patch(
+        "gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=mock_token_response
+    ):
         with patch("gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"):
             with patch(
                 "gateway.middlewares.access_key_auth.create_canonical_request",
                 new=fake_create_canonical_request,
             ):
-                with patch(
-                    "gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"
-                ):
-                    is_valid, _, _ = await verify_access_key_presigned_url(request, access_key)
+                with patch("gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"):
+                    is_valid, _, _ = await verify_access_key_presigned_url(request, access_key, mock_redis)
 
     assert is_valid is True
     assert captured_query_string is not None
@@ -255,11 +249,6 @@ async def test_presigned_url_uses_raw_path_for_canonical_path() -> None:
     mock_token_response.encrypted_secret = "enc"
     mock_token_response.nonce = "nonce"
 
-    mock_api_client = AsyncMock()
-    mock_api_client.__aenter__ = AsyncMock(return_value=mock_api_client)
-    mock_api_client.__aexit__ = AsyncMock()
-    mock_api_client.auth = AsyncMock(return_value=mock_token_response)
-
     captured_path: str | None = None
 
     async def fake_create_canonical_request(
@@ -273,16 +262,16 @@ async def test_presigned_url_uses_raw_path_for_canonical_path() -> None:
         captured_path = path
         return "canonical"
 
-    with patch("gateway.middlewares.access_key_auth.HippiusApiClient", return_value=mock_api_client):
+    with patch(
+        "gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=mock_token_response
+    ):
         with patch("gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"):
             with patch(
                 "gateway.middlewares.access_key_auth.create_canonical_request",
                 new=fake_create_canonical_request,
             ):
-                with patch(
-                    "gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"
-                ):
-                    is_valid, _, _ = await verify_access_key_presigned_url(request, access_key)
+                with patch("gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"):
+                    is_valid, _, _ = await verify_access_key_presigned_url(request, access_key, mock_redis)
 
     assert is_valid is True
     assert captured_path == "/bucket/conflict65%20(3).jpg"
@@ -309,13 +298,10 @@ async def test_presigned_url_credential_id_mismatch_rejected() -> None:
 
     request = make_request(query_params=query_params)
 
-    mock_api_client = AsyncMock()
-    mock_api_client.__aenter__ = AsyncMock(return_value=mock_api_client)
-    mock_api_client.__aexit__ = AsyncMock()
-    mock_api_client.auth = AsyncMock()
+    mock_cached_auth = AsyncMock()
 
-    with patch("gateway.middlewares.access_key_auth.HippiusApiClient", return_value=mock_api_client):
+    with patch("gateway.middlewares.access_key_auth.cached_auth", mock_cached_auth):
         with pytest.raises(AccessKeyAuthError):
-            await verify_access_key_presigned_url(request, access_key)
+            await verify_access_key_presigned_url(request, access_key, mock_redis)
 
-    mock_api_client.auth.assert_not_awaited()
+    mock_cached_auth.assert_not_awaited()

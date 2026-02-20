@@ -4,6 +4,7 @@ from typing import Callable
 
 from fastapi import Request
 from fastapi import Response
+from opentelemetry import trace
 
 from hippius_s3.monitoring import enrich_span_with_account_info
 from hippius_s3.monitoring import get_metrics_collector
@@ -40,7 +41,9 @@ async def metrics_middleware(
     except Exception:
         pass
 
-    get_metrics_collector().record_http_request(
+    collector = get_metrics_collector()
+
+    collector.record_http_request(
         request=request,
         response=response,
         duration=duration,
@@ -49,10 +52,27 @@ async def metrics_middleware(
         handler=endpoint_name,
     )
 
+    if hasattr(request.state, "gateway_overhead_ms"):
+        overhead_seconds = request.state.gateway_overhead_ms / 1000.0
+        body_streaming_ms = (duration * 1000.0) - request.state.gateway_overhead_ms
+
+        collector.record_gateway_overhead(
+            duration=overhead_seconds,
+            method=request.method,
+            status_code=response.status_code,
+            handler=endpoint_name,
+            main_account=main_account,
+        )
+
+        span = trace.get_current_span()
+        if span.is_recording():
+            span.set_attribute("timing.gateway_overhead_ms", request.state.gateway_overhead_ms)
+            span.set_attribute("timing.body_streaming_ms", max(0.0, body_streaming_ms))
+
     if response.status_code >= 400:
         error_type = f"http_{response.status_code}"
 
-        get_metrics_collector().record_error(
+        collector.record_error(
             error_type=error_type,
             operation=endpoint_name,
             bucket_name=None,
