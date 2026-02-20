@@ -219,6 +219,24 @@ class MetricsCollector:
             description="Database connection pool used connections",
         )
 
+        self.gateway_overhead_duration = self.meter.create_histogram(
+            name="gateway_overhead_seconds",
+            description="Gateway middleware processing time excluding body streaming",
+            unit="s",
+        )
+
+        self.auth_cache_hits = self.meter.create_counter(
+            name="auth_cache_hits_total",
+            description="Total auth cache hits",
+            unit="1",
+        )
+
+        self.auth_cache_misses = self.meter.create_counter(
+            name="auth_cache_misses_total",
+            description="Total auth cache misses",
+            unit="1",
+        )
+
         logger.info("Metrics setup complete")
 
     def _obs_redis_used_mem(self, _: object) -> list[metrics.Observation]:
@@ -465,6 +483,31 @@ class MetricsCollector:
         if duration is not None:
             self.downloader_duration.record(duration, attributes=attributes)
 
+    def record_gateway_overhead(
+        self,
+        duration: float,
+        method: str,
+        status_code: int,
+        handler: Optional[str] = None,
+        main_account: Optional[str] = None,
+    ) -> None:
+        attributes: dict[str, str] = {
+            "method": method,
+            "status_code": str(status_code),
+        }
+        if handler:
+            attributes["handler"] = handler
+        if main_account:
+            attributes["main_account"] = main_account
+
+        self.gateway_overhead_duration.record(duration, attributes=attributes)
+
+    def record_auth_cache(self, hit: bool) -> None:
+        if hit:
+            self.auth_cache_hits.add(1)
+        else:
+            self.auth_cache_misses.add(1)
+
     def record_backup_operation(
         self,
         database_name: str,
@@ -531,6 +574,12 @@ class NullMetricsCollector:
         pass
 
     def record_downloader_operation(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_gateway_overhead(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_auth_cache(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_backup_operation(self, *args: object, **kwargs: object) -> None:

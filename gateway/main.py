@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import Callable
 from typing import Dict
 
@@ -16,6 +17,7 @@ from gateway.middlewares.banhammer import BanHammerService
 from gateway.middlewares.banhammer import banhammer_middleware
 from gateway.middlewares.cors import cors_middleware
 from gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
+from gateway.middlewares.input_validation import input_validation_middleware
 from gateway.middlewares.metrics import metrics_middleware
 from gateway.middlewares.rate_limit import RateLimitService
 from gateway.middlewares.rate_limit import rate_limit_middleware
@@ -173,6 +175,8 @@ def factory() -> FastAPI:
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD", "PATCH"])
     async def forward_all(request: Request, path: str) -> Response:
+        if hasattr(request.state, "gateway_start_time"):
+            request.state.gateway_overhead_ms = (time.time() - request.state.gateway_start_time) * 1000
         forward_service = request.app.state.forward_service
         return await forward_service.forward_request(request)
 
@@ -211,6 +215,8 @@ def factory() -> FastAPI:
     app.middleware("http")(account_middleware)
     app.middleware("http")(trailing_slash_normalizer)
     app.middleware("http")(auth_router_middleware)
+    # Innermost middleware: validates input before body streaming begins
+    app.middleware("http")(input_validation_middleware)
 
     return app
 
