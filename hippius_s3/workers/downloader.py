@@ -29,6 +29,7 @@ from opentelemetry import trace
 
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
+from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import PartToDownload
 from hippius_s3.redis_utils import create_redis_client
@@ -214,11 +215,30 @@ async def process_download_request(
                 f"size={size_mb:.1f}MB throughput={throughput:.1f}MB/s "
                 f"parts={success_count}/{total}"
             )
+            total_duration = time.perf_counter() - t_request_start
             if success_count == total:
+                get_metrics_collector().record_downloader_operation(
+                    backend=backend_name,
+                    main_account=download_request.address,
+                    success=True,
+                    duration=total_duration,
+                    num_chunks=sum(len(p.chunks) for p in download_request.chunks),
+                )
                 return True
+            get_metrics_collector().record_downloader_operation(
+                backend=backend_name,
+                main_account=download_request.address,
+                success=False,
+                duration=total_duration,
+            )
             logger.error(f"[{backend_name}] {success_count}/{total} parts OK for {short_id}")
             return False
         except Exception as exc:
+            get_metrics_collector().record_downloader_operation(
+                backend=backend_name,
+                main_account=download_request.address,
+                success=False,
+            )
             logger.error(f"[{backend_name}] process_download_request error: {exc}", exc_info=True)
             return False
 
@@ -234,6 +254,7 @@ async def run_downloader_loop(
     from redis.exceptions import ConnectionError as RedisConnectionError
     from redis.exceptions import TimeoutError as RedisTimeoutError
 
+    from hippius_s3.monitoring import initialize_metrics_collector
     from hippius_s3.queue import dequeue_download_request
     from hippius_s3.queue import initialize_queue_client
     from hippius_s3.redis_cache import initialize_cache_client
@@ -248,6 +269,7 @@ async def run_downloader_loop(
 
     initialize_queue_client(redis_queues_client)
     initialize_cache_client(redis_client)
+    initialize_metrics_collector(redis_client)
 
     if backend_name == "arion":
         backend_info = f" base_url={config.arion_base_url} verify_ssl={config.arion_verify_ssl}"

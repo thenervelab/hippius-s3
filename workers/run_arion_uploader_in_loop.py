@@ -133,6 +133,7 @@ async def run_arion_uploader_loop():
                         get_metrics_collector().record_uploader_operation(
                             main_account=upload_request.address,
                             success=False,
+                            backend="arion",
                             attempt=attempts_next,
                         )
                     else:
