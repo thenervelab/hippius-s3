@@ -1,165 +1,104 @@
-"""E2E test for auth cache — verify that authenticated requests cache the auth response in Redis."""
+"""E2E tests for gateway auth cache (Bearer access key flow).
 
-import base64
+These tests verify that cached_auth() in the gateway correctly caches
+TokenAuthResponse objects in Redis when using Bearer hip_* authentication.
+"""
+
 import time
-from typing import Any
-from typing import Callable
 
-import redis  # type: ignore[import-untyped]
-
-from .conftest import is_real_aws
+import httpx
+import pytest
+import redis
 
 
+GATEWAY_URL = "http://localhost:8080"
+REDIS_URL = "redis://localhost:6379/0"
 AUTH_CACHE_PREFIX = "hippius_auth:"
 
 
-def _get_auth_cache_keys(r: redis.Redis) -> list[str]:
-    """Return all auth cache keys currently in Redis."""
-    keys = []
-    for k in r.scan_iter(match=f"{AUTH_CACHE_PREFIX}*"):
-        keys.append(k.decode() if isinstance(k, bytes) else k)
-    return keys
+@pytest.fixture
+def redis_client():
+    """Direct Redis connection to verify cache state."""
+    r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    yield r
+    r.close()
 
 
-def test_auth_cache_populated_on_authenticated_request(
-    docker_services: Any,
-    boto3_client: Any,
-    test_seed_phrase: str,
-    unique_bucket_name: Callable[[str], str],
-    cleanup_buckets: Callable[[str], None],
-) -> None:
-    """An authenticated request should populate the auth cache in Redis."""
-    if is_real_aws():
-        return
-
-    r = redis.Redis.from_url("redis://localhost:6379/0")
-
-    access_key = base64.b64encode(test_seed_phrase.encode()).decode()
-    cache_key = f"{AUTH_CACHE_PREFIX}{access_key}"
-
-    # Clear any existing cache entry
-    r.delete(cache_key)
-    assert not r.exists(cache_key)
-
-    bucket_name = unique_bucket_name("auth-cache")
-    cleanup_buckets(bucket_name)
-    boto3_client.create_bucket(Bucket=bucket_name)
-
-    # First request — should call the Hippius API and populate the cache
-    boto3_client.put_object(
-        Bucket=bucket_name,
-        Key="cache-test.txt",
-        Body=b"auth cache test",
-    )
-
-    assert r.exists(cache_key), "Auth cache key should exist after first authenticated request"
-
-    cached_value = r.get(cache_key)
-    assert cached_value is not None
-    assert b"valid" in cached_value  # TokenAuthResponse JSON should contain the 'valid' field
-
-    ttl = r.ttl(cache_key)
-    assert 0 < ttl <= 60, f"Auth cache TTL should be between 1-60 seconds, got {ttl}"
+def _bearer_headers(access_key: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {access_key}"}
 
 
-def test_auth_cache_reused_on_second_request(
-    docker_services: Any,
-    boto3_client: Any,
-    test_seed_phrase: str,
-    unique_bucket_name: Callable[[str], str],
-    cleanup_buckets: Callable[[str], None],
-) -> None:
-    """A second authenticated request within the TTL window should reuse the cached auth."""
-    if is_real_aws():
-        return
+@pytest.mark.e2e
+@pytest.mark.hippius_cache
+def test_auth_cache_populated_on_request(redis_client: redis.Redis) -> None:
+    """Sending a Bearer request populates hippius_auth:{key} in Redis."""
+    key = f"hip_cache_pop_{int(time.time())}"
+    cache_key = f"{AUTH_CACHE_PREFIX}{key}"
 
-    r = redis.Redis.from_url("redis://localhost:6379/0")
+    # Ensure clean state
+    redis_client.delete(cache_key)
 
-    access_key = base64.b64encode(test_seed_phrase.encode()).decode()
-    cache_key = f"{AUTH_CACHE_PREFIX}{access_key}"
+    # Send request — response status is irrelevant; cache is populated in auth step
+    with httpx.Client(timeout=10) as client:
+        client.get(f"{GATEWAY_URL}/test-bucket/test-key", headers=_bearer_headers(key))
 
-    # Clear any existing cache entry
-    r.delete(cache_key)
+    cached = redis_client.get(cache_key)
+    assert cached is not None, f"Expected cache key {cache_key} to exist in Redis"
 
-    bucket_name = unique_bucket_name("auth-cache-reuse")
-    cleanup_buckets(bucket_name)
-    boto3_client.create_bucket(Bucket=bucket_name)
+    ttl = redis_client.ttl(cache_key)
+    assert 0 < ttl <= 60, f"Expected TTL between 1-60s, got {ttl}"
 
-    # First request — populates cache
-    boto3_client.put_object(
-        Bucket=bucket_name,
-        Key="first.txt",
-        Body=b"first request",
-    )
 
-    assert r.exists(cache_key)
-    ttl_after_first = r.ttl(cache_key)
-    first_value = r.get(cache_key)
+@pytest.mark.e2e
+@pytest.mark.hippius_cache
+def test_auth_cache_reused_on_second_request(redis_client: redis.Redis) -> None:
+    """Two consecutive Bearer requests reuse the same cached value."""
+    key = f"hip_cache_reuse_{int(time.time())}"
+    cache_key = f"{AUTH_CACHE_PREFIX}{key}"
 
-    # Small delay to let TTL tick down visibly
+    redis_client.delete(cache_key)
+
+    with httpx.Client(timeout=10) as client:
+        client.get(f"{GATEWAY_URL}/test-bucket/test-key", headers=_bearer_headers(key))
+
+    first_value = redis_client.get(cache_key)
+    first_ttl = redis_client.ttl(cache_key)
+    assert first_value is not None
+
     time.sleep(1)
 
-    # Second request — should reuse cache (TTL gets refreshed on cache miss, stays same on hit)
-    boto3_client.put_object(
-        Bucket=bucket_name,
-        Key="second.txt",
-        Body=b"second request",
-    )
+    with httpx.Client(timeout=10) as client:
+        client.get(f"{GATEWAY_URL}/test-bucket/test-key", headers=_bearer_headers(key))
 
-    assert r.exists(cache_key)
-    second_value = r.get(cache_key)
+    second_value = redis_client.get(cache_key)
+    second_ttl = redis_client.ttl(cache_key)
 
-    # The cached value should be identical (same auth response)
-    assert first_value == second_value, "Cached auth response should be the same across requests"
-
-    # TTL should have decreased (cache was hit, not refreshed)
-    ttl_after_second = r.ttl(cache_key)
-    assert ttl_after_second < ttl_after_first, "TTL should decrease on cache hit (not refreshed)"
+    assert second_value == first_value, "Cached value should be identical across requests"
+    assert second_ttl < first_ttl, "TTL should decrease between requests (cache reused, not refreshed)"
 
 
-def test_auth_cache_expires_after_ttl(
-    docker_services: Any,
-    boto3_client: Any,
-    test_seed_phrase: str,
-    unique_bucket_name: Callable[[str], str],
-    cleanup_buckets: Callable[[str], None],
-) -> None:
-    """Auth cache entry should expire after TTL, and be repopulated on next request."""
-    if is_real_aws():
-        return
+@pytest.mark.e2e
+@pytest.mark.hippius_cache
+def test_auth_cache_expires_and_repopulates(redis_client: redis.Redis) -> None:
+    """After manual deletion, the cache key is repopulated on next request."""
+    key = f"hip_cache_expire_{int(time.time())}"
+    cache_key = f"{AUTH_CACHE_PREFIX}{key}"
 
-    r = redis.Redis.from_url("redis://localhost:6379/0")
+    redis_client.delete(cache_key)
 
-    access_key = base64.b64encode(test_seed_phrase.encode()).decode()
-    cache_key = f"{AUTH_CACHE_PREFIX}{access_key}"
+    with httpx.Client(timeout=10) as client:
+        client.get(f"{GATEWAY_URL}/test-bucket/test-key", headers=_bearer_headers(key))
 
-    # Clear and set a short-lived entry to simulate expiry
-    r.delete(cache_key)
+    assert redis_client.exists(cache_key), "Cache should be populated after first request"
 
-    bucket_name = unique_bucket_name("auth-cache-expiry")
-    cleanup_buckets(bucket_name)
-    boto3_client.create_bucket(Bucket=bucket_name)
+    # Simulate expiry by deleting
+    redis_client.delete(cache_key)
+    assert not redis_client.exists(cache_key), "Cache should be gone after deletion"
 
-    # First request — populates cache
-    boto3_client.put_object(
-        Bucket=bucket_name,
-        Key="expire-test.txt",
-        Body=b"expiry test",
-    )
+    # Re-request should repopulate
+    with httpx.Client(timeout=10) as client:
+        client.get(f"{GATEWAY_URL}/test-bucket/test-key", headers=_bearer_headers(key))
 
-    assert r.exists(cache_key)
-
-    # Force expire the cache entry
-    r.delete(cache_key)
-    assert not r.exists(cache_key)
-
-    # Next request should re-populate the cache
-    boto3_client.put_object(
-        Bucket=bucket_name,
-        Key="expire-test-2.txt",
-        Body=b"expiry test 2",
-    )
-
-    assert r.exists(cache_key), "Auth cache should be repopulated after expiry"
-    ttl = r.ttl(cache_key)
-    assert 0 < ttl <= 60, f"Freshly populated auth cache should have full TTL, got {ttl}"
+    assert redis_client.exists(cache_key), "Cache should be repopulated after re-request"
+    ttl = redis_client.ttl(cache_key)
+    assert 0 < ttl <= 60, f"Fresh TTL expected, got {ttl}"

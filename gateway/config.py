@@ -93,9 +93,7 @@ class GatewayConfig:
     max_object_key_length: int = dataclasses.field(
         default_factory=lambda: int(os.getenv("MAX_OBJECT_KEY_LENGTH", "1024"))
     )
-    max_metadata_size: int = dataclasses.field(
-        default_factory=lambda: int(os.getenv("MAX_METADATA_SIZE", "2048"))
-    )
+    max_metadata_size: int = dataclasses.field(default_factory=lambda: int(os.getenv("MAX_METADATA_SIZE", "2048")))
     log_level: str = dataclasses.field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
     loki_url: str = dataclasses.field(
         default_factory=lambda: os.getenv("LOKI_URL", "http://localhost:3100/loki/api/v1/push")

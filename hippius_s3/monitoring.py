@@ -237,6 +237,18 @@ class MetricsCollector:
             unit="1",
         )
 
+        self.seed_auth_cache_hits = self.meter.create_counter(
+            name="seed_auth_cache_hits_total",
+            description="Total seed phrase auth cache hits",
+            unit="1",
+        )
+
+        self.seed_auth_cache_misses = self.meter.create_counter(
+            name="seed_auth_cache_misses_total",
+            description="Total seed phrase auth cache misses",
+            unit="1",
+        )
+
         logger.info("Metrics setup complete")
 
     def _obs_redis_used_mem(self, _: object) -> list[metrics.Observation]:
@@ -508,6 +520,12 @@ class MetricsCollector:
         else:
             self.auth_cache_misses.add(1)
 
+    def record_seed_auth_cache(self, hit: bool) -> None:
+        if hit:
+            self.seed_auth_cache_hits.add(1)
+        else:
+            self.seed_auth_cache_misses.add(1)
+
     def record_backup_operation(
         self,
         database_name: str,
@@ -580,6 +598,9 @@ class NullMetricsCollector:
         pass
 
     def record_auth_cache(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_seed_auth_cache(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_backup_operation(self, *args: object, **kwargs: object) -> None:

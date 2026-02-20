@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import io
 import os
@@ -9,11 +10,43 @@ import httpx
 from fastapi import FastAPI
 from fastapi import File
 from fastapi import UploadFile
+from nacl.secret import SecretBox
 from pydantic import BaseModel
+
 
 app = FastAPI()
 
 IPFS_API_URL = os.getenv("IPFS_API_URL", "http://ipfs:5001")
+
+# Access key auth encryption setup
+# Uses the same test key as gateway: HIPPIUS_AUTH_ENCRYPTION_KEY
+AUTH_ENCRYPTION_KEY_HEX = os.getenv(
+    "HIPPIUS_AUTH_ENCRYPTION_KEY",
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+)
+AUTH_ENCRYPTION_KEY = bytes.fromhex(AUTH_ENCRYPTION_KEY_HEX)
+MOCK_ACCESS_KEY_SECRET = "e2e_test_secret_for_hip_keys"
+MOCK_ACCOUNT_ADDRESS = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+
+# Pre-encrypt the secret at startup so every /objectstore/tokens/auth/ response is consistent
+_box = SecretBox(AUTH_ENCRYPTION_KEY)
+_encrypted_blob = _box.encrypt(MOCK_ACCESS_KEY_SECRET.encode())
+ENCRYPTED_SECRET_B64 = base64.b64encode(_encrypted_blob).decode()
+# nonce is embedded in the encrypted blob; provide a dummy for API compat
+NONCE_B64 = base64.b64encode(b"\x00" * 24).decode()
+
+
+class TokenAuthRequest(BaseModel):
+    accessKeyId: str
+
+
+class TokenAuthResponse(BaseModel):
+    valid: bool
+    status: str
+    account_address: str
+    token_type: str
+    encrypted_secret: str
+    nonce: str
 
 
 class UploadResponse(BaseModel):
@@ -101,6 +134,34 @@ async def get_file_status(file_id: str):
             )
 
     return FileStatusResponse(**file_storage[file_id].model_dump())
+
+
+@app.post("/objectstore/tokens/auth/", response_model=TokenAuthResponse)
+async def token_auth(payload: TokenAuthRequest):
+    """Mock access key authentication endpoint.
+
+    Accepts any hip_* key and returns a valid encrypted secret
+    that the gateway can decrypt with HIPPIUS_AUTH_ENCRYPTION_KEY.
+    """
+    access_key = payload.accessKeyId
+    if not access_key.startswith("hip_"):
+        return TokenAuthResponse(
+            valid=False,
+            status="invalid",
+            account_address="",
+            token_type="",
+            encrypted_secret="",
+            nonce="",
+        )
+
+    return TokenAuthResponse(
+        valid=True,
+        status="active",
+        account_address=MOCK_ACCOUNT_ADDRESS,
+        token_type="master",
+        encrypted_secret=ENCRYPTED_SECRET_B64,
+        nonce=NONCE_B64,
+    )
 
 
 @app.get("/health")
