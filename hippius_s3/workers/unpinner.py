@@ -136,6 +136,7 @@ async def process_unpin_request(
             get_metrics_collector().record_unpinner_operation(
                 main_account=request.address,
                 success=True,
+                backend=backend_name,
             )
 
         except Exception as e:
@@ -168,6 +169,7 @@ async def process_unpin_request(
                 get_metrics_collector().record_unpinner_operation(
                     main_account=request.address,
                     success=False,
+                    backend=backend_name,
                     attempt=attempts_next,
                 )
             else:
@@ -180,6 +182,7 @@ async def process_unpin_request(
                 get_metrics_collector().record_unpinner_operation(
                     main_account=request.address,
                     success=False,
+                    backend=backend_name,
                     error_type=error_class,
                 )
 

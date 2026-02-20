@@ -298,11 +298,6 @@ async def initiate_multipart_upload(
 """
         xml_bytes = xml_string.encode("utf-8")
 
-        get_metrics_collector().record_multipart_operation(
-            operation="initiate_upload",
-            main_account=request.state.account.main_account,
-        )
-
         # Return response with proper headers
         return Response(
             content=xml_bytes,
@@ -670,10 +665,6 @@ async def upload_part(
         total_time = time.time() - start_time
         logger.debug(f"Part {part_number}: TOTAL processing time: {total_time:.3f}s")
 
-        get_metrics_collector().record_multipart_operation(
-            operation="upload_part",
-            main_account=request.state.account.main_account,
-        )
         get_metrics_collector().record_data_transfer(
             operation="upload_part",
             bytes_transferred=file_size,
@@ -1071,10 +1062,6 @@ async def complete_multipart_upload(
 </CompleteMultipartUploadResult>
 """.encode("utf-8")
 
-        get_metrics_collector().record_multipart_operation(
-            operation="complete_upload",
-            main_account=request.state.account.main_account,
-        )
         get_metrics_collector().record_s3_operation(
             operation="complete_multipart_upload",
             bucket_name=bucket_name,

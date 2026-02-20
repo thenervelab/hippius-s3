@@ -210,6 +210,7 @@ class Uploader:
             get_metrics_collector().record_uploader_operation(
                 main_account=payload.address,
                 success=True,
+                backend=self.backend_name,
                 num_chunks=len(payload.chunks),
                 duration=total_duration,
             )
@@ -400,5 +401,6 @@ class Uploader:
         get_metrics_collector().record_uploader_operation(
             main_account=payload.address,
             success=False,
+            backend=self.backend_name,
             error_type=etype,
         )

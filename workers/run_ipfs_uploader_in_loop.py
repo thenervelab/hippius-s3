@@ -136,6 +136,7 @@ async def run_ipfs_uploader_loop():
                         get_metrics_collector().record_uploader_operation(
                             main_account=upload_request.address,
                             success=False,
+                            backend=BACKEND_NAME,
                             attempt=attempts_next,
                         )
                     else:

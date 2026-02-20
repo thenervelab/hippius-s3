@@ -64,31 +64,37 @@ class BackgroundMetricsCollector:
                 logger.error(f"Error collecting metrics: {e}")
                 await asyncio.sleep(5)  # Wait 5 seconds on error
 
+    # All per-backend queues to track (lists use LLEN, ZSETs use ZCARD)
+    LIST_QUEUES = [
+        "ipfs_upload_requests",
+        "arion_upload_requests",
+        "ovh_upload_requests",
+        "ipfs_download_requests",
+        "arion_download_requests",
+        "ovh_download_requests",
+        "ipfs_unpin_requests",
+        "arion_unpin_requests",
+        "ovh_unpin_requests",
+        "substrate_requests",
+        "ipfs_upload_requests:dlq",
+        "arion_upload_requests:dlq",
+    ]
+    ZSET_QUEUES = [
+        "ipfs_upload_retries",
+        "arion_upload_retries",
+    ]
+
     async def _collect_redis_metrics(self) -> None:
         try:
-            if self.redis_queues_client:
-                self.metrics_collector._upload_len = int(await self.redis_queues_client.llen("upload_requests") or 0)
-                self.metrics_collector._unpin_len = int(await self.redis_queues_client.llen("unpin_requests") or 0)
-                self.metrics_collector._substrate_len = int(
-                    await self.redis_queues_client.llen("substrate_requests") or 0
-                )
-                self.metrics_collector._download_len = int(
-                    await self.redis_queues_client.llen("download_requests") or 0
-                )
-            else:
-                self.metrics_collector._upload_len = int(await self.redis_client.llen("upload_requests") or 0)  # ty: ignore
-                self.metrics_collector._unpin_len = int(await self.redis_client.llen("unpin_requests") or 0)  # ty: ignore
-                self.metrics_collector._substrate_len = int(await self.redis_client.llen("substrate_requests") or 0)  # ty: ignore
-                self.metrics_collector._download_len = int(await self.redis_client.llen("download_requests") or 0)  # ty: ignore
+            rc = self.redis_queues_client or self.redis_client
 
-            self.metrics_collector._main_db_size = int(await self.redis_client.dbsize() or 0)  # ty: ignore
-            self.metrics_collector._accounts_db_size = int(await self.redis_accounts_client.dbsize() or 0)
+            for queue_name in self.LIST_QUEUES:
+                length = int(await rc.llen(queue_name) or 0)  # ty: ignore
+                self.metrics_collector.set_queue_length(queue_name, length)
 
-            if self.redis_chain_client:
-                self.metrics_collector._chain_db_size = int(await self.redis_chain_client.dbsize() or 0)
-
-            if self.redis_rate_limiting_client:
-                self.metrics_collector._rate_limiting_db_size = int(await self.redis_rate_limiting_client.dbsize() or 0)
+            for queue_name in self.ZSET_QUEUES:
+                length = int(await rc.zcard(queue_name) or 0)  # ty: ignore
+                self.metrics_collector.set_queue_length(queue_name, length)
 
             info = await self.redis_client.info("memory")  # ty: ignore
             self.metrics_collector._used_mem = info.get("used_memory", 0)
