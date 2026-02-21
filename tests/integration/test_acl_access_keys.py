@@ -21,6 +21,7 @@ def integration_app() -> Any:
     app = FastAPI()
     app.state.acl_service = MagicMock()
     app.state.redis_accounts = AsyncMock()
+    app.state.redis_client = AsyncMock()
 
     @app.get("/{bucket}/{key:path}")
     async def get_object(bucket: str, key: str) -> dict[str, Any]:
@@ -46,7 +47,7 @@ async def test_sub_token_denied_without_grants(integration_app: Any) -> None:
     integration_app.state.acl_service.get_bucket_owner = AsyncMock(return_value=alice_id)
     integration_app.state.acl_service.check_permission = AsyncMock(return_value=False)
 
-    auth_header = f'AWS4-HMAC-SHA256 Credential=hip_bob_sub1/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc'
+    auth_header = "AWS4-HMAC-SHA256 Credential=hip_bob_sub1/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
 
     # Patch verify function as AsyncMock
     mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
@@ -72,7 +73,7 @@ async def test_sub_token_allowed_with_access_key_grant(integration_app: Any) -> 
     integration_app.state.acl_service.get_bucket_owner = AsyncMock(return_value=alice_id)
     integration_app.state.acl_service.check_permission = AsyncMock(return_value=True)
 
-    auth_header = f'AWS4-HMAC-SHA256 Credential=hip_bob_sub1/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc'
+    auth_header = "AWS4-HMAC-SHA256 Credential=hip_bob_sub1/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
 
     mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
 
@@ -98,7 +99,7 @@ async def test_sub_token_denied_with_different_key_grant(integration_app: Any) -
     integration_app.state.acl_service.get_bucket_owner = AsyncMock(return_value=alice_id)
     integration_app.state.acl_service.check_permission = AsyncMock(return_value=False)
 
-    auth_header = f'AWS4-HMAC-SHA256 Credential=hip_bob_sub1/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc'
+    auth_header = "AWS4-HMAC-SHA256 Credential=hip_bob_sub1/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
 
     mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
 
@@ -120,7 +121,7 @@ async def test_master_token_bypasses_acl_for_owned_bucket(integration_app: Any) 
 
     integration_app.state.acl_service.get_bucket_owner = AsyncMock(return_value=alice_id)
 
-    auth_header = f'AWS4-HMAC-SHA256 Credential=hip_alice_master/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc'
+    auth_header = "AWS4-HMAC-SHA256 Credential=hip_alice_master/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
 
     mock_verify = AsyncMock(return_value=(True, alice_id, "master"))
 
@@ -146,7 +147,7 @@ async def test_account_grant_allows_all_keys(integration_app: Any) -> None:
     integration_app.state.acl_service.check_permission = AsyncMock(return_value=True)
 
     for bob_key in ["hip_bob_key1", "hip_bob_key2", "hip_bob_key99"]:
-        auth_header = f'AWS4-HMAC-SHA256 Credential={bob_key}/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc'
+        auth_header = f"AWS4-HMAC-SHA256 Credential={bob_key}/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
 
         mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
 
@@ -170,7 +171,7 @@ async def test_cross_account_access_key_grant(integration_app: Any) -> None:
     integration_app.state.acl_service.get_bucket_owner = AsyncMock(return_value=alice_id)
     integration_app.state.acl_service.check_permission = AsyncMock(return_value=True)
 
-    auth_header = f'AWS4-HMAC-SHA256 Credential=hip_bob_contractor/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc'
+    auth_header = "AWS4-HMAC-SHA256 Credential=hip_bob_contractor/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
 
     mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
 

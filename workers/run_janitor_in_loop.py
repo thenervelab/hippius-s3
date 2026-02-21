@@ -9,12 +9,18 @@ incomplete uploads that were never finalized or cleaned up.
 import asyncio
 import json
 import logging
+import os
 import shutil
 import sys
 import time
 from pathlib import Path
 
 import asyncpg
+from opentelemetry import metrics as otel_metrics
+from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.sdk.resources import Resource
 from redis.asyncio import Redis
 
 
@@ -23,14 +29,112 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
-from hippius_s3.monitoring import get_metrics_collector
-from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.utils import get_query
 
 
 config = get_config()
 setup_loki_logging(config, "janitor", include_ray_id=False)
 logger = logging.getLogger(__name__)
+
+# --- Janitor-owned OTel metrics ---
+
+AGE_BUCKET_BOUNDARIES = [
+    ("0-1h", 3600),
+    ("1-6h", 21600),
+    ("6-24h", 86400),
+    ("1-3d", 259200),
+    ("3-7d", 604800),
+]
+AGE_BUCKET_NAMES = [b[0] for b in AGE_BUCKET_BOUNDARIES] + ["7d+"]
+
+_fs_parts_on_disk = 0
+_fs_oldest_age_seconds = 0.0
+_fs_disk_used_bytes = 0
+_fs_disk_total_bytes = 0
+_fs_age_buckets: dict[str, int] = dict.fromkeys(AGE_BUCKET_NAMES, 0)
+
+_janitor_deleted_counter = None  # set by _setup_janitor_metrics
+
+
+def _obs_parts_on_disk(_: object) -> list[otel_metrics.Observation]:
+    return [otel_metrics.Observation(_fs_parts_on_disk, {})]
+
+
+def _obs_oldest_age(_: object) -> list[otel_metrics.Observation]:
+    return [otel_metrics.Observation(_fs_oldest_age_seconds, {})]
+
+
+def _obs_disk_used(_: object) -> list[otel_metrics.Observation]:
+    return [otel_metrics.Observation(_fs_disk_used_bytes, {})]
+
+
+def _obs_disk_total(_: object) -> list[otel_metrics.Observation]:
+    return [otel_metrics.Observation(_fs_disk_total_bytes, {})]
+
+
+def _obs_age_buckets(_: object) -> list[otel_metrics.Observation]:
+    return [otel_metrics.Observation(count, {"age_bucket": bucket}) for bucket, count in _fs_age_buckets.items()]
+
+
+def _classify_age_bucket(age_seconds: float) -> str:
+    for name, upper in AGE_BUCKET_BOUNDARIES:
+        if age_seconds < upper:
+            return name
+    return "7d+"
+
+
+def _setup_janitor_metrics() -> None:
+    global _janitor_deleted_counter
+
+    if os.getenv("ENABLE_MONITORING", "false").lower() not in ("true", "1", "yes"):
+        logger.info("Monitoring disabled for janitor")
+        return
+
+    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
+    service_name = os.getenv("OTEL_SERVICE_NAME", "hippius-s3")
+
+    resource = Resource.create({"service.name": service_name})
+    metric_reader = PeriodicExportingMetricReader(
+        OTLPMetricExporter(endpoint=endpoint, insecure=True),
+        export_interval_millis=10000,
+    )
+    provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+    otel_metrics.set_meter_provider(provider)
+
+    meter = otel_metrics.get_meter("janitor")
+
+    meter.create_observable_gauge(
+        name="fs_store_parts_on_disk",
+        callbacks=[_obs_parts_on_disk],
+        description="Total part dirs on disk",
+    )
+    meter.create_observable_gauge(
+        name="fs_store_oldest_age_seconds",
+        callbacks=[_obs_oldest_age],
+        description="Age of oldest part in seconds",
+    )
+    meter.create_observable_gauge(
+        name="fs_cache_disk_used_bytes",
+        callbacks=[_obs_disk_used],
+        description="Bytes used on cache filesystem",
+    )
+    meter.create_observable_gauge(
+        name="fs_cache_disk_total_bytes",
+        callbacks=[_obs_disk_total],
+        description="Total bytes on cache filesystem",
+    )
+    meter.create_observable_gauge(
+        name="fs_cache_age_bucket_parts",
+        callbacks=[_obs_age_buckets],
+        description="Number of parts per age bucket",
+    )
+    _janitor_deleted_counter = meter.create_counter(
+        name="fs_janitor_deleted_total",
+        description="Total number of FS parts deleted by the janitor",
+        unit="1",
+    )
+
+    logger.info(f"Janitor metrics enabled, exporting to {endpoint}")
 
 
 async def get_all_dlq_object_ids(redis_client: Redis) -> set[str]:
@@ -61,7 +165,11 @@ async def get_all_dlq_object_ids(redis_client: Redis) -> set[str]:
     return object_ids
 
 
-async def cleanup_stale_parts(db: asyncpg.Connection, fs_store: FileSystemPartsStore, redis_client: Redis) -> int:
+async def cleanup_stale_parts(
+    db: asyncpg.Connection,
+    fs_store: FileSystemPartsStore,
+    redis_client: Redis,
+) -> int:
     """Conservative cleanup of stale parts: rely on FS mtime only for now.
 
     Rationale: DB schemas for tracking MPU progress vary across deployments.
@@ -240,9 +348,14 @@ async def cleanup_old_parts_by_mtime(
     parts_cleaned = 0
     cutoff_time = time.time() - max_age_seconds
 
+    global _fs_parts_on_disk, _fs_oldest_age_seconds, _fs_disk_used_bytes, _fs_disk_total_bytes, _fs_age_buckets
+
     # Walk the FS hierarchy: <root>/<object_id>/v<version>/part_<n>/
     oldest_mtime = None
     parts_seen = 0
+    age_counts: dict[str, int] = dict.fromkeys(AGE_BUCKET_NAMES, 0)
+    now = time.time()
+
     for object_dir in root.iterdir():
         if not object_dir.is_dir():
             continue
@@ -282,6 +395,10 @@ async def cleanup_old_parts_by_mtime(
                     if oldest_mtime is None or mtime < oldest_mtime:
                         oldest_mtime = mtime
 
+                    # Classify part age into bucket
+                    part_age = now - mtime
+                    age_counts[_classify_age_bucket(part_age)] += 1
+
                     old_enough = mtime < cutoff_time
                     fully_replicated = await is_replicated_on_all_backends(
                         db,
@@ -293,7 +410,7 @@ async def cleanup_old_parts_by_mtime(
                     if old_enough or fully_replicated:
                         shutil.rmtree(part_dir)
                         parts_cleaned += 1
-                        age = (time.time() - mtime) / 3600
+                        age = (now - mtime) / 3600
                         logger.info(
                             f"GC cleaned part: {part_dir} {old_enough=} {fully_replicated=} (mtime {age=:.1f}h)"
                         )
@@ -307,16 +424,18 @@ async def cleanup_old_parts_by_mtime(
                 except Exception as e:
                     logger.warning(f"Failed to clean part {part_dir}: {e}")
 
-    # Record metrics
-    try:
-        collector = get_metrics_collector()
-        age_seconds = max(0.0, time.time() - float(oldest_mtime)) if oldest_mtime is not None else 0.0
-        collector.set_fs_store_oldest_age_seconds(age_seconds)  # type: ignore[attr-defined]
-        collector.set_fs_store_parts_on_disk(parts_seen)  # type: ignore[attr-defined]
-        if parts_cleaned > 0:
-            collector.fs_janitor_deleted_total.add(parts_cleaned)  # type: ignore[attr-defined]
-    except Exception:
-        logger.debug("Failed to record FS metrics", exc_info=True)
+    # Update module-level metric variables (read by OTel observable gauge callbacks)
+    _fs_parts_on_disk = parts_seen
+    _fs_oldest_age_seconds = max(0.0, now - float(oldest_mtime)) if oldest_mtime is not None else 0.0
+    _fs_age_buckets = age_counts
+
+    # Disk usage
+    disk = shutil.disk_usage(root)
+    _fs_disk_used_bytes = disk.used
+    _fs_disk_total_bytes = disk.total
+
+    if parts_cleaned > 0 and _janitor_deleted_counter is not None:
+        _janitor_deleted_counter.add(parts_cleaned)
 
     logger.info(f"GC cleaned {parts_cleaned=}")
     return parts_cleaned
@@ -342,11 +461,8 @@ async def run_janitor_loop():
     fs_store = FileSystemPartsStore(config.object_cache_dir)
     redis_client = Redis.from_url(config.redis_queues_url)
 
-    # Initialize metrics
-    try:
-        initialize_metrics_collector(None)  # type: ignore[arg-type]
-    except Exception:
-        logger.debug("Metrics initialization failed; continuing without metrics", exc_info=True)
+    # Initialize janitor-owned OTel metrics
+    _setup_janitor_metrics()
 
     logger.info("Starting janitor service...")
     logger.info(f"FS store root: {config.object_cache_dir}")

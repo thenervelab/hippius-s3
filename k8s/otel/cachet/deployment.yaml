@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cachet
+  namespace: monitoring
+  labels:
+    app: cachet
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: cachet
+  template:
+    metadata:
+      labels:
+        app: cachet
+    spec:
+      initContainers:
+        - name: init-sqlite
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              chown -R 1001:0 /data
+              touch /data/database.sqlite
+              chown 1001:0 /data/database.sqlite
+          volumeMounts:
+            - name: cachet-sqlite
+              mountPath: /data
+      containers:
+        - name: cachet
+          image: cachethq/docker:2.3.18
+          command:
+            - sh
+            - -c
+            - |
+              ln -sf /data/database.sqlite /var/www/html/database/database.sqlite
+              # PHP 7.3 compat: count() on null throws ErrorException
+              sed -i 's/count(\$query->wheres)/count((array) \$query->wheres)/g' /var/www/html/vendor/laravel/framework/src/Illuminate/Database/Eloquent/Builder.php
+              # Clear stale compiled views
+              rm -rf /var/www/html/storage/framework/views/*.php
+              exec /sbin/entrypoint.sh
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: cachet-config
+            - secretRef:
+                name: cachet-secrets
+          volumeMounts:
+            - name: cachet-sqlite
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "250m"
+      volumes:
+        - name: cachet-sqlite
+          persistentVolumeClaim:
+            claimName: cachet-sqlite

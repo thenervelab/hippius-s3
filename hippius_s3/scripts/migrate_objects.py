@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any
 from typing import AsyncGenerator
 
-import asyncpg  # type: ignore[import-untyped]
-import redis.asyncio as async_redis  # type: ignore[import-untyped]
+import asyncpg
+import redis.asyncio as async_redis
 
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
@@ -473,7 +473,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 progress_task = asyncio.create_task(_progress_loop())
 
     config = get_config()
-    db = await asyncpg.connect(config.database_url)  # type: ignore[arg-type]
+    db = await asyncpg.connect(config.database_url)
     redis_client = async_redis.from_url(config.redis_url)
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
 
@@ -607,7 +607,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
             task_db: Any | None = None
             try:
-                task_db = await asyncpg.connect(config.database_url)  # type: ignore[arg-type]
+                task_db = await asyncpg.connect(config.database_url)
                 address = str(o.get("main_account_id", ""))
 
                 if args.dry_run:

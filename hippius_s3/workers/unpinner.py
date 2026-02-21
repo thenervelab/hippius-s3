@@ -136,6 +136,7 @@ async def process_unpin_request(
             get_metrics_collector().record_unpinner_operation(
                 main_account=request.address,
                 success=True,
+                backend=backend_name,
             )
 
         except Exception as e:
@@ -168,6 +169,7 @@ async def process_unpin_request(
                 get_metrics_collector().record_unpinner_operation(
                     main_account=request.address,
                     success=False,
+                    backend=backend_name,
                     attempt=attempts_next,
                 )
             else:
@@ -180,6 +182,7 @@ async def process_unpin_request(
                 get_metrics_collector().record_unpinner_operation(
                     main_account=request.address,
                     success=False,
+                    backend=backend_name,
                     error_type=error_class,
                 )
 
@@ -217,7 +220,7 @@ async def run_unpinner_loop(
         while True:
             await move_due_unpin_retries(backend_name=backend_name)
 
-            unpin_request, redis_queues_client = await with_redis_retry(  # type: ignore[assignment]
+            unpin_request, redis_queues_client = await with_redis_retry(
                 lambda rc: dequeue_unpin_request(queue_name),
                 redis_queues_client,
                 config.redis_queues_url,

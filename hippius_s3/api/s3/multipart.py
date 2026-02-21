@@ -298,11 +298,6 @@ async def initiate_multipart_upload(
 """
         xml_bytes = xml_string.encode("utf-8")
 
-        get_metrics_collector().record_multipart_operation(
-            operation="initiate_upload",
-            main_account=request.state.account.main_account,
-        )
-
         # Return response with proper headers
         return Response(
             content=xml_bytes,
@@ -330,7 +325,7 @@ async def initiate_multipart_upload(
 
 async def get_all_cached_chunks(
     object_id: str,
-    redis_client: Redis,  # type: ignore[type-arg]
+    redis_client: Redis,
 ) -> list[Any]:
     """Find all cached part meta keys for an object using non-blocking SCAN."""
     try:
@@ -449,7 +444,7 @@ async def upload_part(
         except Exception:
             return s3_error_response("InternalError", "Reader pipeline unavailable", status_code=500)
 
-        object_id_str = str(source_obj["object_id"])  # type: ignore[index]
+        object_id_str = str(source_obj["object_id"])
         src_ver = int(source_obj.get("object_version") or 1)
         parts = await read_parts_list(db, object_id_str, src_ver)
         rng = None
@@ -496,9 +491,7 @@ async def upload_part(
                             )
                     if not chunk_specs:
                         continue
-                    dl_parts.append(
-                        PartToDownload(part_number=int(pn), chunks=chunk_specs)  # type: ignore[arg-type]
-                    )
+                    dl_parts.append(PartToDownload(part_number=int(pn), chunks=chunk_specs))
                 except Exception:
                     continue
             req = DownloadChainRequest(
@@ -672,10 +665,6 @@ async def upload_part(
         total_time = time.time() - start_time
         logger.debug(f"Part {part_number}: TOTAL processing time: {total_time:.3f}s")
 
-        get_metrics_collector().record_multipart_operation(
-            operation="upload_part",
-            main_account=request.state.account.main_account,
-        )
         get_metrics_collector().record_data_transfer(
             operation="upload_part",
             bytes_transferred=file_size,
@@ -1073,10 +1062,6 @@ async def complete_multipart_upload(
 </CompleteMultipartUploadResult>
 """.encode("utf-8")
 
-        get_metrics_collector().record_multipart_operation(
-            operation="complete_upload",
-            main_account=request.state.account.main_account,
-        )
         get_metrics_collector().record_s3_operation(
             operation="complete_multipart_upload",
             bucket_name=bucket_name,

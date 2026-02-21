@@ -29,8 +29,10 @@ from opentelemetry import trace
 
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
+from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import PartToDownload
+from hippius_s3.redis_utils import create_redis_client
 from hippius_s3.utils import get_query
 from hippius_s3.utils.timing import log_timing
 
@@ -81,6 +83,104 @@ async def process_download_request(
         base_sleep = config.downloader_retry_base_seconds
         jitter = config.downloader_retry_jitter_seconds
 
+        t_request_start = time.perf_counter()
+        ttfb_recorded = False
+        ttfb_ms = 0.0
+        total_bytes_downloaded = 0
+
+        async def _fetch_chunk(part_number: int, spec: object, span: trace.Span) -> bool:
+            """Fetch and cache a single chunk, guarded by the semaphore."""
+            nonlocal ttfb_recorded, ttfb_ms, total_bytes_downloaded
+            chunk_index = int(spec.index)  # ty: ignore[unresolved-attribute]
+
+            async with semaphore:
+                # Check if already cached
+                cached = await obj_cache.chunk_exists(
+                    download_request.object_id,
+                    int(download_request.object_version),
+                    part_number,
+                    chunk_index,
+                )
+                if cached:
+                    logger.debug(f"[{backend_name}] Skipping cached chunk part={part_number} ci={chunk_index}")
+                    return True
+
+                # Look up backend_identifier (acquire connection from pool)
+                async with db_pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        get_query("get_chunk_backend_identifier"),
+                        backend_name,
+                        download_request.object_id,
+                        int(download_request.object_version),
+                        part_number,
+                        chunk_index,
+                    )
+                if not row or not row["backend_identifier"]:
+                    logger.debug(f"[{backend_name}] No identifier for part={part_number} ci={chunk_index}, skipping")
+                    return True
+
+                identifier = str(row["backend_identifier"])
+
+                # Fetch with retries
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        t0 = time.perf_counter()
+                        data = await fetch_fn(identifier, download_request.subaccount)
+                        fetch_ms = (time.perf_counter() - t0) * 1000.0
+
+                        if not ttfb_recorded:
+                            ttfb_ms = (time.perf_counter() - t_request_start) * 1000.0
+                            ttfb_recorded = True
+                        total_bytes_downloaded += len(data)
+
+                        t_cache = time.perf_counter()
+                        await obj_cache.set_chunk(
+                            download_request.object_id,
+                            int(download_request.object_version),
+                            part_number,
+                            chunk_index,
+                            data,
+                        )
+                        cache_ms = (time.perf_counter() - t_cache) * 1000.0
+
+                        chunk_mb = len(data) / (1024 * 1024)
+                        chunk_throughput = chunk_mb / (fetch_ms / 1000.0) if fetch_ms > 0 else 0
+                        logger.info(
+                            f"[{backend_name}] CHUNK object_id={download_request.object_id} "
+                            f"part={part_number} ci={chunk_index} id={identifier} "
+                            f"fetch={fetch_ms:.0f}ms cache={cache_ms:.0f}ms "
+                            f"size={chunk_mb:.1f}MB throughput={chunk_throughput:.1f}MB/s"
+                        )
+
+                        log_timing(
+                            "downloader.chunk_download_and_store",
+                            fetch_ms + cache_ms,
+                            extra={
+                                "backend": backend_name,
+                                "object_id": download_request.object_id,
+                                "part_number": part_number,
+                                "chunk_index": chunk_index,
+                                "size_bytes": len(data),
+                            },
+                        )
+                        return True
+                    except Exception as exc:
+                        if attempt == max_attempts:
+                            logger.error(
+                                f"[{backend_name}] Failed chunk "
+                                f"part={part_number} ci={chunk_index} "
+                                f"after {max_attempts} attempts: {exc}"
+                            )
+                            return False
+                        sleep_for = base_sleep * attempt + random.uniform(0, jitter)
+                        logger.warning(
+                            f"[{backend_name}] Fetch error part={part_number} "
+                            f"ci={chunk_index} attempt {attempt}/{max_attempts}: "
+                            f"{exc}. Retrying in {sleep_for:.2f}s"
+                        )
+                        await asyncio.sleep(sleep_for)
+            return False  # unreachable, but keeps mypy happy
+
         async def _process_part(part: PartToDownload) -> bool:
             part_number = int(part.part_number)
             with tracer.start_as_current_span(
@@ -90,95 +190,15 @@ async def process_download_request(
                     "part_number": part_number,
                     "num_chunks": len(part.chunks),
                 },
-            ):
-                async with semaphore:
-                    for spec in part.chunks:
-                        chunk_index = int(spec.index)
-
-                        # Check if already cached
-                        cached = await obj_cache.chunk_exists(
-                            download_request.object_id,
-                            int(download_request.object_version),
-                            part_number,
-                            chunk_index,
-                        )
-                        if cached:
-                            logger.debug(f"[{backend_name}] Skipping cached chunk part={part_number} ci={chunk_index}")
-                            continue
-
-                        # Look up backend_identifier (acquire connection from pool)
-                        async with db_pool.acquire() as conn:
-                            row = await conn.fetchrow(
-                                get_query("get_chunk_backend_identifier"),
-                                backend_name,
-                                download_request.object_id,
-                                int(download_request.object_version),
-                                part_number,
-                                chunk_index,
-                            )
-                        if not row or not row["backend_identifier"]:
-                            logger.debug(
-                                f"[{backend_name}] No identifier for part={part_number} ci={chunk_index}, skipping"
-                            )
-                            continue
-
-                        identifier = str(row["backend_identifier"])
-
-                        # Fetch with retries
-                        for attempt in range(1, max_attempts + 1):
-                            try:
-                                t0 = time.perf_counter()
-                                data = await fetch_fn(identifier, download_request.subaccount)
-                                elapsed_ms = (time.perf_counter() - t0) * 1000.0
-
-                                await obj_cache.set_chunk(
-                                    download_request.object_id,
-                                    int(download_request.object_version),
-                                    part_number,
-                                    chunk_index,
-                                    data,
-                                )
-
-                                with contextlib.suppress(Exception):
-                                    head8 = data[:8].hex() if data else ""
-                                    logger.info(
-                                        f"[{backend_name}] STORED part={part_number} "
-                                        f"ci={chunk_index} id={identifier[:16]}… "
-                                        f"len={len(data)} head8={head8}"
-                                    )
-
-                                log_timing(
-                                    "downloader.chunk_download_and_store",
-                                    elapsed_ms,
-                                    extra={
-                                        "backend": backend_name,
-                                        "object_id": download_request.object_id,
-                                        "part_number": part_number,
-                                        "chunk_index": chunk_index,
-                                        "size_bytes": len(data),
-                                    },
-                                )
-                                break  # success
-                            except Exception as exc:
-                                if attempt == max_attempts:
-                                    logger.error(
-                                        f"[{backend_name}] Failed chunk "
-                                        f"part={part_number} ci={chunk_index} "
-                                        f"after {max_attempts} attempts: {exc}"
-                                    )
-                                    return False
-                                sleep_for = base_sleep * attempt + random.uniform(0, jitter)
-                                logger.warning(
-                                    f"[{backend_name}] Fetch error part={part_number} "
-                                    f"ci={chunk_index} attempt {attempt}/{max_attempts}: "
-                                    f"{exc}. Retrying in {sleep_for:.2f}s"
-                                )
-                                await asyncio.sleep(sleep_for)
+            ) as part_span:
+                chunk_results = await asyncio.gather(
+                    *[_fetch_chunk(part_number, spec, part_span) for spec in part.chunks]
+                )
 
                 # Clear in-progress flag
                 with contextlib.suppress(Exception):
                     await redis_client.delete(f"download_in_progress:{download_request.object_id}:{part_number}")
-                return True
+                return all(chunk_results)
 
         try:
             results = await asyncio.gather(*[_process_part(part) for part in download_request.chunks])
@@ -186,12 +206,39 @@ async def process_download_request(
             total = len(download_request.chunks)
             span.set_attribute("result.success_count", success_count)
             span.set_attribute("result.total_parts", total)
+            total_ms = (time.perf_counter() - t_request_start) * 1000.0
+            size_mb = total_bytes_downloaded / (1024 * 1024)
+            throughput = size_mb / (total_ms / 1000.0) if total_ms > 0 else 0
+            logger.info(
+                f"[{backend_name}] PERF download {short_id} "
+                f"total={total_ms:.0f}ms ttfb={ttfb_ms:.0f}ms "
+                f"size={size_mb:.1f}MB throughput={throughput:.1f}MB/s "
+                f"parts={success_count}/{total}"
+            )
+            total_duration = time.perf_counter() - t_request_start
             if success_count == total:
-                logger.info(f"[{backend_name}] All {total} parts OK for {short_id}")
+                get_metrics_collector().record_downloader_operation(
+                    backend=backend_name,
+                    main_account=download_request.address,
+                    success=True,
+                    duration=total_duration,
+                    num_chunks=sum(len(p.chunks) for p in download_request.chunks),
+                )
                 return True
+            get_metrics_collector().record_downloader_operation(
+                backend=backend_name,
+                main_account=download_request.address,
+                success=False,
+                duration=total_duration,
+            )
             logger.error(f"[{backend_name}] {success_count}/{total} parts OK for {short_id}")
             return False
         except Exception as exc:
+            get_metrics_collector().record_downloader_operation(
+                backend=backend_name,
+                main_account=download_request.address,
+                success=False,
+            )
             logger.error(f"[{backend_name}] process_download_request error: {exc}", exc_info=True)
             return False
 
@@ -207,6 +254,7 @@ async def run_downloader_loop(
     from redis.exceptions import ConnectionError as RedisConnectionError
     from redis.exceptions import TimeoutError as RedisTimeoutError
 
+    from hippius_s3.monitoring import initialize_metrics_collector
     from hippius_s3.queue import dequeue_download_request
     from hippius_s3.queue import initialize_queue_client
     from hippius_s3.redis_cache import initialize_cache_client
@@ -215,14 +263,17 @@ async def run_downloader_loop(
 
     config = get_config()
 
-    redis_client = async_redis.from_url(config.redis_url)
+    redis_client: async_redis.Redis = create_redis_client(config.redis_url)  # ty: ignore[invalid-assignment]
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
     db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=20)
 
     initialize_queue_client(redis_queues_client)
     initialize_cache_client(redis_client)
+    initialize_metrics_collector(redis_client)
 
-    logger.info(f"[{backend_name}] Starting downloader, queue={queue_name}")
+    if backend_name == "arion":
+        backend_info = f" base_url={config.arion_base_url} verify_ssl={config.arion_verify_ssl}"
+        logger.info(f"[{backend_name}] Starting downloader, queue={queue_name}{backend_info}")
 
     try:
         while True:
@@ -231,7 +282,7 @@ async def run_downloader_loop(
             except (BusyLoadingError, RedisConnectionError, RedisTimeoutError) as exc:
                 logger.warning(f"[{backend_name}] Redis error dequeuing: {exc}. Reconnecting…")
                 with contextlib.suppress(Exception):
-                    await redis_queues_client.aclose()  # type: ignore[attr-defined]
+                    await redis_queues_client.aclose()  # ty: ignore[unresolved-attribute]
                 await asyncio.sleep(2)
                 redis_queues_client = async_redis.from_url(config.redis_queues_url)
                 initialize_queue_client(redis_queues_client)
@@ -279,8 +330,8 @@ async def run_downloader_loop(
                     job_span.set_status(trace.StatusCode.ERROR, str(exc))
                     logger.warning(f"[{backend_name}] Redis issue during processing: {exc}. Reconnecting…")
                     with contextlib.suppress(Exception):
-                        await redis_client.aclose()  # type: ignore[attr-defined]
-                    redis_client = async_redis.from_url(config.redis_url)
+                        await redis_client.aclose()  # ty: ignore[unresolved-attribute]
+                    redis_client = create_redis_client(config.redis_url)  # ty: ignore[invalid-assignment]
                     initialize_cache_client(redis_client)
                 except asyncpg.InterfaceError as exc:
                     job_span.record_exception(exc)
@@ -296,6 +347,6 @@ async def run_downloader_loop(
         logger.error(f"[{backend_name}] Fatal loop error: {exc}", exc_info=True)
         raise
     finally:
-        await redis_client.aclose()  # type: ignore[attr-defined]
-        await redis_queues_client.aclose()  # type: ignore[attr-defined]
+        await redis_client.aclose()  # ty: ignore[unresolved-attribute]
+        await redis_queues_client.aclose()  # ty: ignore[unresolved-attribute]
         await db_pool.close()

@@ -1,4 +1,6 @@
 tempo:
+  # Disable memory ballast — Go 1.19+ uses GOMEMLIMIT instead
+  memBallastSizeMbs: 0
   receivers:
     otlp:
       protocols:
@@ -19,13 +21,16 @@ tempo:
     defaults:
       metrics_generator:
         processors: [service-graphs, span-metrics]
+  extraEnv:
+    - name: GOMEMLIMIT
+      value: "1600MiB"
   resources:
     requests:
       cpu: 100m
-      memory: 256Mi
+      memory: 512Mi
     limits:
-      cpu: 500m
-      memory: 1Gi
+      cpu: "1"
+      memory: 2Gi
 
 persistence:
   enabled: true

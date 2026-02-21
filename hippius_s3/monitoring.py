@@ -23,21 +23,10 @@ class MetricsCollector:
     def __init__(self, redis_client: Union[Redis, RedisCluster]):
         self.redis_client = redis_client
         self.meter = metrics.get_meter(__name__)
-        self._upload_len = 0
-        self._unpin_len = 0
-        self._substrate_len = 0
-        self._download_len = 0
-        self._main_db_size = 0
-        self._accounts_db_size = 0
-        self._chain_db_size = 0
-        self._substrate_db_size = 0
-        self._rate_limiting_db_size = 0
+        self._queue_lengths: dict[str, int] = {}
         self._used_mem = 0
         self._max_mem = 0
         self._backup_last_success_timestamp = 0.0
-        # FS store metrics
-        self._fs_store_oldest_age_seconds = 0.0
-        self._fs_store_parts_on_disk = 0
         self._db_pool_size = 0
         self._db_pool_free = 0
         self._db_pool_used = 0
@@ -60,18 +49,6 @@ class MetricsCollector:
             name="http_response_bytes_total", description="Total bytes in HTTP responses", unit="bytes"
         )
 
-        self.s3_objects_total = self.meter.create_counter(
-            name="s3_objects_total", description="Total number of S3 objects", unit="1"
-        )
-
-        self.s3_buckets_total = self.meter.create_counter(
-            name="s3_buckets_total", description="Total number of S3 buckets", unit="1"
-        )
-
-        self.multipart_uploads_active = self.meter.create_up_down_counter(
-            name="multipart_uploads_active", description="Number of active multipart uploads", unit="1"
-        )
-
         self.s3_bytes_uploaded = self.meter.create_counter(
             name="s3_bytes_uploaded_total", description="Total bytes uploaded to S3", unit="bytes"
         )
@@ -84,14 +61,6 @@ class MetricsCollector:
             name="s3_operations_total", description="Total S3 operations by type", unit="1"
         )
 
-        self.multipart_parts_uploaded = self.meter.create_counter(
-            name="multipart_parts_uploaded_total", description="Total multipart parts uploaded", unit="1"
-        )
-
-        self.multipart_uploads_completed = self.meter.create_counter(
-            name="multipart_uploads_completed_total", description="Total completed multipart uploads", unit="1"
-        )
-
         self.s3_errors_total = self.meter.create_counter(
             name="s3_errors_total", description="Total S3 errors by type", unit="1"
         )
@@ -100,10 +69,6 @@ class MetricsCollector:
 
         self.cache_misses = self.meter.create_counter(
             name="cache_misses_total", description="Total cache misses", unit="1"
-        )
-
-        self.object_size_bytes = self.meter.create_histogram(
-            name="object_size_bytes", description="Distribution of object sizes", unit="bytes"
         )
 
         self.uploader_requests_total = self.meter.create_counter(
@@ -126,7 +91,7 @@ class MetricsCollector:
 
         self.uploader_chunks_uploaded = self.meter.create_counter(
             name="uploader_chunks_uploaded_total",
-            description="Total chunks uploaded to IPFS",
+            description="Total chunks uploaded to backends",
             unit="1",
         )
 
@@ -144,7 +109,25 @@ class MetricsCollector:
 
         self.unpinner_files_unpinned = self.meter.create_counter(
             name="unpinner_files_unpinned_total",
-            description="Total files unpinned from IPFS",
+            description="Total files unpinned from backends",
+            unit="1",
+        )
+
+        self.downloader_requests_total = self.meter.create_counter(
+            name="downloader_requests_total",
+            description="Total downloader requests processed",
+            unit="1",
+        )
+
+        self.downloader_duration = self.meter.create_histogram(
+            name="downloader_duration_seconds",
+            description="Duration of downloader processing",
+            unit="s",
+        )
+
+        self.downloader_chunks_fetched = self.meter.create_counter(
+            name="downloader_chunks_fetched_total",
+            description="Total chunks fetched from backends",
             unit="1",
         )
 
@@ -215,31 +198,6 @@ class MetricsCollector:
         )
 
         self.meter.create_observable_gauge(
-            name="hippius_redis_db_size",
-            callbacks=[self._obs_db_sizes],
-            description="Total keys in Redis databases (DBSIZE)",
-        )
-
-        # FS store gauges
-        self.meter.create_observable_gauge(
-            name="fs_store_oldest_age_seconds",
-            callbacks=[self._obs_fs_store_oldest_age],
-            description="Age in seconds of the oldest part directory in the FS store",
-        )
-        self.meter.create_observable_gauge(
-            name="fs_store_parts_on_disk",
-            callbacks=[self._obs_fs_store_parts_on_disk],
-            description="Approximate count of part directories on disk in the FS store",
-        )
-
-        # FS janitor deletions counter
-        self.fs_janitor_deleted_total = self.meter.create_counter(
-            name="fs_janitor_deleted_total",
-            description="Total number of FS parts deleted by the janitor",
-            unit="1",
-        )
-
-        self.meter.create_observable_gauge(
             name="backup_last_success_timestamp",
             callbacks=[self._obs_backup_last_success],
             description="Unix timestamp of last successful backup cycle",
@@ -261,27 +219,37 @@ class MetricsCollector:
             description="Database connection pool used connections",
         )
 
-        self.performance_index = self.meter.create_histogram(
-            name="hippius_performance_index",
-            description="Normalized performance index score (0-100)",
+        self.gateway_overhead_duration = self.meter.create_histogram(
+            name="gateway_overhead_seconds",
+            description="Gateway middleware processing time excluding body streaming",
+            unit="s",
+        )
+
+        self.auth_cache_hits = self.meter.create_counter(
+            name="auth_cache_hits_total",
+            description="Total auth cache hits",
             unit="1",
         )
 
-        self.throughput_mbps = self.meter.create_histogram(
-            name="hippius_throughput_mbps",
-            description="Data transfer throughput in MB/s",
-            unit="MB/s",
+        self.auth_cache_misses = self.meter.create_counter(
+            name="auth_cache_misses_total",
+            description="Total auth cache misses",
+            unit="1",
         )
 
-        self.overhead_ms = self.meter.create_histogram(
-            name="hippius_overhead_ms",
-            description="Fixed overhead latency in milliseconds",
-            unit="ms",
+        self.seed_auth_cache_hits = self.meter.create_counter(
+            name="seed_auth_cache_hits_total",
+            description="Total seed phrase auth cache hits",
+            unit="1",
         )
 
-        logger.info(
-            "Performance metrics histograms created: hippius_performance_index, hippius_throughput_mbps, hippius_overhead_ms"
+        self.seed_auth_cache_misses = self.meter.create_counter(
+            name="seed_auth_cache_misses_total",
+            description="Total seed phrase auth cache misses",
+            unit="1",
         )
+
+        logger.info("Metrics setup complete")
 
     def _obs_redis_used_mem(self, _: object) -> list[metrics.Observation]:
         return [metrics.Observation(self._used_mem, {})]
@@ -290,30 +258,13 @@ class MetricsCollector:
         return [metrics.Observation(self._max_mem, {})]
 
     def _obs_queue_lengths(self, _: object) -> list[metrics.Observation]:
-        return [
-            metrics.Observation(self._upload_len, {"queue_name": "upload_requests"}),
-            metrics.Observation(self._unpin_len, {"queue_name": "unpin_requests"}),
-            metrics.Observation(self._substrate_len, {"queue_name": "substrate_requests"}),
-            metrics.Observation(self._download_len, {"queue_name": "download_requests"}),
-        ]
+        return [metrics.Observation(length, {"queue_name": name}) for name, length in self._queue_lengths.items()]
 
-    def _obs_db_sizes(self, _: object) -> list[metrics.Observation]:
-        return [
-            metrics.Observation(self._main_db_size, {"redis_instance": "main"}),
-            metrics.Observation(self._accounts_db_size, {"redis_instance": "accounts"}),
-            metrics.Observation(self._chain_db_size, {"redis_instance": "chain"}),
-            metrics.Observation(self._substrate_db_size, {"redis_instance": "substrate"}),
-            metrics.Observation(self._rate_limiting_db_size, {"redis_instance": "rate_limiting"}),
-        ]
+    def set_queue_length(self, queue_name: str, length: int) -> None:
+        self._queue_lengths[queue_name] = length
 
     def _obs_backup_last_success(self, _: object) -> list[metrics.Observation]:
         return [metrics.Observation(self._backup_last_success_timestamp, {})]
-
-    def _obs_fs_store_oldest_age(self, _: object) -> list[metrics.Observation]:
-        return [metrics.Observation(float(self._fs_store_oldest_age_seconds), {})]
-
-    def _obs_fs_store_parts_on_disk(self, _: object) -> list[metrics.Observation]:
-        return [metrics.Observation(int(self._fs_store_parts_on_disk), {})]
 
     def _obs_db_pool_size(self, _: object) -> list[metrics.Observation]:
         return [metrics.Observation(self._db_pool_size, {})]
@@ -323,13 +274,6 @@ class MetricsCollector:
 
     def _obs_db_pool_used(self, _: object) -> list[metrics.Observation]:
         return [metrics.Observation(self._db_pool_used, {})]
-
-    # Public setters for FS metrics
-    def set_fs_store_oldest_age_seconds(self, age_seconds: float) -> None:
-        self._fs_store_oldest_age_seconds = float(max(0.0, age_seconds))
-
-    def set_fs_store_parts_on_disk(self, count: int) -> None:
-        self._fs_store_parts_on_disk = int(max(0, count))
 
     def update_db_pool_metrics(self, size: int, free: int) -> None:
         self._db_pool_size = size
@@ -386,11 +330,6 @@ class MetricsCollector:
 
         self.s3_operations_total.add(1, attributes=attributes)
 
-        if operation in ["put_object", "post_object"]:
-            self.s3_objects_total.add(1, attributes=attributes)
-        elif operation in ["put_bucket"]:
-            self.s3_buckets_total.add(1, attributes=attributes)
-
     def record_data_transfer(
         self,
         operation: str,
@@ -415,29 +354,6 @@ class MetricsCollector:
             self.s3_bytes_downloaded.add(bytes_transferred, attributes=attributes)
 
         self.s3_operations_total.add(1, attributes=attributes)
-
-        if bytes_transferred > 0:
-            self.object_size_bytes.record(bytes_transferred, attributes=attributes)
-
-    def record_multipart_operation(
-        self,
-        operation: str,
-        main_account: Optional[str] = None,
-    ) -> None:
-        attributes = {"operation": operation}
-
-        if main_account:
-            attributes["main_account"] = main_account
-
-        if operation == "upload_part":
-            self.multipart_parts_uploaded.add(1, attributes=attributes)
-        elif operation == "complete_upload":
-            self.multipart_uploads_completed.add(1, attributes=attributes)
-            self.multipart_uploads_active.add(-1, attributes=attributes)
-        elif operation == "initiate_upload":
-            self.multipart_uploads_active.add(1, attributes=attributes)
-        elif operation == "abort_upload":
-            self.multipart_uploads_active.add(-1, attributes=attributes)
 
     def record_error(
         self,
@@ -477,6 +393,7 @@ class MetricsCollector:
         self,
         main_account: str,
         success: bool,
+        backend: str = "",
         num_chunks: int = 0,
         duration: Optional[float] = None,
         attempt: Optional[int] = None,
@@ -486,18 +403,24 @@ class MetricsCollector:
             "main_account": main_account,
             "success": str(success).lower(),
         }
+        if backend:
+            attributes["backend"] = backend
 
         if attempt is not None:
             retry_attributes = {
                 "main_account": main_account,
                 "attempt": str(attempt),
             }
+            if backend:
+                retry_attributes["backend"] = backend
             self.uploader_requests_retried_total.add(1, attributes=retry_attributes)
         elif error_type is not None:
             dlq_attributes = {
                 "main_account": main_account,
                 "error_type": error_type,
             }
+            if backend:
+                dlq_attributes["backend"] = backend
             self.uploader_dlq_total.add(1, attributes=dlq_attributes)
         else:
             self.uploader_requests_total.add(1, attributes=attributes)
@@ -512,6 +435,7 @@ class MetricsCollector:
         self,
         main_account: str,
         success: bool,
+        backend: str = "",
         num_files: int = 0,
         duration: Optional[float] = None,
         attempt: Optional[int] = None,
@@ -521,18 +445,24 @@ class MetricsCollector:
             "main_account": main_account,
             "success": str(success).lower(),
         }
+        if backend:
+            attributes["backend"] = backend
 
         if attempt is not None:
             retry_attributes = {
                 "main_account": main_account,
                 "attempt": str(attempt),
             }
+            if backend:
+                retry_attributes["backend"] = backend
             self.unpinner_requests_retried_total.add(1, attributes=retry_attributes)
         elif error_type is not None:
             dlq_attributes = {
                 "main_account": main_account,
                 "error_type": error_type,
             }
+            if backend:
+                dlq_attributes["backend"] = backend
             self.unpinner_dlq_total.add(1, attributes=dlq_attributes)
         else:
             self.unpinner_requests_total.add(1, attributes=attributes)
@@ -542,6 +472,59 @@ class MetricsCollector:
 
             if duration is not None:
                 self.unpinner_duration.record(duration, attributes=attributes)
+
+    def record_downloader_operation(
+        self,
+        backend: str,
+        main_account: str,
+        success: bool,
+        duration: Optional[float] = None,
+        num_chunks: int = 0,
+    ) -> None:
+        attributes = {
+            "backend": backend,
+            "main_account": main_account,
+            "success": str(success).lower(),
+        }
+
+        self.downloader_requests_total.add(1, attributes=attributes)
+
+        if num_chunks > 0:
+            self.downloader_chunks_fetched.add(num_chunks, attributes=attributes)
+
+        if duration is not None:
+            self.downloader_duration.record(duration, attributes=attributes)
+
+    def record_gateway_overhead(
+        self,
+        duration: float,
+        method: str,
+        status_code: int,
+        handler: Optional[str] = None,
+        main_account: Optional[str] = None,
+    ) -> None:
+        attributes: dict[str, str] = {
+            "method": method,
+            "status_code": str(status_code),
+        }
+        if handler:
+            attributes["handler"] = handler
+        if main_account:
+            attributes["main_account"] = main_account
+
+        self.gateway_overhead_duration.record(duration, attributes=attributes)
+
+    def record_auth_cache(self, hit: bool) -> None:
+        if hit:
+            self.auth_cache_hits.add(1)
+        else:
+            self.auth_cache_misses.add(1)
+
+    def record_seed_auth_cache(self, hit: bool) -> None:
+        if hit:
+            self.seed_auth_cache_hits.add(1)
+        else:
+            self.seed_auth_cache_misses.add(1)
 
     def record_backup_operation(
         self,
@@ -581,23 +564,6 @@ class MetricsCollector:
         attributes = {"database": database_name}
         self.backup_cleanup_deleted_count.add(deleted_count, attributes=attributes)
 
-    def record_performance_metrics(
-        self,
-        operation: str,
-        bucket: str,
-        performance_index: float,
-        throughput_mbps: float,
-        overhead_ms: float,
-    ) -> None:
-        attributes = {"operation": operation, "bucket": bucket}
-        self.performance_index.record(performance_index, attributes=attributes)
-        self.throughput_mbps.record(throughput_mbps, attributes=attributes)
-        self.overhead_ms.record(overhead_ms, attributes=attributes)
-        logger.info(
-            f"PERF_METRICS: operation={operation}, bucket={bucket}, "
-            f"index={performance_index:.2f}, throughput={throughput_mbps:.2f}MB/s, overhead={overhead_ms:.2f}ms"
-        )
-
 
 class NullMetricsCollector:
     def __init__(self) -> None:
@@ -613,9 +579,6 @@ class NullMetricsCollector:
     def record_data_transfer(self, *args: object, **kwargs: object) -> None:
         pass
 
-    def record_multipart_operation(self, *args: object, **kwargs: object) -> None:
-        pass
-
     def record_error(self, *args: object, **kwargs: object) -> None:
         pass
 
@@ -628,6 +591,18 @@ class NullMetricsCollector:
     def record_unpinner_operation(self, *args: object, **kwargs: object) -> None:
         pass
 
+    def record_downloader_operation(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_gateway_overhead(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_auth_cache(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_seed_auth_cache(self, *args: object, **kwargs: object) -> None:
+        pass
+
     def record_backup_operation(self, *args: object, **kwargs: object) -> None:
         pass
 
@@ -635,9 +610,6 @@ class NullMetricsCollector:
         pass
 
     def record_backup_cleanup(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def record_performance_metrics(self, *args: object, **kwargs: object) -> None:
         pass
 
 

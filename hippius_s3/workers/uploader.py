@@ -91,9 +91,12 @@ def classify_error(error: Exception) -> str:
             "503",
             "502",
             "504",
+            "404",
+            "not found",
             "unavailable",
             "throttled",
             "rate limit",
+            "429",
             "part_meta_not_ready",
             "part_row_missing",
         ]
@@ -114,8 +117,8 @@ class Uploader:
     def __init__(
         self,
         db_pool: Any,
-        redis_client: async_redis.Redis,  # type: ignore[type-arg]
-        redis_queues_client: async_redis.Redis,  # type: ignore[type-arg]
+        redis_client: async_redis.Redis,
+        redis_queues_client: async_redis.Redis,
         config: Any,
         backend_name: str,
         backend_client: BackendClient,
@@ -207,6 +210,7 @@ class Uploader:
             get_metrics_collector().record_uploader_operation(
                 main_account=payload.address,
                 success=True,
+                backend=self.backend_name,
                 num_chunks=len(payload.chunks),
                 duration=total_duration,
             )
@@ -397,5 +401,6 @@ class Uploader:
         get_metrics_collector().record_uploader_operation(
             main_account=payload.address,
             success=False,
+            backend=self.backend_name,
             error_type=etype,
         )

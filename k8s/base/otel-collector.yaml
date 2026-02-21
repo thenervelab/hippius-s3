@@ -37,6 +37,8 @@ data:
         endpoint: tempo.monitoring.svc.cluster.local:4317
         tls:
           insecure: true
+      loki:
+        endpoint: http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push
 
     extensions:
       health_check:
@@ -53,6 +55,10 @@ data:
           receivers: [otlp]
           processors: [memory_limiter, batch]
           exporters: [otlp/tempo]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, resource, batch]
+          exporters: [loki]
 ---
 apiVersion: apps/v1
 kind: Deployment

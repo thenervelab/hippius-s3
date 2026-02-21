@@ -98,6 +98,7 @@ class Config:
     validator_region: str = env("HIPPIUS_VALIDATOR_REGION")
     hippius_api_base_url: str = env("HIPPIUS_API_BASE_URL:https://api.hippius.com/")
     arion_base_url: str = env("HIPPIUS_ARION_BASE_URL:https://arion.hippius.com/")
+    arion_verify_ssl: bool = env("HIPPIUS_ARION_VERIFY_SSL:true", convert=lambda x: x.lower() == "true")
 
     # Redis for caching/rate limiting
     redis_url: str = env("REDIS_URL")
@@ -239,7 +240,7 @@ class Config:
     ipfs_retry_max_ms: int = env("HIPPIUS_IPFS_RETRY_MAX_MS:5000", convert=int)
 
     # Storage version to assign for newly created/overwritten objects
-    # Defaults to 4 (latest layout)
+    # Only v5 is supported
     target_storage_version: int = env("HIPPIUS_TARGET_STORAGE_VERSION:5", convert=int)
 
     # Cachet health monitoring

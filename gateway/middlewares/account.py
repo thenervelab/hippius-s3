@@ -13,8 +13,8 @@ from gateway.config import get_config
 from gateway.services.account_service import BadAccount
 from gateway.services.account_service import InvalidSeedPhraseError
 from gateway.services.account_service import MainAccountError
-from gateway.services.account_service import fetch_account
 from gateway.services.account_service import fetch_account_by_main_address
+from gateway.services.auth_cache import cached_seed_auth
 from gateway.utils.errors import s3_error_response
 from hippius_s3.models.account import HippiusAccount
 from hippius_s3.services.arion_service import CanUploadResponse
@@ -161,8 +161,10 @@ async def account_middleware(request: Request, call_next: Callable) -> Response:
 
         try:
             redis_accounts_client = request.app.state.redis_accounts
-            request.state.account = await fetch_account(
+            redis_client = request.app.state.redis_client
+            request.state.account = await cached_seed_auth(
                 seed_phrase,
+                redis_client,
                 redis_accounts_client,
                 config.substrate_url,
             )
@@ -231,4 +233,4 @@ async def account_middleware(request: Request, call_next: Callable) -> Response:
             delete=False,
         )
     # Continue with the request
-    return await call_next(request)  # type: ignore[no-any-return]
+    return await call_next(request)

@@ -4,4 +4,4 @@ metadata:
   name: redis
 spec:
   type: ExternalName
-  externalName: redis.redis.svc.cluster.local
+  externalName: redis-cluster.hippius-s3-prod.svc.cluster.local

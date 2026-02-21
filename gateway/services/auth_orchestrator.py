@@ -13,8 +13,8 @@ from gateway.middlewares.access_key_auth import verify_access_key_signature
 from gateway.middlewares.sigv4 import AuthParsingError
 from gateway.middlewares.sigv4 import SigV4Verifier
 from gateway.middlewares.sigv4 import extract_credential_from_auth_header
+from gateway.services.auth_cache import cached_auth
 from gateway.utils.errors import s3_error_response
-from hippius_s3.services.hippius_api_service import HippiusApiClient
 from hippius_s3.services.hippius_api_service import HippiusAPIError
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 
@@ -117,6 +117,7 @@ async def _authenticate_presigned_url(request: Request, logger: Any) -> AuthResu
         is_valid, account_address, token_type = await verify_access_key_presigned_url(
             request=request,
             access_key=credential_id,
+            redis_client=request.app.state.redis_client,
         )
     except AccessKeyAuthError as e:
         logger.warning(f"Presigned URL access key auth error: {e}")
@@ -177,8 +178,7 @@ async def _authenticate_bearer(request: Request, auth_header: str, logger: Any) 
         )
 
     try:
-        async with HippiusApiClient() as api_client:
-            token_response = await api_client.auth(token)
+        token_response = await cached_auth(token, request.app.state.redis_client)
 
         if not token_response.valid or token_response.status != "active":
             logger.warning(f"Invalid or inactive Bearer access key: {token[:8]}***, status={token_response.status}")
@@ -239,6 +239,7 @@ async def _authenticate_access_key_header(request: Request, credential: str, log
         is_valid, account_address, token_type = await verify_access_key_signature(
             request=request,
             access_key=credential,
+            redis_client=request.app.state.redis_client,
         )
     except AccessKeyAuthError as e:
         logger.warning(f"Access key auth error: {e}")

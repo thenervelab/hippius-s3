@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 
-import asyncpg  # type: ignore[import-untyped]
-import redis.asyncio as async_redis  # type: ignore[import-untyped]
+import asyncpg
+import redis.asyncio as async_redis
 
 from hippius_s3.config import get_config
 from hippius_s3.queue import UnpinChainRequest
@@ -13,7 +13,7 @@ from hippius_s3.queue import enqueue_unpin_request
 
 async def main_async(args: argparse.Namespace) -> int:
     config = get_config()
-    db = await asyncpg.connect(config.database_url)  # type: ignore[arg-type]
+    db = await asyncpg.connect(config.database_url)
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
 
     from hippius_s3.queue import initialize_queue_client

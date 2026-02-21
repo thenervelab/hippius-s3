@@ -140,7 +140,7 @@ jobs:
             --from-literal=DATABASE_PASSWORD='${{ secrets.DATABASE_PASSWORD }}' \
             --from-literal=DATABASE_URL="${DATABASE_URL}" \
             --from-literal=HIPPIUS_KEYSTORE_DATABASE_URL="${DATABASE_URL}" \
-            --from-literal=REDIS_URL='redis://redis.redis-staging.svc.cluster.local:6379?cluster=true' \
+            --from-literal=REDIS_URL='redis://redis-cluster.hippius-s3-staging.svc.cluster.local:6379?cluster=true' \
             --from-literal=REDIS_ACCOUNTS_URL='redis://redis-accounts:6379' \
             --from-literal=REDIS_CHAIN_URL='redis://redis-chain:6379' \
             --from-literal=REDIS_QUEUES_URL='redis://redis-queues:6379' \
@@ -168,6 +168,16 @@ jobs:
             --namespace=hippius-s3-staging \
             --dry-run=client -o yaml | kubectl apply -f -
 
+      - name: Create postgres superuser secret
+        run: |
+          kubectl create secret generic postgres-superuser \
+            --from-literal=username=postgres \
+            --from-literal=password='${{ secrets.DATABASE_PASSWORD }}' \
+            --namespace=hippius-s3-staging \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl label secret postgres-superuser cnpg.io/reload=true \
+            --namespace=hippius-s3-staging --overwrite
+
       - name: Create postgres backup credentials
         run: |
           kubectl create secret generic postgres-backup-creds \
@@ -180,6 +190,13 @@ jobs:
         run: |
           sed -i "s|OVH_BACKUP_BUCKET_PLACEHOLDER|${{ secrets.OVH_BACKUP_BUCKET }}|g" k8s/staging/postgres-objectstore.yaml
           sed -i "s|OVH_BACKUP_ENDPOINT_URL_PLACEHOLDER|${{ secrets.OVH_BACKUP_ENDPOINT_URL }}|g" k8s/staging/postgres-objectstore.yaml
+
+      - name: Substitute Arion configuration values
+        run: |
+          ARION_URL="${{ secrets.HIPPIUS_ARION_BASE_URL }}"
+          ARION_SSL="${{ secrets.HIPPIUS_ARION_VERIFY_SSL }}"
+          sed -i "s|HIPPIUS_ARION_BASE_URL_PLACEHOLDER|${ARION_URL:-https://arion.hippius.com/}|g" k8s/base/workers-deployments.yaml
+          sed -i "s|HIPPIUS_ARION_VERIFY_SSL_PLACEHOLDER|${ARION_SSL:-true}|g" k8s/base/workers-deployments.yaml
 
       - name: Update image tags
         run: |
@@ -194,6 +211,10 @@ jobs:
         run: |
           kubectl delete job db-migrations -n hippius-s3-staging --ignore-not-found=true
 
+      - name: Deploy Redis cluster
+        run: |
+          kubectl apply -f k8s/redis-cluster/staging.yaml
+
       - name: Deploy to staging
         run: |
           kubectl apply -k k8s/staging
@@ -206,6 +227,11 @@ jobs:
           kubectl rollout status deployment/arion-downloader -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/ipfs-uploader -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/arion-uploader -n hippius-s3-staging --timeout=10m
+
+      - name: Restart external deployments
+        run: |
+          kubectl rollout restart deployment/hydrator -n hippius-s3-staging --ignore-not-found || true
+          kubectl rollout restart deployment/backup -n hippius-s3-staging --ignore-not-found || true
 
       - name: Verify deployment
         run: |
@@ -239,7 +265,7 @@ jobs:
           kubectl create secret generic hippius-s3-secrets \
             --from-literal=DATABASE_URL="${{ secrets.PRODUCTION_DATABASE_URL }}" \
             --from-literal=HIPPIUS_KEYSTORE_DATABASE_URL="${{ secrets.PRODUCTION_DATABASE_URL }}" \
-            --from-literal=REDIS_URL="redis://redis.redis.svc.cluster.local:6379?cluster=true" \
+            --from-literal=REDIS_URL="redis://redis-cluster.hippius-s3-prod.svc.cluster.local:6379?cluster=true" \
             --from-literal=REDIS_ACCOUNTS_URL="redis://redis-accounts:6379/0" \
             --from-literal=REDIS_CHAIN_URL="redis://redis-chain:6379/0" \
             --from-literal=REDIS_QUEUES_URL="redis://redis-queues:6379/0" \
@@ -268,6 +294,16 @@ jobs:
             --namespace=hippius-s3-prod \
             --dry-run=client -o yaml | kubectl apply -f -
 
+      - name: Create postgres superuser secret
+        run: |
+          kubectl create secret generic postgres-superuser \
+            --from-literal=username=postgres \
+            --from-literal=password='${{ secrets.DATABASE_PASSWORD }}' \
+            --namespace=hippius-s3-prod \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl label secret postgres-superuser cnpg.io/reload=true \
+            --namespace=hippius-s3-prod --overwrite
+
       - name: Create postgres backup credentials
         run: |
           kubectl create secret generic postgres-backup-creds \
@@ -280,6 +316,13 @@ jobs:
         run: |
           sed -i "s|OVH_BACKUP_BUCKET_PLACEHOLDER|${{ secrets.OVH_BACKUP_BUCKET }}|g" k8s/production/postgres-objectstore.yaml
           sed -i "s|OVH_BACKUP_ENDPOINT_URL_PLACEHOLDER|${{ secrets.OVH_BACKUP_ENDPOINT_URL }}|g" k8s/production/postgres-objectstore.yaml
+
+      - name: Substitute Arion configuration values
+        run: |
+          ARION_URL="${{ secrets.HIPPIUS_ARION_BASE_URL }}"
+          ARION_SSL="${{ secrets.HIPPIUS_ARION_VERIFY_SSL }}"
+          sed -i "s|HIPPIUS_ARION_BASE_URL_PLACEHOLDER|${ARION_URL:-https://arion.hippius.com/}|g" k8s/base/workers-deployments.yaml
+          sed -i "s|HIPPIUS_ARION_VERIFY_SSL_PLACEHOLDER|${ARION_SSL:-true}|g" k8s/base/workers-deployments.yaml
 
       - name: Update image tags
         run: |
@@ -294,6 +337,10 @@ jobs:
         run: |
           kubectl delete job db-migrations -n hippius-s3-prod --ignore-not-found=true
 
+      - name: Deploy Redis cluster
+        run: |
+          kubectl apply -f k8s/redis-cluster/production.yaml
+
       - name: Deploy to production
         run: |
           kubectl apply -k k8s/production
@@ -306,6 +353,11 @@ jobs:
           kubectl rollout status deployment/arion-downloader -n hippius-s3-prod --timeout=10m
           kubectl rollout status deployment/ipfs-uploader -n hippius-s3-prod --timeout=10m
           kubectl rollout status deployment/arion-uploader -n hippius-s3-prod --timeout=10m
+
+      - name: Restart external deployments
+        run: |
+          kubectl rollout restart deployment/hydrator -n hippius-s3-prod --ignore-not-found || true
+          kubectl rollout restart deployment/backup -n hippius-s3-prod --ignore-not-found || true
 
       - name: Verify deployment
         run: |

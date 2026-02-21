@@ -1,0 +1,152 @@
+# Redis Cluster for hippius-s3-staging namespace
+# 6-node Redis Cluster used as hot-path chunk cache layer.
+# Pure cache — no persistence. Misses fall through to CephFS object_cache volume.
+# Apply: kubectl apply -f k8s/redis-cluster/staging.yaml
+# Bootstrap: kubectl exec -n hippius-s3-staging redis-cluster-0 -- redis-cli --cluster create \
+#   redis-cluster-0.redis-cluster.hippius-s3-staging.svc.cluster.local:6379 \
+#   redis-cluster-1.redis-cluster.hippius-s3-staging.svc.cluster.local:6379 \
+#   redis-cluster-2.redis-cluster.hippius-s3-staging.svc.cluster.local:6379 \
+#   redis-cluster-3.redis-cluster.hippius-s3-staging.svc.cluster.local:6379 \
+#   redis-cluster-4.redis-cluster.hippius-s3-staging.svc.cluster.local:6379 \
+#   redis-cluster-5.redis-cluster.hippius-s3-staging.svc.cluster.local:6379 \
+#   --cluster-yes
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-cluster-config
+  namespace: hippius-s3-staging
+data:
+  redis.conf: |
+    cluster-enabled yes
+    cluster-config-file /data/nodes.conf
+    cluster-node-timeout 5000
+    cluster-require-full-coverage no
+    cluster-migration-barrier 1
+
+    maxmemory 4gb
+    maxmemory-policy allkeys-lru
+    maxmemory-samples 10
+
+    maxclients 10000
+    tcp-backlog 2048
+    tcp-keepalive 300
+    timeout 0
+
+    hz 100
+    lazyfree-lazy-eviction yes
+    lazyfree-lazy-expire yes
+    lazyfree-lazy-server-del yes
+
+    activedefrag yes
+    active-defrag-ignore-bytes 100mb
+    active-defrag-threshold-lower 10
+    active-defrag-threshold-upper 100
+    active-defrag-cycle-min 1
+    active-defrag-cycle-max 25
+
+    protected-mode no
+
+    # No persistence — this is a cache layer
+    appendonly no
+    save ""
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-cluster
+  namespace: hippius-s3-staging
+spec:
+  selector:
+    app: redis-cluster
+  ports:
+    - port: 6379
+      targetPort: 6379
+      name: client
+    - port: 16379
+      targetPort: 16379
+      name: gossip
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-cluster
+  namespace: hippius-s3-staging
+spec:
+  serviceName: redis-cluster
+  replicas: 6
+  selector:
+    matchLabels:
+      app: redis-cluster
+  template:
+    metadata:
+      labels:
+        app: redis-cluster
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: redis-cluster
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command:
+            - sh
+            - -c
+            - >-
+              redis-server /usr/local/etc/redis/redis.conf
+              --cluster-announce-hostname $(hostname).redis-cluster.hippius-s3-staging.svc.cluster.local
+          ports:
+            - containerPort: 6379
+              name: client
+            - containerPort: 16379
+              name: gossip
+          volumeMounts:
+            - name: config
+              mountPath: /usr/local/etc/redis
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli ping | grep -q PONG
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli ping | grep -q PONG
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 6Gi
+      volumes:
+        - name: config
+          configMap:
+            name: redis-cluster-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: ceph-filesystem
+        resources:
+          requests:
+            storage: 1Gi

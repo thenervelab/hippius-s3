@@ -47,21 +47,21 @@ class RedisDownloadChunksCache:
 
 
 class NullDownloadChunksCache:
-    def build_key(self, object_id: str, request_id: str, part_number: int) -> str:  # type: ignore[override]
+    def build_key(self, object_id: str, request_id: str, part_number: int) -> str:
         return f"dl:{object_id}:{request_id}:{int(part_number)}"
 
-    async def get(self, object_id: str, request_id: str, part_number: int) -> Optional[bytes]:  # type: ignore[override]
+    async def get(self, object_id: str, request_id: str, part_number: int) -> Optional[bytes]:
         return None
 
     async def set(
         self, object_id: str, request_id: str, part_number: int, data: bytes, *, ttl: int = DEFAULT_DL_TTL_SECONDS
-    ) -> None:  # type: ignore[override]
+    ) -> None:
         return None
 
-    async def exists(self, object_id: str, request_id: str, part_number: int) -> bool:  # type: ignore[override]
+    async def exists(self, object_id: str, request_id: str, part_number: int) -> bool:
         return False
 
     async def expire(
         self, object_id: str, request_id: str, part_number: int, *, ttl: int = DEFAULT_DL_TTL_SECONDS
-    ) -> None:  # type: ignore[override]
+    ) -> None:
         return None

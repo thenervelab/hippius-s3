@@ -138,7 +138,7 @@ class BaseDLQManager(Generic[T]):
             payload = self.request_class.model_validate(payload_data)
 
             if not force and hasattr(payload, "attempts"):
-                payload.attempts = 0
+                payload.attempts = 0  # ty: ignore[invalid-assignment]
 
             await self.enqueue_func(payload)
             logger.info(f"Successfully requeued identifier: {identifier}")

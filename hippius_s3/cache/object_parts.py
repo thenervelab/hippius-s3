@@ -13,7 +13,7 @@ class _MetricsLike(Protocol):
 
 def _get_metrics_collector() -> _MetricsLike:
     try:
-        from hippius_s3.monitoring import get_metrics_collector  # type: ignore
+        from hippius_s3.monitoring import get_metrics_collector
 
         return get_metrics_collector()
     except Exception:
@@ -33,7 +33,7 @@ DEFAULT_OBJ_PART_TTL_SECONDS = 1800
 def _get_config_value(name: str, default: int) -> int:
     try:
         # Local import to avoid triggering httpx and other deps at module import time
-        from hippius_s3.config import get_config  # type: ignore
+        from hippius_s3.config import get_config
 
         cfg = get_config()
         if name == "object_chunk_size_bytes":
@@ -260,7 +260,7 @@ class RedisObjectPartsCache:
         if not raw:
             return None
         try:
-            return dict(_json.loads(raw))  # type: ignore[arg-type]
+            return dict(_json.loads(raw))
         except Exception:
             return None
 
@@ -288,10 +288,10 @@ class RedisUploadPartsCache:
 
 
 class NullObjectPartsCache:
-    def build_key(self, object_id: str, object_version: int, part_number: int) -> str:  # type: ignore[override]
+    def build_key(self, object_id: str, object_version: int, part_number: int) -> str:
         return f"obj:{object_id}:v:{int(object_version)}:part:{int(part_number)}"
 
-    async def get(self, object_id: str, object_version: int, part_number: int) -> Optional[bytes]:  # type: ignore[override]
+    async def get(self, object_id: str, object_version: int, part_number: int) -> Optional[bytes]:
         return None
 
     async def set(
@@ -302,18 +302,18 @@ class NullObjectPartsCache:
         data: bytes,
         *,
         ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
-    ) -> None:  # type: ignore[override]
+    ) -> None:
         return None
 
-    async def exists(self, object_id: str, object_version: int, part_number: int) -> bool:  # type: ignore[override]
+    async def exists(self, object_id: str, object_version: int, part_number: int) -> bool:
         return False
 
-    async def strlen(self, object_id: str, object_version: int, part_number: int) -> int:  # type: ignore[override]
+    async def strlen(self, object_id: str, object_version: int, part_number: int) -> int:
         return 0
 
     async def expire(
         self, object_id: str, object_version: int, part_number: int, *, ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS
-    ) -> None:  # type: ignore[override]
+    ) -> None:
         return None
 
     # Base helpers removed; use get/set directly

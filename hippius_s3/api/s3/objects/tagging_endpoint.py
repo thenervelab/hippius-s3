@@ -7,7 +7,7 @@ from typing import Any
 
 from fastapi import Request
 from fastapi import Response
-from lxml import etree as ET
+from lxml import etree as ET  # ty: ignore[unresolved-import]
 
 from hippius_s3.api.s3 import errors
 from hippius_s3.repositories.buckets import BucketRepository
@@ -117,9 +117,9 @@ async def set_object_tags(
                 root = ET.fromstring(xml_data)
                 ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
                 tag_dict = {}
-                for tag_elem in root.xpath(".//s3:Tag", namespaces=ns):  # type: ignore[attr-defined]
-                    key_nodes = tag_elem.xpath("./s3:Key", namespaces=ns)  # type: ignore[attr-defined]
-                    value_nodes = tag_elem.xpath("./s3:Value", namespaces=ns)  # type: ignore[attr-defined]
+                for tag_elem in root.xpath(".//s3:Tag", namespaces=ns):
+                    key_nodes = tag_elem.xpath("./s3:Key", namespaces=ns)
+                    value_nodes = tag_elem.xpath("./s3:Value", namespaces=ns)
                     if key_nodes and value_nodes and key_nodes[0].text and value_nodes[0].text:
                         tag_dict[str(key_nodes[0].text)] = str(value_nodes[0].text)
             except Exception:
@@ -137,7 +137,7 @@ async def set_object_tags(
 
         object_id = object_info["object_id"]
         object_version = object_info.get("object_version") or object_info.get("ov.object_version")
-        await db.fetchrow(get_query("update_object_metadata"), json.dumps(metadata), object_id, int(object_version))
+        await db.fetchrow(get_query("update_object_metadata"), json.dumps(metadata), object_id, int(object_version))  # ty: ignore[invalid-argument-type]
         return Response(status_code=200)
 
     except Exception:
@@ -187,7 +187,7 @@ async def delete_object_tags(
 
         object_id = object_info["object_id"]
         object_version = object_info.get("object_version") or object_info.get("ov.object_version")
-        await db.fetchrow(get_query("update_object_metadata"), json.dumps(metadata), object_id, int(object_version))
+        await db.fetchrow(get_query("update_object_metadata"), json.dumps(metadata), object_id, int(object_version))  # ty: ignore[invalid-argument-type]
         return Response(status_code=204)
 
     except Exception:
