@@ -36,15 +36,15 @@ async def _check_can_upload(request: Request, logger: logging.Logger | logging.L
     # AWS CLI v2+ uses chunked transfer encoding and sends the actual file size
     # in x-amz-decoded-content-length instead of Content-Length
     content_length = int(
-        request.headers.get("x-amz-decoded-content-length")
-        or request.headers.get("content-length")
-        or "0"
+        request.headers.get("x-amz-decoded-content-length") or request.headers.get("content-length") or "0"
     )
     main_account = request.state.account.main_account
     arion_client = request.app.state.arion_client
 
     response: CanUploadResponse = await arion_client.can_upload(main_account, content_length)
-    logger.info(f"can_upload billing check for {main_account}: size_bytes={content_length}, result={response.result}, error={response.error}")
+    logger.info(
+        f"can_upload billing check for {main_account}: size_bytes={content_length}, result={response.result}, error={response.error}"
+    )
     if not response.result:
         error_message = response.error or "Upload not permitted by billing service"
         logger.warning(f"can_upload denied for {main_account}: {error_message}")
