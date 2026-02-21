@@ -44,6 +44,7 @@ async def _check_can_upload(request: Request, logger: logging.Logger | logging.L
     arion_client = request.app.state.arion_client
 
     response: CanUploadResponse = await arion_client.can_upload(main_account, content_length)
+    logger.info(f"can_upload billing check for {main_account}: size_bytes={content_length}, result={response.result}, error={response.error}")
     if not response.result:
         error_message = response.error or "Upload not permitted by billing service"
         logger.warning(f"can_upload denied for {main_account}: {error_message}")
