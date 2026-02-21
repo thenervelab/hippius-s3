@@ -32,6 +32,7 @@ from gateway.services.forward_service import ForwardService
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.monitoring import MetricsCollector
 from hippius_s3.monitoring import set_metrics_collector
+from hippius_s3.services.arion_service import ArionClient
 
 
 config = get_config()
@@ -119,6 +120,12 @@ def factory() -> FastAPI:
         )
         logger.info("DocsProxyService initialized")
 
+        app.state.arion_client = ArionClient(
+            base_url=config.arion_base_url,
+            service_key=config.arion_service_key,
+        )
+        logger.info("ArionClient initialized")
+
         async def collect_pool_metrics() -> None:
             while True:
                 await asyncio.sleep(60)
@@ -136,6 +143,10 @@ def factory() -> FastAPI:
     @app.on_event("shutdown")
     async def shutdown() -> None:
         logger.info("Shutting down Hippius S3 Gateway...")
+
+        if hasattr(app.state, "arion_client"):
+            await app.state.arion_client.close()
+            logger.info("ArionClient closed")
 
         if hasattr(app.state, "forward_service"):
             await app.state.forward_service.close()

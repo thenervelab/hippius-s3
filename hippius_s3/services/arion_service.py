@@ -225,6 +225,16 @@ def retry_on_error(
     return decorator
 
 
+class CanUploadRequest(BaseModel):
+    user_id: str
+    size_bytes: int
+
+
+class CanUploadResponse(BaseModel):
+    result: bool
+    error: str | None = None
+
+
 class ArionClient:
     """
     HTTP API client for Hippius API.
@@ -232,12 +242,19 @@ class ArionClient:
 
     def __init__(
         self,
+        base_url: str | None = None,
+        service_key: str | None = None,
     ) -> None:
         """
         Initialize the Arion API client.
+
+        Args:
+            base_url: Optional Arion base URL. Falls back to config if not provided.
+            service_key: Optional API service key. Falls back to config if not provided.
         """
         self._config = get_config()
-        self.api_url = self._config.arion_base_url
+        self.api_url = base_url or self._config.arion_base_url
+        self._service_key = service_key if service_key is not None else self._config.arion_service_key
         self._client = httpx.AsyncClient(
             base_url=self.api_url,
             timeout=httpx.Timeout(
@@ -389,3 +406,34 @@ class ArionClient:
         upload_response = UploadResponse.model_validate(response_json)
         upload_response.size_bytes = len(file_data)
         return upload_response
+
+    @retry_on_error(retries=3, backoff=5.0)
+    async def can_upload(
+        self,
+        account_ss58: str,
+        size_bytes: int,
+    ) -> CanUploadResponse:
+        """
+        Check whether the account is allowed to upload a file of the given size.
+
+        Maps to: POST /can_upload
+
+        Args:
+            account_ss58: Account SS58 address
+            size_bytes: Size of the intended upload in bytes
+
+        Returns:
+            CanUploadResponse: Whether the upload is permitted
+
+        Raises:
+            HippiusAPIError: If the API request fails
+        """
+        headers = self._get_headers(account_ss58)
+        payload = CanUploadRequest(user_id=account_ss58, size_bytes=size_bytes)
+        response = await self._client.post(
+            "/can_upload",
+            json=payload.model_dump(),
+            headers=headers,
+        )
+        response.raise_for_status()
+        return CanUploadResponse.model_validate(response.json())
