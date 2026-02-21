@@ -54,6 +54,21 @@ async def download(account_ss58: str, file_id: str):
     return StreamingResponse(io.BytesIO(entry["bytes"]), media_type="application/octet-stream")
 
 
+class CanUploadRequest(BaseModel):
+    user_id: str
+    size_bytes: int
+
+
+class CanUploadResult(BaseModel):
+    result: bool
+    error: str | None = None
+
+
+@app.post("/can_upload")
+async def can_upload(body: CanUploadRequest) -> CanUploadResult:
+    return CanUploadResult(result=True, error=None)
+
+
 @app.delete("/delete/{user_id}/{file_id}")
 async def delete(user_id: str, file_id: str) -> DeleteResult:
     entry = _store.pop(file_id, None)

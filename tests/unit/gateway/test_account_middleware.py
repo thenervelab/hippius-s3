@@ -2,13 +2,19 @@
 
 import hashlib
 from typing import Any
+from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
+from unittest.mock import patch
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi import Request
 from httpx import ASGITransport
 from httpx import AsyncClient
+
+from hippius_s3.models.account import HippiusAccount
+from tests.unit.mocks.mock_arion_service import MockArionService
 
 
 @pytest.fixture  # type: ignore[misc]
@@ -165,3 +171,160 @@ async def test_account_id_format_matches_ss58_pattern(mock_config_bypass: Any, m
 
     assert len(account_id) == 64  # Full SHA256 hex
     assert all(c in "0123456789abcdef" for c in account_id)
+
+
+# ---------------------------------------------------------------------------
+# can_upload integration tests (non-bypass mode, access_key auth)
+# ---------------------------------------------------------------------------
+
+def _make_can_upload_app(
+    mock_config: Any,
+    mock_arion: MockArionService,
+    monkeypatch: Any,
+) -> FastAPI:
+    """Build a FastAPI app wired with account middleware, mock arion, and mock account fetching."""
+    from gateway.middlewares.account import account_middleware
+
+    monkeypatch.setattr("gateway.middlewares.account.config", mock_config)
+
+    account = HippiusAccount(
+        id="5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        main_account="5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        has_credits=True,
+        upload=True,
+        delete=True,
+    )
+
+    async def mock_fetch_account_by_main_address(address: str, redis_client: Any, substrate_url: str) -> HippiusAccount:
+        return account
+
+    monkeypatch.setattr(
+        "gateway.middlewares.account.fetch_account_by_main_address",
+        mock_fetch_account_by_main_address,
+    )
+
+    app = FastAPI()
+    app.state.redis_accounts = MagicMock()
+    app.state.arion_client = mock_arion
+
+    @app.api_route("/test-bucket/test-key", methods=["GET", "PUT", "POST", "DELETE", "HEAD"])
+    async def test_endpoint(request: Request) -> dict[str, str]:
+        return {"status": "ok"}
+
+    async def inject_access_key(request: Request, call_next: Any) -> Any:
+        request.state.auth_method = "access_key"
+        request.state.account_address = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+        return await call_next(request)
+
+    app.middleware("http")(account_middleware)
+    app.middleware("http")(inject_access_key)
+
+    return app
+
+
+@pytest.mark.asyncio
+async def test_can_upload_allows_when_result_true(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    mock_arion = MockArionService(allow_upload=True)
+    app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert response.status_code == 200
+    assert len(mock_arion.can_upload_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_can_upload_blocks_when_result_false(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    mock_arion = MockArionService(allow_upload=False, upload_error="Quota exceeded")
+    app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert response.status_code == 402
+    assert b"Quota exceeded" in response.content
+
+
+@pytest.mark.asyncio
+async def test_can_upload_skipped_for_get(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    mock_arion = MockArionService(allow_upload=True)
+    app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/test-bucket/test-key")
+
+    assert response.status_code == 200
+    assert len(mock_arion.can_upload_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_can_upload_skipped_for_delete(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    mock_arion = MockArionService(allow_upload=True)
+    app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.delete("/test-bucket/test-key")
+
+    assert response.status_code == 200
+    assert len(mock_arion.can_upload_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_can_upload_sends_correct_content_length(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    mock_arion = MockArionService(allow_upload=True)
+    app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put(
+            "/test-bucket/test-key",
+            content=b"x" * 1024,
+            headers={"content-length": "1024"},
+        )
+
+    assert response.status_code == 200
+    assert mock_arion.can_upload_calls[0] == (
+        "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        1024,
+    )
+
+
+@pytest.mark.asyncio
+async def test_can_upload_fails_closed_on_arion_error(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    mock_arion = MockArionService(raise_on_can_upload=httpx.ConnectError("connection refused"))
+    app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert response.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_can_upload_skipped_in_bypass_mode(mock_config_bypass: Any, monkeypatch: Any) -> None:
+    mock_arion = MockArionService(allow_upload=False, upload_error="should not be called")
+
+    from gateway.middlewares.account import account_middleware
+
+    monkeypatch.setattr("gateway.middlewares.account.config", mock_config_bypass)
+
+    app = FastAPI()
+    app.state.arion_client = mock_arion
+
+    @app.put("/test-bucket/test-key")
+    async def test_endpoint(request: Request) -> dict[str, str]:
+        return {"status": "ok"}
+
+    async def inject_access_key(request: Request, call_next: Any) -> Any:
+        request.state.auth_method = "access_key"
+        request.state.account_address = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+        return await call_next(request)
+
+    app.middleware("http")(account_middleware)
+    app.middleware("http")(inject_access_key)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert response.status_code == 200
+    assert len(mock_arion.can_upload_calls) == 0

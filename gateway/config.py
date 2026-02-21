@@ -124,6 +124,10 @@ class GatewayConfig:
     db_pool_command_timeout: int = dataclasses.field(
         default_factory=lambda: int(os.getenv("GATEWAY_DB_POOL_COMMAND_TIMEOUT", "30"))
     )
+    arion_base_url: str = dataclasses.field(
+        default_factory=lambda: os.getenv("HIPPIUS_ARION_BASE_URL", "https://arion.hippius.com/")
+    )
+    arion_service_key: str = dataclasses.field(default_factory=lambda: os.getenv("ARION_SERVICE_KEY", ""))
 
 
 _config: GatewayConfig | None = None

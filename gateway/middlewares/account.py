@@ -1,6 +1,7 @@
 """Account verification and credit checking middleware for the gateway."""
 
 import hashlib
+import logging
 import re
 from typing import Callable
 
@@ -16,10 +17,37 @@ from gateway.services.account_service import fetch_account_by_main_address
 from gateway.services.auth_cache import cached_seed_auth
 from gateway.utils.errors import s3_error_response
 from hippius_s3.models.account import HippiusAccount
+from hippius_s3.services.arion_service import CanUploadResponse
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 
 
 config = get_config()
+
+
+async def _check_can_upload(request: Request, logger: logging.Logger | logging.LoggerAdapter) -> Response | None:  # type: ignore[type-arg]
+    """
+    Call Arion's can_upload endpoint for PUT/POST requests.
+
+    Returns an error Response if the upload is not allowed, or None if it should proceed.
+    """
+    if request.method not in ("PUT", "POST"):
+        return None
+
+    content_length = int(request.headers.get("content-length", "0"))
+    main_account = request.state.account.main_account
+    arion_client = request.app.state.arion_client
+
+    response: CanUploadResponse = await arion_client.can_upload(main_account, content_length)
+    if not response.result:
+        error_message = response.error or "Upload not permitted by billing service"
+        logger.warning(f"can_upload denied for {main_account}: {error_message}")
+        return s3_error_response(
+            code="UploadNotPermitted",
+            message=error_message,
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        )
+
+    return None
 
 
 async def account_middleware(request: Request, call_next: Callable) -> Response:
@@ -116,6 +144,10 @@ async def account_middleware(request: Request, call_next: Callable) -> Response:
                         status_code=status.HTTP_402_PAYMENT_REQUIRED,
                         BucketName=bucket_name if bucket_name else "",
                     )
+
+                can_upload_error = await _check_can_upload(request, logger)
+                if can_upload_error is not None:
+                    return can_upload_error
         except Exception as e:
             logger.exception(f"Error in access key account verification: {e}")
             return s3_error_response(
@@ -160,6 +192,10 @@ async def account_middleware(request: Request, call_next: Callable) -> Response:
                         status_code=status.HTTP_402_PAYMENT_REQUIRED,
                         BucketName=bucket_name if bucket_name else "",
                     )
+
+                can_upload_error = await _check_can_upload(request, logger)
+                if can_upload_error is not None:
+                    return can_upload_error
         except MainAccountError as e:
             return s3_error_response(
                 code="InvalidAccessKeyId",
