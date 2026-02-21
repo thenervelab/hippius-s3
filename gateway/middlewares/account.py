@@ -33,7 +33,13 @@ async def _check_can_upload(request: Request, logger: logging.Logger | logging.L
     if request.method not in ("PUT", "POST"):
         return None
 
-    content_length = int(request.headers.get("content-length", "0"))
+    # AWS CLI v2+ uses chunked transfer encoding and sends the actual file size
+    # in x-amz-decoded-content-length instead of Content-Length
+    content_length = int(
+        request.headers.get("x-amz-decoded-content-length")
+        or request.headers.get("content-length")
+        or "0"
+    )
     main_account = request.state.account.main_account
     arion_client = request.app.state.arion_client
 
