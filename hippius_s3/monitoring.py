@@ -27,9 +27,6 @@ class MetricsCollector:
         self._used_mem = 0
         self._max_mem = 0
         self._backup_last_success_timestamp = 0.0
-        # FS store metrics
-        self._fs_store_oldest_age_seconds = 0.0
-        self._fs_store_parts_on_disk = 0
         self._db_pool_size = 0
         self._db_pool_free = 0
         self._db_pool_used = 0
@@ -200,25 +197,6 @@ class MetricsCollector:
             name="hippius_queue_length", callbacks=[self._obs_queue_lengths], description="Length of Redis queues"
         )
 
-        # FS store gauges
-        self.meter.create_observable_gauge(
-            name="fs_store_oldest_age_seconds",
-            callbacks=[self._obs_fs_store_oldest_age],
-            description="Age in seconds of the oldest part directory in the FS store",
-        )
-        self.meter.create_observable_gauge(
-            name="fs_store_parts_on_disk",
-            callbacks=[self._obs_fs_store_parts_on_disk],
-            description="Approximate count of part directories on disk in the FS store",
-        )
-
-        # FS janitor deletions counter
-        self.fs_janitor_deleted_total = self.meter.create_counter(
-            name="fs_janitor_deleted_total",
-            description="Total number of FS parts deleted by the janitor",
-            unit="1",
-        )
-
         self.meter.create_observable_gauge(
             name="backup_last_success_timestamp",
             callbacks=[self._obs_backup_last_success],
@@ -241,6 +219,36 @@ class MetricsCollector:
             description="Database connection pool used connections",
         )
 
+        self.gateway_overhead_duration = self.meter.create_histogram(
+            name="gateway_overhead_seconds",
+            description="Gateway middleware processing time excluding body streaming",
+            unit="s",
+        )
+
+        self.auth_cache_hits = self.meter.create_counter(
+            name="auth_cache_hits_total",
+            description="Total auth cache hits",
+            unit="1",
+        )
+
+        self.auth_cache_misses = self.meter.create_counter(
+            name="auth_cache_misses_total",
+            description="Total auth cache misses",
+            unit="1",
+        )
+
+        self.seed_auth_cache_hits = self.meter.create_counter(
+            name="seed_auth_cache_hits_total",
+            description="Total seed phrase auth cache hits",
+            unit="1",
+        )
+
+        self.seed_auth_cache_misses = self.meter.create_counter(
+            name="seed_auth_cache_misses_total",
+            description="Total seed phrase auth cache misses",
+            unit="1",
+        )
+
         logger.info("Metrics setup complete")
 
     def _obs_redis_used_mem(self, _: object) -> list[metrics.Observation]:
@@ -258,12 +266,6 @@ class MetricsCollector:
     def _obs_backup_last_success(self, _: object) -> list[metrics.Observation]:
         return [metrics.Observation(self._backup_last_success_timestamp, {})]
 
-    def _obs_fs_store_oldest_age(self, _: object) -> list[metrics.Observation]:
-        return [metrics.Observation(float(self._fs_store_oldest_age_seconds), {})]
-
-    def _obs_fs_store_parts_on_disk(self, _: object) -> list[metrics.Observation]:
-        return [metrics.Observation(int(self._fs_store_parts_on_disk), {})]
-
     def _obs_db_pool_size(self, _: object) -> list[metrics.Observation]:
         return [metrics.Observation(self._db_pool_size, {})]
 
@@ -272,13 +274,6 @@ class MetricsCollector:
 
     def _obs_db_pool_used(self, _: object) -> list[metrics.Observation]:
         return [metrics.Observation(self._db_pool_used, {})]
-
-    # Public setters for FS metrics
-    def set_fs_store_oldest_age_seconds(self, age_seconds: float) -> None:
-        self._fs_store_oldest_age_seconds = float(max(0.0, age_seconds))
-
-    def set_fs_store_parts_on_disk(self, count: int) -> None:
-        self._fs_store_parts_on_disk = int(max(0, count))
 
     def update_db_pool_metrics(self, size: int, free: int) -> None:
         self._db_pool_size = size
@@ -500,6 +495,37 @@ class MetricsCollector:
         if duration is not None:
             self.downloader_duration.record(duration, attributes=attributes)
 
+    def record_gateway_overhead(
+        self,
+        duration: float,
+        method: str,
+        status_code: int,
+        handler: Optional[str] = None,
+        main_account: Optional[str] = None,
+    ) -> None:
+        attributes: dict[str, str] = {
+            "method": method,
+            "status_code": str(status_code),
+        }
+        if handler:
+            attributes["handler"] = handler
+        if main_account:
+            attributes["main_account"] = main_account
+
+        self.gateway_overhead_duration.record(duration, attributes=attributes)
+
+    def record_auth_cache(self, hit: bool) -> None:
+        if hit:
+            self.auth_cache_hits.add(1)
+        else:
+            self.auth_cache_misses.add(1)
+
+    def record_seed_auth_cache(self, hit: bool) -> None:
+        if hit:
+            self.seed_auth_cache_hits.add(1)
+        else:
+            self.seed_auth_cache_misses.add(1)
+
     def record_backup_operation(
         self,
         database_name: str,
@@ -566,6 +592,15 @@ class NullMetricsCollector:
         pass
 
     def record_downloader_operation(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_gateway_overhead(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_auth_cache(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_seed_auth_cache(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_backup_operation(self, *args: object, **kwargs: object) -> None:

@@ -19,6 +19,7 @@ def auth_router_app() -> Any:
     from gateway.middlewares.auth_router import auth_router_middleware
 
     app = FastAPI()
+    app.state.redis_client = AsyncMock()
 
     @app.get("/test")
     async def test_endpoint(request: Request) -> dict[str, Any]:
@@ -123,14 +124,11 @@ async def test_access_key_detection_and_routing(auth_router_app: Any) -> None:
     mock_token_response.encrypted_secret = encrypted_b64
     mock_token_response.nonce = nonce_b64
 
-    mock_api_client = AsyncMock()
-    mock_api_client.__aenter__ = AsyncMock(return_value=mock_api_client)
-    mock_api_client.__aexit__ = AsyncMock()
-    mock_api_client.auth = AsyncMock(return_value=mock_token_response)
+    auth_header = f"AWS4-HMAC-SHA256 Credential={test_access_key}/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123def456"
 
-    auth_header = f'AWS4-HMAC-SHA256 Credential={test_access_key}/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123def456'
-
-    with patch("gateway.middlewares.access_key_auth.HippiusApiClient", return_value=mock_api_client):
+    with patch(
+        "gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=mock_token_response
+    ):
         with patch("gateway.middlewares.access_key_auth.config") as mock_config:
             mock_config.hippius_secret_decryption_material = key_hex
 
@@ -195,14 +193,11 @@ async def test_access_key_with_invalid_signature_returns_403(auth_router_app: An
     mock_token_response.encrypted_secret = encrypted_b64
     mock_token_response.nonce = nonce_b64
 
-    mock_api_client = AsyncMock()
-    mock_api_client.__aenter__ = AsyncMock(return_value=mock_api_client)
-    mock_api_client.__aexit__ = AsyncMock()
-    mock_api_client.auth = AsyncMock(return_value=mock_token_response)
+    auth_header = f"AWS4-HMAC-SHA256 Credential={test_access_key}/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-    auth_header = f'AWS4-HMAC-SHA256 Credential={test_access_key}/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
-
-    with patch("gateway.middlewares.access_key_auth.HippiusApiClient", return_value=mock_api_client):
+    with patch(
+        "gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=mock_token_response
+    ):
         with patch("gateway.middlewares.access_key_auth.config") as mock_config:
             mock_config.hippius_secret_decryption_material = key_hex
 

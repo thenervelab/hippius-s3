@@ -1,14 +1,9 @@
 # Redis Cluster for hippius-s3-prod namespace
-# 6-node Redis Cluster used as hot-path chunk cache layer.
+# 12-node Redis Cluster used as hot-path chunk cache layer.
 # Pure cache — no persistence. Misses fall through to CephFS object_cache volume.
 # Apply: kubectl apply -f k8s/redis-cluster/production.yaml
 # Bootstrap: kubectl exec -n hippius-s3-prod redis-cluster-0 -- redis-cli --cluster create \
-#   redis-cluster-0.redis-cluster.hippius-s3-prod.svc.cluster.local:6379 \
-#   redis-cluster-1.redis-cluster.hippius-s3-prod.svc.cluster.local:6379 \
-#   redis-cluster-2.redis-cluster.hippius-s3-prod.svc.cluster.local:6379 \
-#   redis-cluster-3.redis-cluster.hippius-s3-prod.svc.cluster.local:6379 \
-#   redis-cluster-4.redis-cluster.hippius-s3-prod.svc.cluster.local:6379 \
-#   redis-cluster-5.redis-cluster.hippius-s3-prod.svc.cluster.local:6379 \
+#   redis-cluster-{0..11}.redis-cluster.hippius-s3-prod.svc.cluster.local:6379 \
 #   --cluster-yes
 apiVersion: v1
 kind: ConfigMap
@@ -23,7 +18,7 @@ data:
     cluster-require-full-coverage no
     cluster-migration-barrier 1
 
-    maxmemory 12gb
+    maxmemory 8gb
     maxmemory-policy allkeys-lru
     maxmemory-samples 10
 
@@ -74,7 +69,8 @@ metadata:
   namespace: hippius-s3-prod
 spec:
   serviceName: redis-cluster
-  replicas: 6
+  podManagementPolicy: Parallel
+  replicas: 12
   selector:
     matchLabels:
       app: redis-cluster
@@ -86,7 +82,8 @@ spec:
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
+          whenUnsatisfiable: DoNotSchedule
+          nodeTaintsPolicy: Honor
           labelSelector:
             matchLabels:
               app: redis-cluster
@@ -135,7 +132,7 @@ spec:
               memory: 1Gi
             limits:
               cpu: "2"
-              memory: 14Gi
+              memory: 9Gi
       volumes:
         - name: config
           configMap:

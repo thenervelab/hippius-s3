@@ -84,6 +84,16 @@ class GatewayConfig:
     public_bucket_cache_ttl_seconds: int = dataclasses.field(
         default_factory=lambda: int(os.getenv("PUBLIC_BUCKET_CACHE_TTL_SECONDS", "300"))
     )
+    min_bucket_name_length: int = dataclasses.field(
+        default_factory=lambda: int(os.getenv("MIN_BUCKET_NAME_LENGTH", "3"))
+    )
+    max_bucket_name_length: int = dataclasses.field(
+        default_factory=lambda: int(os.getenv("MAX_BUCKET_NAME_LENGTH", "63"))
+    )
+    max_object_key_length: int = dataclasses.field(
+        default_factory=lambda: int(os.getenv("MAX_OBJECT_KEY_LENGTH", "1024"))
+    )
+    max_metadata_size: int = dataclasses.field(default_factory=lambda: int(os.getenv("MAX_METADATA_SIZE", "2048")))
     log_level: str = dataclasses.field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
     loki_url: str = dataclasses.field(
         default_factory=lambda: os.getenv("LOKI_URL", "http://localhost:3100/loki/api/v1/push")
@@ -114,6 +124,10 @@ class GatewayConfig:
     db_pool_command_timeout: int = dataclasses.field(
         default_factory=lambda: int(os.getenv("GATEWAY_DB_POOL_COMMAND_TIMEOUT", "30"))
     )
+    arion_base_url: str = dataclasses.field(
+        default_factory=lambda: os.getenv("HIPPIUS_ARION_BASE_URL", "https://arion.hippius.com/")
+    )
+    arion_service_key: str = dataclasses.field(default_factory=lambda: os.getenv("ARION_SERVICE_KEY", ""))
 
 
 _config: GatewayConfig | None = None

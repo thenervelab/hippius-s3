@@ -89,6 +89,18 @@ def test_seed_phrase() -> str:
 
 
 @pytest.fixture(scope="session")
+def test_access_key() -> str:
+    """Return a hip_ access key for e2e tests."""
+    return os.getenv("HIPPIUS_KEY", "hip_e2e_test_master")
+
+
+@pytest.fixture(scope="session")
+def test_access_key_secret() -> str:
+    """Return the plaintext secret the mock API encrypts for hip_ keys."""
+    return "e2e_test_secret_for_hip_keys"
+
+
+@pytest.fixture(scope="session")
 def compose_project_name(test_run_id: str) -> str:
     """Docker compose project name for e2e runs.
 
@@ -168,7 +180,7 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
             "up",
             "-d",
             "--wait",
-                "--build",
+            "--build",
         ]
         result = subprocess.run(up_cmd, env=env, cwd=project_root, capture_output=True, text=True)
         if result.returncode != 0:
@@ -339,6 +351,24 @@ def boto3_client(test_seed_phrase: str) -> Any:
             signature_version="s3v4",
             # E2E reads can legitimately block while the pipeline hydrates from IPFS.
             # Use a short read timeout and retry in the test helper instead of hanging for ~60s.
+            connect_timeout=5,
+            read_timeout=5,
+        ),
+    )
+
+
+@pytest.fixture
+def boto3_access_key_client(test_access_key: str, test_access_key_secret: str) -> Any:
+    """Create a boto3 S3 client using hip_ access key auth for testing."""
+    return boto3.client(
+        "s3",
+        endpoint_url="http://localhost:8080",
+        aws_access_key_id=test_access_key,
+        aws_secret_access_key=test_access_key_secret,
+        region_name="us-east-1",
+        config=Config(
+            s3={"addressing_style": "path"},
+            signature_version="s3v4",
             connect_timeout=5,
             read_timeout=5,
         ),

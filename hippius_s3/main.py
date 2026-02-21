@@ -19,7 +19,6 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from hippius_s3.api.middlewares.fs_cache_pressure import fs_cache_pressure_middleware
-from hippius_s3.api.middlewares.input_validation import input_validation_middleware
 from hippius_s3.api.middlewares.ip_whitelist import ip_whitelist_middleware
 from hippius_s3.api.middlewares.metrics import metrics_middleware
 from hippius_s3.api.middlewares.parse_internal_headers import parse_internal_headers_middleware
@@ -155,7 +154,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             app.state.redis_chain_client,
             app.state.redis_rate_limiting_client,
             app.state.redis_queues_client,
-            object_cache_dir=config.object_cache_dir,
         )
         await app.state.background_metrics_collector.start()
         logger.info("Background metrics collection started")
@@ -285,7 +283,6 @@ def factory() -> FastAPI:
     app.middleware("http")(parse_internal_headers_middleware)
     app.middleware("http")(ip_whitelist_middleware)
     app.middleware("http")(fs_cache_pressure_middleware)
-    app.middleware("http")(input_validation_middleware)
     if config.enable_request_profiling:
         app.add_middleware(SpeedscopeProfilerMiddleware)  # ty: ignore[invalid-argument-type]
 
