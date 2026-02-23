@@ -218,15 +218,15 @@ data:
           "options": { "colorMode": "background", "graphMode": "none", "textMode": "auto" },
           "targets": [
             {
-              "expr": "sum(increase(gateway_bytes_received_total{service_namespace=\"$namespace\"}[1h]))",
+              "expr": "sum(increase(gateway_bytes_received_total{service_namespace=\"$namespace\"}[$__range]))",
               "legendFormat": "ingress"
             },
             {
-              "expr": "sum(increase(gateway_bytes_sent_total{service_namespace=\"$namespace\"}[1h]))",
+              "expr": "sum(increase(gateway_bytes_sent_total{service_namespace=\"$namespace\"}[$__range]))",
               "legendFormat": "egress"
             }
           ],
-          "title": "Total transferred (1h)",
+          "title": "Total transferred",
           "type": "stat"
         },
         {
