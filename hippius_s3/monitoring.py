@@ -249,6 +249,18 @@ class MetricsCollector:
             unit="1",
         )
 
+        self.gateway_bytes_received = self.meter.create_counter(
+            name="gateway_bytes_received_total",
+            description="Total bytes received from clients through the gateway",
+            unit="bytes",
+        )
+
+        self.gateway_bytes_sent = self.meter.create_counter(
+            name="gateway_bytes_sent_total",
+            description="Total bytes sent to clients through the gateway",
+            unit="bytes",
+        )
+
         logger.info("Metrics setup complete")
 
     def _obs_redis_used_mem(self, _: object) -> list[metrics.Observation]:
@@ -526,6 +538,18 @@ class MetricsCollector:
         else:
             self.seed_auth_cache_misses.add(1)
 
+    def record_gateway_bandwidth(
+        self,
+        bytes_received: int,
+        bytes_sent: int,
+        method: str,
+        status_code: int,
+    ) -> None:
+        if bytes_received > 0:
+            self.gateway_bytes_received.add(bytes_received, {"method": method})
+        if bytes_sent > 0:
+            self.gateway_bytes_sent.add(bytes_sent, {"method": method, "status_code": str(status_code)})
+
     def record_backup_operation(
         self,
         database_name: str,
@@ -601,6 +625,9 @@ class NullMetricsCollector:
         pass
 
     def record_seed_auth_cache(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_gateway_bandwidth(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_backup_operation(self, *args: object, **kwargs: object) -> None:

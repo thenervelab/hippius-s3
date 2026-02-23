@@ -7,6 +7,8 @@ import httpx
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 
+from hippius_s3.monitoring import get_metrics_collector
+
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +103,13 @@ class ForwardService:
 
         logger.debug(f"Forwarding {request.method} {target_url} (original: {request.url.path}?{request.url.query})")
 
+        bytes_received = 0
+        bytes_sent = 0
+
         async def request_body_iter() -> typing.AsyncGenerator[bytes, None]:
+            nonlocal bytes_received
             async for chunk in request.stream():
+                bytes_received += len(chunk)
                 yield chunk
 
         # Stream backend response for ALL methods (prevents buffering large downloads in gateway memory).
@@ -119,10 +126,20 @@ class ForwardService:
         filtered_raw = _filter_hop_by_hop_raw_headers(list(upstream_response.headers.raw))
 
         async def iter_upstream() -> typing.AsyncGenerator[bytes, None]:
+            nonlocal bytes_sent
             try:
                 async for chunk in upstream_response.aiter_bytes():
+                    bytes_sent += len(chunk)
                     yield chunk
             finally:
+                # Record bandwidth metrics after streaming completes
+                collector = get_metrics_collector()
+                collector.record_gateway_bandwidth(
+                    bytes_received=bytes_received,
+                    bytes_sent=bytes_sent,
+                    method=request.method,
+                    status_code=upstream_response.status_code,
+                )
                 # Always close the upstream stream to avoid leaking connections.
                 # Shield cleanup so the connection returns to the pool even if cancelled.
                 try:
