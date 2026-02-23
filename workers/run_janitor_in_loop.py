@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import shutil
+import socket
 import sys
 import time
 from pathlib import Path
@@ -93,7 +94,7 @@ def _setup_janitor_metrics() -> None:
     endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
     service_name = os.getenv("OTEL_SERVICE_NAME", "hippius-s3")
 
-    resource = Resource.create({"service.name": service_name})
+    resource = Resource.create({"service.name": service_name, "1": socket.gethostname()})
     metric_reader = PeriodicExportingMetricReader(
         OTLPMetricExporter(endpoint=endpoint, insecure=True),
         export_interval_millis=10000,
