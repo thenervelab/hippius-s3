@@ -71,6 +71,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: ARION_SERVICE_KEY
+            - name: ARION_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_BEARER_TOKEN
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
@@ -251,6 +256,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: ARION_SERVICE_KEY
+            - name: ARION_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_BEARER_TOKEN
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
@@ -428,6 +438,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: ARION_SERVICE_KEY
+            - name: ARION_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_BEARER_TOKEN
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
@@ -602,6 +617,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: ARION_SERVICE_KEY
+            - name: ARION_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_BEARER_TOKEN
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
@@ -777,6 +797,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: ARION_SERVICE_KEY
+            - name: ARION_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_BEARER_TOKEN
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
@@ -923,6 +948,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: ARION_SERVICE_KEY
+            - name: ARION_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_BEARER_TOKEN
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
@@ -1210,6 +1240,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: ARION_SERVICE_KEY
+            - name: ARION_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_BEARER_TOKEN
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
