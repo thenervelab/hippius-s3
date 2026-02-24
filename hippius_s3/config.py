@@ -93,6 +93,7 @@ class Config:
     substrate_url: str = env("HIPPIUS_SUBSTRATE_URL")
     hippius_service_key: str = env("HIPPIUS_SERVICE_KEY")
     arion_service_key: str = env("ARION_SERVICE_KEY")
+    arion_bearer_token: str = env("ARION_BEARER_TOKEN")
     hippius_secret_decryption_material: str = env("HIPPIUS_AUTH_ENCRYPTION_KEY")
 
     validator_region: str = env("HIPPIUS_VALIDATOR_REGION")
