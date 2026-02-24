@@ -135,7 +135,7 @@ data:
           "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
           "targets": [
             {
-              "expr": "sum by (error_type) (rate(s3_errors_total{service_namespace=\"$namespace\"}[5m]))",
+              "expr": "sum by (error_type) (rate(s3_errors_total{service_namespace=\"$namespace\", operation=~\"gateway_.*\"}[5m]))",
               "legendFormat": "{{error_type}}"
             }
           ],
@@ -143,8 +143,33 @@ data:
           "type": "timeseries"
         },
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 6, "x": 0, "y": 9 },
+          "id": 6,
+          "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_overhead_seconds_bucket{service_namespace=\"$namespace\"}[5m])))",
+              "legendFormat": "p95"
+            },
+            {
+              "expr": "histogram_quantile(0.50, sum by (le) (rate(gateway_overhead_seconds_bucket{service_namespace=\"$namespace\"}[5m])))",
+              "legendFormat": "p50"
+            }
+          ],
+          "title": "Gateway overhead (excl. body)",
+          "type": "timeseries"
+        },
+        {
           "collapsed": false,
-          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
           "id": 80,
           "panels": [],
           "title": "Bandwidth",
@@ -218,15 +243,15 @@ data:
           "options": { "colorMode": "background", "graphMode": "none", "textMode": "auto" },
           "targets": [
             {
-              "expr": "sum(increase(gateway_bytes_received_total{service_namespace=\"$namespace\"}[1h]))",
+              "expr": "sum(increase(gateway_bytes_received_total{service_namespace=\"$namespace\"}[$__range]))",
               "legendFormat": "ingress"
             },
             {
-              "expr": "sum(increase(gateway_bytes_sent_total{service_namespace=\"$namespace\"}[1h]))",
+              "expr": "sum(increase(gateway_bytes_sent_total{service_namespace=\"$namespace\"}[$__range]))",
               "legendFormat": "egress"
             }
           ],
-          "title": "Total transferred (1h)",
+          "title": "Total transferred",
           "type": "stat"
         },
         {
@@ -252,7 +277,7 @@ data:
           "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] }, "tooltip": { "mode": "multi" } },
           "targets": [
             {
-              "expr": "hippius_queue_length{service_namespace=\"$namespace\"}",
+              "expr": "max by (queue_name) (hippius_queue_length{service_namespace=\"$namespace\"})",
               "legendFormat": "{{queue_name}}"
             }
           ],
@@ -468,15 +493,15 @@ data:
               "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
               "targets": [
                 {
-                  "expr": "db_pool_size{service_namespace=\"$namespace\"}",
+                  "expr": "sum(db_pool_size{service_namespace=\"$namespace\"})",
                   "legendFormat": "pool size"
                 },
                 {
-                  "expr": "db_pool_used_connections{service_namespace=\"$namespace\"}",
+                  "expr": "sum(db_pool_used_connections{service_namespace=\"$namespace\"})",
                   "legendFormat": "used"
                 },
                 {
-                  "expr": "db_pool_free_connections{service_namespace=\"$namespace\"}",
+                  "expr": "sum(db_pool_free_connections{service_namespace=\"$namespace\"})",
                   "legendFormat": "free"
                 }
               ],
@@ -494,11 +519,11 @@ data:
               "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
               "targets": [
                 {
-                  "expr": "avg_over_time(redis_memory_used_bytes{service_namespace=\"$namespace\"}[2m])",
+                  "expr": "max(avg_over_time(redis_memory_used_bytes{service_namespace=\"$namespace\"}[2m]))",
                   "legendFormat": "used"
                 },
                 {
-                  "expr": "redis_memory_max_bytes{service_namespace=\"$namespace\"}",
+                  "expr": "max(redis_memory_max_bytes{service_namespace=\"$namespace\"})",
                   "legendFormat": "max"
                 }
               ],
@@ -528,7 +553,7 @@ data:
               "options": { "showThresholdLabels": false, "showThresholdMarkers": true },
               "targets": [
                 {
-                  "expr": "fs_cache_disk_used_bytes{service_namespace=\"$namespace\"} / fs_cache_disk_total_bytes{service_namespace=\"$namespace\"} * 100",
+                  "expr": "max(fs_cache_disk_used_bytes{service_namespace=\"$namespace\"}) / max(fs_cache_disk_total_bytes{service_namespace=\"$namespace\"}) * 100",
                   "legendFormat": "disk usage"
                 }
               ],
@@ -556,7 +581,7 @@ data:
               "options": { "colorMode": "background", "graphMode": "none", "textMode": "auto" },
               "targets": [
                 {
-                  "expr": "fs_store_parts_on_disk{service_namespace=\"$namespace\"}",
+                  "expr": "max(fs_store_parts_on_disk{service_namespace=\"$namespace\"})",
                   "legendFormat": "parts"
                 }
               ],
@@ -636,7 +661,7 @@ data:
               "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
               "targets": [
                 {
-                  "expr": "fs_cache_age_bucket_parts{service_namespace=\"$namespace\"}",
+                  "expr": "max by (age_bucket) (fs_cache_age_bucket_parts{service_namespace=\"$namespace\"})",
                   "legendFormat": "{{age_bucket}}"
                 }
               ],
@@ -658,7 +683,7 @@ data:
               "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
               "targets": [
                 {
-                  "expr": "fs_cache_disk_used_bytes{service_namespace=\"$namespace\"} / fs_cache_disk_total_bytes{service_namespace=\"$namespace\"} * 100",
+                  "expr": "max(fs_cache_disk_used_bytes{service_namespace=\"$namespace\"}) / max(fs_cache_disk_total_bytes{service_namespace=\"$namespace\"}) * 100",
                   "legendFormat": "disk usage %"
                 }
               ],
@@ -680,7 +705,7 @@ data:
               "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
               "targets": [
                 {
-                  "expr": "rate(fs_janitor_deleted_total{service_namespace=\"$namespace\"}[10m])",
+                  "expr": "sum(rate(fs_janitor_deleted_total{service_namespace=\"$namespace\"}[10m]))",
                   "legendFormat": "GC rate"
                 }
               ],

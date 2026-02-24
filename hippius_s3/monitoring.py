@@ -419,6 +419,8 @@ class MetricsCollector:
         if backend:
             attributes["backend"] = backend
 
+        self.uploader_requests_total.add(1, attributes=attributes)
+
         if attempt is not None:
             retry_attributes = {
                 "main_account": main_account,
@@ -435,14 +437,12 @@ class MetricsCollector:
             if backend:
                 dlq_attributes["backend"] = backend
             self.uploader_dlq_total.add(1, attributes=dlq_attributes)
-        else:
-            self.uploader_requests_total.add(1, attributes=attributes)
 
-            if num_chunks > 0:
-                self.uploader_chunks_uploaded.add(num_chunks, attributes=attributes)
+        if num_chunks > 0:
+            self.uploader_chunks_uploaded.add(num_chunks, attributes=attributes)
 
-            if duration is not None:
-                self.uploader_duration.record(duration, attributes=attributes)
+        if duration is not None:
+            self.uploader_duration.record(duration, attributes=attributes)
 
     def record_unpinner_operation(
         self,

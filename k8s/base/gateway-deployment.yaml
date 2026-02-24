@@ -32,6 +32,16 @@ spec:
             - configMapRef:
                 name: hippius-s3-environment
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
             - name: GATEWAY_BACKEND_URL
               value: "http://api:8000"
             - name: GATEWAY_PORT
@@ -71,6 +81,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: ARION_SERVICE_KEY
+            - name: ARION_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_BEARER_TOKEN
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
