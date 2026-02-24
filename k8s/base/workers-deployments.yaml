@@ -1090,6 +1090,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: ARION_SERVICE_KEY
+            - name: ARION_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_BEARER_TOKEN
             - name: HIPPIUS_IPFS_API_URLS
               valueFrom:
                 secretKeyRef:
