@@ -135,7 +135,7 @@ data:
           "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
           "targets": [
             {
-              "expr": "sum by (error_type) (rate(s3_errors_total{service_namespace=\"$namespace\"}[5m]))",
+              "expr": "sum by (error_type) (rate(s3_errors_total{service_namespace=\"$namespace\", operation=~\"gateway_.*\"}[5m]))",
               "legendFormat": "{{error_type}}"
             }
           ],
@@ -143,8 +143,33 @@ data:
           "type": "timeseries"
         },
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 6, "x": 0, "y": 9 },
+          "id": 6,
+          "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_overhead_seconds_bucket{service_namespace=\"$namespace\"}[5m])))",
+              "legendFormat": "p95"
+            },
+            {
+              "expr": "histogram_quantile(0.50, sum by (le) (rate(gateway_overhead_seconds_bucket{service_namespace=\"$namespace\"}[5m])))",
+              "legendFormat": "p50"
+            }
+          ],
+          "title": "Gateway overhead (excl. body)",
+          "type": "timeseries"
+        },
+        {
           "collapsed": false,
-          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
           "id": 80,
           "panels": [],
           "title": "Bandwidth",
