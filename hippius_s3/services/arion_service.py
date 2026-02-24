@@ -286,7 +286,7 @@ class ArionClient:
         """
         return {
             "X-API-Key": self._config.arion_service_key,
-            "Authorization": f"Bearer {account_ss58}",
+            "Authorization": f"Bearer {self._config.arion_bearer_token}",
         }
 
     @retry_on_error(retries=3, backoff=5.0)

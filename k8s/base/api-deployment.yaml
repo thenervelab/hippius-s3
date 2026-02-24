@@ -31,6 +31,16 @@ spec:
             - configMapRef:
                 name: hippius-s3-environment
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

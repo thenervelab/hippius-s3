@@ -34,6 +34,16 @@ spec:
             - configMapRef:
                 name: hippius-s3-environment
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
             - name: WORKER_SCRIPT
               value: "workers/run_ipfs_uploader_in_loop.py"
             - name: DATABASE_URL
@@ -204,6 +214,16 @@ spec:
             - configMapRef:
                 name: hippius-s3-environment
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
             - name: WORKER_SCRIPT
               value: "workers/run_arion_uploader_in_loop.py"
             - name: DATABASE_URL
@@ -366,6 +386,16 @@ spec:
             - configMapRef:
                 name: hippius-s3-environment
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
             - name: WORKER_SCRIPT
               value: "workers/run_ipfs_downloader_in_loop.py"
             - name: DATABASE_URL
@@ -535,6 +565,16 @@ spec:
             - configMapRef:
                 name: hippius-s3-environment
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
             - name: WORKER_SCRIPT
               value: "workers/run_arion_downloader_in_loop.py"
             - name: DATABASE_URL
@@ -700,6 +740,16 @@ spec:
             - configMapRef:
                 name: hippius-s3-environment
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
             - name: WORKER_SCRIPT
               value: "workers/run_ipfs_unpinner_in_loop.py"
             - name: DATABASE_URL
@@ -836,6 +886,16 @@ spec:
             - configMapRef:
                 name: hippius-s3-environment
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
             - name: WORKER_SCRIPT
               value: "workers/run_arion_unpinner_in_loop.py"
             - name: DATABASE_URL
@@ -963,6 +1023,16 @@ spec:
             - configMapRef:
                 name: hippius-s3-environment
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
             - name: WORKER_SCRIPT
               value: "workers/run_janitor_in_loop.py"
             - name: DATABASE_URL
@@ -1103,6 +1173,16 @@ spec:
             - configMapRef:
                 name: hippius-s3-environment
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
             - name: WORKER_SCRIPT
               value: "workers/run_account_cacher_in_loop.py"
             - name: DATABASE_URL
