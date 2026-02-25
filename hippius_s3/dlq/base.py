@@ -154,22 +154,56 @@ class BaseDLQManager(Generic[T]):
             with contextlib.suppress(Exception):
                 await self._release_lock(identifier, token)
 
-    async def requeue_all(self, force: bool = False) -> int:
-        """Requeue all DLQ entries (best-effort). Returns count successfully requeued."""
-        all_entries = await self.redis_client.lrange(self.dlq_key, 0, -1)
-        count = 0
-        for entry_json in all_entries:
-            try:
+    async def requeue_all(self, force: bool = False, batch_size: int = 500) -> int:
+        """Requeue all DLQ entries using batched pipeline operations."""
+        total_requeued = 0
+        total_skipped = 0
+
+        while True:
+            # Pop a batch from the DLQ using rpop (FIFO order)
+            pipe = self.redis_client.pipeline()
+            for _ in range(batch_size):
+                pipe.rpop(self.dlq_key)
+            results = await pipe.execute()
+
+            # Filter out None results (queue exhausted)
+            raw_entries = [r for r in results if r is not None]
+            if not raw_entries:
+                break
+
+            # Parse entries and build payloads
+            payloads: list[T] = []
+            for entry_json in raw_entries:
                 entry = json.loads(entry_json)
-                identifier = self._extract_identifier_from_entry(entry)
-                if not identifier:
+                if entry.get("error_type") == "permanent" and not force:
+                    # Put permanent errors back
+                    await self.redis_client.lpush(self.dlq_key, entry_json)
+                    total_skipped += 1
                     continue
-                ok = await self.requeue(str(identifier), force)
-                if ok:
-                    count += 1
-            except Exception:
-                continue
-        return count
+                payload_data = entry["payload"]
+                payload = self.request_class.model_validate(payload_data)
+                if not force and hasattr(payload, "attempts"):
+                    payload.attempts = 0  # ty: ignore[invalid-assignment]
+                payloads.append(payload)
+
+            # Bulk enqueue via pipeline
+            if payloads:
+                await self._bulk_enqueue(payloads)
+                total_requeued += len(payloads)
+
+            logger.info(f"Requeued batch: {len(payloads)} entries (total: {total_requeued}, skipped: {total_skipped})")
+
+            # If we got fewer than batch_size, the queue is drained
+            if len(raw_entries) < batch_size:
+                break
+
+        logger.info(f"Requeue complete: {total_requeued} requeued, {total_skipped} skipped")
+        return total_requeued
+
+    async def _bulk_enqueue(self, payloads: list[T]) -> None:
+        """Bulk enqueue payloads. Override for pipeline support, falls back to sequential."""
+        for payload in payloads:
+            await self.enqueue_func(payload)
 
     def _extract_identifier_from_entry(self, entry: Dict[str, Any]) -> Optional[str]:
         """Extract identifier from DLQ entry. Must be overridden."""
