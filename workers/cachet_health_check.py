@@ -32,14 +32,14 @@ async def check_health_and_update_cachet():
         logger.error("Cachet configuration incomplete, skipping health checks")
         return
 
-    api_health_url = "http://api:8000/health"
-    cachet_update_url = f"{config.cachet_api_url}/api/components/{config.cachet_component_id}"
-    headers = {"Authorization": f"Bearer {config.cachet_api_key}"}
+    health_url = "http://gateway:8080/health"
+    cachet_update_url = f"{config.cachet_api_url}/api/v1/components/{config.cachet_component_id}"
+    headers = {"X-Cachet-Token": config.cachet_api_key}
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         while True:
             try:
-                response = await client.get(api_health_url)
+                response = await client.get(health_url)
                 status = 1 if response.status_code == 200 else 3
                 logger.info(f"Health check result: {response.status_code}, setting status to {status}")
             except Exception as e:

@@ -40,6 +40,8 @@ spec:
               ln -sf /data/database.sqlite /var/www/html/database/database.sqlite
               # PHP 7.3 compat: count() on null throws ErrorException
               sed -i 's/count(\$query->wheres)/count((array) \$query->wheres)/g' /var/www/html/vendor/laravel/framework/src/Illuminate/Database/Eloquent/Builder.php
+              # PHP 7.3 compat: compact() with variable values as names throws ErrorException
+              sed -i "s/@include('partials.incidents', \[compact(\$date), compact(\$incidents)\])/@include('partials.incidents', compact('date', 'incidents'))/" /var/www/html/resources/views/index.blade.php
               # Clear stale compiled views
               rm -rf /var/www/html/storage/framework/views/*.php
               exec /sbin/entrypoint.sh
