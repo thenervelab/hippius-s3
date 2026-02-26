@@ -343,39 +343,52 @@ async def move_due_unpin_retries(
     return moved
 
 
-async def enqueue_download_request(payload: DownloadChainRequest) -> None:
-    """Add a download request to per-backend download queues."""
+async def enqueue_download_request(
+    payload: DownloadChainRequest,
+    *,
+    queues: tuple[str, ...] = (),
+) -> None:
+    """Add a download request to per-backend download queues.
+
+    When *queues* is provided, push directly to those queue names and skip
+    the normal config-intersection logic.  This is used by the uploader
+    hydration path where the caller already knows which backend queues to
+    target.
+    """
     client = get_queue_client()
 
-    config = get_config()
-    effective = compute_effective_backends(
-        payload.download_backends,
-        config.download_backends,
-        context={
-            "request_id": payload.request_id,
-            "object_id": payload.object_id,
-            "object_version": payload.object_version,
-            "bucket_name": payload.bucket_name,
-            "object_key": payload.object_key,
-        },
-        raise_on_empty=False,
-    )
-    if payload.download_backends is not None and effective is None:
-        logger.error(
-            "All requested download backends disallowed by config; not enqueuing. requested=%s allowed=%s context=%s",
+    if queues:
+        queue_names = list(queues)
+    else:
+        config = get_config()
+        effective = compute_effective_backends(
             payload.download_backends,
             config.download_backends,
-            {
+            context={
                 "request_id": payload.request_id,
                 "object_id": payload.object_id,
                 "object_version": payload.object_version,
+                "bucket_name": payload.bucket_name,
+                "object_key": payload.object_key,
             },
+            raise_on_empty=False,
         )
-        return
-    payload.download_backends = effective or config.download_backends
+        if payload.download_backends is not None and effective is None:
+            logger.error(
+                "All requested download backends disallowed by config; not enqueuing. requested=%s allowed=%s context=%s",
+                payload.download_backends,
+                config.download_backends,
+                {
+                    "request_id": payload.request_id,
+                    "object_id": payload.object_id,
+                    "object_version": payload.object_version,
+                },
+            )
+            return
+        payload.download_backends = effective or config.download_backends
+        queue_names = [f"{b}_download_requests" for b in payload.download_backends]
 
     raw = payload.model_dump_json()
-    queue_names = [f"{b}_download_requests" for b in payload.download_backends]
 
     for qname in queue_names:
         await client.lpush(qname, raw)

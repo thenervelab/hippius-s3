@@ -149,6 +149,8 @@ class Config:
     uploader_pin_parallelism: int = env("HIPPIUS_UPLOADER_PIN_PARALLELISM:5", convert=int)
     # Heavy validation gating (legacy PINNER_VALIDATE_COVERAGE supported for compat)
     uploader_validate_coverage: bool = env("UPLOADER_VALIDATE_COVERAGE:false", convert=lambda x: x.lower() == "true")
+    # Hydration: how long to wait for a missing chunk to appear in Redis after enqueuing a download
+    uploader_hydration_timeout_seconds: int = env("HIPPIUS_UPLOADER_HYDRATION_TIMEOUT_SECONDS:120", convert=int)
 
     # Unpinner configuration
     unpinner_parallelism: int = env("HIPPIUS_UNPINNER_PARALLELISM:5", convert=int)
