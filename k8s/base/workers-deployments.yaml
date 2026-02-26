@@ -1322,3 +1322,146 @@ spec:
             limits:
               cpu: 1000m
               memory: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cachet-health-checker
+
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cachet-health-checker
+  template:
+    metadata:
+      labels:
+        app: cachet-health-checker
+        worker-type: cachet-health-checker
+    spec:
+      initContainers:
+        - name: wait-for-services
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - until nc -z gateway 8080; do echo waiting for gateway; sleep 5; done
+      containers:
+        - name: cachet-health-checker
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: hippius-s3-defaults
+            - configMapRef:
+                name: hippius-s3-environment
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
+            - name: WORKER_SCRIPT
+              value: "workers/cachet_health_check.py"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_URL
+            - name: HIPPIUS_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_KEY
+            - name: ARION_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_SERVICE_KEY
+            - name: ARION_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_BEARER_TOKEN
+            - name: HIPPIUS_AUTH_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_AUTH_ENCRYPTION_KEY
+            - name: HIPPIUS_IPFS_API_URLS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_IPFS_API_URLS
+            - name: FRONTEND_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: FRONTEND_HMAC_SECRET
+            - name: CACHET_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: CACHET_API_KEY
+            - name: CACHET_COMPONENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: CACHET_COMPONENT_ID
+            - name: DISCORD_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DISCORD_WEBHOOK_URL
+            - name: HIPPIUS_IPFS_GET_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_IPFS_GET_URL
+            - name: HIPPIUS_IPFS_STORE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_IPFS_STORE_URL
+            - name: HIPPIUS_OVH_KMS_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_ENDPOINT
+            - name: HIPPIUS_OVH_KMS_DEFAULT_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_DEFAULT_KEY_ID
+            - name: HIPPIUS_OVH_KMS_OKMS_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_OKMS_ID
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "test -d /proc/1 && grep -q python /proc/1/cmdline"
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi

@@ -9,7 +9,7 @@ data:
   APP_ENV: "production"
   APP_DEBUG: "false"
   APP_LOG: "single"
-  APP_URL: "http://cachet.monitoring.svc.cluster.local"
+  APP_URL: "https://status.hippius.com"
   DB_DRIVER: "sqlite"
   FORCE_MIGRATION: "true"
   CACHE_DRIVER: "file"

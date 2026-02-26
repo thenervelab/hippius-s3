@@ -1,6 +1,7 @@
 import json
 from typing import Any
 from typing import Dict
+from typing import List
 from typing import Optional
 
 import redis.asyncio as async_redis
@@ -15,13 +16,13 @@ class UploadDLQManager(BaseDLQManager[UploadChainRequest]):
 
     def __init__(self, redis_client: async_redis.Redis, backend_name: str = "upload"):
         self.backend_name = backend_name
+        self._queue_name = f"{backend_name}_upload_requests"
 
         async def enqueue_to_backend(payload: UploadChainRequest) -> None:
             """Enqueue upload request to specific backend queue."""
             client = get_queue_client()
-            queue_name = f"{backend_name}_upload_requests"
             raw = payload.model_dump_json()
-            await client.lpush(queue_name, raw)
+            await client.lpush(self._queue_name, raw)
 
         super().__init__(
             redis_client=redis_client,
@@ -29,6 +30,14 @@ class UploadDLQManager(BaseDLQManager[UploadChainRequest]):
             enqueue_func=enqueue_to_backend,
             request_class=UploadChainRequest,
         )
+
+    async def _bulk_enqueue(self, payloads: List[UploadChainRequest]) -> None:
+        """Bulk enqueue upload requests via Redis pipeline."""
+        client = get_queue_client()
+        pipe = client.pipeline()
+        for payload in payloads:
+            pipe.lpush(self._queue_name, payload.model_dump_json())
+        await pipe.execute()
 
     def _get_identifier(self, payload: UploadChainRequest) -> str:
         return payload.object_id
