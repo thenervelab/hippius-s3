@@ -6,6 +6,7 @@ namespace: hippius-s3-prod
 resources:
   - ../base
   - postgres-objectstore.yaml
+  - gateway-nodeport.yaml
 
 patches:
   - path: namespace-patch.yaml

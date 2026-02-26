@@ -417,7 +417,6 @@ class ObjectWriter:
                 int(object_version),
             )
 
-        # Now that we know counts and sizes, write meta last using exact chunk count
         num_chunks = int(next_chunk_index)
         await writer.write_meta(
             object_id,
@@ -428,7 +427,6 @@ class ObjectWriter:
             plain_size=int(total_size),
         )
 
-        # Ensure upload row and return PutResult-compatible values
         upload_id = await ensure_upload_row(
             self.db,
             object_id=object_id,
@@ -438,7 +436,6 @@ class ObjectWriter:
             metadata=metadata,
         )
 
-        # Ensure parts table has placeholder for base part (part 1) so append/read paths see it
         await upsert_part_placeholder(
             self.db,
             object_id=object_id,
@@ -684,7 +681,6 @@ class ObjectWriter:
             try:
                 await self.fs_store.delete_part(str(object_id), int(object_version), int(part_number))
             except Exception:
-                logger = logging.getLogger(__name__)
                 logger.warning(
                     "Failed to cleanup partial part on FS: object_id=%s v=%s part=%s",
                     object_id,
@@ -700,7 +696,6 @@ class ObjectWriter:
                     keys.append(self.obj_cache.build_meta_key(str(object_id), int(object_version), int(part_number)))
                     await self.redis_client.delete(*keys)
                 except Exception:
-                    logger = logging.getLogger(__name__)
                     logger.warning(
                         "Failed to cleanup partial part in Redis: object_id=%s v=%s part=%s",
                         object_id,
