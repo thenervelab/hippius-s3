@@ -411,6 +411,7 @@ class MetricsCollector:
         duration: Optional[float] = None,
         attempt: Optional[int] = None,
         error_type: Optional[str] = None,
+        status_code: str = "",
     ) -> None:
         attributes = {
             "main_account": main_account,
@@ -418,6 +419,8 @@ class MetricsCollector:
         }
         if backend:
             attributes["backend"] = backend
+        if status_code:
+            attributes["status_code"] = status_code
 
         self.uploader_requests_total.add(1, attributes=attributes)
 

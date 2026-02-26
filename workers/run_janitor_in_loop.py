@@ -94,7 +94,7 @@ def _setup_janitor_metrics() -> None:
     endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
     service_name = os.getenv("OTEL_SERVICE_NAME", "hippius-s3")
 
-    resource = Resource.create({"service.name": service_name, "1": socket.gethostname()})
+    resource = Resource.create({"service.name": service_name, "service.instance.id": socket.gethostname()})
     metric_reader = PeriodicExportingMetricReader(
         OTLPMetricExporter(endpoint=endpoint, insecure=True),
         export_interval_millis=10000,
@@ -475,22 +475,30 @@ async def run_janitor_loop():
 
     try:
         while True:
+            logger.info("Janitor cycle starting...")
+            stale_count = 0
+            gc_count = 0
+            hard_deleted = 0
+
+            # Phase 1: Clean stale MPU parts (aborted uploads)
             try:
-                logger.info("Janitor cycle starting...")
-
-                # Phase 1: Clean stale MPU parts (aborted uploads)
                 stale_count = await cleanup_stale_parts(db, fs_store, redis_client)
-
-                # Phase 2: GC old parts by mtime (safety net for pre-migration chunks)
-                gc_count = await cleanup_old_parts_by_mtime(db, fs_store, redis_client)
-
-                # Phase 3: Hard-delete soft-deleted objects where all unpins are confirmed
-                hard_deleted = await gc_soft_deleted_objects(db)
-
-                logger.info(f"Janitor cycle complete: stale={stale_count} gc={gc_count} hard_deleted={hard_deleted}")
-
             except Exception as e:
-                logger.error(f"Janitor cycle error: {e}", exc_info=True)
+                logger.error(f"Phase 1 (stale cleanup) error: {e}", exc_info=True)
+
+            # Phase 2: GC old parts by mtime + update disk/cache metrics
+            try:
+                gc_count = await cleanup_old_parts_by_mtime(db, fs_store, redis_client)
+            except Exception as e:
+                logger.error(f"Phase 2 (GC) error: {e}", exc_info=True)
+
+            # Phase 3: Hard-delete soft-deleted objects where all unpins are confirmed
+            try:
+                hard_deleted = await gc_soft_deleted_objects(db)
+            except Exception as e:
+                logger.error(f"Phase 3 (hard delete) error: {e}", exc_info=True)
+
+            logger.info(f"Janitor cycle complete: stale={stale_count} gc={gc_count} hard_deleted={hard_deleted}")
 
             logger.info(f"Janitor sleeping {sleep_interval}s until next cycle...")
             await asyncio.sleep(sleep_interval)

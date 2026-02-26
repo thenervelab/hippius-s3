@@ -67,6 +67,13 @@ class ChunkUploadResult(BaseModel):
     part_number: int
 
 
+def extract_http_status_code(error: Exception) -> str:
+    """Extract HTTP status code from exception, or empty string if not an HTTP error."""
+    if hasattr(error, "response") and hasattr(error.response, "status_code"):
+        return str(error.response.status_code)
+    return ""
+
+
 def classify_error(error: Exception) -> str:
     """Classify error as transient, permanent, or unknown."""
     err_str = str(error).lower()
@@ -74,7 +81,16 @@ def classify_error(error: Exception) -> str:
 
     if any(
         keyword in err_str
-        for keyword in ["malformed", "invalid", "negative size", "missing part", "validation error", "integrity"]
+        for keyword in [
+            "malformed",
+            "invalid",
+            "negative size",
+            "missing part",
+            "validation error",
+            "integrity",
+            "507",
+            "insufficient storage",
+        ]
     ):
         return "permanent"
 
@@ -390,7 +406,9 @@ class Uploader:
 
             raise RuntimeError("part_meta_not_ready")
 
-    async def _push_to_dlq(self, payload: UploadChainRequest, last_error: str, error_type: str) -> None:
+    async def _push_to_dlq(
+        self, payload: UploadChainRequest, last_error: str, error_type: str, status_code: str = ""
+    ) -> None:
         """Push a failed request to the Dead-Letter Queue."""
         await self.dlq_manager.push(payload, last_error, error_type)
 
@@ -403,4 +421,5 @@ class Uploader:
             success=False,
             backend=self.backend_name,
             error_type=etype,
+            status_code=status_code,
         )
