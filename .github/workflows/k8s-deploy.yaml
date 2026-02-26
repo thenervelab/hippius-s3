@@ -157,7 +157,7 @@ jobs:
             --from-literal=HIPPIUS_DOWNLOAD_QUEUE_NAMES='${{ secrets.HIPPIUS_DOWNLOAD_QUEUE_NAMES }}' \
             --from-literal=FRONTEND_HMAC_SECRET='${{ secrets.FRONTEND_HMAC_SECRET }}' \
             --from-literal=CACHET_API_KEY='${{ secrets.CACHET_API_KEY }}' \
-            --from-literal=CACHET_COMPONENT_ID='${{ secrets.CACHET_COMPONENT_ID }}' \
+            --from-literal=CACHET_COMPONENT_ID='2' \
             --from-literal=DISCORD_WEBHOOK_URL='${{ secrets.DISCORD_WEBHOOK_URL }}' \
             --from-literal=HIPPIUS_OVH_KMS_ENDPOINT='${{ secrets.HIPPIUS_OVH_KMS_ENDPOINT }}' \
             --from-literal=HIPPIUS_OVH_KMS_DEFAULT_KEY_ID='${{ secrets.HIPPIUS_OVH_KMS_DEFAULT_KEY_ID }}' \
@@ -286,7 +286,7 @@ jobs:
             --from-literal=HIPPIUS_DOWNLOAD_QUEUE_NAMES="${{ secrets.HIPPIUS_DOWNLOAD_QUEUE_NAMES }}" \
             --from-literal=FRONTEND_HMAC_SECRET="${{ secrets.FRONTEND_HMAC_SECRET }}" \
             --from-literal=CACHET_API_KEY="${{ secrets.CACHET_API_KEY }}" \
-            --from-literal=CACHET_COMPONENT_ID="${{ secrets.CACHET_COMPONENT_ID }}" \
+            --from-literal=CACHET_COMPONENT_ID="1" \
             --from-literal=DISCORD_WEBHOOK_URL="${{ secrets.DISCORD_WEBHOOK_URL }}" \
             --from-literal=HIPPIUS_OVH_KMS_ENDPOINT="${{ secrets.HIPPIUS_OVH_KMS_ENDPOINT }}" \
             --from-literal=HIPPIUS_OVH_KMS_DEFAULT_KEY_ID="${{ secrets.HIPPIUS_OVH_KMS_DEFAULT_KEY_ID }}" \
