@@ -91,16 +91,20 @@ def _setup_janitor_metrics() -> None:
         logger.info("Monitoring disabled for janitor")
         return
 
-    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
-    service_name = os.getenv("OTEL_SERVICE_NAME", "hippius-s3")
+    # If auto-instrumentation already set a MeterProvider, use it.
+    # Only create our own if none exists.
+    existing = otel_metrics.get_meter_provider()
+    if not isinstance(existing, MeterProvider):
+        endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
+        service_name = os.getenv("OTEL_SERVICE_NAME", "hippius-s3")
 
-    resource = Resource.create({"service.name": service_name, "service.instance.id": socket.gethostname()})
-    metric_reader = PeriodicExportingMetricReader(
-        OTLPMetricExporter(endpoint=endpoint, insecure=True),
-        export_interval_millis=10000,
-    )
-    provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
-    otel_metrics.set_meter_provider(provider)
+        resource = Resource.create({"service.name": service_name, "service.instance.id": socket.gethostname()})
+        metric_reader = PeriodicExportingMetricReader(
+            OTLPMetricExporter(endpoint=endpoint, insecure=True),
+            export_interval_millis=10000,
+        )
+        provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+        otel_metrics.set_meter_provider(provider)
 
     meter = otel_metrics.get_meter("janitor")
 
@@ -362,11 +366,7 @@ async def cleanup_old_parts_by_mtime(
             continue
 
         object_id = object_dir.name
-
-        # Skip deletion if object is in DLQ
-        if object_id in dlq_object_ids:
-            logger.debug(f"Skipping DLQ-protected {object_id=}")
-            continue
+        is_dlq_protected = object_id in dlq_object_ids
 
         for version_dir in object_dir.iterdir():
             if not version_dir.is_dir() or not version_dir.name.startswith("v"):
@@ -399,6 +399,10 @@ async def cleanup_old_parts_by_mtime(
                     # Classify part age into bucket
                     part_age = now - mtime
                     age_counts[_classify_age_bucket(part_age)] += 1
+
+                    # Don't clean DLQ-protected parts, only count them for metrics
+                    if is_dlq_protected:
+                        continue
 
                     old_enough = mtime < cutoff_time
                     fully_replicated = await is_replicated_on_all_backends(
