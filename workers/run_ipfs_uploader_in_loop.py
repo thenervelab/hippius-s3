@@ -29,6 +29,7 @@ from hippius_s3.services.ray_id_service import ray_id_context
 from hippius_s3.workers.uploader import Uploader
 from hippius_s3.workers.uploader import classify_error
 from hippius_s3.workers.uploader import compute_backoff_ms
+from hippius_s3.workers.uploader import extract_http_status_code
 
 
 config = get_config()
@@ -121,6 +122,7 @@ async def run_ipfs_uploader_loop():
                     worker_logger.exception(f"IPFS upload failed object_id={upload_request.object_id}")
                     err_str = str(e)
                     error_type = classify_error(e)
+                    status_code = extract_http_status_code(e)
                     attempts_next = (upload_request.attempts or 0) + 1
 
                     if error_type == "transient" and attempts_next <= config.uploader_max_attempts:
@@ -138,9 +140,10 @@ async def run_ipfs_uploader_loop():
                             success=False,
                             backend=BACKEND_NAME,
                             attempt=attempts_next,
+                            status_code=status_code,
                         )
                     else:
-                        await uploader._push_to_dlq(upload_request, err_str, error_type)
+                        await uploader._push_to_dlq(upload_request, err_str, error_type, status_code=status_code)
                         async with db_pool.acquire() as db:
                             await db.execute(
                                 "UPDATE object_versions SET status = 'failed' WHERE object_id = $1 AND object_version = $2",

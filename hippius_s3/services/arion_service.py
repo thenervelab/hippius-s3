@@ -185,6 +185,10 @@ def retry_on_error(
                     if hasattr(e, "response") and e.response.status_code == 404:  # ty: ignore[unresolved-attribute]
                         raise
 
+                    # Don't retry on 507 Insufficient Storage - server is full, retrying won't help
+                    if hasattr(e, "response") and e.response.status_code == 507:  # ty: ignore[unresolved-attribute]
+                        raise
+
                     # Don't retry if this was the last attempt
                     if attempt == retries:
                         break
