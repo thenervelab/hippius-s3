@@ -139,8 +139,6 @@ def _setup_janitor_metrics() -> None:
         unit="1",
     )
 
-    logger.info(f"Janitor metrics enabled, exporting to {endpoint}")
-
 
 async def get_all_dlq_object_ids(redis_client: Redis) -> set[str]:
     """Fetch all object_ids currently in both upload and unpin DLQs.
