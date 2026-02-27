@@ -14,17 +14,12 @@ import redis.asyncio as async_redis
 from opentelemetry import trace
 from pydantic import BaseModel
 
-from hippius_s3.backend_routing import resolve_object_backends
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.dlq.upload_dlq import UploadDLQManager
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
-from hippius_s3.queue import DownloadChainRequest
-from hippius_s3.queue import PartChunkSpec
-from hippius_s3.queue import PartToDownload
 from hippius_s3.queue import UploadChainRequest
-from hippius_s3.queue import enqueue_download_request
 from hippius_s3.utils import get_query
 
 
@@ -364,11 +359,7 @@ class Uploader:
                 for ci in range(num_chunks_meta):
                     piece = await self.fs_store.get_chunk(object_id, int(object_version), part_number, ci)
                     if not isinstance(piece, (bytes, bytearray)):
-                        piece = await self._hydrate_chunk(
-                            object_id, int(object_version), part_number, ci, account_ss58, object_key
-                        )
-                        if not isinstance(piece, (bytes, bytearray)):
-                            raise RuntimeError("missing_cipher_chunk")
+                        raise RuntimeError("missing_cipher_chunk")
 
                     async with self._acquire_conn() as conn:
                         chunk_id = await conn.fetchval(
@@ -414,90 +405,6 @@ class Uploader:
                 return ChunkUploadResult(cids=all_chunk_cids, part_number=part_number)
 
             raise RuntimeError("part_meta_not_ready")
-
-    async def _hydrate_chunk(
-        self,
-        object_id: str,
-        object_version: int,
-        part_number: int,
-        chunk_index: int,
-        account_ss58: str,
-        object_key: str,
-    ) -> Optional[bytes]:
-        """Attempt to hydrate a missing chunk from Redis cache or by downloading from other backends."""
-        # Step 1: Check Redis chunk cache (might already be there from a recent download)
-        piece = await self.obj_cache.get_chunk(object_id, object_version, part_number, chunk_index)
-        if isinstance(piece, (bytes, bytearray)):
-            logger.info(
-                f"Hydrated chunk from Redis cache: backend={self.backend_name} "
-                f"object_id={object_id} part={part_number} chunk={chunk_index}"
-            )
-            return bytes(piece)
-
-        # Step 2: Query which backends hold this object's data (excluding self)
-        async with self._acquire_conn() as conn:
-            other_backends = await resolve_object_backends(conn, object_id, object_version)
-        other_backends = [b for b in other_backends if b != self.backend_name]
-
-        if not other_backends:
-            logger.warning(
-                f"No other backends available for hydration: backend={self.backend_name} "
-                f"object_id={object_id} part={part_number} chunk={chunk_index}"
-            )
-            return None
-
-        # Step 3: Enqueue download request targeting the other backends
-        chunk_spec = PartChunkSpec(index=chunk_index)
-        dl_part = PartToDownload(part_number=part_number, chunks=[chunk_spec])
-
-        req = DownloadChainRequest(
-            request_id=f"hydrate::{object_id}::{part_number}::{chunk_index}",
-            object_id=object_id,
-            object_version=object_version,
-            object_key=object_key,
-            bucket_name="",
-            address=account_ss58,
-            subaccount=account_ss58,
-            subaccount_seed_phrase="",
-            substrate_url=self.config.substrate_url,
-            size=0,
-            multipart=False,
-            chunks=[dl_part],
-            download_backends=other_backends,
-        )
-
-        target_queues = tuple(f"{b}_download_requests" for b in other_backends)
-        await enqueue_download_request(req, queues=target_queues)
-
-        logger.info(
-            f"Enqueued hydration download: backend={self.backend_name} "
-            f"object_id={object_id} part={part_number} chunk={chunk_index} "
-            f"target_backends={other_backends}"
-        )
-
-        # Step 4: Poll Redis cache waiting for the chunk to appear
-        timeout = self.config.uploader_hydration_timeout_seconds
-        poll_interval = 0.5
-        elapsed = 0.0
-
-        while elapsed < timeout:
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
-
-            piece = await self.obj_cache.get_chunk(object_id, object_version, part_number, chunk_index)
-            if isinstance(piece, (bytes, bytearray)):
-                logger.info(
-                    f"Hydration succeeded after {elapsed:.1f}s: backend={self.backend_name} "
-                    f"object_id={object_id} part={part_number} chunk={chunk_index}"
-                )
-                return bytes(piece)
-
-        logger.warning(
-            f"Hydration timed out after {timeout}s: backend={self.backend_name} "
-            f"object_id={object_id} part={part_number} chunk={chunk_index} "
-            f"target_backends={other_backends}"
-        )
-        return None
 
     async def _push_to_dlq(
         self, payload: UploadChainRequest, last_error: str, error_type: str, status_code: str = ""
