@@ -15,6 +15,7 @@ from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import enqueue_unpin_request
 from hippius_s3.queue import initialize_queue_client
+from hippius_s3.sentry import init_sentry
 from hippius_s3.services.hippius_api_service import HippiusApiClient
 
 
@@ -22,6 +23,7 @@ config = get_config()
 
 setup_loki_logging(config, "orphan-checker")
 logger = logging.getLogger(__name__)
+init_sentry("orphan-checker", is_worker=True)
 
 
 async def check_for_orphans(
