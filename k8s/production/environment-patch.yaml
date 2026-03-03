@@ -5,3 +5,4 @@ metadata:
 data:
   ENVIRONMENT: "production"
   OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=production,service.namespace=hippius-s3-prod"
+  SENTRY_DSN: "SENTRY_DSN_PLACEHOLDER"

@@ -5,3 +5,4 @@ metadata:
 data:
   ENVIRONMENT: "staging"
   OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=staging,service.namespace=hippius-s3-staging"
+  SENTRY_DSN: "SENTRY_DSN_PLACEHOLDER"

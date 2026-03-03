@@ -30,12 +30,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
+from hippius_s3.sentry import init_sentry
 from hippius_s3.utils import get_query
 
 
 config = get_config()
 setup_loki_logging(config, "janitor", include_ray_id=False)
 logger = logging.getLogger(__name__)
+init_sentry("janitor", is_worker=True)
 
 # --- Janitor-owned OTel metrics ---
 

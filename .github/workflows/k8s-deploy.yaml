@@ -199,6 +199,10 @@ jobs:
           sed -i "s|HIPPIUS_ARION_BASE_URL_PLACEHOLDER|${ARION_URL:-https://arion.hippius.com/}|g" k8s/base/workers-deployments.yaml
           sed -i "s|HIPPIUS_ARION_VERIFY_SSL_PLACEHOLDER|${ARION_SSL:-true}|g" k8s/base/workers-deployments.yaml
 
+      - name: Substitute Sentry DSN
+        run: |
+          sed -i "s|SENTRY_DSN_PLACEHOLDER|${{ secrets.SENTRY_DSN }}|g" k8s/staging/environment-patch.yaml
+
       - name: Update image tags
         run: |
           SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
@@ -327,6 +331,10 @@ jobs:
           ARION_SSL="${{ secrets.HIPPIUS_ARION_VERIFY_SSL }}"
           sed -i "s|HIPPIUS_ARION_BASE_URL_PLACEHOLDER|${ARION_URL:-https://arion.hippius.com/}|g" k8s/base/workers-deployments.yaml
           sed -i "s|HIPPIUS_ARION_VERIFY_SSL_PLACEHOLDER|${ARION_SSL:-true}|g" k8s/base/workers-deployments.yaml
+
+      - name: Substitute Sentry DSN
+        run: |
+          sed -i "s|SENTRY_DSN_PLACEHOLDER|${{ secrets.SENTRY_DSN }}|g" k8s/production/environment-patch.yaml
 
       - name: Update image tags
         run: |
