@@ -9,6 +9,7 @@ import pytest
 from .support.cache import clear_object_cache
 from .support.cache import get_object_id
 from .support.cache import wait_for_all_backends_ready
+from .support.compose import compose_exec
 from .support.compose import disable_arion_proxy
 from .support.compose import enable_arion_proxy
 
@@ -33,6 +34,8 @@ def test_read_succeeds_with_arion_down_and_recovery(
 
     object_id = get_object_id(bucket, key)
     clear_object_cache(object_id)
+    # Also clear the FS cache inside the API container so the reader can't serve from disk
+    compose_exec("api", ["rm", "-rf", f"/var/lib/hippius/object_cache/{object_id}"])
 
     disable_arion_proxy()
     try:
