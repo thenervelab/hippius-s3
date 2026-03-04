@@ -227,7 +227,7 @@ def wait_for_parts_cids(
     object_key: str,
     *,
     min_count: int,
-    backend: str = "ipfs",
+    backend: str = "arion",
     timeout_seconds: float = 20.0,
     deadline: float | None = None,
     dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
@@ -312,7 +312,7 @@ def wait_for_all_backends_ready(
     Uses a single shared deadline so total wait is at most *timeout_seconds*.
     """
     if backends is None:
-        backends = ["ipfs", "arion"]
+        backends = ["arion"]
     shared_deadline = time.time() + timeout_seconds
     for backend in backends:
         if not wait_for_parts_cids(

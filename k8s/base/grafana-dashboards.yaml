@@ -318,8 +318,8 @@ data:
               "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
               "targets": [
                 {
-                  "expr": "sum by (backend) (rate(uploader_requests_total{service_namespace=\"$namespace\", success=\"false\"}[5m]))",
-                  "legendFormat": "{{backend}}"
+                  "expr": "sum by (backend, status_code) (rate(uploader_requests_total{service_namespace=\"$namespace\", success=\"false\"}[5m]))",
+                  "legendFormat": "{{backend}} ({{status_code}})"
                 }
               ],
               "title": "Upload failures",

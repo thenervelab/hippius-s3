@@ -236,6 +236,10 @@ def factory() -> FastAPI:
     config = get_config()
     setup_loki_logging(config, "api")
 
+    from hippius_s3.sentry import init_sentry
+
+    init_sentry("hippius-s3-api")
+
     app = FastAPI(
         title="Hippius S3",
         description="Hippius S3 Gateway",

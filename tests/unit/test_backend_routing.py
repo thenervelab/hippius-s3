@@ -2,24 +2,23 @@
 
 from __future__ import annotations
 
-import json
 import logging
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
+from unittest.mock import patch
 
 import pytest
 from fakeredis.aioredis import FakeRedis
 
-from hippius_s3.backend_routing import compute_effective_backends, resolve_object_backends
-from hippius_s3.queue import (
-    Chunk,
-    DownloadChainRequest,
-    UnpinChainRequest,
-    UploadChainRequest,
-    enqueue_download_request,
-    enqueue_unpin_request,
-    enqueue_upload_to_backends,
-    initialize_queue_client,
-)
+from hippius_s3.backend_routing import compute_effective_backends
+from hippius_s3.backend_routing import resolve_object_backends
+from hippius_s3.queue import Chunk
+from hippius_s3.queue import DownloadChainRequest
+from hippius_s3.queue import UnpinChainRequest
+from hippius_s3.queue import UploadChainRequest
+from hippius_s3.queue import enqueue_download_request
+from hippius_s3.queue import enqueue_unpin_request
+from hippius_s3.queue import enqueue_upload_to_backends
+from hippius_s3.queue import initialize_queue_client
 
 
 # ---------------------------------------------------------------------------
@@ -29,21 +28,21 @@ from hippius_s3.queue import (
 
 class TestComputeEffectiveBackends:
     def test_none_requested_returns_none(self) -> None:
-        result = compute_effective_backends(None, ["ipfs", "arion"])
+        result = compute_effective_backends(None, ["arion"])
         assert result is None
 
     def test_full_overlap_returns_intersection(self) -> None:
-        result = compute_effective_backends(["ipfs", "arion"], ["ipfs", "arion"])
-        assert result == ["ipfs", "arion"]
+        result = compute_effective_backends(["arion"], ["arion"])
+        assert result == ["arion"]
 
     def test_partial_overlap_drops_extras(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.WARNING):
             result = compute_effective_backends(
-                ["ipfs", "arion", "s3"],
-                ["ipfs", "arion"],
+                ["arion", "s3"],
+                ["arion"],
                 context={"test": True},
             )
-        assert result == ["ipfs", "arion"]
+        assert result == ["arion"]
         assert "Backends dropped" in caplog.text
         assert "s3" in caplog.text
 
@@ -51,28 +50,28 @@ class TestComputeEffectiveBackends:
         with pytest.raises(ValueError, match="No backends remain"):
             compute_effective_backends(
                 ["s3"],
-                ["ipfs", "arion"],
+                ["arion"],
                 raise_on_empty=True,
             )
 
     def test_empty_intersection_raise_on_empty_false(self) -> None:
         result = compute_effective_backends(
             ["s3"],
-            ["ipfs", "arion"],
+            ["arion"],
             raise_on_empty=False,
         )
         assert result is None
 
     def test_preserves_requested_order(self) -> None:
-        result = compute_effective_backends(["arion", "ipfs"], ["ipfs", "arion"])
-        assert result == ["arion", "ipfs"]
+        result = compute_effective_backends(["arion"], ["arion"])
+        assert result == ["arion"]
 
     def test_empty_requested_raise_on_empty_true(self) -> None:
         with pytest.raises(ValueError, match="No backends remain"):
-            compute_effective_backends([], ["ipfs", "arion"], raise_on_empty=True)
+            compute_effective_backends([], ["arion"], raise_on_empty=True)
 
     def test_empty_requested_raise_on_empty_false(self) -> None:
-        result = compute_effective_backends([], ["ipfs", "arion"], raise_on_empty=False)
+        result = compute_effective_backends([], ["arion"], raise_on_empty=False)
         assert result is None
 
 
@@ -85,9 +84,9 @@ class TestResolveObjectBackends:
     @pytest.mark.asyncio
     async def test_returns_backend_names(self) -> None:
         db = AsyncMock()
-        db.fetch.return_value = [{"backend": "ipfs"}, {"backend": "arion"}]
+        db.fetch.return_value = [{"backend": "arion"}]
         result = await resolve_object_backends(db, "obj-1", 1)
-        assert result == ["ipfs", "arion"]
+        assert result == ["arion"]
         db.fetch.assert_called_once()
 
     @pytest.mark.asyncio
@@ -107,7 +106,7 @@ class TestResolveObjectBackends:
     @pytest.mark.asyncio
     async def test_passes_none_version(self) -> None:
         db = AsyncMock()
-        db.fetch.return_value = [{"backend": "ipfs"}]
+        db.fetch.return_value = [{"backend": "arion"}]
         await resolve_object_backends(db, "obj-1", None)
         call_args = db.fetch.call_args
         assert call_args[0][1] == "obj-1"
@@ -118,12 +117,13 @@ class TestResolveObjectBackends:
 # Integration tests (FakeRedis + mock config)
 # ---------------------------------------------------------------------------
 
+
 def _mock_config(upload=None, download=None, delete=None):
     """Return a mock config with configurable backend lists."""
     cfg = AsyncMock()
-    cfg.upload_backends = upload or ["ipfs", "arion"]
-    cfg.download_backends = download or ["ipfs", "arion"]
-    cfg.delete_backends = delete or ["ipfs", "arion"]
+    cfg.upload_backends = upload or ["arion"]
+    cfg.download_backends = download or ["arion"]
+    cfg.delete_backends = delete or ["arion"]
     return cfg
 
 
@@ -139,15 +139,13 @@ class TestUploadIntegration:
             object_id="obj-1",
             object_version=1,
             chunks=[Chunk(id=1)],
-            upload_backends=["ipfs"],
+            upload_backends=["arion"],
         )
         with patch("hippius_s3.queue.get_config", return_value=_mock_config()):
             await enqueue_upload_to_backends(payload)
-        # Should only enqueue to ipfs, not arion
-        ipfs_len = await redis.llen("ipfs_upload_requests")
+        # Should only enqueue to arion
         arion_len = await redis.llen("arion_upload_requests")
-        assert ipfs_len == 1
-        assert arion_len == 0
+        assert arion_len == 1
 
     @pytest.mark.asyncio
     async def test_empty_intersection_raises(self) -> None:
@@ -181,9 +179,7 @@ class TestUploadIntegration:
         )
         with patch("hippius_s3.queue.get_config", return_value=_mock_config()):
             await enqueue_upload_to_backends(payload)
-        ipfs_len = await redis.llen("ipfs_upload_requests")
         arion_len = await redis.llen("arion_upload_requests")
-        assert ipfs_len == 1
         assert arion_len == 1
 
 
@@ -209,9 +205,7 @@ class TestDownloadIntegration:
         with patch("hippius_s3.queue.get_config", return_value=_mock_config()):
             await enqueue_download_request(payload)
         arion_len = await redis.llen("arion_download_requests")
-        ipfs_len = await redis.llen("ipfs_download_requests")
         assert arion_len == 1
-        assert ipfs_len == 0
 
     @pytest.mark.asyncio
     async def test_no_backends_falls_to_config(self) -> None:
@@ -233,11 +227,8 @@ class TestDownloadIntegration:
         )
         with patch("hippius_s3.queue.get_config", return_value=_mock_config()):
             await enqueue_download_request(payload)
-        ipfs_len = await redis.llen("ipfs_download_requests")
         arion_len = await redis.llen("arion_download_requests")
-        assert ipfs_len == 1
         assert arion_len == 1
-
 
     @pytest.mark.asyncio
     async def test_misconfig_does_not_enqueue(self, caplog: pytest.LogCaptureFixture) -> None:
@@ -261,10 +252,8 @@ class TestDownloadIntegration:
             with caplog.at_level(logging.ERROR):
                 await enqueue_download_request(payload)
         # Nothing enqueued
-        ipfs_len = await redis.llen("ipfs_download_requests")
         arion_len = await redis.llen("arion_download_requests")
         s3_len = await redis.llen("s3_download_requests")
-        assert ipfs_len == 0
         assert arion_len == 0
         assert s3_len == 0
         assert "All requested download backends disallowed" in caplog.text
@@ -284,9 +273,7 @@ class TestUnpinIntegration:
         with patch("hippius_s3.queue.get_config", return_value=_mock_config()):
             await enqueue_unpin_request(payload)
         arion_len = await redis.llen("arion_unpin_requests")
-        ipfs_len = await redis.llen("ipfs_unpin_requests")
         assert arion_len == 1
-        assert ipfs_len == 0
 
     @pytest.mark.asyncio
     async def test_no_backends_fans_to_config(self) -> None:
@@ -300,9 +287,7 @@ class TestUnpinIntegration:
         )
         with patch("hippius_s3.queue.get_config", return_value=_mock_config()):
             await enqueue_unpin_request(payload)
-        ipfs_len = await redis.llen("ipfs_unpin_requests")
         arion_len = await redis.llen("arion_unpin_requests")
-        assert ipfs_len == 1
         assert arion_len == 1
 
     @pytest.mark.asyncio
@@ -319,10 +304,8 @@ class TestUnpinIntegration:
             with caplog.at_level(logging.ERROR):
                 await enqueue_unpin_request(payload)
         # Nothing enqueued
-        ipfs_len = await redis.llen("ipfs_unpin_requests")
         arion_len = await redis.llen("arion_unpin_requests")
         s3_len = await redis.llen("s3_unpin_requests")
-        assert ipfs_len == 0
         assert arion_len == 0
         assert s3_len == 0
         assert "All requested delete backends disallowed" in caplog.text
@@ -338,9 +321,7 @@ class TestUnpinIntegration:
             delete_backends=["arion"],
         )
         with patch("hippius_s3.queue.get_config", return_value=_mock_config()):
-            await enqueue_unpin_request(payload, queue_name="ipfs_unpin_requests")
-        # queue_name takes precedence — only ipfs queue
-        ipfs_len = await redis.llen("ipfs_unpin_requests")
+            await enqueue_unpin_request(payload, queue_name="arion_unpin_requests")
+        # queue_name takes precedence — only arion queue
         arion_len = await redis.llen("arion_unpin_requests")
-        assert ipfs_len == 1
-        assert arion_len == 0
+        assert arion_len == 1

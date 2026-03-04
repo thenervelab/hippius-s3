@@ -38,7 +38,9 @@ def get_bucket_id(bucket_name: str, *, dsn: str | None = None) -> str:
         return str(row[0])
 
 
-def query_bucket_keks(bucket_name: str, *, keystore_dsn: str | None = None, main_dsn: str | None = None) -> dict[str, Any]:
+def query_bucket_keks(
+    bucket_name: str, *, keystore_dsn: str | None = None, main_dsn: str | None = None
+) -> dict[str, Any]:
     """Query keystore DB for bucket's active KEK row.
 
     Returns dict with keys:

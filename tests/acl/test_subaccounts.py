@@ -27,7 +27,7 @@ class TestSubaccountBucketACL:
 
     @pytest.mark.skipif(
         "config.getoption('--r2') or config.getoption('--aws')",
-        reason="Subaccounts are a Hippius-specific concept. PutBucketAcl not implemented in R2."
+        reason="Subaccounts are a Hippius-specific concept. PutBucketAcl not implemented in R2.",
     )
     def test_upload_subaccount_cannot_write_bucket_acl(self, s3_acc1_upload, clean_bucket) -> None:
         """Test that upload-only subaccount cannot write bucket ACL."""
@@ -38,7 +38,7 @@ class TestSubaccountBucketACL:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_uploaddelete_subaccount_can_write_bucket_acl(self, s3_acc1_uploaddelete, clean_bucket) -> None:
         """Test that upload/delete subaccount can write bucket ACL."""
@@ -55,7 +55,7 @@ class TestSubaccountObjectACL:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_upload_subaccount_can_read_object_acl(self, s3_acc1_upload, s3_acc1_uploaddelete, test_object) -> None:
         """Test that upload-only subaccount can read object ACL."""
@@ -66,7 +66,7 @@ class TestSubaccountObjectACL:
 
     @pytest.mark.skipif(
         "config.getoption('--r2') or config.getoption('--aws')",
-        reason="Subaccounts are a Hippius-specific concept. PutObjectAcl/GetObjectAcl not implemented in R2."
+        reason="Subaccounts are a Hippius-specific concept. PutObjectAcl/GetObjectAcl not implemented in R2.",
     )
     def test_upload_subaccount_cannot_write_object_acl(self, s3_acc1_upload, test_object) -> None:
         """Test that upload-only subaccount cannot write object ACL."""
@@ -77,7 +77,7 @@ class TestSubaccountObjectACL:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_uploaddelete_subaccount_can_write_object_acl(self, s3_acc1_uploaddelete, test_object) -> None:
         """Test that upload/delete subaccount can write object ACL."""

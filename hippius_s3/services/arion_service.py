@@ -185,6 +185,10 @@ def retry_on_error(
                     if hasattr(e, "response") and e.response.status_code == 404:  # ty: ignore[unresolved-attribute]
                         raise
 
+                    # Don't retry on 507 Insufficient Storage - server is full, retrying won't help
+                    if hasattr(e, "response") and e.response.status_code == 507:  # ty: ignore[unresolved-attribute]
+                        raise
+
                     # Don't retry if this was the last attempt
                     if attempt == retries:
                         break
@@ -317,8 +321,8 @@ class ArionClient:
             headers=headers,
         )
 
-        response_json = response.json()
         response.raise_for_status()
+        response_json = response.json()
 
         return DeleteSuccessResponse.model_validate(response_json)
 
@@ -400,8 +404,8 @@ class ArionClient:
             headers=headers,
         )
         logger.info(f"Raw response content {response.content}")
-        response_json = response.json()
         response.raise_for_status()
+        response_json = response.json()
 
         upload_response = UploadResponse.model_validate(response_json)
         upload_response.size_bytes = len(file_data)

@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """Shared per-backend download module.
 
-Each backend entry point (``run_ipfs_downloader_in_loop.py``,
-``run_arion_downloader_in_loop.py``) provides:
+Each backend entry point (``run_arion_downloader_in_loop.py``) provides:
 
-* ``backend_name`` — e.g. ``"ipfs"`` or ``"arion"``
-* ``queue_name``   — e.g. ``"ipfs_download_requests"``
+* ``backend_name`` — e.g. ``"arion"``
+* ``queue_name``   — e.g. ``"arion_download_requests"``
 * ``fetch_fn``     — ``async (identifier, account_address) -> bytes``
 
 This module dequeues download requests, looks up the backend-specific

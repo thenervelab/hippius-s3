@@ -112,9 +112,7 @@ class TestOVHKMSClient:
 
         mock_response = MagicMock()
         mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "plaintext": base64.b64encode(expected_plaintext).decode()
-        }
+        mock_response.json.return_value = {"plaintext": base64.b64encode(expected_plaintext).decode()}
 
         with patch("httpx.AsyncClient") as MockClient:
             mock_client_instance = AsyncMock()
@@ -161,9 +159,7 @@ class TestOVHKMSClient:
 
         mock_response = MagicMock()
         mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "plaintext": base64.b64encode(expected_plaintext).decode()
-        }
+        mock_response.json.return_value = {"plaintext": base64.b64encode(expected_plaintext).decode()}
 
         with patch("httpx.AsyncClient") as MockClient:
             mock_client_instance = AsyncMock()
@@ -230,9 +226,7 @@ class TestOVHKMSClient:
 
         with patch("httpx.AsyncClient") as MockClient:
             mock_client_instance = AsyncMock()
-            mock_client_instance.request = AsyncMock(
-                side_effect=[mock_response_429, mock_response_201]
-            )
+            mock_client_instance.request = AsyncMock(side_effect=[mock_response_429, mock_response_201])
             MockClient.return_value = mock_client_instance
 
             mock_config.ovh_kms_retry_base_ms = 1

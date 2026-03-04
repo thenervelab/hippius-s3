@@ -21,7 +21,7 @@ def get_part_chunks(
     part_number: int = 1,
     *,
     dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
-    backend: str = "ipfs",
+    backend: str = "arion",
 ) -> List[ChunkRow]:
     """Return chunk rows for a given object's part, ordered by chunk_index.
 

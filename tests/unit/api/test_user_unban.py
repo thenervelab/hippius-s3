@@ -104,9 +104,7 @@ async def test_unban_missing_ip_parameter(unban_app: Any) -> None:
 
 @pytest.mark.asyncio
 async def test_unban_redis_error(unban_app: Any) -> None:
-    unban_app.state.redis_rate_limiting_client.delete = AsyncMock(
-        side_effect=Exception("Redis connection error")
-    )
+    unban_app.state.redis_rate_limiting_client.delete = AsyncMock(side_effect=Exception("Redis connection error"))
 
     async with AsyncClient(transport=ASGITransport(app=unban_app), base_url="http://test") as client:
         response = await client.post("/user/unban?ip=1.2.3.4")

@@ -30,12 +30,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
+from hippius_s3.sentry import init_sentry
 from hippius_s3.utils import get_query
 
 
 config = get_config()
 setup_loki_logging(config, "janitor", include_ray_id=False)
 logger = logging.getLogger(__name__)
+init_sentry("janitor", is_worker=True)
 
 # --- Janitor-owned OTel metrics ---
 
@@ -91,16 +93,20 @@ def _setup_janitor_metrics() -> None:
         logger.info("Monitoring disabled for janitor")
         return
 
-    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
-    service_name = os.getenv("OTEL_SERVICE_NAME", "hippius-s3")
+    # If auto-instrumentation already set a MeterProvider, use it.
+    # Only create our own if none exists.
+    existing = otel_metrics.get_meter_provider()
+    if not isinstance(existing, MeterProvider):
+        endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
+        service_name = os.getenv("OTEL_SERVICE_NAME", "hippius-s3")
 
-    resource = Resource.create({"service.name": service_name, "1": socket.gethostname()})
-    metric_reader = PeriodicExportingMetricReader(
-        OTLPMetricExporter(endpoint=endpoint, insecure=True),
-        export_interval_millis=10000,
-    )
-    provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
-    otel_metrics.set_meter_provider(provider)
+        resource = Resource.create({"service.name": service_name, "service.instance.id": socket.gethostname()})
+        metric_reader = PeriodicExportingMetricReader(
+            OTLPMetricExporter(endpoint=endpoint, insecure=True),
+            export_interval_millis=10000,
+        )
+        provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+        otel_metrics.set_meter_provider(provider)
 
     meter = otel_metrics.get_meter("janitor")
 
@@ -135,8 +141,6 @@ def _setup_janitor_metrics() -> None:
         unit="1",
     )
 
-    logger.info(f"Janitor metrics enabled, exporting to {endpoint}")
-
 
 async def get_all_dlq_object_ids(redis_client: Redis) -> set[str]:
     """Fetch all object_ids currently in both upload and unpin DLQs.
@@ -146,7 +150,7 @@ async def get_all_dlq_object_ids(redis_client: Redis) -> set[str]:
     """
     object_ids = set()
 
-    for dlq_key in ["ipfs_upload_requests:dlq", "arion_upload_requests:dlq", "unpin_requests:dlq"]:
+    for dlq_key in ["arion_upload_requests:dlq", "unpin_requests:dlq"]:
         try:
             dlq_entries = await asyncio.wait_for(redis_client.lrange(dlq_key, 0, -1), timeout=5.0)
             for entry_json in dlq_entries:
@@ -362,11 +366,7 @@ async def cleanup_old_parts_by_mtime(
             continue
 
         object_id = object_dir.name
-
-        # Skip deletion if object is in DLQ
-        if object_id in dlq_object_ids:
-            logger.debug(f"Skipping DLQ-protected {object_id=}")
-            continue
+        is_dlq_protected = object_id in dlq_object_ids
 
         for version_dir in object_dir.iterdir():
             if not version_dir.is_dir() or not version_dir.name.startswith("v"):
@@ -399,6 +399,10 @@ async def cleanup_old_parts_by_mtime(
                     # Classify part age into bucket
                     part_age = now - mtime
                     age_counts[_classify_age_bucket(part_age)] += 1
+
+                    # Don't clean DLQ-protected parts, only count them for metrics
+                    if is_dlq_protected:
+                        continue
 
                     old_enough = mtime < cutoff_time
                     fully_replicated = await is_replicated_on_all_backends(
@@ -475,22 +479,30 @@ async def run_janitor_loop():
 
     try:
         while True:
+            logger.info("Janitor cycle starting...")
+            stale_count = 0
+            gc_count = 0
+            hard_deleted = 0
+
+            # Phase 1: Clean stale MPU parts (aborted uploads)
             try:
-                logger.info("Janitor cycle starting...")
-
-                # Phase 1: Clean stale MPU parts (aborted uploads)
                 stale_count = await cleanup_stale_parts(db, fs_store, redis_client)
-
-                # Phase 2: GC old parts by mtime (safety net for pre-migration chunks)
-                gc_count = await cleanup_old_parts_by_mtime(db, fs_store, redis_client)
-
-                # Phase 3: Hard-delete soft-deleted objects where all unpins are confirmed
-                hard_deleted = await gc_soft_deleted_objects(db)
-
-                logger.info(f"Janitor cycle complete: stale={stale_count} gc={gc_count} hard_deleted={hard_deleted}")
-
             except Exception as e:
-                logger.error(f"Janitor cycle error: {e}", exc_info=True)
+                logger.error(f"Phase 1 (stale cleanup) error: {e}", exc_info=True)
+
+            # Phase 2: GC old parts by mtime + update disk/cache metrics
+            try:
+                gc_count = await cleanup_old_parts_by_mtime(db, fs_store, redis_client)
+            except Exception as e:
+                logger.error(f"Phase 2 (GC) error: {e}", exc_info=True)
+
+            # Phase 3: Hard-delete soft-deleted objects where all unpins are confirmed
+            try:
+                hard_deleted = await gc_soft_deleted_objects(db)
+            except Exception as e:
+                logger.error(f"Phase 3 (hard delete) error: {e}", exc_info=True)
+
+            logger.info(f"Janitor cycle complete: stale={stale_count} gc={gc_count} hard_deleted={hard_deleted}")
 
             logger.info(f"Janitor sleeping {sleep_interval}s until next cycle...")
             await asyncio.sleep(sleep_interval)

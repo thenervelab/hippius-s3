@@ -951,8 +951,7 @@ class TestAccessKeyHeaderParsing:
         from gateway.routers.acl import parse_grant_header
 
         grants = parse_grant_header(
-            'id="5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", accessKey="hip_bob_key"',
-            Permission.READ
+            'id="5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", accessKey="hip_bob_key"', Permission.READ
         )
 
         assert len(grants) == 2

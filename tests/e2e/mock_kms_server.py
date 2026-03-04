@@ -19,9 +19,7 @@ from pydantic import BaseModel
 app = FastAPI()
 
 # Mock "HSM" master key - XOR-based wrap for testing only
-MOCK_MASTER_KEY = os.environ.get(
-    "MOCK_KMS_MASTER_KEY", "test-master-key-0123456789abcdef"
-).encode()
+MOCK_MASTER_KEY = os.environ.get("MOCK_KMS_MASTER_KEY", "test-master-key-0123456789abcdef").encode()
 
 # Mock OKMS ID for path matching
 MOCK_OKMS_ID = os.environ.get("MOCK_KMS_OKMS_ID", "mock-okms-id")
@@ -47,9 +45,7 @@ class DecryptDataKeyResponse(BaseModel):
 
 def xor_bytes(data: bytes) -> bytes:
     """XOR data with the mock master key (for testing only)."""
-    key_repeated = (MOCK_MASTER_KEY * ((len(data) // len(MOCK_MASTER_KEY)) + 1))[
-        : len(data)
-    ]
+    key_repeated = (MOCK_MASTER_KEY * ((len(data) // len(MOCK_MASTER_KEY)) + 1))[: len(data)]
     return bytes(a ^ b for a, b in zip(data, key_repeated, strict=True))
 
 
@@ -98,7 +94,7 @@ async def decrypt_data_key(okms_id: str, key_id: str, request: DecryptDataKeyReq
         if not request.key.startswith("mock-jwe."):
             raise HTTPException(status_code=400, detail="Invalid wrapped key format")
 
-        wrapped_b64 = request.key[len("mock-jwe."):]
+        wrapped_b64 = request.key[len("mock-jwe.") :]
         wrapped = base64.b64decode(wrapped_b64)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid wrapped key") from None

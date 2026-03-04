@@ -4,7 +4,6 @@ from typing import Any
 from typing import Optional
 
 import psycopg
-import requests
 
 
 def _get_db_url() -> str:
@@ -48,18 +47,6 @@ def wait_for_object_cid(bucket: str, key: str, timeout_sec: float = 30.0, interv
 # Backwards-compat aliases
 get_manifest_row = get_object_row
 wait_for_manifest_cid = wait_for_object_cid
-
-
-def fetch_ipfs_json(cid: str) -> dict[str, Any]:
-    # Use IPFS API cat endpoint instead of gateway to avoid subdomain redirects in tests
-    api_url = os.getenv("HIPPIUS_E2E_IPFS_API_URL", "http://localhost:5001")
-    url = f"{api_url.rstrip('/')}/api/v0/cat"
-    resp = requests.post(url, params={"arg": cid}, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    if not isinstance(data, dict):
-        raise ValueError(f"Expected JSON object, got {type(data)}")
-    return data
 
 
 def wait_for_object_cid_via_head(

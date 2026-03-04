@@ -245,11 +245,15 @@ def test_kms_outage_blocks_new_object_operations(
 
         # If it's a ClientError, verify it's a server error (500)
         if isinstance(exc_info.value, ClientError):
-            assert exc_info.value.response["Error"]["Code"] in (
-                "InternalServerError",
-                "InternalError",
-                "500",
-            ) or exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 500
+            assert (
+                exc_info.value.response["Error"]["Code"]
+                in (
+                    "InternalServerError",
+                    "InternalError",
+                    "500",
+                )
+                or exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 500
+            )
         # ReadTimeoutError is also acceptable - means API couldn't complete due to KMS unavailability
     finally:
         unpause_service("mock-kms")

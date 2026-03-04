@@ -499,7 +499,12 @@ class TestAccessKeyGrants:
             grantee=Grantee(type=GranteeType.ACCESS_KEY, id="hip_bob_key_123"),
             permission=Permission.READ,
         )
-        assert acl_service._grant_matches(grant, account_id="5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", access_key=None) is False
+        assert (
+            acl_service._grant_matches(
+                grant, account_id="5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", access_key=None
+            )
+            is False
+        )
 
     def test_canonical_user_grant_does_not_match_access_key(self, acl_service: Any) -> None:
         """Test that CANONICAL_USER grant does not match access key"""
@@ -534,11 +539,7 @@ class TestAccessKeyGrants:
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
         has_permission = await acl_service.check_permission(
-            account_id=None,
-            bucket="bucket1",
-            key=None,
-            permission=Permission.READ,
-            access_key="hip_bob_key_123"
+            account_id=None, bucket="bucket1", key=None, permission=Permission.READ, access_key="hip_bob_key_123"
         )
 
         assert has_permission is True
@@ -568,11 +569,7 @@ class TestAccessKeyGrants:
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
         has_permission = await acl_service.check_permission(
-            account_id=None,
-            bucket="bucket1",
-            key=None,
-            permission=Permission.READ,
-            access_key="hip_bob_key_456"
+            account_id=None, bucket="bucket1", key=None, permission=Permission.READ, access_key="hip_bob_key_456"
         )
 
         assert has_permission is False
@@ -603,11 +600,7 @@ class TestAccessKeyGrants:
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
         has_permission_via_account = await acl_service.check_permission(
-            account_id=bob_account,
-            bucket="bucket1",
-            key=None,
-            permission=Permission.READ,
-            access_key="hip_bob_key_123"
+            account_id=bob_account, bucket="bucket1", key=None, permission=Permission.READ, access_key="hip_bob_key_123"
         )
 
         assert has_permission_via_account is True
@@ -628,11 +621,7 @@ class TestAccessKeyGrants:
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
         has_permission = await acl_service.check_permission(
-            account_id=owner_id,
-            bucket="bucket1",
-            key=None,
-            permission=Permission.WRITE,
-            access_key="hip_some_key"
+            account_id=owner_id, bucket="bucket1", key=None, permission=Permission.WRITE, access_key="hip_some_key"
         )
 
         assert has_permission is True

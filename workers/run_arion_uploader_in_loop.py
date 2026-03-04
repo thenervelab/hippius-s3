@@ -23,12 +23,14 @@ from hippius_s3.queue import dequeue_upload_request
 from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.queue import move_due_upload_retries
 from hippius_s3.redis_utils import with_redis_retry
+from hippius_s3.sentry import init_sentry
 from hippius_s3.services.arion_service import ArionClient
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 from hippius_s3.services.ray_id_service import ray_id_context
 from hippius_s3.workers.uploader import Uploader
 from hippius_s3.workers.uploader import classify_error
 from hippius_s3.workers.uploader import compute_backoff_ms
+from hippius_s3.workers.uploader import extract_http_status_code
 
 
 config = get_config()
@@ -36,6 +38,7 @@ tracer = trace.get_tracer(__name__)
 
 setup_loki_logging(config, "arion-uploader")
 logger = logging.getLogger(__name__)
+init_sentry("arion-uploader", is_worker=True)
 
 
 async def run_arion_uploader_loop():
@@ -121,6 +124,7 @@ async def run_arion_uploader_loop():
                     worker_logger.exception(f"Arion upload failed object_id={upload_request.object_id}")
                     err_str = str(e)
                     error_type = classify_error(e)
+                    status_code = extract_http_status_code(e)
                     attempts_next = (upload_request.attempts or 0) + 1
 
                     if error_type == "transient" and attempts_next <= config.uploader_max_attempts:
@@ -135,9 +139,10 @@ async def run_arion_uploader_loop():
                             success=False,
                             backend="arion",
                             attempt=attempts_next,
+                            status_code=status_code,
                         )
                     else:
-                        await uploader._push_to_dlq(upload_request, err_str, error_type)
+                        await uploader._push_to_dlq(upload_request, err_str, error_type, status_code=status_code)
                         async with db_pool.acquire() as db:
                             await db.execute(
                                 "UPDATE object_versions SET status = 'failed' WHERE object_id = $1 AND object_version = $2",

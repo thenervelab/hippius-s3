@@ -10,6 +10,7 @@ from fastapi import UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+
 app = FastAPI()
 
 # In-memory store keyed by file_id (SHA256 of filename) -> {"bytes": bytes, "account_ss58": str, "upload_id": str}
@@ -72,9 +73,7 @@ async def can_upload(body: CanUploadRequest) -> CanUploadResult:
 @app.delete("/delete/{user_id}/{file_id}")
 async def delete(user_id: str, file_id: str) -> DeleteResult:
     entry = _store.pop(file_id, None)
-    return DeleteResult(
-        Success={"status": "deleted", "file_id": file_id, "user_id": user_id}
-    )
+    return DeleteResult(Success={"status": "deleted", "file_id": file_id, "user_id": user_id})
 
 
 @app.get("/health")

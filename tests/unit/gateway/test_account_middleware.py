@@ -2,9 +2,7 @@
 
 import hashlib
 from typing import Any
-from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
-from unittest.mock import patch
 
 import httpx
 import pytest
@@ -176,6 +174,7 @@ async def test_account_id_format_matches_ss58_pattern(mock_config_bypass: Any, m
 # ---------------------------------------------------------------------------
 # can_upload integration tests (non-bypass mode, access_key auth)
 # ---------------------------------------------------------------------------
+
 
 def _make_can_upload_app(
     mock_config: Any,
