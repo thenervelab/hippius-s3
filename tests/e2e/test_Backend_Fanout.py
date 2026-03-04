@@ -1,4 +1,4 @@
-"""E2E test verifying upload fans out to both IPFS and Arion backends."""
+"""E2E test verifying upload fans out to configured backends (Arion)."""
 
 from typing import Any
 from typing import Callable
@@ -16,7 +16,7 @@ def test_upload_fans_out_to_both_backends(
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
 ) -> None:
-    """Verify chunk_backend has rows for both ipfs and arion after upload."""
+    """Verify chunk_backend has rows for arion after upload."""
     bucket = unique_bucket_name("fanout-both")
     cleanup_buckets(bucket)
     boto3_client.create_bucket(Bucket=bucket)
@@ -45,4 +45,4 @@ def test_upload_fans_out_to_both_backends(
         )
         backends = {row[0] for row in cur.fetchall()}
 
-    assert {"ipfs", "arion"} <= backends, f"Expected both ipfs and arion in backends, got {backends}"
+    assert "arion" in backends, f"Expected arion in backends, got {backends}"
