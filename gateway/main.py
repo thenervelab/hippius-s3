@@ -38,10 +38,10 @@ from hippius_s3.services.arion_service import ArionClient
 
 config = get_config()
 logger = setup_loki_logging(config, "hippius-s3-gateway")
-init_sentry("hippius-s3-gateway")
 
 
 def factory() -> FastAPI:
+    init_sentry("hippius-s3-gateway")
     app = FastAPI(
         title="Hippius S3 API",
         version="1.0.0",

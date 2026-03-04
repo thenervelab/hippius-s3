@@ -16,10 +16,13 @@ def init_sentry(
 
     import sentry_sdk
     from sentry_sdk.integrations.asyncio import AsyncioIntegration
+    from sentry_sdk.integrations.fastapi import FastApiIntegration
 
-    integrations: list = []
+    integrations = []
     if is_worker:
         integrations.append(AsyncioIntegration())
+    else:
+        integrations.append(FastApiIntegration())
 
     sentry_sdk.init(
         dsn=dsn,
@@ -27,7 +30,7 @@ def init_sentry(
         traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
         server_name=service_name,
         integrations=integrations,
-        send_default_pii=True,
+        send_default_pii=False,
     )
 
     logger.info(f"Sentry initialized for {service_name}")

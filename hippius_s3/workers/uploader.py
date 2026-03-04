@@ -79,6 +79,10 @@ def classify_error(error: Exception) -> str:
     err_str = str(error).lower()
     err_type = type(error).__name__.lower()
 
+    status_code = extract_http_status_code(error)
+    if status_code == "507":
+        return "permanent"
+
     if any(
         keyword in err_str
         for keyword in [
@@ -88,7 +92,6 @@ def classify_error(error: Exception) -> str:
             "missing part",
             "validation error",
             "integrity",
-            "507",
             "insufficient storage",
         ]
     ):
