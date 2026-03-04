@@ -150,7 +150,7 @@ async def get_all_dlq_object_ids(redis_client: Redis) -> set[str]:
     """
     object_ids = set()
 
-    for dlq_key in ["ipfs_upload_requests:dlq", "arion_upload_requests:dlq", "unpin_requests:dlq"]:
+    for dlq_key in ["arion_upload_requests:dlq", "unpin_requests:dlq"]:
         try:
             dlq_entries = await asyncio.wait_for(redis_client.lrange(dlq_key, 0, -1), timeout=5.0)
             for entry_json in dlq_entries:

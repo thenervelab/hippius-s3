@@ -1,5 +1,4 @@
 import json
-import logging
 from unittest.mock import Mock
 from unittest.mock import patch
 

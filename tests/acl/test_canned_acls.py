@@ -19,7 +19,7 @@ class TestBucketCannedACLs:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_bucket_private_acl(self, s3_acc1_uploaddelete, clean_bucket, canonical_ids) -> None:
         """Test that private (default) bucket ACL only grants owner FULL_CONTROL."""
@@ -35,7 +35,7 @@ class TestBucketCannedACLs:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_bucket_public_read_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
@@ -56,7 +56,7 @@ class TestBucketCannedACLs:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_bucket_public_read_write_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
@@ -80,7 +80,7 @@ class TestBucketCannedACLs:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_bucket_authenticated_read_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
@@ -101,7 +101,7 @@ class TestBucketCannedACLs:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_bucket_log_delivery_write_acl(self, s3_acc1_uploaddelete, clean_bucket, canonical_ids) -> None:
         """Test that log-delivery-write bucket ACL grants LogDelivery group permissions."""
@@ -118,7 +118,7 @@ class TestBucketCannedACLs:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_bucket_acl_set_during_creation(self, s3_acc1_uploaddelete, config) -> None:
         """Test that canned ACL can be set during bucket creation."""
@@ -157,7 +157,7 @@ class TestBucketCannedACLs:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_bucket_acl_overwrite_previous(self, s3_acc1_uploaddelete, clean_bucket, canonical_ids) -> None:
         """Test that setting new ACL overwrites previous ACL."""
@@ -192,7 +192,7 @@ class TestObjectCannedACLs:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_private_acl(self, s3_acc1_uploaddelete, test_object, canonical_ids) -> None:
         """Test that private (default) object ACL only grants owner FULL_CONTROL."""
@@ -208,7 +208,7 @@ class TestObjectCannedACLs:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_public_read_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
@@ -229,7 +229,7 @@ class TestObjectCannedACLs:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_public_read_write_acl(self, s3_acc1_uploaddelete, test_object, canonical_ids) -> None:
         """Test that public-read-write object ACL grants AllUsers READ."""
@@ -245,7 +245,7 @@ class TestObjectCannedACLs:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_authenticated_read_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
@@ -266,7 +266,7 @@ class TestObjectCannedACLs:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_bucket_owner_read_acl(self, s3_acc1_uploaddelete, test_object, canonical_ids) -> None:
         """Test that bucket-owner-read ACL works (single account scenario)."""
@@ -281,7 +281,7 @@ class TestObjectCannedACLs:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_bucket_owner_full_control_acl(self, s3_acc1_uploaddelete, test_object, canonical_ids) -> None:
         """Test that bucket-owner-full-control ACL works (single account scenario)."""
@@ -296,7 +296,7 @@ class TestObjectCannedACLs:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_acl_set_during_upload(self, s3_acc1_uploaddelete, clean_bucket) -> None:
         """Test that canned ACL can be set during object upload."""
@@ -312,7 +312,7 @@ class TestObjectCannedACLs:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_acl_overwrite_previous(self, s3_acc1_uploaddelete, test_object, canonical_ids) -> None:
         """Test that setting new object ACL overwrites previous ACL."""
@@ -332,7 +332,7 @@ class TestObjectCannedACLs:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_get_acl_returns_correct_structure(self, s3_acc1_uploaddelete, test_object) -> None:
         """Test that get_object_acl returns correctly structured response."""

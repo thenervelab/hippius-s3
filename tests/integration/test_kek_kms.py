@@ -32,7 +32,7 @@ def make_mock_jwe(plaintext: bytes) -> str:
 
 def unwrap_mock_jwe(jwe: str) -> bytes:
     """Unwrap a mock JWE-format key to get plaintext."""
-    wrapped_b64 = jwe[len("mock-jwe."):]
+    wrapped_b64 = jwe[len("mock-jwe.") :]
     wrapped = base64.b64decode(wrapped_b64)
     return xor_with_mock_key(wrapped)
 

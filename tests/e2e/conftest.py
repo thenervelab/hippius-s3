@@ -26,13 +26,9 @@ from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 from botocore.exceptions import ReadTimeoutError  # type: ignore[import-untyped]
 
 from .support.compose import enable_arion_proxy
-from .support.compose import enable_ipfs_proxy
 from .support.compose import enable_kms_proxy
 from .support.compose import wait_for_toxiproxy
 
-
-# Ensure required app config vars exist during collection (some modules call get_config() at import-time).
-os.environ.setdefault("HIPPIUS_IPFS_API_URLS", "http://127.0.0.1:5001")
 
 # type: ignore[import-untyped]
 # Note: event_loop fixture removed as it's not needed for synchronous tests
@@ -130,9 +126,6 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
 
     env = os.environ.copy()
     env["COMPOSE_PROJECT_NAME"] = compose_project_name
-    # Important: tests run on the host, but docker-compose variable interpolation uses this env dict.
-    # We want containers to talk to IPFS via toxiproxy inside the compose network, not 127.0.0.1.
-    env["HIPPIUS_IPFS_API_URLS"] = os.environ.get("HIPPIUS_IPFS_API_URLS_DOCKER", "http://toxiproxy:15001")
     project_root = str(Path(__file__).resolve().parents[2])
 
     # Ensure .e2e directories exist for volume mounts
@@ -274,21 +267,6 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
 # Ensure docker services are started for all e2e tests without having to depend on the fixture explicitly
 @pytest.fixture(scope="session", autouse=True)
 def _ensure_services(docker_services: None) -> Iterator[None]:
-    yield
-
-
-@pytest.fixture(scope="session", autouse=True)
-def _init_ipfs_proxies(docker_services: None) -> Iterator[None]:
-    """Ensure Toxiproxy IPFS proxies exist and are enabled before any tests run.
-
-    Depends on docker_services so the compose stack (including toxiproxy) is up.
-    No-op when running against real AWS.
-    """
-    if os.getenv("RUN_REAL_AWS") == "1" or os.getenv("AWS") == "1":
-        yield
-        return
-    assert wait_for_toxiproxy(), "Toxiproxy API not available"
-    enable_ipfs_proxy()
     yield
 
 

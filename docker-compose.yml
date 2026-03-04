@@ -19,11 +19,7 @@ services:
     depends_on:
       api:
         condition: service_healthy
-      ipfs-uploader:
-        condition: service_healthy
       arion-uploader:
-        condition: service_healthy
-      ipfs-downloader:
         condition: service_healthy
       arion-downloader:
         condition: service_healthy
@@ -47,7 +43,6 @@ services:
       - GATEWAY_BACKEND_URL=http://api:8000
       - GATEWAY_PORT=8080
       - HIPPIUS_BYPASS_CREDIT_CHECK=false
-      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
       interval: 60s
@@ -65,8 +60,6 @@ services:
       - .env.defaults
       - .env
     depends_on:
-      ipfs:
-        condition: service_started
       db:
         condition: service_healthy
       redis:
@@ -90,7 +83,6 @@ services:
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
-      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/ || exit 1"]
       interval: 60s
@@ -116,24 +108,6 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
-    networks:
-      - hippius_net
-
-  ipfs:
-    image: ipfs/kubo:latest
-    ports:
-      - "127.0.0.1:4001:4001"
-      - "127.0.0.1:5001:5001"
-    volumes:
-      - ipfs_data:/data/ipfs
-    restart: unless-stopped
-    environment:
-      - IPFS_PROFILE=server
-    healthcheck:
-      test: ["CMD-SHELL", "ipfs id"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
     networks:
       - hippius_net
 
@@ -303,41 +277,6 @@ services:
     networks:
       - hippius_net
 
-  ipfs-uploader:
-    build:
-      context: .
-      dockerfile: workers/Dockerfile
-    env_file:
-      - .env.defaults
-      - .env
-    depends_on:
-      ipfs:
-        condition: service_started
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      redis-queues:
-        condition: service_healthy
-    restart: unless-stopped
-    environment:
-      - PYTHONUNBUFFERED=1
-      - WORKER_SCRIPT=workers/run_ipfs_uploader_in_loop.py
-      - ENABLE_WATCHFILES=true
-      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
-    volumes:
-      - .:/app
-      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
-      - /var/lib/hippius/kms:/kms_certs:ro
-    healthcheck:
-      test: ["CMD-SHELL", "exit 0"]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-      start_period: 10s
-    networks:
-      - hippius_net
-
   arion-uploader:
     build:
       context: .
@@ -371,37 +310,6 @@ services:
     networks:
       - hippius_net
 
-  ipfs-unpinner:
-    build:
-      context: .
-      dockerfile: workers/Dockerfile
-    env_file:
-      - .env.defaults
-      - .env
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      redis-queues:
-        condition: service_healthy
-    healthcheck:
-      test: [ "CMD-SHELL", "exit 0" ]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-      start_period: 10s
-    deploy:
-      replicas: 1
-    restart: unless-stopped
-    environment:
-      - PYTHONUNBUFFERED=1
-      - WORKER_SCRIPT=workers/run_ipfs_unpinner_in_loop.py
-      - ENABLE_WATCHFILES=true
-      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
-    networks:
-      - hippius_net
-
   arion-unpinner:
     build:
       context: .
@@ -429,40 +337,6 @@ services:
       - PYTHONUNBUFFERED=1
       - WORKER_SCRIPT=workers/run_arion_unpinner_in_loop.py
       - ENABLE_WATCHFILES=true
-    networks:
-      - hippius_net
-
-  ipfs-downloader:
-    build:
-      context: .
-      dockerfile: workers/Dockerfile
-    env_file:
-      - .env.defaults
-      - .env
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      redis-queues:
-        condition: service_healthy
-    deploy:
-      replicas: 1
-    restart: unless-stopped
-    environment:
-      - PYTHONUNBUFFERED=1
-      - WORKER_SCRIPT=workers/run_ipfs_downloader_in_loop.py
-      - ENABLE_WATCHFILES=true
-      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
-    volumes:
-      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
-      - /var/lib/hippius/kms:/kms_certs:ro
-    healthcheck:
-      test: ["CMD-SHELL", "exit 0"]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-      start_period: 10s
     networks:
       - hippius_net
 
@@ -517,7 +391,6 @@ services:
       - PYTHONUNBUFFERED=1
       - WORKER_SCRIPT=workers/run_janitor_in_loop.py
       - ENABLE_WATCHFILES=true
-      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
     volumes:
       - .:/app
       - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
@@ -537,7 +410,6 @@ services:
       - PYTHONUNBUFFERED=1
       - WORKER_SCRIPT=workers/run_account_cacher_in_loop.py
       - ENABLE_WATCHFILES=true
-      - HIPPIUS_IPFS_API_URLS=${HIPPIUS_IPFS_API_URLS:-http://ipfs:5001}
     env_file:
       - .env.defaults
       - .env
@@ -548,7 +420,6 @@ services:
 
 volumes:
   postgres_data:
-  ipfs_data:
   redis_data:
   redis_accounts_data:
   redis_chain_data:

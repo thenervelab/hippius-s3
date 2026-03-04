@@ -2,7 +2,6 @@ import dataclasses
 import uuid
 
 import dotenv
-import httpx
 
 from hippius_s3.utils import env
 
@@ -28,7 +27,7 @@ def _parse_csv_urls(value: str | None) -> list[str]:
     return deduped
 
 
-def _parse_backends(value: str | None, default: str = "ipfs") -> list[str]:
+def _parse_backends(value: str | None, default: str = "arion") -> list[str]:
     """Parse comma-separated list of backend names."""
     value = value or default
     return [b.strip() for b in value.split(",") if b.strip()]
@@ -52,11 +51,6 @@ class Config:
     database_url: str = env("DATABASE_URL")
     # Inline default prevents KeyError during class init; runtime fallback to DATABASE_URL is applied in get_config()
     encryption_database_url: str = env("HIPPIUS_KEYSTORE_DATABASE_URL:", convert=str)
-
-    # IPFS Configuration
-    # Preferred naming: comma-separated IPFS HTTP API base URLs used for reads/writes (`/api/v0/*`).
-    # Example: http://ipfs1:5001,http://ipfs2:5001
-    ipfs_api_urls: list[str] = env("HIPPIUS_IPFS_API_URLS", convert=_parse_csv_urls)
 
     # Security
     frontend_hmac_secret: str = env("FRONTEND_HMAC_SECRET")
@@ -157,9 +151,9 @@ class Config:
     unpinner_backoff_max_ms: int = env("HIPPIUS_UNPINNER_BACKOFF_MAX_MS:60000", convert=int)
 
     # Per-operation backend lists (queue names derived as {backend}_{op}_requests)
-    upload_backends: list[str] = env("HIPPIUS_UPLOAD_BACKENDS:ipfs,arion", convert=_parse_backends)
-    download_backends: list[str] = env("HIPPIUS_DOWNLOAD_BACKENDS:ipfs,arion", convert=_parse_backends)
-    delete_backends: list[str] = env("HIPPIUS_DELETE_BACKENDS:ipfs,arion", convert=_parse_backends)
+    upload_backends: list[str] = env("HIPPIUS_UPLOAD_BACKENDS:arion", convert=_parse_backends)
+    download_backends: list[str] = env("HIPPIUS_DOWNLOAD_BACKENDS:arion", convert=_parse_backends)
+    delete_backends: list[str] = env("HIPPIUS_DELETE_BACKENDS:arion", convert=_parse_backends)
 
     # Cache TTL (shared across components)
     cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:259200", convert=int)
@@ -212,8 +206,6 @@ class Config:
     # initial stream timeout (seconds) before sending first byte
     http_stream_initial_timeout_seconds: float = env("HTTP_STREAM_INITIAL_TIMEOUT_SECONDS:5", convert=float)
 
-    httpx_ipfs_api_timeout: httpx.Timeout = dataclasses.field(default_factory=lambda: httpx.Timeout(5))
-
     # Download streaming prefetch window (number of chunks to fetch concurrently).
     # Helps cache-hit throughput by reducing per-chunk Redis roundtrip stalls.
     http_stream_prefetch_chunks: int = env("HTTP_STREAM_PREFETCH_CHUNKS:8", convert=int)
@@ -234,11 +226,6 @@ class Config:
 
     # Retry-After (seconds) for SlowDown responses caused by disk pressure.
     fs_cache_retry_after_seconds: float = env("HIPPIUS_FS_CACHE_RETRY_AFTER_SECONDS:2", convert=float)
-
-    # IPFS upload/pin retry settings
-    ipfs_max_retries: int = env("HIPPIUS_IPFS_MAX_RETRIES:3", convert=int)
-    ipfs_retry_base_ms: int = env("HIPPIUS_IPFS_RETRY_BASE_MS:500", convert=int)
-    ipfs_retry_max_ms: int = env("HIPPIUS_IPFS_RETRY_MAX_MS:5000", convert=int)
 
     # Storage version to assign for newly created/overwritten objects
     # Only v5 is supported

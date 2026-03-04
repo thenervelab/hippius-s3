@@ -136,7 +136,9 @@ def create_s3_client(credentials: str, endpoint_url: str, is_r2: bool = False, i
     if is_r2 or is_aws:
         if ":" not in credentials:
             provider = "R2" if is_r2 else "AWS"
-            raise ValueError(f"{provider} credentials must be in format 'access_key:secret_key', got: {credentials[:20]}...")
+            raise ValueError(
+                f"{provider} credentials must be in format 'access_key:secret_key', got: {credentials[:20]}..."
+            )
         access_key, secret_key = credentials.split(":", 1)
     else:
         access_key = base64.b64encode(credentials.encode()).decode()

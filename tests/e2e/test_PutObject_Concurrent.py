@@ -90,10 +90,7 @@ def test_concurrent_uploads_no_lock_contention(
     start_time = time.monotonic()
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(upload_file, key, content): key
-            for key, content in test_files
-        }
+        futures = {executor.submit(upload_file, key, content): key for key, content in test_files}
 
         for future in as_completed(futures):
             key = futures[future]
@@ -185,10 +182,7 @@ def test_concurrent_uploads_same_key_overwrites(
     start_time = time.monotonic()
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(upload_version, i, content)
-            for i, content in enumerate(contents)
-        ]
+        futures = [executor.submit(upload_version, i, content) for i, content in enumerate(contents)]
 
         for future in as_completed(futures):
             result = future.result()

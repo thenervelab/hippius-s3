@@ -6,15 +6,15 @@ from unittest.mock import MagicMock
 
 import pytest
 from fastapi import FastAPI
-from starlette.responses import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
+from starlette.responses import Response
 
 
 @pytest.fixture  # type: ignore[misc]
 def banhammer_app() -> Any:
-    from gateway.middlewares.banhammer import banhammer_middleware
     from gateway.middlewares.banhammer import BanHammerService
+    from gateway.middlewares.banhammer import banhammer_middleware
 
     app = FastAPI()
 

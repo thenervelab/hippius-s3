@@ -18,7 +18,7 @@ class TestObjectReadPermission:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_read_allows_get_object(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
@@ -34,7 +34,7 @@ class TestObjectReadPermission:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_read_allows_head_object(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
@@ -49,7 +49,7 @@ class TestObjectReadPermission:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_read_denies_delete(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
@@ -76,7 +76,7 @@ class TestObjectReadACPPermission:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_read_acp_allows_get_object_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
@@ -93,7 +93,7 @@ class TestObjectReadACPPermission:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_read_acp_denies_put_object_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
@@ -112,7 +112,7 @@ class TestObjectWriteACPPermission:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_write_acp_allows_put_object_acl(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
@@ -126,7 +126,7 @@ class TestObjectWriteACPPermission:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_write_acp_denies_get_object(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
@@ -145,7 +145,7 @@ class TestObjectFullControlPermission:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_full_control_allows_all_operations(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids

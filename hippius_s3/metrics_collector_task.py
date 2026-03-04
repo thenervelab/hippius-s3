@@ -66,21 +66,16 @@ class BackgroundMetricsCollector:
 
     # All per-backend queues to track (lists use LLEN, ZSETs use ZCARD)
     LIST_QUEUES = [
-        "ipfs_upload_requests",
         "arion_upload_requests",
         "ovh_upload_requests",
-        "ipfs_download_requests",
         "arion_download_requests",
         "ovh_download_requests",
-        "ipfs_unpin_requests",
         "arion_unpin_requests",
         "ovh_unpin_requests",
         "substrate_requests",
-        "ipfs_upload_requests:dlq",
         "arion_upload_requests:dlq",
     ]
     ZSET_QUEUES = [
-        "ipfs_upload_retries",
         "arion_upload_retries",
     ]
 
