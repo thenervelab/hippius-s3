@@ -1,13 +1,19 @@
-# Hippius S3 — JavaScript Examples
+# Hippius S3 -- JavaScript Examples
 
 ## Prerequisites
 
 - Node.js 18+
 - `npm install`
 
-## Environment Variables
+## Credentials
 
-Set these before running any example:
+Two authentication methods:
+
+**Seed phrase (SigV4)**: Base64-encode your 12-word seed phrase as the access key, use the plain seed phrase as the secret key.
+
+**Access key**: Use `hip_*` access keys from https://console.hippius.com/dashboard/settings.
+
+## Environment Variables
 
 ```bash
 export AWS_ACCESS_KEY_ID=hip_your_access_key_here
@@ -16,8 +22,6 @@ export AWS_ENDPOINT_URL_S3=https://s3.hippius.com
 export AWS_DEFAULT_REGION=decentralized
 export S3_BUCKET_NAME=your-bucket-name
 ```
-
-Get your credentials at: https://console.hippius.com/dashboard/settings
 
 ## Examples
 
