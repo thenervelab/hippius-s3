@@ -327,10 +327,10 @@ def boto3_client(test_seed_phrase: str) -> Any:
         config=Config(
             s3={"addressing_style": "path"},
             signature_version="s3v4",
-            # E2E reads can legitimately block while the pipeline hydrates from IPFS.
-            # Use a short read timeout and retry in the test helper instead of hanging for ~60s.
+            # E2E reads can legitimately block while the pipeline hydrates from the backend.
+            # 30s allows multi-chunk objects to be re-downloaded on slower CI runners.
             connect_timeout=5,
-            read_timeout=5,
+            read_timeout=30,
         ),
     )
 
@@ -348,7 +348,7 @@ def boto3_access_key_client(test_access_key: str, test_access_key_secret: str) -
             s3={"addressing_style": "path"},
             signature_version="s3v4",
             connect_timeout=5,
-            read_timeout=5,
+            read_timeout=30,
         ),
     )
 
