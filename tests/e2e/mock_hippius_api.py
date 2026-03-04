@@ -1,12 +1,10 @@
 import base64
 import hashlib
-import io
 import os
 import uuid
 from datetime import datetime
 from datetime import timezone
 
-import httpx
 from fastapi import FastAPI
 from fastapi import File
 from fastapi import UploadFile
@@ -15,8 +13,6 @@ from pydantic import BaseModel
 
 
 app = FastAPI()
-
-IPFS_API_URL = os.getenv("IPFS_API_URL", "http://ipfs:5001")
 
 # Access key auth encryption setup
 # Uses the same test key as gateway: HIPPIUS_AUTH_ENCRYPTION_KEY
@@ -75,15 +71,6 @@ class FileStatusResponse(BaseModel):
     updated_at: str
 
 
-async def upload_to_ipfs(content: bytes) -> str:
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        files = {"file": io.BytesIO(content)}
-        response = await client.post(f"{IPFS_API_URL}/api/v0/add?pin=false", files=files)
-        response.raise_for_status()
-        result = response.json()
-        return result["Hash"]
-
-
 file_storage = {}
 
 
@@ -94,7 +81,7 @@ async def upload_file(file: UploadFile = File(...), account_ss58: str = None):
     size_bytes = len(content)
     sha256_hex = hashlib.sha256(content).hexdigest()
 
-    cid = await upload_to_ipfs(content)
+    cid = f"Qm{hashlib.sha256(content).hexdigest()[:44]}"
 
     now = datetime.now(timezone.utc).isoformat()
 

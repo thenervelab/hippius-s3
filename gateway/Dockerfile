@@ -28,7 +28,8 @@ RUN pip install --no-cache-dir \
     opentelemetry-exporter-prometheus>=0.58b0 \
     opentelemetry-exporter-otlp-proto-grpc>=1.37.0 \
     prometheus-client>=0.23.1 \
-    loki-logger-handler>=1.1.2
+    loki-logger-handler>=1.1.2 \
+    sentry-sdk[fastapi]>=2.0.0
 
 COPY gateway/ ./gateway/
 COPY hippius_s3/ ./hippius_s3/

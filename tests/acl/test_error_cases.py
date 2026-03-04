@@ -17,7 +17,7 @@ class TestInvalidArguments:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_error_mix_canned_acl_with_grant_headers(self, s3_acc1_uploaddelete, clean_bucket, canonical_ids) -> None:
         """Test that mixing canned ACL with grant headers returns error."""
@@ -30,7 +30,7 @@ class TestInvalidArguments:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_error_invalid_canned_acl_name(self, s3_acc1_uploaddelete, clean_bucket) -> None:
         """Test that invalid canned ACL name returns error."""
@@ -41,7 +41,7 @@ class TestInvalidArguments:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_error_object_mix_canned_acl_with_grant_headers(
         self, s3_acc1_uploaddelete, test_object, canonical_ids
@@ -56,7 +56,7 @@ class TestInvalidArguments:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_error_object_invalid_canned_acl_name(self, s3_acc1_uploaddelete, test_object) -> None:
         """Test that invalid canned ACL name for objects returns error."""
@@ -71,7 +71,7 @@ class TestAccessDenied:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_cannot_set_acl_without_permission(self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket) -> None:
         """Test that non-owner cannot set bucket ACL."""
@@ -82,7 +82,7 @@ class TestAccessDenied:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_cannot_set_object_acl_without_permission(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object

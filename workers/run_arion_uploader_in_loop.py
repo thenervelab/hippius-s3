@@ -23,6 +23,7 @@ from hippius_s3.queue import dequeue_upload_request
 from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.queue import move_due_upload_retries
 from hippius_s3.redis_utils import with_redis_retry
+from hippius_s3.sentry import init_sentry
 from hippius_s3.services.arion_service import ArionClient
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 from hippius_s3.services.ray_id_service import ray_id_context
@@ -37,6 +38,7 @@ tracer = trace.get_tracer(__name__)
 
 setup_loki_logging(config, "arion-uploader")
 logger = logging.getLogger(__name__)
+init_sentry("arion-uploader", is_worker=True)
 
 
 async def run_arion_uploader_loop():

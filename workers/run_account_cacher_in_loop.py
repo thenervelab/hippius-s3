@@ -8,12 +8,14 @@ sys.path.insert(0, "/app")
 
 from cacher.run_cacher import SubstrateCacher
 from hippius_s3.config import get_config
+from hippius_s3.sentry import init_sentry
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 config = get_config()
+init_sentry("account-cacher", is_worker=True)
 
 
 async def run_cacher_once():

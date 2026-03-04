@@ -187,9 +187,7 @@ class TestDeleteACL:
 
 class TestInvalidation:
     @pytest.mark.asyncio
-    async def test_invalidate_bucket_acl_deletes_key(
-        self, cached_repo: CachedACLRepository, mock_redis: Any
-    ) -> None:
+    async def test_invalidate_bucket_acl_deletes_key(self, cached_repo: CachedACLRepository, mock_redis: Any) -> None:
         mock_redis.delete.return_value = 1
 
         await cached_repo.invalidate_bucket_acl("my-bucket")
@@ -197,9 +195,7 @@ class TestInvalidation:
         mock_redis.delete.assert_called_once_with("hippius_acl:bucket:my-bucket")
 
     @pytest.mark.asyncio
-    async def test_invalidate_object_acl_deletes_key(
-        self, cached_repo: CachedACLRepository, mock_redis: Any
-    ) -> None:
+    async def test_invalidate_object_acl_deletes_key(self, cached_repo: CachedACLRepository, mock_redis: Any) -> None:
         mock_redis.delete.return_value = 1
 
         await cached_repo.invalidate_object_acl("my-bucket", "my-object")

@@ -21,7 +21,7 @@ class TestBucketGrantHeaders:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_bucket_grant_read(self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids) -> None:
         """Test granting READ permission via header."""
@@ -39,7 +39,7 @@ class TestBucketGrantHeaders:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_bucket_grant_write(self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids) -> None:
         """Test granting WRITE permission via header."""
@@ -56,7 +56,7 @@ class TestBucketGrantHeaders:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_bucket_grant_read_acp(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
@@ -76,7 +76,7 @@ class TestBucketGrantHeaders:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_bucket_grant_write_acp(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
@@ -95,7 +95,7 @@ class TestBucketGrantHeaders:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_bucket_grant_full_control(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
@@ -122,7 +122,7 @@ class TestBucketGrantHeaders:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_bucket_multiple_grants(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
@@ -147,7 +147,7 @@ class TestBucketGrantHeaders:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_bucket_grant_overwrites_previous(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, clean_bucket, canonical_ids
@@ -171,7 +171,7 @@ class TestObjectGrantHeaders:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_grant_read(self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids) -> None:
         """Test granting READ permission via header."""
@@ -189,7 +189,7 @@ class TestObjectGrantHeaders:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_grant_read_acp(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
@@ -209,7 +209,7 @@ class TestObjectGrantHeaders:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_grant_write_acp(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
@@ -228,7 +228,7 @@ class TestObjectGrantHeaders:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_grant_full_control(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
@@ -256,7 +256,7 @@ class TestObjectGrantHeaders:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_multiple_grants(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids
@@ -285,7 +285,7 @@ class TestObjectGrantHeaders:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_object_grant_overwrites_previous(
         self, s3_acc1_uploaddelete, s3_acc2_uploaddelete, test_object, canonical_ids

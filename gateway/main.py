@@ -32,11 +32,13 @@ from gateway.services.forward_service import ForwardService
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.monitoring import MetricsCollector
 from hippius_s3.monitoring import set_metrics_collector
+from hippius_s3.sentry import init_sentry
 from hippius_s3.services.arion_service import ArionClient
 
 
 config = get_config()
 logger = setup_loki_logging(config, "hippius-s3-gateway")
+init_sentry("hippius-s3-gateway")
 
 
 def factory() -> FastAPI:

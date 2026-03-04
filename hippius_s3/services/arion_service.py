@@ -321,8 +321,8 @@ class ArionClient:
             headers=headers,
         )
 
-        response_json = response.json()
         response.raise_for_status()
+        response_json = response.json()
 
         return DeleteSuccessResponse.model_validate(response_json)
 
@@ -404,8 +404,8 @@ class ArionClient:
             headers=headers,
         )
         logger.info(f"Raw response content {response.content}")
-        response_json = response.json()
         response.raise_for_status()
+        response_json = response.json()
 
         upload_response = UploadResponse.model_validate(response_json)
         upload_response.size_bytes = len(file_data)

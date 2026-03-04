@@ -7,14 +7,12 @@ from typing import Any
 from typing import Callable
 
 import pytest
-import redis  # type: ignore[import-untyped]
 
 from .support.cache import clear_object_cache
 from .support.cache import wait_for_parts_cids
-from .support.compose import disable_ipfs_proxy
-from .support.compose import enable_ipfs_proxy
+from .support.compose import disable_arion_proxy
+from .support.compose import enable_arion_proxy
 from .support.compose import exec_python_module
-from .support.compose import wait_for_ipfs_state
 from .support.compose import wait_for_toxiproxy
 
 
@@ -51,21 +49,18 @@ def test_dlq_requeue_multipart_upload(
 
     object_id, ov = get_object_id_and_version(bucket, key)
 
-    # Break IPFS at the docker layer for a deterministic window
-    disable_ipfs_proxy()
-    # Verify proxies are actually disabled by checking Toxiproxy API directly
+    # Break Arion at the docker layer for a deterministic window
+    disable_arion_proxy()
+    # Verify proxy is actually disabled by checking Toxiproxy API directly
     import requests
 
-    resp = requests.get("http://localhost:8474/proxies/ipfs_store")
-    # If deleted, 404 is expected
+    resp = requests.get("http://localhost:8474/proxies/arion")
     if resp.status_code == 200:
         proxy_data = resp.json()
         assert not proxy_data["enabled"], f"Proxy still enabled: {proxy_data}"
-        print(f"DEBUG: Proxy status confirmed disabled: {proxy_data['enabled']}")
+        print(f"DEBUG: Arion proxy status confirmed disabled: {proxy_data['enabled']}")
     else:
         assert resp.status_code == 404, f"Unexpected status from toxiproxy: {resp.status_code} {resp.text}"
-    # Verify IPFS is truly down from inside the uploader container before proceeding
-    assert wait_for_ipfs_state(False, service="ipfs-uploader"), "IPFS still reachable after break"
 
     try:
         # Attempt to complete multipart upload - API should return 200 even if uploader later fails
@@ -81,7 +76,7 @@ def test_dlq_requeue_multipart_upload(
             },
         )
 
-        # Wait for the uploader to push the job to DLQ (IPFS down)
+        # Wait for the uploader to push the job to DLQ (Arion down)
         # Poll DLQ up to a short timeout
         import redis as _redis  # type: ignore[import-untyped]
 
@@ -89,7 +84,7 @@ def test_dlq_requeue_multipart_upload(
         r_queues = _redis.Redis.from_url("redis://localhost:6382/0")
         found = False
         for _ in range(130):
-            entries = list(r_queues.lrange("ipfs_upload_requests:dlq", 0, -1))  # type: ignore[arg-type]
+            entries = list(r_queues.lrange("arion_upload_requests:dlq", 0, -1))  # type: ignore[arg-type]
             for entry_json in entries:
                 import json as _json
 
@@ -103,7 +98,7 @@ def test_dlq_requeue_multipart_upload(
         assert found, "DLQ entry not found after waiting for uploader to fail"
 
         # Verify DLQ entry exists in redis-queues
-        dlq_entries = list(r_queues.lrange("ipfs_upload_requests:dlq", 0, -1))  # type: ignore[arg-type]
+        dlq_entries = list(r_queues.lrange("arion_upload_requests:dlq", 0, -1))  # type: ignore[arg-type]
 
         assert len(dlq_entries) > 0, "No DLQ entries found"
 
@@ -130,13 +125,12 @@ def test_dlq_requeue_multipart_upload(
         assert not r_cache.exists(f"obj:{object_id}:v:{ov}:part:0:meta"), "Part 0 cache not cleared"
         assert not r_cache.exists(f"obj:{object_id}:v:{ov}:part:1:meta"), "Part 1 cache not cleared"
 
-        # Heal IPFS before requeue so uploader can complete successfully
-        enable_ipfs_proxy()
-        assert wait_for_ipfs_state(True, service="ipfs-uploader"), "IPFS did not come back after heal"
+        # Heal Arion before requeue so uploader can complete successfully
+        enable_arion_proxy()
 
         # Run the requeue CLI command inside the api container (mounted /app)
         code, out, err = exec_python_module(
-            "api", "hippius_s3.scripts.dlq_requeue", ["--backend", "ipfs", "requeue", "--object-id", object_id]
+            "api", "hippius_s3.scripts.dlq_requeue", ["--backend", "arion", "requeue", "--object-id", object_id]
         )
         assert code == 0, f"Requeue command failed: {err}\n{out}"
         assert f"Successfully requeued object_id: {object_id}" in out
@@ -155,6 +149,6 @@ def test_dlq_requeue_multipart_upload(
         # We don't manipulate host fs; cleanup can be performed via CLI if needed
 
     finally:
-        # Heal docker-level IPFS connectivity
+        # Heal docker-level Arion connectivity
         with suppress(Exception):
-            enable_ipfs_proxy()
+            enable_arion_proxy()

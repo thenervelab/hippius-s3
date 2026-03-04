@@ -1,8 +1,5 @@
 import logging
 import re
-from unittest.mock import Mock
-
-import pytest
 
 from hippius_s3.services.ray_id_service import RayIDLoggerAdapter
 from hippius_s3.services.ray_id_service import generate_ray_id

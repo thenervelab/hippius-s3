@@ -96,11 +96,6 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_AUTH_ENCRYPTION_KEY
-            - name: HIPPIUS_IPFS_API_URLS
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: HIPPIUS_IPFS_API_URLS
             - name: HIPPIUS_UPLOAD_QUEUE_NAMES
               valueFrom:
                 secretKeyRef:
@@ -111,16 +106,6 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_DOWNLOAD_QUEUE_NAMES
-            - name: HIPPIUS_IPFS_GET_URL
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: HIPPIUS_IPFS_GET_URL
-            - name: HIPPIUS_IPFS_STORE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: HIPPIUS_IPFS_STORE_URL
             - name: CACHET_API_KEY
               valueFrom:
                 secretKeyRef:

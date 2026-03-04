@@ -150,9 +150,6 @@ jobs:
             --from-literal=ARION_SERVICE_KEY='${{ secrets.ARION_SERVICE_KEY }}' \
             --from-literal=ARION_BEARER_TOKEN='${{ secrets.ARION_BEARER_TOKEN }}' \
             --from-literal=HIPPIUS_AUTH_ENCRYPTION_KEY='${{ secrets.HIPPIUS_AUTH_ENCRYPTION_KEY }}' \
-            --from-literal=HIPPIUS_IPFS_API_URLS='${{ secrets.HIPPIUS_IPFS_API_URLS }}' \
-            --from-literal=HIPPIUS_IPFS_GET_URL='${{ secrets.HIPPIUS_IPFS_GET_URL }}' \
-            --from-literal=HIPPIUS_IPFS_STORE_URL='${{ secrets.HIPPIUS_IPFS_STORE_URL }}' \
             --from-literal=HIPPIUS_UPLOAD_QUEUE_NAMES='${{ secrets.HIPPIUS_UPLOAD_QUEUE_NAMES }}' \
             --from-literal=HIPPIUS_DOWNLOAD_QUEUE_NAMES='${{ secrets.HIPPIUS_DOWNLOAD_QUEUE_NAMES }}' \
             --from-literal=FRONTEND_HMAC_SECRET='${{ secrets.FRONTEND_HMAC_SECRET }}' \
@@ -199,6 +196,10 @@ jobs:
           sed -i "s|HIPPIUS_ARION_BASE_URL_PLACEHOLDER|${ARION_URL:-https://arion.hippius.com/}|g" k8s/base/workers-deployments.yaml
           sed -i "s|HIPPIUS_ARION_VERIFY_SSL_PLACEHOLDER|${ARION_SSL:-true}|g" k8s/base/workers-deployments.yaml
 
+      - name: Substitute Sentry DSN
+        run: |
+          sed -i "s|SENTRY_DSN_PLACEHOLDER|${{ secrets.SENTRY_DSN }}|g" k8s/staging/environment-patch.yaml
+
       - name: Update image tags
         run: |
           SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
@@ -224,9 +225,7 @@ jobs:
         run: |
           kubectl rollout status deployment/gateway -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/api -n hippius-s3-staging --timeout=10m
-          kubectl rollout status deployment/ipfs-downloader -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/arion-downloader -n hippius-s3-staging --timeout=10m
-          kubectl rollout status deployment/ipfs-uploader -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/arion-uploader -n hippius-s3-staging --timeout=10m
 
       - name: Restart external deployments
@@ -278,9 +277,6 @@ jobs:
             --from-literal=ARION_SERVICE_KEY="${{ secrets.ARION_SERVICE_KEY }}" \
             --from-literal=ARION_BEARER_TOKEN="${{ secrets.ARION_BEARER_TOKEN }}" \
             --from-literal=HIPPIUS_AUTH_ENCRYPTION_KEY="${{ secrets.HIPPIUS_AUTH_ENCRYPTION_KEY }}" \
-            --from-literal=HIPPIUS_IPFS_API_URLS="http://ipfs:5001" \
-            --from-literal=HIPPIUS_IPFS_GET_URL="${{ secrets.HIPPIUS_IPFS_GET_URL }}" \
-            --from-literal=HIPPIUS_IPFS_STORE_URL="${{ secrets.HIPPIUS_IPFS_STORE_URL }}" \
             --from-literal=DATABASE_PASSWORD="${{ secrets.DATABASE_PASSWORD }}" \
             --from-literal=HIPPIUS_UPLOAD_QUEUE_NAMES="${{ secrets.HIPPIUS_UPLOAD_QUEUE_NAMES }}" \
             --from-literal=HIPPIUS_DOWNLOAD_QUEUE_NAMES="${{ secrets.HIPPIUS_DOWNLOAD_QUEUE_NAMES }}" \
@@ -328,6 +324,10 @@ jobs:
           sed -i "s|HIPPIUS_ARION_BASE_URL_PLACEHOLDER|${ARION_URL:-https://arion.hippius.com/}|g" k8s/base/workers-deployments.yaml
           sed -i "s|HIPPIUS_ARION_VERIFY_SSL_PLACEHOLDER|${ARION_SSL:-true}|g" k8s/base/workers-deployments.yaml
 
+      - name: Substitute Sentry DSN
+        run: |
+          sed -i "s|SENTRY_DSN_PLACEHOLDER|${{ secrets.SENTRY_DSN }}|g" k8s/production/environment-patch.yaml
+
       - name: Update image tags
         run: |
           SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
@@ -353,9 +353,7 @@ jobs:
         run: |
           kubectl rollout status deployment/gateway -n hippius-s3-prod --timeout=10m
           kubectl rollout status deployment/api -n hippius-s3-prod --timeout=10m
-          kubectl rollout status deployment/ipfs-downloader -n hippius-s3-prod --timeout=10m
           kubectl rollout status deployment/arion-downloader -n hippius-s3-prod --timeout=10m
-          kubectl rollout status deployment/ipfs-uploader -n hippius-s3-prod --timeout=10m
           kubectl rollout status deployment/arion-uploader -n hippius-s3-prod --timeout=10m
 
       - name: Restart external deployments

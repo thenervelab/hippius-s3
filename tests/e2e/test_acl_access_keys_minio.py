@@ -10,7 +10,6 @@ Prerequisites:
 """
 
 import io
-from typing import Any
 from xml.etree import ElementTree as ET
 
 import pytest
@@ -69,9 +68,7 @@ def test_bucket(minio_client_alice: Minio) -> str:
 
 @pytest.mark.e2e
 @pytest.mark.skip(reason="Requires running gateway and configured access keys")
-def test_set_bucket_acl_with_access_key_grant_via_xml(
-    minio_client_alice: Minio, test_bucket: str
-) -> None:
+def test_set_bucket_acl_with_access_key_grant_via_xml(minio_client_alice: Minio, test_bucket: str) -> None:
     """Test setting bucket ACL with AccessKey grant using custom XML"""
 
     # Alice uploads an object
@@ -83,7 +80,7 @@ def test_set_bucket_acl_with_access_key_grant_via_xml(
     )
 
     # Alice sets ACL granting READ to Bob's specific key
-    acl_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+    acl_xml = """<?xml version="1.0" encoding="UTF-8"?>
     <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
       <Owner>
         <ID>5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty</ID>
@@ -104,15 +101,15 @@ def test_set_bucket_acl_with_access_key_grant_via_xml(
           <Permission>READ</Permission>
         </Grant>
       </AccessControlList>
-    </AccessControlPolicy>'''
+    </AccessControlPolicy>"""
 
     # Use MinIO's low-level API to set custom ACL
     response = minio_client_alice._url_open(
         "PUT",
         bucket_name=test_bucket,
         query_params={"acl": ""},
-        body=acl_xml.encode('utf-8'),
-        headers={"Content-Type": "application/xml"}
+        body=acl_xml.encode("utf-8"),
+        headers={"Content-Type": "application/xml"},
     )
 
     assert response.status == 200, f"Failed to set ACL: {response.status}"
@@ -120,13 +117,11 @@ def test_set_bucket_acl_with_access_key_grant_via_xml(
 
 @pytest.mark.e2e
 @pytest.mark.skip(reason="Requires running gateway and configured access keys")
-def test_get_bucket_acl_returns_access_key_grant(
-    minio_client_alice: Minio, test_bucket: str
-) -> None:
+def test_get_bucket_acl_returns_access_key_grant(minio_client_alice: Minio, test_bucket: str) -> None:
     """Test that GetBucketAcl returns AccessKey grants in XML"""
 
     # Alice sets ACL with AccessKey grant
-    acl_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+    acl_xml = """<?xml version="1.0" encoding="UTF-8"?>
     <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
       <Owner><ID>5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty</ID></Owner>
       <AccessControlList>
@@ -137,24 +132,20 @@ def test_get_bucket_acl_returns_access_key_grant(
           <Permission>READ</Permission>
         </Grant>
       </AccessControlList>
-    </AccessControlPolicy>'''
+    </AccessControlPolicy>"""
 
     minio_client_alice._url_open(
         "PUT",
         bucket_name=test_bucket,
         query_params={"acl": ""},
-        body=acl_xml.encode('utf-8'),
+        body=acl_xml.encode("utf-8"),
     )
 
     # Get ACL back
-    response = minio_client_alice._url_open(
-        "GET",
-        bucket_name=test_bucket,
-        query_params={"acl": ""}
-    )
+    response = minio_client_alice._url_open("GET", bucket_name=test_bucket, query_params={"acl": ""})
 
     assert response.status == 200
-    acl_response = response.data.decode('utf-8')
+    acl_response = response.data.decode("utf-8")
 
     # Parse XML and verify AccessKey grant is present
     root = ET.fromstring(acl_response)
@@ -175,14 +166,8 @@ def test_get_bucket_acl_returns_access_key_grant(
     assert access_key_grant is not None, "AccessKey grant not found in response"
 
     # Verify the grant details
-    grantee_id = (
-        access_key_grant.find(".//s3:ID", ns) or
-        access_key_grant.find(".//ID")
-    )
-    permission = (
-        access_key_grant.find(".//s3:Permission", ns) or
-        access_key_grant.find(".//Permission")
-    )
+    grantee_id = access_key_grant.find(".//s3:ID", ns) or access_key_grant.find(".//ID")
+    permission = access_key_grant.find(".//s3:Permission", ns) or access_key_grant.find(".//Permission")
 
     assert grantee_id is not None and grantee_id.text == "hip_bob_readonly"
     assert permission is not None and permission.text == "READ"
@@ -211,7 +196,7 @@ def test_access_key_grant_enforces_permissions(
     assert exc_info.value.code == "AccessDenied"
 
     # Alice grants READ to Bob's specific key
-    acl_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+    acl_xml = """<?xml version="1.0" encoding="UTF-8"?>
     <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
       <Owner><ID>5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty</ID></Owner>
       <AccessControlList>
@@ -228,13 +213,13 @@ def test_access_key_grant_enforces_permissions(
           <Permission>READ</Permission>
         </Grant>
       </AccessControlList>
-    </AccessControlPolicy>'''
+    </AccessControlPolicy>"""
 
     minio_client_alice._url_open(
         "PUT",
         bucket_name=test_bucket,
         query_params={"acl": ""},
-        body=acl_xml.encode('utf-8'),
+        body=acl_xml.encode("utf-8"),
     )
 
     # Now Bob can read with hip_bob_sub1
@@ -245,9 +230,7 @@ def test_access_key_grant_enforces_permissions(
 
 @pytest.mark.e2e
 @pytest.mark.skip(reason="Requires running gateway and configured access keys")
-def test_different_access_key_denied(
-    minio_client_alice: Minio, test_bucket: str
-) -> None:
+def test_different_access_key_denied(minio_client_alice: Minio, test_bucket: str) -> None:
     """Test that different access key from same account is denied"""
 
     # Alice uploads object
@@ -259,7 +242,7 @@ def test_different_access_key_denied(
     )
 
     # Alice grants READ to hip_bob_sub1 only
-    acl_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+    acl_xml = """<?xml version="1.0" encoding="UTF-8"?>
     <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
       <Owner><ID>5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty</ID></Owner>
       <AccessControlList>
@@ -276,13 +259,13 @@ def test_different_access_key_denied(
           <Permission>READ</Permission>
         </Grant>
       </AccessControlList>
-    </AccessControlPolicy>'''
+    </AccessControlPolicy>"""
 
     minio_client_alice._url_open(
         "PUT",
         bucket_name=test_bucket,
         query_params={"acl": ""},
-        body=acl_xml.encode('utf-8'),
+        body=acl_xml.encode("utf-8"),
     )
 
     # Bob's hip_bob_sub2 should be denied
@@ -311,19 +294,15 @@ def test_set_acl_via_grant_headers(minio_client_alice: Minio, test_bucket: str) 
         headers={
             "x-amz-grant-read": 'accessKey="hip_bob_readonly"',
             "x-amz-grant-write": 'accessKey="hip_bob_writer"',
-        }
+        },
     )
 
     assert response.status == 200
 
     # Verify ACL was set correctly
-    response = minio_client_alice._url_open(
-        "GET",
-        bucket_name=test_bucket,
-        query_params={"acl": ""}
-    )
+    response = minio_client_alice._url_open("GET", bucket_name=test_bucket, query_params={"acl": ""})
 
-    acl_xml = response.data.decode('utf-8')
+    acl_xml = response.data.decode("utf-8")
 
     # Should contain both access keys
     assert "hip_bob_readonly" in acl_xml
@@ -334,9 +313,7 @@ def test_set_acl_via_grant_headers(minio_client_alice: Minio, test_bucket: str) 
 
 @pytest.mark.e2e
 @pytest.mark.skip(reason="Requires running gateway and configured access keys")
-def test_mixed_canonical_and_access_key_grants(
-    minio_client_alice: Minio, test_bucket: str
-) -> None:
+def test_mixed_canonical_and_access_key_grants(minio_client_alice: Minio, test_bucket: str) -> None:
     """Test ACL with both CanonicalUser and AccessKey grants"""
 
     # Alice uploads object
@@ -348,7 +325,7 @@ def test_mixed_canonical_and_access_key_grants(
     )
 
     # Set ACL with both grant types
-    acl_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+    acl_xml = """<?xml version="1.0" encoding="UTF-8"?>
     <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
       <Owner><ID>5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty</ID></Owner>
       <AccessControlList>
@@ -376,25 +353,21 @@ def test_mixed_canonical_and_access_key_grants(
           <Permission>WRITE</Permission>
         </Grant>
       </AccessControlList>
-    </AccessControlPolicy>'''
+    </AccessControlPolicy>"""
 
     response = minio_client_alice._url_open(
         "PUT",
         bucket_name=test_bucket,
         query_params={"acl": ""},
-        body=acl_xml.encode('utf-8'),
+        body=acl_xml.encode("utf-8"),
     )
 
     assert response.status == 200
 
     # Verify ACL contains both types
-    response = minio_client_alice._url_open(
-        "GET",
-        bucket_name=test_bucket,
-        query_params={"acl": ""}
-    )
+    response = minio_client_alice._url_open("GET", bucket_name=test_bucket, query_params={"acl": ""})
 
-    acl_response = response.data.decode('utf-8')
+    acl_response = response.data.decode("utf-8")
     root = ET.fromstring(acl_response)
 
     # Count grant types
@@ -418,9 +391,7 @@ def test_mixed_canonical_and_access_key_grants(
 
 @pytest.mark.e2e
 @pytest.mark.skip(reason="Requires running gateway and configured access keys")
-def test_object_acl_with_access_key_grant(
-    minio_client_alice: Minio, test_bucket: str
-) -> None:
+def test_object_acl_with_access_key_grant(minio_client_alice: Minio, test_bucket: str) -> None:
     """Test setting object-level ACL with AccessKey grant"""
 
     # Alice uploads object
@@ -433,7 +404,7 @@ def test_object_acl_with_access_key_grant(
     )
 
     # Set object ACL with AccessKey grant
-    acl_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+    acl_xml = """<?xml version="1.0" encoding="UTF-8"?>
     <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
       <Owner><ID>5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty</ID></Owner>
       <AccessControlList>
@@ -450,7 +421,7 @@ def test_object_acl_with_access_key_grant(
           <Permission>READ</Permission>
         </Grant>
       </AccessControlList>
-    </AccessControlPolicy>'''
+    </AccessControlPolicy>"""
 
     # Set object ACL (not bucket ACL)
     response = minio_client_alice._url_open(
@@ -458,33 +429,28 @@ def test_object_acl_with_access_key_grant(
         bucket_name=test_bucket,
         object_name=object_name,
         query_params={"acl": ""},
-        body=acl_xml.encode('utf-8'),
+        body=acl_xml.encode("utf-8"),
     )
 
     assert response.status == 200
 
     # Get object ACL back
     response = minio_client_alice._url_open(
-        "GET",
-        bucket_name=test_bucket,
-        object_name=object_name,
-        query_params={"acl": ""}
+        "GET", bucket_name=test_bucket, object_name=object_name, query_params={"acl": ""}
     )
 
     assert response.status == 200
-    acl_response = response.data.decode('utf-8')
+    acl_response = response.data.decode("utf-8")
     assert "AccessKey" in acl_response or "hip_bob_sub1" in acl_response
 
 
 @pytest.mark.e2e
 @pytest.mark.skip(reason="Requires running gateway and configured access keys")
-def test_invalid_access_key_format_rejected(
-    minio_client_alice: Minio, test_bucket: str
-) -> None:
+def test_invalid_access_key_format_rejected(minio_client_alice: Minio, test_bucket: str) -> None:
     """Test that invalid access key format is rejected"""
 
     # Try to set ACL with invalid access key format (missing hip_ prefix)
-    acl_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+    acl_xml = """<?xml version="1.0" encoding="UTF-8"?>
     <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
       <Owner><ID>5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty</ID></Owner>
       <AccessControlList>
@@ -495,14 +461,14 @@ def test_invalid_access_key_format_rejected(
           <Permission>READ</Permission>
         </Grant>
       </AccessControlList>
-    </AccessControlPolicy>'''
+    </AccessControlPolicy>"""
 
     # This should fail validation
     response = minio_client_alice._url_open(
         "PUT",
         bucket_name=test_bucket,
         query_params={"acl": ""},
-        body=acl_xml.encode('utf-8'),
+        body=acl_xml.encode("utf-8"),
     )
 
     # Should return 400 Bad Request

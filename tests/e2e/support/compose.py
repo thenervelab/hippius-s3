@@ -65,51 +65,9 @@ def exec_python_module(service: str, module: str, args: List[str]) -> Tuple[int,
     return compose_exec(service, ["python", "-m", module] + args)
 
 
-def ipfs_http_ok(service: str = "api", timeout_seconds: float = 1.0) -> bool:
-    """Check if IPFS control API is reachable via Toxiproxy from inside a service container.
-    Probes POST /api/v0/version on host 'toxiproxy' port 15001 by default.
-    Uses stdlib http.client to avoid external deps."""
-    py = (
-        "import sys, http.client;\n"
-        "host = __import__('os').environ.get('TOXI_HOST','toxiproxy')\n"
-        "port = int(__import__('os').environ.get('TOXI_IPFS_CTL_PORT','15001'))\n"
-        "try:\n"
-        f"  c = http.client.HTTPConnection(host, port, timeout={timeout_seconds});\n"
-        "  c.request('POST', '/api/v0/version');\n"
-        "  r = c.getresponse();\n"
-        "  # consider any HTTP response as 'reachable'\n"
-        "  sys.exit(0 if (100 <= r.status < 600) else 1)\n"
-        "except Exception:\n"
-        "  sys.exit(2)\n"
-    )
-    code, _, _ = compose_exec(service, ["python", "-c", py])
-    return code == 0
-
-
-def wait_for_ipfs_state(
-    desired_up: bool, service: str = "api", timeout_seconds: float = 10.0, poll_seconds: float = 0.5
-) -> bool:
-    """Wait until IPFS HTTP is reachable (desired_up=True) or unreachable (False)."""
-    import time
-
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        ok = ipfs_http_ok(service=service, timeout_seconds=poll_seconds)
-        if desired_up and ok:
-            return True
-        if not desired_up and not ok:
-            return True
-        time.sleep(poll_seconds)
-    return False
-
-
 # ---- Toxiproxy helpers ----
 
 _TOXI_BASE = os.environ.get("TOXI_BASE", "http://localhost:8474")
-_TOXI_LISTEN_GET = os.environ.get("TOXI_LISTEN_GET", "0.0.0.0:18080")
-_TOXI_LISTEN_CTL = os.environ.get("TOXI_LISTEN_CTL", "0.0.0.0:15001")
-_TOXI_UPSTREAM_GET = os.environ.get("TOXI_UPSTREAM_GET", "ipfs:8080")
-_TOXI_UPSTREAM_CTL = os.environ.get("TOXI_UPSTREAM_CTL", "ipfs:5001")
 
 # KMS proxy config
 _TOXI_LISTEN_KMS = os.environ.get("TOXI_LISTEN_KMS", "0.0.0.0:18443")
@@ -150,48 +108,6 @@ def _toxiproxy_set_enabled(name: str, enabled: bool) -> bool:
     return post_resp.status_code in (200, 201)
 
 
-def _ensure_ipfs_proxies() -> None:
-    # Ensure both GET and control proxies exist
-    try:
-        print("DEBUG: Checking if IPFS proxies exist")
-        r1 = _toxiproxy_get("ipfs_get")
-        print(f"DEBUG: ipfs_get proxy status: {r1.status_code}")
-        if r1.status_code == 404:
-            print(f"DEBUG: Creating ipfs_get proxy: {_TOXI_LISTEN_GET} -> {_TOXI_UPSTREAM_GET}")
-            ok = _toxiproxy_create("ipfs_get", _TOXI_LISTEN_GET, _TOXI_UPSTREAM_GET)
-            if not ok:
-                raise RuntimeError("failed to create toxiproxy ipfs_get")
-            print("DEBUG: Created ipfs_get proxy")
-        r2 = _toxiproxy_get("ipfs_store")
-        print(f"DEBUG: ipfs_store proxy status: {r2.status_code}")
-        if r2.status_code == 404:
-            print(f"DEBUG: Creating ipfs_store proxy: {_TOXI_LISTEN_CTL} -> {_TOXI_UPSTREAM_CTL}")
-            ok = _toxiproxy_create("ipfs_store", _TOXI_LISTEN_CTL, _TOXI_UPSTREAM_CTL)
-            if not ok:
-                raise RuntimeError("failed to create toxiproxy ipfs_store")
-            print("DEBUG: Created ipfs_store proxy")
-        print("DEBUG: IPFS proxies ensured")
-    except Exception as e:
-        # Bubble up to fail fast in tests
-        print(f"DEBUG: Error ensuring IPFS proxies: {e}")
-        raise
-
-
-def disable_ipfs_proxy() -> None:
-    """Disable IPFS proxies by setting enabled=false (refuses new connections)."""
-    with suppress(Exception):
-        _toxiproxy_set_enabled("ipfs_get", False)
-    with suppress(Exception):
-        _toxiproxy_set_enabled("ipfs_store", False)
-
-
-def enable_ipfs_proxy() -> None:
-    """Ensure IPFS proxies exist and are enabled."""
-    _ensure_ipfs_proxies()
-    _toxiproxy_set_enabled("ipfs_get", True)
-    _toxiproxy_set_enabled("ipfs_store", True)
-
-
 def wait_for_toxiproxy(timeout_seconds: float = 10.0, poll_seconds: float = 0.5) -> bool:
     """Wait for Toxiproxy control API to be available."""
     import time
@@ -200,7 +116,7 @@ def wait_for_toxiproxy(timeout_seconds: float = 10.0, poll_seconds: float = 0.5)
     while time.time() - start_time < timeout_seconds:
         try:
             # Try to get a proxy - if it fails, toxiproxy isn't ready
-            r = _toxiproxy_get("ipfs_get")
+            r = _toxiproxy_get("arion")
             if r.status_code in (200, 404):  # 404 means no proxy exists yet, but toxiproxy is responding
                 return True
         except Exception:
@@ -272,28 +188,24 @@ def enable_arion_proxy() -> None:
 def pause_service(service: str) -> None:
     """Pause a service by disabling its toxiproxy.
 
-    Supported services: 'mock-kms', 'ipfs', 'arion'
+    Supported services: 'mock-kms', 'arion'
     """
     if service == "mock-kms":
         disable_kms_proxy()
-    elif service == "ipfs":
-        disable_ipfs_proxy()
     elif service == "arion":
         disable_arion_proxy()
     else:
-        raise ValueError(f"Unknown service: {service}. Supported: mock-kms, ipfs, arion")
+        raise ValueError(f"Unknown service: {service}. Supported: mock-kms, arion")
 
 
 def unpause_service(service: str) -> None:
     """Unpause a service by enabling its toxiproxy.
 
-    Supported services: 'mock-kms', 'ipfs', 'arion'
+    Supported services: 'mock-kms', 'arion'
     """
     if service == "mock-kms":
         enable_kms_proxy()
-    elif service == "ipfs":
-        enable_ipfs_proxy()
     elif service == "arion":
         enable_arion_proxy()
     else:
-        raise ValueError(f"Unknown service: {service}. Supported: mock-kms, ipfs, arion")
+        raise ValueError(f"Unknown service: {service}. Supported: mock-kms, arion")

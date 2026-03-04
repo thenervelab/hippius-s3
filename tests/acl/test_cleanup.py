@@ -18,7 +18,7 @@ class TestCleanup:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutBucketAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_delete_bucket_with_custom_acl(self, s3_acc1_uploaddelete, config) -> None:
         """Test that bucket with custom ACL can be deleted."""
@@ -53,7 +53,7 @@ class TestCleanup:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_delete_object_with_custom_acl(self, s3_acc1_uploaddelete, clean_bucket) -> None:
         """Test that object with custom ACL can be deleted."""
@@ -70,7 +70,7 @@ class TestCleanup:
 
     @pytest.mark.skipif(
         "config.getoption('--r2')",
-        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/"
+        reason="PutObjectAcl/GetObjectAcl not implemented in R2. See: https://developers.cloudflare.com/r2/api/s3/api/",
     )
     def test_reset_acl_to_default_private(self, s3_acc1_uploaddelete, test_object, canonical_ids) -> None:
         """Test that ACL can be reset from public back to private."""

@@ -1,5 +1,3 @@
-from typing import AsyncIterator
-
 import pytest
 from starlette.requests import Request
 

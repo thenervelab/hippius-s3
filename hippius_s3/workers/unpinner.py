@@ -1,6 +1,6 @@
 """Shared unpinner logic parameterized by backend_name and backend_client.
 
-Each per-backend entry point (run_ipfs_unpinner_in_loop.py, run_arion_unpinner_in_loop.py)
+Each per-backend entry point (run_arion_unpinner_in_loop.py)
 instantiates the correct client and calls run_unpinner_loop from here.
 """
 

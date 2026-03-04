@@ -83,9 +83,7 @@ class TestAccessKeyValidation:
 
 class TestMultipleGrantsToSameKey:
     @pytest.mark.asyncio
-    async def test_multiple_permissions_to_same_key_all_apply(
-        self, acl_service: Any, mock_db_pool: Any
-    ) -> None:
+    async def test_multiple_permissions_to_same_key_all_apply(self, acl_service: Any, mock_db_pool: Any) -> None:
         """Test that multiple grants to same key allow all permissions"""
         owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 
@@ -114,24 +112,24 @@ class TestMultipleGrantsToSameKey:
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
         # All permissions should be allowed
-        assert await acl_service.check_permission(
-            None, "bucket1", None, Permission.READ, access_key="hip_bob_key"
-        ) is True
+        assert (
+            await acl_service.check_permission(None, "bucket1", None, Permission.READ, access_key="hip_bob_key") is True
+        )
 
-        assert await acl_service.check_permission(
-            None, "bucket1", None, Permission.WRITE, access_key="hip_bob_key"
-        ) is True
+        assert (
+            await acl_service.check_permission(None, "bucket1", None, Permission.WRITE, access_key="hip_bob_key")
+            is True
+        )
 
-        assert await acl_service.check_permission(
-            None, "bucket1", None, Permission.READ_ACP, access_key="hip_bob_key"
-        ) is True
+        assert (
+            await acl_service.check_permission(None, "bucket1", None, Permission.READ_ACP, access_key="hip_bob_key")
+            is True
+        )
 
 
 class TestMixedAccountAndKeyGrants:
     @pytest.mark.asyncio
-    async def test_account_grant_allows_all_keys(
-        self, acl_service: Any, mock_db_pool: Any
-    ) -> None:
+    async def test_account_grant_allows_all_keys(self, acl_service: Any, mock_db_pool: Any) -> None:
         """Test that account-level grant allows all keys from that account"""
         owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
         bob_account = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
@@ -154,14 +152,13 @@ class TestMixedAccountAndKeyGrants:
 
         # All of Bob's keys should have READ access
         for key in ["hip_bob_key1", "hip_bob_key2", "hip_bob_key99"]:
-            assert await acl_service.check_permission(
-                bob_account, "bucket1", None, Permission.READ, access_key=key
-            ) is True
+            assert (
+                await acl_service.check_permission(bob_account, "bucket1", None, Permission.READ, access_key=key)
+                is True
+            )
 
     @pytest.mark.asyncio
-    async def test_key_grant_overrides_no_account_grant(
-        self, acl_service: Any, mock_db_pool: Any
-    ) -> None:
+    async def test_key_grant_overrides_no_account_grant(self, acl_service: Any, mock_db_pool: Any) -> None:
         """Test that specific key grant works even without account grant"""
         owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
         bob_account = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
@@ -184,19 +181,23 @@ class TestMixedAccountAndKeyGrants:
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
         # Special key has WRITE via key grant
-        assert await acl_service.check_permission(
-            bob_account, "bucket1", None, Permission.WRITE, access_key="hip_bob_special"
-        ) is True
+        assert (
+            await acl_service.check_permission(
+                bob_account, "bucket1", None, Permission.WRITE, access_key="hip_bob_special"
+            )
+            is True
+        )
 
         # Other keys don't have WRITE (no account grant)
-        assert await acl_service.check_permission(
-            bob_account, "bucket1", None, Permission.WRITE, access_key="hip_bob_other"
-        ) is False
+        assert (
+            await acl_service.check_permission(
+                bob_account, "bucket1", None, Permission.WRITE, access_key="hip_bob_other"
+            )
+            is False
+        )
 
     @pytest.mark.asyncio
-    async def test_account_and_key_grant_union(
-        self, acl_service: Any, mock_db_pool: Any
-    ) -> None:
+    async def test_account_and_key_grant_union(self, acl_service: Any, mock_db_pool: Any) -> None:
         """Test that permissions are union of account and key grants"""
         owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
         bob_account = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
@@ -224,29 +225,39 @@ class TestMixedAccountAndKeyGrants:
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
         # hip_bob_writer has both READ (via account) and WRITE (via key)
-        assert await acl_service.check_permission(
-            bob_account, "bucket1", None, Permission.READ, access_key="hip_bob_writer"
-        ) is True
+        assert (
+            await acl_service.check_permission(
+                bob_account, "bucket1", None, Permission.READ, access_key="hip_bob_writer"
+            )
+            is True
+        )
 
-        assert await acl_service.check_permission(
-            bob_account, "bucket1", None, Permission.WRITE, access_key="hip_bob_writer"
-        ) is True
+        assert (
+            await acl_service.check_permission(
+                bob_account, "bucket1", None, Permission.WRITE, access_key="hip_bob_writer"
+            )
+            is True
+        )
 
         # Other Bob keys have only READ (via account)
-        assert await acl_service.check_permission(
-            bob_account, "bucket1", None, Permission.READ, access_key="hip_bob_reader"
-        ) is True
+        assert (
+            await acl_service.check_permission(
+                bob_account, "bucket1", None, Permission.READ, access_key="hip_bob_reader"
+            )
+            is True
+        )
 
-        assert await acl_service.check_permission(
-            bob_account, "bucket1", None, Permission.WRITE, access_key="hip_bob_reader"
-        ) is False
+        assert (
+            await acl_service.check_permission(
+                bob_account, "bucket1", None, Permission.WRITE, access_key="hip_bob_reader"
+            )
+            is False
+        )
 
 
 class TestOwnershipAndAccessKeys:
     @pytest.mark.asyncio
-    async def test_owner_has_full_control_regardless_of_key(
-        self, acl_service: Any, mock_db_pool: Any
-    ) -> None:
+    async def test_owner_has_full_control_regardless_of_key(self, acl_service: Any, mock_db_pool: Any) -> None:
         """Test that bucket owner has full control with any access key"""
         owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 
@@ -259,18 +270,18 @@ class TestOwnershipAndAccessKeys:
 
         # Owner has all permissions regardless of which key they use
         for permission in [Permission.READ, Permission.WRITE, Permission.READ_ACP, Permission.WRITE_ACP]:
-            assert await acl_service.check_permission(
-                owner_id, "bucket1", None, permission, access_key="hip_owner_key1"
-            ) is True
+            assert (
+                await acl_service.check_permission(owner_id, "bucket1", None, permission, access_key="hip_owner_key1")
+                is True
+            )
 
-            assert await acl_service.check_permission(
-                owner_id, "bucket1", None, permission, access_key="hip_owner_key2"
-            ) is True
+            assert (
+                await acl_service.check_permission(owner_id, "bucket1", None, permission, access_key="hip_owner_key2")
+                is True
+            )
 
     @pytest.mark.asyncio
-    async def test_key_grant_does_not_transfer_ownership(
-        self, acl_service: Any, mock_db_pool: Any
-    ) -> None:
+    async def test_key_grant_does_not_transfer_ownership(self, acl_service: Any, mock_db_pool: Any) -> None:
         """Test that granting FULL_CONTROL to key doesn't make it owner"""
         owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
         bob_account = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
@@ -300,9 +311,7 @@ class TestOwnershipAndAccessKeys:
 
 class TestNullAndMissingValues:
     @pytest.mark.asyncio
-    async def test_none_access_key_doesnt_match_key_grant(
-        self, acl_service: Any, mock_db_pool: Any
-    ) -> None:
+    async def test_none_access_key_doesnt_match_key_grant(self, acl_service: Any, mock_db_pool: Any) -> None:
         """Test that None access_key doesn't match ACCESS_KEY grants"""
         owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 
@@ -323,14 +332,10 @@ class TestNullAndMissingValues:
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
         # Seed phrase auth (no access_key) doesn't match ACCESS_KEY grant
-        assert await acl_service.check_permission(
-            None, "bucket1", None, Permission.READ, access_key=None
-        ) is False
+        assert await acl_service.check_permission(None, "bucket1", None, Permission.READ, access_key=None) is False
 
     @pytest.mark.asyncio
-    async def test_empty_string_access_key_doesnt_match(
-        self, acl_service: Any, mock_db_pool: Any
-    ) -> None:
+    async def test_empty_string_access_key_doesnt_match(self, acl_service: Any, mock_db_pool: Any) -> None:
         """Test that empty string access_key doesn't match grants"""
         owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 
@@ -351,16 +356,12 @@ class TestNullAndMissingValues:
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
         # Empty string doesn't match
-        assert await acl_service.check_permission(
-            None, "bucket1", None, Permission.READ, access_key=""
-        ) is False
+        assert await acl_service.check_permission(None, "bucket1", None, Permission.READ, access_key="") is False
 
 
 class TestCrosAccountAccessKeyGrants:
     @pytest.mark.asyncio
-    async def test_cross_account_key_grant_works(
-        self, acl_service: Any, mock_db_pool: Any
-    ) -> None:
+    async def test_cross_account_key_grant_works(self, acl_service: Any, mock_db_pool: Any) -> None:
         """Test granting permission to another account's access key"""
         alice_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
         bob_id = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
@@ -383,21 +384,25 @@ class TestCrosAccountAccessKeyGrants:
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
         # Bob's contractor key can read Alice's bucket
-        assert await acl_service.check_permission(
-            bob_id, "alice-bucket", None, Permission.READ, access_key="hip_bob_contractor"
-        ) is True
+        assert (
+            await acl_service.check_permission(
+                bob_id, "alice-bucket", None, Permission.READ, access_key="hip_bob_contractor"
+            )
+            is True
+        )
 
         # Bob's other keys cannot
-        assert await acl_service.check_permission(
-            bob_id, "alice-bucket", None, Permission.READ, access_key="hip_bob_personal"
-        ) is False
+        assert (
+            await acl_service.check_permission(
+                bob_id, "alice-bucket", None, Permission.READ, access_key="hip_bob_personal"
+            )
+            is False
+        )
 
 
 class TestFullControlPermission:
     @pytest.mark.asyncio
-    async def test_full_control_implies_all_permissions(
-        self, acl_service: Any, mock_db_pool: Any
-    ) -> None:
+    async def test_full_control_implies_all_permissions(self, acl_service: Any, mock_db_pool: Any) -> None:
         """Test that FULL_CONTROL grant allows all operations"""
         owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 
@@ -419,16 +424,15 @@ class TestFullControlPermission:
 
         # FULL_CONTROL allows all permissions
         for permission in [Permission.READ, Permission.WRITE, Permission.READ_ACP, Permission.WRITE_ACP]:
-            assert await acl_service.check_permission(
-                None, "bucket1", None, permission, access_key="hip_bob_admin"
-            ) is True
+            assert (
+                await acl_service.check_permission(None, "bucket1", None, permission, access_key="hip_bob_admin")
+                is True
+            )
 
 
 class TestCaseSensitivity:
     @pytest.mark.asyncio
-    async def test_access_key_matching_is_case_sensitive(
-        self, acl_service: Any, mock_db_pool: Any
-    ) -> None:
+    async def test_access_key_matching_is_case_sensitive(self, acl_service: Any, mock_db_pool: Any) -> None:
         """Test that access key matching is case sensitive"""
         owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 
@@ -449,15 +453,17 @@ class TestCaseSensitivity:
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
         # Exact case match works
-        assert await acl_service.check_permission(
-            None, "bucket1", None, Permission.READ, access_key="hip_Bob_Key"
-        ) is True
+        assert (
+            await acl_service.check_permission(None, "bucket1", None, Permission.READ, access_key="hip_Bob_Key") is True
+        )
 
         # Different case doesn't match
-        assert await acl_service.check_permission(
-            None, "bucket1", None, Permission.READ, access_key="hip_bob_key"
-        ) is False
+        assert (
+            await acl_service.check_permission(None, "bucket1", None, Permission.READ, access_key="hip_bob_key")
+            is False
+        )
 
-        assert await acl_service.check_permission(
-            None, "bucket1", None, Permission.READ, access_key="HIP_BOB_KEY"
-        ) is False
+        assert (
+            await acl_service.check_permission(None, "bucket1", None, Permission.READ, access_key="HIP_BOB_KEY")
+            is False
+        )

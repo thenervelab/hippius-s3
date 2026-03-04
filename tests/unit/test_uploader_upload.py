@@ -60,7 +60,9 @@ async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock
     redis_queues = FakeRedis()
 
     mock_backend_client = MagicMock()
-    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
+    uploader = Uploader(
+        mock_db_pool, redis, redis_queues, mock_config, backend_name="arion", backend_client=mock_backend_client
+    )
     uploader.fs_store = mock_fs_store
 
     mock_upload_response = UploadResponse(
@@ -119,7 +121,9 @@ async def test_upload_stores_backend_identifier_in_chunk_backend(mock_config, mo
     redis_queues = FakeRedis()
 
     mock_backend_client = MagicMock()
-    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
+    uploader = Uploader(
+        mock_db_pool, redis, redis_queues, mock_config, backend_name="arion", backend_client=mock_backend_client
+    )
     uploader.fs_store = mock_fs_store
 
     mock_upload_response = UploadResponse(
@@ -176,7 +180,7 @@ async def test_upload_stores_backend_identifier_in_chunk_backend(mock_config, mo
         args = insert_call.args
         # insert_chunk_backend takes: query, part_id, chunk_index, backend, backend_identifier
         assert len(args) == 5
-        assert args[3] == "ipfs"
+        assert args[3] == "arion"
         assert args[4] == "QmTestCID"
 
 
@@ -186,7 +190,9 @@ async def test_process_upload_skips_deleted_object(mock_config, mock_db_pool):
     redis_queues = FakeRedis()
 
     mock_backend_client = MagicMock()
-    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
+    uploader = Uploader(
+        mock_db_pool, redis, redis_queues, mock_config, backend_name="arion", backend_client=mock_backend_client
+    )
 
     mock_conn = AsyncMock()
     mock_conn.fetchval = AsyncMock(return_value=True)
@@ -222,7 +228,9 @@ async def test_process_upload_skips_when_object_row_missing(mock_config, mock_db
     redis_queues = FakeRedis()
 
     mock_backend_client = MagicMock()
-    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
+    uploader = Uploader(
+        mock_db_pool, redis, redis_queues, mock_config, backend_name="arion", backend_client=mock_backend_client
+    )
 
     mock_conn = AsyncMock()
     # Query returns True when the objects row doesn't exist (outer COALESCE defaults to TRUE)
@@ -260,7 +268,9 @@ async def test_process_upload_no_longer_calls_pin_on_api(mock_config, mock_db_po
     mock_config.publish_to_chain = True
 
     mock_backend_client = MagicMock()
-    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config, backend_name="ipfs", backend_client=mock_backend_client)
+    uploader = Uploader(
+        mock_db_pool, redis, redis_queues, mock_config, backend_name="arion", backend_client=mock_backend_client
+    )
 
     mock_conn = AsyncMock()
     mock_conn.execute = AsyncMock()

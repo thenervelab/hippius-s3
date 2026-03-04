@@ -10,10 +10,6 @@ services:
                "--maxmemory",
                "5000mb", ]
 
-  ipfs-downloader:
-    deploy:
-      replicas: 1
-
   arion-downloader:
     deploy:
       replicas: 1

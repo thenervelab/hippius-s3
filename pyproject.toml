@@ -45,6 +45,7 @@ dependencies = [
     "opentelemetry-exporter-otlp-proto-grpc>=1.37.0",
     "prometheus-client>=0.23.1",
     "loki-logger-handler>=1.1.2",
+    "sentry-sdk[fastapi]>=2.0.0",
 ]
 
 [project.optional-dependencies]
