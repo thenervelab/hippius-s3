@@ -93,6 +93,16 @@ class ObjectPartsCache(Protocol):
 
     async def chunk_exists(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> bool: ...
 
+    async def set_chunks(
+        self,
+        object_id: str,
+        object_version: int,
+        part_number: int,
+        chunks: list[bytes],
+        *,
+        ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
+    ) -> None: ...
+
     # Pub/sub notification API
     async def wait_for_chunk(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int
@@ -322,6 +332,22 @@ class RedisObjectPartsCache:
         )
         return exists
 
+    async def set_chunks(
+        self,
+        object_id: str,
+        object_version: int,
+        part_number: int,
+        chunks: list[bytes],
+        *,
+        ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
+    ) -> None:
+        ttl_val = int(ttl if ttl is not None else _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS))
+        async with self.redis.pipeline(transaction=False) as pipe:
+            for i, data in enumerate(chunks):
+                key = self.build_chunk_key(object_id, int(object_version), int(part_number), int(i))
+                pipe.setex(key, ttl_val, data)
+            await pipe.execute()
+
     @asynccontextmanager
     async def _subscribe(self, channel: str) -> AsyncIterator[Any]:
         pubsub = self.redis.pubsub()
@@ -459,6 +485,17 @@ class NullObjectPartsCache:
 
     async def expire(
         self, object_id: str, object_version: int, part_number: int, *, ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS
+    ) -> None:
+        return None
+
+    async def set_chunks(
+        self,
+        object_id: str,
+        object_version: int,
+        part_number: int,
+        chunks: list[bytes],
+        *,
+        ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
     ) -> None:
         return None
 

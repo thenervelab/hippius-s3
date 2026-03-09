@@ -98,11 +98,9 @@ class WriteThroughPartsWriter:
 
         # Redis second (best-effort) — pipeline all setex calls into a single round-trip
         try:
-            async with self.redis_cache.redis.pipeline(transaction=False) as pipe:
-                for i, ct in enumerate(chunks):
-                    key = self.redis_cache.build_chunk_key(object_id, int(object_version), int(part_number), int(i))
-                    pipe.setex(key, self.ttl_seconds, ct)
-                await pipe.execute()
+            await self.redis_cache.set_chunks(
+                object_id, int(object_version), int(part_number), chunks, ttl=self.ttl_seconds
+            )
         except Exception as e:
             logger.warning(
                 f"Redis batch chunk write failed (best-effort): object_id={object_id} v={object_version} part={part_number}: {e}",
