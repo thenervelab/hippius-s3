@@ -291,7 +291,6 @@ async def migrate_one(
                 object_id=object_id,
                 object_version=ctx.object_version,
                 plan=part_plan,
-                sleep_seconds=config.http_download_sleep_loop,
                 storage_version=ctx.storage_version,
                 key_bytes=ctx.key_bytes,
                 suite_id=ctx.suite_id,
