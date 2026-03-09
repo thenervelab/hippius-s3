@@ -350,7 +350,7 @@ class RedisObjectPartsCache:
                 int(chunk_index),
             )
             if c is not None:
-                return cast(bytes, c)
+                return c
 
             # Wait for notification — worker will publish after set_chunk
             async for msg in pubsub.listen():

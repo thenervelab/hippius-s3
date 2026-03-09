@@ -24,7 +24,7 @@ from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 config = get_config()
 
 
-async def _check_can_upload(request: Request, logger: logging.Logger | logging.LoggerAdapter) -> Response | None:  # type: ignore[type-arg]
+async def _check_can_upload(request: Request, logger: logging.Logger | logging.LoggerAdapter) -> Response | None:
     """
     Call Arion's can_upload endpoint for PUT/POST requests.
 

@@ -43,7 +43,7 @@ def setup_loki_logging(config: LoggingConfig, service_name: str, include_ray_id:
     """
     log_level = getattr(logging, config.log_level.upper(), logging.INFO)
 
-    handlers = [logging.StreamHandler(sys.stdout)]
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
 
     if config.loki_enabled and config.loki_url:
         loki_handler = LokiLoggerHandler(
