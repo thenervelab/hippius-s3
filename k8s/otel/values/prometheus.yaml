@@ -35,6 +35,11 @@ extraScrapeConfigs: |
       - targets: ['otel-collector.hippius-s3-prod.svc.cluster.local:8889']
     metrics_path: '/metrics'
     scrape_interval: 15s
+  - job_name: 'otel-collector-arion'
+    static_configs:
+      - targets: ['otel-collector.hippius-arion.svc.cluster.local:8889']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
   - job_name: 'cnpg'
     kubernetes_sd_configs:
       - role: pod
