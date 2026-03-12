@@ -96,14 +96,13 @@ class WriteThroughPartsWriter:
         for i, ct in enumerate(chunks):
             await self.fs_store.set_chunk(object_id, int(object_version), int(part_number), int(i), ct)
 
-        # Redis second (best-effort for each chunk)
-        for i, ct in enumerate(chunks):
-            try:
-                await self.redis_cache.set_chunk(
-                    object_id, int(object_version), int(part_number), int(i), ct, ttl=self.ttl_seconds
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Redis chunk write failed (best-effort): object_id={object_id} v={object_version} part={part_number} chunk={i}: {e}",
-                    exc_info=True,
-                )
+        # Redis second (best-effort) — pipeline all setex calls into a single round-trip
+        try:
+            await self.redis_cache.set_chunks(
+                object_id, int(object_version), int(part_number), chunks, ttl=self.ttl_seconds
+            )
+        except Exception as e:
+            logger.warning(
+                f"Redis batch chunk write failed (best-effort): object_id={object_id} v={object_version} part={part_number}: {e}",
+                exc_info=True,
+            )

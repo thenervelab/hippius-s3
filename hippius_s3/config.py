@@ -168,6 +168,7 @@ class Config:
     downloader_chunk_retries: int = env("DOWNLOADER_CHUNK_RETRIES:3", convert=int)
     downloader_retry_base_seconds: float = env("DOWNLOADER_RETRY_BASE_SECONDS:0.1", convert=float)
     downloader_retry_jitter_seconds: float = env("DOWNLOADER_RETRY_JITTER_SECONDS:0.1", convert=float)
+    downloader_semaphore: int = env("DOWNLOADER_SEMAPHORE:20", convert=int)
 
     # Crypto configuration
     # hip-enc/legacy: SecretBox per-chunk (legacy objects)
@@ -198,17 +199,15 @@ class Config:
     ovh_kms_retry_base_ms: int = env("HIPPIUS_OVH_KMS_RETRY_BASE_MS:500", convert=int)
     ovh_kms_retry_max_ms: int = env("HIPPIUS_OVH_KMS_RETRY_MAX_MS:5000", convert=int)
 
-    # endpoint chunk download settings, quite aggressive
+    # endpoint chunk download settings
     redis_read_chunk_timeout: int = 60
-    http_download_sleep_loop: float = 0.02
-    http_redis_get_retries: int = int(redis_read_chunk_timeout / http_download_sleep_loop)
 
     # initial stream timeout (seconds) before sending first byte
     http_stream_initial_timeout_seconds: float = env("HTTP_STREAM_INITIAL_TIMEOUT_SECONDS:5", convert=float)
 
     # Download streaming prefetch window (number of chunks to fetch concurrently).
     # Helps cache-hit throughput by reducing per-chunk Redis roundtrip stalls.
-    http_stream_prefetch_chunks: int = env("HTTP_STREAM_PREFETCH_CHUNKS:8", convert=int)
+    http_stream_prefetch_chunks: int = env("HTTP_STREAM_PREFETCH_CHUNKS:16", convert=int)
 
     # DLQ configuration
     dlq_dir: str = env("HIPPIUS_DLQ_DIR:/tmp/hippius_dlq")
@@ -253,10 +252,6 @@ def get_config() -> Config:
     # Ensure a usable keystore DSN (falls back to DATABASE_URL)
     if not cfg.encryption_database_url:
         object.__setattr__(cfg, "encryption_database_url", cfg.database_url)
-
-    # Sanity checks (avoid division-by-zero and confusing runtime behavior)
-    if cfg.http_download_sleep_loop <= 0:
-        raise ValueError("HTTP_DOWNLOAD_SLEEP_LOOP_SECONDS must be > 0")
 
     # Enforce environment constraints:
     # - Only in 'test' can enable_bypass_credit_check be True

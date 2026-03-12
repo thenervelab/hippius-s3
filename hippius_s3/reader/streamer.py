@@ -9,7 +9,6 @@ from typing import Iterable
 
 from .decrypter import decrypt_chunk_if_needed
 from .decrypter import maybe_slice
-from .fetcher import fetch_chunk_blocking
 from .types import ChunkPlanItem
 
 
@@ -22,7 +21,6 @@ async def stream_plan(
     object_id: str,
     object_version: int,
     plan: Iterable[ChunkPlanItem],
-    sleep_seconds: float,
     storage_version: int,
     key_bytes: bytes | None,
     suite_id: str | None,
@@ -38,13 +36,11 @@ async def stream_plan(
     # (The pipelined scheduler below requires at least one "refill" per iteration.)
     if prefetch == 0:
         for item in plan:
-            c = await fetch_chunk_blocking(
-                obj_cache,
+            c = await obj_cache.wait_for_chunk(
                 object_id,
                 int(object_version),
                 int(item.part_number),
                 int(item.chunk_index),
-                sleep_seconds=sleep_seconds,
             )
             pt = await decrypt_chunk_if_needed(
                 c,
@@ -65,13 +61,11 @@ async def stream_plan(
     it = iter(plan)
 
     async def _fetch(item: ChunkPlanItem) -> bytes:
-        return await fetch_chunk_blocking(
-            obj_cache,
+        return await obj_cache.wait_for_chunk(
             object_id,
             int(object_version),
             int(item.part_number),
             int(item.chunk_index),
-            sleep_seconds=sleep_seconds,
         )
 
     # A small lookahead window to overlap Redis fetch with decrypt + response IO.

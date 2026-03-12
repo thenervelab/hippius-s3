@@ -77,7 +77,7 @@ async def process_download_request(
             f"object_id={download_request.object_id}"
         )
 
-        semaphore = asyncio.Semaphore(10)
+        semaphore = asyncio.Semaphore(config.downloader_semaphore)
         max_attempts = config.downloader_chunk_retries
         base_sleep = config.downloader_retry_base_seconds
         jitter = config.downloader_retry_jitter_seconds
@@ -139,6 +139,13 @@ async def process_download_request(
                             part_number,
                             chunk_index,
                             data,
+                        )
+                        # Notify waiting readers via pub/sub
+                        await obj_cache.notify_chunk(
+                            download_request.object_id,
+                            int(download_request.object_version),
+                            part_number,
+                            chunk_index,
                         )
                         cache_ms = (time.perf_counter() - t_cache) * 1000.0
 
