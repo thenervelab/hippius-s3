@@ -129,9 +129,7 @@ async def verify_access_key_signature(
             f"Access key auth successful: key={access_key[:8]}***, account={token_response.account_address}, type={token_response.token_type}"
         )
         if token_response.token_type == "master":
-            logger.info(
-                f"AUDIT: Master token used: key={access_key[:8]}***, account={token_response.account_address}"
-            )
+            logger.info(f"AUDIT: Master token used: key={access_key[:8]}***, account={token_response.account_address}")
         return True, token_response.account_address, token_response.token_type
 
     logger.warning(f"Signature mismatch for access key: {access_key[:8]}***")
