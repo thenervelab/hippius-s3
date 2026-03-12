@@ -132,7 +132,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # IPFS service not needed in API container; workers own IPFS interactions
 
         # Cache repositories
-        app.state.obj_cache = RedisObjectPartsCache(app.state.redis_client)
+        app.state.obj_cache = RedisObjectPartsCache(app.state.redis_client, queues_client=app.state.redis_queues_client)
         app.state.dl_cache = RedisDownloadChunksCache(app.state.redis_client)
         app.state.fs_store = FileSystemPartsStore(config.object_cache_dir)
         logger.info("Cache repositories initialized")

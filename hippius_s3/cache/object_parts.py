@@ -129,8 +129,9 @@ class ObjectPartsCache(Protocol):
 
 
 class RedisObjectPartsCache:
-    def __init__(self, redis_client: Any) -> None:
+    def __init__(self, redis_client: Any, queues_client: Any = None) -> None:
         self.redis = redis_client
+        self._queues_client = queues_client or redis_client
 
     def build_key(self, object_id: str, object_version: int, part_number: int) -> str:
         return f"obj:{object_id}:v:{int(object_version)}:part:{int(part_number)}"
@@ -350,7 +351,7 @@ class RedisObjectPartsCache:
 
     @asynccontextmanager
     async def _subscribe(self, channel: str) -> AsyncIterator[Any]:
-        pubsub = self.redis.pubsub()
+        pubsub = self._queues_client.pubsub()
         await pubsub.subscribe(channel)
         try:
             yield pubsub
@@ -407,7 +408,7 @@ class RedisObjectPartsCache:
             int(part_number),
             int(chunk_index),
         )
-        await self.redis.publish(f"notify:{chunk_key}", "1")
+        await self._queues_client.publish(f"notify:{chunk_key}", "1")
 
     async def set_meta(
         self,
