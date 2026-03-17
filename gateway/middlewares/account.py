@@ -30,9 +30,6 @@ async def _check_can_upload(request: Request, logger: logging.Logger | logging.L
 
     Returns an error Response if the upload is not allowed, or None if it should proceed.
     """
-    # TODO: temporary bypass - Arion billing API returning errors for all accounts
-    return None
-
     if request.method not in ("PUT", "POST"):
         return None
 
