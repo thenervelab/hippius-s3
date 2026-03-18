@@ -10,6 +10,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from typing import AsyncGenerator
+from typing import cast
 
 import asyncpg
 import redis.asyncio as async_redis
@@ -154,7 +155,7 @@ def _normalize_json_work_items(raw: Any, log: logging.Logger) -> list[dict[str, 
             )
             continue
 
-        d: dict[str, Any] = it
+        d = cast(dict[str, Any], it)
         bucket = str(d.get("bucket") or d.get("bucket_name") or "").strip()
         key = str(d.get("key") or d.get("object_key") or "").strip()
         if not bucket or not key:
