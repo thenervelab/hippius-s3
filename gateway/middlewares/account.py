@@ -29,6 +29,7 @@ async def _check_can_upload(request: Request, logger: logging.Logger | logging.L
     Call Arion's can_upload endpoint for PUT/POST requests.
 
     Returns an error Response if the upload is not allowed, or None if it should proceed.
+    Uses Redis cache to avoid redundant Arion calls during multipart uploads.
     """
     if request.method not in ("PUT", "POST"):
         return None
@@ -40,6 +41,14 @@ async def _check_can_upload(request: Request, logger: logging.Logger | logging.L
     )
     main_account = request.state.account.main_account
     arion_client = request.app.state.arion_client
+    redis_accounts = request.app.state.redis_accounts
+
+    # Check cache before calling Arion (avoids rate limiting on multipart uploads)
+    cache_key = f"can_upload:{main_account}"
+    cached = await redis_accounts.get(cache_key)
+    if cached == b"1":
+        logger.debug(f"can_upload cache hit for {main_account}, skipping Arion call")
+        return None
 
     response: CanUploadResponse = await arion_client.can_upload(main_account, content_length)
     logger.info(
@@ -53,6 +62,9 @@ async def _check_can_upload(request: Request, logger: logging.Logger | logging.L
             message=error_message,
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
         )
+
+    # Cache successful result for 60s — denials are NOT cached so users can retry after topping up
+    await redis_accounts.set(cache_key, b"1", ex=60)
 
     return None
 
