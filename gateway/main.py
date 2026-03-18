@@ -36,11 +36,14 @@ from hippius_s3.sentry import init_sentry
 from hippius_s3.services.arion_service import ArionClient
 
 
-config = get_config()
-logger = setup_loki_logging(config, "hippius-s3-gateway")
-
-
 def factory() -> FastAPI:
+    from hippius_s3.otel_setup import configure_otel
+
+    config = get_config()
+    logger = setup_loki_logging(config, "hippius-s3-gateway")
+
+    configure_otel("hippius-s3-gateway")
+
     init_sentry("hippius-s3-gateway")
     app = FastAPI(
         title="Hippius S3 API",
@@ -87,7 +90,7 @@ def factory() -> FastAPI:
         app.state.metrics_collector = MetricsCollector(app.state.redis_client)
         set_metrics_collector(app.state.metrics_collector)
         logger.info("Metrics collector initialized")
-        logger.info("Tracing and metrics handled by opentelemetry-instrument wrapper")
+        logger.info("Tracing and metrics handled by programmatic OTel init")
 
         app.state.forward_service = ForwardService(config.backend_url)
         logger.info(f"ForwardService initialized with backend: {config.backend_url}")
@@ -234,12 +237,11 @@ def factory() -> FastAPI:
     return app
 
 
-app = factory()
-
 if __name__ == "__main__":
     import os
 
     import uvicorn
 
+    config = get_config()
     debug_mode = os.getenv("DEBUG", "false").lower() == "true"
-    uvicorn.run("gateway.main:app", host="0.0.0.0", port=config.port, reload=debug_mode, access_log=True)
+    uvicorn.run("gateway.main:factory", host="0.0.0.0", port=config.port, reload=debug_mode, access_log=True, factory=True)

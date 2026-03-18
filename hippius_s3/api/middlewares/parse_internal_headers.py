@@ -58,10 +58,11 @@ async def parse_internal_headers_middleware(
         delete=request.headers.get("X-Hippius-Can-Delete") == "True",
     )
 
-    logger.info(
-        f"Headers: request_user={request.state.request_user_id[:16]}..., "
-        f"bucket_owner={request.state.bucket_owner_id[:16] if request.state.bucket_owner_id else 'NONE'}..., "
-        f"main_account={main_account[:16]}..."
-    )
+    if request.url.path != "/health":
+        logger.info(
+            f"Headers: request_user={request.state.request_user_id[:16]}..., "
+            f"bucket_owner={request.state.bucket_owner_id[:16] if request.state.bucket_owner_id else 'NONE'}..., "
+            f"main_account={main_account[:16]}..."
+        )
 
     return await call_next(request)

@@ -29,6 +29,14 @@ class RayIDFilter(logging.Filter):
         return True
 
 
+class HealthCheckFilter(logging.Filter):
+    """Suppress uvicorn access log entries for /health endpoints."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return "/health" not in message
+
+
 def setup_loki_logging(config: LoggingConfig, service_name: str, include_ray_id: bool = True) -> logging.Logger:
     """
     Configure logging with optional Loki handler and ray ID support.
@@ -43,7 +51,7 @@ def setup_loki_logging(config: LoggingConfig, service_name: str, include_ray_id:
     """
     log_level = getattr(logging, config.log_level.upper(), logging.INFO)
 
-    handlers = [logging.StreamHandler(sys.stdout)]
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
 
     if config.loki_enabled and config.loki_url:
         loki_handler = LokiLoggerHandler(
@@ -71,5 +79,8 @@ def setup_loki_logging(config: LoggingConfig, service_name: str, include_ray_id:
         format=log_format,
         handlers=handlers,
     )
+
+    # Suppress noisy /health access log lines from uvicorn
+    logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
 
     return logging.getLogger(service_name)

@@ -2,6 +2,7 @@
 
 import hashlib
 from typing import Any
+from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
 import httpx
@@ -203,7 +204,10 @@ def _make_can_upload_app(
     )
 
     app = FastAPI()
-    app.state.redis_accounts = MagicMock()
+    mock_redis_accounts = AsyncMock()
+    mock_redis_accounts.get = AsyncMock(return_value=None)
+    mock_redis_accounts.set = AsyncMock()
+    app.state.redis_accounts = mock_redis_accounts
     app.state.arion_client = mock_arion
 
     @app.api_route("/test-bucket/test-key", methods=["GET", "PUT", "POST", "DELETE", "HEAD"])
@@ -327,3 +331,162 @@ async def test_can_upload_skipped_in_bypass_mode(mock_config_bypass: Any, monkey
 
     assert response.status_code == 200
     assert len(mock_arion.can_upload_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# can_upload Redis cache tests
+# ---------------------------------------------------------------------------
+
+
+def _make_can_upload_app_with_redis(
+    mock_config: Any,
+    mock_arion: MockArionService,
+    mock_redis_accounts: AsyncMock,
+    monkeypatch: Any,
+) -> FastAPI:
+    """Build a FastAPI app with explicit control over the redis_accounts mock."""
+    from gateway.middlewares.account import account_middleware
+
+    monkeypatch.setattr("gateway.middlewares.account.config", mock_config)
+
+    account = HippiusAccount(
+        id="5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        main_account="5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        has_credits=True,
+        upload=True,
+        delete=True,
+    )
+
+    async def mock_fetch_account_by_main_address(address: str, redis_client: Any, substrate_url: str) -> HippiusAccount:
+        return account
+
+    monkeypatch.setattr(
+        "gateway.middlewares.account.fetch_account_by_main_address",
+        mock_fetch_account_by_main_address,
+    )
+
+    app = FastAPI()
+    app.state.redis_accounts = mock_redis_accounts
+    app.state.arion_client = mock_arion
+
+    @app.api_route("/test-bucket/test-key", methods=["GET", "PUT", "POST", "DELETE", "HEAD"])
+    async def test_endpoint(request: Request) -> dict[str, str]:
+        return {"status": "ok"}
+
+    async def inject_access_key(request: Request, call_next: Any) -> Any:
+        request.state.auth_method = "access_key"
+        request.state.account_address = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+        return await call_next(request)
+
+    app.middleware("http")(account_middleware)
+    app.middleware("http")(inject_access_key)
+
+    return app
+
+
+@pytest.mark.asyncio
+async def test_can_upload_cache_hit_skips_arion_call(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    """When Redis has a cached can_upload result, Arion should not be called."""
+    mock_arion = MockArionService(allow_upload=True)
+    mock_redis = AsyncMock()
+    mock_redis.get = AsyncMock(return_value=b"1")
+    mock_redis.set = AsyncMock()
+
+    app = _make_can_upload_app_with_redis(mock_config_no_bypass, mock_arion, mock_redis, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert response.status_code == 200
+    mock_redis.get.assert_called_once_with("can_upload:5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY")
+    assert len(mock_arion.can_upload_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_can_upload_cache_miss_calls_arion_and_caches(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    """On cache miss, Arion is called and a successful result is cached with 60s TTL."""
+    mock_arion = MockArionService(allow_upload=True)
+    mock_redis = AsyncMock()
+    mock_redis.get = AsyncMock(return_value=None)
+    mock_redis.set = AsyncMock()
+
+    app = _make_can_upload_app_with_redis(mock_config_no_bypass, mock_arion, mock_redis, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert response.status_code == 200
+    assert len(mock_arion.can_upload_calls) == 1
+    mock_redis.set.assert_called_once_with(
+        "can_upload:5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        b"1",
+        ex=60,
+    )
+
+
+@pytest.mark.asyncio
+async def test_can_upload_denial_is_not_cached(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    """When Arion denies an upload, the result must NOT be cached so users can retry after topping up."""
+    mock_arion = MockArionService(allow_upload=False, upload_error="Quota exceeded")
+    mock_redis = AsyncMock()
+    mock_redis.get = AsyncMock(return_value=None)
+    mock_redis.set = AsyncMock()
+
+    app = _make_can_upload_app_with_redis(mock_config_no_bypass, mock_arion, mock_redis, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert response.status_code == 402
+    assert len(mock_arion.can_upload_calls) == 1
+    mock_redis.set.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_can_upload_cache_simulates_multipart_upload(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    """Simulate 8-part multipart upload: only the first part should call Arion, rest hit cache."""
+    mock_arion = MockArionService(allow_upload=True)
+
+    call_count = 0
+
+    async def mock_get(key: str) -> bytes | None:
+        nonlocal call_count
+        call_count += 1
+        # First call returns miss, subsequent calls return hit (simulating the cache being populated)
+        if call_count == 1:
+            return None
+        return b"1"
+
+    mock_redis = AsyncMock()
+    mock_redis.get = mock_get
+    mock_redis.set = AsyncMock()
+
+    app = _make_can_upload_app_with_redis(mock_config_no_bypass, mock_arion, mock_redis, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for i in range(8):
+            response = await client.put(
+                "/test-bucket/test-key",
+                content=b"x" * 16384,
+                headers={"content-length": "16384"},
+            )
+            assert response.status_code == 200
+
+    # Only 1 Arion call (first part), the other 7 hit cache
+    assert len(mock_arion.can_upload_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_can_upload_cache_key_is_per_account(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    """The cache key includes the account address, so different accounts don't share cache."""
+    mock_arion = MockArionService(allow_upload=True)
+    mock_redis = AsyncMock()
+    mock_redis.get = AsyncMock(return_value=None)
+    mock_redis.set = AsyncMock()
+
+    app = _make_can_upload_app_with_redis(mock_config_no_bypass, mock_arion, mock_redis, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    mock_redis.get.assert_called_with("can_upload:5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY")

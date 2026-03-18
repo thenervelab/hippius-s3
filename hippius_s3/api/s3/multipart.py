@@ -555,7 +555,6 @@ async def upload_part(
             object_id=object_id_str,
             object_version=src_ver,
             plan=plan,
-            sleep_seconds=config.http_download_sleep_loop,
             storage_version=storage_version,
             key_bytes=key_bytes,
             suite_id=suite_id,

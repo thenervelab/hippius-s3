@@ -4,7 +4,7 @@ from typing import Any
 from typing import Iterable
 from typing import List
 
-from .db_meta import read_part_plain_and_chunk_size
+from .db_meta import read_parts_plain_and_chunk_sizes_batch
 from .types import ChunkPlanItem
 from .types import RangeRequest
 
@@ -20,11 +20,13 @@ async def build_chunk_plan(
     # Normalize and sort parts
     ordered = sorted(parts, key=lambda x: int(x.get("part_number", 0)))
 
-    # Preload sizes to avoid repeated DB calls and compute offsets
+    # Batch-load all part sizes in a single DB query instead of N sequential calls
+    part_numbers = [int(p.get("part_number", 0)) for p in ordered]
+    size_map = await read_parts_plain_and_chunk_sizes_batch(db, object_id, part_numbers, int(object_version))
+
     sizes: list[tuple[int, int, int]] = []  # (part_number, plain_size, chunk_size)
-    for p in ordered:
-        pn = int(p.get("part_number", 0))
-        ps, cs = await read_part_plain_and_chunk_size(db, object_id, pn, int(object_version))
+    for pn in part_numbers:
+        ps, cs = size_map.get(pn, (0, 0))
         sizes.append((pn, ps, cs))
 
     offsets: dict[int, int] = {}
