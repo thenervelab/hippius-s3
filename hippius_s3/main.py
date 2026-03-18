@@ -132,7 +132,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # IPFS service not needed in API container; workers own IPFS interactions
 
         # Cache repositories
-        app.state.obj_cache = RedisObjectPartsCache(app.state.redis_client)
+        app.state.obj_cache = RedisObjectPartsCache(app.state.redis_client, queues_client=app.state.redis_queues_client)
         app.state.dl_cache = RedisDownloadChunksCache(app.state.redis_client)
         app.state.fs_store = FileSystemPartsStore(config.object_cache_dir)
         logger.info("Cache repositories initialized")
@@ -144,7 +144,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         set_metrics_collector(app.state.metrics_collector)
 
         logger.info("Metrics collector initialized")
-        logger.info("Tracing and metrics handled by opentelemetry-instrument wrapper")
+        logger.info("Tracing and metrics handled by programmatic OTel init")
 
         # Start background metrics collection
         app.state.background_metrics_collector = BackgroundMetricsCollector(
@@ -232,6 +232,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 def factory() -> FastAPI:
     """Factory function to create and configure the FastAPI application."""
+    from hippius_s3.otel_setup import configure_otel
+
+    configure_otel("hippius-s3-api")
+
     load_dotenv()
     config = get_config()
     setup_loki_logging(config, "api")

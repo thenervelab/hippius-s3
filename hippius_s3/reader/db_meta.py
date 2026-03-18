@@ -36,3 +36,28 @@ async def read_part_plain_and_chunk_size(
     ps = int(dbm.get("plain_size") or 0)
     cs = int(dbm.get("chunk_size_bytes") or 0)
     return ps, cs
+
+
+async def read_parts_plain_and_chunk_sizes_batch(
+    db: Any, object_id: str, part_numbers: list[int], object_version: int
+) -> dict[int, tuple[int, int]]:
+    """Batch-read plain_size and chunk_size for multiple parts in a single DB query."""
+    if not part_numbers:
+        return {}
+    rows = await db.fetch(
+        """
+        SELECT part_number, size_bytes, chunk_size_bytes
+        FROM parts
+        WHERE object_id = $1 AND object_version = $2 AND part_number = ANY($3)
+        """,
+        object_id,
+        int(object_version),
+        part_numbers,
+    )
+    result: dict[int, tuple[int, int]] = {}
+    for row in rows or []:
+        pn = int(row["part_number"])
+        ps = int(row["size_bytes"] or 0)
+        cs = int(row["chunk_size_bytes"] or 0)
+        result[pn] = (ps, cs)
+    return result
