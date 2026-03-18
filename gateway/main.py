@@ -41,6 +41,10 @@ logger = setup_loki_logging(config, "hippius-s3-gateway")
 
 
 def factory() -> FastAPI:
+    from hippius_s3.otel_setup import configure_otel
+
+    configure_otel("hippius-s3-gateway")
+
     init_sentry("hippius-s3-gateway")
     app = FastAPI(
         title="Hippius S3 API",
@@ -87,7 +91,7 @@ def factory() -> FastAPI:
         app.state.metrics_collector = MetricsCollector(app.state.redis_client)
         set_metrics_collector(app.state.metrics_collector)
         logger.info("Metrics collector initialized")
-        logger.info("Tracing and metrics handled by opentelemetry-instrument wrapper")
+        logger.info("Tracing and metrics handled by programmatic OTel init")
 
         app.state.forward_service = ForwardService(config.backend_url)
         logger.info(f"ForwardService initialized with backend: {config.backend_url}")
