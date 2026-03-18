@@ -20,6 +20,8 @@ from hippius_s3.reader.streamer import stream_plan
 from hippius_s3.reader.types import ChunkPlanItem
 from hippius_s3.reader.types import RangeRequest
 from hippius_s3.services.crypto_service import CryptoService
+from hippius_s3.services.envelope_service import unwrap_dek
+from hippius_s3.services.kek_service import get_bucket_kek_bytes
 from hippius_s3.storage_version import require_supported_storage_version
 
 
@@ -59,43 +61,26 @@ async def build_stream_context(
     parts = await read_parts_list(db, info["object_id"], ov)
     plan = await build_chunk_plan(db, info["object_id"], parts, rng, object_version=ov)
 
+    # Batch check all chunks in a single Redis pipeline round trip
     source = "cache"
-    try:
-        for item in plan:
-            exists = await obj_cache.chunk_exists(
-                info["object_id"],
-                int(info.get("object_version") or info.get("current_object_version") or 1),
-                int(item.part_number),
-                int(item.chunk_index),
-            )
-            if not exists:
-                source = "pipeline"
-                break
-    except Exception:
-        source = "pipeline"
+    checks = [(int(item.part_number), int(item.chunk_index)) for item in plan]
+    exist_results = await obj_cache.chunks_exist_batch(info["object_id"], ov, checks)
+
+    # Build missing set from batch results
+    indices_by_part: dict[int, set[int]] = {}
+    for item, cached in zip(plan, exist_results, strict=True):
+        if not cached:
+            source = "pipeline"
+            idx_set = indices_by_part.setdefault(int(item.part_number), set())
+            idx_set.add(int(item.chunk_index))
 
     if source == "pipeline":
         cid_by_part: dict[int, str] = {}
         for p in parts:
-            try:
-                pn = int(p.get("part_number", 0))
-                cid_raw = p.get("cid")
-                if cid_raw and str(cid_raw).strip().lower() not in {"", "none", "pending"}:
-                    cid_by_part[pn] = str(cid_raw)
-            except Exception:
-                continue
-        indices_by_part: dict[int, set[int]] = {}
-        for item in plan:
-            ok = await obj_cache.chunk_exists(
-                info["object_id"],
-                int(info.get("object_version") or info.get("current_object_version") or 1),
-                int(item.part_number),
-                int(item.chunk_index),
-            )
-            if ok:
-                continue
-            idx_set = indices_by_part.setdefault(int(item.part_number), set())
-            idx_set.add(int(item.chunk_index))
+            pn = int(p.get("part_number", 0))
+            cid_raw = p.get("cid")
+            if cid_raw and str(cid_raw).strip().lower() not in {"", "none", "pending"}:
+                cid_by_part[pn] = str(cid_raw)
         dl_parts: list[PartToDownload] = []
         # CIDs are optional.
         # - If per-chunk CIDs exist in part_chunks, include them so the IPFS downloader can hydrate from IPFS.
@@ -164,9 +149,6 @@ async def build_stream_context(
     wrapped_dek = info.get("wrapped_dek")
     if not bucket_id or not kek_id or not wrapped_dek:
         raise RuntimeError("v5_missing_envelope_metadata")
-    from hippius_s3.services.envelope_service import unwrap_dek
-    from hippius_s3.services.kek_service import get_bucket_kek_bytes
-
     kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
     aad = f"hippius-dek:{bucket_id}:{info.get('object_id')}:{object_version}".encode("utf-8")
     key_bytes = unwrap_dek(kek=kek_bytes, wrapped_dek=bytes(wrapped_dek), aad=aad)

@@ -93,6 +93,10 @@ class ObjectPartsCache(Protocol):
 
     async def chunk_exists(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> bool: ...
 
+    async def chunks_exist_batch(
+        self, object_id: str, object_version: int, checks: list[tuple[int, int]]
+    ) -> list[bool]: ...
+
     async def set_chunks(
         self,
         object_id: str,
@@ -359,7 +363,29 @@ class RedisObjectPartsCache:
             await pubsub.unsubscribe(channel)
             await pubsub.aclose()
 
+    async def chunks_exist_batch(
+        self,
+        object_id: str,
+        object_version: int,
+        checks: list[tuple[int, int]],
+    ) -> list[bool]:
+        """Check existence of multiple chunks in a single Redis pipeline round trip."""
+        if not checks:
+            return []
+        keys = [self.build_chunk_key(object_id, int(object_version), int(pn), int(ci)) for pn, ci in checks]
+        async with self.redis.pipeline(transaction=False) as pipe:
+            for key in keys:
+                pipe.exists(key)
+            results = await pipe.execute()
+        return [bool(r) for r in results]
+
     async def wait_for_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> bytes:
+        # Fast path: chunk already cached — skip pubsub subscribe entirely
+        c = await self.get_chunk(object_id, int(object_version), int(part_number), int(chunk_index))
+        if c is not None:
+            return c
+
+        # Slow path: subscribe and wait for worker to populate cache
         chunk_key = self.build_chunk_key(
             object_id,
             int(object_version),
@@ -369,7 +395,7 @@ class RedisObjectPartsCache:
         channel = f"notify:{chunk_key}"
 
         async with self._subscribe(channel) as pubsub:
-            # Check if chunk already exists (covers: worker finished before we subscribed)
+            # Re-check after subscribe (race safety: worker may have finished between our check and subscribe)
             c = await self.get_chunk(
                 object_id,
                 int(object_version),
@@ -499,6 +525,11 @@ class NullObjectPartsCache:
         ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
     ) -> None:
         return None
+
+    async def chunks_exist_batch(
+        self, object_id: str, object_version: int, checks: list[tuple[int, int]]
+    ) -> list[bool]:
+        return [False] * len(checks)
 
     async def wait_for_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> bytes:
         raise NotImplementedError("NullObjectPartsCache does not support wait_for_chunk")

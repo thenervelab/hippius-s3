@@ -1,7 +1,8 @@
 """Tests for pub/sub-based chunk fetching via ObjectPartsCache.wait_for_chunk.
 
-Validates the subscribe→check→wait pattern that prevents the classic
-pub/sub race condition where a worker publishes before the reader subscribes.
+Validates the fast-path (return immediately if cached) and slow-path
+(subscribe→check→wait) pattern that prevents the classic pub/sub race
+condition where a worker publishes before the reader subscribes.
 """
 
 from __future__ import annotations
@@ -57,13 +58,17 @@ class FakeObjCache:
         key = self.build_chunk_key(object_id, object_version, part_number, chunk_index)
         self._chunks[key] = data
 
-    async def wait_for_chunk(
-        self, object_id: str, object_version: int, part_number: int, chunk_index: int
-    ) -> bytes:
+    async def wait_for_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> bytes:
         from contextlib import asynccontextmanager
         from typing import AsyncIterator
         from typing import cast
 
+        # Fast path: chunk already cached — skip pubsub entirely
+        c = await self.get_chunk(object_id, int(object_version), int(part_number), int(chunk_index))
+        if c is not None:
+            return c
+
+        # Slow path: subscribe and wait for worker to populate cache
         chunk_key = self.build_chunk_key(object_id, int(object_version), int(part_number), int(chunk_index))
         channel = f"notify:{chunk_key}"
 
@@ -77,6 +82,7 @@ class FakeObjCache:
                 await self._pubsub.aclose()
 
         async with _subscribe(channel) as pubsub:
+            # Re-check after subscribe (race safety)
             c = await self.get_chunk(object_id, int(object_version), int(part_number), int(chunk_index))
             if c is not None:
                 return cast(bytes, c)
@@ -90,15 +96,13 @@ class FakeObjCache:
             await self.get_chunk(object_id, int(object_version), int(part_number), int(chunk_index)),
         )
 
-    async def notify_chunk(
-        self, object_id: str, object_version: int, part_number: int, chunk_index: int
-    ) -> None:
+    async def notify_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> None:
         pass
 
 
 @pytest.mark.asyncio
 async def test_chunk_already_exists_returns_immediately():
-    """If chunk exists before we wait, return it without waiting for a message."""
+    """If chunk exists before we wait, fast path returns it without pubsub."""
     pubsub = FakePubSub()
     obj_cache = FakeObjCache(pubsub)
     obj_cache.set_chunk_data("obj1", 1, 1, 0, b"hello")
@@ -106,11 +110,12 @@ async def test_chunk_already_exists_returns_immediately():
     result = await obj_cache.wait_for_chunk("obj1", 1, 1, 0)
 
     assert result == b"hello"
-    # Should have subscribed first (before the GET check)
-    pubsub.subscribe.assert_awaited_once()
-    # Should have cleaned up
-    pubsub.unsubscribe.assert_awaited_once()
-    pubsub.aclose.assert_awaited_once()
+    # Fast path: should NOT have subscribed at all
+    pubsub.subscribe.assert_not_awaited()
+    pubsub.unsubscribe.assert_not_awaited()
+    pubsub.aclose.assert_not_awaited()
+    # Should have done exactly 1 get_chunk call (the fast-path check)
+    assert obj_cache._get_count == 1
 
 
 @pytest.mark.asyncio
