@@ -244,4 +244,6 @@ if __name__ == "__main__":
 
     config = get_config()
     debug_mode = os.getenv("DEBUG", "false").lower() == "true"
-    uvicorn.run("gateway.main:factory", host="0.0.0.0", port=config.port, reload=debug_mode, access_log=True, factory=True)
+    uvicorn.run(
+        "gateway.main:factory", host="0.0.0.0", port=config.port, reload=debug_mode, access_log=True, factory=True
+    )
