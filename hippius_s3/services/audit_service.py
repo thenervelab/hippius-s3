@@ -10,11 +10,11 @@ class AuditLogger:
         self.logger = logger if logger is not None else logging.getLogger(logger_name)
 
     def should_skip(self, path: str, client_ip: str) -> bool:
-        if path == "/metrics":
+        if path in ("/health", "/metrics"):
             return True
 
         is_internal_ip = client_ip in ("127.0.0.1", "localhost") or client_ip.startswith("172.")
-        return bool(is_internal_ip and path in ("/", "/health"))
+        return bool(is_internal_ip and path == "/")
 
     def log_request(
         self,
