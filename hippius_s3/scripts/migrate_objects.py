@@ -154,8 +154,9 @@ def _normalize_json_work_items(raw: Any, log: logging.Logger) -> list[dict[str, 
             )
             continue
 
-        bucket = str(it.get("bucket") or it.get("bucket_name") or "").strip()
-        key = str(it.get("key") or it.get("object_key") or "").strip()
+        d: dict[str, Any] = it
+        bucket = str(d.get("bucket") or d.get("bucket_name") or "").strip()
+        key = str(d.get("key") or d.get("object_key") or "").strip()
         if not bucket or not key:
             log.warning("Skipping malformed work item (missing bucket/key): index=%d value=%r", i, it)
             continue

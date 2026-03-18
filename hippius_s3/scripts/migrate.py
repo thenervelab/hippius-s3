@@ -131,16 +131,18 @@ def main() -> None:
     logger.info("Starting Hippius S3 migration process")
 
     # Get environment variables
-    database_url = os.environ.get("DATABASE_URL")
+    database_url: str | None = os.environ.get("DATABASE_URL")
     if not database_url:
         logger.error("DATABASE_URL environment variable is required")
         sys.exit(1)
 
+    assert database_url is not None
+
     # Log configuration
-    logger.info(f"App database: {mask_database_url(database_url)}")  # ty: ignore[invalid-argument-type]
+    logger.info(f"App database: {mask_database_url(database_url)}")
 
     # Wait for database
-    wait_for_database(database_url)  # ty: ignore[invalid-argument-type]
+    wait_for_database(database_url)
 
     # Run application database migrations
     logger.info("Running application database migrations")
