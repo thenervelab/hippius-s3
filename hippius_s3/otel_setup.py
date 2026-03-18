@@ -19,7 +19,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 logger = logging.getLogger(__name__)
 
-_otel_configured = False
+_otel_configured_pid: int | None = None
 
 
 def configure_otel(service_name: str) -> None:
@@ -31,10 +31,10 @@ def configure_otel(service_name: str) -> None:
     the SDK initializes in the parent process and the BatchSpanProcessor
     thread doesn't survive fork.
     """
-    global _otel_configured
-    if _otel_configured:
+    global _otel_configured_pid
+    if _otel_configured_pid == os.getpid():
         return
-    _otel_configured = True
+    _otel_configured_pid = os.getpid()
 
     if os.environ.get("ENABLE_MONITORING", "false").lower() not in ("true", "1", "yes"):
         logger.info("OTel programmatic init skipped (monitoring disabled)")

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json as _json
 from contextlib import asynccontextmanager
 from typing import Any
 from typing import AsyncIterator
 from typing import Optional
 from typing import Protocol
-from typing import cast
 
 
 # Lazy monitoring import: avoid pulling opentelemetry at import-time
@@ -259,17 +259,12 @@ class RedisObjectPartsCache:
     ) -> None:
         """Set TTL on meta and all chunk keys for this part to prevent orphaned chunk bytes."""
         ttl_val = int(ttl if ttl is not None else _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS))
-        # Collect all chunk keys first, then pipeline all expire calls into a single round-trip
+        # Build deterministic key list from meta instead of scanning the keyspace
         keys: list[Any] = [self.build_meta_key(object_id, object_version, part_number)]
-        keys.extend(
-            [
-                key
-                async for key in self.redis.scan_iter(
-                    match=f"obj:{object_id}:v:{int(object_version)}:part:{int(part_number)}:chunk:*",
-                    count=100,
-                )
-            ]
-        )
+        meta = await self.get_meta(object_id, object_version, part_number)
+        if meta:
+            num_chunks = int(meta.get("num_chunks", 0))
+            keys.extend(self.build_chunk_key(object_id, object_version, part_number, i) for i in range(num_chunks))
         async with self.redis.pipeline(transaction=False) as pipe:
             for key in keys:
                 pipe.expire(key, ttl_val)
@@ -380,6 +375,8 @@ class RedisObjectPartsCache:
         return [bool(r) for r in results]
 
     async def wait_for_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> bytes:
+        timeout = _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS)
+
         # Fast path: chunk already cached — skip pubsub subscribe entirely
         c = await self.get_chunk(object_id, int(object_version), int(part_number), int(chunk_index))
         if c is not None:
@@ -405,21 +402,24 @@ class RedisObjectPartsCache:
             if c is not None:
                 return c
 
-            # Wait for notification — worker will publish after set_chunk
-            async for msg in pubsub.listen():
-                if msg["type"] == "message":
-                    break
+            # Wait for notification with timeout to avoid hanging forever if the worker crashes
+            async def _listen() -> None:
+                async for msg in pubsub.listen():
+                    if msg["type"] == "message":
+                        return
 
-        # Chunk is guaranteed to be in Redis now
-        return cast(
-            bytes,
-            await self.get_chunk(
-                object_id,
-                int(object_version),
-                int(part_number),
-                int(chunk_index),
-            ),
+            await asyncio.wait_for(_listen(), timeout=timeout)
+
+        # Fetch the chunk — verify it wasn't evicted between notification and read
+        data = await self.get_chunk(
+            object_id,
+            int(object_version),
+            int(part_number),
+            int(chunk_index),
         )
+        if data is None:
+            raise RuntimeError(f"Chunk evicted after pub/sub notification: {chunk_key}")
+        return data
 
     async def notify_chunk(
         self,
