@@ -36,12 +36,11 @@ from hippius_s3.sentry import init_sentry
 from hippius_s3.services.arion_service import ArionClient
 
 
-config = get_config()
-logger = setup_loki_logging(config, "hippius-s3-gateway")
-
-
 def factory() -> FastAPI:
     from hippius_s3.otel_setup import configure_otel
+
+    config = get_config()
+    logger = setup_loki_logging(config, "hippius-s3-gateway")
 
     configure_otel("hippius-s3-gateway")
 
@@ -238,12 +237,11 @@ def factory() -> FastAPI:
     return app
 
 
-app = factory()
-
 if __name__ == "__main__":
     import os
 
     import uvicorn
 
+    config = get_config()
     debug_mode = os.getenv("DEBUG", "false").lower() == "true"
-    uvicorn.run("gateway.main:app", host="0.0.0.0", port=config.port, reload=debug_mode, access_log=True)
+    uvicorn.run("gateway.main:factory", host="0.0.0.0", port=config.port, reload=debug_mode, access_log=True, factory=True)
