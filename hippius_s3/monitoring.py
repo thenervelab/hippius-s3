@@ -663,22 +663,28 @@ def initialize_metrics_collector(redis_client: Union[Redis, RedisCluster]) -> Me
         set_metrics_collector(null_collector)
         return null_collector
 
-    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
-    service_name = os.getenv("OTEL_SERVICE_NAME", "hippius-s3")
+    # Only create a MeterProvider if one hasn't been set already
+    # (configure_otel in otel_setup.py may have already initialized it)
+    current_provider = metrics.get_meter_provider()
+    if isinstance(current_provider, MeterProvider):
+        logger.info("MeterProvider already configured (by otel_setup), skipping duplicate init")
+    else:
+        endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
+        service_name = os.getenv("OTEL_SERVICE_NAME", "hippius-s3")
 
-    resource = Resource.create({"service.name": service_name, "service.instance.id": socket.gethostname()})
+        resource = Resource.create({"service.name": service_name, "service.instance.id": socket.gethostname()})
 
-    metric_reader = PeriodicExportingMetricReader(
-        OTLPMetricExporter(endpoint=endpoint, insecure=True),
-        export_interval_millis=10000,
-    )
+        metric_reader = PeriodicExportingMetricReader(
+            OTLPMetricExporter(endpoint=endpoint, insecure=True),
+            export_interval_millis=10000,
+        )
 
-    provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
-    metrics.set_meter_provider(provider)
+        provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+        metrics.set_meter_provider(provider)
+        logger.info(f"Monitoring enabled, exporting to {endpoint}")
 
     collector = MetricsCollector(redis_client)
     set_metrics_collector(collector)
-    logger.info(f"Monitoring enabled, exporting to {endpoint}")
     return collector
 
 

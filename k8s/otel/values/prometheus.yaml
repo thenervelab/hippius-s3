@@ -25,9 +25,9 @@ server:
       memory: 2Gi
 
 extraScrapeConfigs: |
-  - job_name: 'otel-collector'
+  - job_name: 'otel-collector-staging'
     static_configs:
-      - targets: ['otel-collector.__APP_NAMESPACE__.svc.cluster.local:8889']
+      - targets: ['otel-collector.hippius-s3-staging.svc.cluster.local:8889']
     metrics_path: '/metrics'
     scrape_interval: 15s
   - job_name: 'otel-collector-prod'
@@ -35,12 +35,17 @@ extraScrapeConfigs: |
       - targets: ['otel-collector.hippius-s3-prod.svc.cluster.local:8889']
     metrics_path: '/metrics'
     scrape_interval: 15s
+  - job_name: 'otel-collector-arion'
+    static_configs:
+      - targets: ['otel-collector.hippius-arion.svc.cluster.local:8889']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
   - job_name: 'cnpg'
     kubernetes_sd_configs:
       - role: pod
         namespaces:
           names:
-            - __APP_NAMESPACE__
+            - hippius-s3-staging
             - hippius-s3-prod
     relabel_configs:
       - source_labels: [__meta_kubernetes_pod_label_cnpg_io_cluster]

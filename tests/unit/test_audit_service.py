@@ -32,14 +32,12 @@ def test_should_skip_metrics_endpoint(audit_logger):
     assert audit_logger.should_skip("/metrics", "192.168.1.100") is True
 
 
-def test_should_skip_health_endpoint_internal_ip(audit_logger):
+def test_should_skip_health_endpoint(audit_logger):
     assert audit_logger.should_skip("/health", "127.0.0.1") is True
     assert audit_logger.should_skip("/health", "localhost") is True
     assert audit_logger.should_skip("/health", "172.20.0.5") is True
-
-
-def test_should_not_skip_health_endpoint_external_ip(audit_logger):
-    assert audit_logger.should_skip("/health", "192.168.1.100") is False
+    assert audit_logger.should_skip("/health", "192.168.1.100") is True
+    assert audit_logger.should_skip("/health", "141.94.163.182") is True
 
 
 def test_should_skip_root_endpoint_internal_ip(audit_logger):

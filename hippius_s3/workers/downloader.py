@@ -47,6 +47,7 @@ async def process_download_request(
     fetch_fn: Callable[[str, str], Awaitable[bytes]],
     db_pool: asyncpg.Pool,
     redis_client: async_redis.Redis,
+    queues_client: async_redis.Redis | None = None,
 ) -> bool:
     """Process a single download request for one backend.
 
@@ -68,7 +69,7 @@ async def process_download_request(
         },
     ) as span:
         config = get_config()
-        obj_cache = RedisObjectPartsCache(redis_client)
+        obj_cache = RedisObjectPartsCache(redis_client, queues_client=queues_client)
 
         short_id = f"{download_request.bucket_name}/{download_request.object_key}"
         logger.info(
@@ -77,7 +78,7 @@ async def process_download_request(
             f"object_id={download_request.object_id}"
         )
 
-        semaphore = asyncio.Semaphore(10)
+        semaphore = asyncio.Semaphore(config.downloader_semaphore)
         max_attempts = config.downloader_chunk_retries
         base_sleep = config.downloader_retry_base_seconds
         jitter = config.downloader_retry_jitter_seconds
@@ -139,6 +140,13 @@ async def process_download_request(
                             part_number,
                             chunk_index,
                             data,
+                        )
+                        # Notify waiting readers via pub/sub
+                        await obj_cache.notify_chunk(
+                            download_request.object_id,
+                            int(download_request.object_version),
+                            part_number,
+                            chunk_index,
                         )
                         cache_ms = (time.perf_counter() - t_cache) * 1000.0
 
@@ -318,6 +326,7 @@ async def run_downloader_loop(
                         fetch_fn=fetch_fn,
                         db_pool=db_pool,
                         redis_client=redis_client,
+                        queues_client=redis_queues_client,
                     )
                     if ok:
                         worker_logger.info(f"[{backend_name}] Done: {request.bucket_name}/{request.object_key}")

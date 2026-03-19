@@ -10,6 +10,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from typing import AsyncGenerator
+from typing import cast
 
 import asyncpg
 import redis.asyncio as async_redis
@@ -154,8 +155,9 @@ def _normalize_json_work_items(raw: Any, log: logging.Logger) -> list[dict[str, 
             )
             continue
 
-        bucket = str(it.get("bucket") or it.get("bucket_name") or "").strip()
-        key = str(it.get("key") or it.get("object_key") or "").strip()
+        d = cast(dict[str, Any], it)
+        bucket = str(d.get("bucket") or d.get("bucket_name") or "").strip()
+        key = str(d.get("key") or d.get("object_key") or "").strip()
         if not bucket or not key:
             log.warning("Skipping malformed work item (missing bucket/key): index=%d value=%r", i, it)
             continue
@@ -291,7 +293,6 @@ async def migrate_one(
                 object_id=object_id,
                 object_version=ctx.object_version,
                 plan=part_plan,
-                sleep_seconds=config.http_download_sleep_loop,
                 storage_version=ctx.storage_version,
                 key_bytes=ctx.key_bytes,
                 suite_id=ctx.suite_id,
