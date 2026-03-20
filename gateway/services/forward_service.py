@@ -42,9 +42,13 @@ def _filter_hop_by_hop_raw_headers(raw_headers: list[tuple[bytes, bytes]]) -> li
             connection_tokens |= {t.strip().lower() for t in toks if t.strip()}
 
     hop = _HOP_BY_HOP_HEADERS | connection_tokens
+    # Strip headers that the gateway's own server layer will add,
+    # preventing duplicates (e.g. "server: uvicorn, uvicorn").
+    single_value_headers = {"date", "server"}
     out: list[tuple[bytes, bytes]] = []
     for k, v in raw_headers:
-        if k.decode("latin-1").lower() in hop:
+        name = k.decode("latin-1").lower()
+        if name in hop or name in single_value_headers:
             continue
         out.append((k, v))
     return out
