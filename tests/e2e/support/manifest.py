@@ -47,20 +47,3 @@ def wait_for_object_cid(bucket: str, key: str, timeout_sec: float = 30.0, interv
 # Backwards-compat aliases
 get_manifest_row = get_object_row
 wait_for_manifest_cid = wait_for_object_cid
-
-
-def wait_for_object_cid_via_head(
-    boto3_client: Any, bucket: str, key: str, *, timeout_sec: float = 30.0, interval: float = 0.5
-) -> Optional[str]:
-    """Poll HEAD until x-amz-ipfs-cid is set (not 'pending'), return the CID or None on timeout."""
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
-        try:
-            head = boto3_client.head_object(Bucket=bucket, Key=key)
-            cid = head["ResponseMetadata"]["HTTPHeaders"].get("x-amz-ipfs-cid")
-            if cid and str(cid).strip().lower() != "pending":
-                return str(cid)
-        except Exception:
-            pass
-        time.sleep(interval)
-    return None

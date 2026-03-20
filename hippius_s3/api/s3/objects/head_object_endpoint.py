@@ -159,6 +159,7 @@ async def handle_head_object(
             "Content-Length": str(size_bytes),
             "ETag": f'"{md5_hash}"',
             "Last-Modified": created_at.strftime("%a, %d %b %Y %H:%M:%S GMT"),
+            "Accept-Ranges": "bytes",
         }
         # Source hint: cache vs pipeline
         with tracer.start_as_current_span("head_object.check_cache_status") as span:
@@ -209,9 +210,6 @@ async def handle_head_object(
             for k, v in meta_val.items():
                 if k != "ipfs" and not isinstance(v, dict):
                     headers[f"x-amz-meta-{k}"] = str(v)
-        # CID hint if available
-        simple_cid = (row.get("simple_cid") or row.get("ipfs_cid") or "").strip()
-        headers["x-amz-ipfs-cid"] = simple_cid or "pending"
         return Response(status_code=200, headers=headers)
 
     except errors.S3Error as e:
