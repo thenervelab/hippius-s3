@@ -170,7 +170,7 @@ async def account_middleware(
                         BucketName=bucket_name if bucket_name else "",
                     )
 
-                can_upload_error = await d_check_can_upload(request, logger)
+                can_upload_error = await _check_can_upload(request, logger)
                 if can_upload_error is not None:
                     return can_upload_error
         except Exception as e:
