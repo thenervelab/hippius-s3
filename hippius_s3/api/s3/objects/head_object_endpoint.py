@@ -178,6 +178,17 @@ async def handle_head_object(
         object_version = int(row.get("object_version") or 1)
         headers["x-amz-version-id"] = str(object_version)
 
+        # Add Arion file hash (first chunk of first part)
+        arion_hash = await db.fetchval(
+            get_query("get_chunk_backend_identifier"),
+            "arion",
+            row["object_id"],
+            object_version,
+            1,  # part_number (1-based)
+            0,  # chunk_index (0-based)
+        )
+        headers["X-Hippius-Arion-File-Hash"] = arion_hash or "pending"
+
         # Append version header if present
         with tracer.start_as_current_span("head_object.fetch_append_version") as span:
             try:

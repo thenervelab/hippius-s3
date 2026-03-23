@@ -63,14 +63,14 @@ async def handle_list_objects(
             storage_class = ET.SubElement(content, "StorageClass")
             storage_class.text = "multipart" if obj.get("multipart") else "standard"
             owner = ET.SubElement(content, "Owner")
-            ET.SubElement(owner, "ID").text = (obj.get("ipfs_cid") or "").strip() or "pending"
+            ET.SubElement(owner, "ID").text = (obj.get("arion_file_hash") or "").strip() or "pending"
             ET.SubElement(owner, "DisplayName").text = ctx.main_account_id
 
         xml_content = ET.tostring(root, encoding="UTF-8", xml_declaration=True, pretty_print=True)
 
         # Custom headers (optional diagnostics)
         total_objects = len(results)
-        objects_with_cid = sum(1 for obj in results if obj.get("ipfs_cid"))
+        objects_with_cid = sum(1 for obj in results if obj.get("arion_file_hash"))
         status_counts: dict[str, int] = {}
         for obj in results:
             status = obj.get("status", "unknown")
