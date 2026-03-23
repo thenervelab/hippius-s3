@@ -24,7 +24,10 @@ from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 config = get_config()
 
 
-async def _check_can_upload(request: Request, logger: logging.Logger | logging.LoggerAdapter) -> Response | None:
+async def _check_can_upload(
+    request: Request,
+    logger: logging.Logger | logging.LoggerAdapter,
+) -> Response | None:
     """
     Call Arion's can_upload endpoint for PUT/POST requests.
 
@@ -69,7 +72,10 @@ async def _check_can_upload(request: Request, logger: logging.Logger | logging.L
     return None
 
 
-async def account_middleware(request: Request, call_next: Callable) -> Response:
+async def account_middleware(
+    request: Request,
+    call_next: Callable,
+) -> Response:
     """
     Middleware to check if the account has enough credit for any S3 operation.
 
