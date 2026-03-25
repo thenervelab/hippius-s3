@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-# In-memory store keyed by file_id (SHA256 of filename) -> {"bytes": bytes, "account_ss58": str, "upload_id": str}
+# In-memory store keyed by upload_id -> {"bytes": bytes, "account_ss58": str, "file_id": str}
 _store: dict[str, dict] = {}
 
 
@@ -35,7 +35,7 @@ async def upload(file: UploadFile = File(...), account_ss58: str = Form(...)) ->
     # Mirror real Arion: file_id = SHA256(filename)
     file_name = file.filename or "unknown"
     file_id = hashlib.sha256(file_name.encode()).hexdigest()
-    _store[file_id] = {"bytes": content, "account_ss58": account_ss58, "upload_id": upload_id}
+    _store[upload_id] = {"bytes": content, "account_ss58": account_ss58, "file_id": file_id}
     return UploadResult(
         upload_id=upload_id,
         file_id=file_id,
@@ -44,10 +44,10 @@ async def upload(file: UploadFile = File(...), account_ss58: str = Form(...)) ->
     )
 
 
-@app.get("/download/{account_ss58}/{file_id}")
-async def download(account_ss58: str, file_id: str):
-    # file_id = SHA256(filename) — same value stored as backend_identifier in chunk_backend
-    entry = _store.get(file_id)
+@app.get("/download/{account_ss58}/{identifier}")
+async def download(account_ss58: str, identifier: str):
+    # identifier = upload_id — stored as backend_identifier in chunk_backend
+    entry = _store.get(identifier)
     if entry is None:
         raise HTTPException(status_code=404, detail="not found")
     import io
@@ -70,10 +70,10 @@ async def can_upload(body: CanUploadRequest) -> CanUploadResult:
     return CanUploadResult(result=True, error=None)
 
 
-@app.delete("/delete/{user_id}/{file_id}")
-async def delete(user_id: str, file_id: str) -> DeleteResult:
-    entry = _store.pop(file_id, None)
-    return DeleteResult(Success={"status": "deleted", "file_id": file_id, "user_id": user_id})
+@app.delete("/delete/{user_id}/{identifier}")
+async def delete(user_id: str, identifier: str) -> DeleteResult:
+    entry = _store.pop(identifier, None)
+    return DeleteResult(Success={"status": "deleted", "file_id": identifier, "user_id": user_id})
 
 
 @app.get("/health")
