@@ -81,7 +81,7 @@ class UploadResponse(BaseModel):
 
     @property
     def cid(self) -> str:
-        return self.file_id
+        return self.upload_id
 
     @property
     def id(self) -> str:
