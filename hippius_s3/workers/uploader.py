@@ -42,6 +42,7 @@ class BackendClient(ABC):
         file_name: str,
         content_type: str,
         account_ss58: str,
+        extra_headers: dict[str, str] | None = None,
     ) -> UploadResponse:
         pass
 
@@ -208,6 +209,10 @@ class Uploader:
                 f"Processing upload backend={self.backend_name} object_id={payload.object_id} chunks={len(payload.chunks)}"
             )
 
+            extra_headers: dict[str, str] | None = None
+            if payload.bypass_billing and self.config.arion_billing_bypass_key:
+                extra_headers = {"X-Billing-Bypass": self.config.arion_billing_bypass_key}
+
             all_chunk_cids = await self._upload_chunks(
                 object_id=payload.object_id,
                 object_key=payload.object_key,
@@ -215,6 +220,7 @@ class Uploader:
                 upload_id=payload.upload_id,
                 object_version=int(payload.object_version or 1),
                 account_ss58=payload.address,
+                extra_headers=extra_headers,
             )
 
             total_duration = time.time() - start_time
@@ -244,6 +250,7 @@ class Uploader:
         upload_id: Optional[str],
         object_version: int,
         account_ss58: str,
+        extra_headers: dict[str, str] | None = None,
     ) -> List[str]:
         concurrency = self.config.uploader_multipart_max_concurrency
         with tracer.start_as_current_span(
@@ -267,6 +274,7 @@ class Uploader:
                         upload_id=upload_id,
                         object_version=int(object_version),
                         account_ss58=account_ss58,
+                        extra_headers=extra_headers,
                     )
 
             chunks_sorted = sorted(chunks, key=lambda c: c.id)
@@ -301,6 +309,7 @@ class Uploader:
         upload_id: Optional[str],
         object_version: int,
         account_ss58: str,
+        extra_headers: dict[str, str] | None = None,
     ) -> ChunkUploadResult:
         part_number = int(chunk.id)
         with tracer.start_as_current_span(
@@ -378,6 +387,7 @@ class Uploader:
                         file_name=str(chunk_id),
                         content_type="application/octet-stream",
                         account_ss58=account_ss58,
+                        extra_headers=extra_headers,
                     )
 
                     piece_cid = str(chunk_upload_result.cid)

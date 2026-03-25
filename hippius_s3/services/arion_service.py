@@ -368,6 +368,7 @@ class ArionClient:
         file_name: str,
         content_type: str,
         account_ss58: str,
+        extra_headers: Dict[str, str] | None = None,
     ) -> UploadResponse:
         """
         Upload file using multipart form data.
@@ -397,6 +398,8 @@ class ArionClient:
         data = {"account_ss58": account_ss58}
 
         headers = self._get_headers(account_ss58)
+        if extra_headers:
+            headers.update(extra_headers)
         response = await self._client.post(
             "/upload",
             files=files,
