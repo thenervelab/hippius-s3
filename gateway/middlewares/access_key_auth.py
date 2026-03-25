@@ -169,13 +169,17 @@ async def verify_access_key_presigned_url(
         logger.error("Missing required X-Amz-* query parameters for presigned URL verification")
         raise AccessKeyAuthError("Missing required presigned URL parameters")
 
+    # Narrow types after the all() check above guarantees non-None
+    assert credential is not None
+    assert expires_str is not None
+    assert signed_headers_str is not None
+
     if algorithm != "AWS4-HMAC-SHA256":
         logger.error(f"Unsupported X-Amz-Algorithm in presigned URL: {algorithm}")
         raise AccessKeyAuthError("Unsupported signature algorithm")
 
     # Parse credential: <access_key>/<date>/<region>/<service>/aws4_request
-    # At this point credential is guaranteed non-empty by the earlier all([...]) check
-    credential_parts = credential.split("/")  # type: ignore[union-attr]
+    credential_parts = credential.split("/")
     if len(credential_parts) < 5:
         logger.error(f"Invalid X-Amz-Credential format: {credential}")
         raise AccessKeyAuthError("Invalid credential format")
@@ -195,7 +199,7 @@ async def verify_access_key_presigned_url(
         raise AccessKeyAuthError("Invalid credential scope")
 
     try:
-        expires = int(expires_str)  # type: ignore[arg-type]
+        expires = int(expires_str)
     except ValueError:
         logger.error(f"Invalid X-Amz-Expires value: {expires_str}")
         raise AccessKeyAuthError("Invalid expires value") from None
@@ -219,8 +223,7 @@ async def verify_access_key_presigned_url(
         )
         return False, "", ""
 
-    # signed_headers_str is validated above in the all([...]) check
-    signed_headers = signed_headers_str.split(";")  # type: ignore[union-attr]
+    signed_headers = signed_headers_str.split(";")
 
     # Require host to be part of the signed headers, as per AWS SigV4 requirements
     if "host" not in signed_headers:
