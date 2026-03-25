@@ -253,6 +253,9 @@ async def main() -> None:
     requeue_parser.add_argument("--object-id", help="Specific object ID to requeue")
     requeue_parser.add_argument("--cid", help="Specific CID to requeue (for unpin worker)")
     requeue_parser.add_argument("--force", action="store_true", help="Force requeue of permanent errors")
+    requeue_parser.add_argument(
+        "--bypass-billing", action="store_true", help="Set bypass_billing flag on requeued items (for 402 errors)"
+    )
 
     # purge command
     purge_parser = subparsers.add_parser("purge", help="Purge entries from DLQ")
@@ -336,9 +339,10 @@ async def main() -> None:
                 print(f"    {error_type}: {count}")
 
         elif args.command == "requeue":
+            bypass_billing = getattr(args, "bypass_billing", False)
             identifier = args.cid if args.cid else args.object_id
             if identifier:
-                success = await dlq_manager.requeue(identifier, args.force)
+                success = await dlq_manager.requeue(identifier, args.force, bypass_billing=bypass_billing)
                 if success:
                     id_type = "CID" if args.cid else "object_id"
                     print(f"Successfully requeued {id_type}: {identifier}")
@@ -347,7 +351,7 @@ async def main() -> None:
                     print(f"Failed to requeue {id_type}: {identifier}")
                     sys.exit(1)
             else:
-                count = await dlq_manager.requeue_all(args.force)
+                count = await dlq_manager.requeue_all(args.force, bypass_billing=bypass_billing)
                 print(f"Requeued {count} DLQ entries")
 
         elif args.command == "purge":

@@ -114,7 +114,7 @@ class BaseDLQManager(Generic[T]):
         """Find and remove a specific entry by identifier. Must be overridden."""
         raise NotImplementedError("Subclass must implement _find_and_remove_entry()")
 
-    async def requeue(self, identifier: str, force: bool = False) -> bool:
+    async def requeue(self, identifier: str, force: bool = False, bypass_billing: bool = False) -> bool:
         """Requeue a specific entry by identifier."""
         token = await self._acquire_lock(identifier)
         if not token:
@@ -140,6 +140,9 @@ class BaseDLQManager(Generic[T]):
             if not force and hasattr(payload, "attempts"):
                 payload.attempts = 0  # ty: ignore[invalid-assignment]
 
+            if bypass_billing and hasattr(payload, "bypass_billing"):
+                payload.bypass_billing = True  # ty: ignore[invalid-assignment]
+
             await self.enqueue_func(payload)
             logger.info(f"Successfully requeued identifier: {identifier}")
             return True
@@ -154,7 +157,7 @@ class BaseDLQManager(Generic[T]):
             with contextlib.suppress(Exception):
                 await self._release_lock(identifier, token)
 
-    async def requeue_all(self, force: bool = False, batch_size: int = 500) -> int:
+    async def requeue_all(self, force: bool = False, batch_size: int = 500, bypass_billing: bool = False) -> int:
         """Requeue all DLQ entries using batched pipeline operations."""
         total_requeued = 0
         total_skipped = 0
@@ -184,6 +187,8 @@ class BaseDLQManager(Generic[T]):
                 payload = self.request_class.model_validate(payload_data)
                 if not force and hasattr(payload, "attempts"):
                     payload.attempts = 0  # ty: ignore[invalid-assignment]
+                if bypass_billing and hasattr(payload, "bypass_billing"):
+                    payload.bypass_billing = True  # ty: ignore[invalid-assignment]
                 payloads.append(payload)
 
             # Bulk enqueue via pipeline
