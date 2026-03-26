@@ -262,6 +262,124 @@ async def test_process_upload_skips_when_object_row_missing(mock_config, mock_db
 
 
 @pytest.mark.asyncio
+async def test_upload_passes_extra_headers_when_bypass_billing(mock_config, mock_db_pool, mock_fs_store):
+    mock_config.arion_billing_bypass_key = "secret-bypass-key"
+    redis = FakeRedis()
+    redis_queues = FakeRedis()
+
+    mock_backend_client = MagicMock()
+    uploader = Uploader(
+        mock_db_pool, redis, redis_queues, mock_config, backend_name="arion", backend_client=mock_backend_client
+    )
+    uploader.fs_store = mock_fs_store
+
+    mock_upload_response = UploadResponse(
+        id="file-uuid-123",
+        original_name="test.part1.chunk0",
+        content_type="application/octet-stream",
+        size_bytes=1024,
+        sha256_hex="abc123",
+        cid="QmChunk123",
+        status="completed",
+        file_url="https://example.com/file",
+        created_at="2025-11-27T12:00:00Z",
+        updated_at="2025-11-27T12:00:00Z",
+    )
+
+    chunk_uuid = "aaaabbbb-cccc-dddd-eeee-ffffffffffff"
+
+    mock_conn = AsyncMock()
+    mock_conn.fetchrow = AsyncMock(return_value=MockRow({"part_id": "part-uuid"}))
+    mock_conn.fetchval = AsyncMock(side_effect=[chunk_uuid, 1])
+    mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
+
+    mock_api_instance = AsyncMock()
+    mock_api_instance.upload_file_and_get_cid = AsyncMock(return_value=mock_upload_response)
+    uploader.backend_client = mock_api_instance
+
+    await uploader._upload_single_chunk(
+        object_id="obj-123",
+        object_key="test-key",
+        chunk=Chunk(id=1),
+        upload_id="upload-123",
+        object_version=1,
+        account_ss58="5FakeTestAccountAddress123456789012345678901234",
+        extra_headers={"X-Billing-Bypass": "secret-bypass-key"},
+    )
+
+    call_args = mock_api_instance.upload_file_and_get_cid.call_args
+    assert call_args.kwargs["extra_headers"] == {"X-Billing-Bypass": "secret-bypass-key"}
+
+
+@pytest.mark.asyncio
+async def test_process_upload_sets_bypass_billing_headers(mock_config, mock_db_pool):
+    mock_config.arion_billing_bypass_key = "secret-bypass-key"
+    redis = FakeRedis()
+    redis_queues = FakeRedis()
+
+    mock_backend_client = MagicMock()
+    uploader = Uploader(
+        mock_db_pool, redis, redis_queues, mock_config, backend_name="arion", backend_client=mock_backend_client
+    )
+
+    mock_conn = AsyncMock()
+    mock_conn.fetchval = AsyncMock(return_value=False)
+    mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
+
+    payload = UploadChainRequest(
+        address="user1",
+        bucket_name="test-bucket",
+        object_key="test-key",
+        object_id="obj-123",
+        object_version=1,
+        chunks=[Chunk(id=1)],
+        upload_id="upload-123",
+        bypass_billing=True,
+    )
+
+    with patch.object(uploader, "_upload_chunks", new_callable=AsyncMock) as mock_upload_chunks:
+        mock_upload_chunks.return_value = ["QmCID1"]
+        await uploader.process_upload(payload)
+
+        call_args = mock_upload_chunks.call_args
+        assert call_args.kwargs["extra_headers"] == {"X-Billing-Bypass": "secret-bypass-key"}
+
+
+@pytest.mark.asyncio
+async def test_process_upload_no_bypass_headers_when_flag_false(mock_config, mock_db_pool):
+    mock_config.arion_billing_bypass_key = "secret-bypass-key"
+    redis = FakeRedis()
+    redis_queues = FakeRedis()
+
+    mock_backend_client = MagicMock()
+    uploader = Uploader(
+        mock_db_pool, redis, redis_queues, mock_config, backend_name="arion", backend_client=mock_backend_client
+    )
+
+    mock_conn = AsyncMock()
+    mock_conn.fetchval = AsyncMock(return_value=False)
+    mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
+
+    payload = UploadChainRequest(
+        address="user1",
+        bucket_name="test-bucket",
+        object_key="test-key",
+        object_id="obj-123",
+        object_version=1,
+        chunks=[Chunk(id=1)],
+        upload_id="upload-123",
+        bypass_billing=False,
+    )
+
+    with patch.object(uploader, "_upload_chunks", new_callable=AsyncMock) as mock_upload_chunks:
+        mock_upload_chunks.return_value = ["QmCID1"]
+        await uploader.process_upload(payload)
+
+        call_args = mock_upload_chunks.call_args
+        assert call_args.kwargs["extra_headers"] is None
+
+
+@pytest.mark.asyncio
 async def test_process_upload_no_longer_calls_pin_on_api(mock_config, mock_db_pool):
     redis = FakeRedis()
     redis_queues = FakeRedis()

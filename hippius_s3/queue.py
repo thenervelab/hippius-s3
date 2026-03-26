@@ -77,6 +77,7 @@ class UploadChainRequest(RetryableRequest):
     chunks: list[Chunk]
     upload_id: str | None = None
     upload_backends: list[str] | None = None  # Set by API at enqueue time
+    bypass_billing: bool = False
 
     @property
     def name(self) -> str:
