@@ -93,6 +93,7 @@ class Config:
     validator_region: str = env("HIPPIUS_VALIDATOR_REGION")
     hippius_api_base_url: str = env("HIPPIUS_API_BASE_URL:https://api.hippius.com/")
     arion_billing_bypass_key: str = env("ARION_BILLING_BYPASS_KEY:")
+    arion_rate_limiting_proxy_bypass_key: str = env("ARION_RATE_LIMITING_PROXY_BYPASS_KEY:")
     arion_base_url: str = env("HIPPIUS_ARION_BASE_URL:https://arion.hippius.com/")
     arion_verify_ssl: bool = env("HIPPIUS_ARION_VERIFY_SSL:true", convert=lambda x: x.lower() == "true")
 

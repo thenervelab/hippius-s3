@@ -288,10 +288,13 @@ class ArionClient:
         Returns:
             Dict[str, str]: Headers with authentication token
         """
-        return {
+        headers = {
             "X-API-Key": self._config.arion_service_key,
             "Authorization": f"Bearer {self._config.arion_bearer_token}",
         }
+        if self._config.arion_rate_limiting_proxy_bypass_key:
+            headers["X-Hippius-Bypass-Rate-Limiting"] = self._config.arion_rate_limiting_proxy_bypass_key
+        return headers
 
     @retry_on_error(retries=3, backoff=5.0)
     async def unpin_file(

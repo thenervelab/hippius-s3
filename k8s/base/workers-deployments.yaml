@@ -81,6 +81,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: ARION_BILLING_BYPASS_KEY
+            - name: ARION_RATE_LIMITING_PROXY_BYPASS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_RATE_LIMITING_PROXY_BYPASS_KEY
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
@@ -253,6 +258,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: ARION_BEARER_TOKEN
+            - name: ARION_RATE_LIMITING_PROXY_BYPASS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_RATE_LIMITING_PROXY_BYPASS_KEY
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
