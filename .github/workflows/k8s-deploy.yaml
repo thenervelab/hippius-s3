@@ -149,7 +149,7 @@ jobs:
             --from-literal=HIPPIUS_SERVICE_KEY='${{ secrets.HIPPIUS_SERVICE_KEY }}' \
             --from-literal=ARION_SERVICE_KEY='${{ secrets.ARION_SERVICE_KEY }}' \
             --from-literal=ARION_BEARER_TOKEN='${{ secrets.ARION_BEARER_TOKEN }}' \
-            --from-literal=ARION_BILLING_BYPASS_KEY='${{ vars.ARION_BILLING_BYPASS_KEY }}' \
+            --from-literal=ARION_BILLING_BYPASS_KEY='${{ secrets.ARION_BILLING_BYPASS_KEY }}' \
             --from-literal=HIPPIUS_AUTH_ENCRYPTION_KEY='${{ secrets.HIPPIUS_AUTH_ENCRYPTION_KEY }}' \
             --from-literal=HIPPIUS_UPLOAD_QUEUE_NAMES='${{ secrets.HIPPIUS_UPLOAD_QUEUE_NAMES }}' \
             --from-literal=HIPPIUS_DOWNLOAD_QUEUE_NAMES='${{ secrets.HIPPIUS_DOWNLOAD_QUEUE_NAMES }}' \
@@ -277,7 +277,7 @@ jobs:
             --from-literal=HIPPIUS_SERVICE_KEY="${{ secrets.HIPPIUS_SERVICE_KEY }}" \
             --from-literal=ARION_SERVICE_KEY="${{ secrets.ARION_SERVICE_KEY }}" \
             --from-literal=ARION_BEARER_TOKEN="${{ secrets.ARION_BEARER_TOKEN }}" \
-            --from-literal=ARION_BILLING_BYPASS_KEY="${{ vars.ARION_BILLING_BYPASS_KEY }}" \
+            --from-literal=ARION_BILLING_BYPASS_KEY="${{ secrets.ARION_BILLING_BYPASS_KEY }}" \
             --from-literal=HIPPIUS_AUTH_ENCRYPTION_KEY="${{ secrets.HIPPIUS_AUTH_ENCRYPTION_KEY }}" \
             --from-literal=DATABASE_PASSWORD="${{ secrets.DATABASE_PASSWORD }}" \
             --from-literal=HIPPIUS_UPLOAD_QUEUE_NAMES="${{ secrets.HIPPIUS_UPLOAD_QUEUE_NAMES }}" \
