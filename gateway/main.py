@@ -223,10 +223,10 @@ def factory() -> FastAPI:
     app.middleware("http")(metrics_middleware)
     app.middleware("http")(tracing_middleware)
     app.middleware("http")(cors_middleware)
-    if config.enable_banhammer:
-        app.middleware("http")(banhammer_wrapper)
+    # if config.enable_banhammer:
+    #     app.middleware("http")(banhammer_wrapper)
     app.middleware("http")(verify_frontend_hmac_middleware)
-    app.middleware("http")(rate_limit_wrapper)
+    # app.middleware("http")(rate_limit_wrapper)
     app.middleware("http")(acl_middleware)
     app.middleware("http")(account_middleware)
     app.middleware("http")(trailing_slash_normalizer)
