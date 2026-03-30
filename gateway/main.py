@@ -1,6 +1,5 @@
 import asyncio
 import time
-from typing import Callable
 from typing import Dict
 
 import asyncpg
@@ -13,14 +12,10 @@ from gateway.middlewares.account import account_middleware
 from gateway.middlewares.acl import acl_middleware
 from gateway.middlewares.audit_log import audit_log_middleware
 from gateway.middlewares.auth_router import auth_router_middleware
-from gateway.middlewares.banhammer import BanHammerService
-from gateway.middlewares.banhammer import banhammer_middleware
 from gateway.middlewares.cors import cors_middleware
 from gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
 from gateway.middlewares.input_validation import input_validation_middleware
 from gateway.middlewares.metrics import metrics_middleware
-from gateway.middlewares.rate_limit import RateLimitService
-from gateway.middlewares.rate_limit import rate_limit_middleware
 from gateway.middlewares.ray_id import ray_id_middleware
 from gateway.middlewares.tracing import tracing_middleware
 from gateway.middlewares.trailing_slash import trailing_slash_normalizer
@@ -95,21 +90,7 @@ def factory() -> FastAPI:
         app.state.forward_service = ForwardService(config.backend_url)
         logger.info(f"ForwardService initialized with backend: {config.backend_url}")
 
-        app.state.rate_limit_service = RateLimitService(app.state.redis_rate_limiting)
-        logger.info("RateLimitService initialized")
-
-        app.state.banhammer_service = BanHammerService(
-            app.state.redis_rate_limiting,
-            allowlist_ips=config.banhammer_allowlist_ips,
-            unauth_infringement_window_seconds=config.banhammer_unauth_window_seconds,
-            unauth_infringement_cooldown_seconds=config.banhammer_unauth_ban_seconds,
-            unauth_infringement_max=config.banhammer_unauth_max,
-            auth_infringement_window_seconds=config.banhammer_auth_window_seconds,
-            auth_infringement_cooldown_seconds=config.banhammer_auth_ban_seconds,
-            auth_infringement_max=config.banhammer_auth_max,
-            unauth_404_methods=config.banhammer_unauth_404_methods,
-        )
-        logger.info("BanHammerService initialized")
+        logger.info("Rate limiting and banhammer disabled")
 
         app.state.acl_service = ACLService(
             db_pool=app.state.postgres_pool,
@@ -196,22 +177,6 @@ def factory() -> FastAPI:
         forward_service = request.app.state.forward_service
         return await forward_service.forward_request(request)
 
-    async def rate_limit_wrapper(request: Request, call_next: Callable) -> Response:
-        return await rate_limit_middleware(
-            request,
-            call_next,
-            request.app.state.rate_limit_service,
-            max_requests=config.rate_limit_per_minute,
-            window_seconds=60,
-        )
-
-    async def banhammer_wrapper(request: Request, call_next: Callable) -> Response:
-        return await banhammer_middleware(
-            request,
-            call_next,
-            request.app.state.banhammer_service,
-        )
-
     # Register middleware in REVERSE order (outermost first)
     # IMPORTANT: auth_router must execute BEFORE account (so register AFTER)
     # IMPORTANT: trailing_slash must execute AFTER auth_router (so register BEFORE)
@@ -223,10 +188,7 @@ def factory() -> FastAPI:
     app.middleware("http")(metrics_middleware)
     app.middleware("http")(tracing_middleware)
     app.middleware("http")(cors_middleware)
-    # if config.enable_banhammer:
-    #     app.middleware("http")(banhammer_wrapper)
     app.middleware("http")(verify_frontend_hmac_middleware)
-    # app.middleware("http")(rate_limit_wrapper)
     app.middleware("http")(acl_middleware)
     app.middleware("http")(account_middleware)
     app.middleware("http")(trailing_slash_normalizer)
