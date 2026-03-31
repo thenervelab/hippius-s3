@@ -32,7 +32,13 @@ def create_redis_client(redis_url: str) -> Union[Redis, RedisCluster]:
         host_port = redis_url.replace("redis://", "").split("?")[0].split("/")[0]
         host, port = host_port.split(":") if ":" in host_port else (host_port, "6379")
         logger.info(f"Creating Redis Cluster client for {host}:{port}")
-        return RedisCluster(host=host, port=int(port))
+        return RedisCluster(
+            host=host,
+            port=int(port),
+            socket_connect_timeout=5,
+            socket_timeout=5,
+            retry_on_error=[RedisConnectionError(), RedisTimeoutError()],
+        )
     logger.info("Creating Redis client")
     return Redis.from_url(redis_url)
 
