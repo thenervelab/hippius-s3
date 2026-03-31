@@ -22,7 +22,8 @@ data:
         timeout: 1s
         send_batch_size: 1024
       memory_limiter:
-        limit_mib: 256
+        limit_mib: 768
+        spike_limit_mib: 128
         check_interval: 1s
 
     exporters:
@@ -95,11 +96,11 @@ spec:
               mountPath: /etc/otelcol-contrib
           resources:
             requests:
-              cpu: 100m
-              memory: 256Mi
-            limits:
-              cpu: 500m
+              cpu: 250m
               memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
           livenessProbe:
             httpGet:
               path: /
