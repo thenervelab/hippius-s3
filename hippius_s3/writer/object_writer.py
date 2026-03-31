@@ -252,7 +252,7 @@ class ObjectWriter:
         perf_stream_start = time.monotonic()
 
         adapter = CryptoService.get_adapter(suite_id)
-        write_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(maxsize=2)
+        write_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(maxsize=16)
         consumer_error: BaseException | None = None
 
         # Write-through: FS first (fatal), then Redis (best-effort)
@@ -674,7 +674,7 @@ class ObjectWriter:
         perf_queue_wait_ms = 0.0
         perf_stream_start = time.monotonic()
 
-        write_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(maxsize=2)
+        write_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(maxsize=16)
         consumer_error: BaseException | None = None
 
         async def _cleanup_partial() -> None:

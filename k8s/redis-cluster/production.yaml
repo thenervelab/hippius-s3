@@ -18,7 +18,7 @@ data:
     cluster-require-full-coverage no
     cluster-migration-barrier 1
 
-    maxmemory 8gb
+    maxmemory 16gb
     maxmemory-policy allkeys-lru
     maxmemory-samples 10
 
@@ -132,7 +132,7 @@ spec:
               memory: 1Gi
             limits:
               cpu: "2"
-              memory: 9Gi
+              memory: 18Gi
       volumes:
         - name: config
           configMap:
