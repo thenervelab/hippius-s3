@@ -105,6 +105,7 @@ class ObjectPartsCache(Protocol):
         chunks: list[bytes],
         *,
         ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
+        start_index: int = 0,
     ) -> None: ...
 
     # Pub/sub notification API
@@ -340,10 +341,11 @@ class RedisObjectPartsCache:
         chunks: list[bytes],
         *,
         ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
+        start_index: int = 0,
     ) -> None:
         ttl_val = int(ttl if ttl is not None else _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS))
         async with self.redis.pipeline(transaction=False) as pipe:
-            for i, data in enumerate(chunks):
+            for i, data in enumerate(chunks, start=start_index):
                 key = self.build_chunk_key(object_id, int(object_version), int(part_number), int(i))
                 pipe.setex(key, ttl_val, data)
             await pipe.execute()
@@ -523,6 +525,7 @@ class NullObjectPartsCache:
         chunks: list[bytes],
         *,
         ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
+        start_index: int = 0,
     ) -> None:
         return None
 

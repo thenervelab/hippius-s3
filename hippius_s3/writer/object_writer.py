@@ -257,10 +257,11 @@ class ObjectWriter:
 
         # Write-through: FS writes in consumer loop (fatal), Redis batched after stream (best-effort)
         redis_chunks: list[bytes] = []
+        redis_batch_start_index = 0
         perf_redis_ms = 0.0
 
         async def _flush_redis_batch() -> None:
-            nonlocal perf_redis_ms
+            nonlocal perf_redis_ms, redis_batch_start_index
             if not redis_chunks:
                 return
             t0 = time.monotonic()
@@ -271,6 +272,7 @@ class ObjectWriter:
                     int(part_number),
                     list(redis_chunks),
                     ttl=ttl,
+                    start_index=redis_batch_start_index,
                 )
             except Exception as e:
                 logger.warning(
@@ -278,6 +280,7 @@ class ObjectWriter:
                     f"v={object_version} part={part_number} chunks={len(redis_chunks)}: {e}"
                 )
             perf_redis_ms += (time.monotonic() - t0) * 1000
+            redis_batch_start_index += len(redis_chunks)
             redis_chunks.clear()
 
         async def _consumer() -> None:
@@ -723,10 +726,11 @@ class ObjectWriter:
 
         # Write-through: FS writes in consumer loop (fatal), Redis batched after stream (best-effort)
         mpu_redis_chunks: list[bytes] = []
+        mpu_redis_batch_start_index = 0
         perf_redis_ms = 0.0
 
         async def _flush_mpu_redis_batch() -> None:
-            nonlocal perf_redis_ms
+            nonlocal perf_redis_ms, mpu_redis_batch_start_index
             if not mpu_redis_chunks:
                 return
             t0 = time.monotonic()
@@ -737,6 +741,7 @@ class ObjectWriter:
                     int(part_number),
                     list(mpu_redis_chunks),
                     ttl=ttl,
+                    start_index=mpu_redis_batch_start_index,
                 )
             except Exception as e:
                 logger.warning(
@@ -744,6 +749,7 @@ class ObjectWriter:
                     f"v={object_version} part={part_number} chunks={len(mpu_redis_chunks)}: {e}"
                 )
             perf_redis_ms += (time.monotonic() - t0) * 1000
+            mpu_redis_batch_start_index += len(mpu_redis_chunks)
             mpu_redis_chunks.clear()
 
         async def _consumer() -> None:
