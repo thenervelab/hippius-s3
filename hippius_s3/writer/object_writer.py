@@ -16,6 +16,7 @@ from opentelemetry import trace
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
+from hippius_s3.cache import create_fs_store
 from hippius_s3.config import get_config
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.parts_service import upsert_part_placeholder
@@ -43,7 +44,7 @@ class ObjectWriter:
         self.config = get_config()
         self.obj_cache = RedisObjectPartsCache(redis_client)
         # Initialize FS store for write-through (optional for backward compat during rollout)
-        self.fs_store = fs_store or FileSystemPartsStore(self.config.object_cache_dir)
+        self.fs_store = fs_store or create_fs_store(self.config)
 
     async def create_version_for_migration(
         self,

@@ -28,6 +28,7 @@ from redis.asyncio import Redis
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hippius_s3.cache import FileSystemPartsStore
+from hippius_s3.cache import create_fs_store
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.sentry import init_sentry
@@ -463,7 +464,7 @@ async def gc_soft_deleted_objects(db: asyncpg.Connection) -> int:
 async def run_janitor_loop():
     """Main janitor loop: periodically clean stale and old parts."""
     db = await asyncpg.connect(config.database_url)
-    fs_store = FileSystemPartsStore(config.object_cache_dir)
+    fs_store = create_fs_store(config)
     redis_client = Redis.from_url(config.redis_queues_url)
 
     # Initialize janitor-owned OTel metrics

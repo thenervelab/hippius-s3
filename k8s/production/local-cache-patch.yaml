@@ -1,0 +1,68 @@
+# Patch: Add local cache volume + nodeSelector for CephFS → local storage migration
+# Applies to: api, arion-uploader, janitor (pods that use FS cache)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k8s-v3-node6-cache
+      containers:
+        - name: api
+          volumeMounts:
+            - name: local-cache
+              mountPath: /var/lib/hippius/local_object_cache
+            - name: object-cache
+              mountPath: /var/lib/hippius/object_cache
+              readOnly: true
+      volumes:
+        - name: local-cache
+          persistentVolumeClaim:
+            claimName: local-cache-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arion-uploader
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k8s-v3-node6-cache
+      containers:
+        - name: arion-uploader
+          volumeMounts:
+            - name: local-cache
+              mountPath: /var/lib/hippius/local_object_cache
+            - name: object-cache
+              mountPath: /var/lib/hippius/object_cache
+              readOnly: true
+      volumes:
+        - name: local-cache
+          persistentVolumeClaim:
+            claimName: local-cache-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: janitor
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k8s-v3-node6-cache
+      containers:
+        - name: janitor
+          volumeMounts:
+            - name: local-cache
+              mountPath: /var/lib/hippius/local_object_cache
+            - name: object-cache
+              mountPath: /var/lib/hippius/object_cache
+              readOnly: true
+      volumes:
+        - name: local-cache
+          persistentVolumeClaim:
+            claimName: local-cache-pvc
