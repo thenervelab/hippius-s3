@@ -7,6 +7,8 @@ resources:
   - ../base
   - postgres-objectstore.yaml
   - gateway-nodeport.yaml
+  - pv-local-cache.yaml
+  - pvc-local-cache.yaml
 
 patches:
   - path: namespace-patch.yaml
@@ -16,6 +18,8 @@ patches:
   - path: redis-tuning.yaml
   - path: ingress-patch.yaml
   - path: services-patch.yaml
+  - path: local-cache-patch.yaml
+  - path: local-cache-configmap-patch.yaml
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api
