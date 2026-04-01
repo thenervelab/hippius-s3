@@ -37,7 +37,9 @@ def create_redis_client(redis_url: str) -> Union[Redis, RedisCluster]:
             port=int(port),
             socket_connect_timeout=5,
             socket_timeout=5,
-            retry_on_error=[RedisConnectionError(), RedisTimeoutError()],
+            health_check_interval=30,
+            socket_keepalive=True,
+            retry_on_error=[RedisConnectionError, RedisTimeoutError],  # type: ignore[arg-type]  # stubs say instances, runtime expects classes
         )
     logger.info("Creating Redis client")
     return Redis.from_url(redis_url)
