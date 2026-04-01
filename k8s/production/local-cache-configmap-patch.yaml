@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hippius-s3-defaults
+data:
+  HIPPIUS_OBJECT_CACHE_DIR: "/var/lib/hippius/local_object_cache"
+  HIPPIUS_OBJECT_CACHE_FALLBACK_DIR: "/var/lib/hippius/object_cache"

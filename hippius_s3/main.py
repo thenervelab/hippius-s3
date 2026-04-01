@@ -28,9 +28,9 @@ from hippius_s3.api.s3 import errors as s3_errors
 from hippius_s3.api.s3.public_router import router as public_router
 from hippius_s3.api.s3.router import router as s3_router_new
 from hippius_s3.api.user import router as user_router
-from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisDownloadChunksCache
 from hippius_s3.cache import RedisObjectPartsCache
+from hippius_s3.cache import create_fs_store
 from hippius_s3.config import Config
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
@@ -134,7 +134,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Cache repositories
         app.state.obj_cache = RedisObjectPartsCache(app.state.redis_client, queues_client=app.state.redis_queues_client)
         app.state.dl_cache = RedisDownloadChunksCache(app.state.redis_client)
-        app.state.fs_store = FileSystemPartsStore(config.object_cache_dir)
+        app.state.fs_store = create_fs_store(config)
         logger.info("Cache repositories initialized")
 
         from hippius_s3.monitoring import MetricsCollector

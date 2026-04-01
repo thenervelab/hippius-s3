@@ -14,8 +14,8 @@ import redis.asyncio as async_redis
 from opentelemetry import trace
 from pydantic import BaseModel
 
-from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
+from hippius_s3.cache import create_fs_store
 from hippius_s3.dlq.upload_dlq import UploadDLQManager
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
@@ -150,7 +150,7 @@ class Uploader:
         self.backend_name = backend_name
         self.backend_client = backend_client
         self.obj_cache = RedisObjectPartsCache(redis_client)
-        self.fs_store = FileSystemPartsStore(config.object_cache_dir)
+        self.fs_store = create_fs_store(config)
         self.dlq_manager = UploadDLQManager(redis_queues_client, backend_name=backend_name)
 
     class _ConnCtx:
