@@ -17,6 +17,7 @@ data:
     cluster-node-timeout 5000
     cluster-require-full-coverage no
     cluster-migration-barrier 1
+    cluster-preferred-endpoint-type hostname
 
     maxmemory 16gb
     maxmemory-policy allkeys-lru
