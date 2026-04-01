@@ -13,7 +13,7 @@ def create_fs_store(config: object) -> FileSystemPartsStore:
     fallback_dir = getattr(config, "object_cache_fallback_dir", "")
     cache_dir = getattr(config, "object_cache_dir", "")
     if fallback_dir:
-        return DualFileSystemPartsStore(cache_dir, fallback_dir)  # type: ignore[return-value]
+        return DualFileSystemPartsStore(cache_dir, fallback_dir)
     return FileSystemPartsStore(cache_dir)
 
 
