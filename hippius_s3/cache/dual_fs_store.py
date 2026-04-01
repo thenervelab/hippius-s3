@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import logging
 from typing import Optional
 
 from hippius_s3.cache.fs_store import FileSystemPartsStore
-
-
-logger = logging.getLogger(__name__)
 
 
 class DualFileSystemPartsStore:
