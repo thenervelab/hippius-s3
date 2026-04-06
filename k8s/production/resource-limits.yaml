@@ -39,7 +39,7 @@ kind: Deployment
 metadata:
   name: arion-uploader
 spec:
-  replicas: 15
+  replicas: 25
   template:
     spec:
       containers:

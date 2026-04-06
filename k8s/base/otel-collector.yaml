@@ -38,6 +38,13 @@ data:
         endpoint: tempo.monitoring.svc.cluster.local:4317
         tls:
           insecure: true
+        retry_on_failure:
+          enabled: true
+          max_elapsed_time: 300s
+        sending_queue:
+          enabled: true
+          num_consumers: 4
+          queue_size: 100
       loki:
         endpoint: http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push
 

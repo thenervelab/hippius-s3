@@ -16,6 +16,8 @@ loki:
   storage:
     type: filesystem
   limits_config:
+    ingestion_rate_mb: 8
+    ingestion_burst_size_mb: 16
     retention_period: 168h
     max_query_length: 168h
     max_query_parallelism: 32
@@ -28,10 +30,10 @@ singleBinary:
   resources:
     requests:
       cpu: 100m
-      memory: 256Mi
+      memory: 512Mi
     limits:
       cpu: 500m
-      memory: 1Gi
+      memory: 2Gi
 
 gateway:
   enabled: false
