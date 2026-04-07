@@ -2,26 +2,31 @@
 
 ```mermaid
 flowchart LR
+    Gateway[Gateway - Auth/ACL/Rate Limit]
     API[FastAPI S3 API]
 
     subgraph Workers
-        Pinner
-        ChainRetry[Substrate Submit Wrapper]
+        Uploader[Arion Uploader]
+        Downloader[Arion Downloader]
+        Unpinner[Unpinner]
+        Janitor[FS Cache Cleanup]
     end
 
-    Redis[(Redis)]
+    Redis[(Redis Queues)]
     DLQFS[(DLQ Filesystem)]
     DB[(Postgres)]
-    IPFS[Hippius SDK / IPFS]
-    Substrate[Substrate Node]
+    Arion[Arion Service]
+    HippiusAPI[Hippius API]
 
+    Gateway -->|forward authenticated request| API
     API -->|upsert object/parts| DB
-    API -->|write part bytes and enqueue | Redis
-    Pinner -->|dequeue| Redis
-    Pinner -->|upload/pin parts| IPFS
-    Pinner -->|manifest publish via adapter| IPFS
-    Pinner -->|update status and manifest CID| DB
-    Pinner -->|DLQ persist| DLQFS
-    ChainRetry -->|submit storage_request| Substrate
+    API -->|write part bytes and enqueue| Redis
+    Uploader -->|dequeue| Redis
+    Uploader -->|upload chunks| Arion
+    Uploader -->|update chunk_backend| DB
+    Uploader -->|DLQ persist| DLQFS
+    Downloader -->|fetch chunks| Arion
+    Unpinner -->|delete chunks| Arion
+    HippiusAPI -.->|pin requests / account checks| Arion
     DLQFS -.->|hydrate requeue| Redis
 ```

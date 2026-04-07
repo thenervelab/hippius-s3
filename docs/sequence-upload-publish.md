@@ -1,35 +1,37 @@
-## Upload/Publish Sequence (PUT or Multipart Append)
+## Upload Sequence (PUT or Multipart Complete)
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant Client
+    participant Gateway
     participant API
-    participant Redis as Redis Cache
-    participant Pinner as Pinner Worker
-    participant IPFS as IPFS Service
-    participant SDK as Hippius SDK
+    participant Redis as Redis Queues
+    participant FSCache as FS Cache
+    participant Worker as Backend Uploader
+    participant Backend as Arion
     participant DB as Postgres
 
-    Client->>API: PUT / append bytes
-    API->>DB: upsert object / initial parts rows
-    API->>Redis: write part bytes (obj:{object_id}:part:{n})
-    API-->>Client: 200 (append version/etag)
-    API->>Redis: enqueue UploadChainRequest
+    Client->>Gateway: PUT /{bucket}/{key}
+    Gateway->>Gateway: auth + ACL + rate limit + audit
+    Gateway->>API: forward with X-Hippius-* headers
+    API->>DB: upsert object (status=publishing) + part rows
+    API->>Redis: write part bytes (write-through)
+    API->>FSCache: write part bytes (write-through)
+    API->>Redis: enqueue UploadChainRequest per backend
+    API-->>Client: 200 (ETag)
 
-    Pinner->>Redis: dequeue request
-    Pinner->>Redis: get part bytes
-    Pinner->>IPFS: upload + pin part(s)
-    IPFS-->>Pinner: part CID(s)
-    Pinner->>DB: upsert parts(object_id, part_number, ipfs_cid)
-    Pinner->>Pinner: build manifest if all parts CIDed
-    alt publish_to_chain
-        Pinner->>IPFS: publish_manifest(file bytes)
-        IPFS->>SDK: s3_publish (retries)
-        SDK-->>IPFS: cid, tx_hash
-    else fallback
-        Pinner->>IPFS: upload+pin manifest
-        IPFS-->>Pinner: manifest CID
+    Worker->>Redis: dequeue UploadChainRequest
+    Worker->>Redis: get part/chunk bytes
+    loop each chunk in part
+        Worker->>Backend: upload chunk
+        Backend-->>Worker: CID / backend_identifier
+        Worker->>DB: upsert chunk_backend(chunk_id, backend, identifier)
     end
-    Pinner->>DB: update objects.ipfs_cid, status=uploaded
+    alt all chunks uploaded
+        Worker->>DB: update object_version status=uploaded
+    else permanent error after retries
+        Worker->>DB: update object_version status=failed
+        Worker->>Worker: persist to DLQ
+    end
 ```

@@ -65,7 +65,7 @@ CLI Usage
   - `uv run hippius_s3/scripts/cleanup_migration_versions.py [--bucket <name>] [--key <key>] [--min-age-minutes 30] [--limit 1000] [--dry-run]`
   - Behavior:
     - Selects non-current `version_type='migration'` versions older than `--min-age-minutes` (default 30)
-    - Enqueues IPFS unpin (if a CID exists)
+    - Enqueues backend unpin (if a CID exists)
     - Deletes parts and the version row
 
 Containerized runner (optional)

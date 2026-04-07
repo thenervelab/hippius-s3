@@ -2,7 +2,7 @@
 
 **Last Updated: February 17, 2026**
 
-This Acceptable Use Policy ("AUP") governs the use of all services provided by Hippius ("we," "us," "our"), including but not limited to decentralized storage via **s3.hippius.com**, direct storage via **arion.hippius.com**, IPFS pinning, virtual machines, and any related infrastructure, APIs, or tools (collectively, the "Services"). This AUP is incorporated by reference into the Hippius [Terms and Conditions](https://hippius.com/terms-and-conditions).
+This Acceptable Use Policy ("AUP") governs the use of all services provided by Hippius ("we," "us," "our"), including but not limited to decentralized storage via **s3.hippius.com**, direct storage via **arion.hippius.com**, virtual machines, and any related infrastructure, APIs, or tools (collectively, the "Services"). This AUP is incorporated by reference into the Hippius [Terms and Conditions](https://hippius.com/terms-and-conditions).
 
 By using any Hippius Service, you agree to comply with this AUP. Violation of this policy may result in immediate suspension or termination of your account, removal of stored content, and, where appropriate, referral to law enforcement authorities.
 
@@ -162,4 +162,4 @@ For questions about this Acceptable Use Policy, to report violations, or to subm
 
 ---
 
-*This Acceptable Use Policy applies to all Hippius Services, including storage accessed via s3.hippius.com, arion.hippius.com, IPFS gateways, and any associated APIs or interfaces. By using any Hippius Service, you acknowledge that you have read, understood, and agree to be bound by this policy.*
+*This Acceptable Use Policy applies to all Hippius Services, including storage accessed via s3.hippius.com, arion.hippius.com, and any associated APIs or interfaces. By using any Hippius Service, you acknowledge that you have read, understood, and agree to be bound by this policy.*

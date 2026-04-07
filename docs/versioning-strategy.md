@@ -137,7 +137,7 @@ GET /bucket/file.txt
 [7 days later - cleanup]
   - Verify bbb-222 still is_latest = TRUE
   - Delete aaa-111 and all parts
-  - Unpin old CIDs from IPFS
+  - Unpin old CIDs from backend
   - Mark migration as 'cleaned'
 
 [Final state]

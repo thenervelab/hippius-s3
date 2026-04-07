@@ -18,7 +18,7 @@ The monitoring stack consists of:
 graph TB
     subgraph "Application Layer"
         API[FastAPI App<br/>:8000]
-        Workers[Workers<br/>uploader, substrate,<br/>downloader, etc.]
+        Workers[Workers<br/>uploader, downloader,<br/>unpinner, etc.]
     end
 
     subgraph "Infrastructure"
@@ -26,7 +26,7 @@ graph TB
         RedisAccounts[(Redis Accounts<br/>:6380)]
         RedisChain[(Redis Chain<br/>:6381)]
         Postgres[(PostgreSQL<br/>:5432)]
-        IPFS[IPFS Node]
+        Arion[Arion Service]
         DockerLogs[/var/lib/docker/containers]
     end
 
@@ -85,7 +85,7 @@ graph TB
     classDef observability fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px
 
     class API,Workers appLayer
-    class Redis,RedisAccounts,RedisChain,Postgres,IPFS,DockerLogs infra
+    class Redis,RedisAccounts,RedisChain,Postgres,Arion,DockerLogs infra
     class RedisExp,RedisAccExp,RedisChainExp,PostgresExp exporter
     class OTEL,Prom,Loki,Tempo,Promtail,Grafana observability
 ```

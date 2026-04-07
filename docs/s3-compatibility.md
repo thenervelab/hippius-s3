@@ -72,7 +72,7 @@ Notes:
 | GetObjectTorrent                                |           |                                                             |                                               |                                                                      |
 | GetPublicAccessBlock                            |           |                                                             |                                               |                                                                      |
 | HeadBucket                                      | ✔         | 200 if exists, 404 if not (empty body)                      | HEAD /{bucket}                                | test_CreateBucket.py                                                 |
-| HeadObject                                      | ✔         | Returns metadata headers (size, content type, ETag, CID)    | HEAD /{bucket}/{key}                          | test_HeadObject.py, test_HeadObject_Pending.py                       |
+| HeadObject                                      | ✔         | Returns metadata headers (size, content type, ETag, version) | HEAD /{bucket}/{key}                          | test_HeadObject.py, test_HeadObject_Pending.py                       |
 | ListBucketAnalyticsConfigurations               |           |                                                             |                                               |                                                                      |
 | ListBucketIntelligentTieringConfigurations      |           |                                                             |                                               |                                                                      |
 | ListBucketInventoryConfigurations               |           |                                                             |                                               |                                                                      |
@@ -81,7 +81,7 @@ Notes:
 | ListDirectoryBuckets                            |           |                                                             |                                               |                                                                      |
 | ListMultipartUploads                            | ✔         | Lists ongoing multipart uploads                             | GET /{bucket}?uploads                         | test_ListMultipartUploads.py                                         |
 | ListObjects                                     | ✔         | Optional prefix filtering                                   | GET /{bucket}                                 | test_ListObjects.py                                                  |
-| ListObjectsV2                                   | ✔         | Partial: basic listing + Prefix; no v2 tokens/delimiter yet | GET /{bucket}                                 | test_ListObjects.py                                                  |
+| ListObjectsV2                                   | ✔         | Basic listing + Prefix only; no ContinuationToken/StartAfter/Delimiter; IsTruncated always false | GET /{bucket}                                 | test_ListObjects.py                                                  |
 | ListObjectVersions                              |           |                                                             |                                               |                                                                      |
 | ListParts                                       | ✔         | Lists parts; supports pagination                            | GET /{bucket}/{key}?uploadId=...              | test_ListParts.py                                                    |
 | PutBucketAccelerateConfiguration                |           |                                                             |                                               |                                                                      |
@@ -218,6 +218,7 @@ Notes:
   - `POST /{bucket}/{key}?uploadId=...` — Complete multipart upload (computes combined ETag, enqueues publish)
   - `DELETE /{bucket}/{key}?uploadId=...` — Abort multipart upload
   - `GET /{bucket}?uploads` — List ongoing multipart uploads
+  - `GET /{bucket}/{key}?uploadId=...` — List parts (supports `max-parts` and `part-number-marker` pagination)
 
 - **Error responses**
 
@@ -226,6 +227,8 @@ Notes:
 
 - **Headers returned**
   - `Content-Type`, `Content-Length`, `ETag` (quoted), `Last-Modified`
-  - `x-amz-ipfs-cid` on HEAD responses: CID or `pending`
-  - `x-hippius-source`: `cache` or `pipeline` (diagnostic; indicates serving source)
   - `Accept-Ranges: bytes` on GETs
+  - `x-amz-version-id`: object version number
+  - `x-hippius-source`: `cache` or `pipeline` (diagnostic; indicates serving source)
+  - `X-Hippius-Arion-File-Hash`: Arion backend file hash or `pending`
+  - `x-amz-meta-append-version`: current append version (when applicable)
