@@ -253,16 +253,22 @@ class SubstrateCacher:
         main_account_credits = await self.fetch_free_credits()
         logger.info(f"Successfully fetched {len(main_account_credits)} account credits")
 
-        subaccount_role_map = await self.fetch_subaccount_roles()
-        subaccount_to_main = await self.fetch_subaccount_mappings()
-
-        logger.debug(
-            f"Data summary: {len(main_account_credits)} credits, "
-            f"{len(subaccount_role_map)} roles, {len(subaccount_to_main)} mappings"
-        )
-
-        await self.cache_subaccount_data(main_account_credits, subaccount_role_map, subaccount_to_main)
+        # Cache main account credits first - this is critical for access key auth
         await self.cache_main_account_credits(main_account_credits)
+
+        # Subaccount caching is optional - the pallet may not exist on chain
+        try:
+            subaccount_role_map = await self.fetch_subaccount_roles()
+            subaccount_to_main = await self.fetch_subaccount_mappings()
+
+            logger.debug(
+                f"Data summary: {len(main_account_credits)} credits, "
+                f"{len(subaccount_role_map)} roles, {len(subaccount_to_main)} mappings"
+            )
+
+            await self.cache_subaccount_data(main_account_credits, subaccount_role_map, subaccount_to_main)
+        except RuntimeError as e:
+            logger.warning(f"Subaccount caching skipped: {e}")
 
         await self.disconnect()
 
