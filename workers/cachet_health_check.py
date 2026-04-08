@@ -35,8 +35,8 @@ async def check_health_and_update_cachet():
         return
 
     health_url = "http://gateway:8080/health"
-    cachet_update_url = f"{config.cachet_api_url}/api/v1/components/{config.cachet_component_id}"
-    headers = {"X-Cachet-Token": config.cachet_api_key}
+    cachet_update_url = f"{config.cachet_api_url}/api/components/{config.cachet_component_id}"
+    headers = {"Authorization": f"Bearer {config.cachet_api_key}"}
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         while True:
