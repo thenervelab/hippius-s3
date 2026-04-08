@@ -106,16 +106,6 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_DOWNLOAD_QUEUE_NAMES
-            - name: CACHET_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: CACHET_API_KEY
-            - name: CACHET_COMPONENT_ID
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: CACHET_COMPONENT_ID
             - name: DISCORD_WEBHOOK_URL
               valueFrom:
                 secretKeyRef:
