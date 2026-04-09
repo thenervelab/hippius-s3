@@ -40,6 +40,7 @@ async def auth_router_middleware(
     if auth_result.auth_method == "access_key":
         request.state.access_key = auth_result.access_key
         request.state.account_address = auth_result.account_address
+        request.state.account_id = auth_result.account_address
         request.state.token_type = auth_result.token_type
         if auth_result.access_key:
             logger.debug(f"Authenticated with access key: {auth_result.access_key[:8]}***")
