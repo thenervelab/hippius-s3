@@ -161,6 +161,7 @@ async def _authenticate_presigned_url(request: Request, logger: Any) -> AuthResu
         auth_method="access_key",
         access_key=credential_id,
         account_address=account_address,
+        account_id=account_address,
         token_type=token_type,
     )
 
@@ -283,6 +284,7 @@ async def _authenticate_access_key_header(request: Request, credential: str, log
         auth_method="access_key",
         access_key=credential,
         account_address=account_address,
+        account_id=account_address,
         token_type=token_type,
     )
 
