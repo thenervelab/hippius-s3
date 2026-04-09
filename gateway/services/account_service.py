@@ -95,12 +95,12 @@ async def fetch_account(
         delete = role == "UploadDelete"
         main_account_id = data["main_account_id"]
 
-        has_credits, free_credits = False, 0
+        has_credits, free_credits = True, 0
         main_account_cache_key = f"hippius_main_account_credits:{main_account_id}"
         main_account_data = await redis_accounts_client.get(main_account_cache_key)
         if main_account_data:
             main_data = json.loads(main_account_data)
-            has_credits = main_data.get("has_credits", False)
+            has_credits = main_data.get("has_credits", True)
             free_credits = main_data.get("free_credits", 0)
 
         logger.info(f"{subaccount_id}:{main_account_id}:{free_credits}")
@@ -144,14 +144,14 @@ async def fetch_account_by_main_address(
     main_account_cache_key = f"hippius_main_account_credits:{account_address}"
     main_account_data = await redis_accounts_client.get(main_account_cache_key)
 
-    has_credits, free_credits = False, 0
+    has_credits, free_credits = True, 0
     if main_account_data:
         main_data = json.loads(main_account_data)
-        has_credits = main_data.get("has_credits", False)
+        has_credits = main_data.get("has_credits", True)
         free_credits = main_data.get("free_credits", 0)
         logger.info(f"Access key account: {account_address}:{free_credits}")
     else:
-        logger.warning(f"No cached credits found for main account: {account_address}")
+        logger.warning(f"No cached credits found for main account: {account_address}, defaulting to has_credits=True")
 
     return HippiusAccount(
         id=account_address,
