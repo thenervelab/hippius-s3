@@ -187,6 +187,7 @@ def factory() -> FastAPI:
         app.middleware("http")(audit_log_middleware)
     app.middleware("http")(metrics_middleware)
     app.middleware("http")(tracing_middleware)
+    app.middleware("http")(cors_middleware)
     app.middleware("http")(verify_frontend_hmac_middleware)
     app.middleware("http")(acl_middleware)
     app.middleware("http")(account_middleware)
@@ -195,7 +196,6 @@ def factory() -> FastAPI:
     # Innermost middleware: validates input before body streaming begins
     app.middleware("http")(input_validation_middleware)
 
-    app.middleware("http")(cors_middleware)
     return app
 
 
