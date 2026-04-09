@@ -173,6 +173,11 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
     elif "policy" in request.query_params:
         return await set_bucket_policy(bucket_name, request, db)
 
+    # Check if this is a request to set CORS (we just return 200 OK)
+    elif "cors" in request.query_params:
+        logger.info(f"Ignored CORS configuration for bucket '{bucket_name}' via S3 protocol")
+        return Response(status_code=200)
+
     # Handle standard bucket creation if not a tagging, lifecycle, or policy request
     else:
         if is_valid_ss58_address(bucket_name):
