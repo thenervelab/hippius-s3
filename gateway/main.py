@@ -177,24 +177,21 @@ def factory() -> FastAPI:
         forward_service = request.app.state.forward_service
         return await forward_service.forward_request(request)
 
-    # Register middleware in REVERSE order (outermost first)
-    # IMPORTANT: auth_router must execute BEFORE account (so register AFTER)
-    # IMPORTANT: trailing_slash must execute AFTER auth_router (so register BEFORE)
-    # IMPORTANT: audit_log must execute AFTER account (so register BEFORE) to access account info
-    # IMPORTANT: ray_id must execute FIRST (so register LAST) to make ray_id available to all middlewares
+    # Starlette executes middleware last-registered-first (last = outermost).
+    # The list below runs innermost → outermost on the request path.
     app.middleware("http")(ray_id_middleware)
     if config.enable_audit_logging:
         app.middleware("http")(audit_log_middleware)
     app.middleware("http")(metrics_middleware)
     app.middleware("http")(tracing_middleware)
-    app.middleware("http")(cors_middleware)
     app.middleware("http")(verify_frontend_hmac_middleware)
     app.middleware("http")(acl_middleware)
     app.middleware("http")(account_middleware)
     app.middleware("http")(trailing_slash_normalizer)
     app.middleware("http")(auth_router_middleware)
-    # Innermost middleware: validates input before body streaming begins
     app.middleware("http")(input_validation_middleware)
+    # Outermost: CORS must wrap everything so error responses get CORS headers
+    app.middleware("http")(cors_middleware)
 
     return app
 
