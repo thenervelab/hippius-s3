@@ -86,7 +86,7 @@ def test_seed_phrase() -> str:
 @pytest.fixture(scope="session")
 def test_access_key() -> str:
     """Return a hip_ access key for e2e tests."""
-    return os.getenv("HIPPIUS_KEY", "hip_e2e_test_master")
+    return os.getenv("HIPPIUS_E2E_ACCESS_KEY", "hip_e2e_test_master")
 
 
 @pytest.fixture(scope="session")
