@@ -10,9 +10,14 @@ from fastapi import FastAPI
 from httpx import ASGITransport
 from httpx import AsyncClient
 
+from gateway.middlewares.access_key_auth import VerifiedAccessKey
 from gateway.middlewares.account import account_middleware
 from gateway.middlewares.acl import acl_middleware
 from gateway.middlewares.auth_router import auth_router_middleware
+
+
+def _verified(account_address: str, token_type: str = "sub") -> VerifiedAccessKey:
+    return VerifiedAccessKey(account_address=account_address, token_type=token_type, has_credits=True)
 
 
 @pytest.fixture  # type: ignore[misc]
@@ -50,7 +55,7 @@ async def test_sub_token_denied_without_grants(integration_app: Any) -> None:
     auth_header = "AWS4-HMAC-SHA256 Credential=hip_bob_sub1/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
 
     # Patch verify function as AsyncMock
-    mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
+    mock_verify = AsyncMock(return_value=_verified(bob_id))
 
     with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
         with patch("gateway.middlewares.account.config.bypass_credit_check", True):
@@ -75,7 +80,7 @@ async def test_sub_token_allowed_with_access_key_grant(integration_app: Any) -> 
 
     auth_header = "AWS4-HMAC-SHA256 Credential=hip_bob_sub1/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
 
-    mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
+    mock_verify = AsyncMock(return_value=_verified(bob_id))
 
     with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
         with patch("gateway.middlewares.account.config.bypass_credit_check", True):
@@ -101,7 +106,7 @@ async def test_sub_token_denied_with_different_key_grant(integration_app: Any) -
 
     auth_header = "AWS4-HMAC-SHA256 Credential=hip_bob_sub1/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
 
-    mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
+    mock_verify = AsyncMock(return_value=_verified(bob_id))
 
     with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
         with patch("gateway.middlewares.account.config.bypass_credit_check", True):
@@ -123,7 +128,7 @@ async def test_master_token_bypasses_acl_for_owned_bucket(integration_app: Any) 
 
     auth_header = "AWS4-HMAC-SHA256 Credential=hip_alice_master/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
 
-    mock_verify = AsyncMock(return_value=(True, alice_id, "master"))
+    mock_verify = AsyncMock(return_value=_verified(alice_id, "master"))
 
     with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
         with patch("gateway.middlewares.account.config.bypass_credit_check", True):
@@ -149,7 +154,7 @@ async def test_account_grant_allows_all_keys(integration_app: Any) -> None:
     for bob_key in ["hip_bob_key1", "hip_bob_key2", "hip_bob_key99"]:
         auth_header = f"AWS4-HMAC-SHA256 Credential={bob_key}/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
 
-        mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
+        mock_verify = AsyncMock(return_value=_verified(bob_id))
 
         with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
             with patch("gateway.middlewares.account.config.bypass_credit_check", True):
@@ -173,7 +178,7 @@ async def test_cross_account_access_key_grant(integration_app: Any) -> None:
 
     auth_header = "AWS4-HMAC-SHA256 Credential=hip_bob_contractor/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
 
-    mock_verify = AsyncMock(return_value=(True, bob_id, "sub"))
+    mock_verify = AsyncMock(return_value=_verified(bob_id))
 
     with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
         with patch("gateway.middlewares.account.config.bypass_credit_check", True):
@@ -207,7 +212,7 @@ async def test_presigned_get_uses_access_key_for_acl(integration_app: Any) -> No
     }
 
     # Patch presigned verifier to simulate successful verification and account mapping
-    mock_verify_presigned = AsyncMock(return_value=(True, bob_id, "sub"))
+    mock_verify_presigned = AsyncMock(return_value=_verified(bob_id))
 
     with patch("gateway.services.auth_orchestrator.verify_access_key_presigned_url", mock_verify_presigned):
         with patch("gateway.middlewares.account.config.bypass_credit_check", True):
