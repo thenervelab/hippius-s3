@@ -503,8 +503,6 @@ async def upload_part(
                 bucket_name=source_bucket_name,
                 address=request.state.account.main_account,
                 subaccount=request.state.account.main_account,
-                subaccount_seed_phrase=request.state.seed_phrase,
-                substrate_url=config.substrate_url,
                 size=int(source_obj.get("size_bytes") or 0),
                 multipart=bool((json.loads(source_obj.get("metadata") or "{}") or {}).get("multipart", False)),
                 chunks=dl_parts,

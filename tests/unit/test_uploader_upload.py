@@ -199,10 +199,7 @@ async def test_process_upload_skips_deleted_object(mock_config, mock_db_pool):
     mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
 
     payload = UploadChainRequest(
-        substrate_url="http://test",
         address="user1",
-        subaccount="user1",
-        subaccount_seed_phrase="test-seed",
         bucket_name="test-bucket",
         object_key="test-key",
         should_encrypt=False,
@@ -238,10 +235,7 @@ async def test_process_upload_skips_when_object_row_missing(mock_config, mock_db
     mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
 
     payload = UploadChainRequest(
-        substrate_url="http://test",
         address="user1",
-        subaccount="user1",
-        subaccount_seed_phrase="test-seed",
         bucket_name="test-bucket",
         object_key="test-key",
         should_encrypt=False,
@@ -396,10 +390,7 @@ async def test_process_upload_no_longer_calls_pin_on_api(mock_config, mock_db_po
     mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
 
     payload = UploadChainRequest(
-        substrate_url="http://test",
         address="user1",
-        subaccount="user1",
-        subaccount_seed_phrase="test-seed",
         bucket_name="test-bucket",
         object_key="test-key",
         should_encrypt=False,

@@ -7,6 +7,7 @@ import logging
 import re
 
 from fastapi import Request
+from pydantic import BaseModel
 from redis.asyncio import Redis
 
 from gateway.config import get_config
@@ -18,6 +19,8 @@ from gateway.middlewares.sigv4 import extract_signature_from_auth_header
 from gateway.middlewares.sigv4 import extract_signed_headers
 from gateway.services.auth_cache import cached_auth
 from gateway.services.auth_service import decrypt_secret
+from hippius_s3.services.hippius_api_service import TokenAuthResponse
+from hippius_s3.utils.ss58 import SS58_ADDRESS_PATTERN
 
 
 logger = logging.getLogger(__name__)
@@ -28,25 +31,48 @@ class AccessKeyAuthError(Exception):
     pass
 
 
+class VerifiedAccessKey(BaseModel):
+    account_address: str
+    token_type: str
+    has_credits: bool
+
+
 ALLOWED_TOKEN_TYPES = {"master", "sub"}
 ACCESS_KEY_PATTERN = re.compile(r"^hip_[a-zA-Z0-9_-]{1,240}$")
+_ACCOUNT_ADDRESS_RE = re.compile(SS58_ADDRESS_PATTERN)
+_CREDENTIAL_RE = re.compile(r"Credential=[^/]+/([^/]+)/([^/]+)/([^/]+)/")
+
+
+def _validate_token_response(token_response: TokenAuthResponse, access_key: str, label: str = "") -> None:
+    """Validate common token response fields. Raises AccessKeyAuthError on failure."""
+    prefix = f"{label} " if label else ""
+
+    if not token_response.valid or token_response.status != "active":
+        logger.warning(f"Invalid or inactive {prefix}access key: {access_key[:8]}***, status={token_response.status}")
+        raise AccessKeyAuthError("Invalid or inactive access key")
+
+    if not token_response.account_address:
+        logger.error(f"API returned empty account_address for {prefix}key: {access_key[:8]}***")
+        raise AccessKeyAuthError("Invalid API response: missing account_address")
+
+    if not _ACCOUNT_ADDRESS_RE.match(token_response.account_address):
+        logger.error(f"Invalid account address format: {token_response.account_address}")
+        raise AccessKeyAuthError("Invalid account address format")
+
+    if token_response.token_type not in ALLOWED_TOKEN_TYPES:
+        logger.error(f"Invalid token type: {token_response.token_type}")
+        raise AccessKeyAuthError(f"Invalid token type: {token_response.token_type}")
 
 
 async def verify_access_key_signature(
     request: Request,
     access_key: str,
     redis_client: "Redis",
-) -> tuple[bool, str, str]:
+) -> VerifiedAccessKey:
     """
     Verify AWS SigV4 signature using access key authentication.
 
-    Args:
-        request: FastAPI request object
-        access_key: Access key ID (starts with hip_)
-        redis_client: Redis client for auth caching
-
-    Returns:
-        (is_valid, account_address, token_type)
+    Raises AccessKeyAuthError on any validation or signature failure.
     """
     if not access_key or not ACCESS_KEY_PATTERN.match(access_key):
         logger.warning(f"Invalid access key format: {access_key[:8] if access_key else 'empty'}***")
@@ -63,22 +89,7 @@ async def verify_access_key_signature(
     signed_headers = extract_signed_headers(auth_header)
 
     token_response = await cached_auth(access_key, redis_client)
-
-    if not token_response.valid or token_response.status != "active":
-        logger.warning(f"Invalid or inactive access key: {access_key[:8]}***, status={token_response.status}")
-        return False, "", ""
-
-    if not token_response.account_address:
-        logger.error(f"API returned empty account_address for key: {access_key[:8]}***")
-        raise AccessKeyAuthError("Invalid API response: missing account_address")
-
-    if not re.match(r"^[1-9A-HJ-NP-Za-km-z]{47,48}$", token_response.account_address):
-        logger.error(f"Invalid account address format: {token_response.account_address}")
-        raise AccessKeyAuthError("Invalid account address format")
-
-    if token_response.token_type not in ALLOWED_TOKEN_TYPES:
-        logger.error(f"Invalid token type: {token_response.token_type}")
-        raise AccessKeyAuthError(f"Invalid token type: {token_response.token_type}")
+    _validate_token_response(token_response, access_key)
 
     decrypted_secret = decrypt_secret(
         token_response.encrypted_secret,
@@ -86,10 +97,7 @@ async def verify_access_key_signature(
         config.hippius_secret_decryption_material,
     )
 
-    credential_match = re.search(
-        r"Credential=[^/]+/([^/]+)/([^/]+)/([^/]+)/",
-        auth_header,
-    )
+    credential_match = _CREDENTIAL_RE.search(auth_header)
     if not credential_match:
         raise AccessKeyAuthError("Invalid credential format")
 
@@ -122,35 +130,32 @@ async def verify_access_key_signature(
     )
 
     # provided_signature is guaranteed non-empty by earlier validation
-    is_valid = hmac.compare_digest(calculated_signature, provided_signature or "")
+    if not hmac.compare_digest(calculated_signature, provided_signature or ""):
+        logger.warning(f"Signature mismatch for access key: {access_key[:8]}***")
+        raise AccessKeyAuthError("Signature does not match")
 
-    if is_valid:
-        logger.info(
-            f"Access key auth successful: key={access_key[:8]}***, account={token_response.account_address}, type={token_response.token_type}"
-        )
-        if token_response.token_type == "master":
-            logger.info(f"AUDIT: Master token used: key={access_key[:8]}***, account={token_response.account_address}")
-        return True, token_response.account_address, token_response.token_type
+    logger.info(
+        f"Access key auth successful: key={access_key[:8]}***, account={token_response.account_address}, type={token_response.token_type}"
+    )
+    if token_response.token_type == "master":
+        logger.info(f"AUDIT: Master token used: key={access_key[:8]}***, account={token_response.account_address}")
 
-    logger.warning(f"Signature mismatch for access key: {access_key[:8]}***")
-    return False, "", ""
+    return VerifiedAccessKey(
+        account_address=token_response.account_address,
+        token_type=token_response.token_type,
+        has_credits=token_response.credits > 0,
+    )
 
 
 async def verify_access_key_presigned_url(
     request: Request,
     access_key: str,
     redis_client: "Redis",
-) -> tuple[bool, str, str]:
+) -> VerifiedAccessKey:
     """
     Verify AWS SigV4 query-string (presigned URL) signature using access key authentication.
 
-    Args:
-        request: FastAPI request object
-        access_key: Access key ID (starts with hip_)
-        redis_client: Redis client for auth caching
-
-    Returns:
-        (is_valid, account_address, token_type)
+    Raises AccessKeyAuthError on any validation or signature failure.
     """
     if not access_key or not ACCESS_KEY_PATTERN.match(access_key):
         logger.warning(f"Invalid access key format in presigned URL: {access_key[:8] if access_key else 'empty'}***")
@@ -198,21 +203,9 @@ async def verify_access_key_presigned_url(
         logger.error(f"X-Amz-Date ({amz_date}) and credential scope date ({date_scope}) mismatch in presigned URL")
         raise AccessKeyAuthError("Invalid credential scope")
 
-    try:
-        expires = int(expires_str)
-    except ValueError:
-        logger.error(f"Invalid X-Amz-Expires value: {expires_str}")
-        raise AccessKeyAuthError("Invalid expires value") from None
+    expires = _parse_expires(expires_str)
 
-    if expires <= 0 or expires > 604800:
-        logger.error(f"X-Amz-Expires out of allowed range (1-604800): {expires}")
-        raise AccessKeyAuthError("Expires value out of range")
-
-    try:
-        signed_at = datetime.datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=datetime.timezone.utc)
-    except ValueError:
-        logger.error(f"Invalid X-Amz-Date format: {amz_date}")
-        raise AccessKeyAuthError("Invalid date format") from None
+    signed_at = _parse_amz_date(amz_date)
 
     now = datetime.datetime.now(datetime.timezone.utc)
     expiry_time = signed_at + datetime.timedelta(seconds=expires)
@@ -221,7 +214,7 @@ async def verify_access_key_presigned_url(
         logger.info(
             f"Presigned URL expired: signed_at={signed_at.isoformat()}, expires_in={expires}s, now={now.isoformat()}"
         )
-        return False, "", ""
+        raise AccessKeyAuthError("Request has expired")
 
     signed_headers = signed_headers_str.split(";")
 
@@ -231,24 +224,7 @@ async def verify_access_key_presigned_url(
         raise AccessKeyAuthError("Invalid signed headers")
 
     token_response = await cached_auth(access_key, redis_client)
-
-    if not token_response.valid or token_response.status != "active":
-        logger.warning(
-            f"Invalid or inactive access key for presigned URL: {access_key[:8]}***, status={token_response.status}"
-        )
-        return False, "", ""
-
-    if not token_response.account_address:
-        logger.error(f"API returned empty account_address for presigned key: {access_key[:8]}***")
-        raise AccessKeyAuthError("Invalid API response: missing account_address")
-
-    if not re.match(r"^[1-9A-HJ-NP-Za-km-z]{47,48}$", token_response.account_address):
-        logger.error(f"Invalid account address format: {token_response.account_address}")
-        raise AccessKeyAuthError("Invalid account address format")
-
-    if token_response.token_type not in ALLOWED_TOKEN_TYPES:
-        logger.error(f"Invalid token type for presigned URL: {token_response.token_type}")
-        raise AccessKeyAuthError(f"Invalid token type: {token_response.token_type}")
+    _validate_token_response(token_response, access_key, label="presigned URL")
 
     decrypted_secret = decrypt_secret(
         token_response.encrypted_secret,
@@ -283,19 +259,46 @@ async def verify_access_key_presigned_url(
     )
 
     # provided_signature is validated above as non-empty
-    is_valid = hmac.compare_digest(calculated_signature, str(provided_signature))
+    if not hmac.compare_digest(calculated_signature, str(provided_signature)):
+        logger.warning(f"Presigned URL signature mismatch for access key: {access_key[:8]}***")
+        raise AccessKeyAuthError("Signature does not match")
 
-    if is_valid:
+    logger.info(
+        f"Presigned URL access key auth successful: key={access_key[:8]}***, "
+        f"account={token_response.account_address}, type={token_response.token_type}"
+    )
+    if token_response.token_type == "master":
         logger.info(
-            f"Presigned URL access key auth successful: key={access_key[:8]}***, "
-            f"account={token_response.account_address}, type={token_response.token_type}"
+            f"AUDIT: Master token used via presigned URL: key={access_key[:8]}***, "
+            f"account={token_response.account_address}"
         )
-        if token_response.token_type == "master":
-            logger.info(
-                f"AUDIT: Master token used via presigned URL: key={access_key[:8]}***, "
-                f"account={token_response.account_address}"
-            )
-        return True, token_response.account_address, token_response.token_type
 
-    logger.warning(f"Presigned URL signature mismatch for access key: {access_key[:8]}***")
-    return False, "", ""
+    return VerifiedAccessKey(
+        account_address=token_response.account_address,
+        token_type=token_response.token_type,
+        has_credits=token_response.credits > 0,
+    )
+
+
+def _parse_expires(expires_str: str) -> int:
+    """Parse and validate X-Amz-Expires value."""
+    try:
+        expires = int(expires_str)
+    except ValueError:
+        logger.error(f"Invalid X-Amz-Expires value: {expires_str}")
+        raise AccessKeyAuthError("Invalid expires value") from None
+
+    if expires <= 0 or expires > 604800:
+        logger.error(f"X-Amz-Expires out of allowed range (1-604800): {expires}")
+        raise AccessKeyAuthError("Expires value out of range")
+
+    return expires
+
+
+def _parse_amz_date(amz_date: str) -> datetime.datetime:
+    """Parse X-Amz-Date string into a timezone-aware datetime."""
+    try:
+        return datetime.datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        logger.error(f"Invalid X-Amz-Date format: {amz_date}")
+        raise AccessKeyAuthError("Invalid date format") from None

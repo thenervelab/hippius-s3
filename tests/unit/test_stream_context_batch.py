@@ -110,7 +110,7 @@ async def test_partial_cached_sets_source_pipeline(
     mock_plan.return_value = plan_items
     mock_read_parts.return_value = [{"part_number": 1, "cid": "cid1"}]
     mock_crypto.is_supported_suite_id.return_value = True
-    mock_config.return_value = MagicMock(substrate_url="ws://localhost")
+    mock_config.return_value = MagicMock()
 
     # First and third cached, second missing
     obj_cache = FakeObjCache([True, False, True])
@@ -151,7 +151,7 @@ async def test_none_cached_sets_source_pipeline(
     mock_plan.return_value = plan_items
     mock_read_parts.return_value = [{"part_number": 1, "cid": "cid1"}]
     mock_crypto.is_supported_suite_id.return_value = True
-    mock_config.return_value = MagicMock(substrate_url="ws://localhost")
+    mock_config.return_value = MagicMock()
 
     obj_cache = FakeObjCache([False, False, False, False])
     db = FakeDB()

@@ -1,20 +1,14 @@
-import base64
 import hashlib
 import hmac
 import logging
 import re
-from typing import Awaitable
-from typing import Callable
 from urllib.parse import parse_qsl
 from urllib.parse import quote
 from urllib.parse import urlencode
 
 from fastapi import Request
-from fastapi import Response
-from starlette import status
 
 from gateway.config import get_config
-from gateway.utils.errors import s3_error_response
 
 
 config = get_config()
@@ -197,173 +191,6 @@ def calculate_signature(
     k_signing = sign(k_service, "aws4_request")
 
     return hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-class SigV4Verifier:
-    def __init__(
-        self,
-        request: Request,
-    ):
-        self.request = request
-        self.auth_header = request.headers.get("authorization", "")
-        self.amz_date = request.headers.get("x-amz-date", "")
-        self.method = request.method
-
-        # Canonical path derived strictly from raw_path bytes in the ASGI scope.
-        self.path = canonical_path_from_scope(request)
-        self.query_string = request.url.query
-        self.seed_phrase = ""
-        self.region = config.validator_region
-        self.service = "s3"
-
-    def extract_auth_parts(self) -> bool:
-        logger.debug(f"Request method: {self.method}")
-        logger.debug(f"Request path: {self.path}")
-        logger.debug(f"Request query: {self.query_string}")
-        logger.debug(f"AMZ date header: {self.amz_date}")
-
-        logger.debug("ALL REQUEST HEADERS:")
-        for key, value in self.request.headers.items():
-            logger.debug(f"  {key}: {value}")
-
-        if not self.auth_header or not self.auth_header.startswith("AWS4-HMAC-SHA256"):
-            logger.error("FAIL: Authorization header missing or invalid format")
-            raise AuthParsingError("Credentials not found")
-
-        logger.debug("SUCCESS: Authorization header format valid")
-
-        encoded_seed_phrase, date_scope, self.region, self.service = extract_credential_from_auth_header(
-            self.auth_header
-        )
-
-        logger.debug("Extracted credential parts:")
-        logger.debug(f"  Date scope: '{date_scope}'")
-        logger.debug(f"  Region: '{self.region}'")
-        logger.debug(f"  Service: '{self.service}'")
-
-        if not encoded_seed_phrase or len(encoded_seed_phrase.strip()) == 0:
-            logger.error("FAIL: Access key is empty")
-            raise AuthParsingError("Bad seed phrase format")
-
-        padding_needed = len(encoded_seed_phrase) % 4
-        if padding_needed:
-            encoded_seed_phrase += "=" * (4 - padding_needed)
-
-        seed_phrase_bytes = base64.b64decode(encoded_seed_phrase)
-
-        if not seed_phrase_bytes:
-            logger.error("FAIL: Seed phrase decoded to empty bytes")
-            raise AuthParsingError("Bad seed phrase format")
-
-        if not all(b < 128 for b in seed_phrase_bytes):
-            logger.error("FAIL: Seed phrase contains non-ASCII bytes")
-            raise AuthParsingError("Bad seed phrase format")
-
-        self.seed_phrase = seed_phrase_bytes.decode("ascii")
-        logger.debug("SUCCESS: Seed phrase decoded successfully")
-
-        if not self.seed_phrase or len(self.seed_phrase.strip()) == 0:
-            logger.error("FAIL: Seed phrase is empty after decoding")
-            raise AuthParsingError("Bad seed phrase format")
-
-        self.provided_signature = extract_signature_from_auth_header(self.auth_header)
-        logger.debug(f"SUCCESS: Extracted signature: {self.provided_signature}")
-
-        self.signed_headers = extract_signed_headers(self.auth_header)
-        logger.debug(f"SUCCESS: Extracted signed headers: {self.signed_headers}")
-
-        return True
-
-    async def create_canonical_request(self, headers: list[str]) -> str:
-        return await create_canonical_request(
-            request=self.request,
-            signed_headers=headers,
-            method=self.method,
-            path=self.path,
-            query_string=self.query_string,
-        )
-
-    def create_string_to_sign(self, canonical_request: str) -> str:
-        credential_scope = f"{self.amz_date[:8]}/{self.region}/{self.service}/aws4_request"
-        hashed_canonical_request = hashlib.sha256(canonical_request.encode()).hexdigest()
-        return f"AWS4-HMAC-SHA256\n{self.amz_date}\n{credential_scope}\n{hashed_canonical_request}"
-
-    def calculate_signature(self, string_to_sign: str) -> str:
-        date_stamp = self.amz_date[:8]
-        return calculate_signature(
-            string_to_sign=string_to_sign,
-            secret=self.seed_phrase,
-            date_stamp=date_stamp,
-            region=self.region,
-            service=self.service,
-        )
-
-    async def verify_signature(self) -> bool:
-        try:
-            self.extract_auth_parts()
-            logger.debug("SUCCESS: Auth parts extraction completed")
-        except AuthParsingError as e:
-            logger.error(f"FAIL: Auth parsing failed: {e}")
-            return False
-
-        canonical_request = await self.create_canonical_request(self.signed_headers)
-        logger.debug(f"Canonical request:\n{canonical_request}")
-
-        string_to_sign = self.create_string_to_sign(canonical_request)
-        logger.debug(f"String to sign:\n{string_to_sign}")
-
-        calculated_signature = self.calculate_signature(string_to_sign)
-        logger.debug(f"Calculated signature: {calculated_signature}")
-        logger.debug(f"Provided signature:   {self.provided_signature}")
-
-        signature_valid = hmac.compare_digest(calculated_signature, self.provided_signature)
-        logger.debug(f"Signature verification: {'SUCCESS' if signature_valid else 'FAIL'}")
-
-        return signature_valid
-
-
-async def sigv4_middleware(
-    request: Request,
-    call_next: Callable[[Request], Awaitable[Response]],
-) -> Response:
-    """
-    AWS Signature V4 verification middleware for the gateway.
-
-    Verifies the SigV4 signature and extracts the seed phrase from the request.
-    Public read access is handled by ACL middleware, not here.
-    """
-    exempt_paths = ["/docs", "/openapi.json", "/user/", "/robots.txt", "/metrics", "/health"]
-
-    if request.method == "OPTIONS":
-        return await call_next(request)
-
-    path = request.url.path
-
-    if any(path.startswith(exempt_path) or path == exempt_path for exempt_path in exempt_paths):
-        return await call_next(request)
-
-    # Allow anonymous GET/HEAD requests for public bucket access
-    # ACL middleware will handle authorization
-    # Exclude ListBuckets (/) which always requires authentication
-    if request.method in ["GET", "HEAD"]:
-        auth_header = request.headers.get("authorization")
-        if not auth_header and path != "/":
-            # No authentication provided - continue as anonymous
-            # request.state.seed_phrase will not be set
-            return await call_next(request)
-
-    verifier = SigV4Verifier(request)
-    is_valid = await verifier.verify_signature()
-
-    if not is_valid:
-        return s3_error_response(
-            code="SignatureDoesNotMatch",
-            message="The request signature we calculated does not match the signature you provided",
-            status_code=status.HTTP_403_FORBIDDEN,
-        )
-
-    request.state.seed_phrase = verifier.seed_phrase
-    return await call_next(request)
 
 
 def canonicalize_query_string(query_string: str) -> str:

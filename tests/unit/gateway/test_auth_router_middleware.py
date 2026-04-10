@@ -123,6 +123,7 @@ async def test_access_key_detection_and_routing(auth_router_app: Any) -> None:
     mock_token_response.token_type = test_token_type
     mock_token_response.encrypted_secret = encrypted_b64
     mock_token_response.nonce = nonce_b64
+    mock_token_response.credits = 100.0
 
     auth_header = f"AWS4-HMAC-SHA256 Credential={test_access_key}/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123def456"
 
@@ -192,6 +193,7 @@ async def test_access_key_with_invalid_signature_returns_403(auth_router_app: An
     mock_token_response.token_type = "master"
     mock_token_response.encrypted_secret = encrypted_b64
     mock_token_response.nonce = nonce_b64
+    mock_token_response.credits = 100.0
 
     auth_header = f"AWS4-HMAC-SHA256 Credential={test_access_key}/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
@@ -228,7 +230,13 @@ async def test_presigned_get_with_access_key_uses_access_key_auth(auth_router_ap
     test_token_type = "sub"
 
     # Patch the presigned URL verifier so we don't depend on its implementation here
-    mock_verify = AsyncMock(return_value=(True, test_account_address, test_token_type))
+    from gateway.middlewares.access_key_auth import VerifiedAccessKey
+
+    mock_verify = AsyncMock(
+        return_value=VerifiedAccessKey(
+            account_address=test_account_address, token_type=test_token_type, has_credits=True
+        )
+    )
 
     query_params = {
         "X-Amz-Algorithm": "AWS4-HMAC-SHA256",

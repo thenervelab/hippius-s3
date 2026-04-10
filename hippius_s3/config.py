@@ -84,7 +84,6 @@ class Config:
     max_metadata_size: int = env("MAX_METADATA_SIZE", convert=int)
 
     # Blockchain
-    substrate_url: str = env("HIPPIUS_SUBSTRATE_URL")
     hippius_service_key: str = env("HIPPIUS_SERVICE_KEY")
     arion_service_key: str = env("ARION_SERVICE_KEY")
     arion_bearer_token: str = env("ARION_BEARER_TOKEN")
