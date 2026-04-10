@@ -53,7 +53,6 @@ async def build_stream_context(
     rng: RangeRequest | None,
     address: str,
 ) -> StreamContext:
-    cfg = get_config()
     storage_version = require_supported_storage_version(int(info["storage_version"]))
     # v4-only policy: always decrypt at read time.
 
@@ -128,8 +127,6 @@ async def build_stream_context(
                 bucket_name=info.get("bucket_name", ""),
                 address=address,
                 subaccount=address,
-                subaccount_seed_phrase="",
-                substrate_url=cfg.substrate_url,
                 size=int(info.get("size_bytes") or 0),
                 multipart=bool(info.get("multipart")),
                 chunks=dl_parts,

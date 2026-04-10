@@ -71,6 +71,7 @@ class TokenAuthResponse(BaseModel):
     token_type: str
     encrypted_secret: str
     nonce: str
+    credits: float = 0.0
 
 
 class UploadResponse(BaseModel):

@@ -90,23 +90,6 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: account-cacher
-spec:
-  template:
-    spec:
-      containers:
-        - name: account-cacher
-          resources:
-            requests:
-              cpu: 200m
-              memory: 512Mi
-            limits:
-              cpu: 1000m
-              memory: 2Gi
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
   name: janitor
 spec:
   template:

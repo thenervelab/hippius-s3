@@ -44,18 +44,29 @@ def make_request(
 mock_redis = AsyncMock()
 
 
-@pytest.mark.asyncio
-async def test_presigned_url_expired_short_circuits_before_api_call() -> None:
-    """Expired presigned URL should return (False, '', '') without hitting Hippius API."""
-    access_key = "hip_presigned_key_12345"
+def _make_token_response(
+    account_address: str = "5FH2aQUbix3nNatzST4mPM8iuebGvSMFerZLdwvDmAwRDFep",
+    token_type: str = "sub",
+    credits: float = 100.0,
+) -> MagicMock:
+    """Build a mock TokenAuthResponse with all required fields."""
+    mock = MagicMock()
+    mock.valid = True
+    mock.status = "active"
+    mock.account_address = account_address
+    mock.token_type = token_type
+    mock.encrypted_secret = "enc"
+    mock.nonce = "nonce"
+    mock.credits = credits
+    return mock
 
-    # Signed 2 hours ago, expires in 1 hour -> definitely expired
-    now = datetime.datetime.now(datetime.timezone.utc)
-    signed_at = now - datetime.timedelta(hours=2)
+
+def _make_presigned_query_params(access_key: str, offset: datetime.timedelta = datetime.timedelta()) -> dict[str, str]:
+    """Build presigned URL query params with configurable signing time offset from now."""
+    signed_at = datetime.datetime.now(datetime.timezone.utc) + offset
     amz_date = signed_at.strftime("%Y%m%dT%H%M%SZ")
     date_scope = amz_date[:8]
-
-    query_params = {
+    return {
         "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
         "X-Amz-Credential": f"{access_key}/{date_scope}/us-east-1/s3/aws4_request",
         "X-Amz-Date": amz_date,
@@ -64,121 +75,52 @@ async def test_presigned_url_expired_short_circuits_before_api_call() -> None:
         "X-Amz-Signature": "deadbeef",
     }
 
+
+@pytest.mark.asyncio
+async def test_presigned_url_expired_raises() -> None:
+    """Expired presigned URL should raise AccessKeyAuthError without hitting Hippius API."""
+    access_key = "hip_presigned_key_12345"
+    query_params = _make_presigned_query_params(access_key, offset=datetime.timedelta(hours=-2))
     request = make_request(query_params=query_params)
 
-    # Patch cached_auth; it should not be called for expired URL
     mock_cached_auth = AsyncMock()
 
     with patch("gateway.middlewares.access_key_auth.cached_auth", mock_cached_auth):
-        with patch("gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret") as mock_decrypt:
-            with patch(
-                "gateway.middlewares.access_key_auth.create_canonical_request",
-                new_callable=AsyncMock,
-                return_value="canonical",
-            ) as mock_canonical:
-                with patch(
-                    "gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"
-                ) as mock_calc_sig:
-                    is_valid, account, token_type = await verify_access_key_presigned_url(
-                        request, access_key, mock_redis
-                    )
-
-    assert is_valid is False
-    assert account == ""
-    assert token_type == ""
+        with pytest.raises(AccessKeyAuthError, match="expired"):
+            await verify_access_key_presigned_url(request, access_key, mock_redis)
 
     mock_cached_auth.assert_not_awaited()
-    mock_decrypt.assert_not_called()
-    mock_canonical.assert_not_awaited()
-    mock_calc_sig.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_presigned_url_valid_window_verifies_signature() -> None:
-    """Valid, unexpired presigned URL should go through full signature pipeline."""
+async def test_presigned_url_valid_returns_verified_key() -> None:
+    """Valid, unexpired presigned URL should return VerifiedAccessKey."""
     access_key = "hip_presigned_key_12345"
-    account_address = "5FH2aQUbix3nNatzST4mPM8iuebGvSMFerZLdwvDmAwRDFep"
-    token_type = "sub"
-
-    now = datetime.datetime.now(datetime.timezone.utc)
-    signed_at = now - datetime.timedelta(minutes=1)
-    amz_date = signed_at.strftime("%Y%m%dT%H%M%SZ")
-    date_scope = amz_date[:8]
-
-    query_params = {
-        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
-        "X-Amz-Credential": f"{access_key}/{date_scope}/us-east-1/s3/aws4_request",
-        "X-Amz-Date": amz_date,
-        "X-Amz-Expires": "3600",
-        "X-Amz-SignedHeaders": "host",
-        "X-Amz-Signature": "deadbeef",
-    }
-
+    query_params = _make_presigned_query_params(access_key, offset=datetime.timedelta(minutes=-1))
     request = make_request(query_params=query_params)
 
-    mock_token_response = MagicMock()
-    mock_token_response.valid = True
-    mock_token_response.status = "active"
-    mock_token_response.account_address = account_address
-    mock_token_response.token_type = token_type
-    mock_token_response.encrypted_secret = "enc"
-    mock_token_response.nonce = "nonce"
-
-    mock_cached_auth = AsyncMock(return_value=mock_token_response)
-
-    with patch("gateway.middlewares.access_key_auth.cached_auth", mock_cached_auth):
+    with patch("gateway.middlewares.access_key_auth.cached_auth", AsyncMock(return_value=_make_token_response())):
         with patch("gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"):
             with patch(
                 "gateway.middlewares.access_key_auth.create_canonical_request",
                 new_callable=AsyncMock,
                 return_value="canonical",
-            ) as mock_canonical:
-                with patch(
-                    "gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"
-                ) as mock_calc_sig:
-                    is_valid, out_account, out_token_type = await verify_access_key_presigned_url(
-                        request, access_key, mock_redis
-                    )
+            ):
+                with patch("gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"):
+                    result = await verify_access_key_presigned_url(request, access_key, mock_redis)
 
-    assert is_valid is True
-    assert out_account == account_address
-    assert out_token_type == token_type
-
-    mock_cached_auth.assert_awaited()
-    mock_canonical.assert_awaited()
-    mock_calc_sig.assert_called()
+    assert result.account_address == "5FH2aQUbix3nNatzST4mPM8iuebGvSMFerZLdwvDmAwRDFep"
+    assert result.token_type == "sub"
+    assert result.has_credits is True
 
 
 @pytest.mark.asyncio
 async def test_canonical_query_for_presigned_excludes_signature() -> None:
     """Canonical query string for presigned URLs must exclude X-Amz-Signature."""
     access_key = "hip_presigned_key_12345"
-
-    now = datetime.datetime.now(datetime.timezone.utc)
-    signed_at = now
-    amz_date = signed_at.strftime("%Y%m%dT%H%M%SZ")
-    date_scope = amz_date[:8]
-
-    # Include an extra param to verify sorting and filtering behavior
-    query_params = {
-        "foo": "bar",
-        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
-        "X-Amz-Credential": f"{access_key}/{date_scope}/us-east-1/s3/aws4_request",
-        "X-Amz-Date": amz_date,
-        "X-Amz-Expires": "3600",
-        "X-Amz-SignedHeaders": "host",
-        "X-Amz-Signature": "deadbeef",
-    }
-
+    query_params = _make_presigned_query_params(access_key)
+    query_params["foo"] = "bar"
     request = make_request(query_params=query_params)
-
-    mock_token_response = MagicMock()
-    mock_token_response.valid = True
-    mock_token_response.status = "active"
-    mock_token_response.account_address = "5FH2aQUbix3nNatzST4mPM8iuebGvSMFerZLdwvDmAwRDFep"
-    mock_token_response.token_type = "sub"
-    mock_token_response.encrypted_secret = "enc"
-    mock_token_response.nonce = "nonce"
 
     captured_query_string: str | None = None
 
@@ -193,22 +135,17 @@ async def test_canonical_query_for_presigned_excludes_signature() -> None:
         captured_query_string = query_string
         return "canonical"
 
-    with patch(
-        "gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=mock_token_response
-    ):
+    with patch("gateway.middlewares.access_key_auth.cached_auth", AsyncMock(return_value=_make_token_response())):
         with patch("gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"):
             with patch(
                 "gateway.middlewares.access_key_auth.create_canonical_request",
                 new=fake_create_canonical_request,
             ):
                 with patch("gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"):
-                    is_valid, _, _ = await verify_access_key_presigned_url(request, access_key, mock_redis)
+                    await verify_access_key_presigned_url(request, access_key, mock_redis)
 
-    assert is_valid is True
     assert captured_query_string is not None
-    # The canonical query string should not contain the signature parameter name
     assert "X-Amz-Signature" not in captured_query_string
-    # But should contain other params like foo=bar
     assert "foo=bar" in captured_query_string
 
 
@@ -220,34 +157,11 @@ async def test_presigned_url_uses_raw_path_for_canonical_path() -> None:
     of spaces and other characters exactly matches what the client signed.
     """
     access_key = "hip_presigned_key_12345"
-    account_address = "5FH2aQUbix3nNatzST4mPM8iuebGvSMFerZLdwvDmAwRDFep"
-
-    now = datetime.datetime.now(datetime.timezone.utc)
-    signed_at = now
-    amz_date = signed_at.strftime("%Y%m%dT%H%M%SZ")
-    date_scope = amz_date[:8]
+    query_params = _make_presigned_query_params(access_key)
 
     logical_path = "/bucket/conflict65 (3).jpg"
     wire_path = b"/bucket/conflict65%20(3).jpg"
-
-    query_params = {
-        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
-        "X-Amz-Credential": f"{access_key}/{date_scope}/us-east-1/s3/aws4_request",
-        "X-Amz-Date": amz_date,
-        "X-Amz-Expires": "3600",
-        "X-Amz-SignedHeaders": "host",
-        "X-Amz-Signature": "deadbeef",
-    }
-
     request = make_request(path=logical_path, query_params=query_params, raw_path=wire_path)
-
-    mock_token_response = MagicMock()
-    mock_token_response.valid = True
-    mock_token_response.status = "active"
-    mock_token_response.account_address = account_address
-    mock_token_response.token_type = "sub"
-    mock_token_response.encrypted_secret = "enc"
-    mock_token_response.nonce = "nonce"
 
     captured_path: str | None = None
 
@@ -262,18 +176,15 @@ async def test_presigned_url_uses_raw_path_for_canonical_path() -> None:
         captured_path = path
         return "canonical"
 
-    with patch(
-        "gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=mock_token_response
-    ):
+    with patch("gateway.middlewares.access_key_auth.cached_auth", AsyncMock(return_value=_make_token_response())):
         with patch("gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"):
             with patch(
                 "gateway.middlewares.access_key_auth.create_canonical_request",
                 new=fake_create_canonical_request,
             ):
                 with patch("gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"):
-                    is_valid, _, _ = await verify_access_key_presigned_url(request, access_key, mock_redis)
+                    await verify_access_key_presigned_url(request, access_key, mock_redis)
 
-    assert is_valid is True
     assert captured_path == "/bucket/conflict65%20(3).jpg"
 
 

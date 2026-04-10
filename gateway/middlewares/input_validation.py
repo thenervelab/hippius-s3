@@ -11,10 +11,10 @@ from typing import Callable
 
 from fastapi import Request
 from fastapi import Response
-from substrateinterface.utils.ss58 import is_valid_ss58_address
 
 from gateway.config import get_config
 from gateway.utils.errors import s3_error_response
+from hippius_s3.utils.ss58 import is_valid_ss58_address
 
 
 logger = logging.getLogger(__name__)
