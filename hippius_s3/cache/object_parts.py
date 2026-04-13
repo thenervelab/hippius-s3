@@ -329,11 +329,10 @@ class RedisObjectPartsCache:
         part_number: int,
         chunk_index: int,
     ) -> bool:
-        exists = bool(
-            await self.redis.exists(
-                self.build_chunk_key(object_id, object_version, part_number, chunk_index),
-            )
-        )
+        key = self.build_chunk_key(object_id, object_version, part_number, chunk_index)
+        exists = bool(await self.redis.exists(key))
+        if not exists and self._download_cache is not None:
+            exists = bool(await self._download_cache.exists(key))
         _get_metrics_collector().record_cache_operation(
             hit=exists,
             operation="chunk_exists",

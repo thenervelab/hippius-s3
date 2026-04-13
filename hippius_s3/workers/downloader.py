@@ -342,7 +342,10 @@ async def run_downloader_loop(
                     logger.warning(f"[{backend_name}] Redis issue during processing: {exc}. Reconnecting…")
                     with contextlib.suppress(Exception):
                         await redis_client.aclose()  # ty: ignore[unresolved-attribute]
+                    with contextlib.suppress(Exception):
+                        await download_cache_client.aclose()  # ty: ignore[unresolved-attribute]
                     redis_client = create_redis_client(config.redis_url)  # ty: ignore[invalid-assignment]
+                    download_cache_client = create_redis_client(config.redis_download_cache_url)  # ty: ignore[invalid-assignment]
                     initialize_cache_client(redis_client)
                     obj_cache = RedisObjectPartsCache(
                         redis_client, queues_client=redis_queues_client, download_cache_client=download_cache_client
@@ -363,4 +366,5 @@ async def run_downloader_loop(
     finally:
         await redis_client.aclose()  # ty: ignore[unresolved-attribute]
         await redis_queues_client.aclose()  # ty: ignore[unresolved-attribute]
+        await download_cache_client.aclose()  # ty: ignore[unresolved-attribute]
         await db_pool.close()

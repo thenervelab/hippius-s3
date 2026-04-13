@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from collections import deque
 from typing import Any
@@ -22,8 +21,10 @@ async def _flush_consumed(obj_cache: Any, object_id: str, object_version: int, i
     """Batch-delete consumed chunks from the download cache and clear the buffer."""
     if not items:
         return
-    with contextlib.suppress(Exception):
+    try:
         await obj_cache.delete_download_chunks(object_id, int(object_version), items)
+    except Exception:
+        logger.warning("Download cache cleanup failed for object_id=%s (non-fatal, TTL will expire)", object_id)
     items.clear()
 
 
