@@ -134,6 +134,12 @@ services:
     volumes:
       - ./monitoring/otel/otel-config.yml:/etc/otelcol-contrib/otel-config.yml:ro
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+        reservations:
+          memory: 256M
     networks:
       - hippius_net
 
