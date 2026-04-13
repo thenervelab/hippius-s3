@@ -39,6 +39,8 @@ services:
         condition: service_healthy
       redis-queues:
         condition: service_healthy
+      redis-download-cache:
+        condition: service_healthy
       mock-kms:
         condition: service_healthy
     volumes:
@@ -242,6 +244,29 @@ services:
         "yes",
         "--appendfsync",
         "everysec",
+      ]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+    networks:
+      - hippius_net
+
+  redis-download-cache:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6385:6379"
+    command:
+      [
+        "redis-server",
+        "--maxmemory",
+        "2gb",
+        "--maxmemory-policy",
+        "volatile-ttl",
+        "--save",
+        "",
+        "--appendonly",
+        "no",
       ]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]

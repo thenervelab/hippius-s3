@@ -116,6 +116,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.redis_queues_client = async_redis.from_url(config.redis_queues_url)
         logger.info("Redis queues client initialized")
 
+        app.state.redis_download_cache_client = create_redis_client(config.redis_download_cache_url)
+        logger.info("Redis download cache client initialized")
+
         from hippius_s3.queue import initialize_queue_client
         from hippius_s3.redis_cache import initialize_cache_client
         from hippius_s3.redis_chain import initialize_chain_client
@@ -132,7 +135,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # IPFS service not needed in API container; workers own IPFS interactions
 
         # Cache repositories
-        app.state.obj_cache = RedisObjectPartsCache(app.state.redis_client, queues_client=app.state.redis_queues_client)
+        app.state.obj_cache = RedisObjectPartsCache(
+            app.state.redis_client,
+            queues_client=app.state.redis_queues_client,
+            download_cache_client=app.state.redis_download_cache_client,
+        )
         app.state.dl_cache = RedisDownloadChunksCache(app.state.redis_client)
         app.state.fs_store = create_fs_store(config)
         logger.info("Cache repositories initialized")
@@ -214,6 +221,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.info("Redis queues client closed")
         except Exception:
             logger.exception("Error shutting down Redis queues client")
+
+        try:
+            await app.state.redis_download_cache_client.close()
+            logger.info("Redis download cache client closed")
+        except Exception:
+            logger.exception("Error shutting down Redis download cache client")
 
         try:
             await app.state.postgres_pool.close()

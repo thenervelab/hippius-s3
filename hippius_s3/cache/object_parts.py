@@ -115,6 +115,13 @@ class ObjectPartsCache(Protocol):
 
     async def notify_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> None: ...
 
+    # Download cache API
+    async def set_download_chunk(
+        self, object_id: str, object_version: int, part_number: int, chunk_index: int, data: bytes, *, ttl: int = 300
+    ) -> None: ...
+
+    async def delete_download_chunks(self, object_id: str, object_version: int, plan_items: list[Any]) -> None: ...
+
     # Metadata API
     def build_meta_key(self, object_id: str, object_version: int, part_number: int) -> str: ...
 
@@ -134,9 +141,10 @@ class ObjectPartsCache(Protocol):
 
 
 class RedisObjectPartsCache:
-    def __init__(self, redis_client: Any, queues_client: Any = None) -> None:
+    def __init__(self, redis_client: Any, queues_client: Any = None, download_cache_client: Any = None) -> None:
         self.redis = redis_client
         self._queues_client = queues_client or redis_client
+        self._download_cache = download_cache_client
 
     def build_key(self, object_id: str, object_version: int, part_number: int) -> str:
         return f"obj:{object_id}:v:{int(object_version)}:part:{int(part_number)}"
@@ -277,20 +285,19 @@ class RedisObjectPartsCache:
     async def get_chunk(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int
     ) -> Optional[bytes]:
-        result = await self.redis.get(
-            self.build_chunk_key(
-                object_id,
-                object_version,
-                part_number,
-                chunk_index,
-            )
-        )
-        is_hit = isinstance(result, bytes)
-        _get_metrics_collector().record_cache_operation(
-            hit=is_hit,
-            operation="get_chunk",
-        )
-        return result if is_hit else None
+        key = self.build_chunk_key(object_id, object_version, part_number, chunk_index)
+        result = await self.redis.get(key)
+        if isinstance(result, bytes):
+            _get_metrics_collector().record_cache_operation(hit=True, operation="get_chunk")
+            return result
+        # Fallback to download cache
+        if self._download_cache is not None:
+            result = await self._download_cache.get(key)
+            if isinstance(result, bytes):
+                _get_metrics_collector().record_cache_operation(hit=True, operation="get_chunk_download")
+                return result
+        _get_metrics_collector().record_cache_operation(hit=False, operation="get_chunk")
+        return None
 
     async def set_chunk(
         self,
@@ -374,7 +381,19 @@ class RedisObjectPartsCache:
             for key in keys:
                 pipe.exists(key)
             results = await pipe.execute()
-        return [bool(r) for r in results]
+        main_exists = [bool(r) for r in results]
+        # Check download cache for any misses
+        if self._download_cache is not None:
+            missing_indices = [i for i, exists in enumerate(main_exists) if not exists]
+            if missing_indices:
+                async with self._download_cache.pipeline(transaction=False) as pipe:
+                    for i in missing_indices:
+                        pipe.exists(keys[i])
+                    dl_results = await pipe.execute()
+                for idx, dl_exists in zip(missing_indices, dl_results, strict=True):
+                    if bool(dl_exists):
+                        main_exists[idx] = True
+        return main_exists
 
     async def wait_for_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> bytes:
         timeout = _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS)
@@ -437,6 +456,38 @@ class RedisObjectPartsCache:
             int(chunk_index),
         )
         await self._queues_client.publish(f"notify:{chunk_key}", "1")
+
+    async def set_download_chunk(
+        self,
+        object_id: str,
+        object_version: int,
+        part_number: int,
+        chunk_index: int,
+        data: bytes,
+        *,
+        ttl: int = 300,
+    ) -> None:
+        """Write a chunk to the download cache with a short TTL."""
+        if self._download_cache is None:
+            return
+        key = self.build_chunk_key(object_id, int(object_version), int(part_number), int(chunk_index))
+        await self._download_cache.setex(key, int(ttl), data)
+
+    async def delete_download_chunks(
+        self,
+        object_id: str,
+        object_version: int,
+        plan_items: list[Any],
+    ) -> None:
+        """Delete consumed chunks from the download cache after streaming."""
+        if self._download_cache is None:
+            return
+        keys = [
+            self.build_chunk_key(object_id, int(object_version), int(item.part_number), int(item.chunk_index))
+            for item in plan_items
+        ]
+        if keys:
+            await self._download_cache.delete(*keys)
 
     async def set_meta(
         self,
@@ -538,6 +589,14 @@ class NullObjectPartsCache:
         raise NotImplementedError("NullObjectPartsCache does not support wait_for_chunk")
 
     async def notify_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> None:
+        return None
+
+    async def set_download_chunk(
+        self, object_id: str, object_version: int, part_number: int, chunk_index: int, data: bytes, *, ttl: int = 300
+    ) -> None:
+        return None
+
+    async def delete_download_chunks(self, object_id: str, object_version: int, plan_items: list[Any]) -> None:
         return None
 
     # Base helpers removed; use get/set directly

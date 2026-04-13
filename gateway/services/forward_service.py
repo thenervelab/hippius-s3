@@ -144,6 +144,17 @@ class ForwardService:
                     method=request.method,
                     status_code=upstream_response.status_code,
                 )
+                # Detect truncated responses before uvicorn raises RuntimeError
+                expected_raw = upstream_response.headers.get("content-length")
+                if expected_raw and bytes_sent < int(expected_raw):
+                    logger.warning(
+                        "Incomplete upstream stream: sent=%d expected=%s method=%s path=%s status=%d",
+                        bytes_sent,
+                        expected_raw,
+                        request.method,
+                        request.url.path,
+                        upstream_response.status_code,
+                    )
                 # Always close the upstream stream to avoid leaking connections.
                 # Shield cleanup so the connection returns to the pool even if cancelled.
                 try:
