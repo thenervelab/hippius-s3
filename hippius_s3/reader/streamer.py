@@ -14,19 +14,6 @@ from .types import ChunkPlanItem
 
 logger = logging.getLogger(__name__)
 
-_CLEANUP_BATCH_SIZE = 100
-
-
-async def _flush_consumed(obj_cache: Any, object_id: str, object_version: int, items: list[ChunkPlanItem]) -> None:
-    """Batch-delete consumed chunks from the download cache and clear the buffer."""
-    if not items:
-        return
-    try:
-        await obj_cache.delete_download_chunks(object_id, int(object_version), items)
-    except Exception:
-        logger.warning("Download cache cleanup failed for object_id=%s (non-fatal, TTL will expire)", object_id)
-    items.clear()
-
 
 async def stream_plan(
     *,
@@ -44,38 +31,31 @@ async def stream_plan(
     prefetch_chunks: int = 0,
 ) -> AsyncGenerator[bytes, None]:
     prefetch = max(0, int(prefetch_chunks))
-    consumed_items: list[ChunkPlanItem] = []
 
     # Correctness: prefetch=0 must preserve the original sequential behavior.
     # (The pipelined scheduler below requires at least one "refill" per iteration.)
     if prefetch == 0:
-        try:
-            for item in plan:
-                c = await obj_cache.wait_for_chunk(
-                    object_id,
-                    int(object_version),
-                    int(item.part_number),
-                    int(item.chunk_index),
-                )
-                pt = await decrypt_chunk_if_needed(
-                    c,
-                    object_id=object_id,
-                    part_number=int(item.part_number),
-                    chunk_index=int(item.chunk_index),
-                    storage_version=int(storage_version),
-                    key_bytes=key_bytes,
-                    suite_id=suite_id,
-                    bucket_id=bucket_id,
-                    upload_id=upload_id,
-                    address=address,
-                    bucket_name=bucket_name,
-                )
-                consumed_items.append(item)
-                if len(consumed_items) >= _CLEANUP_BATCH_SIZE:
-                    await _flush_consumed(obj_cache, object_id, object_version, consumed_items)
-                yield maybe_slice(pt, item.slice_start, item.slice_end_excl)
-        finally:
-            await _flush_consumed(obj_cache, object_id, object_version, consumed_items)
+        for item in plan:
+            c = await obj_cache.wait_for_chunk(
+                object_id,
+                int(object_version),
+                int(item.part_number),
+                int(item.chunk_index),
+            )
+            pt = await decrypt_chunk_if_needed(
+                c,
+                object_id=object_id,
+                part_number=int(item.part_number),
+                chunk_index=int(item.chunk_index),
+                storage_version=int(storage_version),
+                key_bytes=key_bytes,
+                suite_id=suite_id,
+                bucket_id=bucket_id,
+                upload_id=upload_id,
+                address=address,
+                bucket_name=bucket_name,
+            )
+            yield maybe_slice(pt, item.slice_start, item.slice_end_excl)
         return
 
     it = iter(plan)
@@ -153,9 +133,6 @@ async def stream_plan(
                 address=address,
                 bucket_name=bucket_name,
             )
-            consumed_items.append(item)
-            if len(consumed_items) >= _CLEANUP_BATCH_SIZE:
-                await _flush_consumed(obj_cache, object_id, object_version, consumed_items)
             yield maybe_slice(pt, item.slice_start, item.slice_end_excl)
     finally:
         # Ensure any pending tasks are cancelled if the client disconnects mid-stream.
@@ -165,5 +142,3 @@ async def stream_plan(
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-        # Flush remaining consumed chunks from download cache
-        await _flush_consumed(obj_cache, object_id, object_version, consumed_items)

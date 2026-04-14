@@ -17,8 +17,10 @@ from hippius_s3.cache.object_parts import RedisObjectPartsCache
 def _make_redis_mock(get_return=None):
     mock = MagicMock()
     mock.get = AsyncMock(return_value=get_return)
+    mock.getex = AsyncMock(return_value=get_return)
     mock.setex = AsyncMock()
     mock.delete = AsyncMock()
+    mock.exists = AsyncMock(return_value=0)
     return mock
 
 
@@ -33,12 +35,12 @@ async def test_get_chunk_main_hit_skips_download_cache():
 
     assert result == b"main-data"
     main.get.assert_awaited_once()
-    dl.get.assert_not_awaited()
+    dl.getex.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_get_chunk_main_miss_download_cache_hit():
-    """Main miss -> falls back to download cache -> returns data."""
+    """Main miss -> falls back to download cache via GETEX -> returns data."""
     main = _make_redis_mock(get_return=None)
     dl = _make_redis_mock(get_return=b"dl-data")
     cache = RedisObjectPartsCache(main, download_cache_client=dl)
@@ -47,7 +49,7 @@ async def test_get_chunk_main_miss_download_cache_hit():
 
     assert result == b"dl-data"
     main.get.assert_awaited_once()
-    dl.get.assert_awaited_once()
+    dl.getex.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -91,15 +93,13 @@ async def test_set_download_chunk_writes_to_download_cache():
 
 
 @pytest.mark.asyncio
-async def test_set_download_chunk_noop_without_client():
-    """When download_cache_client=None, set_download_chunk is a no-op."""
+async def test_set_download_chunk_crashes_without_client():
+    """When download_cache_client=None, set_download_chunk raises RuntimeError."""
     main = _make_redis_mock()
     cache = RedisObjectPartsCache(main)
 
-    await cache.set_download_chunk("obj1", 1, 1, 0, b"data", ttl=300)
-
-    # No write to main Redis — download cache is not configured
-    main.setex.assert_not_awaited()
+    with pytest.raises(RuntimeError, match="download_cache_client is required"):
+        await cache.set_download_chunk("obj1", 1, 1, 0, b"data", ttl=300)
 
 
 @pytest.mark.asyncio
@@ -115,29 +115,47 @@ async def test_set_download_chunk_uses_short_ttl():
 
 
 @pytest.mark.asyncio
-async def test_delete_download_chunks_removes_keys():
-    """Explicit cleanup deletes keys from download cache."""
-    from hippius_s3.reader.types import ChunkPlanItem
+async def test_get_chunk_uses_getex_on_download_cache():
+    """Download cache read uses GETEX to refresh TTL, not plain GET."""
+    main = _make_redis_mock(get_return=None)
+    dl = MagicMock()
+    dl.getex = AsyncMock(return_value=b"dl-data")
+    cache = RedisObjectPartsCache(main, download_cache_client=dl)
 
-    dl = _make_redis_mock()
-    cache = RedisObjectPartsCache(_make_redis_mock(), download_cache_client=dl)
+    result = await cache.get_chunk("obj1", 1, 1, 0)
 
-    items = [ChunkPlanItem(part_number=1, chunk_index=0), ChunkPlanItem(part_number=1, chunk_index=1)]
-    await cache.delete_download_chunks("obj1", 1, items)
-
-    dl.delete.assert_awaited_once()
-    call_args = dl.delete.call_args[0]
-    assert "obj:obj1:v:1:part:1:chunk:0" in call_args
-    assert "obj:obj1:v:1:part:1:chunk:1" in call_args
+    assert result == b"dl-data"
+    dl.getex.assert_awaited_once()
+    call_args = dl.getex.call_args
+    assert call_args[1]["ex"] == 300
 
 
 @pytest.mark.asyncio
-async def test_delete_download_chunks_noop_without_client():
-    """download_cache_client=None -> no error."""
-    from hippius_s3.reader.types import ChunkPlanItem
+async def test_chunk_exists_checks_download_cache():
+    """chunk_exists() falls back to download cache when main Redis misses."""
+    main = MagicMock()
+    main.exists = AsyncMock(return_value=0)
+    dl = MagicMock()
+    dl.exists = AsyncMock(return_value=1)
+    cache = RedisObjectPartsCache(main, download_cache_client=dl)
 
-    cache = RedisObjectPartsCache(_make_redis_mock())
-    items = [ChunkPlanItem(part_number=1, chunk_index=0)]
+    result = await cache.chunk_exists("obj1", 1, 1, 0)
 
-    await cache.delete_download_chunks("obj1", 1, items)
-    # No exception raised
+    assert result is True
+    main.exists.assert_awaited_once()
+    dl.exists.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_chunk_exists_skips_download_cache_on_main_hit():
+    """chunk_exists() doesn't check download cache when main Redis hits."""
+    main = MagicMock()
+    main.exists = AsyncMock(return_value=1)
+    dl = MagicMock()
+    dl.exists = AsyncMock()
+    cache = RedisObjectPartsCache(main, download_cache_client=dl)
+
+    result = await cache.chunk_exists("obj1", 1, 1, 0)
+
+    assert result is True
+    dl.exists.assert_not_awaited()

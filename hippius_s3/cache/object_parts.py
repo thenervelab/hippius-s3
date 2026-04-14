@@ -43,6 +43,8 @@ def _get_config_value(name: str, default: int) -> int:
             return cfg.object_chunk_size_bytes
         if name == "cache_ttl_seconds":
             return cfg.cache_ttl_seconds
+        if name == "download_cache_ttl_seconds":
+            return cfg.download_cache_ttl_seconds
         # Unknown config keys must not be accessed dynamically.
         return default
     except Exception:
@@ -119,8 +121,6 @@ class ObjectPartsCache(Protocol):
     async def set_download_chunk(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int, data: bytes, *, ttl: int = 300
     ) -> None: ...
-
-    async def delete_download_chunks(self, object_id: str, object_version: int, plan_items: list[Any]) -> None: ...
 
     # Metadata API
     def build_meta_key(self, object_id: str, object_version: int, part_number: int) -> str: ...
@@ -290,9 +290,10 @@ class RedisObjectPartsCache:
         if isinstance(result, bytes):
             _get_metrics_collector().record_cache_operation(hit=True, operation="get_chunk")
             return result
-        # Fallback to download cache
+        # Fallback to download cache — use GETEX to refresh TTL on read (keep-alive for active streams)
         if self._download_cache is not None:
-            result = await self._download_cache.get(key)
+            dl_ttl = _get_config_value("download_cache_ttl_seconds", 300)
+            result = await self._download_cache.getex(key, ex=dl_ttl)
             if isinstance(result, bytes):
                 _get_metrics_collector().record_cache_operation(hit=True, operation="get_chunk_download")
                 return result
@@ -430,13 +431,24 @@ class RedisObjectPartsCache:
 
             await asyncio.wait_for(_listen(), timeout=timeout)
 
-        # Fetch the chunk — verify it wasn't evicted between notification and read
+        # Fetch the chunk — retry once if evicted between notification and read
         data = await self.get_chunk(
             object_id,
             int(object_version),
             int(part_number),
             int(chunk_index),
         )
+        if data is None:
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning("Chunk transient miss after notification, retrying: %s", chunk_key)
+            await asyncio.sleep(0.1)
+            data = await self.get_chunk(
+                object_id,
+                int(object_version),
+                int(part_number),
+                int(chunk_index),
+            )
         if data is None:
             raise RuntimeError(f"Chunk evicted after pub/sub notification: {chunk_key}")
         return data
@@ -468,25 +480,9 @@ class RedisObjectPartsCache:
     ) -> None:
         """Write a chunk to the download cache with a short TTL."""
         if self._download_cache is None:
-            return
+            raise RuntimeError("download_cache_client is required but not configured")
         key = self.build_chunk_key(object_id, int(object_version), int(part_number), int(chunk_index))
         await self._download_cache.setex(key, int(ttl), data)
-
-    async def delete_download_chunks(
-        self,
-        object_id: str,
-        object_version: int,
-        plan_items: list[Any],
-    ) -> None:
-        """Delete consumed chunks from the download cache after streaming."""
-        if self._download_cache is None:
-            return
-        keys = [
-            self.build_chunk_key(object_id, int(object_version), int(item.part_number), int(item.chunk_index))
-            for item in plan_items
-        ]
-        if keys:
-            await self._download_cache.delete(*keys)
 
     async def set_meta(
         self,
@@ -593,9 +589,6 @@ class NullObjectPartsCache:
     async def set_download_chunk(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int, data: bytes, *, ttl: int = 300
     ) -> None:
-        return None
-
-    async def delete_download_chunks(self, object_id: str, object_version: int, plan_items: list[Any]) -> None:
         return None
 
     # Base helpers removed; use get/set directly

@@ -464,7 +464,7 @@ spec:
             - --maxmemory
             - 16gb
             - --maxmemory-policy
-            - volatile-ttl
+            - volatile-lru
             - --save
             - ""
             - --appendonly

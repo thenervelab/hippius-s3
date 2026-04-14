@@ -262,7 +262,7 @@ services:
         "--maxmemory",
         "2gb",
         "--maxmemory-policy",
-        "volatile-ttl",
+        "volatile-lru",
         "--save",
         "",
         "--appendonly",
