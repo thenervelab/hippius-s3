@@ -146,6 +146,7 @@ jobs:
             --from-literal=REDIS_QUEUES_URL='redis://redis-queues:6379' \
             --from-literal=REDIS_RATE_LIMITING_URL='redis://redis-rate-limiting:6379' \
             --from-literal=REDIS_ACL_URL='redis://redis-acl:6379' \
+            --from-literal=REDIS_DOWNLOAD_CACHE_URL='redis://redis-download-cache:6379' \
             --from-literal=HIPPIUS_SERVICE_KEY='${{ secrets.HIPPIUS_SERVICE_KEY }}' \
             --from-literal=ARION_SERVICE_KEY='${{ secrets.ARION_SERVICE_KEY }}' \
             --from-literal=ARION_BEARER_TOKEN='${{ secrets.ARION_BEARER_TOKEN }}' \
@@ -273,6 +274,7 @@ jobs:
             --from-literal=REDIS_QUEUES_URL="redis://redis-queues:6379/0" \
             --from-literal=REDIS_RATE_LIMITING_URL="redis://redis-rate-limiting:6379/0" \
             --from-literal=REDIS_ACL_URL="redis://redis-acl:6379/0" \
+            --from-literal=REDIS_DOWNLOAD_CACHE_URL="redis://redis-download-cache:6379/0" \
             --from-literal=HIPPIUS_SERVICE_KEY="${{ secrets.HIPPIUS_SERVICE_KEY }}" \
             --from-literal=ARION_SERVICE_KEY="${{ secrets.ARION_SERVICE_KEY }}" \
             --from-literal=ARION_BEARER_TOKEN="${{ secrets.ARION_BEARER_TOKEN }}" \
