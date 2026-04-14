@@ -117,7 +117,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("Redis queues client initialized")
 
         app.state.redis_download_cache_client = create_redis_client(config.redis_download_cache_url)
-        await app.state.redis_download_cache_client.ping()  # ty: ignore[possibly-missing-attribute]
+        await app.state.redis_download_cache_client.ping()  # ty: ignore[unresolved-attribute]
         logger.info("Redis download cache client initialized and verified")
 
         from hippius_s3.queue import initialize_queue_client
@@ -306,7 +306,7 @@ def factory() -> FastAPI:
     app.middleware("http")(ip_whitelist_middleware)
     app.middleware("http")(fs_cache_pressure_middleware)
     if config.enable_request_profiling:
-        app.add_middleware(SpeedscopeProfilerMiddleware)  # ty: ignore[invalid-argument-type]
+        app.add_middleware(SpeedscopeProfilerMiddleware)
 
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception) -> Response:
