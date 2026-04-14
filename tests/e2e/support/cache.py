@@ -118,15 +118,18 @@ def clear_object_cache(
     parts: Iterable[int] | None = None,
     *,
     redis_url: str = "redis://localhost:6379/0",
+    download_cache_url: str = "redis://localhost:6385/0",
     dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
 ) -> None:
     """Delete chunked obj:{object_id}:part:{n}:chunk:* and meta keys in Redis for the given parts.
 
+    Clears both the main cache and the download cache.
     If parts is None, queries DB to find actual parts for this object (much faster than scanning 256).
     """
     import psycopg
 
     r = redis.Redis.from_url(redis_url)
+    r_dl = redis.Redis.from_url(download_cache_url)
 
     # If no parts specified, query DB for actual part numbers to avoid scanning 256 empty parts
     if parts is None:
@@ -169,6 +172,9 @@ def clear_object_cache(
         base_key = roc.build_key(object_id, int(object_version), int(pn))
         for k in r.scan_iter(match=f"{base_key}:chunk:*"):
             r.delete(k)
+        # Also clear download cache
+        for k in r_dl.scan_iter(match=f"{base_key}:chunk:*"):
+            r_dl.delete(k)
     # Sanity: assert no meta remains for requested parts
     for pn in parts:
         meta_key = roc.build_meta_key(object_id, int(object_version), int(pn))
