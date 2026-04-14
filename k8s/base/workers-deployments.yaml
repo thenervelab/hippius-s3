@@ -195,7 +195,7 @@ spec:
           command:
             - sh
             - -c
-            - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
+            - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379 && nc -z redis-download-cache 6379; do echo waiting for services; sleep 5; done
       containers:
         - name: arion-downloader
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
