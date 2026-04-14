@@ -117,7 +117,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("Redis queues client initialized")
 
         app.state.redis_download_cache_client = create_redis_client(config.redis_download_cache_url)
-        await app.state.redis_download_cache_client.ping()
+        await app.state.redis_download_cache_client.ping()  # ty: ignore[possibly-missing-attribute]
         logger.info("Redis download cache client initialized and verified")
 
         from hippius_s3.queue import initialize_queue_client
