@@ -88,6 +88,10 @@ fi
 # ─── Select bucket ──────────────────────────────────────────────────────────
 if [[ -n "$BUCKET_FLAG" ]]; then
     BUCKET="$BUCKET_FLAG"
+    if ! aws s3api head-bucket --bucket "$BUCKET" "${AWS_ARGS[@]}" 2>/dev/null; then
+        echo "Error: Couldn't find bucket '${BUCKET}'"
+        exit 1
+    fi
 else
     echo "Fetching bucket list..."
     BUCKET_LIST=$(aws s3api list-buckets "${AWS_ARGS[@]}" --query "Buckets[].Name" --output json 2>/dev/null || true)
@@ -151,6 +155,8 @@ fi
 # ─── Confirm and delete ──────────────────────────────────────────────────────
 echo ""
 echo "This will permanently delete bucket s3://${BUCKET} and ALL objects inside it."
+echo "Hint: You can run 'aws s3 ls s3://${BUCKET}/ --recursive --endpoint-url ${ENDPOINT_URL}' to list all objects first."
+echo ""
 read -rp "Are you sure? (y/N): " confirm
 if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
     echo "Aborted."
