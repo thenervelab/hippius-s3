@@ -46,8 +46,7 @@ async def process_download_request(
     backend_name: str,
     fetch_fn: Callable[[str, str], Awaitable[bytes]],
     db_pool: asyncpg.Pool,
-    redis_client: async_redis.Redis,
-    queues_client: async_redis.Redis | None = None,
+    obj_cache: RedisObjectPartsCache,
 ) -> bool:
     """Process a single download request for one backend.
 
@@ -69,7 +68,6 @@ async def process_download_request(
         },
     ) as span:
         config = get_config()
-        obj_cache = RedisObjectPartsCache(redis_client, queues_client=queues_client)
 
         short_id = f"{download_request.bucket_name}/{download_request.object_key}"
         logger.info(
@@ -134,12 +132,13 @@ async def process_download_request(
                         total_bytes_downloaded += len(data)
 
                         t_cache = time.perf_counter()
-                        await obj_cache.set_chunk(
+                        await obj_cache.set_download_chunk(
                             download_request.object_id,
                             int(download_request.object_version),
                             part_number,
                             chunk_index,
                             data,
+                            ttl=config.download_cache_ttl_seconds,
                         )
                         # Notify waiting readers via pub/sub
                         await obj_cache.notify_chunk(
@@ -204,7 +203,7 @@ async def process_download_request(
 
                 # Clear in-progress flag
                 with contextlib.suppress(Exception):
-                    await redis_client.delete(f"download_in_progress:{download_request.object_id}:{part_number}")
+                    await obj_cache.redis.delete(f"download_in_progress:{download_request.object_id}:{part_number}")
                 return all(chunk_results)
 
         try:
@@ -272,11 +271,16 @@ async def run_downloader_loop(
 
     redis_client: async_redis.Redis = create_redis_client(config.redis_url)  # ty: ignore[invalid-assignment]
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
+    download_cache_client: async_redis.Redis = create_redis_client(config.redis_download_cache_url)  # ty: ignore[invalid-assignment]
     db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=20)
 
     initialize_queue_client(redis_queues_client)
     initialize_cache_client(redis_client)
     initialize_metrics_collector(redis_client)
+
+    obj_cache = RedisObjectPartsCache(
+        redis_client, queues_client=redis_queues_client, download_cache_client=download_cache_client
+    )
 
     if backend_name == "arion":
         backend_info = f" base_url={config.arion_base_url} verify_ssl={config.arion_verify_ssl}"
@@ -325,8 +329,7 @@ async def run_downloader_loop(
                         backend_name=backend_name,
                         fetch_fn=fetch_fn,
                         db_pool=db_pool,
-                        redis_client=redis_client,
-                        queues_client=redis_queues_client,
+                        obj_cache=obj_cache,
                     )
                     if ok:
                         worker_logger.info(f"[{backend_name}] Done: {request.bucket_name}/{request.object_key}")
@@ -339,8 +342,14 @@ async def run_downloader_loop(
                     logger.warning(f"[{backend_name}] Redis issue during processing: {exc}. Reconnecting…")
                     with contextlib.suppress(Exception):
                         await redis_client.aclose()  # ty: ignore[unresolved-attribute]
+                    with contextlib.suppress(Exception):
+                        await download_cache_client.aclose()  # ty: ignore[unresolved-attribute]
                     redis_client = create_redis_client(config.redis_url)  # ty: ignore[invalid-assignment]
+                    download_cache_client = create_redis_client(config.redis_download_cache_url)  # ty: ignore[invalid-assignment]
                     initialize_cache_client(redis_client)
+                    obj_cache = RedisObjectPartsCache(
+                        redis_client, queues_client=redis_queues_client, download_cache_client=download_cache_client
+                    )
                 except asyncpg.InterfaceError as exc:
                     job_span.record_exception(exc)
                     job_span.set_status(trace.StatusCode.ERROR, str(exc))
@@ -357,4 +366,5 @@ async def run_downloader_loop(
     finally:
         await redis_client.aclose()  # ty: ignore[unresolved-attribute]
         await redis_queues_client.aclose()  # ty: ignore[unresolved-attribute]
+        await download_cache_client.aclose()  # ty: ignore[unresolved-attribute]
         await db_pool.close()

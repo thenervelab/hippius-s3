@@ -88,14 +88,15 @@ def test_range_downloads_only_needed_chunks(
     assert r.headers.get("x-hippius-source") in {"pipeline", "cache"}
 
     # Inspect Redis for which chunk keys were created (versioned namespace)
+    # Check both main cache and download cache since chunks may be in either
     rcli = redis.Redis.from_url("redis://localhost:6379/0")
+    rcli_dl = redis.Redis.from_url("redis://localhost:6385/0")
     # version already fetched above
-    keys = sorted(
-        [
-            k.decode()
-            for k in rcli.scan_iter(match=f"obj:{object_id}:v:{ov}:part:1:chunk:*", count=1000)  # 1-based part number
-        ]
-    )
+    pattern = f"obj:{object_id}:v:{ov}:part:1:chunk:*"
+    keys = sorted(set(
+        [k.decode() for k in rcli.scan_iter(match=pattern, count=1000)]
+        + [k.decode() for k in rcli_dl.scan_iter(match=pattern, count=1000)]
+    ))
     # Expect at minimum chunk:0 exists for the first-range request
     # (downloader may prefetch additional chunks, but the in-range chunk must be present)
     expected_chunk = f"obj:{object_id}:v:{ov}:part:1:chunk:0"
@@ -110,7 +111,10 @@ def test_range_downloads_only_needed_chunks(
     end = start + 128 * 1024 - 1
     r2 = signed_http_get(bucket, key, {"Range": f"bytes={start}-{end}"})
     assert r2.status_code == 206
-    keys2 = sorted([k.decode() for k in rcli.scan_iter(match=f"obj:{object_id}:v:{ov}:part:1:chunk:*", count=1000)])
+    keys2 = sorted(set(
+        [k.decode() for k in rcli.scan_iter(match=pattern, count=1000)]
+        + [k.decode() for k in rcli_dl.scan_iter(match=pattern, count=1000)]
+    ))
     expected_chunk2 = f"obj:{object_id}:v:{ov}:part:1:chunk:1"
     assert expected_chunk2 in keys2, f"expected chunk {expected_chunk2} not found in {keys2}"
     # Verify minimal hydration: should not have fetched all chunks
