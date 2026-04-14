@@ -462,7 +462,7 @@ spec:
           command:
             - redis-server
             - --maxmemory
-            - 16gb
+            - 32gb
             - --maxmemory-policy
             - volatile-lru
             - --save
@@ -497,4 +497,4 @@ spec:
               memory: 1Gi
             limits:
               cpu: 2
-              memory: 18Gi
+              memory: 34Gi

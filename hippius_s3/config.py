@@ -161,7 +161,7 @@ class Config:
     delete_backends: list[str] = env("HIPPIUS_DELETE_BACKENDS:arion", convert=_parse_backends)
 
     # Cache TTL (shared across components)
-    cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:259200", convert=int)
+    cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:3600", convert=int)
     # Download cache TTL (short-lived: download-to-stream pipeline)
     download_cache_ttl_seconds: int = env("DOWNLOAD_CACHE_TTL:300", convert=int)
     # Unified object part chunk size (bytes) for cache and range math
