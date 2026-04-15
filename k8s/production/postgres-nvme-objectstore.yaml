@@ -1,0 +1,26 @@
+# ObjectStore for the NVMe cluster's own backups (activate after promotion)
+# After promoting postgres-nvme, add the barman-cloud plugin to the cluster
+# and point it at this ObjectStore for WAL archiving and scheduled backups.
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: ovh-postgres-backup-nvme
+  namespace: hippius-s3-prod
+spec:
+  configuration:
+    destinationPath: s3://hippius-s3-psql-backup/production/postgres-nvme/
+    endpointURL: https://s3.eu-west-par.io.cloud.ovh.net
+    s3Credentials:
+      accessKeyId:
+        name: postgres-backup-creds
+        key: ACCESS_KEY_ID
+      secretAccessKey:
+        name: postgres-backup-creds
+        key: ACCESS_KEY_SECRET
+    wal:
+      compression: gzip
+      maxParallel: 2
+    data:
+      compression: gzip
+      jobs: 2
+  retentionPolicy: "30d"

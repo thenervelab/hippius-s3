@@ -1,0 +1,109 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: postgres-nvme
+  namespace: hippius-s3-prod
+spec:
+  instances: 3
+  primaryUpdateStrategy: unsupervised
+
+  # Bootstrap: restore from OVH Barman backup, then stream from primary
+  bootstrap:
+    recovery:
+      source: ceph-primary
+
+  # Replica mode: continuously stream from the CephFS primary cluster
+  replica:
+    enabled: true
+    source: ceph-primary
+
+  # External cluster definition: plugin-based Barman backup for bootstrap + streaming connection
+  externalClusters:
+    - name: ceph-primary
+      plugin:
+        name: barman-cloud.cloudnative-pg.io
+        parameters:
+          barmanObjectName: ovh-postgres-backup
+          serverName: postgres
+      connectionParameters:
+        host: postgres-rw.hippius-s3-prod.svc.cluster.local
+        user: streaming_replica
+        sslmode: verify-full
+        dbname: postgres
+      sslKey:
+        name: postgres-replication
+        key: tls.key
+      sslCert:
+        name: postgres-replication
+        key: tls.crt
+      sslRootCert:
+        name: postgres-ca
+        key: ca.crt
+
+  # Local NVMe storage on dedicated nodes
+  storage:
+    storageClass: local-postgresql
+    size: 800Gi
+
+  # Schedule only on dedicated psql-s3-* nodes
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+    nodeSelector:
+      hippius.io/role: postgresql
+    tolerations:
+      - key: hippius.io/postgresql
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+
+  enableSuperuserAccess: true
+
+  # PostgreSQL parameters -- same as current production, tuned for 64GB RAM nodes
+  postgresql:
+    parameters:
+      max_connections: "1000"
+      shared_buffers: "16GB"
+      effective_cache_size: "48GB"
+      work_mem: "128MB"
+      maintenance_work_mem: "4GB"
+      checkpoint_completion_target: "0.9"
+      wal_buffers: "64MB"
+      default_statistics_target: "500"
+      random_page_cost: "1.1"
+      effective_io_concurrency: "200"
+      max_worker_processes: "48"
+      max_parallel_workers_per_gather: "4"
+      max_parallel_workers: "12"
+      max_parallel_maintenance_workers: "4"
+      wal_level: "replica"
+      max_wal_size: "4GB"
+      min_wal_size: "1GB"
+      checkpoint_timeout: "15min"
+      max_slot_wal_keep_size: "30GB"
+
+  # Resource limits for dedicated 64GB / 12-core nodes
+  resources:
+    requests:
+      cpu: "2"
+      memory: 16Gi
+    limits:
+      cpu: "10"
+      memory: 56Gi
+
+  monitoring:
+    enablePodMonitor: false
+
+  replicationSlots:
+    highAvailability:
+      enabled: true
+      slotPrefix: _cnpg_
+    synchronizeReplicas:
+      enabled: true
+    updateInterval: 30
+
+  startDelay: 3600
+  stopDelay: 1800
+  smartShutdownTimeout: 180
+  switchoverDelay: 3600
