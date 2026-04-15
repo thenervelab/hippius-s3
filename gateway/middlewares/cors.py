@@ -26,7 +26,9 @@ async def cors_middleware(
         response = await call_next(request)
 
     # Add CORS headers to ALL responses (including OPTIONS)
-    response.headers["Access-Control-Allow-Origin"] = "*"
+    origin = request.headers.get("origin")
+    response.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, HEAD, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "*"
     response.headers["Access-Control-Expose-Headers"] = "*"
