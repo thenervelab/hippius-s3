@@ -324,6 +324,7 @@ class ArionClient:
             headers=headers,
         )
 
+        logger.info(f"Raw response content {response.content}")
         response.raise_for_status()
         response_json = response.json()
 
