@@ -1,9 +1,10 @@
-"""E2E tests for gateway auth cache (Bearer access key flow).
+"""E2E tests for gateway auth cache (SigV4 access key flow).
 
 These tests verify that cached_auth() in the gateway correctly caches
-TokenAuthResponse objects in Redis when using Bearer hip_* authentication.
+TokenAuthResponse objects in Redis when using hip_* access key authentication.
 """
 
+import datetime
 import time
 
 import httpx
@@ -24,14 +25,24 @@ def redis_client():
     r.close()
 
 
-def _bearer_headers(access_key: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {access_key}"}
+def _sigv4_headers(access_key: str) -> dict[str, str]:
+    """Build minimal SigV4 headers that trigger cached_auth() before signature validation."""
+    amz_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    date_scope = amz_date[:8]
+    return {
+        "Authorization": (
+            f"AWS4-HMAC-SHA256 Credential={access_key}/{date_scope}/us-east-1/s3/aws4_request, "
+            "SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000"
+        ),
+        "x-amz-date": amz_date,
+        "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+    }
 
 
 @pytest.mark.e2e
 @pytest.mark.hippius_cache
 def test_auth_cache_populated_on_request(redis_client: redis.Redis) -> None:
-    """Sending a Bearer request populates hippius_auth:{key} in Redis."""
+    """Sending a SigV4 request populates hippius_auth:{key} in Redis."""
     key = f"hip_cache_pop_{int(time.time())}"
     cache_key = f"{AUTH_CACHE_PREFIX}{key}"
 
@@ -40,7 +51,7 @@ def test_auth_cache_populated_on_request(redis_client: redis.Redis) -> None:
 
     # Send request — response status is irrelevant; cache is populated in auth step
     with httpx.Client(timeout=10) as client:
-        client.get(f"{GATEWAY_URL}/test-bucket/test-key", headers=_bearer_headers(key))
+        client.get(f"{GATEWAY_URL}/test-bucket/test-key", headers=_sigv4_headers(key))
 
     cached = redis_client.get(cache_key)
     assert cached is not None, f"Expected cache key {cache_key} to exist in Redis"
@@ -52,14 +63,14 @@ def test_auth_cache_populated_on_request(redis_client: redis.Redis) -> None:
 @pytest.mark.e2e
 @pytest.mark.hippius_cache
 def test_auth_cache_reused_on_second_request(redis_client: redis.Redis) -> None:
-    """Two consecutive Bearer requests reuse the same cached value."""
+    """Two consecutive SigV4 requests reuse the same cached value."""
     key = f"hip_cache_reuse_{int(time.time())}"
     cache_key = f"{AUTH_CACHE_PREFIX}{key}"
 
     redis_client.delete(cache_key)
 
     with httpx.Client(timeout=10) as client:
-        client.get(f"{GATEWAY_URL}/test-bucket/test-key", headers=_bearer_headers(key))
+        client.get(f"{GATEWAY_URL}/test-bucket/test-key", headers=_sigv4_headers(key))
 
     first_value = redis_client.get(cache_key)
     first_ttl = redis_client.ttl(cache_key)
@@ -68,7 +79,7 @@ def test_auth_cache_reused_on_second_request(redis_client: redis.Redis) -> None:
     time.sleep(1)
 
     with httpx.Client(timeout=10) as client:
-        client.get(f"{GATEWAY_URL}/test-bucket/test-key", headers=_bearer_headers(key))
+        client.get(f"{GATEWAY_URL}/test-bucket/test-key", headers=_sigv4_headers(key))
 
     second_value = redis_client.get(cache_key)
     second_ttl = redis_client.ttl(cache_key)
@@ -87,7 +98,7 @@ def test_auth_cache_expires_and_repopulates(redis_client: redis.Redis) -> None:
     redis_client.delete(cache_key)
 
     with httpx.Client(timeout=10) as client:
-        client.get(f"{GATEWAY_URL}/test-bucket/test-key", headers=_bearer_headers(key))
+        client.get(f"{GATEWAY_URL}/test-bucket/test-key", headers=_sigv4_headers(key))
 
     assert redis_client.exists(cache_key), "Cache should be populated after first request"
 
@@ -97,7 +108,7 @@ def test_auth_cache_expires_and_repopulates(redis_client: redis.Redis) -> None:
 
     # Re-request should repopulate
     with httpx.Client(timeout=10) as client:
-        client.get(f"{GATEWAY_URL}/test-bucket/test-key", headers=_bearer_headers(key))
+        client.get(f"{GATEWAY_URL}/test-bucket/test-key", headers=_sigv4_headers(key))
 
     assert redis_client.exists(cache_key), "Cache should be repopulated after re-request"
     ttl = redis_client.ttl(cache_key)
