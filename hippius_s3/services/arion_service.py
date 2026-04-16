@@ -324,6 +324,7 @@ class ArionClient:
             headers=headers,
         )
 
+        logger.info(f"Raw response content {response.content}")
         response.raise_for_status()
         response_json = response.json()
 
@@ -360,6 +361,7 @@ class ArionClient:
             download_path,
             headers=headers,
         ) as response:
+            logger.info(f"Raw response status {response.status_code} for {download_path}")
             response.raise_for_status()
             async for chunk in response.aiter_bytes(chunk_size):
                 yield chunk
@@ -445,5 +447,6 @@ class ArionClient:
             json=payload.model_dump(),
             headers=headers,
         )
+        logger.info(f"Raw response content {response.content}")
         response.raise_for_status()
         return CanUploadResponse.model_validate(response.json())

@@ -367,7 +367,7 @@ class Uploader:
                 return ChunkUploadResult(cids=[], part_number=part_number)
 
             if num_chunks_meta > 0 and part_id:
-                all_chunk_cids: list[str] = []
+                all_file_hashes: list[str] = []
                 for ci in range(num_chunks_meta):
                     piece = await self.fs_store.get_chunk(object_id, int(object_version), part_number, ci)
                     if not isinstance(piece, (bytes, bytearray)):
@@ -390,13 +390,13 @@ class Uploader:
                         extra_headers=extra_headers,
                     )
 
-                    piece_cid = str(chunk_upload_result.cid)
-                    piece_file_id = str(chunk_upload_result.id)
-                    all_chunk_cids.append(piece_cid)
+                    upload_id = str(chunk_upload_result.cid)
+                    file_hash = str(chunk_upload_result.id)
+                    all_file_hashes.append(file_hash)
 
                     logger.info(
                         f"Uploaded chunk: backend={self.backend_name} object_id={object_id} part={part_number} "
-                        f"chunk={ci} file_id={piece_file_id} cid={piece_cid} status={chunk_upload_result.status}"
+                        f"chunk={ci} file_id={file_hash} upload_id={upload_id} status={chunk_upload_result.status}"
                     )
 
                     async with self._acquire_conn() as conn:
@@ -405,17 +405,16 @@ class Uploader:
                             part_id,
                             int(ci),
                             self.backend_name,
-                            piece_cid,
+                            file_hash,
                         )
 
-                span.set_attribute("result.num_piece_cids", len(all_chunk_cids))
-                span.set_attribute("result.cids", ",".join(all_chunk_cids))
+                span.set_attribute("result.num_piece_cids", len(all_file_hashes))
+                span.set_attribute("result.cids", ",".join(all_file_hashes))
 
-                logger.debug(
-                    f"Uploaded {num_chunks_meta} chunks backend={self.backend_name} object_id={object_id} "
-                    f"part={part_number} cids={len(all_chunk_cids)}"
+                return ChunkUploadResult(
+                    cids=all_file_hashes,
+                    part_number=part_number,
                 )
-                return ChunkUploadResult(cids=all_chunk_cids, part_number=part_number)
 
             raise RuntimeError("part_meta_not_ready")
 

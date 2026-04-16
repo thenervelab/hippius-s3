@@ -181,7 +181,7 @@ async def test_upload_stores_backend_identifier_in_chunk_backend(mock_config, mo
         # insert_chunk_backend takes: query, part_id, chunk_index, backend, backend_identifier
         assert len(args) == 5
         assert args[3] == "arion"
-        assert args[4] == "QmTestCID"
+        assert args[4] == "file-uuid-999"
 
 
 @pytest.mark.asyncio
