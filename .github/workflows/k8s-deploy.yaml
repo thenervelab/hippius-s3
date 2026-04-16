@@ -134,7 +134,7 @@ jobs:
 
       - name: Update secrets
         run: |
-          DATABASE_URL="postgresql://postgres:${{ secrets.DATABASE_PASSWORD }}@postgres-rw:5432/hippius?sslmode=disable"
+          DATABASE_URL="postgresql://postgres:${{ secrets.DATABASE_PASSWORD }}@pgbouncer:5432/hippius?sslmode=disable"
 
           kubectl create secret generic hippius-s3-secrets \
             --from-literal=DATABASE_PASSWORD='${{ secrets.DATABASE_PASSWORD }}' \
@@ -182,6 +182,17 @@ jobs:
           kubectl create secret generic postgres-backup-creds \
             --from-literal=ACCESS_KEY_ID='${{ secrets.OVH_BACKUP_ACCESS_KEY_ID }}' \
             --from-literal=ACCESS_KEY_SECRET='${{ secrets.OVH_BACKUP_SECRET_ACCESS_KEY }}' \
+            --namespace=hippius-s3-staging \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Create pgbouncer userlist secret
+        run: |
+          PG_MD5=$(echo -n "${{ secrets.DATABASE_PASSWORD }}postgres" | md5sum | cut -d' ' -f1)
+          ADMIN_MD5=$(echo -n "${{ secrets.DATABASE_PASSWORD }}pgbouncer_admin" | md5sum | cut -d' ' -f1)
+          USERLIST="\"postgres\" \"md5${PG_MD5}\"
+          \"pgbouncer_admin\" \"md5${ADMIN_MD5}\""
+          kubectl create secret generic pgbouncer-userlist \
+            --from-literal=userlist.txt="${USERLIST}" \
             --namespace=hippius-s3-staging \
             --dry-run=client -o yaml | kubectl apply -f -
 
