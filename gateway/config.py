@@ -31,7 +31,6 @@ class GatewayConfig:
         default_factory=lambda: os.getenv("REDIS_ACL_URL", "redis://redis-acl:6379/0")
     )
     hippius_chain_url: str = dataclasses.field(default_factory=lambda: os.getenv("HIPPIUS_CHAIN_URL", ""))
-    substrate_url: str = dataclasses.field(default_factory=lambda: os.getenv("HIPPIUS_SUBSTRATE_URL", ""))
     enable_public_read: bool = dataclasses.field(
         default_factory=lambda: os.getenv("ENABLE_PUBLIC_READ", "false").lower() == "true"
     )

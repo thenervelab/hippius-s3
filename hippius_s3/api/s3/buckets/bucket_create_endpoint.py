@@ -11,13 +11,13 @@ import asyncpg
 from fastapi import Request
 from fastapi import Response
 from lxml import etree as ET  # ty: ignore[unresolved-import]
-from substrateinterface.utils.ss58 import is_valid_ss58_address
 
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.buckets.bucket_policy_endpoint import set_bucket_policy
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.utils import get_query
 from hippius_s3.utils import get_request_body
+from hippius_s3.utils.ss58 import is_valid_ss58_address
 
 
 logger = logging.getLogger(__name__)

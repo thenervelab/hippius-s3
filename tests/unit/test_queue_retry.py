@@ -21,10 +21,7 @@ async def test_enqueue_retry_request_sets_attempts_and_schedules() -> None:
     redis = FakeRedis()
     initialize_queue_client(redis)
     payload = UploadChainRequest(
-        substrate_url="http://test",
         address="user1",
-        subaccount="user1",
-        subaccount_seed_phrase="test-seed",
         bucket_name="test-bucket",
         object_key="test-key",
         should_encrypt=False,

@@ -34,10 +34,6 @@ services:
     environment:
       <<: *monitoring-enabled
 
-  account-cacher:
-    environment:
-      <<: *monitoring-enabled
-
   janitor:
     environment:
       <<: *monitoring-enabled

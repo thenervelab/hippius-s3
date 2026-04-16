@@ -1,6 +1,5 @@
 """User API endpoints for frontend JSON responses."""
 
-import base64
 import ipaddress
 import logging
 from typing import Optional
@@ -17,7 +16,6 @@ from hippius_s3.config import get_config
 from hippius_s3.dependencies import DBConnection
 from hippius_s3.dependencies import get_postgres
 from hippius_s3.services.acl_helper import has_public_read_acl
-from hippius_s3.substrate_client import SubstrateClient
 from hippius_s3.utils import get_query
 
 
@@ -119,46 +117,6 @@ async def get_bucket_location(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get bucket location",
         ) from e
-
-
-@router.get("/credits")
-async def credits(
-    b64_subaccount_seed_phrase: str = Query(..., description="Subaccount seed phrase in base64"),
-) -> JSONResponse:
-    try:
-        subaccount_seed = base64.b64decode(b64_subaccount_seed_phrase).decode()
-
-        substrate_client = SubstrateClient(
-            url=config.substrate_url,
-        )
-        substrate_client.connect(seed_phrase=subaccount_seed)
-        assert substrate_client._account_address is not None
-
-        main_account = substrate_client.query_sub_account(
-            substrate_client._account_address,
-            seed_phrase=subaccount_seed,
-        )
-
-        if not main_account:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="The seed phrase you passed in belongs to a main account, please pass in a subaccount seed phrase instead",
-            )
-
-        remaining_credits = await substrate_client.get_free_credits(
-            account_address=main_account,
-        )
-
-        return JSONResponse(
-            {
-                "credits": remaining_credits,
-            }
-        )
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Provided value is not a valid seed phrase",
-        ) from None
 
 
 @router.get("/list_objects")
