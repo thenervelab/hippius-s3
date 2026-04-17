@@ -207,7 +207,14 @@ async def process_download_request(
                 return all(chunk_results)
 
         try:
-            results = await asyncio.gather(*[_process_part(part) for part in download_request.chunks])
+            # Process parts in bounded batches to prevent OOM with huge objects
+            # (e.g. 5K+ parts = 10K+ tasks). The semaphore still controls concurrent fetches.
+            part_batch_size = max(1, config.downloader_semaphore)
+            results: list[bool] = []
+            for batch_start in range(0, len(download_request.chunks), part_batch_size):
+                batch = download_request.chunks[batch_start : batch_start + part_batch_size]
+                batch_results = await asyncio.gather(*[_process_part(part) for part in batch])
+                results.extend(batch_results)
             success_count = sum(1 for r in results if r)
             total = len(download_request.chunks)
             span.set_attribute("result.success_count", success_count)
