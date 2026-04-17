@@ -16,15 +16,10 @@ spec:
     spec:
       containers:
         - name: pgbouncer
-          image: bitnami/pgbouncer:1.25.0
+          image: edoburu/pgbouncer:1.25.0-p0
           ports:
             - containerPort: 5432
               name: pgbouncer
-          env:
-            - name: PGBOUNCER_CONF_FILE
-              value: /etc/pgbouncer/pgbouncer.ini
-            - name: PGBOUNCER_AUTH_FILE
-              value: /etc/pgbouncer/userlist.txt
           volumeMounts:
             - name: pgbouncer-config
               mountPath: /etc/pgbouncer/pgbouncer.ini

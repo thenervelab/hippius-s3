@@ -15,8 +15,6 @@ resources:
   - api-deployment.yaml
   - gateway-deployment.yaml
   - workers-deployments.yaml
-  - pgbouncer-configmap.yaml
-  - pgbouncer-deployment.yaml
   - services.yaml
   - ingress.yaml
   - networkpolicy.yaml

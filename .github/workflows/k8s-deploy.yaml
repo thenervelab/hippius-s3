@@ -189,10 +189,9 @@ jobs:
         run: |
           PG_MD5=$(echo -n "${{ secrets.DATABASE_PASSWORD }}postgres" | md5sum | cut -d' ' -f1)
           ADMIN_MD5=$(echo -n "${{ secrets.DATABASE_PASSWORD }}pgbouncer_admin" | md5sum | cut -d' ' -f1)
-          USERLIST="\"postgres\" \"md5${PG_MD5}\"
-          \"pgbouncer_admin\" \"md5${ADMIN_MD5}\""
+          printf '"postgres" "md5%s"\n"pgbouncer_admin" "md5%s"\n' "${PG_MD5}" "${ADMIN_MD5}" > /tmp/userlist.txt
           kubectl create secret generic pgbouncer-userlist \
-            --from-literal=userlist.txt="${USERLIST}" \
+            --from-file=userlist.txt=/tmp/userlist.txt \
             --namespace=hippius-s3-staging \
             --dry-run=client -o yaml | kubectl apply -f -
 
