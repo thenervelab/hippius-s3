@@ -75,15 +75,17 @@ def _make_mock_db_pool_no_identifier():
 
 
 def _make_mock_obj_cache(cached_keys: set[str] | None = None):
-    """Create a mock obj_cache with download cache support."""
+    """Create a mock obj_cache matching RedisObjectPartsCache's surface used here."""
     cache = MagicMock()
     cached = cached_keys or set()
 
-    async def chunk_exists(object_id, object_version, part_number, chunk_index):
-        key = f"obj:{object_id}:v:{object_version}:part:{part_number}:chunk:{chunk_index}"
-        return key in cached
+    async def chunks_exist_batch(object_id, object_version, checks):
+        return [
+            f"obj:{object_id}:v:{object_version}:part:{pn}:chunk:{ci}" in cached
+            for pn, ci in checks
+        ]
 
-    cache.chunk_exists = AsyncMock(side_effect=chunk_exists)
+    cache.chunks_exist_batch = AsyncMock(side_effect=chunks_exist_batch)
     cache.set_download_chunk = AsyncMock()
     cache.notify_chunk = AsyncMock()
     cache.redis = MagicMock()
@@ -370,6 +372,76 @@ async def test_semaphore_of_1_still_processes_all(mock_metrics, mock_config):
 
     assert result is True
     assert fetch_fn.await_count == num_parts
+
+
+@pytest.mark.asyncio
+@patch("hippius_s3.workers.downloader.get_config")
+@patch("hippius_s3.workers.downloader.get_metrics_collector")
+async def test_peak_concurrency_bounded_by_semaphore(mock_metrics, mock_config):
+    """fetch_fn is never invoked more than `config.downloader_semaphore` times concurrently."""
+    semaphore = 4
+    num_parts = 20
+    config = _make_mock_config(semaphore=semaphore)
+    mock_config.return_value = config
+    mock_metrics.return_value = MagicMock()
+
+    current = 0
+    peak = 0
+    lock = asyncio.Lock()
+
+    async def tracking_fetch(identifier, account):
+        nonlocal current, peak
+        async with lock:
+            current += 1
+            if current > peak:
+                peak = current
+        try:
+            await asyncio.sleep(0.005)
+            return b"x" * 4096
+        finally:
+            async with lock:
+                current -= 1
+
+    db_pool = _make_mock_db_pool()
+    obj_cache = _make_mock_obj_cache()
+    request = _make_request(num_parts, chunks_per_part=1)
+
+    result = await process_download_request(
+        request,
+        backend_name="arion",
+        fetch_fn=tracking_fetch,
+        db_pool=db_pool,
+        obj_cache=obj_cache,
+    )
+
+    assert result is True
+    assert peak <= semaphore
+    assert peak >= 1
+
+
+@pytest.mark.asyncio
+@patch("hippius_s3.workers.downloader.get_config")
+@patch("hippius_s3.workers.downloader.get_metrics_collector")
+async def test_chunks_exist_batch_called_once(mock_metrics, mock_config):
+    """Cache existence is checked via one pipelined call, not per-chunk."""
+    config = _make_mock_config(semaphore=4)
+    mock_config.return_value = config
+    mock_metrics.return_value = MagicMock()
+
+    fetch_fn = AsyncMock(return_value=b"x" * 4096)
+    db_pool = _make_mock_db_pool()
+    obj_cache = _make_mock_obj_cache()
+    request = _make_request(50, chunks_per_part=2)
+
+    await process_download_request(
+        request,
+        backend_name="arion",
+        fetch_fn=fetch_fn,
+        db_pool=db_pool,
+        obj_cache=obj_cache,
+    )
+
+    assert obj_cache.chunks_exist_batch.await_count == 1
 
 
 @pytest.mark.asyncio

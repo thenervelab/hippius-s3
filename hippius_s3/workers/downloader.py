@@ -30,7 +30,6 @@ from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import DownloadChainRequest
-from hippius_s3.queue import PartToDownload
 from hippius_s3.redis_utils import create_redis_client
 from hippius_s3.utils import get_query
 from hippius_s3.utils.timing import log_timing
@@ -76,7 +75,6 @@ async def process_download_request(
             f"object_id={download_request.object_id}"
         )
 
-        semaphore = asyncio.Semaphore(config.downloader_semaphore)
         max_attempts = config.downloader_chunk_retries
         base_sleep = config.downloader_retry_base_seconds
         jitter = config.downloader_retry_jitter_seconds
@@ -86,139 +84,150 @@ async def process_download_request(
         ttfb_ms = 0.0
         total_bytes_downloaded = 0
 
-        async def _fetch_chunk(part_number: int, spec: object, span: trace.Span) -> bool:
-            """Fetch and cache a single chunk, guarded by the semaphore."""
+        async def _fetch_chunk(part_number: int, spec: object) -> bool:
+            """Fetch and cache a single chunk. Concurrency is bounded by the worker pool."""
             nonlocal ttfb_recorded, ttfb_ms, total_bytes_downloaded
             chunk_index = int(spec.index)  # ty: ignore[unresolved-attribute]
 
-            async with semaphore:
-                # Check if already cached
-                cached = await obj_cache.chunk_exists(
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    get_query("get_chunk_backend_identifier"),
+                    backend_name,
                     download_request.object_id,
                     int(download_request.object_version),
                     part_number,
                     chunk_index,
                 )
-                if cached:
-                    logger.debug(f"[{backend_name}] Skipping cached chunk part={part_number} ci={chunk_index}")
-                    return True
+            if not row or not row["backend_identifier"]:
+                logger.debug(f"[{backend_name}] No identifier for part={part_number} ci={chunk_index}, skipping")
+                return True
 
-                # Look up backend_identifier (acquire connection from pool)
-                async with db_pool.acquire() as conn:
-                    row = await conn.fetchrow(
-                        get_query("get_chunk_backend_identifier"),
-                        backend_name,
+            identifier = str(row["backend_identifier"])
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    t0 = time.perf_counter()
+                    data = await fetch_fn(identifier, download_request.subaccount)
+                    fetch_ms = (time.perf_counter() - t0) * 1000.0
+
+                    if not ttfb_recorded:
+                        ttfb_ms = (time.perf_counter() - t_request_start) * 1000.0
+                        ttfb_recorded = True
+                    total_bytes_downloaded += len(data)
+
+                    t_cache = time.perf_counter()
+                    await obj_cache.set_download_chunk(
+                        download_request.object_id,
+                        int(download_request.object_version),
+                        part_number,
+                        chunk_index,
+                        data,
+                        ttl=config.download_cache_ttl_seconds,
+                    )
+                    await obj_cache.notify_chunk(
                         download_request.object_id,
                         int(download_request.object_version),
                         part_number,
                         chunk_index,
                     )
-                if not row or not row["backend_identifier"]:
-                    logger.debug(f"[{backend_name}] No identifier for part={part_number} ci={chunk_index}, skipping")
+                    cache_ms = (time.perf_counter() - t_cache) * 1000.0
+
+                    chunk_mb = len(data) / (1024 * 1024)
+                    chunk_throughput = chunk_mb / (fetch_ms / 1000.0) if fetch_ms > 0 else 0
+                    logger.info(
+                        f"[{backend_name}] CHUNK object_id={download_request.object_id} "
+                        f"part={part_number} ci={chunk_index} id={identifier} "
+                        f"fetch={fetch_ms:.0f}ms cache={cache_ms:.0f}ms "
+                        f"size={chunk_mb:.1f}MB throughput={chunk_throughput:.1f}MB/s"
+                    )
+
+                    log_timing(
+                        "downloader.chunk_download_and_store",
+                        fetch_ms + cache_ms,
+                        extra={
+                            "backend": backend_name,
+                            "object_id": download_request.object_id,
+                            "part_number": part_number,
+                            "chunk_index": chunk_index,
+                            "size_bytes": len(data),
+                        },
+                    )
                     return True
-
-                identifier = str(row["backend_identifier"])
-
-                # Fetch with retries
-                for attempt in range(1, max_attempts + 1):
-                    try:
-                        t0 = time.perf_counter()
-                        data = await fetch_fn(identifier, download_request.subaccount)
-                        fetch_ms = (time.perf_counter() - t0) * 1000.0
-
-                        if not ttfb_recorded:
-                            ttfb_ms = (time.perf_counter() - t_request_start) * 1000.0
-                            ttfb_recorded = True
-                        total_bytes_downloaded += len(data)
-
-                        t_cache = time.perf_counter()
-                        await obj_cache.set_download_chunk(
-                            download_request.object_id,
-                            int(download_request.object_version),
-                            part_number,
-                            chunk_index,
-                            data,
-                            ttl=config.download_cache_ttl_seconds,
+                except Exception as exc:
+                    if attempt == max_attempts:
+                        logger.error(
+                            f"[{backend_name}] Failed chunk "
+                            f"part={part_number} ci={chunk_index} "
+                            f"after {max_attempts} attempts: {exc}"
                         )
-                        # Notify waiting readers via pub/sub
-                        await obj_cache.notify_chunk(
-                            download_request.object_id,
-                            int(download_request.object_version),
-                            part_number,
-                            chunk_index,
-                        )
-                        cache_ms = (time.perf_counter() - t_cache) * 1000.0
-
-                        chunk_mb = len(data) / (1024 * 1024)
-                        chunk_throughput = chunk_mb / (fetch_ms / 1000.0) if fetch_ms > 0 else 0
-                        logger.info(
-                            f"[{backend_name}] CHUNK object_id={download_request.object_id} "
-                            f"part={part_number} ci={chunk_index} id={identifier} "
-                            f"fetch={fetch_ms:.0f}ms cache={cache_ms:.0f}ms "
-                            f"size={chunk_mb:.1f}MB throughput={chunk_throughput:.1f}MB/s"
-                        )
-
-                        log_timing(
-                            "downloader.chunk_download_and_store",
-                            fetch_ms + cache_ms,
-                            extra={
-                                "backend": backend_name,
-                                "object_id": download_request.object_id,
-                                "part_number": part_number,
-                                "chunk_index": chunk_index,
-                                "size_bytes": len(data),
-                            },
-                        )
-                        return True
-                    except Exception as exc:
-                        if attempt == max_attempts:
-                            logger.error(
-                                f"[{backend_name}] Failed chunk "
-                                f"part={part_number} ci={chunk_index} "
-                                f"after {max_attempts} attempts: {exc}"
-                            )
-                            return False
-                        sleep_for = base_sleep * attempt + random.uniform(0, jitter)
-                        logger.warning(
-                            f"[{backend_name}] Fetch error part={part_number} "
-                            f"ci={chunk_index} attempt {attempt}/{max_attempts}: "
-                            f"{exc}. Retrying in {sleep_for:.2f}s"
-                        )
-                        await asyncio.sleep(sleep_for)
+                        return False
+                    sleep_for = base_sleep * attempt + random.uniform(0, jitter)
+                    logger.warning(
+                        f"[{backend_name}] Fetch error part={part_number} "
+                        f"ci={chunk_index} attempt {attempt}/{max_attempts}: "
+                        f"{exc}. Retrying in {sleep_for:.2f}s"
+                    )
+                    await asyncio.sleep(sleep_for)
             return False  # unreachable, but keeps mypy happy
 
-        async def _process_part(part: PartToDownload) -> bool:
-            part_number = int(part.part_number)
-            with tracer.start_as_current_span(
-                "downloader.download_part",
-                attributes={
-                    "object_id": download_request.object_id,
-                    "part_number": part_number,
-                    "num_chunks": len(part.chunks),
-                },
-            ) as part_span:
-                chunk_results = await asyncio.gather(
-                    *[_fetch_chunk(part_number, spec, part_span) for spec in part.chunks]
-                )
-
-                # Clear in-progress flag
-                with contextlib.suppress(Exception):
-                    await obj_cache.redis.delete(f"download_in_progress:{download_request.object_id}:{part_number}")
-                return all(chunk_results)
-
         try:
-            # Process parts in bounded batches to prevent OOM with huge objects
-            # (e.g. 5K+ parts = 10K+ tasks). The semaphore still controls concurrent fetches.
-            part_batch_size = max(1, config.downloader_semaphore)
-            results: list[bool] = []
-            for batch_start in range(0, len(download_request.chunks), part_batch_size):
-                batch = download_request.chunks[batch_start : batch_start + part_batch_size]
-                batch_results = await asyncio.gather(*[_process_part(part) for part in batch])
-                results.extend(batch_results)
-            success_count = sum(1 for r in results if r)
-            total = len(download_request.chunks)
-            span.set_attribute("result.success_count", success_count)
-            span.set_attribute("result.total_parts", total)
+            # Flatten (part_number, spec) and pre-filter cached chunks with a single
+            # pipelined EXISTS so large objects don't pay N per-chunk round-trips.
+            chunk_specs: list[tuple[int, object]] = [
+                (int(part.part_number), spec) for part in download_request.chunks for spec in part.chunks
+            ]
+            num_parts = len(download_request.chunks)
+            total_chunks = len(chunk_specs)
+
+            if chunk_specs:
+                checks = [(pn, int(spec.index)) for pn, spec in chunk_specs]  # ty: ignore[unresolved-attribute]
+                cached_flags = await obj_cache.chunks_exist_batch(
+                    download_request.object_id,
+                    int(download_request.object_version),
+                    checks,
+                )
+                pending = [cs for cs, ex in zip(chunk_specs, cached_flags, strict=False) if not ex]
+                cached_count = total_chunks - len(pending)
+            else:
+                pending = []
+                cached_count = 0
+
+            # Bounded worker pool: workers drain a shared queue so concurrency is
+            # capped without the batch-barrier of per-batch gather(). Large objects
+            # (5K+ parts, 10K+ chunks) stay within memory limits.
+            queue: asyncio.Queue[tuple[int, object]] = asyncio.Queue()
+            for cs in pending:
+                queue.put_nowait(cs)
+
+            fetched_results: list[bool] = []
+
+            async def worker() -> None:
+                while True:
+                    try:
+                        pn, spec = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    fetched_results.append(await _fetch_chunk(pn, spec))
+
+            worker_results = await asyncio.gather(
+                *(worker() for _ in range(config.downloader_semaphore)),
+                return_exceptions=True,
+            )
+            for r in worker_results:
+                if isinstance(r, BaseException):
+                    logger.warning(f"[{backend_name}] worker failed: {r}")
+
+            # Clear per-part in-progress flags after all chunks are done.
+            with contextlib.suppress(Exception):
+                for part in download_request.chunks:
+                    await obj_cache.redis.delete(
+                        f"download_in_progress:{download_request.object_id}:{int(part.part_number)}"
+                    )
+
+            chunk_success_count = cached_count + sum(1 for r in fetched_results if r)
+            span.set_attribute("result.success_count", chunk_success_count)
+            span.set_attribute("result.total_chunks", total_chunks)
+            span.set_attribute("result.total_parts", num_parts)
             total_ms = (time.perf_counter() - t_request_start) * 1000.0
             size_mb = total_bytes_downloaded / (1024 * 1024)
             throughput = size_mb / (total_ms / 1000.0) if total_ms > 0 else 0
@@ -226,16 +235,16 @@ async def process_download_request(
                 f"[{backend_name}] PERF download {short_id} "
                 f"total={total_ms:.0f}ms ttfb={ttfb_ms:.0f}ms "
                 f"size={size_mb:.1f}MB throughput={throughput:.1f}MB/s "
-                f"parts={success_count}/{total}"
+                f"chunks={chunk_success_count}/{total_chunks}"
             )
             total_duration = time.perf_counter() - t_request_start
-            if success_count == total:
+            if chunk_success_count == total_chunks:
                 get_metrics_collector().record_downloader_operation(
                     backend=backend_name,
                     main_account=download_request.address,
                     success=True,
                     duration=total_duration,
-                    num_chunks=sum(len(p.chunks) for p in download_request.chunks),
+                    num_chunks=total_chunks,
                 )
                 return True
             get_metrics_collector().record_downloader_operation(
@@ -244,7 +253,7 @@ async def process_download_request(
                 success=False,
                 duration=total_duration,
             )
-            logger.error(f"[{backend_name}] {success_count}/{total} parts OK for {short_id}")
+            logger.error(f"[{backend_name}] {chunk_success_count}/{total_chunks} chunks OK for {short_id}")
             return False
         except Exception as exc:
             get_metrics_collector().record_downloader_operation(
