@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+spec:
+  replicas: 2
+  template:
+    spec:
+      nodeSelector:
+        hippius.com/cache-region: us-0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 2
+  template:
+    spec:
+      nodeSelector:
+        hippius.com/cache-region: us-0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arion-downloader
+spec:
+  replicas: 10
+  template:
+    spec:
+      nodeSelector:
+        hippius.com/cache-region: us-0
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-queues
+spec:
+  template:
+    spec:
+      nodeSelector:
+        hippius.com/cache-region: us-0
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-rate-limiting
+spec:
+  template:
+    spec:
+      nodeSelector:
+        hippius.com/cache-region: us-0
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-acl
+spec:
+  template:
+    spec:
+      nodeSelector:
+        hippius.com/cache-region: us-0

@@ -136,12 +136,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # IPFS service not needed in API container; workers own IPFS interactions
 
         # Cache repositories
+        # In read-only mode (CDN cache), use the download cache as the primary Redis.
+        # No main chunk cache exists since there are no uploads to populate it.
+        # Set download_cache_client=None to avoid redundant fallback lookup on the same instance.
+        if config.read_only_mode:
+            primary_cache_client = app.state.redis_download_cache_client
+            dl_fallback_client = None
+            logger.info("Read-only mode: using download cache as primary chunk cache")
+        else:
+            primary_cache_client = app.state.redis_client
+            dl_fallback_client = app.state.redis_download_cache_client
         app.state.obj_cache = RedisObjectPartsCache(
-            app.state.redis_client,
+            primary_cache_client,
             queues_client=app.state.redis_queues_client,
-            download_cache_client=app.state.redis_download_cache_client,
+            download_cache_client=dl_fallback_client,
         )
-        app.state.dl_cache = RedisDownloadChunksCache(app.state.redis_client)
+        app.state.dl_cache = RedisDownloadChunksCache(primary_cache_client)
         app.state.fs_store = create_fs_store(config)
         logger.info("Cache repositories initialized")
 
