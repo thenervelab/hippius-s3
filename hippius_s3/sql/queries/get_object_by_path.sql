@@ -14,7 +14,16 @@ SELECT o.object_id, o.bucket_id, o.object_key,
        ov.wrapped_dek,
        b.bucket_name
 FROM objects o
-JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
+JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = (
+    -- Skip incomplete multipart placeholders (InitiateMultipartUpload without Complete)
+    SELECT v.object_version
+    FROM object_versions v
+    WHERE v.object_id = o.object_id
+      AND v.object_version <= o.current_object_version
+      AND (v.md5_hash IS NOT NULL OR v.size_bytes > 0)
+    ORDER BY v.object_version DESC
+    LIMIT 1
+)
 JOIN buckets b ON o.bucket_id = b.bucket_id
 LEFT JOIN cids c ON ov.cid_id = c.id
 WHERE o.bucket_id = $1 AND o.object_key = $2 AND o.deleted_at IS NULL
