@@ -26,7 +26,18 @@ WITH object_info AS (
         ov.kek_id,
         ov.wrapped_dek
     FROM objects o
-    JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
+    JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = (
+        -- Prefer current_object_version, but skip incomplete multipart placeholders
+        -- (size_bytes=0 and md5_hash IS NULL means InitiateMultipartUpload ran but
+        -- CompleteMultipartUpload has not). Fall back to the latest completed version.
+        SELECT v.object_version
+        FROM object_versions v
+        WHERE v.object_id = o.object_id
+          AND v.object_version <= o.current_object_version
+          AND (v.md5_hash IS NOT NULL OR v.size_bytes > 0)
+        ORDER BY v.object_version DESC
+        LIMIT 1
+    )
     JOIN buckets b ON o.bucket_id = b.bucket_id
     LEFT JOIN cids c ON ov.cid_id = c.id
     WHERE b.bucket_name = $1
