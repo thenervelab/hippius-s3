@@ -34,7 +34,7 @@ WITH object_info AS (
         FROM object_versions v
         WHERE v.object_id = o.object_id
           AND v.object_version <= o.current_object_version
-          AND (v.md5_hash IS NOT NULL OR v.size_bytes > 0)
+          AND (v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
         ORDER BY v.object_version DESC
         LIMIT 1
     )
