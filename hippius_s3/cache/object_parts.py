@@ -141,10 +141,13 @@ class ObjectPartsCache(Protocol):
 
 
 class RedisObjectPartsCache:
-    def __init__(self, redis_client: Any, queues_client: Any = None, download_cache_client: Any = None) -> None:
+    def __init__(
+        self, redis_client: Any, queues_client: Any = None, download_cache_client: Any = None, fs_store: Any = None
+    ) -> None:
         self.redis = redis_client
         self._queues_client = queues_client or redis_client
         self._download_cache = download_cache_client
+        self._fs_store = fs_store
 
     def build_key(self, object_id: str, object_version: int, part_number: int) -> str:
         return f"obj:{object_id}:v:{int(object_version)}:part:{int(part_number)}"
@@ -285,6 +288,12 @@ class RedisObjectPartsCache:
     async def get_chunk(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int
     ) -> Optional[bytes]:
+        # Filesystem first — stat is cheap and avoids Redis round-trips entirely
+        if self._fs_store is not None:
+            result = await self._fs_store.get_chunk(object_id, object_version, part_number, chunk_index)
+            if result is not None:
+                _get_metrics_collector().record_cache_operation(hit=True, operation="get_chunk_fs")
+                return result
         key = self.build_chunk_key(object_id, object_version, part_number, chunk_index)
         result = await self.redis.get(key)
         if isinstance(result, bytes):

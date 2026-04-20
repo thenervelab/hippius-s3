@@ -57,7 +57,7 @@ kind: Deployment
 metadata:
   name: arion-downloader
 spec:
-  replicas: 25
+  replicas: 15
   template:
     spec:
       containers:
