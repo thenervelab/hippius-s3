@@ -25,7 +25,6 @@ import pytest
 
 from tests.e2e.support.cache import clear_object_cache
 from tests.e2e.support.cache import get_object_id_and_version
-from tests.e2e.support.cache import wait_for_all_backends_ready
 
 
 DB_DSN = "postgresql://postgres:postgres@localhost:5432/hippius"
