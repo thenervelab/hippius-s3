@@ -136,13 +136,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # IPFS service not needed in API container; workers own IPFS interactions
 
         # Cache repositories
+        app.state.fs_store = create_fs_store(config)
         app.state.obj_cache = RedisObjectPartsCache(
             app.state.redis_client,
             queues_client=app.state.redis_queues_client,
             download_cache_client=app.state.redis_download_cache_client,
+            fs_store=app.state.fs_store,
         )
         app.state.dl_cache = RedisDownloadChunksCache(app.state.redis_client)
-        app.state.fs_store = create_fs_store(config)
         logger.info("Cache repositories initialized")
 
         from hippius_s3.monitoring import MetricsCollector
