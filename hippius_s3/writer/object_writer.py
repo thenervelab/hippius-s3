@@ -412,6 +412,20 @@ class ObjectWriter:
                 },
             )
 
+        # Write FS meta BEFORE making this version visible in DB.
+        # The download query skips versions with size=0/md5='', so the version
+        # only becomes serveable after update_object_version_metadata sets size/md5.
+        # FS meta must exist first, otherwise get_chunk() returns None (meta check fails).
+        num_chunks = int(next_chunk_index)
+        await writer.write_meta(
+            object_id,
+            int(object_version),
+            int(part_number),
+            chunk_size=chunk_size,
+            num_chunks=int(num_chunks),
+            plain_size=int(total_size),
+        )
+
         # Update the reserved object_versions row with final md5/size
         perf_post_start = time.monotonic()
         with tracer.start_as_current_span(
@@ -437,16 +451,6 @@ class ObjectWriter:
             )
             # Envelope (kek_id, wrapped_dek) was already written immediately after
             # the upsert to prevent the read-race on concurrent overwrites.
-
-        num_chunks = int(next_chunk_index)
-        await writer.write_meta(
-            object_id,
-            int(object_version),
-            int(part_number),
-            chunk_size=chunk_size,
-            num_chunks=int(num_chunks),
-            plain_size=int(total_size),
-        )
 
         upload_id = await ensure_upload_row(
             self.db,
