@@ -370,7 +370,7 @@ jobs:
   deploy-cache-production:
     runs-on: ubuntu-latest
     needs: [build-images, deploy-production]
-    if: github.ref == 'refs/heads/k8s-production'
+    if: false  # CDN/cache deployment temporarily disabled
     environment: production
     strategy:
       matrix:
