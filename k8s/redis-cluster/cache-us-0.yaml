@@ -1,7 +1,6 @@
 # Redis Cluster for hippius-s3-cache-us-0 namespace
-# 6-node Redis Cluster used as the download chunk cache for CDN edge.
-# Pure cache — no persistence. This is the only Redis cache needed for reads.
-# Both REDIS_URL and REDIS_DOWNLOAD_CACHE_URL point to this cluster.
+# 6-node Redis Cluster. Used for metrics + pub/sub chunk-ready notifications;
+# chunk data lives on the shared FS cache (local NVMe PVC), not in Redis.
 # Apply: kubectl apply -f k8s/redis-cluster/cache-us-0.yaml
 # Bootstrap: kubectl exec -n hippius-s3-cache-us-0 redis-cluster-0 -- redis-cli --cluster create \
 #   redis-cluster-{0..5}.redis-cluster.hippius-s3-cache-us-0.svc.cluster.local:6379 \

@@ -78,11 +78,6 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: REDIS_RATE_LIMITING_URL
-            - name: REDIS_DOWNLOAD_CACHE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: REDIS_DOWNLOAD_CACHE_URL
             - name: HIPPIUS_SERVICE_KEY
               valueFrom:
                 secretKeyRef:
@@ -133,7 +128,9 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: FRONTEND_HMAC_SECRET
-          # No volume mounts: read-only cache does not need object-cache, persist, or dlq PVCs
+          # Base mounts only KMS certs. Region overlays add a local-cache PVC
+          # (via local-cache-patch.yaml) mounted at /var/lib/hippius/object_cache
+          # for FS-backed download chunk storage.
           volumeMounts:
             - name: kms-certs
               mountPath: /kms_certs

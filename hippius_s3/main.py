@@ -116,10 +116,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.redis_queues_client = async_redis.from_url(config.redis_queues_url)
         logger.info("Redis queues client initialized")
 
-        app.state.redis_download_cache_client = create_redis_client(config.redis_download_cache_url)
-        await app.state.redis_download_cache_client.ping()  # ty: ignore[unresolved-attribute]
-        logger.info("Redis download cache client initialized and verified")
-
         from hippius_s3.queue import initialize_queue_client
         from hippius_s3.redis_cache import initialize_cache_client
         from hippius_s3.redis_chain import initialize_chain_client
@@ -136,23 +132,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # IPFS service not needed in API container; workers own IPFS interactions
 
         # Cache repositories
-        # In read-only mode (CDN cache), use the download cache as the primary Redis.
-        # No main chunk cache exists since there are no uploads to populate it.
-        # Set download_cache_client=None to avoid redundant fallback lookup on the same instance.
-        if config.read_only_mode:
-            primary_cache_client = app.state.redis_download_cache_client
-            dl_fallback_client = None
-            logger.info("Read-only mode: using download cache as primary chunk cache")
-        else:
-            primary_cache_client = app.state.redis_client
-            dl_fallback_client = app.state.redis_download_cache_client
-        app.state.obj_cache = RedisObjectPartsCache(
-            primary_cache_client,
-            queues_client=app.state.redis_queues_client,
-            download_cache_client=dl_fallback_client,
-        )
-        app.state.dl_cache = RedisDownloadChunksCache(primary_cache_client)
+        # Chunks are stored on the shared filesystem (via FileSystemPartsStore).
+        # Redis is used only for pub/sub chunk-ready notifications (queues_client).
         app.state.fs_store = create_fs_store(config)
+        app.state.obj_cache = RedisObjectPartsCache(
+            app.state.redis_client,
+            queues_client=app.state.redis_queues_client,
+            fs_store=app.state.fs_store,
+        )
+        app.state.dl_cache = RedisDownloadChunksCache(app.state.redis_client)
         logger.info("Cache repositories initialized")
 
         from hippius_s3.monitoring import MetricsCollector
@@ -232,12 +220,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.info("Redis queues client closed")
         except Exception:
             logger.exception("Error shutting down Redis queues client")
-
-        try:
-            await app.state.redis_download_cache_client.close()
-            logger.info("Redis download cache client closed")
-        except Exception:
-            logger.exception("Error shutting down Redis download cache client")
 
         try:
             await app.state.postgres_pool.close()

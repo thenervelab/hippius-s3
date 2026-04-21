@@ -76,11 +76,6 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: REDIS_RATE_LIMITING_URL
-            - name: REDIS_DOWNLOAD_CACHE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: REDIS_DOWNLOAD_CACHE_URL
             - name: HIPPIUS_SERVICE_KEY
               valueFrom:
                 secretKeyRef:

@@ -6,11 +6,14 @@ namespace: hippius-s3-cache-eu-0
 resources:
   - ../../base
   - gateway-nodeport.yaml
+  - pv-local-cache.yaml
+  - pvc-local-cache.yaml
 
 patches:
   - path: namespace-patch.yaml
   - path: environment-patch.yaml
   - path: nodeselector-patch.yaml
+  - path: local-cache-patch.yaml
 
 labels:
   - pairs:
