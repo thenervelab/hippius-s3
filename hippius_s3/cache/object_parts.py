@@ -98,8 +98,18 @@ class RedisObjectPartsCache:
 
     @property
     def fs(self) -> FileSystemPartsStore:
+        """Return the backing FS store, creating a default one from config on demand.
+
+        Many legacy call sites instantiate `RedisObjectPartsCache(redis_client)`
+        without threading `fs_store` through. Auto-wiring from `create_fs_store`
+        lets those paths keep working while the caller graph is cleaned up.
+        Tests that want to inject a mock still pass `fs_store=` explicitly.
+        """
         if self._fs is None:
-            raise RuntimeError("fs_store is required but not configured")
+            from hippius_s3.cache import create_fs_store
+            from hippius_s3.config import get_config
+
+            self._fs = create_fs_store(get_config())
         return self._fs
 
     # ---- chunked API (FS-backed) ----
