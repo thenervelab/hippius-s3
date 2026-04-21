@@ -413,19 +413,47 @@ async def run_downloader_loop(
 
     max_inflight = max(1, config.downloader_max_inflight)
     inflight: set[asyncio.Task[None]] = set()
+    # Flags set by _reap when an inflight task died on an infra error. The
+    # main loop picks these up and rebuilds the affected client before
+    # dequeuing the next request, so subsequent tasks don't keep failing
+    # against a stale connection.
+    needs_redis_reconnect = False
+    needs_db_reconnect = False
 
     def _reap(tasks: set[asyncio.Task[None]]) -> None:
+        nonlocal needs_redis_reconnect, needs_db_reconnect
         for t in tasks:
             inflight.discard(t)
             err = t.exception()
-            if err is not None and not isinstance(err, asyncio.CancelledError):
-                logger.error(f"[{backend_name}] inflight task error: {err}")
+            if err is None or isinstance(err, asyncio.CancelledError):
+                continue
+            logger.error(f"[{backend_name}] inflight task error: {err}")
+            if isinstance(err, (BusyLoadingError, RedisConnectionError, RedisTimeoutError)):
+                needs_redis_reconnect = True
+            elif isinstance(err, asyncpg.InterfaceError):
+                needs_db_reconnect = True
 
     logger.info(f"[{backend_name}] Inflight pool size: {max_inflight}")
 
     try:
         while True:
             _reap({t for t in inflight if t.done()})
+
+            if needs_redis_reconnect:
+                logger.warning(f"[{backend_name}] Rebuilding cache redis client after task error")
+                with contextlib.suppress(Exception):
+                    await redis_client.aclose()  # ty: ignore[unresolved-attribute]
+                redis_client = create_redis_client(config.redis_url)  # ty: ignore[invalid-assignment]
+                initialize_cache_client(redis_client)
+                obj_cache = RedisObjectPartsCache(redis_client, queues_client=redis_queues_client, fs_store=fs_store)
+                needs_redis_reconnect = False
+
+            if needs_db_reconnect:
+                logger.warning(f"[{backend_name}] Recreating DB pool after task error")
+                with contextlib.suppress(Exception):
+                    await db_pool.close()
+                db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=20)
+                needs_db_reconnect = False
 
             if len(inflight) >= max_inflight:
                 done_wait, _ = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
