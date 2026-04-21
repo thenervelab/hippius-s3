@@ -148,6 +148,50 @@ async def build_stream_context(
     kek_id = info.get("kek_id")
     wrapped_dek = info.get("wrapped_dek")
     if not bucket_id or not kek_id or not wrapped_dek:
+        # Current version is mid-write (overwrite in progress). Fall back to the
+        # previous version which is guaranteed to have a complete envelope.
+        prev_version = object_version - 1
+        if prev_version >= 1:
+            logger.warning(
+                "Envelope missing on v%s of %s, falling back to v%s",
+                object_version,
+                info.get("object_id"),
+                prev_version,
+            )
+            from hippius_s3.utils import get_query as _get_query
+
+            prev_info = await db.fetchrow(
+                _get_query("get_object_for_download_with_permissions_by_version"),
+                info.get("bucket_name"),
+                info.get("object_key"),
+                prev_version,
+            )
+            if prev_info and prev_info.get("kek_id") and prev_info.get("wrapped_dek"):
+                # Use the previous version's envelope and data (single attempt, no recursion)
+                info = dict(prev_info)
+                object_version = int(info.get("object_version") or info.get("current_object_version") or prev_version)
+                bucket_id = str(info.get("bucket_id") or "")
+                suite_id = str(info.get("enc_suite_id") or "hip-enc/aes256gcm")
+                kek_id = info["kek_id"]
+                wrapped_dek = info["wrapped_dek"]
+                parts = await read_parts_list(db, info["object_id"], object_version)
+                plan = await build_chunk_plan(db, info["object_id"], parts, rng, object_version=object_version)
+                checks = [(int(item.part_number), int(item.chunk_index)) for item in plan]
+                exist_results = await obj_cache.chunks_exist_batch(info["object_id"], object_version, checks)
+                source = "cache" if all(exist_results) else "pipeline"
+                kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
+                aad = f"hippius-dek:{bucket_id}:{info['object_id']}:{object_version}".encode("utf-8")
+                key_bytes = unwrap_dek(kek=kek_bytes, wrapped_dek=bytes(wrapped_dek), aad=aad)
+                return StreamContext(
+                    plan=plan,
+                    object_version=object_version,
+                    storage_version=storage_version,
+                    source=source,
+                    key_bytes=key_bytes,
+                    suite_id=suite_id,
+                    bucket_id=bucket_id,
+                    upload_id=str(info.get("upload_id") or ""),
+                )
         raise RuntimeError("v5_missing_envelope_metadata")
     kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
     aad = f"hippius-dek:{bucket_id}:{info.get('object_id')}:{object_version}".encode("utf-8")

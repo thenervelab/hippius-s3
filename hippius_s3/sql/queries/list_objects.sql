@@ -6,11 +6,20 @@ SELECT o.object_id, o.bucket_id, o.object_key, o.current_object_version,
        ov.size_bytes, ov.content_type, o.created_at, ov.md5_hash,
        ov.status, b.bucket_name, ov.multipart
 FROM objects o
-JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
+JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = (
+    -- Skip incomplete multipart placeholders (InitiateMultipartUpload without Complete)
+    SELECT v.object_version
+    FROM object_versions v
+    WHERE v.object_id = o.object_id
+      AND v.object_version <= o.current_object_version
+      AND (v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
+    ORDER BY v.object_version DESC
+    LIMIT 1
+)
 JOIN buckets b ON o.bucket_id = b.bucket_id
 LEFT JOIN cids c ON ov.cid_id = c.id
 LEFT JOIN parts p1 ON p1.object_id = o.object_id
-  AND p1.object_version = o.current_object_version
+  AND p1.object_version = ov.object_version
   AND p1.part_number = 1
 LEFT JOIN part_chunks pc0 ON pc0.part_id = p1.part_id
   AND pc0.chunk_index = 0

@@ -180,6 +180,15 @@ def clear_object_cache(
         meta_key = roc.build_meta_key(object_id, int(object_version), int(pn))
         assert not r.exists(meta_key), f"Part {pn} cache not cleared"
 
+    # Clear FS cache for this object so reads go through the download pipeline
+    import shutil
+    from pathlib import Path
+
+    for cache_dir in ["/var/lib/hippius/object_cache", "/var/lib/hippius/local_object_cache"]:
+        obj_dir = Path(cache_dir) / object_id
+        if obj_dir.exists():
+            shutil.rmtree(obj_dir, ignore_errors=True)
+
 
 def read_part_from_cache(
     object_id: str,

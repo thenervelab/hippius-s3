@@ -239,6 +239,27 @@ class ObjectWriter:
         wrapped_dek = wrap_dek(kek=kek_bytes, dek=dek, aad=aad)
         key_bytes = dek
 
+        # Write envelope to DB immediately so concurrent GETs never see NULL kek_id/wrapped_dek.
+        # Without this, a GET between the upsert (which bumps current_object_version) and this
+        # UPDATE would hit v5_missing_envelope_metadata → 500.
+        await self.db.execute(
+            """
+            UPDATE object_versions
+               SET encryption_version = 5,
+                   enc_suite_id = $1,
+                   enc_chunk_size_bytes = $2,
+                   kek_id = $3,
+                   wrapped_dek = $4
+             WHERE object_id = $5 AND object_version = $6
+            """,
+            str(suite_id),
+            int(chunk_size),
+            kek_id,
+            wrapped_dek,
+            object_id,
+            int(object_version),
+        )
+
         hasher = hashlib.md5()
         total_size = 0
         writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
@@ -391,6 +412,20 @@ class ObjectWriter:
                 },
             )
 
+        # Write FS meta BEFORE making this version visible in DB.
+        # The download query skips versions with size=0/md5='', so the version
+        # only becomes serveable after update_object_version_metadata sets size/md5.
+        # FS meta must exist first, otherwise get_chunk() returns None (meta check fails).
+        num_chunks = int(next_chunk_index)
+        await writer.write_meta(
+            object_id,
+            int(object_version),
+            int(part_number),
+            chunk_size=chunk_size,
+            num_chunks=int(num_chunks),
+            plain_size=int(total_size),
+        )
+
         # Update the reserved object_versions row with final md5/size
         perf_post_start = time.monotonic()
         with tracer.start_as_current_span(
@@ -414,40 +449,8 @@ class ObjectWriter:
                 object_id,
                 int(object_version),
             )
-
-            aad = f"hippius-dek:{bucket_id}:{object_id}:{object_version}".encode("utf-8")
-            from hippius_s3.services.envelope_service import wrap_dek
-            from hippius_s3.services.kek_service import get_bucket_kek_bytes
-
-            kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
-            wrapped_dek = wrap_dek(kek=kek_bytes, dek=key_bytes, aad=aad)
-            await self.db.execute(
-                """
-                UPDATE object_versions
-                   SET encryption_version = 5,
-                       enc_suite_id = $1,
-                       enc_chunk_size_bytes = $2,
-                       kek_id = $3,
-                       wrapped_dek = $4
-                 WHERE object_id = $5 AND object_version = $6
-                """,
-                str(suite_id),
-                int(chunk_size),
-                kek_id,
-                wrapped_dek,
-                object_id,
-                int(object_version),
-            )
-
-        num_chunks = int(next_chunk_index)
-        await writer.write_meta(
-            object_id,
-            int(object_version),
-            int(part_number),
-            chunk_size=chunk_size,
-            num_chunks=int(num_chunks),
-            plain_size=int(total_size),
-        )
+            # Envelope (kek_id, wrapped_dek) was already written immediately after
+            # the upsert to prevent the read-race on concurrent overwrites.
 
         upload_id = await ensure_upload_row(
             self.db,
