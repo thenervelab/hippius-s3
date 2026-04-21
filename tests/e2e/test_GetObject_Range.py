@@ -58,11 +58,6 @@ def test_range_downloads_only_needed_chunks(
     signed_http_get: Any,
 ) -> None:
     """After clearing cache, a small range should only materialize the in-range chunk(s)."""
-    try:
-        import redis  # type: ignore[import-untyped]
-    except Exception:
-        pytest.skip("redis client unavailable")
-
     bucket = unique_bucket_name("range-chunk-only")
     cleanup_buckets(bucket)
     boto3_client.create_bucket(Bucket=bucket)
@@ -87,22 +82,33 @@ def test_range_downloads_only_needed_chunks(
     assert r.status_code == 206
     assert r.headers.get("x-hippius-source") in {"pipeline", "cache"}
 
-    # Inspect Redis for which chunk keys were created (versioned namespace)
-    # Check both main cache and download cache since chunks may be in either.
-    # Note: if the FS cache could not be cleared (e.g. permission denied on bind-mount
-    # owned by root in CI), get_chunk() serves from FS and no Redis keys are created.
-    rcli = redis.Redis.from_url("redis://localhost:6379/0")
-    rcli_dl = redis.Redis.from_url("redis://localhost:6385/0")
-    pattern = f"obj:{object_id}:v:{ov}:part:1:chunk:*"
-    keys = sorted(set(
-        [k.decode() for k in rcli.scan_iter(match=pattern, count=1000)]
-        + [k.decode() for k in rcli_dl.scan_iter(match=pattern, count=1000)]
-    ))
-    if keys:
-        # Chunks went through the download pipeline into Redis — verify minimal hydration
-        expected_chunk = f"obj:{object_id}:v:{ov}:part:1:chunk:0"
-        assert expected_chunk in keys, f"expected chunk {expected_chunk} not found in {keys}"
-        assert len(keys) <= 3, f"too many chunks hydrated: {keys}"
+    # Inspect the FS cache for which chunk files were created. Chunks live
+    # under <cache_dir>/<object_id>/v<ov>/part_1/chunk_<i>.bin on either the
+    # local NVMe primary or the legacy CephFS fallback. If the FS cache
+    # could not be cleared (e.g. permission denied on a bind-mount owned by
+    # root in CI), the read may have been served from pre-existing files;
+    # in that case no new chunks are created and this assertion is skipped.
+    from pathlib import Path as _Path
+
+    def _chunks_present_for_part(part_number: int) -> list[int]:
+        found: set[int] = set()
+        for cache_dir in ("/var/lib/hippius/local_object_cache", "/var/lib/hippius/object_cache"):
+            part_dir = _Path(cache_dir) / object_id / f"v{ov}" / f"part_{part_number}"
+            if not part_dir.exists():
+                continue
+            for entry in part_dir.iterdir():
+                name = entry.name
+                if name.startswith("chunk_") and name.endswith(".bin"):
+                    try:
+                        found.add(int(name[len("chunk_") : -len(".bin")]))
+                    except ValueError:
+                        continue
+        return sorted(found)
+
+    hydrated = _chunks_present_for_part(1)
+    if hydrated:
+        assert 0 in hydrated, f"expected chunk 0 present for part 1, got {hydrated}"
+        assert len(hydrated) <= 3, f"too many chunks hydrated: {hydrated}"
 
     # Clear cache again and request middle of the second chunk
     clear_object_cache(object_id)
@@ -110,15 +116,11 @@ def test_range_downloads_only_needed_chunks(
     end = start + 128 * 1024 - 1
     r2 = signed_http_get(bucket, key, {"Range": f"bytes={start}-{end}"})
     assert r2.status_code == 206
-    keys2 = sorted(set(
-        [k.decode() for k in rcli.scan_iter(match=pattern, count=1000)]
-        + [k.decode() for k in rcli_dl.scan_iter(match=pattern, count=1000)]
-    ))
-    if keys2:
-        expected_chunk2 = f"obj:{object_id}:v:{ov}:part:1:chunk:1"
-        assert expected_chunk2 in keys2, f"expected chunk {expected_chunk2} not found in {keys2}"
+    hydrated2 = _chunks_present_for_part(1)
+    if hydrated2:
+        assert 1 in hydrated2, f"expected chunk 1 present for part 1, got {hydrated2}"
         # Verify minimal hydration: should not have fetched all chunks
-        assert len(keys2) <= 3, f"too many chunks hydrated: {keys2}"
+        assert len(hydrated2) <= 3, f"too many chunks hydrated: {hydrated2}"
 
 
 def test_get_object_range_invalid(

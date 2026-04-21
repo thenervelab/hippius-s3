@@ -3,7 +3,8 @@
 
 Dequeues from ``arion_download_requests``, looks up the Arion identifier
 via ``chunk_backend``, fetches ciphertext from the Arion storage gateway,
-and stores it in the Redis chunk cache.
+writes it into the shared filesystem cache (``FileSystemPartsStore``),
+and publishes a pub/sub notification so waiting streamers can read it.
 """
 
 import asyncio

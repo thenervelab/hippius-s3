@@ -1,6 +1,3 @@
-from .download_chunks import DownloadChunksCache
-from .download_chunks import NullDownloadChunksCache
-from .download_chunks import RedisDownloadChunksCache
 from .dual_fs_store import DualFileSystemPartsStore
 from .fs_store import FileSystemPartsStore
 from .notifier import ChunkNotifier
@@ -18,9 +15,6 @@ def create_fs_store(config: object) -> FileSystemPartsStore:
 __all__ = [
     "ChunkNotifier",
     "RedisObjectPartsCache",
-    "DownloadChunksCache",
-    "RedisDownloadChunksCache",
-    "NullDownloadChunksCache",
     "FileSystemPartsStore",
     "DualFileSystemPartsStore",
     "create_fs_store",

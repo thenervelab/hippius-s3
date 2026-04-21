@@ -274,9 +274,14 @@ async def process_download_request(
                     *[_fetch_chunk(part_number, spec, part_span) for spec in part.chunks]
                 )
 
-                # Clear in-progress flag (legacy — some callers rely on this)
+                # Release the coalescing lock (set by build_stream_context on
+                # enqueue). Key format must match that callsite exactly.
                 with contextlib.suppress(Exception):
-                    await obj_cache.redis.delete(f"download_in_progress:{download_request.object_id}:{part_number}")
+                    lock_key = (
+                        f"download_in_progress:{download_request.object_id}"
+                        f":v:{int(download_request.object_version)}:part:{part_number}"
+                    )
+                    await obj_cache.redis.delete(lock_key)
                 return all(chunk_results)
 
         try:

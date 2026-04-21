@@ -157,6 +157,10 @@ class Config:
     upload_backends: list[str] = env("HIPPIUS_UPLOAD_BACKENDS:arion", convert=_parse_backends)
     download_backends: list[str] = env("HIPPIUS_DOWNLOAD_BACKENDS:arion", convert=_parse_backends)
     delete_backends: list[str] = env("HIPPIUS_DELETE_BACKENDS:arion", convert=_parse_backends)
+    # Backup backends (e.g. OVH via s3-backup). Unioned with upload_backends
+    # when checking "fully replicated" in the janitor — a part is only safe
+    # to evict once every upload AND backup backend has its chunk_backend row.
+    backup_backends: list[str] = env("HIPPIUS_BACKUP_BACKENDS:", convert=lambda v: _parse_backends(v, default=""))
 
     # Cache TTL (shared across components — still used for pub/sub wait timeout)
     cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:3600", convert=int)
@@ -176,6 +180,12 @@ class Config:
     downloader_retry_base_seconds: float = env("DOWNLOADER_RETRY_BASE_SECONDS:0.1", convert=float)
     downloader_retry_jitter_seconds: float = env("DOWNLOADER_RETRY_JITTER_SECONDS:0.1", convert=float)
     downloader_semaphore: int = env("DOWNLOADER_SEMAPHORE:20", convert=int)
+    # When multiple streamers hit a cache miss on the same part concurrently,
+    # only one enqueues a DownloadChainRequest; the others wait via pub/sub.
+    # The Redis lock that enforces this is cleared by the downloader on
+    # completion, and this TTL caps the worst-case hang if the downloader
+    # crashes mid-request.
+    download_coalesce_lock_ttl_seconds: int = env("DOWNLOAD_COALESCE_LOCK_TTL:120", convert=int)
 
     # Crypto configuration
     # hip-enc/legacy: SecretBox per-chunk (legacy objects)

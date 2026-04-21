@@ -3,18 +3,22 @@
 
 Runs periodically and:
 - Deletes stale MPU parts (aborted uploads) older than `mpu_stale_seconds`.
-- GC aged parts older than `fs_cache_gc_max_age_seconds` that have been
-  replicated to all expected backends.
+- GC aged parts that have been replicated to every required backend
+  (upload + backup). Replication is an ABSOLUTE gate: a chunk that hasn't
+  been backed up to every required backend is NEVER deleted, under any
+  conditions.
 - Keeps "hot" parts (atime within `fs_cache_hot_retention_seconds`) —
   these are recently read and worth keeping on NVMe.
 - Cleans orphan `.tmp.*` files (from worker crashes during atomic write).
 - Hard-deletes soft-deleted objects whose backends have confirmed unpin.
 
-Disk-pressure modes:
-- Normal (< 85%):   honor hot retention.
-- Elevated (85-95%): halve hot retention.
-- Critical (>= 95%): ignore hot retention; delete even non-replicated
-  aged parts as a last resort.
+Disk-pressure modes (all still replication-gated):
+- Normal   (<85%):  honor hot retention; evict only replicated + aged + cold.
+- Elevated (85-95%): halve hot retention; evict replicated + cold regardless of age.
+- Critical (>=95%): disable hot retention; evict replicated + cold regardless of age.
+  If no replicated parts exist, the janitor logs an ERROR and does nothing.
+  It will never delete non-replicated data to free space. Operator paging
+  is the answer, not data loss.
 """
 
 import asyncio
@@ -221,7 +225,12 @@ async def get_all_dlq_object_ids(redis_client: Redis) -> set[str]:
     """
     object_ids = set()
 
-    for dlq_key in ["arion_upload_requests:dlq", "unpin_requests:dlq"]:
+    # Enumerate DLQ keys dynamically from the configured upload backends so
+    # a new backend (e.g. ipfs) doesn't silently bypass protection.
+    dlq_keys = [f"{b}_upload_requests:dlq" for b in config.upload_backends]
+    dlq_keys.append("unpin_requests:dlq")
+
+    for dlq_key in dlq_keys:
         try:
             dlq_entries = await asyncio.wait_for(redis_client.lrange(dlq_key, 0, -1), timeout=5.0)
             for entry_json in dlq_entries:
@@ -370,11 +379,19 @@ async def is_replicated_on_all_backends(
     )
     version_type = row["version_type"] if row else None
     if version_type == "migration":
-        expected = ["ipfs"]
+        expected: list[str] = ["ipfs"]
     elif row and row["upload_backends"]:
         expected = list(row["upload_backends"])
     else:
-        expected = config.upload_backends
+        expected = list(config.upload_backends)
+
+    # Union in the backup backends (e.g. OVH). The janitor must not delete a
+    # part until every required backend — upload AND backup — has a live
+    # chunk_backend row for every chunk.
+    backup_backends = list(getattr(config, "backup_backends", []) or [])
+    for b in backup_backends:
+        if b and b not in expected:
+            expected.append(b)
 
     result = await db.fetchrow(
         get_query("count_chunk_backends"),
@@ -432,17 +449,30 @@ async def cleanup_old_parts_by_mtime(
     fs_store: FileSystemPartsStore,
     redis_client: Redis,
 ) -> int:
-    """Age / replication / hot-retention based GC.
+    """Safe, replication-gated GC.
 
-    Deletion rule (given pressure mode):
-    - Normal (hot retention active): delete if
-        (old_enough OR fully_replicated) AND NOT hot
-    - Elevated: hot retention halved; otherwise same
-    - Critical: ignore hot retention entirely; also delete parts that are
-      old_enough even if not yet replicated (last-resort space recovery)
+    ABSOLUTE RULE: never delete a part that isn't fully replicated to every
+    required backend (upload + backup, e.g. arion + ovh). Age, disk pressure,
+    and hot-retention policies only relax what's eligible among
+    already-replicated parts — they never override the replication check.
+
+    Deletion rule:
+        delete <=> fully_replicated AND NOT hot AND NOT dlq_protected
+
+    Where:
+    - fully_replicated: every chunk has a live `chunk_backend` row for every
+      backend in upload_backends ∪ backup_backends.
+    - hot: atime within the pressure-adjusted hot-retention window.
+      - Normal pressure:   hot_window = config.fs_cache_hot_retention_seconds
+      - Elevated (>=85%):  hot_window halves
+      - Critical (>=95%):  hot_window = 0 (hot protection disabled; all
+        replicated parts become eligible for eviction)
+
+    Under critical pressure with nothing replicated, the janitor is stuck.
+    That is the correct outcome — it logs an ERROR so operators page.
     """
     max_age_seconds = config.fs_cache_gc_max_age_seconds
-    logger.info(f"Scanning for orphaned FS parts older than {max_age_seconds}s")
+    logger.info(f"Scanning FS parts eligible for GC (max_age={max_age_seconds}s, replication-gated)")
 
     dlq_object_ids = await get_all_dlq_object_ids(redis_client)
     if dlq_object_ids:
@@ -519,40 +549,43 @@ async def cleanup_old_parts_by_mtime(
                     if is_dlq_protected:
                         continue
 
-                    # Hot files are protected unless disk is critical
+                    # Hot files are protected. Under critical pressure
+                    # hot_window is 0, which forces is_hot=False, letting
+                    # fully-replicated parts become eligible even if recently read.
                     if is_hot:
                         continue
 
-                    old_enough = mtime < cutoff_time
+                    # ABSOLUTE safety gate: never delete non-replicated data.
                     fully_replicated = await is_replicated_on_all_backends(
                         db,
                         object_id,
                         object_version,
                         part_number,
                     )
+                    if not fully_replicated:
+                        continue
 
-                    # Normal/elevated: delete if old OR replicated
-                    # Critical: delete if old (even without replication) OR replicated
-                    should_delete = old_enough or fully_replicated
-                    if pressure == 2 and not should_delete:
-                        # Last resort: force deletion of anything past half its
-                        # age threshold, even if not fully replicated yet.
-                        should_delete = mtime < (now - max_age_seconds / 2)
+                    # A fully-replicated, cold, non-DLQ part is safe to evict.
+                    # Under normal pressure we additionally require age > cutoff
+                    # so we don't thrash. Under any pressure level we evict
+                    # replicated cold parts regardless of age.
+                    old_enough = mtime < cutoff_time
+                    if pressure == 0 and not old_enough:
+                        continue
 
-                    if should_delete:
-                        shutil.rmtree(part_dir)
-                        parts_cleaned += 1
-                        age = (now - mtime) / 3600
-                        logger.info(
-                            f"GC cleaned part: {part_dir} {old_enough=} "
-                            f"{fully_replicated=} pressure={pressure} (mtime {age=:.1f}h)"
-                        )
+                    shutil.rmtree(part_dir)
+                    parts_cleaned += 1
+                    age = (now - mtime) / 3600
+                    logger.info(
+                        f"GC cleaned part: {part_dir} replicated=True "
+                        f"pressure={pressure} {old_enough=} (mtime {age=:.1f}h)"
+                    )
 
-                        # Try to prune empty parents
-                        with contextlib.suppress(OSError):
-                            version_dir.rmdir()
-                        with contextlib.suppress(OSError):
-                            object_dir.rmdir()
+                    # Try to prune empty parents (idempotent; ignore if not empty)
+                    with contextlib.suppress(OSError):
+                        version_dir.rmdir()
+                    with contextlib.suppress(OSError):
+                        object_dir.rmdir()
                 except Exception as e:
                     logger.warning(f"Failed to clean part {part_dir}: {e}")
 
@@ -572,6 +605,19 @@ async def cleanup_old_parts_by_mtime(
         _janitor_deleted_counter.add(parts_cleaned)
 
     logger.info(f"GC cleaned {parts_cleaned=} hot_parts={hot_parts} pressure={pressure}")
+
+    # If we're under critical disk pressure but couldn't free any space,
+    # every on-disk part is either hot (ignored under critical — nothing to
+    # free) or non-replicated (we refuse to delete). Page the operator.
+    if pressure == 2 and parts_cleaned == 0 and parts_seen > 0:
+        logger.error(
+            "JANITOR_CRITICAL_PRESSURE_BLOCKED parts_seen=%d hot_parts=%d — "
+            "disk is >=95%% full but all remaining parts are non-replicated. "
+            "Operator action required; refusing to delete unreplicated data.",
+            parts_seen,
+            hot_parts,
+        )
+
     return parts_cleaned
 
 

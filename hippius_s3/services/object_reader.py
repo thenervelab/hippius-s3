@@ -75,17 +75,43 @@ async def build_stream_context(
             idx_set.add(int(item.chunk_index))
 
     if source == "pipeline":
-        cid_by_part: dict[int, str] = {}
-        for p in parts:
-            pn = int(p.get("part_number", 0))
-            cid_raw = p.get("cid")
-            if cid_raw and str(cid_raw).strip().lower() not in {"", "none", "pending"}:
-                cid_by_part[pn] = str(cid_raw)
+        # Coalesce concurrent misses on the same part: only one streamer
+        # actually enqueues a download request per (object_id, version, part).
+        # Others will just wait on the pub/sub notification emitted by the
+        # downloader. The lock TTL covers crashed-streamer / crashed-downloader
+        # cases — on TTL expiry, the next miss re-enqueues.
+        lock_ttl = int(getattr(cfg, "download_coalesce_lock_ttl_seconds", 120))
+        ray_token = str(info.get("ray_id") or "anonymous")
+        acquired_parts: set[int] = set()
+        for pn in list(indices_by_part.keys()):
+            lock_key = f"download_in_progress:{info['object_id']}:v:{ov}:part:{pn}"
+            try:
+                acquired = await redis.set(lock_key, ray_token, nx=True, ex=lock_ttl)
+            except Exception:
+                # Redis hiccup — fail open: behave as if we acquired the lock
+                # so the download still happens. Worst case is a duplicate
+                # enqueue, which the downloader deduplicates via chunk_exists.
+                acquired = True
+            if acquired:
+                acquired_parts.add(pn)
+            else:
+                logger.debug(
+                    "download coalesced: another streamer is fetching object_id=%s v=%s part=%s (lock held)",
+                    info["object_id"],
+                    ov,
+                    pn,
+                )
+
+        # If every missing part is already being fetched by someone else,
+        # we don't enqueue anything — we just fall through to stream_plan,
+        # which will wait on pub/sub for each chunk.
         dl_parts: list[PartToDownload] = []
         # CIDs are optional.
         # - If per-chunk CIDs exist in part_chunks, include them so the IPFS downloader can hydrate from IPFS.
         # - Otherwise, keep cid=None so alternative hydrators (deterministic addressing) can handle it.
         for pn, idxs in indices_by_part.items():
+            if pn not in acquired_parts:
+                continue
             include = {int(i) for i in idxs}
             by_index: dict[int, tuple[str | None, int | None]] = {}
             try:

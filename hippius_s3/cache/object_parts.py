@@ -72,18 +72,15 @@ class RedisObjectPartsCache:
         self,
         redis_client: Any,
         queues_client: Any = None,
-        download_cache_client: Any = None,
         fs_store: Optional[FileSystemPartsStore] = None,
     ) -> None:
-        # `redis_client` retained for a few callers that access `.redis.delete`
-        # directly (in-progress flags). Not used for chunk/meta storage.
+        # `redis_client` is retained because a few callers access `.redis` for
+        # the download-coalescing lock (SET/DELETE on `download_in_progress:…`
+        # keys). It is not used for chunk or meta storage.
         self.redis = redis_client
         # `queues_client` is the pub/sub transport. Fall back to redis_client
         # only for tests that pass a single mock.
         self._notifier = ChunkNotifier(queues_client or redis_client)
-        # `download_cache_client` accepted for backward compat with existing
-        # call sites — completely ignored; FS is the only chunk cache now.
-        del download_cache_client
         self._fs = fs_store
 
     # ---- key builders (used by some callers for pub/sub / diagnostics) ----
@@ -278,22 +275,3 @@ class RedisObjectPartsCache:
 
     async def notify_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> None:
         await self._notifier.notify(object_id, int(object_version), int(part_number), int(chunk_index))
-
-    # ---- legacy shim: download cache write is now just a chunk write ----
-
-    async def set_download_chunk(
-        self,
-        object_id: str,
-        object_version: int,
-        part_number: int,
-        chunk_index: int,
-        data: bytes,
-        *,
-        ttl: int = 300,
-    ) -> None:
-        """Alias for set_chunk — kept for backward compat with callers that
-        used to distinguish short-lived download chunks from long-lived
-        upload chunks. Now everything is just an FS write.
-        """
-        del ttl
-        await self.fs.set_chunk(object_id, int(object_version), int(part_number), int(chunk_index), data)

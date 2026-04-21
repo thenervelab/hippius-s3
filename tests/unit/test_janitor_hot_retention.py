@@ -195,39 +195,80 @@ async def test_critical_pressure_ignores_hot_retention(fs_root, fs_store, redis_
 
 
 @pytest.mark.asyncio
-async def test_critical_pressure_deletes_non_replicated_past_half_age(
-    fs_root, fs_store, redis_mock, db_mock, monkeypatch
-):
-    """Critical pressure — last-resort delete: non-replicated part past half its
-    max-age window is deleted."""
+async def test_critical_pressure_refuses_to_delete_non_replicated(fs_root, fs_store, redis_mock, db_mock, monkeypatch):
+    """Absolute safety rule: even at 95%+ disk, a non-replicated part is
+    NEVER deleted. The janitor logs ERROR and refuses to touch it rather
+    than risk destroying the only copy of data.
+    """
     _patch_config(hot_retention=10800, gc_max_age=600)
     monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 2)
 
-    # mtime is 400s ago (past max_age/2 = 300) but less than max_age (600),
-    # and NOT replicated. Under normal mode this would be kept.
-    _make_part(fs_root, OBJ, 1, 1, mtime_offset=400, atime_offset=400)
+    # Very old, NOT replicated. Old janitor would have deleted this.
+    _make_part(fs_root, OBJ, 1, 1, mtime_offset=3600, atime_offset=3600)
 
     with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock(return_value=False)):
+        count = await janitor.cleanup_old_parts_by_mtime(db_mock, fs_store, redis_mock)
+
+    assert count == 0
+    assert (fs_root / OBJ / "v1" / "part_1").exists()
+
+
+@pytest.mark.asyncio
+async def test_critical_pressure_evicts_replicated_cold_parts(fs_root, fs_store, redis_mock, db_mock, monkeypatch):
+    """Under critical pressure, fully-replicated cold parts ARE eligible for
+    eviction regardless of age (hot_window=0 at critical pressure).
+    """
+    _patch_config(hot_retention=10800, gc_max_age=600)
+    monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 2)
+
+    _make_part(fs_root, OBJ, 1, 1, mtime_offset=60, atime_offset=60)
+
+    with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock(return_value=True)):
         count = await janitor.cleanup_old_parts_by_mtime(db_mock, fs_store, redis_mock)
 
     assert count == 1
 
 
 @pytest.mark.asyncio
-async def test_critical_pressure_keeps_very_fresh_non_replicated(fs_root, fs_store, redis_mock, db_mock, monkeypatch):
-    """Even under critical pressure, a freshly-uploaded non-replicated part
-    (younger than half-age) is still kept to avoid data loss on in-flight
-    uploads."""
-    _patch_config(hot_retention=10800, gc_max_age=600)
-    monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 2)
+async def test_backup_backends_unioned_into_replication_check(fs_root, fs_store, redis_mock, db_mock, monkeypatch):
+    """When HIPPIUS_BACKUP_BACKENDS is set, those backends must be required
+    for the replication check too. This guards against deleting FS chunks
+    before s3-backup has pushed them to OVH.
+    """
+    _patch_config(hot_retention=0, gc_max_age=60)
+    # Pretend OVH backup is required in addition to arion upload
+    janitor.config.upload_backends = ["arion"]
+    janitor.config.backup_backends = ["ovh"]
+    monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 0)
 
-    _make_part(fs_root, OBJ, 1, 1, mtime_offset=60, atime_offset=60)
+    _make_part(fs_root, OBJ, 1, 1, mtime_offset=7200, atime_offset=7200)
 
-    with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock(return_value=False)):
+    # Record the `expected` list passed to the SQL so we can assert the union.
+    captured_expected: list[list[str]] = []
+
+    async def fake_fetchrow(sql, *args):
+        if "object_versions" in sql:
+            return {"version_type": None, "upload_backends": ["arion"]}
+        if "count_chunk_backends" in sql or "chunk_backend" in sql:
+            expected_arg = args[3] if len(args) >= 4 else []
+            captured_expected.append(list(expected_arg))
+            # Say: total==replicated==expected so the part is "replicated"
+            return {"total_chunks": 1, "replicated_chunks": 1, "expected_chunks": 1}
+        return None
+
+    # Bypass get_query and drive fetchrow with our fake via the db_mock.
+    db_mock.fetchrow = AsyncMock(side_effect=fake_fetchrow)
+
+    # Mock get_query to return a dummy SQL string flagged for our faker.
+    with patch.object(janitor, "get_query", return_value="SELECT count_chunk_backends"):
         count = await janitor.cleanup_old_parts_by_mtime(db_mock, fs_store, redis_mock)
 
-    # 60s < max_age/2 (300s), so still fresh enough to skip even under critical
-    assert count == 0
+    # Janitor called is_replicated_on_all_backends, which called
+    # count_chunk_backends with an `expected` list containing BOTH arion and ovh.
+    assert captured_expected, "replication check never ran"
+    assert set(captured_expected[0]) == {"arion", "ovh"}
+    # And because we claimed full replication, the eviction actually proceeds.
+    assert count == 1
 
 
 # -------- orphan .tmp cleanup ----------
