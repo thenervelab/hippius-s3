@@ -527,7 +527,31 @@ async def cleanup_old_parts_by_mtime(
                 except (ValueError, IndexError):
                     continue
 
-                # Check mtime (for age) and atime (for hot retention)
+                # Check mtime (for age) and atime (for hot retention).
+                #
+                # ZFS + noatime note: in prod the local-cache volume is a ZFS
+                # dataset mounted `noatime` (see `mount | grep local_object_cache`
+                # → `rw,noatime,xattr,noacl,casesensitive`). `noatime` only
+                # blocks VFS-triggered atime updates on reads (the
+                # `file_accessed() → atime_needs_update() → dirty_inode()`
+                # path). It does NOT block explicit `utimensat(2)` metadata
+                # writes, which go through `setattr()`. Our reader refreshes
+                # atime on every chunk read via `os.utime(path, None)` in
+                # `fs_store.get_chunk`, so hot-retention works correctly here.
+                # OpenZFS PR #4482 ("Fix atime handling and relatime") made
+                # this behaviour consistent — atime is handled purely by VFS
+                # and explicit setattr writes are always honoured regardless
+                # of the mount's noatime flag.
+                #
+                # Side effect: `os.utime(path, None)` sets BOTH atime and
+                # mtime to "now" (UTIME_NOW on both). Recently-read chunks
+                # therefore show `atime == mtime` to the nanosecond — that's
+                # expected, not a bug. It also means reads push mtime
+                # forward, so the mtime-based age check below is more
+                # conservative on actively-read content (treats hot chunks
+                # as younger than their original landing time). Replication
+                # is still the absolute gate, so this only relaxes, never
+                # tightens, what we delete.
                 meta_file = part_dir / "meta.json"
                 check_path = meta_file if meta_file.exists() else part_dir
 
