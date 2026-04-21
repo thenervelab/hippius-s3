@@ -270,9 +270,17 @@ async def process_download_request(
                     except Exception as meta_exc:
                         logger.warning(f"[{backend_name}] Failed to write eager meta part={part_number}: {meta_exc}")
 
-                chunk_results = await asyncio.gather(
-                    *[_fetch_chunk(part_number, spec, part_span) for spec in part.chunks]
-                )
+                # Batch chunks so a pathological single-part (up to ~1280
+                # chunks for a 5 GiB part at 4 MiB chunk size) doesn't create
+                # thousands of tasks parked on the semaphore. Matches the
+                # part-batching budget so the worst case per part is capped.
+                chunk_batch_size = max(1, config.downloader_semaphore)
+                chunk_results: list[bool] = []
+                for i in range(0, len(part.chunks), chunk_batch_size):
+                    batch = part.chunks[i : i + chunk_batch_size]
+                    chunk_results.extend(
+                        await asyncio.gather(*[_fetch_chunk(part_number, spec, part_span) for spec in batch])
+                    )
 
                 # Release the coalescing lock (set by build_stream_context on
                 # enqueue). Key format must match that callsite exactly.
@@ -369,8 +377,89 @@ async def run_downloader_loop(
         backend_info = f" base_url={config.arion_base_url} verify_ssl={config.arion_verify_ssl}"
         logger.info(f"[{backend_name}] Starting downloader, queue={queue_name}{backend_info}")
 
+    async def _run_job(request: DownloadChainRequest) -> None:
+        ray_id = request.ray_id or "no-ray-id"
+        ray_id_context.set(ray_id)
+        worker_logger = get_logger_with_ray_id(__name__, ray_id)
+
+        with tracer.start_as_current_span(
+            "downloader.job",
+            attributes={
+                "object_id": request.object_id,
+                "hippius.ray_id": ray_id,
+                "backend": backend_name,
+                "hippius.account.main": request.address,
+            },
+        ) as job_span:
+            try:
+                ok = await process_download_request(
+                    request,
+                    backend_name=backend_name,
+                    fetch_fn=fetch_fn,
+                    db_pool=db_pool,
+                    obj_cache=obj_cache,
+                    fs_store=fs_store,
+                )
+                if ok:
+                    worker_logger.info(f"[{backend_name}] Done: {request.bucket_name}/{request.object_key}")
+                else:
+                    job_span.set_status(trace.StatusCode.ERROR, "partial failure")
+                    worker_logger.error(f"[{backend_name}] Failed: {request.bucket_name}/{request.object_key}")
+            except Exception as exc:
+                job_span.record_exception(exc)
+                job_span.set_status(trace.StatusCode.ERROR, str(exc))
+                worker_logger.error(f"[{backend_name}] job error: {exc}", exc_info=True)
+                raise
+
+    max_inflight = max(1, config.downloader_max_inflight)
+    inflight: set[asyncio.Task[None]] = set()
+    # Flags set by _reap when an inflight task died on an infra error. The
+    # main loop picks these up and rebuilds the affected client before
+    # dequeuing the next request, so subsequent tasks don't keep failing
+    # against a stale connection.
+    needs_redis_reconnect = False
+    needs_db_reconnect = False
+
+    def _reap(tasks: set[asyncio.Task[None]]) -> None:
+        nonlocal needs_redis_reconnect, needs_db_reconnect
+        for t in tasks:
+            inflight.discard(t)
+            err = t.exception()
+            if err is None or isinstance(err, asyncio.CancelledError):
+                continue
+            logger.error(f"[{backend_name}] inflight task error: {err}")
+            if isinstance(err, (BusyLoadingError, RedisConnectionError, RedisTimeoutError)):
+                needs_redis_reconnect = True
+            elif isinstance(err, asyncpg.InterfaceError):
+                needs_db_reconnect = True
+
+    logger.info(f"[{backend_name}] Inflight pool size: {max_inflight}")
+
     try:
         while True:
+            _reap({t for t in inflight if t.done()})
+
+            if needs_redis_reconnect:
+                logger.warning(f"[{backend_name}] Rebuilding cache redis client after task error")
+                with contextlib.suppress(Exception):
+                    await redis_client.aclose()  # ty: ignore[unresolved-attribute]
+                redis_client = create_redis_client(config.redis_url)  # ty: ignore[invalid-assignment]
+                initialize_cache_client(redis_client)
+                obj_cache = RedisObjectPartsCache(redis_client, queues_client=redis_queues_client, fs_store=fs_store)
+                needs_redis_reconnect = False
+
+            if needs_db_reconnect:
+                logger.warning(f"[{backend_name}] Recreating DB pool after task error")
+                with contextlib.suppress(Exception):
+                    await db_pool.close()
+                db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=20)
+                needs_db_reconnect = False
+
+            if len(inflight) >= max_inflight:
+                done_wait, _ = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+                _reap(done_wait)
+                continue
+
             try:
                 request = await dequeue_download_request(queue_name)
             except (BusyLoadingError, RedisConnectionError, RedisTimeoutError) as exc:
@@ -386,61 +475,30 @@ async def run_downloader_loop(
                 continue
 
             if request is None:
-                await asyncio.sleep(config.downloader_sleep_loop)
+                # Nothing to pick up. If we have inflight work, wait on it
+                # instead of sleeping — keeps the loop responsive to task
+                # completions without an idle poll.
+                if inflight:
+                    done_wait, _ = await asyncio.wait(
+                        inflight, return_when=asyncio.FIRST_COMPLETED, timeout=config.downloader_sleep_loop
+                    )
+                    _reap(done_wait)
+                else:
+                    await asyncio.sleep(config.downloader_sleep_loop)
                 continue
 
             if request.expire_at and time.time() > request.expire_at:
                 logger.warning(f"[{backend_name}] Discarding expired request {request.name}")
                 continue
 
-            ray_id = request.ray_id or "no-ray-id"
-            ray_id_context.set(ray_id)
-            worker_logger = get_logger_with_ray_id(__name__, ray_id)
-
-            with tracer.start_as_current_span(
-                "downloader.job",
-                attributes={
-                    "object_id": request.object_id,
-                    "hippius.ray_id": ray_id,
-                    "backend": backend_name,
-                    "hippius.account.main": request.address,
-                },
-            ) as job_span:
-                try:
-                    ok = await process_download_request(
-                        request,
-                        backend_name=backend_name,
-                        fetch_fn=fetch_fn,
-                        db_pool=db_pool,
-                        obj_cache=obj_cache,
-                        fs_store=fs_store,
-                    )
-                    if ok:
-                        worker_logger.info(f"[{backend_name}] Done: {request.bucket_name}/{request.object_key}")
-                    else:
-                        job_span.set_status(trace.StatusCode.ERROR, "partial failure")
-                        worker_logger.error(f"[{backend_name}] Failed: {request.bucket_name}/{request.object_key}")
-                except (RedisConnectionError, RedisTimeoutError, BusyLoadingError) as exc:
-                    job_span.record_exception(exc)
-                    job_span.set_status(trace.StatusCode.ERROR, str(exc))
-                    logger.warning(f"[{backend_name}] Redis issue during processing: {exc}. Reconnecting…")
-                    with contextlib.suppress(Exception):
-                        await redis_client.aclose()  # ty: ignore[unresolved-attribute]
-                    redis_client = create_redis_client(config.redis_url)  # ty: ignore[invalid-assignment]
-                    initialize_cache_client(redis_client)
-                    obj_cache = RedisObjectPartsCache(
-                        redis_client, queues_client=redis_queues_client, fs_store=fs_store
-                    )
-                except asyncpg.InterfaceError as exc:
-                    job_span.record_exception(exc)
-                    job_span.set_status(trace.StatusCode.ERROR, str(exc))
-                    logger.warning(f"[{backend_name}] DB pool issue, recreating…")
-                    with contextlib.suppress(Exception):
-                        await db_pool.close()
-                    db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=20)
+            inflight.add(asyncio.create_task(_run_job(request)))
 
     except KeyboardInterrupt:
         logger.info(f"[{backend_name}] Downloader stopping…")
+        for t in inflight:
+            t.cancel()
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
     except Exception as exc:
         logger.error(f"[{backend_name}] Fatal loop error: {exc}", exc_info=True)
         raise

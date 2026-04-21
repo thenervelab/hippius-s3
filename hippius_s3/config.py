@@ -180,6 +180,12 @@ class Config:
     downloader_retry_base_seconds: float = env("DOWNLOADER_RETRY_BASE_SECONDS:0.1", convert=float)
     downloader_retry_jitter_seconds: float = env("DOWNLOADER_RETRY_JITTER_SECONDS:0.1", convert=float)
     downloader_semaphore: int = env("DOWNLOADER_SEMAPHORE:20", convert=int)
+    # Max concurrent DownloadChainRequests a single downloader pod processes.
+    # The main loop dequeues and spawns tasks up to this cap; the semaphore
+    # above still bounds total concurrent chunk fetches across all tasks.
+    # Range-heavy read patterns produce many 1-part DCRs, so parallelising
+    # DCRs is what delivers real backend throughput.
+    downloader_max_inflight: int = env("DOWNLOADER_MAX_INFLIGHT:10", convert=int)
     # When multiple streamers hit a cache miss on the same part concurrently,
     # only one enqueues a DownloadChainRequest; the others wait via pub/sub.
     # The Redis lock that enforces this is cleared by the downloader on
