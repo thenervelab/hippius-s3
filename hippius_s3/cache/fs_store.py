@@ -16,6 +16,7 @@ import os
 import shutil
 import uuid
 from pathlib import Path
+from typing import Any
 from typing import Optional
 from uuid import UUID
 
@@ -44,12 +45,21 @@ class FileSystemPartsStore:
         self.root = Path(root_dir)
         self.root.mkdir(parents=True, exist_ok=True)
 
-    def _safe_object_id(self, object_id: str) -> str:
-        """Validate object_id as UUID to prevent path traversal."""
+    def _safe_object_id(self, object_id: Any) -> str:
+        """Validate object_id as UUID to prevent path traversal.
+
+        Accepts either a str (normalised via UUID parse) or a UUID instance
+        (passed through via str()). Anything else raises ValueError. asyncpg
+        may return UUID objects for UUID columns depending on codec setup.
+        """
+        if isinstance(object_id, UUID):
+            return str(object_id)
+        if not isinstance(object_id, str):
+            raise ValueError(f"Invalid object_id type: {type(object_id).__name__}")
         try:
-            return str(UUID(object_id))
-        except (ValueError, AttributeError) as e:
-            raise ValueError(f"Invalid object_id: {object_id}") from e
+            return str(UUID(object_id.strip()))
+        except (ValueError, AttributeError, TypeError) as e:
+            raise ValueError(f"Invalid object_id: {object_id!r}") from e
 
     def part_path(self, object_id: str, object_version: int, part_number: int) -> str:
         """Return the directory path for a specific part.
