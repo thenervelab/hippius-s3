@@ -2,8 +2,7 @@
 # The local NVMe volume (local-cache-pvc) is attached to k8s-v3-node6-cache;
 # pods must run there to access it.
 #
-# Applies to: api, arion-uploader, arion-downloader, janitor. The s3-hydrator
-# from the s3-backup repo requires an equivalent patch in its own manifests.
+# Applies to: api, arion-uploader, arion-downloader, janitor.
 ---
 apiVersion: apps/v1
 kind: Deployment

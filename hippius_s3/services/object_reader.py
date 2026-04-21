@@ -107,8 +107,8 @@ async def build_stream_context(
         # which will wait on pub/sub for each chunk.
         dl_parts: list[PartToDownload] = []
         # CIDs are optional.
-        # - If per-chunk CIDs exist in part_chunks, include them so the IPFS downloader can hydrate from IPFS.
-        # - Otherwise, keep cid=None so alternative hydrators (deterministic addressing) can handle it.
+        # - If per-chunk CIDs exist in part_chunks, include them so the IPFS downloader can fetch from IPFS.
+        # - Otherwise, keep cid=None so other backends (deterministic addressing) can handle it.
         for pn, idxs in indices_by_part.items():
             if pn not in acquired_parts:
                 continue

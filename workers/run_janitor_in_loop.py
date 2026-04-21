@@ -385,7 +385,7 @@ async def is_replicated_on_all_backends(
     else:
         expected = list(config.upload_backends)
 
-    # Union in the backup backends (e.g. OVH). The janitor must not delete a
+    # Union in any configured backup backends. The janitor must not delete a
     # part until every required backend — upload AND backup — has a live
     # chunk_backend row for every chunk.
     backup_backends = list(getattr(config, "backup_backends", []) or [])
@@ -452,8 +452,8 @@ async def cleanup_old_parts_by_mtime(
     """Safe, replication-gated GC.
 
     ABSOLUTE RULE: never delete a part that isn't fully replicated to every
-    required backend (upload + backup, e.g. arion + ovh). Age, disk pressure,
-    and hot-retention policies only relax what's eligible among
+    required backend (upload + any configured backup backends). Age, disk
+    pressure, and hot-retention policies only relax what's eligible among
     already-replicated parts — they never override the replication check.
 
     Deletion rule:

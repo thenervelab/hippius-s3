@@ -157,9 +157,9 @@ class Config:
     upload_backends: list[str] = env("HIPPIUS_UPLOAD_BACKENDS:arion", convert=_parse_backends)
     download_backends: list[str] = env("HIPPIUS_DOWNLOAD_BACKENDS:arion", convert=_parse_backends)
     delete_backends: list[str] = env("HIPPIUS_DELETE_BACKENDS:arion", convert=_parse_backends)
-    # Backup backends (e.g. OVH via s3-backup). Unioned with upload_backends
-    # when checking "fully replicated" in the janitor — a part is only safe
-    # to evict once every upload AND backup backend has its chunk_backend row.
+    # Optional additional backends that must have replicated a chunk before
+    # the janitor is allowed to evict it from the FS cache. Unioned with
+    # upload_backends when checking "fully replicated".
     backup_backends: list[str] = env("HIPPIUS_BACKUP_BACKENDS:", convert=lambda v: _parse_backends(v, default=""))
 
     # Cache TTL (shared across components — still used for pub/sub wait timeout)

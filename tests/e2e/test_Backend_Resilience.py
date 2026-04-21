@@ -34,7 +34,7 @@ def test_read_recovers_after_cache_eviction(
     # Also clear the FS cache inside the API container so the reader can't serve from disk
     compose_exec("api", ["rm", "-rf", f"/var/lib/hippius/object_cache/{object_id}"])
 
-    # With caches cleared, the reader must hydrate from the backend via the download pipeline.
+    # With caches cleared, the reader must fetch from the backend via the download pipeline.
     resp = boto3_client.get_object(Bucket=bucket, Key=key)
     assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
     assert resp["Body"].read() == content

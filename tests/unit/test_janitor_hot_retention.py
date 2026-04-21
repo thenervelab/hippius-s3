@@ -233,12 +233,12 @@ async def test_critical_pressure_evicts_replicated_cold_parts(fs_root, fs_store,
 async def test_backup_backends_unioned_into_replication_check(fs_root, fs_store, redis_mock, db_mock, monkeypatch):
     """When HIPPIUS_BACKUP_BACKENDS is set, those backends must be required
     for the replication check too. This guards against deleting FS chunks
-    before s3-backup has pushed them to OVH.
+    before a configured backup backend has accepted them.
     """
     _patch_config(hot_retention=0, gc_max_age=60)
-    # Pretend OVH backup is required in addition to arion upload
+    # Pretend an additional backup backend is required alongside arion upload
     janitor.config.upload_backends = ["arion"]
-    janitor.config.backup_backends = ["ovh"]
+    janitor.config.backup_backends = ["extra"]
     monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 0)
 
     _make_part(fs_root, OBJ, 1, 1, mtime_offset=7200, atime_offset=7200)
@@ -264,9 +264,9 @@ async def test_backup_backends_unioned_into_replication_check(fs_root, fs_store,
         count = await janitor.cleanup_old_parts_by_mtime(db_mock, fs_store, redis_mock)
 
     # Janitor called is_replicated_on_all_backends, which called
-    # count_chunk_backends with an `expected` list containing BOTH arion and ovh.
+    # count_chunk_backends with an `expected` list unioning upload and backup backends.
     assert captured_expected, "replication check never ran"
-    assert set(captured_expected[0]) == {"arion", "ovh"}
+    assert set(captured_expected[0]) == {"arion", "extra"}
     # And because we claimed full replication, the eviction actually proceeds.
     assert count == 1
 

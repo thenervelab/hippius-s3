@@ -32,8 +32,8 @@ class FileSystemPartsStore:
               meta.json (presence indicates part is complete)
 
     All writes are atomic (unique-tmp + rename) so concurrent writers from
-    different worker pods (arion-downloader, s3-hydrator) don't corrupt files.
-    Readers check for meta.json existence before reading chunks.
+    different worker pods don't corrupt files. Readers check for meta.json
+    existence before reading chunks.
     """
 
     def __init__(self, root_dir: str) -> None:
