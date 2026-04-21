@@ -13,6 +13,10 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: ingress-nginx
+        # Allow cache namespaces to access PG cross-namespace
+        - namespaceSelector:
+            matchLabels:
+              hippius.io/role: cache
     - from:
         - namespaceSelector:
             matchLabels:

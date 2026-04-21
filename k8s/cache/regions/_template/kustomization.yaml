@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# TEMPLATE: Replace REGION_NAME with your region identifier (e.g., ap-0)
+namespace: hippius-s3-cache-REGION_NAME
+
+resources:
+  - ../../base
+  - gateway-nodeport.yaml
+
+patches:
+  - path: namespace-patch.yaml
+  - path: environment-patch.yaml
+  - path: nodeselector-patch.yaml
+
+labels:
+  - pairs:
+      cache-region: REGION_NAME
+    includeSelectors: false
+
+images:
+  - name: ghcr.io/thenervelab/hippius-s3/api
+    newTag: latest
+  - name: ghcr.io/thenervelab/hippius-s3/gateway
+    newTag: latest
+  - name: ghcr.io/thenervelab/hippius-s3/workers
+    newTag: latest

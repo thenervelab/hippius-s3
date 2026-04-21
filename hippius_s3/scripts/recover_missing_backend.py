@@ -15,10 +15,6 @@ Usage (on an API pod):
     python -m hippius_s3.scripts.recover_missing_backend --backend arion --require-backend ipfs --dry-run
     python -m hippius_s3.scripts.recover_missing_backend --backend arion --require-backend ipfs
 
-    # OVH recovery (all objects missing OVH, regardless of other backends)
-    python -m hippius_s3.scripts.recover_missing_backend --backend ovh --dry-run
-    python -m hippius_s3.scripts.recover_missing_backend --backend ovh
-
     # Tuning
     python -m hippius_s3.scripts.recover_missing_backend --backend arion --days 7 --batch-size 500
 """
@@ -120,7 +116,7 @@ ORDER BY ov.created_at ASC
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Re-enqueue objects missing a storage backend")
-    parser.add_argument("--backend", required=True, help="Target backend to recover (arion, ovh, ipfs)")
+    parser.add_argument("--backend", required=True, help="Target backend to recover (arion, ipfs)")
     parser.add_argument(
         "--require-backend",
         default=None,

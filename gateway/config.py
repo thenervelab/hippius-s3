@@ -44,6 +44,9 @@ class GatewayConfig:
     bypass_credit_check: bool = dataclasses.field(
         default_factory=lambda: os.getenv("HIPPIUS_BYPASS_CREDIT_CHECK", "false").lower() == "true"
     )
+    read_only_mode: bool = dataclasses.field(
+        default_factory=lambda: os.getenv("HIPPIUS_READ_ONLY_MODE", "false").lower() == "true"
+    )
     rate_limit_per_minute: int = dataclasses.field(
         default_factory=lambda: int(os.getenv("HIPPIUS_RATE_LIMIT_PER_MINUTE", "7200"))
     )

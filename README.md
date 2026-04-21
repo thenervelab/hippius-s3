@@ -271,10 +271,6 @@ Secrets required for CI/CD deployment (configured in `.github/workflows/k8s-depl
 | **Backend Routing** | `HIPPIUS_UPLOAD_BACKENDS` | Upload backend config |
 | | `HIPPIUS_DOWNLOAD_BACKENDS` | Download backend config |
 | | `HIPPIUS_DELETE_BACKENDS` | Delete backend config |
-| **Backup** | `OVH_BACKUP_ACCESS_KEY_ID` | OVH S3 backup credentials |
-| | `OVH_BACKUP_SECRET_ACCESS_KEY` | OVH S3 backup secret |
-| | `OVH_BACKUP_BUCKET` | OVH backup bucket |
-| | `OVH_BACKUP_ENDPOINT_URL` | OVH endpoint URL |
 | **Monitoring** | `SENTRY_DSN` | Sentry error tracking |
 | | `CACHET_API_KEY` | Status page API key |
 | | `CACHET_COMPONENT_ID` | Status page component ID |

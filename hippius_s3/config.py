@@ -76,6 +76,7 @@ class Config:
     enable_public_read: bool = env("HIPPIUS_ENABLE_PUBLIC_READ:true", convert=lambda x: x.lower() == "true")
     public_bucket_cache_ttl_seconds: int = env("PUBLIC_BUCKET_CACHE_TTL_SECONDS:60", convert=int)
     enable_bypass_credit_check: bool = env("HIPPIUS_BYPASS_CREDIT_CHECK:false", convert=lambda x: x.lower() == "true")
+    read_only_mode: bool = env("HIPPIUS_READ_ONLY_MODE:false", convert=lambda x: x.lower() == "true")
 
     # S3 Validation Limits
     min_bucket_name_length: int = env("MIN_BUCKET_NAME_LENGTH", convert=int)
@@ -111,9 +112,6 @@ class Config:
 
     # Redis for queues (persistent)
     redis_queues_url: str = env("REDIS_QUEUES_URL:redis://127.0.0.1:6382/0")
-
-    # Redis for download cache (short-lived chunks for download-to-stream pipeline)
-    redis_download_cache_url: str = env("REDIS_DOWNLOAD_CACHE_URL:redis://127.0.0.1:6385/0")
 
     # Database connection pool configuration
     db_pool_min_size: int = env("API_DB_POOL_MIN_SIZE:5", convert=int)
@@ -159,11 +157,17 @@ class Config:
     upload_backends: list[str] = env("HIPPIUS_UPLOAD_BACKENDS:arion", convert=_parse_backends)
     download_backends: list[str] = env("HIPPIUS_DOWNLOAD_BACKENDS:arion", convert=_parse_backends)
     delete_backends: list[str] = env("HIPPIUS_DELETE_BACKENDS:arion", convert=_parse_backends)
+    # Optional additional backends that must have replicated a chunk before
+    # the janitor is allowed to evict it from the FS cache. Unioned with
+    # upload_backends when checking "fully replicated".
+    backup_backends: list[str] = env("HIPPIUS_BACKUP_BACKENDS:", convert=lambda v: _parse_backends(v, default=""))
 
-    # Cache TTL (shared across components)
+    # Cache TTL (shared across components — still used for pub/sub wait timeout)
     cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:3600", convert=int)
-    # Download cache TTL (short-lived: download-to-stream pipeline)
-    download_cache_ttl_seconds: int = env("DOWNLOAD_CACHE_TTL:300", convert=int)
+    # Hot-retention window for the FS cache: chunks read within this window
+    # are protected from janitor deletion so frequently-accessed content
+    # stays on NVMe. Touched on every read by the API/streamer.
+    fs_cache_hot_retention_seconds: int = env("HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS:10800", convert=int)
     # Unified object part chunk size (bytes) for cache and range math
     object_chunk_size_bytes: int = env("HIPPIUS_CHUNK_SIZE_BYTES:4194304", convert=int)
     # Downloader behavior (default: no whole-part backfill)
@@ -176,6 +180,12 @@ class Config:
     downloader_retry_base_seconds: float = env("DOWNLOADER_RETRY_BASE_SECONDS:0.1", convert=float)
     downloader_retry_jitter_seconds: float = env("DOWNLOADER_RETRY_JITTER_SECONDS:0.1", convert=float)
     downloader_semaphore: int = env("DOWNLOADER_SEMAPHORE:20", convert=int)
+    # When multiple streamers hit a cache miss on the same part concurrently,
+    # only one enqueues a DownloadChainRequest; the others wait via pub/sub.
+    # The Redis lock that enforces this is cleared by the downloader on
+    # completion, and this TTL caps the worst-case hang if the downloader
+    # crashes mid-request.
+    download_coalesce_lock_ttl_seconds: int = env("DOWNLOAD_COALESCE_LOCK_TTL:120", convert=int)
 
     # Crypto configuration
     # hip-enc/legacy: SecretBox per-chunk (legacy objects)

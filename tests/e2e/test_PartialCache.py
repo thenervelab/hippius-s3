@@ -74,16 +74,19 @@ def test_get_partial_cache_fallbacks(
     object_id, ov = get_object_id_and_version(bucket, key)
     clear_object_cache(object_id, parts=[1])
 
-    # Diagnostic: verify chunked cache presence before first GET
+    # Diagnostic: verify chunked cache presence before first GET (FS-backed)
     try:
-        import redis as _redis  # type: ignore[import-untyped]
+        from pathlib import Path as _Path
 
-        r = _redis.Redis.from_url("redis://localhost:6379/0")
-        # Fetch current_object_version for versioned cache keys
-        # version already fetched above
-        has1 = bool(r.exists(f"obj:{object_id}:v:{ov}:part:1:meta"))
-        has2 = bool(r.exists(f"obj:{object_id}:v:{ov}:part:2:meta"))
-        print(f"DEBUG cache before GET: object_id={object_id} part1meta={has1} part2meta={has2}")
+        def _meta_present(part_number: int) -> bool:
+            for cache_dir in ("/var/lib/hippius/local_object_cache", "/var/lib/hippius/object_cache"):
+                if (_Path(cache_dir) / object_id / f"v{ov}" / f"part_{part_number}" / "meta.json").exists():
+                    return True
+            return False
+
+        print(
+            f"DEBUG cache before GET: object_id={object_id} part1meta={_meta_present(1)} part2meta={_meta_present(2)}"
+        )
     except Exception as _e:  # pragma: no cover
         print(f"DEBUG cache probe failed: {_e}")
 

@@ -1,0 +1,37 @@
+# Mount the local NVMe cache PVC on every pod that reads/writes chunks.
+# The PVC is bound to a PV tied to nodes labeled hippius.com/cache-region=eu-0,
+# which is already enforced by nodeselector-patch.yaml.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          volumeMounts:
+            - name: local-cache
+              mountPath: /var/lib/hippius/object_cache
+      volumes:
+        - name: local-cache
+          persistentVolumeClaim:
+            claimName: local-cache-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arion-downloader
+spec:
+  template:
+    spec:
+      containers:
+        - name: arion-downloader
+          volumeMounts:
+            - name: local-cache
+              mountPath: /var/lib/hippius/object_cache
+      volumes:
+        - name: local-cache
+          persistentVolumeClaim:
+            claimName: local-cache-pvc

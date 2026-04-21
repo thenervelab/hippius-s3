@@ -7,8 +7,6 @@ from typing import Optional
 import psycopg  # type: ignore[import-untyped]
 import redis  # type: ignore[import-untyped]
 
-from hippius_s3.cache import RedisObjectPartsCache
-
 
 def get_object_id_and_version(
     bucket_name: str, object_key: str, *, dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius"
@@ -118,20 +116,37 @@ def clear_object_cache(
     parts: Iterable[int] | None = None,
     *,
     redis_url: str = "redis://localhost:6379/0",
-    download_cache_url: str = "redis://localhost:6385/0",
     dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
 ) -> None:
-    """Delete chunked obj:{object_id}:part:{n}:chunk:* and meta keys in Redis for the given parts.
+    """Clear FS cache entries for `object_id` so the next GET is a cache miss.
 
-    Clears both the main cache and the download cache.
-    If parts is None, queries DB to find actual parts for this object (much faster than scanning 256).
+    After the FS-cache migration, chunks live on the filesystem (not Redis).
+    This helper walks the known cache mount points and removes the
+    object's part tree. It also best-effort clears any leftover Redis keys
+    for the object in case an older deploy populated them — safe if empty.
     """
+    import shutil
+    from pathlib import Path
+
     import psycopg
 
-    r = redis.Redis.from_url(redis_url)
-    r_dl = redis.Redis.from_url(download_cache_url)
+    # Resolve current object_version (used to namespace part directories).
+    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT o.current_object_version
+            FROM objects o
+            WHERE o.object_id = %s
+            LIMIT 1
+            """,
+            (object_id,),
+        )
+        row = cur.fetchone()
+        object_version = int(row[0]) if row and row[0] is not None else 1
 
-    # If no parts specified, query DB for actual part numbers to avoid scanning 256 empty parts
+    # Wipe per-part directories from the FS cache. Both legacy (CephFS)
+    # and local NVMe mount points are covered to keep the helper robust
+    # across dev / staging / prod layouts.
     if parts is None:
         with psycopg.connect(dsn) as conn, conn.cursor() as cur:
             cur.execute(
@@ -144,62 +159,65 @@ def clear_object_cache(
                 (object_id,),
             )
             parts_list = [row[0] for row in cur.fetchall()]
-            # Always include part 1 (the base object part)
             if 1 not in parts_list:
                 parts_list.insert(0, 1)
             parts = parts_list
 
-    # Determine current object_version for namespacing
-    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT o.current_object_version
-            FROM objects o
-            WHERE o.object_id = %s
-            LIMIT 1
-            """,
-            (object_id,),
-        )
-        row = cur.fetchone()
-        object_version = int(row[0]) if row and row[0] is not None else 1
+    # Delete the part directories from INSIDE the API container first. The
+    # files there are owned by the container user and a host-side `rmtree`
+    # on a bind-mount usually fails silently on the CI runner (different UID),
+    # which silently leaves the cache populated and breaks follow-up
+    # "source == pipeline" assertions.
+    from .compose import compose_exec
 
-    roc = RedisObjectPartsCache(r)
     for pn in parts:
-        # Delete meta first, then all chunk keys (versioned namespace)
-        meta_key = roc.build_meta_key(object_id, int(object_version), int(pn))
-        r.delete(meta_key)
-        # Scan and delete chunk keys using cache key prefix
-        base_key = roc.build_key(object_id, int(object_version), int(pn))
-        for k in r.scan_iter(match=f"{base_key}:chunk:*"):
-            r.delete(k)
-        # Also clear download cache
-        for k in r_dl.scan_iter(match=f"{base_key}:chunk:*"):
-            r_dl.delete(k)
-    # Sanity: assert no meta remains for requested parts
-    for pn in parts:
-        meta_key = roc.build_meta_key(object_id, int(object_version), int(pn))
-        assert not r.exists(meta_key), f"Part {pn} cache not cleared"
+        container_part_dir = f"/var/lib/hippius/object_cache/{object_id}/v{object_version}/part_{int(pn)}"
+        try:
+            compose_exec("api", ["rm", "-rf", container_part_dir])
+        except Exception:  # docker-compose not available (pure-host run); fall through to host rmtree
+            pass
+        # Also try the NVMe mount path (production / CDN regions)
+        container_nvme_part_dir = f"/var/lib/hippius/local_object_cache/{object_id}/v{object_version}/part_{int(pn)}"
+        try:
+            compose_exec("api", ["rm", "-rf", container_nvme_part_dir])
+        except Exception:
+            pass
 
-    # Clear FS cache for this object so reads go through the download pipeline
-    import shutil
-    from pathlib import Path
-
-    for cache_dir in ["/var/lib/hippius/object_cache", "/var/lib/hippius/local_object_cache"]:
+    # Belt-and-suspenders: also remove from the host. Harmless if the path
+    # doesn't exist or the rmtree can't delete (ignore_errors=True).
+    for cache_dir in ("/var/lib/hippius/object_cache", "/var/lib/hippius/local_object_cache"):
         obj_dir = Path(cache_dir) / object_id
-        if obj_dir.exists():
-            shutil.rmtree(obj_dir, ignore_errors=True)
+        if not obj_dir.exists():
+            continue
+        for pn in parts:
+            part_dir = obj_dir / f"v{object_version}" / f"part_{int(pn)}"
+            if part_dir.exists():
+                shutil.rmtree(part_dir, ignore_errors=True)
+
+    # Best-effort: remove the download-in-progress coalescing locks so a
+    # subsequent miss re-enqueues instead of waiting for a phantom worker.
+    try:
+        r = redis.Redis.from_url(redis_url)
+        for pn in parts:
+            r.delete(f"download_in_progress:{object_id}:v:{object_version}:part:{int(pn)}")
+    except Exception:
+        pass
 
 
 def read_part_from_cache(
     object_id: str,
     part_number: int,
     *,
-    redis_url: str = "redis://localhost:6379/0",
     dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
 ) -> Optional[bytes]:
-    """Assemble part bytes from chunked cache if present; returns None if missing."""
-    r = redis.Redis.from_url(redis_url)
-    # Fetch current object_version
+    """Assemble part bytes from the FS cache if fully present; otherwise None.
+
+    Walks the known FS cache mount points (local NVMe primary, CephFS
+    fallback) and stitches chunks using meta.json.
+    """
+    import json as _json
+    from pathlib import Path
+
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -213,28 +231,30 @@ def read_part_from_cache(
         row = cur.fetchone()
         object_version = int(row[0]) if row and row[0] is not None else 1
 
-    roc = RedisObjectPartsCache(r)
-    meta_key = roc.build_meta_key(object_id, int(object_version), int(part_number))
-    meta = r.get(meta_key)
-    if not meta:
-        return None
-    import json as _json
-
-    try:
-        m = _json.loads(meta)
-    except Exception:
-        return None
-    num_chunks = int(m.get("num_chunks", 0))
-    if num_chunks <= 0:
-        return b""
-    chunks: list[bytes] = []
-    for i in range(num_chunks):
-        chunk_key = roc.build_chunk_key(object_id, int(object_version), int(part_number), i)
-        c = r.get(chunk_key)
-        if not isinstance(c, (bytes, bytearray)):
-            return None
-        chunks.append(bytes(c))
-    return b"".join(chunks)
+    for cache_dir in ("/var/lib/hippius/local_object_cache", "/var/lib/hippius/object_cache"):
+        part_dir = Path(cache_dir) / object_id / f"v{object_version}" / f"part_{int(part_number)}"
+        meta_path = part_dir / "meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = _json.loads(meta_path.read_text())
+        except Exception:
+            continue
+        num_chunks = int(meta.get("num_chunks", 0))
+        if num_chunks <= 0:
+            return b""
+        chunks: list[bytes] = []
+        missing = False
+        for i in range(num_chunks):
+            chunk_path = part_dir / f"chunk_{i}.bin"
+            if not chunk_path.exists():
+                missing = True
+                break
+            chunks.append(chunk_path.read_bytes())
+        if missing:
+            continue
+        return b"".join(chunks)
+    return None
 
 
 def wait_for_parts_cids(

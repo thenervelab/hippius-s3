@@ -1,12 +1,28 @@
 #!/usr/bin/env python3
-"""Janitor task to clean up stale filesystem parts from aborted multipart uploads.
+"""Janitor task: clean up stale / aged parts from the shared FS cache.
 
-This background task runs periodically to identify and remove parts from the FS store
-that belong to stale or abandoned multipart uploads, preventing disk bloat from
-incomplete uploads that were never finalized or cleaned up.
+Runs periodically and:
+- Deletes stale MPU parts (aborted uploads) older than `mpu_stale_seconds`.
+- GC aged parts that have been replicated to every required backend
+  (upload + backup). Replication is an ABSOLUTE gate: a chunk that hasn't
+  been backed up to every required backend is NEVER deleted, under any
+  conditions.
+- Keeps "hot" parts (atime within `fs_cache_hot_retention_seconds`) —
+  these are recently read and worth keeping on NVMe.
+- Cleans orphan `.tmp.*` files (from worker crashes during atomic write).
+- Hard-deletes soft-deleted objects whose backends have confirmed unpin.
+
+Disk-pressure modes (all still replication-gated):
+- Normal   (<85%):  honor hot retention; evict only replicated + aged + cold.
+- Elevated (85-95%): halve hot retention; evict replicated + cold regardless of age.
+- Critical (>=95%): disable hot retention; evict replicated + cold regardless of age.
+  If no replicated parts exist, the janitor logs an ERROR and does nothing.
+  It will never delete non-replicated data to free space. Operator paging
+  is the answer, not data loss.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -51,13 +67,24 @@ AGE_BUCKET_BOUNDARIES = [
 ]
 AGE_BUCKET_NAMES = [b[0] for b in AGE_BUCKET_BOUNDARIES] + ["7d+"]
 
+# Disk pressure thresholds (fraction of total disk used).
+PRESSURE_ELEVATED = 0.85
+PRESSURE_CRITICAL = 0.95
+
+# Maximum age of an orphan `.tmp.*` file before we delete it. Atomic writes
+# finish in milliseconds; anything older than this is a crashed-write orphan.
+TMP_FILE_MAX_AGE_SECONDS = 3600  # 1h
+
 _fs_parts_on_disk = 0
 _fs_oldest_age_seconds = 0.0
 _fs_disk_used_bytes = 0
 _fs_disk_total_bytes = 0
+_fs_hot_parts = 0
+_fs_pressure_mode = 0  # 0 = normal, 1 = elevated, 2 = critical
 _fs_age_buckets: dict[str, int] = dict.fromkeys(AGE_BUCKET_NAMES, 0)
 
 _janitor_deleted_counter = None  # set by _setup_janitor_metrics
+_janitor_tmp_deleted_counter = None
 
 
 def _obs_parts_on_disk(_: object) -> list[otel_metrics.Observation]:
@@ -76,6 +103,14 @@ def _obs_disk_total(_: object) -> list[otel_metrics.Observation]:
     return [otel_metrics.Observation(_fs_disk_total_bytes, {})]
 
 
+def _obs_hot_parts(_: object) -> list[otel_metrics.Observation]:
+    return [otel_metrics.Observation(_fs_hot_parts, {})]
+
+
+def _obs_pressure_mode(_: object) -> list[otel_metrics.Observation]:
+    return [otel_metrics.Observation(_fs_pressure_mode, {})]
+
+
 def _obs_age_buckets(_: object) -> list[otel_metrics.Observation]:
     return [otel_metrics.Observation(count, {"age_bucket": bucket}) for bucket, count in _fs_age_buckets.items()]
 
@@ -87,8 +122,32 @@ def _classify_age_bucket(age_seconds: float) -> str:
     return "7d+"
 
 
+def _pressure_mode(root: Path) -> int:
+    """Return the current disk-pressure mode (0/1/2)."""
+    try:
+        usage = shutil.disk_usage(root)
+        ratio = usage.used / usage.total if usage.total else 0.0
+    except OSError:
+        return 0
+    if ratio >= PRESSURE_CRITICAL:
+        return 2
+    if ratio >= PRESSURE_ELEVATED:
+        return 1
+    return 0
+
+
+def _effective_hot_retention(mode: int) -> float:
+    """Effective hot-retention window (seconds) given pressure mode."""
+    base = float(getattr(config, "fs_cache_hot_retention_seconds", 10800))
+    if mode == 1:
+        return base / 2
+    if mode == 2:
+        return 0.0  # disable hot retention under critical pressure
+    return base
+
+
 def _setup_janitor_metrics() -> None:
-    global _janitor_deleted_counter
+    global _janitor_deleted_counter, _janitor_tmp_deleted_counter
 
     if os.getenv("ENABLE_MONITORING", "false").lower() not in ("true", "1", "yes"):
         logger.info("Monitoring disabled for janitor")
@@ -132,6 +191,16 @@ def _setup_janitor_metrics() -> None:
         description="Total bytes on cache filesystem",
     )
     meter.create_observable_gauge(
+        name="fs_cache_hot_parts",
+        callbacks=[_obs_hot_parts],
+        description="Parts retained because atime is within hot-retention window",
+    )
+    meter.create_observable_gauge(
+        name="fs_cache_pressure_mode",
+        callbacks=[_obs_pressure_mode],
+        description="0=normal, 1=elevated, 2=critical",
+    )
+    meter.create_observable_gauge(
         name="fs_cache_age_bucket_parts",
         callbacks=[_obs_age_buckets],
         description="Number of parts per age bucket",
@@ -139,6 +208,11 @@ def _setup_janitor_metrics() -> None:
     _janitor_deleted_counter = meter.create_counter(
         name="fs_janitor_deleted_total",
         description="Total number of FS parts deleted by the janitor",
+        unit="1",
+    )
+    _janitor_tmp_deleted_counter = meter.create_counter(
+        name="fs_janitor_tmp_deleted_total",
+        description="Total number of orphan .tmp files deleted by the janitor",
         unit="1",
     )
 
@@ -151,7 +225,12 @@ async def get_all_dlq_object_ids(redis_client: Redis) -> set[str]:
     """
     object_ids = set()
 
-    for dlq_key in ["arion_upload_requests:dlq", "unpin_requests:dlq"]:
+    # Enumerate DLQ keys dynamically from the configured upload backends so
+    # a new backend (e.g. ipfs) doesn't silently bypass protection.
+    dlq_keys = [f"{b}_upload_requests:dlq" for b in config.upload_backends]
+    dlq_keys.append("unpin_requests:dlq")
+
+    for dlq_key in dlq_keys:
         try:
             dlq_entries = await asyncio.wait_for(redis_client.lrange(dlq_key, 0, -1), timeout=5.0)
             for entry_json in dlq_entries:
@@ -222,9 +301,7 @@ async def cleanup_stale_parts(
                 except Exception:
                     continue
 
-                import time as _t
-
-                if mtime > (_t.time() - stale_threshold_seconds):
+                if mtime > (time.time() - stale_threshold_seconds):
                     # Recently touched, skip
                     continue
 
@@ -302,11 +379,19 @@ async def is_replicated_on_all_backends(
     )
     version_type = row["version_type"] if row else None
     if version_type == "migration":
-        expected = ["ipfs"]
+        expected: list[str] = ["ipfs"]
     elif row and row["upload_backends"]:
         expected = list(row["upload_backends"])
     else:
-        expected = config.upload_backends
+        expected = list(config.upload_backends)
+
+    # Union in any configured backup backends. The janitor must not delete a
+    # part until every required backend — upload AND backup — has a live
+    # chunk_backend row for every chunk.
+    backup_backends = list(getattr(config, "backup_backends", []) or [])
+    for b in backup_backends:
+        if b and b not in expected:
+            expected.append(b)
 
     result = await db.fetchrow(
         get_query("count_chunk_backends"),
@@ -323,25 +408,71 @@ async def is_replicated_on_all_backends(
     return result["total_chunks"] == result["replicated_chunks"]
 
 
+async def cleanup_orphan_tmp_files(fs_store: FileSystemPartsStore) -> int:
+    """Remove orphan atomic-write temp files that outlived a crashed worker.
+
+    Workers use `<target>.tmp.<uuid>` as the tempfile for atomic rename.
+    If the worker crashes between creating the tempfile and renaming it,
+    the tempfile is left behind. Delete anything named `*.tmp.*` older than
+    `TMP_FILE_MAX_AGE_SECONDS`.
+    """
+    root = fs_store.root
+    if not root.exists():
+        return 0
+
+    now = time.time()
+    cutoff = now - TMP_FILE_MAX_AGE_SECONDS
+    removed = 0
+
+    # rglob is fine; the FS is bounded by active objects
+    for path in root.rglob("*.tmp.*"):
+        try:
+            if not path.is_file():
+                continue
+            if path.stat().st_mtime > cutoff:
+                continue
+            path.unlink()
+            removed += 1
+            logger.info(f"Removed orphan tmp file: {path}")
+        except OSError as e:
+            logger.debug(f"Skip orphan tmp {path}: {e}")
+
+    if removed > 0 and _janitor_tmp_deleted_counter is not None:
+        _janitor_tmp_deleted_counter.add(removed)
+    if removed > 0:
+        logger.info(f"Janitor removed {removed} orphan tmp files")
+    return removed
+
+
 async def cleanup_old_parts_by_mtime(
     db: asyncpg.Connection,
     fs_store: FileSystemPartsStore,
     redis_client: Redis,
 ) -> int:
-    """Clean up old parts from FS based on modification time (backup GC).
+    """Safe, replication-gated GC.
 
-    This is a safety net to remove orphaned parts that weren't caught by the
-    stale MPU cleanup (e.g., parts without DB entries).
+    ABSOLUTE RULE: never delete a part that isn't fully replicated to every
+    required backend (upload + any configured backup backends). Age, disk
+    pressure, and hot-retention policies only relax what's eligible among
+    already-replicated parts — they never override the replication check.
 
-    Args:
-        fs_store: FileSystemPartsStore instance
-        redis_client: Redis client for DLQ checks
+    Deletion rule:
+        delete <=> fully_replicated AND NOT hot AND NOT dlq_protected
 
-    Returns:
-        Number of parts cleaned up
+    Where:
+    - fully_replicated: every chunk has a live `chunk_backend` row for every
+      backend in upload_backends ∪ backup_backends.
+    - hot: atime within the pressure-adjusted hot-retention window.
+      - Normal pressure:   hot_window = config.fs_cache_hot_retention_seconds
+      - Elevated (>=85%):  hot_window halves
+      - Critical (>=95%):  hot_window = 0 (hot protection disabled; all
+        replicated parts become eligible for eviction)
+
+    Under critical pressure with nothing replicated, the janitor is stuck.
+    That is the correct outcome — it logs an ERROR so operators page.
     """
     max_age_seconds = config.fs_cache_gc_max_age_seconds
-    logger.info(f"Scanning for orphaned FS parts older than {max_age_seconds}s")
+    logger.info(f"Scanning FS parts eligible for GC (max_age={max_age_seconds}s, replication-gated)")
 
     dlq_object_ids = await get_all_dlq_object_ids(redis_client)
     if dlq_object_ids:
@@ -353,12 +484,20 @@ async def cleanup_old_parts_by_mtime(
 
     parts_cleaned = 0
     cutoff_time = time.time() - max_age_seconds
+    pressure = _pressure_mode(root)
+    hot_window = _effective_hot_retention(pressure)
+    if pressure > 0:
+        logger.warning(
+            f"Disk pressure={pressure} ({'elevated' if pressure == 1 else 'critical'}); hot_window={hot_window}s"
+        )
 
-    global _fs_parts_on_disk, _fs_oldest_age_seconds, _fs_disk_used_bytes, _fs_disk_total_bytes, _fs_age_buckets
+    global _fs_parts_on_disk, _fs_oldest_age_seconds, _fs_disk_used_bytes
+    global _fs_disk_total_bytes, _fs_age_buckets, _fs_hot_parts, _fs_pressure_mode
 
     # Walk the FS hierarchy: <root>/<object_id>/v<version>/part_<n>/
     oldest_mtime = None
     parts_seen = 0
+    hot_parts = 0
     age_counts: dict[str, int] = dict.fromkeys(AGE_BUCKET_NAMES, 0)
     now = time.time()
 
@@ -388,45 +527,65 @@ async def cleanup_old_parts_by_mtime(
                 except (ValueError, IndexError):
                     continue
 
-                # Check mtime of meta.json (if present) or the directory itself
+                # Check mtime (for age) and atime (for hot retention)
                 meta_file = part_dir / "meta.json"
                 check_path = meta_file if meta_file.exists() else part_dir
 
                 try:
-                    mtime = check_path.stat().st_mtime
+                    stat = check_path.stat()
+                    mtime = stat.st_mtime
+                    atime = stat.st_atime
                     if oldest_mtime is None or mtime < oldest_mtime:
                         oldest_mtime = mtime
 
-                    # Classify part age into bucket
                     part_age = now - mtime
                     age_counts[_classify_age_bucket(part_age)] += 1
 
-                    # Don't clean DLQ-protected parts, only count them for metrics
+                    is_hot = hot_window > 0 and atime > (now - hot_window)
+                    if is_hot:
+                        hot_parts += 1
+
+                    # Don't clean DLQ-protected parts (only count them for metrics)
                     if is_dlq_protected:
                         continue
 
-                    old_enough = mtime < cutoff_time
+                    # Hot files are protected. Under critical pressure
+                    # hot_window is 0, which forces is_hot=False, letting
+                    # fully-replicated parts become eligible even if recently read.
+                    if is_hot:
+                        continue
+
+                    # ABSOLUTE safety gate: never delete non-replicated data.
                     fully_replicated = await is_replicated_on_all_backends(
                         db,
                         object_id,
                         object_version,
                         part_number,
                     )
+                    if not fully_replicated:
+                        continue
 
-                    if old_enough or fully_replicated:
-                        shutil.rmtree(part_dir)
-                        parts_cleaned += 1
-                        age = (now - mtime) / 3600
-                        logger.info(
-                            f"GC cleaned part: {part_dir} {old_enough=} {fully_replicated=} (mtime {age=:.1f}h)"
-                        )
+                    # A fully-replicated, cold, non-DLQ part is safe to evict.
+                    # Under normal pressure we additionally require age > cutoff
+                    # so we don't thrash. Under any pressure level we evict
+                    # replicated cold parts regardless of age.
+                    old_enough = mtime < cutoff_time
+                    if pressure == 0 and not old_enough:
+                        continue
 
-                        # Try to prune empty parents
-                        try:
-                            version_dir.rmdir()
-                            object_dir.rmdir()
-                        except OSError:
-                            pass  # Not empty; ignore
+                    shutil.rmtree(part_dir)
+                    parts_cleaned += 1
+                    age = (now - mtime) / 3600
+                    logger.info(
+                        f"GC cleaned part: {part_dir} replicated=True "
+                        f"pressure={pressure} {old_enough=} (mtime {age=:.1f}h)"
+                    )
+
+                    # Try to prune empty parents (idempotent; ignore if not empty)
+                    with contextlib.suppress(OSError):
+                        version_dir.rmdir()
+                    with contextlib.suppress(OSError):
+                        object_dir.rmdir()
                 except Exception as e:
                     logger.warning(f"Failed to clean part {part_dir}: {e}")
 
@@ -434,6 +593,8 @@ async def cleanup_old_parts_by_mtime(
     _fs_parts_on_disk = parts_seen
     _fs_oldest_age_seconds = max(0.0, now - float(oldest_mtime)) if oldest_mtime is not None else 0.0
     _fs_age_buckets = age_counts
+    _fs_hot_parts = hot_parts
+    _fs_pressure_mode = pressure
 
     # Disk usage
     disk = shutil.disk_usage(root)
@@ -443,7 +604,20 @@ async def cleanup_old_parts_by_mtime(
     if parts_cleaned > 0 and _janitor_deleted_counter is not None:
         _janitor_deleted_counter.add(parts_cleaned)
 
-    logger.info(f"GC cleaned {parts_cleaned=}")
+    logger.info(f"GC cleaned {parts_cleaned=} hot_parts={hot_parts} pressure={pressure}")
+
+    # If we're under critical disk pressure but couldn't free any space,
+    # every on-disk part is either hot (ignored under critical — nothing to
+    # free) or non-replicated (we refuse to delete). Page the operator.
+    if pressure == 2 and parts_cleaned == 0 and parts_seen > 0:
+        logger.error(
+            "JANITOR_CRITICAL_PRESSURE_BLOCKED parts_seen=%d hot_parts=%d — "
+            "disk is >=95%% full but all remaining parts are non-replicated. "
+            "Operator action required; refusing to delete unreplicated data.",
+            parts_seen,
+            hot_parts,
+        )
+
     return parts_cleaned
 
 
@@ -474,9 +648,11 @@ async def run_janitor_loop():
     logger.info(f"FS store root: {config.object_cache_dir}")
     logger.info(f"MPU stale threshold: {config.mpu_stale_seconds}s")
     logger.info(f"FS GC max age: {config.fs_cache_gc_max_age_seconds}s")
+    logger.info(f"FS hot retention: {getattr(config, 'fs_cache_hot_retention_seconds', 10800)}s")
 
-    # Run immediately on start, then periodically
-    sleep_interval = 600  # 10m
+    # Sleep intervals: shorter under disk pressure to catch up
+    sleep_normal = 600  # 10m
+    sleep_pressure = 120  # 2m
 
     try:
         while True:
@@ -484,6 +660,7 @@ async def run_janitor_loop():
             stale_count = 0
             gc_count = 0
             hard_deleted = 0
+            tmp_count = 0
 
             # Phase 1: Clean stale MPU parts (aborted uploads)
             try:
@@ -497,15 +674,26 @@ async def run_janitor_loop():
             except Exception as e:
                 logger.error(f"Phase 2 (GC) error: {e}", exc_info=True)
 
-            # Phase 3: Hard-delete soft-deleted objects where all unpins are confirmed
+            # Phase 3: Clean orphan .tmp.* files from crashed atomic writes
+            try:
+                tmp_count = await cleanup_orphan_tmp_files(fs_store)
+            except Exception as e:
+                logger.error(f"Phase 3 (tmp cleanup) error: {e}", exc_info=True)
+
+            # Phase 4: Hard-delete soft-deleted objects where all unpins are confirmed
             try:
                 hard_deleted = await gc_soft_deleted_objects(db)
             except Exception as e:
-                logger.error(f"Phase 3 (hard delete) error: {e}", exc_info=True)
+                logger.error(f"Phase 4 (hard delete) error: {e}", exc_info=True)
 
-            logger.info(f"Janitor cycle complete: stale={stale_count} gc={gc_count} hard_deleted={hard_deleted}")
+            logger.info(
+                f"Janitor cycle complete: stale={stale_count} gc={gc_count} tmp={tmp_count} hard_deleted={hard_deleted}"
+            )
 
-            logger.info(f"Janitor sleeping {sleep_interval}s until next cycle...")
+            # Pick sleep interval based on current pressure
+            pressure = _pressure_mode(fs_store.root)
+            sleep_interval = sleep_pressure if pressure > 0 else sleep_normal
+            logger.info(f"Janitor sleeping {sleep_interval}s (pressure={pressure})")
             await asyncio.sleep(sleep_interval)
     finally:
         if redis_client:

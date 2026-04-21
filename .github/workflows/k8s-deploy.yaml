@@ -146,7 +146,6 @@ jobs:
             --from-literal=REDIS_QUEUES_URL='redis://redis-queues:6379' \
             --from-literal=REDIS_RATE_LIMITING_URL='redis://redis-rate-limiting:6379' \
             --from-literal=REDIS_ACL_URL='redis://redis-acl:6379' \
-            --from-literal=REDIS_DOWNLOAD_CACHE_URL='redis://redis-download-cache:6379' \
             --from-literal=HIPPIUS_SERVICE_KEY='${{ secrets.HIPPIUS_SERVICE_KEY }}' \
             --from-literal=ARION_SERVICE_KEY='${{ secrets.ARION_SERVICE_KEY }}' \
             --from-literal=ARION_BEARER_TOKEN='${{ secrets.ARION_BEARER_TOKEN }}' \
@@ -274,7 +273,6 @@ jobs:
             --from-literal=REDIS_QUEUES_URL="redis://redis-queues:6379/0" \
             --from-literal=REDIS_RATE_LIMITING_URL="redis://redis-rate-limiting:6379/0" \
             --from-literal=REDIS_ACL_URL="redis://redis-acl:6379/0" \
-            --from-literal=REDIS_DOWNLOAD_CACHE_URL="redis://redis-download-cache:6379/0" \
             --from-literal=HIPPIUS_SERVICE_KEY="${{ secrets.HIPPIUS_SERVICE_KEY }}" \
             --from-literal=ARION_SERVICE_KEY="${{ secrets.ARION_SERVICE_KEY }}" \
             --from-literal=ARION_BEARER_TOKEN="${{ secrets.ARION_BEARER_TOKEN }}" \
@@ -368,3 +366,132 @@ jobs:
           kubectl get pods -n hippius-s3-prod
           kubectl get services -n hippius-s3-prod
           kubectl get ingress -n hippius-s3-prod
+
+  deploy-cache-production:
+    runs-on: ubuntu-latest
+    needs: [build-images, deploy-production]
+    if: false  # CDN/cache deployment temporarily disabled
+    environment: production
+    strategy:
+      matrix:
+        region: [us-0, eu-0]
+      fail-fast: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
+
+      - name: Set cache namespace
+        id: ns
+        run: echo "namespace=hippius-s3-cache-${{ matrix.region }}" >> $GITHUB_OUTPUT
+
+      - name: Create namespace if needed
+        run: |
+          kubectl create namespace ${{ steps.ns.outputs.namespace }} --dry-run=client -o yaml | kubectl apply -f -
+          kubectl label namespace ${{ steps.ns.outputs.namespace }} hippius.io/role=cache --overwrite
+
+      - name: Update cache secrets
+        run: |
+          CACHE_NS="${{ steps.ns.outputs.namespace }}"
+          CLUSTER_URL="redis://redis-cluster.${CACHE_NS}.svc.cluster.local:6379?cluster=true"
+          DATABASE_URL="postgresql://postgres:${{ secrets.DATABASE_PASSWORD }}@postgres-rw.hippius-s3-prod.svc.cluster.local:5432/hippius?sslmode=disable"
+
+          kubectl create secret generic hippius-s3-secrets \
+            --from-literal=DATABASE_URL="${DATABASE_URL}" \
+            --from-literal=HIPPIUS_KEYSTORE_DATABASE_URL="${DATABASE_URL}" \
+            --from-literal=REDIS_URL="${CLUSTER_URL}" \
+            --from-literal=REDIS_ACCOUNTS_URL="redis://redis-accounts.hippius-s3-prod.svc.cluster.local:6379/0" \
+            --from-literal=REDIS_CHAIN_URL="redis://redis-chain.hippius-s3-prod.svc.cluster.local:6379/0" \
+            --from-literal=REDIS_QUEUES_URL="redis://redis-queues:6379/0" \
+            --from-literal=REDIS_RATE_LIMITING_URL="redis://redis-rate-limiting:6379/0" \
+            --from-literal=REDIS_ACL_URL="redis://redis-acl:6379/0" \
+            --from-literal=HIPPIUS_SERVICE_KEY="${{ secrets.HIPPIUS_SERVICE_KEY }}" \
+            --from-literal=ARION_SERVICE_KEY="${{ secrets.ARION_SERVICE_KEY }}" \
+            --from-literal=ARION_BEARER_TOKEN="${{ secrets.ARION_BEARER_TOKEN }}" \
+            --from-literal=ARION_BILLING_BYPASS_KEY="${{ secrets.ARION_BILLING_BYPASS_KEY }}" \
+            --from-literal=ARION_RATE_LIMITING_PROXY_BYPASS_KEY="${{ secrets.ARION_RATE_LIMITING_PROXY_BYPASS_KEY }}" \
+            --from-literal=HIPPIUS_AUTH_ENCRYPTION_KEY="${{ secrets.HIPPIUS_AUTH_ENCRYPTION_KEY }}" \
+            --from-literal=HIPPIUS_DOWNLOAD_QUEUE_NAMES="${{ secrets.HIPPIUS_DOWNLOAD_QUEUE_NAMES }}" \
+            --from-literal=FRONTEND_HMAC_SECRET="${{ secrets.FRONTEND_HMAC_SECRET }}" \
+            --from-literal=DISCORD_WEBHOOK_URL="${{ secrets.DISCORD_WEBHOOK_URL }}" \
+            --from-literal=HIPPIUS_OVH_KMS_ENDPOINT="${{ secrets.HIPPIUS_OVH_KMS_ENDPOINT }}" \
+            --from-literal=HIPPIUS_OVH_KMS_DEFAULT_KEY_ID="${{ secrets.HIPPIUS_OVH_KMS_DEFAULT_KEY_ID }}" \
+            --from-literal=HIPPIUS_OVH_KMS_OKMS_ID="${{ secrets.HIPPIUS_OVH_KMS_OKMS_ID }}" \
+            --from-literal=RESUBMISSION_SEED_PHRASE="${{ secrets.RESUBMISSION_SEED_PHRASE }}" \
+            --from-literal=HIPPIUS_DOWNLOAD_BACKENDS="${{ secrets.HIPPIUS_DOWNLOAD_BACKENDS }}" \
+            --namespace=${CACHE_NS} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Copy KMS certs to cache namespace
+        run: |
+          CACHE_NS="${{ steps.ns.outputs.namespace }}"
+          kubectl get secret ovh-kms-certs -n hippius-s3-prod -o json | \
+            jq 'del(.metadata.namespace,.metadata.resourceVersion,.metadata.uid,.metadata.creationTimestamp)' | \
+            kubectl apply -n ${CACHE_NS} -f -
+
+      - name: Substitute Arion configuration values
+        run: |
+          ARION_URL="${{ secrets.HIPPIUS_ARION_BASE_URL }}"
+          ARION_SSL="${{ secrets.HIPPIUS_ARION_VERIFY_SSL }}"
+          sed -i "s|HIPPIUS_ARION_BASE_URL_PLACEHOLDER|${ARION_URL:-https://arion.hippius.com/}|g" k8s/cache/base/arion-downloader-deployment.yaml
+          sed -i "s|HIPPIUS_ARION_VERIFY_SSL_PLACEHOLDER|${ARION_SSL:-true}|g" k8s/cache/base/arion-downloader-deployment.yaml
+
+      - name: Substitute Sentry DSN
+        run: |
+          sed -i "s|SENTRY_DSN_PLACEHOLDER|${{ secrets.SENTRY_DSN }}|g" k8s/cache/regions/${{ matrix.region }}/environment-patch.yaml
+
+      - name: Update image tags
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          cd k8s/cache/regions/${{ matrix.region }}
+          kustomize edit set image \
+            ghcr.io/thenervelab/hippius-s3/api:${SHORT_SHA} \
+            ghcr.io/thenervelab/hippius-s3/gateway:${SHORT_SHA} \
+            ghcr.io/thenervelab/hippius-s3/workers:${SHORT_SHA}
+
+      - name: Deploy Redis cluster
+        run: |
+          kubectl apply -f k8s/redis-cluster/cache-${{ matrix.region }}.yaml
+
+      - name: Wait for Redis cluster pods
+        run: |
+          CACHE_NS="${{ steps.ns.outputs.namespace }}"
+          kubectl rollout status statefulset/redis-cluster -n ${CACHE_NS} --timeout=5m
+
+      - name: Bootstrap Redis cluster (idempotent)
+        run: |
+          CACHE_NS="${{ steps.ns.outputs.namespace }}"
+          CLUSTER_INFO=$(kubectl exec -n ${CACHE_NS} redis-cluster-0 -- redis-cli cluster info 2>/dev/null || echo "")
+          if echo "$CLUSTER_INFO" | grep -q "cluster_state:ok"; then
+            echo "Redis cluster already bootstrapped, skipping"
+          else
+            NODES=""
+            for i in $(seq 0 5); do
+              NODES="$NODES redis-cluster-${i}.redis-cluster.${CACHE_NS}.svc.cluster.local:6379"
+            done
+            kubectl exec -n ${CACHE_NS} redis-cluster-0 -- redis-cli --cluster create $NODES --cluster-yes
+          fi
+
+      - name: Deploy cache region
+        run: |
+          kubectl apply -k k8s/cache/regions/${{ matrix.region }}
+
+      - name: Wait for rollout
+        run: |
+          CACHE_NS="${{ steps.ns.outputs.namespace }}"
+          kubectl rollout status deployment/gateway -n ${CACHE_NS} --timeout=10m
+          kubectl rollout status deployment/api -n ${CACHE_NS} --timeout=10m
+          kubectl rollout status deployment/arion-downloader -n ${CACHE_NS} --timeout=10m
+
+      - name: Verify deployment
+        run: |
+          CACHE_NS="${{ steps.ns.outputs.namespace }}"
+          kubectl get pods -n ${CACHE_NS}
+          kubectl get services -n ${CACHE_NS}

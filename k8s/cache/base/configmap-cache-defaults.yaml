@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hippius-s3-defaults
+data:
+  # Read-only mode: reject writes at gateway, use download cache as primary
+  HIPPIUS_READ_ONLY_MODE: "true"
+  PUBLISH_TO_CHAIN: "false"
+
+  # No filesystem cache needed (reads only)
+  HIPPIUS_OBJECT_CACHE_DIR: ""
+  HIPPIUS_OBJECT_CACHE_FALLBACK_DIR: ""
+  HIPPIUS_DLQ_DIR: ""
+  HIPPIUS_DLQ_ARCHIVE_DIR: ""
+
+  # Arion-only downloads, no uploads or deletes
+  HIPPIUS_DOWNLOAD_BACKENDS: "arion"
+  HIPPIUS_UPLOAD_BACKENDS: ""
+  HIPPIUS_DELETE_BACKENDS: ""
+
+  # Features
+  ENABLE_BANHAMMER: "true"
+  ENABLE_AUDIT_LOGGING: "true"
+  HIPPIUS_ENABLE_PUBLIC_READ: "true"
+  HIPPIUS_BYPASS_CREDIT_CHECK: "false"
+
+  # Pool configuration (read-only needs fewer connections)
+  GATEWAY_DB_POOL_MIN_SIZE: "5"
+  GATEWAY_DB_POOL_MAX_SIZE: "25"
+  API_DB_POOL_MIN_SIZE: "5"
+  API_DB_POOL_MAX_SIZE: "20"
+
+  # Rate limiting
+  HIPPIUS_RATE_LIMIT_PER_MINUTE: "7200"
+
+  # Logging
+  LOG_LEVEL: "INFO"
+  LOKI_ENABLED: "true"
+
+  # Server config
+  HOST: "0.0.0.0"
+  PORT: "8000"
+  UVICORN_WORKERS: "2"
+  RATE_LIMIT_PER_MINUTE: "7200"
+  MAX_REQUEST_SIZE_MB: "5368709120"
+  MIN_BUCKET_NAME_LENGTH: "3"
+  MAX_BUCKET_NAME_LENGTH: "63"
+  MAX_OBJECT_KEY_LENGTH: "1024"
+  MAX_METADATA_SIZE: "2048"
+
+  # Substrate / chain (required by config, but not used in read-only mode)
+  HIPPIUS_SUBSTRATE_URL: "wss://rpc.hippius.network"
+  HIPPIUS_VALIDATOR_REGION: "decentralized"
+  HIPPIUS_API_BASE_URL: "https://api.hippius.com/api"
+
+  # KMS
+  HIPPIUS_KMS_MODE: "required"
+  HIPPIUS_OVH_KMS_CERT_PATH: "/kms_certs/client.crt"
+  HIPPIUS_OVH_KMS_KEY_PATH: "/kms_certs/client.key"
+
+  # Validation
+  ENABLE_STRICT_VALIDATION: "true"
+  HIPPIUS_TARGET_STORAGE_VERSION: "5"
+  ACL_CACHE_TTL_SECONDS: "600"
+  ENABLE_PUBLIC_READ: "true"
+
+  # OTEL (cross-namespace to main otel-collector)
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.hippius-s3-prod.svc.cluster.local:4317"
+  OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: "cumulative"
+  SENTRY_DSN: ""
+  SENTRY_TRACES_SAMPLE_RATE: "0.1"

@@ -1,5 +1,8 @@
-# Patch: Add local cache volume + nodeSelector for CephFS → local storage migration
-# Applies to: api, arion-uploader, janitor (pods that use FS cache)
+# Patch: Pin every pod that reads/writes the FS cache onto the cache node.
+# The local NVMe volume (local-cache-pvc) is attached to k8s-v3-node6-cache;
+# pods must run there to access it.
+#
+# Applies to: api, arion-uploader, arion-downloader, janitor.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -34,6 +37,28 @@ spec:
         kubernetes.io/hostname: k8s-v3-node6-cache
       containers:
         - name: arion-uploader
+          volumeMounts:
+            - name: local-cache
+              mountPath: /var/lib/hippius/local_object_cache
+            - name: object-cache
+              mountPath: /var/lib/hippius/object_cache
+              readOnly: true
+      volumes:
+        - name: local-cache
+          persistentVolumeClaim:
+            claimName: local-cache-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arion-downloader
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k8s-v3-node6-cache
+      containers:
+        - name: arion-downloader
           volumeMounts:
             - name: local-cache
               mountPath: /var/lib/hippius/local_object_cache
