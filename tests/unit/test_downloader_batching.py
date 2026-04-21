@@ -444,3 +444,61 @@ async def test_in_progress_flag_cleared_per_part(mock_metrics, mock_config, fs_s
     )
 
     assert obj_cache.redis.delete.await_count == num_parts
+
+
+@pytest.mark.asyncio
+@patch("hippius_s3.workers.downloader.get_config")
+@patch("hippius_s3.workers.downloader.get_metrics_collector")
+async def test_chunk_batching_caps_concurrent_fetches_per_part(mock_metrics, mock_config, fs_store):
+    """A single part with many chunks must not fire all chunk fetches at once.
+
+    Protects against the pathological case of a 5 GiB part at 4 MiB chunk size
+    (~1280 chunks) creating thousands of tasks parked on the semaphore. The
+    chunk batch size is bound to downloader_semaphore so worst-case in-flight
+    tasks per part is capped.
+    """
+    import asyncio
+
+    semaphore_value = 8
+    chunks_per_part = 50  # Simulate a large single-part DCR
+    config = _make_mock_config(semaphore=semaphore_value)
+    mock_config.return_value = config
+    mock_metrics.return_value = MagicMock()
+
+    concurrent_fetches = 0
+    max_concurrent = 0
+    lock = asyncio.Lock()
+
+    async def tracking_fetch(identifier, account):
+        nonlocal concurrent_fetches, max_concurrent
+        async with lock:
+            concurrent_fetches += 1
+            if concurrent_fetches > max_concurrent:
+                max_concurrent = concurrent_fetches
+        # Give the event loop a chance to schedule more if we weren't capped
+        await asyncio.sleep(0.001)
+        async with lock:
+            concurrent_fetches -= 1
+        return b"x" * 4096
+
+    db_pool = _make_mock_db_pool()
+    obj_cache = _make_mock_obj_cache()
+    request = _make_request(1, chunks_per_part=chunks_per_part)
+
+    result = await process_download_request(
+        request,
+        backend_name="arion",
+        fetch_fn=tracking_fetch,
+        db_pool=db_pool,
+        obj_cache=obj_cache,
+        fs_store=fs_store,
+    )
+
+    assert result is True
+    # All chunks eventually processed
+    for ci in range(chunks_per_part):
+        assert await fs_store.chunk_exists(OBJ, 1, 1, ci)
+    # Concurrent fetches never exceed the batch ceiling (= downloader_semaphore)
+    assert max_concurrent <= semaphore_value, (
+        f"Chunk batching breached: {max_concurrent} concurrent > {semaphore_value} cap"
+    )
