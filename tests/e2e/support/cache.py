@@ -163,6 +163,28 @@ def clear_object_cache(
                 parts_list.insert(0, 1)
             parts = parts_list
 
+    # Delete the part directories from INSIDE the API container first. The
+    # files there are owned by the container user and a host-side `rmtree`
+    # on a bind-mount usually fails silently on the CI runner (different UID),
+    # which silently leaves the cache populated and breaks follow-up
+    # "source == pipeline" assertions.
+    from .compose import compose_exec
+
+    for pn in parts:
+        container_part_dir = f"/var/lib/hippius/object_cache/{object_id}/v{object_version}/part_{int(pn)}"
+        try:
+            compose_exec("api", ["rm", "-rf", container_part_dir])
+        except Exception:  # docker-compose not available (pure-host run); fall through to host rmtree
+            pass
+        # Also try the NVMe mount path (production / CDN regions)
+        container_nvme_part_dir = f"/var/lib/hippius/local_object_cache/{object_id}/v{object_version}/part_{int(pn)}"
+        try:
+            compose_exec("api", ["rm", "-rf", container_nvme_part_dir])
+        except Exception:
+            pass
+
+    # Belt-and-suspenders: also remove from the host. Harmless if the path
+    # doesn't exist or the rmtree can't delete (ignore_errors=True).
     for cache_dir in ("/var/lib/hippius/object_cache", "/var/lib/hippius/local_object_cache"):
         obj_dir = Path(cache_dir) / object_id
         if not obj_dir.exists():
