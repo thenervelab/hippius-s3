@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Shared per-backend download module.
+"""Shared per-backend download worker.
 
 Each backend entry point (``run_arion_downloader_in_loop.py``) provides:
 
@@ -8,8 +8,12 @@ Each backend entry point (``run_arion_downloader_in_loop.py``) provides:
 * ``fetch_fn``     — ``async (identifier, account_address) -> bytes``
 
 This module dequeues download requests, looks up the backend-specific
-identifier for each chunk, fetches the ciphertext, and stores it in the
-Redis chunk cache.
+identifier for each chunk, fetches the ciphertext, writes it to the shared
+filesystem cache (``FileSystemPartsStore``), and publishes a pub/sub
+notification so streamers waiting on the chunk can proceed.
+
+Meta is written EAGERLY at part start (using ``num_chunks`` / ``chunk_size``
+from DB) so partial-range fills become readable per-chunk as they land.
 """
 
 from __future__ import annotations
@@ -26,7 +30,9 @@ import asyncpg
 import redis.asyncio as async_redis
 from opentelemetry import trace
 
+from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
+from hippius_s3.cache import create_fs_store
 from hippius_s3.config import get_config
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import DownloadChainRequest
@@ -40,6 +46,51 @@ logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
 
 
+async def _write_part_meta_from_db(
+    *,
+    db_pool: asyncpg.Pool,
+    fs_store: FileSystemPartsStore,
+    object_id: str,
+    object_version: int,
+    part_number: int,
+) -> None:
+    """Write meta.json eagerly from the DB parts row.
+
+    Reader uses meta.json existence as a "part is known" signal; per-chunk
+    file presence is the "this chunk is ready" signal. Writing meta up-front
+    lets partial fills (range requests) become readable chunk-by-chunk.
+
+    Idempotent: meta content is deterministic from DB, so re-writes are safe.
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT size_bytes, chunk_size_bytes FROM parts WHERE object_id = $1 "
+            "AND object_version = $2 AND part_number = $3",
+            object_id,
+            int(object_version),
+            int(part_number),
+        )
+    if not row:
+        logger.warning(
+            "No parts row for meta: object_id=%s v=%s part=%s",
+            object_id,
+            object_version,
+            part_number,
+        )
+        return
+    size_bytes = int(row["size_bytes"] or 0)
+    chunk_size = int(row["chunk_size_bytes"] or 0) or (4 * 1024 * 1024)
+    num_chunks = 0 if size_bytes <= 0 else (size_bytes + chunk_size - 1) // chunk_size
+    await fs_store.set_meta(
+        object_id,
+        int(object_version),
+        int(part_number),
+        chunk_size=chunk_size,
+        num_chunks=num_chunks,
+        size_bytes=size_bytes,
+    )
+
+
 async def process_download_request(
     download_request: DownloadChainRequest,
     *,
@@ -47,15 +98,18 @@ async def process_download_request(
     fetch_fn: Callable[[str, str], Awaitable[bytes]],
     db_pool: asyncpg.Pool,
     obj_cache: RedisObjectPartsCache,
+    fs_store: FileSystemPartsStore,
 ) -> bool:
     """Process a single download request for one backend.
 
     For each part/chunk in the request:
-    1. Look up ``backend_identifier`` from the ``chunk_backend`` table.
-    2. Skip if no identifier (this backend doesn't hold the chunk).
-    3. Skip if already cached.
-    4. Call *fetch_fn(identifier, account_address)* to obtain ciphertext bytes.
-    5. Store in the Redis chunk cache.
+    1. Ensure meta.json exists on FS (write from DB if missing).
+    2. Look up ``backend_identifier`` from the ``chunk_backend`` table.
+    3. Skip if no identifier (this backend doesn't hold the chunk).
+    4. Skip if already cached on FS.
+    5. Call ``fetch_fn(identifier, account_address)`` to obtain ciphertext.
+    6. Write to FS atomically.
+    7. Publish pub/sub notification via ``obj_cache.notify_chunk``.
     """
     with tracer.start_as_current_span(
         "downloader.process_download",
@@ -92,8 +146,9 @@ async def process_download_request(
             chunk_index = int(spec.index)  # ty: ignore[unresolved-attribute]
 
             async with semaphore:
-                # Check if already cached
-                cached = await obj_cache.chunk_exists(
+                # Check if already cached on FS (may have been filled by a
+                # concurrent request / worker)
+                cached = await fs_store.chunk_exists(
                     download_request.object_id,
                     int(download_request.object_version),
                     part_number,
@@ -132,13 +187,12 @@ async def process_download_request(
                         total_bytes_downloaded += len(data)
 
                         t_cache = time.perf_counter()
-                        await obj_cache.set_download_chunk(
+                        await fs_store.set_chunk(
                             download_request.object_id,
                             int(download_request.object_version),
                             part_number,
                             chunk_index,
                             data,
-                            ttl=config.download_cache_ttl_seconds,
                         )
                         # Notify waiting readers via pub/sub
                         await obj_cache.notify_chunk(
@@ -197,13 +251,45 @@ async def process_download_request(
                     "num_chunks": len(part.chunks),
                 },
             ) as part_span:
-                chunk_results = await asyncio.gather(
-                    *[_fetch_chunk(part_number, spec, part_span) for spec in part.chunks]
+                # Ensure meta.json exists up-front so per-chunk existence
+                # checks work correctly as chunks land on FS.
+                existing_meta = await fs_store.get_meta(
+                    download_request.object_id,
+                    int(download_request.object_version),
+                    part_number,
                 )
+                if existing_meta is None:
+                    try:
+                        await _write_part_meta_from_db(
+                            db_pool=db_pool,
+                            fs_store=fs_store,
+                            object_id=download_request.object_id,
+                            object_version=int(download_request.object_version),
+                            part_number=part_number,
+                        )
+                    except Exception as meta_exc:
+                        logger.warning(f"[{backend_name}] Failed to write eager meta part={part_number}: {meta_exc}")
 
-                # Clear in-progress flag
+                # Batch chunks so a pathological single-part (up to ~1280
+                # chunks for a 5 GiB part at 4 MiB chunk size) doesn't create
+                # thousands of tasks parked on the semaphore. Matches the
+                # part-batching budget so the worst case per part is capped.
+                chunk_batch_size = max(1, config.downloader_semaphore)
+                chunk_results: list[bool] = []
+                for i in range(0, len(part.chunks), chunk_batch_size):
+                    batch = part.chunks[i : i + chunk_batch_size]
+                    chunk_results.extend(
+                        await asyncio.gather(*[_fetch_chunk(part_number, spec, part_span) for spec in batch])
+                    )
+
+                # Release the coalescing lock (set by build_stream_context on
+                # enqueue). Key format must match that callsite exactly.
                 with contextlib.suppress(Exception):
-                    await obj_cache.redis.delete(f"download_in_progress:{download_request.object_id}:{part_number}")
+                    lock_key = (
+                        f"download_in_progress:{download_request.object_id}"
+                        f":v:{int(download_request.object_version)}:part:{part_number}"
+                    )
+                    await obj_cache.redis.delete(lock_key)
                 return all(chunk_results)
 
         try:
@@ -278,23 +364,102 @@ async def run_downloader_loop(
 
     redis_client: async_redis.Redis = create_redis_client(config.redis_url)  # ty: ignore[invalid-assignment]
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
-    download_cache_client: async_redis.Redis = create_redis_client(config.redis_download_cache_url)  # ty: ignore[invalid-assignment]
     db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=20)
+    fs_store = create_fs_store(config)
 
     initialize_queue_client(redis_queues_client)
     initialize_cache_client(redis_client)
     initialize_metrics_collector(redis_client)
 
-    obj_cache = RedisObjectPartsCache(
-        redis_client, queues_client=redis_queues_client, download_cache_client=download_cache_client
-    )
+    obj_cache = RedisObjectPartsCache(redis_client, queues_client=redis_queues_client, fs_store=fs_store)
 
     if backend_name == "arion":
         backend_info = f" base_url={config.arion_base_url} verify_ssl={config.arion_verify_ssl}"
         logger.info(f"[{backend_name}] Starting downloader, queue={queue_name}{backend_info}")
 
+    async def _run_job(request: DownloadChainRequest) -> None:
+        ray_id = request.ray_id or "no-ray-id"
+        ray_id_context.set(ray_id)
+        worker_logger = get_logger_with_ray_id(__name__, ray_id)
+
+        with tracer.start_as_current_span(
+            "downloader.job",
+            attributes={
+                "object_id": request.object_id,
+                "hippius.ray_id": ray_id,
+                "backend": backend_name,
+                "hippius.account.main": request.address,
+            },
+        ) as job_span:
+            try:
+                ok = await process_download_request(
+                    request,
+                    backend_name=backend_name,
+                    fetch_fn=fetch_fn,
+                    db_pool=db_pool,
+                    obj_cache=obj_cache,
+                    fs_store=fs_store,
+                )
+                if ok:
+                    worker_logger.info(f"[{backend_name}] Done: {request.bucket_name}/{request.object_key}")
+                else:
+                    job_span.set_status(trace.StatusCode.ERROR, "partial failure")
+                    worker_logger.error(f"[{backend_name}] Failed: {request.bucket_name}/{request.object_key}")
+            except Exception as exc:
+                job_span.record_exception(exc)
+                job_span.set_status(trace.StatusCode.ERROR, str(exc))
+                worker_logger.error(f"[{backend_name}] job error: {exc}", exc_info=True)
+                raise
+
+    max_inflight = max(1, config.downloader_max_inflight)
+    inflight: set[asyncio.Task[None]] = set()
+    # Flags set by _reap when an inflight task died on an infra error. The
+    # main loop picks these up and rebuilds the affected client before
+    # dequeuing the next request, so subsequent tasks don't keep failing
+    # against a stale connection.
+    needs_redis_reconnect = False
+    needs_db_reconnect = False
+
+    def _reap(tasks: set[asyncio.Task[None]]) -> None:
+        nonlocal needs_redis_reconnect, needs_db_reconnect
+        for t in tasks:
+            inflight.discard(t)
+            err = t.exception()
+            if err is None or isinstance(err, asyncio.CancelledError):
+                continue
+            logger.error(f"[{backend_name}] inflight task error: {err}")
+            if isinstance(err, (BusyLoadingError, RedisConnectionError, RedisTimeoutError)):
+                needs_redis_reconnect = True
+            elif isinstance(err, asyncpg.InterfaceError):
+                needs_db_reconnect = True
+
+    logger.info(f"[{backend_name}] Inflight pool size: {max_inflight}")
+
     try:
         while True:
+            _reap({t for t in inflight if t.done()})
+
+            if needs_redis_reconnect:
+                logger.warning(f"[{backend_name}] Rebuilding cache redis client after task error")
+                with contextlib.suppress(Exception):
+                    await redis_client.aclose()  # ty: ignore[unresolved-attribute]
+                redis_client = create_redis_client(config.redis_url)  # ty: ignore[invalid-assignment]
+                initialize_cache_client(redis_client)
+                obj_cache = RedisObjectPartsCache(redis_client, queues_client=redis_queues_client, fs_store=fs_store)
+                needs_redis_reconnect = False
+
+            if needs_db_reconnect:
+                logger.warning(f"[{backend_name}] Recreating DB pool after task error")
+                with contextlib.suppress(Exception):
+                    await db_pool.close()
+                db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=20)
+                needs_db_reconnect = False
+
+            if len(inflight) >= max_inflight:
+                done_wait, _ = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+                _reap(done_wait)
+                continue
+
             try:
                 request = await dequeue_download_request(queue_name)
             except (BusyLoadingError, RedisConnectionError, RedisTimeoutError) as exc:
@@ -310,68 +475,34 @@ async def run_downloader_loop(
                 continue
 
             if request is None:
-                await asyncio.sleep(config.downloader_sleep_loop)
+                # Nothing to pick up. If we have inflight work, wait on it
+                # instead of sleeping — keeps the loop responsive to task
+                # completions without an idle poll.
+                if inflight:
+                    done_wait, _ = await asyncio.wait(
+                        inflight, return_when=asyncio.FIRST_COMPLETED, timeout=config.downloader_sleep_loop
+                    )
+                    _reap(done_wait)
+                else:
+                    await asyncio.sleep(config.downloader_sleep_loop)
                 continue
 
             if request.expire_at and time.time() > request.expire_at:
                 logger.warning(f"[{backend_name}] Discarding expired request {request.name}")
                 continue
 
-            ray_id = request.ray_id or "no-ray-id"
-            ray_id_context.set(ray_id)
-            worker_logger = get_logger_with_ray_id(__name__, ray_id)
-
-            with tracer.start_as_current_span(
-                "downloader.job",
-                attributes={
-                    "object_id": request.object_id,
-                    "hippius.ray_id": ray_id,
-                    "backend": backend_name,
-                    "hippius.account.main": request.address,
-                },
-            ) as job_span:
-                try:
-                    ok = await process_download_request(
-                        request,
-                        backend_name=backend_name,
-                        fetch_fn=fetch_fn,
-                        db_pool=db_pool,
-                        obj_cache=obj_cache,
-                    )
-                    if ok:
-                        worker_logger.info(f"[{backend_name}] Done: {request.bucket_name}/{request.object_key}")
-                    else:
-                        job_span.set_status(trace.StatusCode.ERROR, "partial failure")
-                        worker_logger.error(f"[{backend_name}] Failed: {request.bucket_name}/{request.object_key}")
-                except (RedisConnectionError, RedisTimeoutError, BusyLoadingError) as exc:
-                    job_span.record_exception(exc)
-                    job_span.set_status(trace.StatusCode.ERROR, str(exc))
-                    logger.warning(f"[{backend_name}] Redis issue during processing: {exc}. Reconnecting…")
-                    with contextlib.suppress(Exception):
-                        await redis_client.aclose()  # ty: ignore[unresolved-attribute]
-                    with contextlib.suppress(Exception):
-                        await download_cache_client.aclose()  # ty: ignore[unresolved-attribute]
-                    redis_client = create_redis_client(config.redis_url)  # ty: ignore[invalid-assignment]
-                    download_cache_client = create_redis_client(config.redis_download_cache_url)  # ty: ignore[invalid-assignment]
-                    initialize_cache_client(redis_client)
-                    obj_cache = RedisObjectPartsCache(
-                        redis_client, queues_client=redis_queues_client, download_cache_client=download_cache_client
-                    )
-                except asyncpg.InterfaceError as exc:
-                    job_span.record_exception(exc)
-                    job_span.set_status(trace.StatusCode.ERROR, str(exc))
-                    logger.warning(f"[{backend_name}] DB pool issue, recreating…")
-                    with contextlib.suppress(Exception):
-                        await db_pool.close()
-                    db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=20)
+            inflight.add(asyncio.create_task(_run_job(request)))
 
     except KeyboardInterrupt:
         logger.info(f"[{backend_name}] Downloader stopping…")
+        for t in inflight:
+            t.cancel()
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
     except Exception as exc:
         logger.error(f"[{backend_name}] Fatal loop error: {exc}", exc_info=True)
         raise
     finally:
         await redis_client.aclose()  # ty: ignore[unresolved-attribute]
         await redis_queues_client.aclose()  # ty: ignore[unresolved-attribute]
-        await download_cache_client.aclose()  # ty: ignore[unresolved-attribute]
         await db_pool.close()

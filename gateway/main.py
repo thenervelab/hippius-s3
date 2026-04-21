@@ -17,6 +17,7 @@ from gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
 from gateway.middlewares.input_validation import input_validation_middleware
 from gateway.middlewares.metrics import metrics_middleware
 from gateway.middlewares.ray_id import ray_id_middleware
+from gateway.middlewares.read_only import read_only_middleware
 from gateway.middlewares.tracing import tracing_middleware
 from gateway.middlewares.trailing_slash import trailing_slash_normalizer
 from gateway.routers.acl import router as acl_router
@@ -190,6 +191,8 @@ def factory() -> FastAPI:
     app.middleware("http")(trailing_slash_normalizer)
     app.middleware("http")(auth_router_middleware)
     app.middleware("http")(input_validation_middleware)
+    if config.read_only_mode:
+        app.middleware("http")(read_only_middleware)
     # Outermost: CORS must wrap everything so error responses get CORS headers
     app.middleware("http")(cors_middleware)
 

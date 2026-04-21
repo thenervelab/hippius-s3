@@ -35,9 +35,11 @@ data:
             "name": "namespace",
             "options": [
               { "selected": true, "text": "hippius-s3-prod", "value": "hippius-s3-prod" },
-              { "selected": false, "text": "hippius-s3-staging", "value": "hippius-s3-staging" }
+              { "selected": false, "text": "hippius-s3-staging", "value": "hippius-s3-staging" },
+              { "selected": false, "text": "cache-us-0", "value": "hippius-s3-cache-us-0" },
+              { "selected": false, "text": "cache-eu-0", "value": "hippius-s3-cache-eu-0" }
             ],
-            "query": "hippius-s3-prod,hippius-s3-staging",
+            "query": "hippius-s3-prod,hippius-s3-staging,hippius-s3-cache-us-0,hippius-s3-cache-eu-0",
             "type": "custom"
           }
         ]
@@ -843,5 +845,179 @@ data:
       "timezone": "browser",
       "title": "Hippius S3 — System Load",
       "uid": "hippius-s3-system-load",
+      "version": 1
+    }
+  cache-overview.json: |
+    {
+      "annotations": { "list": [] },
+      "editable": true,
+      "graphTooltip": 1,
+      "id": null,
+      "links": [],
+      "templating": {
+        "list": [
+          {
+            "current": { "selected": true, "text": "hippius-s3-cache-us-0", "value": "hippius-s3-cache-us-0" },
+            "hide": 0,
+            "includeAll": true,
+            "label": "Cache Region",
+            "multi": true,
+            "name": "cache_region",
+            "options": [
+              { "selected": false, "text": "All", "value": "$__all" },
+              { "selected": true, "text": "cache-us-0", "value": "hippius-s3-cache-us-0" },
+              { "selected": false, "text": "cache-eu-0", "value": "hippius-s3-cache-eu-0" }
+            ],
+            "query": "hippius-s3-cache-us-0,hippius-s3-cache-eu-0",
+            "type": "custom"
+          }
+        ]
+      },
+      "panels": [
+        {
+          "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+          "id": 1,
+          "title": "Cache Traffic by Region",
+          "type": "row"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": { "color": { "mode": "palette-classic" }, "unit": "reqps" }
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+          "id": 2,
+          "targets": [
+            {
+              "expr": "sum by (service_namespace) (rate(http_requests_total{service_namespace=~\"$cache_region\", handler=~\"gateway.*\"}[5m]))",
+              "legendFormat": "{{service_namespace}}"
+            }
+          ],
+          "title": "Gateway req/s by Region",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": { "color": { "mode": "palette-classic" }, "unit": "reqps" }
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+          "id": 3,
+          "targets": [
+            {
+              "expr": "sum by (service_namespace) (rate(http_requests_total{service_namespace=~\"$cache_region\", handler!~\"gateway.*\"}[5m]))",
+              "legendFormat": "{{service_namespace}}"
+            }
+          ],
+          "title": "API req/s by Region",
+          "type": "timeseries"
+        },
+        {
+          "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+          "id": 4,
+          "title": "Cache Performance",
+          "type": "row"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": { "color": { "mode": "palette-classic" }, "unit": "percentunit", "min": 0, "max": 1 }
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 10 },
+          "id": 5,
+          "targets": [
+            {
+              "expr": "sum by (service_namespace) (rate(cache_hits_total{service_namespace=~\"$cache_region\"}[5m])) / (sum by (service_namespace) (rate(cache_hits_total{service_namespace=~\"$cache_region\"}[5m])) + sum by (service_namespace) (rate(cache_misses_total{service_namespace=~\"$cache_region\"}[5m])))",
+              "legendFormat": "{{service_namespace}}"
+            }
+          ],
+          "title": "Cache Hit Ratio by Region",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": { "color": { "mode": "palette-classic" }, "unit": "s" }
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 10 },
+          "id": 6,
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum by (le, service_namespace) (rate(downloader_duration_seconds_bucket{service_namespace=~\"$cache_region\"}[5m])))",
+              "legendFormat": "p95 {{service_namespace}}"
+            },
+            {
+              "expr": "histogram_quantile(0.50, sum by (le, service_namespace) (rate(downloader_duration_seconds_bucket{service_namespace=~\"$cache_region\"}[5m])))",
+              "legendFormat": "p50 {{service_namespace}}"
+            }
+          ],
+          "title": "Download Latency by Region",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": { "color": { "mode": "palette-classic" }, "unit": "bytes" }
+          },
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 10 },
+          "id": 7,
+          "targets": [
+            {
+              "expr": "max by (service_namespace) (redis_memory_used_bytes{service_namespace=~\"$cache_region\"})",
+              "legendFormat": "{{service_namespace}}"
+            }
+          ],
+          "title": "Redis Memory by Region",
+          "type": "timeseries"
+        },
+        {
+          "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
+          "id": 8,
+          "title": "Errors & Health",
+          "type": "row"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": { "color": { "mode": "palette-classic" }, "unit": "reqps" }
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 19 },
+          "id": 9,
+          "targets": [
+            {
+              "expr": "sum by (service_namespace, status_code) (rate(http_requests_total{service_namespace=~\"$cache_region\", status_code=~\"[45]..\"}[5m]))",
+              "legendFormat": "{{service_namespace}} {{status_code}}"
+            }
+          ],
+          "title": "Error Rates by Region",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": { "color": { "mode": "palette-classic" } }
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 19 },
+          "id": 10,
+          "targets": [
+            {
+              "expr": "kube_deployment_status_replicas_ready{namespace=~\"hippius-s3-cache-.*\"}",
+              "legendFormat": "{{namespace}} / {{deployment}}"
+            }
+          ],
+          "title": "Ready Replicas by Region",
+          "type": "timeseries"
+        }
+      ],
+      "schemaVersion": 39,
+      "tags": ["hippius", "s3", "cache", "cdn"],
+      "time": { "from": "now-1h", "to": "now" },
+      "timepicker": {},
+      "timezone": "browser",
+      "title": "Hippius S3 — Cache Overview",
+      "uid": "hippius-s3-cache-overview",
       "version": 1
     }

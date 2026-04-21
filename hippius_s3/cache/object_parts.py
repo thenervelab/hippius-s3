@@ -1,12 +1,23 @@
+"""Parts cache facade — FS-backed chunks with Redis pub/sub notifications.
+
+Previously backed by Redis (hence the class name `RedisObjectPartsCache`).
+After the FS-cache migration, chunk and meta I/O is delegated to
+`FileSystemPartsStore` and the only Redis use is the pub/sub channel
+for chunk-ready notifications (isolated in `ChunkNotifier`).
+
+The class name is kept for now to minimize call-site churn; a follow-up PR
+may rename to `PartsCache`.
+"""
+
 from __future__ import annotations
 
-import asyncio
-import json as _json
-from contextlib import asynccontextmanager
 from typing import Any
-from typing import AsyncIterator
 from typing import Optional
 from typing import Protocol
+
+from .fs_store import FileSystemPartsStore
+from .notifier import ChunkNotifier
+from .notifier import build_chunk_key
 
 
 # Lazy monitoring import: avoid pulling opentelemetry at import-time
@@ -28,14 +39,8 @@ def _get_metrics_collector() -> _MetricsLike:
         return _Noop()
 
 
-# Lazy-config: avoid importing application config at module import time.
-# Use a conservative default TTL and resolve real config only when needed inside methods.
-DEFAULT_OBJ_PART_TTL_SECONDS = 1800
-
-
 def _get_config_value(name: str, default: int) -> int:
     try:
-        # Local import to avoid triggering httpx and other deps at module import time
         from hippius_s3.config import get_config
 
         cfg = get_config()
@@ -43,271 +48,78 @@ def _get_config_value(name: str, default: int) -> int:
             return cfg.object_chunk_size_bytes
         if name == "cache_ttl_seconds":
             return cfg.cache_ttl_seconds
-        if name == "download_cache_ttl_seconds":
-            return cfg.download_cache_ttl_seconds
-        # Unknown config keys must not be accessed dynamically.
         return default
     except Exception:
         return default
 
 
-class ObjectPartsCache(Protocol):
-    def build_key(self, object_id: str, object_version: int, part_number: int) -> str: ...
-
-    # Back-compat whole-part API
-    async def get(self, object_id: str, object_version: int, part_number: int) -> Optional[bytes]: ...
-
-    async def set(
-        self,
-        object_id: str,
-        object_version: int,
-        part_number: int,
-        data: bytes,
-        *,
-        ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
-    ) -> None: ...
-
-    async def exists(self, object_id: str, object_version: int, part_number: int) -> bool: ...
-
-    async def strlen(self, object_id: str, object_version: int, part_number: int) -> int: ...
-
-    async def expire(
-        self, object_id: str, object_version: int, part_number: int, *, ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS
-    ) -> None: ...
-
-    # New chunked API
-    def build_chunk_key(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> str: ...
-
-    async def get_chunk(
-        self, object_id: str, object_version: int, part_number: int, chunk_index: int
-    ) -> Optional[bytes]: ...
-
-    async def set_chunk(
-        self,
-        object_id: str,
-        object_version: int,
-        part_number: int,
-        chunk_index: int,
-        data: bytes,
-        *,
-        ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
-    ) -> None: ...
-
-    async def chunk_exists(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> bool: ...
-
-    async def chunks_exist_batch(
-        self, object_id: str, object_version: int, checks: list[tuple[int, int]]
-    ) -> list[bool]: ...
-
-    async def set_chunks(
-        self,
-        object_id: str,
-        object_version: int,
-        part_number: int,
-        chunks: list[bytes],
-        *,
-        ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
-        start_index: int = 0,
-    ) -> None: ...
-
-    # Pub/sub notification API
-    async def wait_for_chunk(
-        self, object_id: str, object_version: int, part_number: int, chunk_index: int
-    ) -> bytes: ...
-
-    async def notify_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> None: ...
-
-    # Download cache API
-    async def set_download_chunk(
-        self, object_id: str, object_version: int, part_number: int, chunk_index: int, data: bytes, *, ttl: int = 300
-    ) -> None: ...
-
-    # Metadata API
-    def build_meta_key(self, object_id: str, object_version: int, part_number: int) -> str: ...
-
-    async def set_meta(
-        self,
-        object_id: str,
-        object_version: int,
-        part_number: int,
-        *,
-        chunk_size: int,
-        num_chunks: int,
-        size_bytes: int,
-        ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
-    ) -> None: ...
-
-    async def get_meta(self, object_id: str, object_version: int, part_number: int) -> Optional[dict]: ...
+DEFAULT_OBJ_PART_TTL_SECONDS = 1800
 
 
 class RedisObjectPartsCache:
+    """FS-backed parts cache with Redis pub/sub notifications.
+
+    Composes `FileSystemPartsStore` for all chunk/meta I/O and `ChunkNotifier`
+    for the wait/notify pub/sub pattern that coordinates streamers with
+    download workers.
+
+    The `redis_client` param is retained for backward compatibility (some
+    callers reach `.redis` for in-progress flag cleanup); it's only used
+    for those legacy operations and may be removed once those are cleaned up.
+    """
+
     def __init__(
-        self, redis_client: Any, queues_client: Any = None, download_cache_client: Any = None, fs_store: Any = None
+        self,
+        redis_client: Any,
+        queues_client: Any = None,
+        fs_store: Optional[FileSystemPartsStore] = None,
     ) -> None:
+        # `redis_client` is retained because a few callers access `.redis` for
+        # the download-coalescing lock (SET/DELETE on `download_in_progress:…`
+        # keys). It is not used for chunk or meta storage.
         self.redis = redis_client
-        self._queues_client = queues_client or redis_client
-        self._download_cache = download_cache_client
-        self._fs_store = fs_store
+        # `queues_client` is the pub/sub transport. Fall back to redis_client
+        # only for tests that pass a single mock.
+        self._notifier = ChunkNotifier(queues_client or redis_client)
+        self._fs = fs_store
+
+    # ---- key builders (used by some callers for pub/sub / diagnostics) ----
 
     def build_key(self, object_id: str, object_version: int, part_number: int) -> str:
         return f"obj:{object_id}:v:{int(object_version)}:part:{int(part_number)}"
 
     def build_chunk_key(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> str:
-        return f"obj:{object_id}:v:{int(object_version)}:part:{int(part_number)}:chunk:{int(chunk_index)}"
+        return build_chunk_key(object_id, object_version, part_number, chunk_index)
 
     def build_meta_key(self, object_id: str, object_version: int, part_number: int) -> str:
         return f"obj:{object_id}:v:{int(object_version)}:part:{int(part_number)}:meta"
 
-    async def get(self, object_id: str, object_version: int, part_number: int) -> Optional[bytes]:
-        # Assemble from chunked entries using meta
-        try:
-            meta_raw = await self.redis.get(self.build_meta_key(object_id, object_version, part_number))
-            if not meta_raw:
-                _get_metrics_collector().record_cache_operation(hit=False, operation="get")
-                return None
-            meta = _json.loads(meta_raw)
-            num_chunks = int(meta.get("num_chunks", 0))
-            if num_chunks <= 0:
-                _get_metrics_collector().record_cache_operation(hit=False, operation="get")
-                return None
-            chunks: list[bytes] = []
-            for i in range(num_chunks):
-                c = await self.redis.get(self.build_chunk_key(object_id, object_version, part_number, i))
-                if not isinstance(c, bytes):
-                    _get_metrics_collector().record_cache_operation(hit=False, operation="get")
-                    return None
-                chunks.append(c)
-            _get_metrics_collector().record_cache_operation(hit=True, operation="get")
-            return b"".join(chunks)
-        except Exception:
-            _get_metrics_collector().record_cache_operation(hit=False, operation="get")
-            return None
+    # ---- FS store accessor ----
 
-    async def set(
-        self,
-        object_id: str,
-        object_version: int,
-        part_number: int,
-        data: bytes,
-        *,
-        ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
-    ) -> None:
-        # Split into fixed-size chunks and store meta first (for cheap readiness checks), then chunk keys
-        chunk_size = _get_config_value("object_chunk_size_bytes", 4 * 1024 * 1024)
-        total = len(data) if isinstance(data, (bytes, bytearray)) else 0
-        if total == 0:
-            # Still write empty meta with zero chunks for consistency
-            await self.set_meta(
-                object_id,
-                object_version,
-                part_number,
-                chunk_size=chunk_size,
-                num_chunks=0,
-                size_bytes=0,
-                ttl=ttl,
-            )
-            return
-        num_chunks = (total + chunk_size - 1) // chunk_size
-        # Write meta first to signal readiness before chunks are fully written
-        await self.set_meta(
-            object_id,
-            object_version,
-            part_number,
-            chunk_size=chunk_size,
-            num_chunks=num_chunks,
-            size_bytes=total,
-            ttl=ttl,
-        )
-        # Then write chunk data — pipeline all setex calls into a single round-trip
-        ttl_val = int(ttl if ttl is not None else _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS))
-        async with self.redis.pipeline(transaction=False) as pipe:
-            for i in range(num_chunks):
-                start = i * chunk_size
-                end = min(start + chunk_size, total)
-                key = self.build_chunk_key(object_id, object_version, part_number, i)
-                pipe.setex(key, ttl_val, data[start:end])
-            await pipe.execute()
+    @property
+    def fs(self) -> FileSystemPartsStore:
+        """Return the backing FS store, creating a default one from config on demand.
 
-    async def exists(
-        self,
-        object_id: str,
-        object_version: int,
-        part_number: int,
-    ) -> bool:
-        return bool(
-            await self.redis.exists(
-                self.build_meta_key(object_id, object_version, part_number),
-            ),
-        )
+        Many legacy call sites instantiate `RedisObjectPartsCache(redis_client)`
+        without threading `fs_store` through. Auto-wiring from `create_fs_store`
+        lets those paths keep working while the caller graph is cleaned up.
+        Tests that want to inject a mock still pass `fs_store=` explicitly.
+        """
+        if self._fs is None:
+            from hippius_s3.cache import create_fs_store
+            from hippius_s3.config import get_config
 
-    async def strlen(
-        self,
-        object_id: str,
-        object_version: int,
-        part_number: int,
-    ) -> int:
-        try:
-            meta_raw = await self.redis.get(
-                self.build_meta_key(
-                    object_id,
-                    object_version,
-                    part_number,
-                )
-            )
-            if not meta_raw:
-                return 0
-            meta = _json.loads(meta_raw)
-            return int(meta.get("size_bytes", 0))
-        except Exception:
-            return 0
+            self._fs = create_fs_store(get_config())
+        return self._fs
 
-    async def expire(
-        self,
-        object_id: str,
-        object_version: int,
-        part_number: int,
-        *,
-        ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
-    ) -> None:
-        """Set TTL on meta and all chunk keys for this part to prevent orphaned chunk bytes."""
-        ttl_val = int(ttl if ttl is not None else _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS))
-        # Build deterministic key list from meta instead of scanning the keyspace
-        keys: list[Any] = [self.build_meta_key(object_id, object_version, part_number)]
-        meta = await self.get_meta(object_id, object_version, part_number)
-        if meta:
-            num_chunks = int(meta.get("num_chunks", 0))
-            keys.extend(self.build_chunk_key(object_id, object_version, part_number, i) for i in range(num_chunks))
-        async with self.redis.pipeline(transaction=False) as pipe:
-            for key in keys:
-                pipe.expire(key, ttl_val)
-            await pipe.execute()
+    # ---- chunked API (FS-backed) ----
 
-    # Note: base part policy is 1-based; callers should use get/set directly with part_number=1
-
-    # Chunked API
     async def get_chunk(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int
     ) -> Optional[bytes]:
-        # Filesystem first — stat is cheap and avoids Redis round-trips entirely
-        if self._fs_store is not None:
-            result = await self._fs_store.get_chunk(object_id, object_version, part_number, chunk_index)
-            if result is not None:
-                _get_metrics_collector().record_cache_operation(hit=True, operation="get_chunk_fs")
-                return result
-        key = self.build_chunk_key(object_id, object_version, part_number, chunk_index)
-        result = await self.redis.get(key)
-        if isinstance(result, bytes):
-            _get_metrics_collector().record_cache_operation(hit=True, operation="get_chunk")
-            return result
-        # Fallback to download cache — use GETEX to refresh TTL on read (keep-alive for active streams)
-        if self._download_cache is not None:
-            dl_ttl = _get_config_value("download_cache_ttl_seconds", 300)
-            result = await self._download_cache.getex(key, ex=dl_ttl)
-            if isinstance(result, bytes):
-                _get_metrics_collector().record_cache_operation(hit=True, operation="get_chunk_download")
-                return result
-        _get_metrics_collector().record_cache_operation(hit=False, operation="get_chunk")
-        return None
+        data = await self.fs.get_chunk(object_id, int(object_version), int(part_number), int(chunk_index))
+        _get_metrics_collector().record_cache_operation(hit=data is not None, operation="get_chunk")
+        return data
 
     async def set_chunk(
         self,
@@ -319,35 +131,19 @@ class RedisObjectPartsCache:
         *,
         ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
     ) -> None:
-        await self.redis.setex(
-            self.build_chunk_key(
-                object_id,
-                object_version,
-                part_number,
-                chunk_index,
-            ),
-            int(
-                ttl if ttl is not None else _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS),
-            ),
-            data,
-        )
+        # ttl kept in signature for backward compat — ignored (no TTL on FS).
+        del ttl
+        await self.fs.set_chunk(object_id, int(object_version), int(part_number), int(chunk_index), data)
 
-    async def chunk_exists(
-        self,
-        object_id: str,
-        object_version: int,
-        part_number: int,
-        chunk_index: int,
-    ) -> bool:
-        key = self.build_chunk_key(object_id, object_version, part_number, chunk_index)
-        exists = bool(await self.redis.exists(key))
-        if not exists and self._download_cache is not None:
-            exists = bool(await self._download_cache.exists(key))
-        _get_metrics_collector().record_cache_operation(
-            hit=exists,
-            operation="chunk_exists",
-        )
+    async def chunk_exists(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> bool:
+        exists = await self.fs.chunk_exists(object_id, int(object_version), int(part_number), int(chunk_index))
+        _get_metrics_collector().record_cache_operation(hit=exists, operation="chunk_exists")
         return exists
+
+    async def chunks_exist_batch(
+        self, object_id: str, object_version: int, checks: list[tuple[int, int]]
+    ) -> list[bool]:
+        return await self.fs.chunks_exist_batch(object_id, int(object_version), checks)
 
     async def set_chunks(
         self,
@@ -359,139 +155,11 @@ class RedisObjectPartsCache:
         ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
         start_index: int = 0,
     ) -> None:
-        ttl_val = int(ttl if ttl is not None else _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS))
-        async with self.redis.pipeline(transaction=False) as pipe:
-            for i, data in enumerate(chunks, start=start_index):
-                key = self.build_chunk_key(object_id, int(object_version), int(part_number), int(i))
-                pipe.setex(key, ttl_val, data)
-            await pipe.execute()
+        del ttl
+        for i, data in enumerate(chunks, start=start_index):
+            await self.fs.set_chunk(object_id, int(object_version), int(part_number), int(i), data)
 
-    @asynccontextmanager
-    async def _subscribe(self, channel: str) -> AsyncIterator[Any]:
-        pubsub = self._queues_client.pubsub()
-        await pubsub.subscribe(channel)
-        try:
-            yield pubsub
-        finally:
-            await pubsub.unsubscribe(channel)
-            await pubsub.aclose()
-
-    async def chunks_exist_batch(
-        self,
-        object_id: str,
-        object_version: int,
-        checks: list[tuple[int, int]],
-    ) -> list[bool]:
-        """Check existence of multiple chunks in a single Redis pipeline round trip."""
-        if not checks:
-            return []
-        keys = [self.build_chunk_key(object_id, int(object_version), int(pn), int(ci)) for pn, ci in checks]
-        async with self.redis.pipeline(transaction=False) as pipe:
-            for key in keys:
-                pipe.exists(key)
-            results = await pipe.execute()
-        main_exists = [bool(r) for r in results]
-        # Check download cache for any misses
-        if self._download_cache is not None:
-            missing_indices = [i for i, exists in enumerate(main_exists) if not exists]
-            if missing_indices:
-                async with self._download_cache.pipeline(transaction=False) as pipe:
-                    for i in missing_indices:
-                        pipe.exists(keys[i])
-                    dl_results = await pipe.execute()
-                for idx, dl_exists in zip(missing_indices, dl_results, strict=True):
-                    if bool(dl_exists):
-                        main_exists[idx] = True
-        return main_exists
-
-    async def wait_for_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> bytes:
-        timeout = _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS)
-
-        # Fast path: chunk already cached — skip pubsub subscribe entirely
-        c = await self.get_chunk(object_id, int(object_version), int(part_number), int(chunk_index))
-        if c is not None:
-            return c
-
-        # Slow path: subscribe and wait for worker to populate cache
-        chunk_key = self.build_chunk_key(
-            object_id,
-            int(object_version),
-            int(part_number),
-            int(chunk_index),
-        )
-        channel = f"notify:{chunk_key}"
-
-        async with self._subscribe(channel) as pubsub:
-            # Re-check after subscribe (race safety: worker may have finished between our check and subscribe)
-            c = await self.get_chunk(
-                object_id,
-                int(object_version),
-                int(part_number),
-                int(chunk_index),
-            )
-            if c is not None:
-                return c
-
-            # Wait for notification with timeout to avoid hanging forever if the worker crashes
-            async def _listen() -> None:
-                async for msg in pubsub.listen():
-                    if msg["type"] == "message":
-                        return
-
-            await asyncio.wait_for(_listen(), timeout=timeout)
-
-        # Fetch the chunk — retry once if evicted between notification and read
-        data = await self.get_chunk(
-            object_id,
-            int(object_version),
-            int(part_number),
-            int(chunk_index),
-        )
-        if data is None:
-            import logging as _logging
-
-            _logging.getLogger(__name__).warning("Chunk transient miss after notification, retrying: %s", chunk_key)
-            await asyncio.sleep(0.1)
-            data = await self.get_chunk(
-                object_id,
-                int(object_version),
-                int(part_number),
-                int(chunk_index),
-            )
-        if data is None:
-            raise RuntimeError(f"Chunk evicted after pub/sub notification: {chunk_key}")
-        return data
-
-    async def notify_chunk(
-        self,
-        object_id: str,
-        object_version: int,
-        part_number: int,
-        chunk_index: int,
-    ) -> None:
-        chunk_key = self.build_chunk_key(
-            object_id,
-            int(object_version),
-            int(part_number),
-            int(chunk_index),
-        )
-        await self._queues_client.publish(f"notify:{chunk_key}", "1")
-
-    async def set_download_chunk(
-        self,
-        object_id: str,
-        object_version: int,
-        part_number: int,
-        chunk_index: int,
-        data: bytes,
-        *,
-        ttl: int = 300,
-    ) -> None:
-        """Write a chunk to the download cache with a short TTL."""
-        if self._download_cache is None:
-            raise RuntimeError("download_cache_client is required but not configured")
-        key = self.build_chunk_key(object_id, int(object_version), int(part_number), int(chunk_index))
-        await self._download_cache.setex(key, int(ttl), data)
+    # ---- metadata API (FS-backed) ----
 
     async def set_meta(
         self,
@@ -504,51 +172,40 @@ class RedisObjectPartsCache:
         size_bytes: int,
         ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
     ) -> None:
-        payload = {"chunk_size": int(chunk_size), "num_chunks": int(num_chunks), "size_bytes": int(size_bytes)}
-        await self.redis.setex(
-            self.build_meta_key(object_id, object_version, part_number),
-            int(ttl if ttl is not None else _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS)),
-            _json.dumps(payload),
+        del ttl
+        await self.fs.set_meta(
+            object_id,
+            int(object_version),
+            int(part_number),
+            chunk_size=int(chunk_size),
+            num_chunks=int(num_chunks),
+            size_bytes=int(size_bytes),
         )
 
     async def get_meta(self, object_id: str, object_version: int, part_number: int) -> Optional[dict]:
-        raw = await self.redis.get(self.build_meta_key(object_id, object_version, part_number))
-        if not raw:
-            return None
-        try:
-            return dict(_json.loads(raw))
-        except Exception:
-            return None
+        return await self.fs.get_meta(object_id, int(object_version), int(part_number))
 
-
-class RedisUploadPartsCache:
-    """Cache for in-flight multipart uploads keyed by upload_id."""
-
-    def __init__(self, redis_client: Any) -> None:
-        self.redis = redis_client
-
-    def build_key(self, upload_id: str, part_number: int) -> str:
-        return f"obj:{upload_id}:part:{int(part_number)}"
-
-    async def get(self, upload_id: str, part_number: int) -> Optional[bytes]:
-        result = await self.redis.get(self.build_key(upload_id, part_number))
-        return result if isinstance(result, bytes) else None
-
-    async def set(
-        self, upload_id: str, part_number: int, data: bytes, *, ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS
-    ) -> None:
-        await self.redis.setex(self.build_key(upload_id, part_number), ttl, data)
-
-    async def delete(self, upload_id: str, part_number: int) -> None:
-        await self.redis.delete(self.build_key(upload_id, part_number))
-
-
-class NullObjectPartsCache:
-    def build_key(self, object_id: str, object_version: int, part_number: int) -> str:
-        return f"obj:{object_id}:v:{int(object_version)}:part:{int(part_number)}"
+    # ---- whole-part legacy API (assembled from FS chunks) ----
 
     async def get(self, object_id: str, object_version: int, part_number: int) -> Optional[bytes]:
-        return None
+        meta = await self.fs.get_meta(object_id, int(object_version), int(part_number))
+        if not meta:
+            _get_metrics_collector().record_cache_operation(hit=False, operation="get")
+            return None
+        num_chunks = int(meta.get("num_chunks", 0))
+        if num_chunks <= 0:
+            # Empty part: return empty bytes
+            _get_metrics_collector().record_cache_operation(hit=True, operation="get")
+            return b""
+        chunks: list[bytes] = []
+        for i in range(num_chunks):
+            c = await self.fs.get_chunk(object_id, int(object_version), int(part_number), i)
+            if c is None:
+                _get_metrics_collector().record_cache_operation(hit=False, operation="get")
+                return None
+            chunks.append(c)
+        _get_metrics_collector().record_cache_operation(hit=True, operation="get")
+        return b"".join(chunks)
 
     async def set(
         self,
@@ -559,45 +216,72 @@ class NullObjectPartsCache:
         *,
         ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
     ) -> None:
-        return None
+        del ttl
+        chunk_size = _get_config_value("object_chunk_size_bytes", 4 * 1024 * 1024)
+        total = len(data) if isinstance(data, (bytes, bytearray)) else 0
+        if total == 0:
+            await self.fs.set_meta(
+                object_id,
+                int(object_version),
+                int(part_number),
+                chunk_size=chunk_size,
+                num_chunks=0,
+                size_bytes=0,
+            )
+            return
+        num_chunks = (total + chunk_size - 1) // chunk_size
+        for i in range(num_chunks):
+            start = i * chunk_size
+            end = min(start + chunk_size, total)
+            await self.fs.set_chunk(object_id, int(object_version), int(part_number), i, data[start:end])
+        # Write meta LAST so readers don't see partially-written parts.
+        await self.fs.set_meta(
+            object_id,
+            int(object_version),
+            int(part_number),
+            chunk_size=chunk_size,
+            num_chunks=num_chunks,
+            size_bytes=total,
+        )
 
     async def exists(self, object_id: str, object_version: int, part_number: int) -> bool:
-        return False
+        meta = await self.fs.get_meta(object_id, int(object_version), int(part_number))
+        return meta is not None
 
     async def strlen(self, object_id: str, object_version: int, part_number: int) -> int:
-        return 0
+        meta = await self.fs.get_meta(object_id, int(object_version), int(part_number))
+        if not meta:
+            return 0
+        return int(meta.get("size_bytes", 0))
 
     async def expire(
-        self, object_id: str, object_version: int, part_number: int, *, ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS
-    ) -> None:
-        return None
-
-    async def set_chunks(
         self,
         object_id: str,
         object_version: int,
         part_number: int,
-        chunks: list[bytes],
         *,
         ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
-        start_index: int = 0,
     ) -> None:
-        return None
+        """Refresh the 'recently used' marker for a part.
 
-    async def chunks_exist_batch(
-        self, object_id: str, object_version: int, checks: list[tuple[int, int]]
-    ) -> list[bool]:
-        return [False] * len(checks)
+        Previously extended Redis TTL; now touches FS mtime/atime so the
+        janitor's age-based GC treats the part as freshly accessed.
+        """
+        del ttl
+        await self.fs.touch_part(object_id, int(object_version), int(part_number))
+
+    # ---- pub/sub API ----
 
     async def wait_for_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> bytes:
-        raise NotImplementedError("NullObjectPartsCache does not support wait_for_chunk")
+        timeout = _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS)
+        return await self._notifier.wait_for_chunk(
+            object_id,
+            int(object_version),
+            int(part_number),
+            int(chunk_index),
+            fetch_fn=self.fs.get_chunk,
+            timeout=float(timeout),
+        )
 
     async def notify_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> None:
-        return None
-
-    async def set_download_chunk(
-        self, object_id: str, object_version: int, part_number: int, chunk_index: int, data: bytes, *, ttl: int = 300
-    ) -> None:
-        return None
-
-    # Base helpers removed; use get/set directly
+        await self._notifier.notify(object_id, int(object_version), int(part_number), int(chunk_index))

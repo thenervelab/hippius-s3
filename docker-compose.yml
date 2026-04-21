@@ -72,8 +72,6 @@ services:
         condition: service_healthy
       redis-queues:
         condition: service_healthy
-      redis-download-cache:
-        condition: service_healthy
     volumes:
       - .:/app
       # Shared object parts FS store (write-through cache)
@@ -279,32 +277,6 @@ services:
     networks:
       - hippius_net
 
-  redis-download-cache:
-    image: redis:7-alpine
-    ports:
-      - "127.0.0.1:6385:6379"
-    command:
-      [
-        "redis-server",
-        "--maxmemory",
-        "2gb",
-        "--maxmemory-policy",
-        "volatile-lru",
-        "--save",
-        "",
-        "--appendonly",
-        "no",
-      ]
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
-      interval: 5s
-      timeout: 3s
-      retries: 50
-      start_period: 30s
-    networks:
-      - hippius_net
-
   arion-uploader:
     build:
       context: .
@@ -381,8 +353,6 @@ services:
       redis:
         condition: service_healthy
       redis-queues:
-        condition: service_healthy
-      redis-download-cache:
         condition: service_healthy
     deploy:
       replicas: 1

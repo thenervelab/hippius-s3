@@ -8,7 +8,6 @@ from typing import Callable
 
 import pytest
 
-from .support.cache import clear_object_cache
 from .support.cache import wait_for_parts_cids
 from .support.compose import disable_arion_proxy
 from .support.compose import enable_arion_proxy
@@ -47,7 +46,7 @@ def test_dlq_requeue_multipart_upload(
     # Get object_id for later use (no need to wait for parts yet)
     from .support.cache import get_object_id_and_version
 
-    object_id, ov = get_object_id_and_version(bucket, key)
+    object_id, _ov = get_object_id_and_version(bucket, key)
 
     # Break Arion at the docker layer for a deterministic window
     disable_arion_proxy()
@@ -116,14 +115,12 @@ def test_dlq_requeue_multipart_upload(
         # Note: We no longer persist DLQ bytes to a separate filesystem area.
         # The uploader reads chunks from the FS store written during upload, so no dlq-fs checks are needed here.
 
-        # Clear Redis cache to simulate cache eviction
-        clear_object_cache(object_id, parts=[0, 1])
-
-        # Verify cache is actually cleared (meta) using versioned keys
-        # Cache keys are stored in main redis (port 6379), not redis-queues
-        r_cache = _redis.Redis.from_url("redis://localhost:6379/0")
-        assert not r_cache.exists(f"obj:{object_id}:v:{ov}:part:0:meta"), "Part 0 cache not cleared"
-        assert not r_cache.exists(f"obj:{object_id}:v:{ov}:part:1:meta"), "Part 1 cache not cleared"
+        # NOTE: we used to clear the Redis download cache here to simulate
+        # eviction before requeue. Post-migration, chunks live on the shared
+        # FS cache and the requeue path (`dlq_requeue` → uploader) reads
+        # chunks straight from FS. Clearing FS would leave the uploader
+        # with nothing to upload, so we leave the FS cache alone and simply
+        # unblock Arion, then requeue.
 
         # Heal Arion before requeue so uploader can complete successfully
         enable_arion_proxy()

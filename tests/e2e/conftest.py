@@ -327,7 +327,7 @@ def boto3_client(test_seed_phrase: str) -> Any:
         config=Config(
             s3={"addressing_style": "path"},
             signature_version="s3v4",
-            # E2E reads can legitimately block while the pipeline hydrates from the backend.
+            # E2E reads can legitimately block while the pipeline fetches from the backend.
             # 30s allows multi-chunk objects to be re-downloaded on slower CI runners.
             connect_timeout=5,
             read_timeout=30,
