@@ -64,7 +64,7 @@ async def _write_part_meta_from_db(
     """
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT plain_size, chunk_size_bytes FROM parts WHERE object_id = $1 "
+            "SELECT size_bytes, chunk_size_bytes FROM parts WHERE object_id = $1 "
             "AND object_version = $2 AND part_number = $3",
             object_id,
             int(object_version),
@@ -78,16 +78,16 @@ async def _write_part_meta_from_db(
             part_number,
         )
         return
-    plain_size = int(row["plain_size"] or 0)
+    size_bytes = int(row["size_bytes"] or 0)
     chunk_size = int(row["chunk_size_bytes"] or 0) or (4 * 1024 * 1024)
-    num_chunks = 0 if plain_size <= 0 else (plain_size + chunk_size - 1) // chunk_size
+    num_chunks = 0 if size_bytes <= 0 else (size_bytes + chunk_size - 1) // chunk_size
     await fs_store.set_meta(
         object_id,
         int(object_version),
         int(part_number),
         chunk_size=chunk_size,
         num_chunks=num_chunks,
-        size_bytes=plain_size,
+        size_bytes=size_bytes,
     )
 
 

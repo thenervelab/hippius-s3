@@ -58,11 +58,11 @@ def _make_mock_config(semaphore: int = 4, retries: int = 1):
 
 
 def _make_mock_db_pool(
-    identifier: str | None = "arion-id-123", *, plain_size: int = 4096, chunk_size: int = 4 * 1024 * 1024
+    identifier: str | None = "arion-id-123", *, size_bytes: int = 4096, chunk_size: int = 4 * 1024 * 1024
 ):
     """Create a mock DB pool whose queries return:
     - `get_chunk_backend_identifier`: a backend_identifier row
-    - `SELECT plain_size, chunk_size_bytes FROM parts ...`: the part's meta row
+    - `SELECT size_bytes, chunk_size_bytes FROM parts ...`: the part's meta row
     """
     pool = MagicMock()
     conn = AsyncMock()
@@ -70,8 +70,8 @@ def _make_mock_db_pool(
     async def _fetchrow(sql: str, *args):
         if "backend_identifier" in sql or "chunk_backend" in sql:
             return {"backend_identifier": identifier}
-        if "plain_size" in sql:
-            return {"plain_size": plain_size, "chunk_size_bytes": chunk_size}
+        if "size_bytes" in sql:
+            return {"size_bytes": size_bytes, "chunk_size_bytes": chunk_size}
         return None
 
     conn.fetchrow = AsyncMock(side_effect=_fetchrow)

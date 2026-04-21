@@ -116,14 +116,16 @@ def test_dlq_requeue_multipart_upload(
         # Note: We no longer persist DLQ bytes to a separate filesystem area.
         # The uploader reads chunks from the FS store written during upload, so no dlq-fs checks are needed here.
 
-        # Clear Redis cache to simulate cache eviction
+        # Clear the FS cache to simulate eviction
         clear_object_cache(object_id, parts=[0, 1])
 
-        # Verify cache is actually cleared (meta) using versioned keys
-        # Cache keys are stored in main redis (port 6379), not redis-queues
-        r_cache = _redis.Redis.from_url("redis://localhost:6379/0")
-        assert not r_cache.exists(f"obj:{object_id}:v:{ov}:part:0:meta"), "Part 0 cache not cleared"
-        assert not r_cache.exists(f"obj:{object_id}:v:{ov}:part:1:meta"), "Part 1 cache not cleared"
+        # Verify the part directories are really gone on every known mount.
+        from pathlib import Path as _Path
+
+        for pn in (0, 1):
+            for cache_dir in ("/var/lib/hippius/local_object_cache", "/var/lib/hippius/object_cache"):
+                part_dir = _Path(cache_dir) / object_id / f"v{ov}" / f"part_{pn}"
+                assert not part_dir.exists(), f"Part {pn} FS cache not cleared at {part_dir}"
 
         # Heal Arion before requeue so uploader can complete successfully
         enable_arion_proxy()

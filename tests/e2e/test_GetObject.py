@@ -5,8 +5,6 @@ import time
 from typing import Any
 from typing import Callable
 
-import redis
-
 from .conftest import assert_hippius_source
 from .conftest import is_real_aws
 from .support.cache import clear_object_cache
@@ -121,14 +119,10 @@ def test_get_object_eventual_consistency(
     object_id, _ = get_object_id_and_version(bucket_name, key)
     object_id, object_version = get_object_id_and_version(bucket_name, key)
 
-    # Verify Redis has cached part chunk meta
-    redis_client = redis.Redis.from_url("redis://localhost:6379/0")
-    # Use versioned cache keys (fetch current_object_version)
-    # object_version already resolved above
-    # Count meta keys via cache helper (no raw key construction)
-    from hippius_s3.cache import RedisObjectPartsCache
+    # Verify the FS cache holds meta.json for at least 2 parts (upload path
+    # writes chunks + meta atomically; this is what the reader hits on a hit).
+    from pathlib import Path
 
-    roc = RedisObjectPartsCache(redis_client)
     import psycopg  # type: ignore[import-untyped]
 
     with psycopg.connect("postgresql://postgres:postgres@localhost:5432/hippius") as conn, conn.cursor() as cur:
@@ -144,10 +138,12 @@ def test_get_object_eventual_consistency(
         part_numbers = [int(row[0]) for row in cur.fetchall()]
     present = 0
     for pn in part_numbers:
-        meta_key = roc.build_meta_key(object_id, object_version, pn)
-        if redis_client.exists(meta_key):
-            present += 1
-    assert present >= 2, f"Expected at least 2 cached parts, found {present}"
+        for cache_dir in ("/var/lib/hippius/local_object_cache", "/var/lib/hippius/object_cache"):
+            meta = Path(cache_dir) / object_id / f"v{object_version}" / f"part_{pn}" / "meta.json"
+            if meta.exists():
+                present += 1
+                break
+    assert present >= 2, f"Expected at least 2 cached parts on FS, found {present}"
 
     # Step 4: Simulate eventual consistency issue - force all CIDs to 'pending'
     # This simulates the state where upload succeeded but background processing hasn't completed
