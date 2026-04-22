@@ -24,6 +24,7 @@ from fastapi import Path as FPath
 from fastapi import Query
 from fastapi import Request
 from fastapi import status
+from fastapi.responses import JSONResponse
 from fastapi.responses import Response
 from pydantic import BaseModel
 from pydantic import Field
@@ -164,6 +165,7 @@ async def _verify_access_key_owned_by_account(access_key_id: str, account_id: st
 @router.get(
     "/{access_key_id}/scope",
     response_model=ScopeResponse,
+    response_class=JSONResponse,
     responses={
         404: {"model": ErrorDetail, "description": "No scope set for this access key."},
         403: {"model": ErrorDetail, "description": "Scope exists but account_id does not match."},
@@ -217,6 +219,7 @@ async def get_scope(
 @router.put(
     "/{access_key_id}/scope",
     response_model=ScopeResponse,
+    response_class=JSONResponse,
     responses={
         400: {"model": ErrorDetail, "description": "Invalid body or target access key is not a sub-token."},
         403: {"model": ErrorDetail, "description": "Target access key or a bucket is not owned by account_id."},
