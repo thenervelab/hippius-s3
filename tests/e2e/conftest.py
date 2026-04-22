@@ -354,6 +354,37 @@ def boto3_access_key_client(test_access_key: str, test_access_key_secret: str) -
 
 
 @pytest.fixture
+def test_master_access_key() -> str:
+    """Hardcoded master access key for sub-token e2e tests.
+
+    Intentionally NOT reading from HIPPIUS_KEY like `test_access_key` does —
+    the e2e mock API accepts any hip_* key and we want deterministic behavior
+    regardless of CI secrets. `HIPPIUS_KEY` in CI is not always a `hip_*` value,
+    which silently routes requests through the seed-phrase auth path and yields
+    SignatureDoesNotMatch.
+    """
+    return "hip_e2e_master"
+
+
+@pytest.fixture
+def boto3_master_client(test_master_access_key: str, test_access_key_secret: str) -> Any:
+    """boto3 S3 client authenticated as a master hip_* access key (no env override)."""
+    return boto3.client(
+        "s3",
+        endpoint_url="http://localhost:8080",
+        aws_access_key_id=test_master_access_key,
+        aws_secret_access_key=test_access_key_secret,
+        region_name="us-east-1",
+        config=Config(
+            s3={"addressing_style": "path"},
+            signature_version="s3v4",
+            connect_timeout=5,
+            read_timeout=30,
+        ),
+    )
+
+
+@pytest.fixture
 def test_sub_token_access_key() -> str:
     """Sub-token access key; the mock API returns token_type='sub' for `hip_sub_*`."""
     return "hip_sub_e2e_test"

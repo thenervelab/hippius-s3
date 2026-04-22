@@ -17,37 +17,24 @@ import pytest
 from botocore.exceptions import ClientError
 
 
-pytestmark = [
-    pytest.mark.e2e,
-    pytest.mark.local,
-    pytest.mark.skip(
-        reason=(
-            "Blocked on pre-existing e2e access-key SigV4 issue: `boto3_access_key_client` "
-            "is only used by this file (no other e2e exercises that path), and every "
-            "CreateBucket call via it returns SignatureDoesNotMatch in CI. Scope logic is "
-            "already covered end-to-end by tests/integration/test_sub_token_scope_router.py "
-            "and the full middleware chain in tests/integration/test_acl_access_keys.py. "
-            "Un-skip once the access-key SigV4 mismatch in the e2e docker stack is resolved."
-        )
-    ),
-]
+pytestmark = [pytest.mark.e2e, pytest.mark.local]
 
 
 @pytest.fixture  # type: ignore[misc]
-def scoped_bucket(boto3_access_key_client: Any, cleanup_buckets: Any, unique_bucket_name: Any) -> str:
+def scoped_bucket(boto3_master_client: Any, cleanup_buckets: Any, unique_bucket_name: Any) -> str:
     """Create a bucket owned by the master test account; register for cleanup."""
     name = unique_bucket_name("subtok-a")
     cleanup_buckets(name)
-    boto3_access_key_client.create_bucket(Bucket=name)
+    boto3_master_client.create_bucket(Bucket=name)
     return name
 
 
 @pytest.fixture  # type: ignore[misc]
-def other_bucket(boto3_access_key_client: Any, cleanup_buckets: Any, unique_bucket_name: Any) -> str:
+def other_bucket(boto3_master_client: Any, cleanup_buckets: Any, unique_bucket_name: Any) -> str:
     """A second bucket, used for out-of-scope enforcement tests."""
     name = unique_bucket_name("subtok-b")
     cleanup_buckets(name)
-    boto3_access_key_client.create_bucket(Bucket=name)
+    boto3_master_client.create_bucket(Bucket=name)
     return name
 
 
@@ -171,14 +158,14 @@ def test_sub_token_without_scope_default_denies(
 
 def test_object_read_sub_token_can_read_but_not_write(
     sub_token_scope_client: Any,
-    boto3_access_key_client: Any,
+    boto3_master_client: Any,
     boto3_sub_token_client: Any,
     test_sub_token_access_key: str,
     mock_account_ss58: str,
     scoped_bucket: str,
 ) -> None:
     # Master puts an object; sub-token should be able to read it.
-    _put_small_object(boto3_access_key_client, scoped_bucket, "readable.txt", b"hi")
+    _put_small_object(boto3_master_client, scoped_bucket, "readable.txt", b"hi")
 
     sub_token_scope_client.put(
         test_sub_token_access_key,
@@ -231,14 +218,14 @@ def test_object_read_write_sub_token_crud_on_scoped_bucket(
 
 def test_bucket_scope_specific_denies_other_bucket(
     sub_token_scope_client: Any,
-    boto3_access_key_client: Any,
+    boto3_master_client: Any,
     boto3_sub_token_client: Any,
     test_sub_token_access_key: str,
     mock_account_ss58: str,
     scoped_bucket: str,
     other_bucket: str,
 ) -> None:
-    _put_small_object(boto3_access_key_client, other_bucket, "other.txt", b"no")
+    _put_small_object(boto3_master_client, other_bucket, "other.txt", b"no")
 
     sub_token_scope_client.put(
         test_sub_token_access_key,
@@ -285,7 +272,7 @@ def test_object_read_sub_token_cannot_list_buckets(
 
 def test_scope_update_invalidates_cache_immediately(
     sub_token_scope_client: Any,
-    boto3_access_key_client: Any,
+    boto3_master_client: Any,
     boto3_sub_token_client: Any,
     test_sub_token_access_key: str,
     mock_account_ss58: str,
@@ -293,7 +280,7 @@ def test_scope_update_invalidates_cache_immediately(
 ) -> None:
     """Flip the scope from read-only → write and verify the new permission
     takes effect on the very next request (cache invalidation on PUT scope)."""
-    _put_small_object(boto3_access_key_client, scoped_bucket, "cache-test.txt", b"v0")
+    _put_small_object(boto3_master_client, scoped_bucket, "cache-test.txt", b"v0")
 
     # Start as read-only.
     sub_token_scope_client.put(
