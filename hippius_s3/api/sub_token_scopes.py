@@ -13,9 +13,8 @@ Redis cache so scope changes take effect immediately.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import re
-from enum import Enum
 from typing import NoReturn
 
 from fastapi import APIRouter
@@ -29,48 +28,20 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 from pydantic import Field
 
-from gateway.services.auth_cache import cached_auth
+from gateway.services.sub_token_scope_cache import scope_cache_key
 from hippius_s3.dependencies import DBConnection
 from hippius_s3.dependencies import get_postgres
+from hippius_s3.models.sub_token import ACCESS_KEY_PATTERN
+from hippius_s3.models.sub_token import SS58_PATTERN
+from hippius_s3.models.sub_token import BucketScope
+from hippius_s3.models.sub_token import Permission
 from hippius_s3.repositories.sub_token_scope_repository import SubTokenScopeRepository
-from hippius_s3.repositories.sub_token_scope_repository import scope_cache_key
+from hippius_s3.services.hippius_api_service import HippiusApiClient
 from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["sub-token-scopes"])
-
-ACCESS_KEY_PATTERN = re.compile(r"^hip_[a-zA-Z0-9_-]{1,240}$")
-SS58_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{47,48}$")
-
-
-# --- enums ------------------------------------------------------------------
-
-
-class Permission(str, Enum):
-    """R2-style permission tiers. Each tier maps to a fixed set of S3 operations:
-
-    - `admin_read_write` — all S3 ops on in-scope buckets; CreateBucket / DeleteBucket only when `bucket_scope=all`
-    - `admin_read` — GetObject, HeadObject, ListBucket, ListBuckets, GetBucketAcl/Location/Tagging
-    - `object_read_write` — GetObject, HeadObject, PutObject, DeleteObject, ListBucket, multipart ops
-    - `object_read` — GetObject, HeadObject, ListBucket
-    """
-
-    admin_read_write = "admin_read_write"
-    admin_read = "admin_read"
-    object_read_write = "object_read_write"
-    object_read = "object_read"
-
-
-class BucketScope(str, Enum):
-    """Which buckets the sub-token is permitted on:
-
-    - `all` — every bucket owned by `account_id`. Required for CreateBucket / ListBuckets.
-    - `specific` — only the buckets listed in `buckets` (by name). Must be non-empty.
-    """
-
-    all = "all"
-    specific = "specific"
 
 
 # --- request / response models ---------------------------------------------
@@ -81,13 +52,13 @@ class ScopePutBody(BaseModel):
 
     account_id: str = Field(
         ...,
-        description="Substrate SS58 address of the account that owns the sub-token. Buckets listed in `buckets` must be owned by this account.",
+        description=(
+            "Substrate SS58 address of the account that owns the sub-token. "
+            "Buckets listed in `buckets` must be owned by this account."
+        ),
         examples=["5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"],
     )
-    permission: Permission = Field(
-        ...,
-        description="R2-style permission tier.",
-    )
+    permission: Permission = Field(..., description="R2-style permission tier.")
     bucket_scope: BucketScope = Field(
         ...,
         description="'all' for every bucket owned by account_id, or 'specific' for the buckets listed in `buckets`.",
@@ -114,8 +85,7 @@ class ScopeResponse(BaseModel):
         default_factory=list,
         description=(
             "Bucket UUIDs referenced by the stored scope but no longer present in the `buckets` table "
-            "(e.g. the bucket was deleted). Empty in the normal case. When non-empty, the caller should "
-            "re-PUT a clean scope to remove the dangling references."
+            "(e.g. the bucket was deleted). Empty in the normal case."
         ),
     )
 
@@ -143,24 +113,49 @@ def _validate_account_id(account_id: str) -> None:
 
 
 async def _resolve_bucket_ids(db: DBConnection, account_id: str, bucket_names: list[str]) -> list[str]:
-    """Resolve bucket names to UUIDs; every bucket must be owned by account_id."""
+    """Resolve bucket names to UUIDs; every bucket must be owned by account_id.
+
+    Reports *all* missing and/or wrongly-owned buckets in a single error, not
+    just the first one — spares the caller N round-trips to fix a typo'd list.
+    """
     if not bucket_names:
         return []
     rows = await db.fetch(get_query("resolve_buckets_by_names"), list(bucket_names))
     by_name = {r["bucket_name"]: r for r in rows}
-    bucket_ids: list[str] = []
-    for name in bucket_names:
-        row = by_name.get(name)
-        if row is None:
-            _raise("NoSuchBucket", f"Bucket does not exist: {name}", status.HTTP_404_NOT_FOUND)
-        if row["main_account_id"] != account_id:
-            _raise(
-                "AccessDenied",
-                f"Bucket not owned by account_id: {name}",
-                status.HTTP_403_FORBIDDEN,
-            )
-        bucket_ids.append(str(row["bucket_id"]))
-    return bucket_ids
+
+    missing = [n for n in bucket_names if n not in by_name]
+    if missing:
+        _raise("NoSuchBucket", f"Buckets do not exist: {missing}", status.HTTP_404_NOT_FOUND)
+
+    unauthorized = [n for n in bucket_names if by_name[n]["main_account_id"] != account_id]
+    if unauthorized:
+        _raise("AccessDenied", f"Buckets not owned by account_id: {unauthorized}", status.HTTP_403_FORBIDDEN)
+
+    return [str(by_name[n]["bucket_id"]) for n in bucket_names]
+
+
+async def _verify_access_key_owned_by_account(access_key_id: str, account_id: str) -> None:
+    """Confirm the target access_key_id is an active sub-token of `account_id`.
+
+    Calls the account API directly (no caching — this is a write path, not the
+    hot read path). Keeps the API layer free of a dependency on gateway services.
+    """
+    async with HippiusApiClient() as client:
+        token_response = await client.auth(access_key_id)
+    if not token_response.valid:
+        _raise("InvalidArgument", "Target access key is not valid", status.HTTP_400_BAD_REQUEST)
+    if token_response.token_type != "sub":
+        _raise(
+            "InvalidArgument",
+            "Target access key is not a sub-token (scope can only be installed on sub-tokens)",
+            status.HTTP_400_BAD_REQUEST,
+        )
+    if token_response.account_address != account_id:
+        _raise(
+            "AccessDenied",
+            "Target sub-token belongs to a different account than the one supplied in body.account_id",
+            status.HTTP_403_FORBIDDEN,
+        )
 
 
 # --- endpoints --------------------------------------------------------------
@@ -171,12 +166,14 @@ async def _resolve_bucket_ids(db: DBConnection, account_id: str, bucket_names: l
     response_model=ScopeResponse,
     responses={
         404: {"model": ErrorDetail, "description": "No scope set for this access key."},
-        400: {"model": ErrorDetail, "description": "Invalid access_key_id format."},
+        403: {"model": ErrorDetail, "description": "Scope exists but account_id does not match."},
+        400: {"model": ErrorDetail, "description": "Invalid access_key_id or account_id format."},
     },
     summary="Get sub-token scope",
     description=(
         "Return the current R2-style scope record for a sub-token's access key.\n\n"
-        "Returns **404** if no scope has been set (sub-tokens default-deny until scope is installed).\n\n"
+        "Returns **404** if no scope has been set (sub-tokens default-deny until scope is installed). "
+        "Returns **403** if a scope exists but is stored under a different account_id.\n\n"
         "**Auth**: protected by the frontend HMAC layer (`X-HMAC-Signature`)."
     ),
 )
@@ -189,14 +186,14 @@ async def get_scope(
     _validate_access_key(access_key_id)
     _validate_account_id(account_id)
 
-    repo: SubTokenScopeRepository = request.app.state.sub_token_scope_repo
-    scope = await repo.get(access_key_id)
-    if scope is None:
+    row = await db.fetchrow(get_query("get_sub_token_scope_with_buckets"), access_key_id)
+    if row is None:
         _raise("NoSuchScope", "Scope not set for this access key", status.HTTP_404_NOT_FOUND)
-    if scope.account_id != account_id:
+
+    if row["account_id"] != account_id:
         logger.warning(
             f"get_scope account_id mismatch: access_key={access_key_id[:8]}***, "
-            f"requested={account_id}, stored={scope.account_id}"
+            f"requested={account_id}, stored={row['account_id']}"
         )
         _raise(
             "AccessDenied",
@@ -204,18 +201,15 @@ async def get_scope(
             status.HTTP_403_FORBIDDEN,
         )
 
-    bucket_rows = await db.fetch(get_query("resolve_buckets_by_ids"), list(scope.bucket_ids))
-    names_by_id = {str(r["bucket_id"]): r["bucket_name"] for r in bucket_rows}
-    live_buckets = [names_by_id[b] for b in scope.bucket_ids if b in names_by_id]
-    stale_bucket_ids = [b for b in scope.bucket_ids if b not in names_by_id]
+    stale_bucket_ids = list(row["stale_bucket_ids"] or [])
     if stale_bucket_ids:
         logger.warning(f"get_scope found stale bucket_ids: access_key={access_key_id[:8]}***, stale={stale_bucket_ids}")
     return ScopeResponse(
-        access_key_id=scope.access_key_id,
-        account_id=scope.account_id,
-        permission=Permission(scope.permission),
-        bucket_scope=BucketScope(scope.bucket_scope),
-        buckets=live_buckets,
+        access_key_id=row["access_key_id"],
+        account_id=row["account_id"],
+        permission=Permission(row["permission"]),
+        bucket_scope=BucketScope(row["bucket_scope"]),
+        buckets=list(row["live_bucket_names"] or []),
         stale_bucket_ids=stale_bucket_ids,
     )
 
@@ -224,28 +218,19 @@ async def get_scope(
     "/{access_key_id}/scope",
     response_model=ScopeResponse,
     responses={
-        400: {
-            "model": ErrorDetail,
-            "description": "Invalid body (bad permission, bucket_scope, missing buckets, etc.).",
-        },
-        403: {"model": ErrorDetail, "description": "A bucket in `buckets` is not owned by `account_id`."},
-        404: {"model": ErrorDetail, "description": "A bucket in `buckets` does not exist."},
+        400: {"model": ErrorDetail, "description": "Invalid body or target access key is not a sub-token."},
+        403: {"model": ErrorDetail, "description": "Target access key or a bucket is not owned by account_id."},
+        404: {"model": ErrorDetail, "description": "One or more buckets in `buckets` do not exist."},
     },
     summary="Set (upsert) sub-token scope",
     description=(
         "Install or replace the scope for a sub-token.\n\n"
-        "This is an upsert: if a scope already exists for `access_key_id` it's replaced; "
-        "otherwise it's inserted. Takes effect on the next S3 request from the sub-token "
-        "(the gateway's 60s scope cache is invalidated on success).\n\n"
+        "Upsert: if a scope already exists for `access_key_id` it's replaced; otherwise inserted. "
+        "Takes effect on the next S3 request — the gateway's 60s scope cache is invalidated on success.\n\n"
         "**Rules**\n"
+        "- `access_key_id` must start with `hip_` and be an active sub-token belonging to `account_id`.\n"
         "- Every bucket in `buckets` must exist and be owned by `account_id`.\n"
-        "- `bucket_scope='specific'` requires a non-empty `buckets` list.\n"
-        "- `bucket_scope='all'` requires `buckets` to be empty.\n"
-        "- `access_key_id` must start with `hip_`.\n\n"
-        "**Common patterns**\n"
-        "- Read-only access to a single bucket: `permission=object_read`, `bucket_scope=specific`, `buckets=[A]`.\n"
-        "- Read+write on two buckets: `permission=object_read_write`, `bucket_scope=specific`, `buckets=[A,B]`.\n"
-        "- Account-wide admin (can create new buckets): `permission=admin_read_write`, `bucket_scope=all`, `buckets=[]`.\n\n"
+        "- `bucket_scope='specific'` requires a non-empty `buckets` list; `bucket_scope='all'` requires empty.\n\n"
         "**Auth**: protected by the frontend HMAC layer (`X-HMAC-Signature`)."
     ),
 )
@@ -258,54 +243,43 @@ async def put_scope(
     _validate_access_key(access_key_id)
     _validate_account_id(body.account_id)
 
-    if body.bucket_scope == BucketScope.specific and not body.buckets:
+    if body.bucket_scope is BucketScope.specific and not body.buckets:
         _raise("InvalidArgument", "bucket_scope='specific' requires non-empty buckets", status.HTTP_400_BAD_REQUEST)
-    if body.bucket_scope == BucketScope.all and body.buckets:
+    if body.bucket_scope is BucketScope.all and body.buckets:
         _raise("InvalidArgument", "bucket_scope='all' must not specify buckets", status.HTTP_400_BAD_REQUEST)
 
-    # Verify the target access_key is a sub-token belonging to body.account_id.
-    # Protects against the console accidentally (or maliciously) installing scope
-    # for a typo'd key or a key that doesn't belong to the claimed account.
-    token_response = await cached_auth(access_key_id, request.app.state.redis_client)
-    if not token_response.valid:
-        _raise("InvalidArgument", "Target access key is not valid", status.HTTP_400_BAD_REQUEST)
-    if token_response.token_type != "sub":
-        _raise(
-            "InvalidArgument",
-            "Target access key is not a sub-token (scope can only be installed on sub-tokens)",
-            status.HTTP_400_BAD_REQUEST,
-        )
-    if token_response.account_address != body.account_id:
-        _raise(
-            "AccessDenied",
-            "Target sub-token belongs to a different account than the one supplied in body.account_id",
-            status.HTTP_403_FORBIDDEN,
-        )
-
-    bucket_ids = await _resolve_bucket_ids(db, body.account_id, body.buckets)
-
-    repo: SubTokenScopeRepository = request.app.state.sub_token_scope_repo
-    scope = await repo.upsert(
-        access_key_id=access_key_id,
-        account_id=body.account_id,
-        permission=body.permission.value,
-        bucket_scope=body.bucket_scope.value,
-        bucket_ids=bucket_ids,
+    # Run the token validation and bucket resolution concurrently — they're
+    # independent and the slow path is the account-API call.
+    _, bucket_ids = await asyncio.gather(
+        _verify_access_key_owned_by_account(access_key_id, body.account_id),
+        _resolve_bucket_ids(db, body.account_id, body.buckets),
     )
 
+    repo: SubTokenScopeRepository = request.app.state.sub_token_scope_repo
     redis_client = request.app.state.redis_client
-    await redis_client.delete(scope_cache_key(access_key_id))
+
+    # Upsert and cache-invalidate in parallel.
+    scope, _ = await asyncio.gather(
+        repo.upsert(
+            access_key_id=access_key_id,
+            account_id=body.account_id,
+            permission=body.permission,
+            bucket_scope=body.bucket_scope,
+            bucket_ids=bucket_ids,
+        ),
+        redis_client.delete(scope_cache_key(access_key_id)),
+    )
+
     logger.info(
         f"Sub-token scope upserted: access_key={access_key_id[:8]}***, "
         f"account={body.account_id}, permission={body.permission.value}, "
         f"bucket_scope={body.bucket_scope.value}, buckets={len(body.buckets)}"
     )
-
     return ScopeResponse(
         access_key_id=scope.access_key_id,
         account_id=scope.account_id,
-        permission=Permission(scope.permission),
-        bucket_scope=BucketScope(scope.bucket_scope),
+        permission=scope.permission,
+        bucket_scope=scope.bucket_scope,
         buckets=list(body.buckets),
         stale_bucket_ids=[],
     )
@@ -319,24 +293,24 @@ async def put_scope(
     },
     summary="Revoke sub-token scope",
     description=(
-        "Delete the scope row for a sub-token. The sub-token immediately default-denies everything "
-        "on the next request (after the 60s cache is invalidated).\n\n"
-        "Idempotent: returns 204 whether or not a row existed.\n\n"
+        "Delete the scope row for a sub-token. Idempotent: returns 204 whether or not a row existed. "
+        "The 60s cache is invalidated so the sub-token default-denies everything on its next request.\n\n"
         "**Auth**: protected by the frontend HMAC layer (`X-HMAC-Signature`)."
     ),
 )
 async def delete_scope(
     request: Request,
     access_key_id: str = FPath(..., description="Sub-token access key ID, e.g. `hip_abcdef012345...`."),
-    db: DBConnection = Depends(get_postgres),
 ) -> Response:
     _validate_access_key(access_key_id)
 
     repo: SubTokenScopeRepository = request.app.state.sub_token_scope_repo
-    deleted = await repo.delete(access_key_id)
-
     redis_client = request.app.state.redis_client
-    await redis_client.delete(scope_cache_key(access_key_id))
-    logger.info(f"Sub-token scope deleted: access_key={access_key_id[:8]}***, existed={deleted}")
 
+    deleted, _ = await asyncio.gather(
+        repo.delete(access_key_id),
+        redis_client.delete(scope_cache_key(access_key_id)),
+    )
+
+    logger.info(f"Sub-token scope deleted: access_key={access_key_id[:8]}***, existed={deleted}")
     return Response(status_code=status.HTTP_204_NO_CONTENT)

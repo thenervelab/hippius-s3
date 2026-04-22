@@ -19,6 +19,8 @@ from gateway.middlewares.sigv4 import extract_signature_from_auth_header
 from gateway.middlewares.sigv4 import extract_signed_headers
 from gateway.services.auth_cache import cached_auth
 from gateway.services.auth_service import decrypt_secret
+from hippius_s3.models.sub_token import ACCESS_KEY_PATTERN
+from hippius_s3.models.sub_token import SS58_PATTERN
 
 
 logger = logging.getLogger(__name__)
@@ -37,8 +39,6 @@ class TokenAuth:
 
 
 ALLOWED_TOKEN_TYPES = {"master", "sub"}
-ACCESS_KEY_PATTERN = re.compile(r"^hip_[a-zA-Z0-9_-]{1,240}$")
-SS58_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{47,48}$")
 
 
 async def verify_access_key_signature(

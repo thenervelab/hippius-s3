@@ -128,27 +128,27 @@ def test_bucket_in_scope_none_bucket_with_all() -> None:
 
 
 def test_evaluate_no_scope_denies() -> None:
-    allowed, reason = evaluate(None, bucket_id="b", method="GET", has_key=True, query_params={})
+    allowed, reason = evaluate(scope=None, bucket_id="b", method="GET", has_key=True, query_params={})
     assert allowed is False
     assert reason == "no_scope"
 
 
 def test_evaluate_object_read_allows_get() -> None:
     scope = _scope("specific", ["b"])
-    allowed, _ = evaluate(scope, bucket_id="b", method="GET", has_key=True, query_params={})
+    allowed, _ = evaluate(scope=scope, bucket_id="b", method="GET", has_key=True, query_params={})
     assert allowed is True
 
 
 def test_evaluate_object_read_denies_put() -> None:
     scope = _scope("specific", ["b"])
-    allowed, reason = evaluate(scope, bucket_id="b", method="PUT", has_key=True, query_params={})
+    allowed, reason = evaluate(scope=scope, bucket_id="b", method="PUT", has_key=True, query_params={})
     assert allowed is False
     assert reason == "op_not_allowed"
 
 
 def test_evaluate_object_read_denies_bucket_outside_scope() -> None:
     scope = _scope("specific", ["b"])
-    allowed, reason = evaluate(scope, bucket_id="other", method="GET", has_key=True, query_params={})
+    allowed, reason = evaluate(scope=scope, bucket_id="other", method="GET", has_key=True, query_params={})
     assert allowed is False
     assert reason == "bucket_out_of_scope"
 
@@ -166,7 +166,7 @@ def test_evaluate_create_bucket_requires_admin_rw_with_scope_all() -> None:
         bucket_scope="all",
         bucket_ids=(),
     )
-    allowed, _ = evaluate(scope_all_admin, bucket_id=None, method="PUT", has_key=False, query_params={})
+    allowed, _ = evaluate(scope=scope_all_admin, bucket_id=None, method="PUT", has_key=False, query_params={})
     assert allowed is True
 
 
@@ -179,7 +179,7 @@ def test_evaluate_create_bucket_denied_on_specific_scope() -> None:
         bucket_ids=("b",),
     )
     allowed, reason = evaluate(
-        scope_admin_specific, bucket_id=None, method="PUT", has_key=False, query_params={}
+        scope=scope_admin_specific, bucket_id=None, method="PUT", has_key=False, query_params={}
     )
     assert allowed is False
     assert reason == "create_bucket_requires_scope_all"
@@ -194,7 +194,7 @@ def test_evaluate_create_bucket_denied_for_non_admin_rw() -> None:
             bucket_scope="all",
             bucket_ids=(),
         )
-        allowed, reason = evaluate(scope, bucket_id=None, method="PUT", has_key=False, query_params={})
+        allowed, reason = evaluate(scope=scope, bucket_id=None, method="PUT", has_key=False, query_params={})
         assert allowed is False, f"{permission} should not allow CreateBucket"
         assert reason == "op_not_allowed"
 
@@ -283,7 +283,7 @@ def test_full_evaluate_matrix(
     expected_allowed, expected_reason = _expected(tier, bucket_scope, target_in_scope, op)
 
     actual_allowed, actual_reason = evaluate(
-        scope,
+        scope=scope,
         bucket_id=bucket_id_arg,
         method=method,
         has_key=has_key,
@@ -313,10 +313,10 @@ def test_object_read_on_scoped_bucket_mirrors_r2_readonly_token() -> None:
         access_key_id="hip_r", account_id="acct",
         permission="object_read", bucket_scope="specific", bucket_ids=("books",),
     )
-    assert evaluate(scope, bucket_id="books", method="GET", has_key=True, query_params={})[0] is True
-    assert evaluate(scope, bucket_id="books", method="HEAD", has_key=True, query_params={})[0] is True
-    assert evaluate(scope, bucket_id="books", method="PUT", has_key=True, query_params={})[0] is False
-    assert evaluate(scope, bucket_id="books", method="DELETE", has_key=True, query_params={})[0] is False
+    assert evaluate(scope=scope, bucket_id="books", method="GET", has_key=True, query_params={})[0] is True
+    assert evaluate(scope=scope, bucket_id="books", method="HEAD", has_key=True, query_params={})[0] is True
+    assert evaluate(scope=scope, bucket_id="books", method="PUT", has_key=True, query_params={})[0] is False
+    assert evaluate(scope=scope, bucket_id="books", method="DELETE", has_key=True, query_params={})[0] is False
 
 
 def test_object_read_write_on_scoped_bucket_mirrors_r2_rw_token() -> None:
@@ -326,7 +326,7 @@ def test_object_read_write_on_scoped_bucket_mirrors_r2_rw_token() -> None:
         permission="object_read_write", bucket_scope="specific", bucket_ids=("books",),
     )
     for method in ("GET", "HEAD", "PUT", "DELETE"):
-        ok, _ = evaluate(scope, bucket_id="books", method=method, has_key=True, query_params={})
+        ok, _ = evaluate(scope=scope, bucket_id="books", method=method, has_key=True, query_params={})
         assert ok is True, f"{method} should be allowed for object_read_write"
 
 
@@ -336,16 +336,16 @@ def test_admin_read_only_mirrors_r2_admin_read_token() -> None:
         access_key_id="hip_ar", account_id="acct",
         permission="admin_read", bucket_scope="all", bucket_ids=(),
     )
-    assert evaluate(scope, bucket_id="b", method="GET", has_key=True, query_params={})[0] is True
+    assert evaluate(scope=scope, bucket_id="b", method="GET", has_key=True, query_params={})[0] is True
     # list_bucket (object listing within a bucket) permitted
-    assert evaluate(scope, bucket_id="b", method="GET", has_key=False, query_params={})[0] is True
+    assert evaluate(scope=scope, bucket_id="b", method="GET", has_key=False, query_params={})[0] is True
     # read bucket metadata permitted
-    assert evaluate(scope, bucket_id="b", method="GET", has_key=False, query_params={"acl": ""})[0] is True
+    assert evaluate(scope=scope, bucket_id="b", method="GET", has_key=False, query_params={"acl": ""})[0] is True
     # any write is denied
-    assert evaluate(scope, bucket_id="b", method="PUT", has_key=True, query_params={})[0] is False
-    assert evaluate(scope, bucket_id="b", method="PUT", has_key=False, query_params={"acl": ""})[0] is False
+    assert evaluate(scope=scope, bucket_id="b", method="PUT", has_key=True, query_params={})[0] is False
+    assert evaluate(scope=scope, bucket_id="b", method="PUT", has_key=False, query_params={"acl": ""})[0] is False
     # CreateBucket denied (admin_read can list but not create)
-    assert evaluate(scope, bucket_id=None, method="PUT", has_key=False, query_params={})[0] is False
+    assert evaluate(scope=scope, bucket_id=None, method="PUT", has_key=False, query_params={})[0] is False
 
 
 def test_admin_read_write_with_scope_all_can_create_and_delete_buckets() -> None:
@@ -355,12 +355,12 @@ def test_admin_read_write_with_scope_all_can_create_and_delete_buckets() -> None
         permission="admin_read_write", bucket_scope="all", bucket_ids=(),
     )
     # CreateBucket
-    assert evaluate(scope, bucket_id=None, method="PUT", has_key=False, query_params={})[0] is True
+    assert evaluate(scope=scope, bucket_id=None, method="PUT", has_key=False, query_params={})[0] is True
     # DeleteBucket
-    assert evaluate(scope, bucket_id="b", method="DELETE", has_key=False, query_params={})[0] is True
+    assert evaluate(scope=scope, bucket_id="b", method="DELETE", has_key=False, query_params={})[0] is True
     # Every object op
     for method in ("GET", "HEAD", "PUT", "DELETE"):
-        assert evaluate(scope, bucket_id="b", method=method, has_key=True, query_params={})[0] is True
+        assert evaluate(scope=scope, bucket_id="b", method=method, has_key=True, query_params={})[0] is True
 
 
 def test_admin_read_write_specific_scope_cannot_create_new_buckets() -> None:
@@ -372,14 +372,14 @@ def test_admin_read_write_specific_scope_cannot_create_new_buckets() -> None:
     )
     # Full control of listed bucket
     for method in ("GET", "HEAD", "PUT", "DELETE"):
-        assert evaluate(scope, bucket_id="alpha", method=method, has_key=True, query_params={})[0] is True
+        assert evaluate(scope=scope, bucket_id="alpha", method=method, has_key=True, query_params={})[0] is True
     # DeleteBucket on listed bucket permitted
-    assert evaluate(scope, bucket_id="alpha", method="DELETE", has_key=False, query_params={})[0] is True
+    assert evaluate(scope=scope, bucket_id="alpha", method="DELETE", has_key=False, query_params={})[0] is True
     # But CreateBucket is denied
-    allowed, reason = evaluate(scope, bucket_id=None, method="PUT", has_key=False, query_params={})
+    allowed, reason = evaluate(scope=scope, bucket_id=None, method="PUT", has_key=False, query_params={})
     assert allowed is False
     assert reason == "create_bucket_requires_scope_all"
     # And any op on a different bucket is denied
-    allowed, reason = evaluate(scope, bucket_id="beta", method="GET", has_key=True, query_params={})
+    allowed, reason = evaluate(scope=scope, bucket_id="beta", method="GET", has_key=True, query_params={})
     assert allowed is False
     assert reason == "bucket_out_of_scope"

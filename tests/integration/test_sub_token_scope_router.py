@@ -46,9 +46,11 @@ def scope_app(monkeypatch: pytest.MonkeyPatch) -> Any:
     redis_client.delete = AsyncMock(return_value=1)
     app.state.redis_client = redis_client
 
-    # Mock DB connection — `db.fetch(query, args...)` is the only call we need.
+    # Mock DB connection — handlers call `db.fetch(...)` (PUT bucket resolution)
+    # and `db.fetchrow(...)` (GET via the get_sub_token_scope_with_buckets query).
     mock_conn = MagicMock()
     mock_conn.fetch = AsyncMock(return_value=[])
+    mock_conn.fetchrow = AsyncMock(return_value=None)
     pool = MagicMock()
     db = DBConnection(conn=mock_conn, pool=pool)
 
@@ -58,15 +60,12 @@ def scope_app(monkeypatch: pytest.MonkeyPatch) -> Any:
     app.dependency_overrides[get_postgres] = _fake_get_postgres
     app.include_router(sub_token_scopes_router, prefix="/user/sub-tokens")
 
-    # Default cached_auth mock: valid sub-token owned by ACCT_A.
-    default_token_response = MagicMock()
-    default_token_response.valid = True
-    default_token_response.status = "active"
-    default_token_response.token_type = "sub"
-    default_token_response.account_address = ACCT_A
+    # Default: target access_key is a valid sub-token owned by ACCT_A. Tests that
+    # exercise rejection paths override this mock with `side_effect` raising
+    # HTTPException or swap it for one that raises a specific error.
     monkeypatch.setattr(
-        "hippius_s3.api.sub_token_scopes.cached_auth",
-        AsyncMock(return_value=default_token_response),
+        "hippius_s3.api.sub_token_scopes._verify_access_key_owned_by_account",
+        AsyncMock(return_value=None),
     )
 
     app.state._test_mock_conn = mock_conn
@@ -124,6 +123,16 @@ async def test_put_scope_stores_and_invalidates_cache(scope_app: Any) -> None:
 # ---- P2.5 — PUT rejects orphan access_key_id -----------------------------
 
 
+def _verify_raises(code: str, message: str, http_status: int) -> AsyncMock:
+    """Build a mock for `_verify_access_key_owned_by_account` that raises HTTPException."""
+    from fastapi import HTTPException
+
+    async def _raise(*args: Any, **kwargs: Any) -> None:
+        raise HTTPException(status_code=http_status, detail={"code": code, "message": message})
+
+    return AsyncMock(side_effect=_raise)
+
+
 @pytest.mark.asyncio
 async def test_put_scope_rejects_unknown_access_key(scope_app: Any) -> None:
     """P2.5: installing scope for an access_key that is not a known sub-token of
@@ -131,14 +140,10 @@ async def test_put_scope_rejects_unknown_access_key(scope_app: Any) -> None:
     bucket_id = str(uuid4())
     scope_app.state._test_mock_conn.fetch.return_value = [_bucket_row("bucket-a", ACCT_A, bucket_id)]
 
-    # Simulate the account API returning "not a sub-token of ACCT_A" for this access key.
-    mock_token_response = MagicMock()
-    mock_token_response.valid = True
-    mock_token_response.status = "active"
-    mock_token_response.token_type = "master"  # not a sub-token
-    mock_token_response.account_address = ACCT_A
-
-    with patch("hippius_s3.api.sub_token_scopes.cached_auth", AsyncMock(return_value=mock_token_response)):
+    with patch(
+        "hippius_s3.api.sub_token_scopes._verify_access_key_owned_by_account",
+        _verify_raises("InvalidArgument", "Target access key is not a sub-token", 400),
+    ):
         async with AsyncClient(transport=ASGITransport(app=scope_app), base_url="http://test") as client:
             resp = await client.put(
                 f"/user/sub-tokens/{KEY_X}/scope",
@@ -151,7 +156,6 @@ async def test_put_scope_rejects_unknown_access_key(scope_app: Any) -> None:
             )
 
     assert resp.status_code == 400, resp.text
-    # Repo must not have written anything.
     scope_app.state._test_mock_repo.upsert.assert_not_awaited()
 
 
@@ -161,13 +165,10 @@ async def test_put_scope_rejects_access_key_from_different_account(scope_app: An
     bucket_id = str(uuid4())
     scope_app.state._test_mock_conn.fetch.return_value = [_bucket_row("bucket-a", ACCT_A, bucket_id)]
 
-    mock_token_response = MagicMock()
-    mock_token_response.valid = True
-    mock_token_response.status = "active"
-    mock_token_response.token_type = "sub"
-    mock_token_response.account_address = ACCT_B  # different account
-
-    with patch("hippius_s3.api.sub_token_scopes.cached_auth", AsyncMock(return_value=mock_token_response)):
+    with patch(
+        "hippius_s3.api.sub_token_scopes._verify_access_key_owned_by_account",
+        _verify_raises("AccessDenied", "Target sub-token belongs to a different account", 403),
+    ):
         async with AsyncClient(transport=ASGITransport(app=scope_app), base_url="http://test") as client:
             resp = await client.put(
                 f"/user/sub-tokens/{KEY_X}/scope",
@@ -186,29 +187,48 @@ async def test_put_scope_rejects_access_key_from_different_account(scope_app: An
 # ---- P2.3 — GET account_id mismatch --------------------------------------
 
 
+def _scope_row(
+    *,
+    access_key_id: str = KEY_X,
+    account_id: str = ACCT_A,
+    permission: str = "object_read",
+    bucket_scope: str = "specific",
+    bucket_ids: list[str] | None = None,
+    live_bucket_names: list[str] | None = None,
+    stale_bucket_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Shape-compatible row for the get_sub_token_scope_with_buckets query."""
+    return {
+        "access_key_id": access_key_id,
+        "account_id": account_id,
+        "permission": permission,
+        "bucket_scope": bucket_scope,
+        "bucket_ids": list(bucket_ids or []),
+        "live_bucket_names": list(live_bucket_names or []),
+        "stale_bucket_ids": list(stale_bucket_ids or []),
+    }
+
+
 @pytest.mark.asyncio
 async def test_get_scope_mismatched_account_returns_403_not_404(scope_app: Any) -> None:
     """P2.3: scope exists but belongs to a different account → AccessDenied, not NoSuchScope."""
     other_bucket_id = str(uuid4())
-    scope_app.state._test_mock_repo.get.return_value = SubTokenScope(
-        access_key_id=KEY_X,
+    scope_app.state._test_mock_conn.fetchrow.return_value = _scope_row(
         account_id=ACCT_B,  # stored record belongs to B
-        permission="object_read",
-        bucket_scope="specific",
-        bucket_ids=(other_bucket_id,),
+        bucket_ids=[other_bucket_id],
+        live_bucket_names=["other-bucket"],
     )
 
     async with AsyncClient(transport=ASGITransport(app=scope_app), base_url="http://test") as client:
         resp = await client.get(f"/user/sub-tokens/{KEY_X}/scope", params={"account_id": ACCT_A})
 
     assert resp.status_code == 403, resp.text
-    body = resp.json()
-    assert body["detail"]["code"] == "AccessDenied"
+    assert resp.json()["detail"]["code"] == "AccessDenied"
 
 
 @pytest.mark.asyncio
 async def test_get_scope_not_set_returns_404(scope_app: Any) -> None:
-    scope_app.state._test_mock_repo.get.return_value = None
+    scope_app.state._test_mock_conn.fetchrow.return_value = None
 
     async with AsyncClient(transport=ASGITransport(app=scope_app), base_url="http://test") as client:
         resp = await client.get(f"/user/sub-tokens/{KEY_X}/scope", params={"account_id": ACCT_A})
@@ -226,17 +246,11 @@ async def test_get_scope_reports_stale_bucket_ids(scope_app: Any) -> None:
     include A in `buckets` AND surface B in `stale_bucket_ids` instead of silently dropping it."""
     live_id = str(uuid4())
     deleted_id = str(uuid4())
-    scope_app.state._test_mock_repo.get.return_value = SubTokenScope(
-        access_key_id=KEY_X,
-        account_id=ACCT_A,
-        permission="object_read",
-        bucket_scope="specific",
-        bucket_ids=(live_id, deleted_id),
+    scope_app.state._test_mock_conn.fetchrow.return_value = _scope_row(
+        bucket_ids=[live_id, deleted_id],
+        live_bucket_names=["live-bucket"],
+        stale_bucket_ids=[deleted_id],
     )
-    # Only the live bucket is still present.
-    scope_app.state._test_mock_conn.fetch.return_value = [
-        {"bucket_id": live_id, "bucket_name": "live-bucket"},
-    ]
 
     async with AsyncClient(transport=ASGITransport(app=scope_app), base_url="http://test") as client:
         resp = await client.get(f"/user/sub-tokens/{KEY_X}/scope", params={"account_id": ACCT_A})

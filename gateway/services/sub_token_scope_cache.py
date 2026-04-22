@@ -5,18 +5,25 @@ import logging
 
 from redis.asyncio import Redis
 
-from hippius_s3.repositories.sub_token_scope_repository import SCOPE_CACHE_TTL_SECONDS
-from hippius_s3.repositories.sub_token_scope_repository import SubTokenScope
+from hippius_s3.models.sub_token import BucketScope
+from hippius_s3.models.sub_token import Permission
+from hippius_s3.models.sub_token import SubTokenScope
 from hippius_s3.repositories.sub_token_scope_repository import SubTokenScopeRepository
-from hippius_s3.repositories.sub_token_scope_repository import scope_cache_key
 
 
 logger = logging.getLogger(__name__)
 
-# Sentinel used to represent "no scope row in DB" — kept in Redis so repeated
-# default-deny decisions don't hammer Postgres for unscoped sub-tokens. The
-# shared redis_client returns bytes (no decode_responses), so store/compare bytes.
+SCOPE_CACHE_PREFIX = "hippius_subscope:"
+SCOPE_CACHE_TTL_SECONDS = 60
+
+# Sentinel stored in Redis to mean "no scope row in DB" — keeps repeated
+# default-deny decisions off the Postgres hot path. redis_client returns bytes
+# (no decode_responses), so we compare bytes directly.
 _NEGATIVE_MARKER = b"__none__"
+
+
+def scope_cache_key(access_key_id: str) -> str:
+    return f"{SCOPE_CACHE_PREFIX}{access_key_id}"
 
 
 async def get_cached_sub_token_scope(
@@ -35,8 +42,8 @@ async def get_cached_sub_token_scope(
         return SubTokenScope(
             access_key_id=payload["access_key_id"],
             account_id=payload["account_id"],
-            permission=payload["permission"],
-            bucket_scope=payload["bucket_scope"],
+            permission=Permission(payload["permission"]),
+            bucket_scope=BucketScope(payload["bucket_scope"]),
             bucket_ids=tuple(payload.get("bucket_ids", [])),
         )
 
@@ -48,8 +55,8 @@ async def get_cached_sub_token_scope(
         payload = {
             "access_key_id": scope.access_key_id,
             "account_id": scope.account_id,
-            "permission": scope.permission,
-            "bucket_scope": scope.bucket_scope,
+            "permission": scope.permission.value,
+            "bucket_scope": scope.bucket_scope.value,
             "bucket_ids": list(scope.bucket_ids),
         }
         await redis_client.setex(key, SCOPE_CACHE_TTL_SECONDS, json.dumps(payload))

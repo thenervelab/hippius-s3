@@ -6,99 +6,109 @@ Mirrors Cloudflare R2's model.
 
 from __future__ import annotations
 
-from hippius_s3.repositories.sub_token_scope_repository import SubTokenScope
+from hippius_s3.models.sub_token import BucketScope
+from hippius_s3.models.sub_token import Op
+from hippius_s3.models.sub_token import Permission
+from hippius_s3.models.sub_token import SubTokenScope
 
 
-# Internal operation vocabulary. Every S3 request maps to exactly one of these.
-OP_READ_OBJECT = "read_object"  # GET/HEAD object (includes ?tagging, ?acl reads)
-OP_WRITE_OBJECT = "write_object"  # PUT/POST object (includes ?tagging writes, multipart)
-OP_DELETE_OBJECT = "delete_object"  # DELETE object
-OP_LIST_BUCKET = "list_bucket"  # GET/HEAD bucket (list objects)
-OP_LIST_BUCKETS = "list_buckets"  # GET /
-OP_CREATE_BUCKET = "create_bucket"  # PUT /bucket
-OP_DELETE_BUCKET = "delete_bucket"  # DELETE bucket (no key)
-OP_READ_BUCKET_META = "read_bucket_meta"  # GetBucketAcl, GetBucketLocation, GetBucketTagging, etc.
-OP_WRITE_BUCKET_META = "write_bucket_meta"  # PutBucketAcl, PutBucketTagging, etc.
+# Re-exports — several callers still reference these by their old names.
+OP_READ_OBJECT = Op.read_object
+OP_WRITE_OBJECT = Op.write_object
+OP_DELETE_OBJECT = Op.delete_object
+OP_LIST_BUCKET = Op.list_bucket
+OP_LIST_BUCKETS = Op.list_buckets
+OP_CREATE_BUCKET = Op.create_bucket
+OP_DELETE_BUCKET = Op.delete_bucket
+OP_READ_BUCKET_META = Op.read_bucket_meta
+OP_WRITE_BUCKET_META = Op.write_bucket_meta
 
 
-PERMISSION_MATRIX: dict[str, frozenset[str]] = {
-    "admin_read_write": frozenset(
+PERMISSION_MATRIX: dict[Permission, frozenset[Op]] = {
+    Permission.admin_read_write: frozenset(
         {
-            OP_READ_OBJECT,
-            OP_WRITE_OBJECT,
-            OP_DELETE_OBJECT,
-            OP_LIST_BUCKET,
-            OP_LIST_BUCKETS,
-            OP_CREATE_BUCKET,
-            OP_DELETE_BUCKET,
-            OP_READ_BUCKET_META,
-            OP_WRITE_BUCKET_META,
+            Op.read_object,
+            Op.write_object,
+            Op.delete_object,
+            Op.list_bucket,
+            Op.list_buckets,
+            Op.create_bucket,
+            Op.delete_bucket,
+            Op.read_bucket_meta,
+            Op.write_bucket_meta,
         }
     ),
-    "admin_read": frozenset(
+    Permission.admin_read: frozenset(
         {
-            OP_READ_OBJECT,
-            OP_LIST_BUCKET,
-            OP_LIST_BUCKETS,
-            OP_READ_BUCKET_META,
+            Op.read_object,
+            Op.list_bucket,
+            Op.list_buckets,
+            Op.read_bucket_meta,
         }
     ),
-    "object_read_write": frozenset(
+    Permission.object_read_write: frozenset(
         {
-            OP_READ_OBJECT,
-            OP_WRITE_OBJECT,
-            OP_DELETE_OBJECT,
-            OP_LIST_BUCKET,
+            Op.read_object,
+            Op.write_object,
+            Op.delete_object,
+            Op.list_bucket,
         }
     ),
-    "object_read": frozenset(
+    Permission.object_read: frozenset(
         {
-            OP_READ_OBJECT,
-            OP_LIST_BUCKET,
+            Op.read_object,
+            Op.list_bucket,
         }
     ),
 }
 
 
-def required_op(method: str, has_key: bool, query_params: dict[str, str]) -> str:
-    """Map an incoming S3 HTTP request to the single op name required to authorise it.
+# Subresource query params that turn a bucket op into a bucket-metadata op.
+_BUCKET_META_SUBRESOURCES = frozenset({"acl", "tagging", "policy", "cors", "lifecycle"})
 
-    Subresource queries (?acl, ?tagging, etc.) on the bucket map to bucket-meta ops.
-    On an object, they are treated as object reads/writes — same as AWS.
+_OBJECT_OPS: dict[str, Op] = {
+    "GET": Op.read_object,
+    "HEAD": Op.read_object,
+    "PUT": Op.write_object,
+    "POST": Op.write_object,
+    "DELETE": Op.delete_object,
+}
+
+_BUCKET_OPS: dict[str, Op] = {
+    "GET": Op.list_bucket,
+    "HEAD": Op.list_bucket,
+    "PUT": Op.create_bucket,
+    "DELETE": Op.delete_bucket,
+}
+
+_BUCKET_META_OPS: dict[str, Op] = {
+    "GET": Op.read_bucket_meta,
+    "HEAD": Op.read_bucket_meta,
+    "PUT": Op.write_bucket_meta,
+    "POST": Op.write_bucket_meta,
+    "DELETE": Op.write_bucket_meta,
+}
+
+
+def required_op(method: str, has_key: bool, query_params: dict[str, str]) -> Op:
+    """Map an incoming S3 HTTP request to the single op required to authorise it.
+
+    Subresource queries (?acl, ?tagging, …) on a bucket map to bucket-meta ops;
+    on an object they're treated as regular reads/writes, same as AWS.
     """
-    is_meta_subresource = any(q in query_params for q in ("acl", "tagging", "policy", "cors", "lifecycle"))
-
     if has_key:
-        # object-level
-        if method in ("GET", "HEAD"):
-            return OP_READ_OBJECT
-        if method in ("PUT", "POST"):
-            return OP_WRITE_OBJECT
-        if method == "DELETE":
-            return OP_DELETE_OBJECT
-        return OP_WRITE_OBJECT  # conservative default
+        return _OBJECT_OPS.get(method, Op.write_object)
 
-    # bucket-level
+    is_meta_subresource = any(q in query_params for q in _BUCKET_META_SUBRESOURCES)
     if is_meta_subresource:
-        if method in ("GET", "HEAD"):
-            return OP_READ_BUCKET_META
-        return OP_WRITE_BUCKET_META
+        return _BUCKET_META_OPS.get(method, Op.write_bucket_meta)
 
-    if method in ("GET", "HEAD"):
-        return OP_LIST_BUCKET
-    if method == "PUT":
-        return OP_CREATE_BUCKET
-    if method == "DELETE":
-        return OP_DELETE_BUCKET
-    return OP_WRITE_BUCKET_META  # conservative default
+    return _BUCKET_OPS.get(method, Op.write_bucket_meta)
 
 
-def permission_allows(permission: str, op: str) -> bool:
+def permission_allows(permission: Permission, op: Op) -> bool:
     """Return True if the tier's operation set covers the required op."""
-    allowed = PERMISSION_MATRIX.get(permission)
-    if allowed is None:
-        return False
-    return op in allowed
+    return op in PERMISSION_MATRIX.get(permission, frozenset())
 
 
 def bucket_in_scope(bucket_id: str | None, scope: SubTokenScope) -> bool:
@@ -106,7 +116,7 @@ def bucket_in_scope(bucket_id: str | None, scope: SubTokenScope) -> bool:
 
     `bucket_id` may be None for list-buckets (no single bucket in play).
     """
-    if scope.bucket_scope == "all":
+    if scope.bucket_scope is BucketScope.all:
         return True
     if bucket_id is None:
         return False
@@ -114,8 +124,8 @@ def bucket_in_scope(bucket_id: str | None, scope: SubTokenScope) -> bool:
 
 
 def evaluate(
-    scope: SubTokenScope | None,
     *,
+    scope: SubTokenScope | None,
     bucket_id: str | None,
     method: str,
     has_key: bool,
@@ -132,13 +142,11 @@ def evaluate(
     if not permission_allows(scope.permission, op):
         return False, "op_not_allowed"
 
-    # ListBuckets doesn't belong to any particular bucket.
-    if op == OP_LIST_BUCKETS:
+    if op is Op.list_buckets:
         return True, ""
 
-    # CreateBucket requires admin_read_write with bucket_scope='all'.
-    if op == OP_CREATE_BUCKET:
-        if scope.bucket_scope != "all":
+    if op is Op.create_bucket:
+        if scope.bucket_scope is not BucketScope.all:
             return False, "create_bucket_requires_scope_all"
         return True, ""
 
