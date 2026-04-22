@@ -10,33 +10,53 @@ from hippius_s3.repositories.sub_token_scope_repository import SubTokenScope
 
 
 # Internal operation vocabulary. Every S3 request maps to exactly one of these.
-OP_READ_OBJECT = "read_object"        # GET/HEAD object (includes ?tagging, ?acl reads)
-OP_WRITE_OBJECT = "write_object"      # PUT/POST object (includes ?tagging writes, multipart)
-OP_DELETE_OBJECT = "delete_object"    # DELETE object
-OP_LIST_BUCKET = "list_bucket"        # GET/HEAD bucket (list objects)
-OP_LIST_BUCKETS = "list_buckets"      # GET /
-OP_CREATE_BUCKET = "create_bucket"    # PUT /bucket
-OP_DELETE_BUCKET = "delete_bucket"    # DELETE bucket (no key)
-OP_READ_BUCKET_META = "read_bucket_meta"   # GetBucketAcl, GetBucketLocation, GetBucketTagging, etc.
-OP_WRITE_BUCKET_META = "write_bucket_meta" # PutBucketAcl, PutBucketTagging, etc.
+OP_READ_OBJECT = "read_object"  # GET/HEAD object (includes ?tagging, ?acl reads)
+OP_WRITE_OBJECT = "write_object"  # PUT/POST object (includes ?tagging writes, multipart)
+OP_DELETE_OBJECT = "delete_object"  # DELETE object
+OP_LIST_BUCKET = "list_bucket"  # GET/HEAD bucket (list objects)
+OP_LIST_BUCKETS = "list_buckets"  # GET /
+OP_CREATE_BUCKET = "create_bucket"  # PUT /bucket
+OP_DELETE_BUCKET = "delete_bucket"  # DELETE bucket (no key)
+OP_READ_BUCKET_META = "read_bucket_meta"  # GetBucketAcl, GetBucketLocation, GetBucketTagging, etc.
+OP_WRITE_BUCKET_META = "write_bucket_meta"  # PutBucketAcl, PutBucketTagging, etc.
 
 
 PERMISSION_MATRIX: dict[str, frozenset[str]] = {
-    "admin_read_write": frozenset({
-        OP_READ_OBJECT, OP_WRITE_OBJECT, OP_DELETE_OBJECT,
-        OP_LIST_BUCKET, OP_LIST_BUCKETS,
-        OP_CREATE_BUCKET, OP_DELETE_BUCKET,
-        OP_READ_BUCKET_META, OP_WRITE_BUCKET_META,
-    }),
-    "admin_read": frozenset({
-        OP_READ_OBJECT, OP_LIST_BUCKET, OP_LIST_BUCKETS, OP_READ_BUCKET_META,
-    }),
-    "object_read_write": frozenset({
-        OP_READ_OBJECT, OP_WRITE_OBJECT, OP_DELETE_OBJECT, OP_LIST_BUCKET,
-    }),
-    "object_read": frozenset({
-        OP_READ_OBJECT, OP_LIST_BUCKET,
-    }),
+    "admin_read_write": frozenset(
+        {
+            OP_READ_OBJECT,
+            OP_WRITE_OBJECT,
+            OP_DELETE_OBJECT,
+            OP_LIST_BUCKET,
+            OP_LIST_BUCKETS,
+            OP_CREATE_BUCKET,
+            OP_DELETE_BUCKET,
+            OP_READ_BUCKET_META,
+            OP_WRITE_BUCKET_META,
+        }
+    ),
+    "admin_read": frozenset(
+        {
+            OP_READ_OBJECT,
+            OP_LIST_BUCKET,
+            OP_LIST_BUCKETS,
+            OP_READ_BUCKET_META,
+        }
+    ),
+    "object_read_write": frozenset(
+        {
+            OP_READ_OBJECT,
+            OP_WRITE_OBJECT,
+            OP_DELETE_OBJECT,
+            OP_LIST_BUCKET,
+        }
+    ),
+    "object_read": frozenset(
+        {
+            OP_READ_OBJECT,
+            OP_LIST_BUCKET,
+        }
+    ),
 }
 
 

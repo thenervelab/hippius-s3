@@ -134,9 +134,7 @@ async def verify_access_key_signature(
         f"account={token_response.account_address}, type={token_response.token_type}"
     )
     if token_response.token_type == "master":
-        logger.info(
-            f"AUDIT: Master token used: key={access_key[:8]}***, account={token_response.account_address}"
-        )
+        logger.info(f"AUDIT: Master token used: key={access_key[:8]}***, account={token_response.account_address}")
     return TokenAuth(
         access_key=access_key,
         account_address=token_response.account_address,

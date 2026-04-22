@@ -102,7 +102,9 @@ async def acl_middleware(
     auth_method = getattr(request.state, "auth_method", None)
     token_type = getattr(request.state, "token_type", None)
     account_id = getattr(request.state, "account_id", None)
-    access_key = getattr(request.state, "access_key", None) if auth_method in ("access_key", "bearer_access_key") else None
+    access_key = (
+        getattr(request.state, "access_key", None) if auth_method in ("access_key", "bearer_access_key") else None
+    )
 
     acl_service = request.app.state.acl_service
 
