@@ -71,7 +71,10 @@ class SubTokenScopeRepository:
             bucket_scope,
             bucket_ids,
         )
-        assert row is not None
+        if row is None:
+            # asyncpg's INSERT ... RETURNING always yields a row; this guards against
+            # a schema-level regression rather than a realistic runtime condition.
+            raise RuntimeError("upsert_sub_token_scope did not return a row")
         logger.info(
             f"Upserted sub_token_scope: access_key={access_key_id[:8]}***, "
             f"permission={permission}, bucket_scope={bucket_scope}, buckets={len(bucket_ids)}"

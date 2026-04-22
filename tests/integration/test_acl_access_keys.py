@@ -21,9 +21,18 @@ def integration_app() -> Any:
     """Create FastAPI app with full auth + ACL middleware chain"""
     app = FastAPI()
     app.state.acl_service = MagicMock()
-    # Default get_bucket_id behaves as identity so the middleware's sub-token
-    # branch has something to match on; tests may override.
+    # get_bucket_owner_and_id delegates to get_bucket_owner so legacy tests that
+    # only override get_bucket_owner keep working. Tests exercising the combined
+    # path (e.g. the single-query assertion) override get_bucket_owner_and_id
+    # directly and opt out of the delegation.
     app.state.acl_service.get_bucket_id = AsyncMock(side_effect=lambda b: b)
+
+    async def _default_owner_and_id(bucket: str) -> tuple[str | None, str | None]:
+        owner = await app.state.acl_service.get_bucket_owner(bucket)
+        bid = await app.state.acl_service.get_bucket_id(bucket) if owner else None
+        return owner, bid
+
+    app.state.acl_service.get_bucket_owner_and_id = AsyncMock(side_effect=_default_owner_and_id)
     app.state.redis_accounts = AsyncMock()
     app.state.redis_client = AsyncMock()
     # Cache misses by default so the sub-token branch goes to the repo.
@@ -60,6 +69,39 @@ def integration_app() -> Any:
     app.middleware("http")(auth_router_middleware)
 
     return app
+
+
+@pytest.mark.asyncio
+async def test_bucket_metadata_fetched_in_single_query(integration_app: Any) -> None:
+    """acl_middleware should resolve (owner, bucket_id) in a single DB call, not two."""
+    alice_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+    bob_id = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+
+    # Mock get_bucket_owner_and_id to return both in one go; assert the old
+    # split methods are NOT called individually.
+    integration_app.state.acl_service.get_bucket_owner_and_id = AsyncMock(
+        return_value=(alice_id, "bucket-uuid-1")
+    )
+    integration_app.state.acl_service.get_bucket_owner = AsyncMock(
+        side_effect=AssertionError("get_bucket_owner must not be called — use get_bucket_owner_and_id")
+    )
+    integration_app.state.acl_service.get_bucket_id = AsyncMock(
+        side_effect=AssertionError("get_bucket_id must not be called — use get_bucket_owner_and_id")
+    )
+    integration_app.state.acl_service.check_permission = AsyncMock(return_value=True)
+
+    auth_header = "AWS4-HMAC-SHA256 Credential=hip_bob_sub1/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
+    mock_verify = AsyncMock(return_value=TokenAuth(access_key="hip_bob_sub1", account_address=bob_id, token_type="sub"))
+
+    with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
+        with patch("gateway.middlewares.account.config.bypass_credit_check", True):
+            async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
+                await client.get(
+                    "/alice-bucket/test.txt",
+                    headers={"Authorization": auth_header, "x-amz-date": "20250101T000000Z"},
+                )
+
+    integration_app.state.acl_service.get_bucket_owner_and_id.assert_awaited_once_with("alice-bucket")
 
 
 @pytest.mark.asyncio

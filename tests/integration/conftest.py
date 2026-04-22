@@ -241,6 +241,7 @@ async def gateway_app(
     mock_acl_service.check_permission = AsyncMock(return_value=True)
     mock_acl_service.get_bucket_owner = AsyncMock(return_value="test-owner-id")
     mock_acl_service.get_bucket_id = AsyncMock(side_effect=lambda b: b)
+    mock_acl_service.get_bucket_owner_and_id = AsyncMock(return_value=("test-owner-id", "test-bucket-id"))
     app.state.acl_service = mock_acl_service
 
     mock_scope_repo = MagicMock()
@@ -298,6 +299,7 @@ async def gateway_app_no_auth(
     mock_acl_service.check_permission = AsyncMock(return_value=True)
     mock_acl_service.get_bucket_owner = AsyncMock(return_value="test-owner-id")
     mock_acl_service.get_bucket_id = AsyncMock(side_effect=lambda b: b)
+    mock_acl_service.get_bucket_owner_and_id = AsyncMock(return_value=("test-owner-id", "test-bucket-id"))
     app.state.acl_service = mock_acl_service
 
     mock_scope_repo = MagicMock()

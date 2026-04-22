@@ -13,11 +13,10 @@ from hippius_s3.repositories.sub_token_scope_repository import scope_cache_key
 
 logger = logging.getLogger(__name__)
 
-SCOPE_NEGATIVE_MARKER = "__none__"
-
-
-def _cache_key(access_key_id: str) -> str:
-    return scope_cache_key(access_key_id)
+# Sentinel used to represent "no scope row in DB" — kept in Redis so repeated
+# default-deny decisions don't hammer Postgres for unscoped sub-tokens. The
+# shared redis_client returns bytes (no decode_responses), so store/compare bytes.
+_NEGATIVE_MARKER = b"__none__"
 
 
 async def get_cached_sub_token_scope(
@@ -25,16 +24,12 @@ async def get_cached_sub_token_scope(
     repo: SubTokenScopeRepository,
     redis_client: Redis,
 ) -> SubTokenScope | None:
-    """Return the sub-token scope, caching both hits and misses for 60s.
-
-    A missing row is cached as a null sentinel so repeated default-deny decisions
-    don't hammer Postgres.
-    """
-    key = _cache_key(access_key_id)
+    """Return the sub-token scope, caching both hits and misses for 60s."""
+    key = scope_cache_key(access_key_id)
 
     cached = await redis_client.get(key)
     if cached is not None:
-        if cached == SCOPE_NEGATIVE_MARKER or cached == SCOPE_NEGATIVE_MARKER.encode():
+        if cached == _NEGATIVE_MARKER:
             return None
         payload = json.loads(cached)
         return SubTokenScope(
@@ -48,7 +43,7 @@ async def get_cached_sub_token_scope(
     scope = await repo.get(access_key_id)
 
     if scope is None:
-        await redis_client.setex(key, SCOPE_CACHE_TTL_SECONDS, SCOPE_NEGATIVE_MARKER)
+        await redis_client.setex(key, SCOPE_CACHE_TTL_SECONDS, _NEGATIVE_MARKER)
     else:
         payload = {
             "access_key_id": scope.access_key_id,
@@ -60,7 +55,3 @@ async def get_cached_sub_token_scope(
         await redis_client.setex(key, SCOPE_CACHE_TTL_SECONDS, json.dumps(payload))
 
     return scope
-
-
-async def invalidate_sub_token_scope(access_key_id: str, redis_client: Redis) -> None:
-    await redis_client.delete(_cache_key(access_key_id))

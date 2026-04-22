@@ -35,6 +35,7 @@ from hippius_s3.config import Config
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
+from hippius_s3.repositories.sub_token_scope_repository import SubTokenScopeRepository
 from hippius_s3.storage_version import UnsupportedStorageVersionError
 
 
@@ -141,6 +142,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             fs_store=app.state.fs_store,
         )
         logger.info("Cache repositories initialized")
+
+        app.state.sub_token_scope_repo = SubTokenScopeRepository(db_pool=app.state.postgres_pool)
+        logger.info("SubTokenScopeRepository initialized")
 
         from hippius_s3.monitoring import MetricsCollector
         from hippius_s3.monitoring import set_metrics_collector

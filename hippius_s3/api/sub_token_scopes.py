@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import re
 from enum import Enum
+from typing import NoReturn
 
 from fastapi import APIRouter
 from fastapi import Depends
@@ -28,10 +29,12 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 from pydantic import Field
 
+from gateway.services.auth_cache import cached_auth
 from hippius_s3.dependencies import DBConnection
 from hippius_s3.dependencies import get_postgres
 from hippius_s3.repositories.sub_token_scope_repository import SubTokenScopeRepository
 from hippius_s3.repositories.sub_token_scope_repository import scope_cache_key
+from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
@@ -107,6 +110,14 @@ class ScopeResponse(BaseModel):
         ...,
         description="Bucket names the scope applies to (empty when bucket_scope='all').",
     )
+    stale_bucket_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Bucket UUIDs referenced by the stored scope but no longer present in the `buckets` table "
+            "(e.g. the bucket was deleted). Empty in the normal case. When non-empty, the caller should "
+            "re-PUT a clean scope to remove the dangling references."
+        ),
+    )
 
 
 class ErrorDetail(BaseModel):
@@ -117,7 +128,7 @@ class ErrorDetail(BaseModel):
 # --- helpers ---------------------------------------------------------------
 
 
-def _raise(code: str, message: str, http_status: int) -> None:
+def _raise(code: str, message: str, http_status: int) -> NoReturn:
     raise HTTPException(status_code=http_status, detail={"code": code, "message": message})
 
 
@@ -135,24 +146,19 @@ async def _resolve_bucket_ids(db: DBConnection, account_id: str, bucket_names: l
     """Resolve bucket names to UUIDs; every bucket must be owned by account_id."""
     if not bucket_names:
         return []
-    rows = await db.fetch(
-        "SELECT bucket_name, bucket_id, main_account_id FROM buckets WHERE bucket_name = ANY($1)",
-        list(bucket_names),
-    )
+    rows = await db.fetch(get_query("resolve_buckets_by_names"), list(bucket_names))
     by_name = {r["bucket_name"]: r for r in rows}
     bucket_ids: list[str] = []
     for name in bucket_names:
         row = by_name.get(name)
         if row is None:
             _raise("NoSuchBucket", f"Bucket does not exist: {name}", status.HTTP_404_NOT_FOUND)
-            return []  # unreachable, for type-checker
         if row["main_account_id"] != account_id:
             _raise(
                 "AccessDenied",
                 f"Bucket not owned by account_id: {name}",
                 status.HTTP_403_FORBIDDEN,
             )
-            return []  # unreachable
         bucket_ids.append(str(row["bucket_id"]))
     return bucket_ids
 
@@ -183,23 +189,34 @@ async def get_scope(
     _validate_access_key(access_key_id)
     _validate_account_id(account_id)
 
-    repo = SubTokenScopeRepository(db.pool)
+    repo: SubTokenScopeRepository = request.app.state.sub_token_scope_repo
     scope = await repo.get(access_key_id)
-    if scope is None or scope.account_id != account_id:
+    if scope is None:
         _raise("NoSuchScope", "Scope not set for this access key", status.HTTP_404_NOT_FOUND)
-        raise AssertionError  # unreachable; helps mypy
+    if scope.account_id != account_id:
+        logger.warning(
+            f"get_scope account_id mismatch: access_key={access_key_id[:8]}***, "
+            f"requested={account_id}, stored={scope.account_id}"
+        )
+        _raise(
+            "AccessDenied",
+            "Scope exists but does not belong to the provided account_id",
+            status.HTTP_403_FORBIDDEN,
+        )
 
-    bucket_rows = await db.fetch(
-        "SELECT bucket_id, bucket_name FROM buckets WHERE bucket_id = ANY($1::uuid[])",
-        list(scope.bucket_ids),
-    )
+    bucket_rows = await db.fetch(get_query("resolve_buckets_by_ids"), list(scope.bucket_ids))
     names_by_id = {str(r["bucket_id"]): r["bucket_name"] for r in bucket_rows}
+    live_buckets = [names_by_id[b] for b in scope.bucket_ids if b in names_by_id]
+    stale_bucket_ids = [b for b in scope.bucket_ids if b not in names_by_id]
+    if stale_bucket_ids:
+        logger.warning(f"get_scope found stale bucket_ids: access_key={access_key_id[:8]}***, stale={stale_bucket_ids}")
     return ScopeResponse(
         access_key_id=scope.access_key_id,
         account_id=scope.account_id,
         permission=Permission(scope.permission),
         bucket_scope=BucketScope(scope.bucket_scope),
-        buckets=[names_by_id[b] for b in scope.bucket_ids if b in names_by_id],
+        buckets=live_buckets,
+        stale_bucket_ids=stale_bucket_ids,
     )
 
 
@@ -246,9 +263,28 @@ async def put_scope(
     if body.bucket_scope == BucketScope.all and body.buckets:
         _raise("InvalidArgument", "bucket_scope='all' must not specify buckets", status.HTTP_400_BAD_REQUEST)
 
+    # Verify the target access_key is a sub-token belonging to body.account_id.
+    # Protects against the console accidentally (or maliciously) installing scope
+    # for a typo'd key or a key that doesn't belong to the claimed account.
+    token_response = await cached_auth(access_key_id, request.app.state.redis_client)
+    if not token_response.valid:
+        _raise("InvalidArgument", "Target access key is not valid", status.HTTP_400_BAD_REQUEST)
+    if token_response.token_type != "sub":
+        _raise(
+            "InvalidArgument",
+            "Target access key is not a sub-token (scope can only be installed on sub-tokens)",
+            status.HTTP_400_BAD_REQUEST,
+        )
+    if token_response.account_address != body.account_id:
+        _raise(
+            "AccessDenied",
+            "Target sub-token belongs to a different account than the one supplied in body.account_id",
+            status.HTTP_403_FORBIDDEN,
+        )
+
     bucket_ids = await _resolve_bucket_ids(db, body.account_id, body.buckets)
 
-    repo = SubTokenScopeRepository(db.pool)
+    repo: SubTokenScopeRepository = request.app.state.sub_token_scope_repo
     scope = await repo.upsert(
         access_key_id=access_key_id,
         account_id=body.account_id,
@@ -271,6 +307,7 @@ async def put_scope(
         permission=Permission(scope.permission),
         bucket_scope=BucketScope(scope.bucket_scope),
         buckets=list(body.buckets),
+        stale_bucket_ids=[],
     )
 
 
@@ -295,7 +332,7 @@ async def delete_scope(
 ) -> Response:
     _validate_access_key(access_key_id)
 
-    repo = SubTokenScopeRepository(db.pool)
+    repo: SubTokenScopeRepository = request.app.state.sub_token_scope_repo
     deleted = await repo.delete(access_key_id)
 
     redis_client = request.app.state.redis_client

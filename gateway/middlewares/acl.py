@@ -108,13 +108,12 @@ async def acl_middleware(
 
     acl_service = request.app.state.acl_service
 
-    # Resolve bucket ownership / id once (if a bucket is in play).
+    # Resolve bucket ownership / id in a single query when a bucket is in play.
     bucket_owner_id: str | None = None
     bucket_id: str | None = None
     if bucket is not None:
-        bucket_owner_id = await acl_service.get_bucket_owner(bucket)
+        bucket_owner_id, bucket_id = await acl_service.get_bucket_owner_and_id(bucket)
         if bucket_owner_id is not None:
-            bucket_id = await acl_service.get_bucket_id(bucket)
             request.state.bucket_owner_id = bucket_owner_id
 
     # -------------------------------------------------------------------------
