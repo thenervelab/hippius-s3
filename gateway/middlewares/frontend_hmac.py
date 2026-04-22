@@ -4,9 +4,9 @@ import logging
 from typing import Awaitable
 from typing import Callable
 
-from fastapi import HTTPException
 from fastapi import Request
 from fastapi import Response
+from fastapi.responses import JSONResponse
 from starlette import status
 
 from gateway.config import get_config
@@ -16,12 +16,18 @@ config = get_config()
 logger = logging.getLogger(__name__)
 
 
+def _error(status_code: int, detail: str) -> Response:
+    # Starlette http-level middlewares can't raise HTTPException — FastAPI's
+    # exception handler only catches those from route handlers. Return the
+    # response directly.
+    return JSONResponse(status_code=status_code, content={"detail": detail})
+
+
 async def verify_frontend_hmac_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
-    """
-    HMAC middleware for frontend user endpoints.
+    """HMAC middleware for frontend user endpoints.
 
     Expects an X-HMAC-Signature header containing the HMAC signature of the request.
     The signature is calculated as HMAC-SHA256(secret, method + path + query_string).
@@ -29,37 +35,29 @@ async def verify_frontend_hmac_middleware(
     if not request.url.path.startswith("/user/"):
         return await call_next(request)
 
-    # Skip HMAC verification for OPTIONS requests (CORS preflight)
     if request.method == "OPTIONS":
         return await call_next(request)
 
     hmac_signature = request.headers.get("x-hmac-signature")
     if not hmac_signature:
         logger.warning(f"Missing X-HMAC-Signature header for {request.method} {request.url.path}")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing X-HMAC-Signature header")
+        return _error(status.HTTP_401_UNAUTHORIZED, "Missing X-HMAC-Signature header")
 
-    # Create the message to sign: method + path + query_string
     message = request.method + request.url.path
     if request.url.query:
         message += "?" + request.url.query
 
-    # Calculate the expected signature
     expected_signature = hmac.new(
         config.frontend_hmac_secret.encode("utf-8"),
         message.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
 
-    logger.info(f"{message=} {expected_signature=} {hmac_signature=}")
-
-    # Compare signatures
     if not hmac.compare_digest(expected_signature, hmac_signature):
         logger.warning(
             f"Frontend HMAC verification failed for {request.method} {request.url.path}, raw message={message}"
         )
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid HMAC signature")
+        return _error(status.HTTP_403_FORBIDDEN, "Invalid HMAC signature")
 
-    logger.debug(
-        f"Frontend HMAC verification successful for {request.method} {request.url.path} {message=} {expected_signature=}"
-    )
+    logger.debug(f"Frontend HMAC verification successful for {request.method} {request.url.path}")
     return await call_next(request)
