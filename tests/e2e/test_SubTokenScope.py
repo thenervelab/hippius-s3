@@ -21,28 +21,20 @@ pytestmark = [pytest.mark.e2e, pytest.mark.local]
 
 
 @pytest.fixture  # type: ignore[misc]
-def scoped_bucket(boto3_access_key_client: Any, cleanup_buckets: Any) -> str:
+def scoped_bucket(boto3_access_key_client: Any, cleanup_buckets: Any, unique_bucket_name: Any) -> str:
     """Create a bucket owned by the master test account; register for cleanup."""
-    name = "sub-token-scope-test-a"
+    name = unique_bucket_name("subtok-a")
     cleanup_buckets(name)
-    try:
-        boto3_access_key_client.create_bucket(Bucket=name)
-    except ClientError as e:
-        if e.response["Error"]["Code"] not in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
-            raise
+    boto3_access_key_client.create_bucket(Bucket=name)
     return name
 
 
 @pytest.fixture  # type: ignore[misc]
-def other_bucket(boto3_access_key_client: Any, cleanup_buckets: Any) -> str:
+def other_bucket(boto3_access_key_client: Any, cleanup_buckets: Any, unique_bucket_name: Any) -> str:
     """A second bucket, used for out-of-scope enforcement tests."""
-    name = "sub-token-scope-test-b"
+    name = unique_bucket_name("subtok-b")
     cleanup_buckets(name)
-    try:
-        boto3_access_key_client.create_bucket(Bucket=name)
-    except ClientError as e:
-        if e.response["Error"]["Code"] not in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
-            raise
+    boto3_access_key_client.create_bucket(Bucket=name)
     return name
 
 
