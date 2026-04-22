@@ -28,6 +28,7 @@ from gateway.services.forward_service import ForwardService
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.monitoring import MetricsCollector
 from hippius_s3.monitoring import set_metrics_collector
+from hippius_s3.repositories.sub_token_scope_repository import SubTokenScopeRepository
 from hippius_s3.sentry import init_sentry
 from hippius_s3.services.arion_service import ArionClient
 
@@ -99,6 +100,9 @@ def factory() -> FastAPI:
             cache_ttl=config.acl_cache_ttl_seconds,
         )
         logger.info("ACLService initialized")
+
+        app.state.sub_token_scope_repo = SubTokenScopeRepository(db_pool=app.state.postgres_pool)
+        logger.info("SubTokenScopeRepository initialized")
 
         app.state.docs_proxy_service = DocsProxyService(
             backend_url=config.backend_url,

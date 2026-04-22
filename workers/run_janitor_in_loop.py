@@ -68,7 +68,7 @@ AGE_BUCKET_BOUNDARIES = [
 AGE_BUCKET_NAMES = [b[0] for b in AGE_BUCKET_BOUNDARIES] + ["7d+"]
 
 # Disk pressure thresholds (fraction of total disk used).
-PRESSURE_ELEVATED = 0.85
+PRESSURE_ELEVATED = 0.75
 PRESSURE_CRITICAL = 0.95
 
 # Maximum age of an orphan `.tmp.*` file before we delete it. Atomic writes

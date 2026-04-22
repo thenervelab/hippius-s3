@@ -228,7 +228,15 @@ async def test_presigned_get_with_access_key_uses_access_key_auth(auth_router_ap
     test_token_type = "sub"
 
     # Patch the presigned URL verifier so we don't depend on its implementation here
-    mock_verify = AsyncMock(return_value=(True, test_account_address, test_token_type))
+    from gateway.middlewares.access_key_auth import TokenAuth
+
+    mock_verify = AsyncMock(
+        return_value=TokenAuth(
+            access_key=test_access_key,
+            account_address=test_account_address,
+            token_type=test_token_type,
+        )
+    )
 
     query_params = {
         "X-Amz-Algorithm": "AWS4-HMAC-SHA256",

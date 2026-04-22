@@ -58,6 +58,12 @@ class ACLService:
         row = await self.acl_repo.db.fetchrow(query, bucket)
         return str(row["main_account_id"]) if row else None
 
+    async def get_bucket_id(self, bucket: str) -> str | None:
+        """Get bucket UUID from buckets table."""
+        query = "SELECT bucket_id FROM buckets WHERE bucket_name = $1"
+        row = await self.acl_repo.db.fetchrow(query, bucket)
+        return str(row["bucket_id"]) if row else None
+
     async def get_object_owner(self, bucket: str, key: str) -> str | None:
         """Get object owner (inherits from bucket owner)."""
         query = """

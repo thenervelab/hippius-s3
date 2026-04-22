@@ -46,7 +46,7 @@ mock_redis = AsyncMock()
 
 @pytest.mark.asyncio
 async def test_presigned_url_expired_short_circuits_before_api_call() -> None:
-    """Expired presigned URL should return (False, '', '') without hitting Hippius API."""
+    """Expired presigned URL should raise AccessKeyAuthError without hitting Hippius API."""
     access_key = "hip_presigned_key_12345"
 
     # Signed 2 hours ago, expires in 1 hour -> definitely expired
@@ -79,13 +79,8 @@ async def test_presigned_url_expired_short_circuits_before_api_call() -> None:
                 with patch(
                     "gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"
                 ) as mock_calc_sig:
-                    is_valid, account, token_type = await verify_access_key_presigned_url(
-                        request, access_key, mock_redis
-                    )
-
-    assert is_valid is False
-    assert account == ""
-    assert token_type == ""
+                    with pytest.raises(AccessKeyAuthError, match="expired"):
+                        await verify_access_key_presigned_url(request, access_key, mock_redis)
 
     mock_cached_auth.assert_not_awaited()
     mock_decrypt.assert_not_called()
@@ -136,13 +131,11 @@ async def test_presigned_url_valid_window_verifies_signature() -> None:
                 with patch(
                     "gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"
                 ) as mock_calc_sig:
-                    is_valid, out_account, out_token_type = await verify_access_key_presigned_url(
-                        request, access_key, mock_redis
-                    )
+                    token_auth = await verify_access_key_presigned_url(request, access_key, mock_redis)
 
-    assert is_valid is True
-    assert out_account == account_address
-    assert out_token_type == token_type
+    assert token_auth.access_key == access_key
+    assert token_auth.account_address == account_address
+    assert token_auth.token_type == token_type
 
     mock_cached_auth.assert_awaited()
     mock_canonical.assert_awaited()
@@ -202,9 +195,9 @@ async def test_canonical_query_for_presigned_excludes_signature() -> None:
                 new=fake_create_canonical_request,
             ):
                 with patch("gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"):
-                    is_valid, _, _ = await verify_access_key_presigned_url(request, access_key, mock_redis)
+                    token_auth = await verify_access_key_presigned_url(request, access_key, mock_redis)
 
-    assert is_valid is True
+    assert token_auth.access_key == access_key
     assert captured_query_string is not None
     # The canonical query string should not contain the signature parameter name
     assert "X-Amz-Signature" not in captured_query_string
@@ -271,9 +264,9 @@ async def test_presigned_url_uses_raw_path_for_canonical_path() -> None:
                 new=fake_create_canonical_request,
             ):
                 with patch("gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"):
-                    is_valid, _, _ = await verify_access_key_presigned_url(request, access_key, mock_redis)
+                    token_auth = await verify_access_key_presigned_url(request, access_key, mock_redis)
 
-    assert is_valid is True
+    assert token_auth.access_key == access_key
     assert captured_path == "/bucket/conflict65%20(3).jpg"
 
 

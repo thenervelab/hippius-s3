@@ -27,6 +27,7 @@ from hippius_s3.api.middlewares.tracing import tracing_middleware
 from hippius_s3.api.s3 import errors as s3_errors
 from hippius_s3.api.s3.public_router import router as public_router
 from hippius_s3.api.s3.router import router as s3_router_new
+from hippius_s3.api.sub_token_scopes import router as sub_token_scopes_router
 from hippius_s3.api.user import router as user_router
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.cache import create_fs_store
@@ -355,6 +356,7 @@ Disallow: /"""
         return JSONResponse(content={"status": "healthy"})
 
     app.include_router(user_router, prefix="/user")
+    app.include_router(sub_token_scopes_router, prefix="/user/sub-tokens")
     app.include_router(public_router, prefix="")
     app.include_router(s3_router_new, prefix="")
 

@@ -114,7 +114,7 @@ async def _authenticate_presigned_url(request: Request, logger: Any) -> AuthResu
     logger.debug(f"Detected presigned URL access key authentication: {credential_id[:8]}***")
 
     try:
-        is_valid, account_address, token_type = await verify_access_key_presigned_url(
+        token_auth = await verify_access_key_presigned_url(
             request=request,
             access_key=credential_id,
             redis_client=request.app.state.redis_client,
@@ -147,22 +147,13 @@ async def _authenticate_presigned_url(request: Request, logger: Any) -> AuthResu
             )
         )
 
-    if not is_valid:
-        return AuthResult(
-            error_response=s3_error_response(
-                code="SignatureDoesNotMatch",
-                message="The request signature we calculated does not match the signature you provided",
-                status_code=status.HTTP_403_FORBIDDEN,
-            )
-        )
-
     return AuthResult(
         is_valid=True,
         auth_method="access_key",
-        access_key=credential_id,
-        account_address=account_address,
-        account_id=account_address,
-        token_type=token_type,
+        access_key=token_auth.access_key,
+        account_address=token_auth.account_address,
+        account_id=token_auth.account_address,
+        token_type=token_auth.token_type,
     )
 
 
@@ -237,7 +228,7 @@ async def _authenticate_access_key_header(request: Request, credential: str, log
     logger.debug(f"Detected access key authentication: {credential[:8]}***")
 
     try:
-        is_valid, account_address, token_type = await verify_access_key_signature(
+        token_auth = await verify_access_key_signature(
             request=request,
             access_key=credential,
             redis_client=request.app.state.redis_client,
@@ -270,22 +261,13 @@ async def _authenticate_access_key_header(request: Request, credential: str, log
             )
         )
 
-    if not is_valid:
-        return AuthResult(
-            error_response=s3_error_response(
-                code="SignatureDoesNotMatch",
-                message="The request signature we calculated does not match the signature you provided",
-                status_code=status.HTTP_403_FORBIDDEN,
-            )
-        )
-
     return AuthResult(
         is_valid=True,
         auth_method="access_key",
-        access_key=credential,
-        account_address=account_address,
-        account_id=account_address,
-        token_type=token_type,
+        access_key=token_auth.access_key,
+        account_address=token_auth.account_address,
+        account_id=token_auth.account_address,
+        token_type=token_auth.token_type,
     )
 
 
