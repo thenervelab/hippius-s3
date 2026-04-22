@@ -46,6 +46,17 @@ def _error_code(e: ClientError) -> str:
     return str(e.response["Error"]["Code"])
 
 
+def _status(e: ClientError) -> int:
+    return int(e.response["ResponseMetadata"]["HTTPStatusCode"])
+
+
+def _is_forbidden(e: ClientError) -> bool:
+    """boto3 versions vary in how they parse S3 XML error codes, especially when
+    the body is small. Fall back to HTTP 403 as the source of truth — that's
+    what clients actually see."""
+    return _status(e) == 403 or _error_code(e) in ("AccessDenied", "403")
+
+
 # ---- HMAC control plane --------------------------------------------------
 
 
@@ -151,11 +162,11 @@ def test_sub_token_without_scope_default_denies(
 
     with pytest.raises(ClientError) as exc:
         boto3_sub_token_client.get_object(Bucket=scoped_bucket, Key="any-key")
-    assert _error_code(exc.value) == "AccessDenied"
+    assert _is_forbidden(exc.value)
 
     with pytest.raises(ClientError) as exc:
         boto3_sub_token_client.put_object(Bucket=scoped_bucket, Key="x", Body=b"y")
-    assert _error_code(exc.value) == "AccessDenied"
+    assert _is_forbidden(exc.value)
 
 
 def test_object_read_sub_token_can_read_but_not_write(
@@ -184,11 +195,11 @@ def test_object_read_sub_token_can_read_but_not_write(
 
     with pytest.raises(ClientError) as exc:
         boto3_sub_token_client.put_object(Bucket=scoped_bucket, Key="write.txt", Body=b"x")
-    assert _error_code(exc.value) == "AccessDenied"
+    assert _is_forbidden(exc.value)
 
     with pytest.raises(ClientError) as exc:
         boto3_sub_token_client.delete_object(Bucket=scoped_bucket, Key="readable.txt")
-    assert _error_code(exc.value) == "AccessDenied"
+    assert _is_forbidden(exc.value)
 
     sub_token_scope_client.delete(test_sub_token_access_key)
 
@@ -241,11 +252,11 @@ def test_bucket_scope_specific_denies_other_bucket(
 
     with pytest.raises(ClientError) as exc:
         boto3_sub_token_client.get_object(Bucket=other_bucket, Key="other.txt")
-    assert _error_code(exc.value) == "AccessDenied"
+    assert _is_forbidden(exc.value)
 
     with pytest.raises(ClientError) as exc:
         boto3_sub_token_client.put_object(Bucket=other_bucket, Key="x", Body=b"y")
-    assert _error_code(exc.value) == "AccessDenied"
+    assert _is_forbidden(exc.value)
 
     sub_token_scope_client.delete(test_sub_token_access_key)
 
@@ -268,7 +279,7 @@ def test_object_read_sub_token_cannot_list_buckets(
     )
     with pytest.raises(ClientError) as exc:
         boto3_sub_token_client.list_buckets()
-    assert _error_code(exc.value) == "AccessDenied"
+    assert _is_forbidden(exc.value)
     sub_token_scope_client.delete(test_sub_token_access_key)
 
 
