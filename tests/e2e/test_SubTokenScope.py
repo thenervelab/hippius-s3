@@ -124,7 +124,9 @@ def test_get_scope_wrong_account_returns_403(
             "buckets": [scoped_bucket],
         },
     )
-    resp = sub_token_scope_client.get(test_sub_token_access_key, "5FZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ")
+    # Valid 48-char SS58 that isn't the account the scope was stored against.
+    other_account = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+    resp = sub_token_scope_client.get(test_sub_token_access_key, other_account)
     assert resp.status_code == 403
     assert resp.json()["detail"]["code"] == "AccessDenied"
     sub_token_scope_client.delete(test_sub_token_access_key)
