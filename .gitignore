@@ -80,5 +80,3 @@ tests/e2e/certs/*.srl
 # Node
 node_modules/
 package-lock.json
-
-CLAUDE.md
