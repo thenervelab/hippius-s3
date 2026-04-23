@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import unquote
 
+import asyncpg
 from fastapi import Request
 from fastapi import Response
 from lxml import etree as ET  # ty: ignore[unresolved-import]
@@ -156,7 +157,7 @@ def build_copy_success_response(etag: str, last_modified: datetime) -> Response:
 
 
 async def handle_streaming_copy(
-    db: Any,
+    pool: asyncpg.Pool,
     redis_client: Any,
     request: Request,
     source_bucket: dict,
@@ -181,7 +182,7 @@ async def handle_streaming_copy(
     source_object_key = source_object["object_key"]
 
     chunks_iter = await stream_object(
-        db,
+        pool,
         redis_client,
         obj_cache,
         {
@@ -206,7 +207,7 @@ async def handle_streaming_copy(
     )
 
     content_type = str(source_object["content_type"])
-    ow = ObjectWriter(pool=db, redis_client=redis_client, fs_store=request.app.state.fs_store)
+    ow = ObjectWriter(pool=pool, redis_client=redis_client, fs_store=request.app.state.fs_store)
     put_res = await ow.put_simple_stream_full(
         bucket_id=str(dest_bucket["bucket_id"]),
         bucket_name=dest_bucket["bucket_name"],

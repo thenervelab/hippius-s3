@@ -94,8 +94,6 @@ async def handle_get_object(
             f"GET start {bucket_name}/{object_key} read_mode={hdr_mode or 'auto'} range={bool(range_header)} version={version_id or 'current'}"
         )
 
-    # Acquire only for the metadata phase; release before the StreamingResponse
-    # begins so the conn isn't held across the body write.
     db = await pool.acquire()
     try:
         # Gateway now handles all ACL/permission checks

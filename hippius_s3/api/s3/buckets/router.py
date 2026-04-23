@@ -59,7 +59,6 @@ async def get_bucket(
     if "policy" in request.query_params:
         async with pool.acquire() as conn:
             return await policy_get_bucket_policy(bucket_name, conn, request.state.account.main_account)
-    # list objects — uses the pool directly so each query auto-releases its conn
     ctx = get_request_context(request)
     return await handle_list_objects(bucket_name, ctx, pool, request.query_params.get("prefix"))
 

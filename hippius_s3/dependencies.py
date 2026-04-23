@@ -58,16 +58,9 @@ async def get_postgres(request: Request) -> AsyncGenerator["DBConnection", None]
 
 
 def get_db_pool(request: Request) -> asyncpg.Pool:
-    """
-    Dependency that returns the shared Postgres pool itself, without acquiring
-    a connection. Endpoints should call `pool.fetch(...)` / `pool.fetchrow(...)` /
-    `pool.execute(...)` (asyncpg auto-acquires + releases per call), or use
-    `async with pool.acquire() as conn:` for multi-statement / transactional work.
-
-    Prefer this over `get_postgres` for endpoints with long-running non-DB work
-    (streaming responses, slow client reads, FS/Arion operations) so a Postgres
-    connection isn't held idle for the entire request.
-    """
+    """Return the pool directly. Use for endpoints with long-running non-DB
+    work (streaming, slow client reads, FS/Arion I/O) so a connection isn't
+    held idle across the entire request."""
     pool: asyncpg.Pool = request.app.state.postgres_pool
     return pool
 

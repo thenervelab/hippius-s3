@@ -66,7 +66,7 @@ async def handle_copy_object(
         if src_multipart:
             logger.info("CopyObject multipart source: forcing streaming fallback")
             return await handle_streaming_copy(
-                db=pool,
+                pool=pool,
                 redis_client=redis_client,
                 request=request,
                 source_bucket=source_bucket,
@@ -105,7 +105,7 @@ async def handle_copy_object(
 
         logger.info(f"CopyObject using streaming fallback: {reason}")
         return await handle_streaming_copy(
-            db=pool,
+            pool=pool,
             redis_client=redis_client,
             request=request,
             source_bucket=source_bucket,
