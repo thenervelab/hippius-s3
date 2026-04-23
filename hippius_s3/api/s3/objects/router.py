@@ -74,8 +74,7 @@ async def put_object(
                 bucket_name, object_key, request, conn, request.state.seed_phrase, request.state.account.main_account
             )
     if request.headers.get("x-amz-copy-source"):
-        async with pool.acquire() as conn:
-            return await handle_copy_object(bucket_name, object_key, request, conn, redis_client)
+        return await handle_copy_object(bucket_name, object_key, request, pool, redis_client)
     return await handle_put_object(bucket_name, object_key, request, pool, redis_client)
 
 

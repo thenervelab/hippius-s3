@@ -31,9 +31,10 @@ router = APIRouter()
 @router.get("/", status_code=200)
 async def list_buckets(
     ctx: RequestContext = Depends(get_request_context),
-    db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
 ) -> Response:
-    return await handle_list_buckets(ctx, db)
+    async with pool.acquire() as conn:
+        return await handle_list_buckets(ctx, conn)
 
 
 @router.get("/{bucket_name}", status_code=200)
@@ -67,34 +68,38 @@ async def get_bucket(
 async def create_or_modify_bucket(
     bucket_name: str,
     request: Request,
-    db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
 ) -> Response:
     # Delegate to the new comprehensive handler (supports create/tagging/lifecycle/policy)
-    return await handle_create_bucket(bucket_name, request, db)
+    async with pool.acquire() as conn:
+        return await handle_create_bucket(bucket_name, request, conn)
 
 
 @router.delete("/{bucket_name}")
 async def delete_bucket_tags_route(
     bucket_name: str,
     request: Request,
-    db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
     redis_client: Any = Depends(dependencies.get_redis),
 ) -> Response:
     if "tagging" in request.query_params:
-        return await tags_delete_bucket_tags(bucket_name, db, request.state.account.main_account)
-    return await handle_delete_bucket(bucket_name, request, db, redis_client)
+        async with pool.acquire() as conn:
+            return await tags_delete_bucket_tags(bucket_name, conn, request.state.account.main_account)
+    async with pool.acquire() as conn:
+        return await handle_delete_bucket(bucket_name, request, conn, redis_client)
 
 
 @router.post("/{bucket_name}")
 async def post_bucket_subresources(
     bucket_name: str,
     request: Request,
-    db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
     redis_client: Any = Depends(dependencies.get_redis),
 ) -> Response:
     # Only subresource supported here is ?delete
     if "delete" in request.query_params:
-        return await handle_delete_objects(bucket_name, request, db, redis_client)
+        async with pool.acquire() as conn:
+            return await handle_delete_objects(bucket_name, request, conn, redis_client)
     return errors.s3_error_response(
         "NotImplemented",
         "The specified operation is not supported.",
@@ -106,6 +111,7 @@ async def post_bucket_subresources(
 async def head_bucket(
     bucket_name: str,
     request: Request,
-    db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
 ) -> Response:
-    return await handle_head_bucket(bucket_name, request, db)
+    async with pool.acquire() as conn:
+        return await handle_head_bucket(bucket_name, request, conn)

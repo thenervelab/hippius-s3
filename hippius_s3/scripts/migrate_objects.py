@@ -606,9 +606,9 @@ async def main_async(args: argparse.Namespace) -> int:
                     work_item["attempts"] = int(work_item.get("attempts") or 0) + 1
                     state_dirty.set()
 
-            task_db: Any | None = None
+            task_pool: Any | None = None
             try:
-                task_db = await asyncpg.create_pool(config.database_url, min_size=1, max_size=2)
+                task_pool = await asyncpg.create_pool(config.database_url, min_size=1, max_size=2)
                 address = str(o.get("main_account_id", ""))
 
                 if args.dry_run:
@@ -627,7 +627,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 ok = False
                 try:
                     coro = migrate_one(
-                        db=task_db,
+                        db=task_pool,
                         redis_client=redis_client,
                         object_id=o["object_id"],
                         bucket_id=o["bucket_id"],
@@ -689,9 +689,9 @@ async def main_async(args: argparse.Namespace) -> int:
                         work_item["finished_at"] = _now_ts()
                         state_dirty.set()
             finally:
-                if task_db is not None:
+                if task_pool is not None:
                     with suppress(Exception):
-                        await task_db.close()
+                        await task_pool.close()
 
         queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=max(1, concurrency * 2))
 

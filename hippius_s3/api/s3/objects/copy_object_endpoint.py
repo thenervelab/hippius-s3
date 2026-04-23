@@ -6,6 +6,7 @@ from datetime import datetime
 from datetime import timezone
 from typing import Any
 
+import asyncpg
 from fastapi import Request
 from fastapi import Response
 
@@ -29,21 +30,21 @@ async def handle_copy_object(
     bucket_name: str,
     object_key: str,
     request: Request,
-    db: Any,
+    pool: asyncpg.Pool,
     redis_client: Any,
 ) -> Response:
     try:
         source_bucket_name, source_object_key = parse_copy_source(request.headers.get("x-amz-copy-source"))
 
         user, source_bucket, dest_bucket, source_object = await resolve_copy_resources(
-            db=db,
+            db=pool,
             main_account=request.state.account.main_account,
             source_bucket_name=source_bucket_name,
             source_object_key=source_object_key,
             dest_bucket_name=bucket_name,
         )
 
-        existing_dest = await ObjectRepository(db).get_by_path(dest_bucket["bucket_id"], object_key)
+        existing_dest = await ObjectRepository(pool).get_by_path(dest_bucket["bucket_id"], object_key)
         object_id = str(existing_dest["object_id"]) if existing_dest else str(uuid.uuid4())
         copy_created_at = datetime.now(timezone.utc)
 
@@ -65,7 +66,7 @@ async def handle_copy_object(
         if src_multipart:
             logger.info("CopyObject multipart source: forcing streaming fallback")
             return await handle_streaming_copy(
-                db=db,
+                db=pool,
                 redis_client=redis_client,
                 request=request,
                 source_bucket=source_bucket,
@@ -79,7 +80,7 @@ async def handle_copy_object(
             )
 
         eligible, chunk_rows, reason = await should_use_v5_fast_path(
-            db=db,
+            db=pool,
             src_obj_row=src_obj_row,
             existing_dest=existing_dest,
             src_storage_version=src_storage_version,
@@ -90,7 +91,7 @@ async def handle_copy_object(
             assert chunk_rows is not None
             logger.info("CopyObject using v5 fast path (envelope rewrap + CID reuse)")
             return await execute_v5_fast_path_copy(
-                db=db,
+                db=pool,
                 source_bucket=source_bucket,
                 dest_bucket=dest_bucket,
                 source_object=source_object,
@@ -104,7 +105,7 @@ async def handle_copy_object(
 
         logger.info(f"CopyObject using streaming fallback: {reason}")
         return await handle_streaming_copy(
-            db=db,
+            db=pool,
             redis_client=redis_client,
             request=request,
             source_bucket=source_bucket,

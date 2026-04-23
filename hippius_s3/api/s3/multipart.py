@@ -711,12 +711,11 @@ async def upload_part(
         raise
 
 
-@router.delete("/{bucket_name}/{object_key:path}", status_code=204)
 async def abort_multipart_upload(
     _: str,
     __: str,
     request: Request,
-    db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    db: Any,
 ) -> Response:
     """Abort a multipart upload (DELETE with uploadId)."""
     upload_id = request.query_params.get("uploadId")
