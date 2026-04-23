@@ -3,6 +3,26 @@ from __future__ import annotations
 import json
 
 
+def if_none_match_matches(header_value: str | None, md5_hash: str) -> bool:
+    """Return True iff the `If-None-Match` header indicates the client already has the current version.
+
+    Accepts the S3/strong-ETag convention `"<md5_hash>"` or `"<md5_hash>-<parts>"`.
+    Also honors the `*` wildcard. Comma-separated lists are supported per RFC 7232.
+    """
+    if not header_value or not md5_hash:
+        return False
+    if header_value.strip() == "*":
+        return True
+    for token in header_value.split(","):
+        candidate = token.strip()
+        if candidate.startswith("W/"):
+            candidate = candidate[2:]
+        candidate = candidate.strip('"')
+        if candidate == md5_hash:
+            return True
+    return False
+
+
 def build_headers(
     info: dict,
     *,
