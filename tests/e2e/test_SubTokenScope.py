@@ -193,12 +193,15 @@ def test_object_read_sub_token_can_read_but_not_write(
     resp = boto3_sub_token_client.get_object(Bucket=scoped_bucket, Key="readable.txt")
     assert resp["Body"].read() == b"hi"
 
+    # DELETE first (no body, keeps the HTTP keepalive connection clean);
+    # PUT last (has a body boto3 would otherwise still be flushing when we
+    # tore the connection down, which confuses the next request on the wire).
     with pytest.raises(ClientError) as exc:
-        boto3_sub_token_client.put_object(Bucket=scoped_bucket, Key="write.txt", Body=b"x")
+        boto3_sub_token_client.delete_object(Bucket=scoped_bucket, Key="readable.txt")
     assert _is_forbidden(exc.value)
 
     with pytest.raises(ClientError) as exc:
-        boto3_sub_token_client.delete_object(Bucket=scoped_bucket, Key="readable.txt")
+        boto3_sub_token_client.put_object(Bucket=scoped_bucket, Key="write.txt", Body=b"x")
     assert _is_forbidden(exc.value)
 
     sub_token_scope_client.delete(test_sub_token_access_key)
