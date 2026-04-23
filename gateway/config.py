@@ -135,9 +135,6 @@ class GatewayConfig:
     # ATS (Apache Traffic Server) reverse-proxy cache. When ATS_CACHE_ENDPOINT is unset,
     # all PURGE + public Cache-Control logic becomes a no-op — safe default for local dev.
     ats_cache_endpoint: str = dataclasses.field(default_factory=lambda: os.getenv("ATS_CACHE_ENDPOINT", ""))
-    ats_cache_offload_buckets: set[str] = dataclasses.field(
-        default_factory=lambda: set(_parse_csv(os.getenv("ATS_CACHE_OFFLOAD_BUCKETS", "")))
-    )
 
 
 _config: GatewayConfig | None = None

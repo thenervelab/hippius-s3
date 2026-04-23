@@ -126,6 +126,20 @@ async def acl_middleware(
 
     request.state.bucket_owner_id = bucket_owner_id
 
+    # Compute anonymous_read_allowed once, before any auth-bypass paths, so
+    # master-token and presigned-URL reads of public objects also populate ATS cache.
+    # Gated on ATS being active to avoid a Redis round-trip when there's no consumer.
+    request.state.anonymous_read_allowed = False
+    if get_config().ats_cache_endpoint and request.method in ("GET", "HEAD") and key is not None:
+        request.state.anonymous_read_allowed = await acl_service.check_permission(
+            account_id=None,
+            bucket=bucket,
+            key=key,
+            permission=Permission.READ,
+            access_key=None,
+            bucket_owner_id=bucket_owner_id,
+        )
+
     if auth_method == "access_key" and token_type == "master" and bucket_owner_id == account_id:
         logger.info(f"Master token bypass for account {account_id} on bucket {bucket}")
         request.state.bucket_owner_id = bucket_owner_id
@@ -165,28 +179,6 @@ async def acl_middleware(
 
     is_anonymous = account_id is None or account_id == "anonymous"
     request.state.is_anonymous_access = is_anonymous
-
-    # Only probe AllUsers grant when ATS caching is active — otherwise no consumer.
-    # Master-token bypass above returns early, so those reads default to False and won't
-    # populate the ATS cache; the next anon reader will.
-    request.state.anonymous_read_allowed = False
-    if (
-        get_config().ats_cache_endpoint
-        and request.method in ("GET", "HEAD")
-        and key is not None
-        and permission == Permission.READ
-    ):
-        if is_anonymous:
-            request.state.anonymous_read_allowed = True
-        else:
-            request.state.anonymous_read_allowed = await acl_service.check_permission(
-                account_id=None,
-                bucket=bucket,
-                key=key,
-                permission=Permission.READ,
-                access_key=None,
-                bucket_owner_id=bucket_owner_id,
-            )
 
     response = await call_next(request)
 
