@@ -163,6 +163,20 @@ async def acl_middleware(
     is_anonymous = account_id is None or account_id == "anonymous"
     request.state.is_anonymous_access = is_anonymous
 
+    request.state.anonymous_read_allowed = False
+    if request.method in ("GET", "HEAD") and key is not None and permission == Permission.READ:
+        if is_anonymous:
+            request.state.anonymous_read_allowed = True
+        else:
+            request.state.anonymous_read_allowed = await acl_service.check_permission(
+                account_id=None,
+                bucket=bucket,
+                key=key,
+                permission=Permission.READ,
+                access_key=None,
+                bucket_owner_id=bucket_owner_id,
+            )
+
     response = await call_next(request)
 
     if is_anonymous:

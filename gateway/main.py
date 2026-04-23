@@ -10,8 +10,10 @@ from fastapi import Response
 from gateway.config import get_config
 from gateway.middlewares.account import account_middleware
 from gateway.middlewares.acl import acl_middleware
+from gateway.middlewares.ats_purge import ats_purge_middleware
 from gateway.middlewares.audit_log import audit_log_middleware
 from gateway.middlewares.auth_router import auth_router_middleware
+from gateway.middlewares.cache_control import cache_control_middleware
 from gateway.middlewares.cors import cors_middleware
 from gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
 from gateway.middlewares.input_validation import input_validation_middleware
@@ -193,6 +195,11 @@ def factory() -> FastAPI:
     app.middleware("http")(input_validation_middleware)
     if config.read_only_mode:
         app.middleware("http")(read_only_middleware)
+    # Cache-Control header injection + ATS PURGE dispatch on successful writes.
+    # Registered just inside CORS so their response-path edits happen before
+    # CORS headers are layered onto the outgoing response.
+    app.middleware("http")(ats_purge_middleware)
+    app.middleware("http")(cache_control_middleware)
     # Outermost: CORS must wrap everything so error responses get CORS headers
     app.middleware("http")(cors_middleware)
 
