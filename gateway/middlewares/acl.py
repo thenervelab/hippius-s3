@@ -163,6 +163,11 @@ async def acl_middleware(
     is_anonymous = account_id is None or account_id == "anonymous"
     request.state.is_anonymous_access = is_anonymous
 
+    # anonymous_read_allowed drives the Cache-Control emitted by cache_control_middleware.
+    # Only True when the object is readable by GROUP:AllUsers — the signal ATS needs to
+    # know it can hand a cached body to a different client. Master-token bypass above
+    # returns early, so those reads default to False (private) — acceptable since the
+    # first anon reader will populate the ATS cache.
     request.state.anonymous_read_allowed = False
     if request.method in ("GET", "HEAD") and key is not None and permission == Permission.READ:
         if is_anonymous:

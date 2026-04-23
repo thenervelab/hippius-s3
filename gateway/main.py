@@ -131,11 +131,16 @@ def factory() -> FastAPI:
 
     @app.on_event("shutdown")
     async def shutdown() -> None:
+        from gateway.services import ats_cache_client
+
         logger.info("Shutting down Hippius S3 Gateway...")
 
         if hasattr(app.state, "arion_client"):
             await app.state.arion_client.close()
             logger.info("ArionClient closed")
+
+        await ats_cache_client.close()
+        logger.info("ATS cache client closed")
 
         if hasattr(app.state, "forward_service"):
             await app.state.forward_service.close()
