@@ -11,6 +11,7 @@ from datetime import timezone
 from typing import Any
 from typing import AsyncIterator
 
+import asyncpg
 from opentelemetry import trace
 
 from hippius_s3.api.middlewares.tracing import set_span_attributes
@@ -38,8 +39,8 @@ logger = logging.getLogger(__name__)
 
 
 class ObjectWriter:
-    def __init__(self, *, db: Any, redis_client: Any, fs_store: FileSystemPartsStore | None = None) -> None:
-        self.db = db
+    def __init__(self, *, pool: asyncpg.Pool, redis_client: Any, fs_store: FileSystemPartsStore | None = None) -> None:
+        self.pool = pool
         self.redis_client = redis_client
         self.config = get_config()
         self.obj_cache = RedisObjectPartsCache(redis_client)
@@ -55,7 +56,7 @@ class ObjectWriter:
         storage_version_target: int,
         upload_backends: list[str],
     ) -> int:
-        row = await self.db.fetchrow(
+        row = await self.pool.fetchrow(
             get_query("create_migration_version"),
             object_id,
             content_type,
@@ -74,7 +75,7 @@ class ObjectWriter:
         expected_old_version: int,
         new_version: int,
     ) -> bool:
-        row = await self.db.fetchrow(
+        row = await self.pool.fetchrow(
             get_query("swap_current_version_cas"),
             object_id,
             int(expected_old_version),
@@ -139,7 +140,7 @@ class ObjectWriter:
 
         # Ensure upload row and insert part placeholder
         upload_id = await ensure_upload_row(
-            self.db,
+            self.pool,
             object_id=object_id,
             bucket_id=bucket_id,
             object_key=object_key,
@@ -147,7 +148,7 @@ class ObjectWriter:
             metadata=metadata,
         )
         await upsert_part_placeholder(
-            self.db,
+            self.pool,
             object_id=object_id,
             upload_id=str(upload_id),
             part_number=1,
@@ -208,7 +209,7 @@ class ObjectWriter:
             },
         ):
             reserve_row = await upsert_object_basic(
-                self.db,
+                self.pool,
                 object_id=object_id,
                 bucket_id=bucket_id,
                 object_key=object_key,
@@ -242,7 +243,7 @@ class ObjectWriter:
         # Write envelope to DB immediately so concurrent GETs never see NULL kek_id/wrapped_dek.
         # Without this, a GET between the upsert (which bumps current_object_version) and this
         # UPDATE would hit v5_missing_envelope_metadata → 500.
-        await self.db.execute(
+        await self.pool.execute(
             """
             UPDATE object_versions
                SET encryption_version = 5,
@@ -439,7 +440,7 @@ class ObjectWriter:
                 "storage_version": resolved_storage_version,
             },
         ):
-            await self.db.execute(
+            await self.pool.execute(
                 get_query("update_object_version_metadata"),
                 int(total_size),
                 md5_hash,
@@ -453,7 +454,7 @@ class ObjectWriter:
             # the upsert to prevent the read-race on concurrent overwrites.
 
         upload_id = await ensure_upload_row(
-            self.db,
+            self.pool,
             object_id=object_id,
             bucket_id=bucket_id,
             object_key=object_key,
@@ -462,7 +463,7 @@ class ObjectWriter:
         )
 
         await upsert_part_placeholder(
-            self.db,
+            self.pool,
             object_id=object_id,
             upload_id=str(upload_id),
             part_number=int(part_number),
@@ -511,8 +512,8 @@ class ObjectWriter:
         from hippius_s3.services.kek_service import get_bucket_kek_bytes
         from hippius_s3.services.kek_service import get_or_create_active_bucket_kek
 
-        async with self.db.transaction():
-            row = await self.db.fetchrow(
+        async with self.pool.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
                 """
                 SELECT storage_version, kek_id, wrapped_dek
                   FROM object_versions
@@ -539,7 +540,7 @@ class ObjectWriter:
             kek_id_new, kek_bytes = await get_or_create_active_bucket_kek(bucket_id=bucket_id)
             aad = f"hippius-dek:{bucket_id}:{object_id}:{int(object_version)}".encode("utf-8")
             wrapped_new = wrap_dek(kek=kek_bytes, dek=dek, aad=aad)
-            await self.db.execute(
+            await conn.execute(
                 """
                 UPDATE object_versions
                    SET encryption_version = 5,
@@ -576,7 +577,7 @@ class ObjectWriter:
 
         chunk_size = self.config.object_chunk_size_bytes
         # Resolve bucket_id for this version
-        meta = await self.db.fetchrow(
+        meta = await self.pool.fetchrow(
             """
             SELECT o.bucket_id, ov.storage_version
               FROM objects o
@@ -626,7 +627,7 @@ class ObjectWriter:
         md5_hash = await loop.run_in_executor(None, lambda: hashlib.md5(body_bytes).hexdigest())
 
         await upsert_part_placeholder(
-            self.db,
+            self.pool,
             object_id=str(object_id),
             upload_id=str(upload_id),
             part_number=int(part_number),
@@ -661,7 +662,7 @@ class ObjectWriter:
             max_size = 0
 
         # Resolve bucket_id for this version
-        meta = await self.db.fetchrow(
+        meta = await self.pool.fetchrow(
             """
             SELECT o.bucket_id, ov.storage_version
               FROM objects o
@@ -881,7 +882,7 @@ class ObjectWriter:
 
         perf_post_start = time.monotonic()
         await upsert_part_placeholder(
-            self.db,
+            self.pool,
             object_id=str(object_id),
             upload_id=str(upload_id),
             part_number=int(part_number),
@@ -916,7 +917,7 @@ class ObjectWriter:
         seed_phrase: str,
     ) -> CompleteResult:
         # Compute combined ETag from part etags for this version
-        parts = await self.db.fetch(
+        parts = await self.pool.fetch(
             get_query("get_parts_etags_for_version"),
             object_id,
             int(object_version),
@@ -926,16 +927,16 @@ class ObjectWriter:
         final_md5 = hashlib.md5(binary).hexdigest() + f"-{len(etags)}"
 
         # Total size
-        all_parts = await self.db.fetch(
+        all_parts = await self.pool.fetch(
             get_query("list_parts_for_version"),
             object_id,
             int(object_version),
         )
         total_size = sum(int(p["size_bytes"]) for p in all_parts)
 
-        async with self.db.transaction():
+        async with self.pool.acquire() as conn, conn.transaction():
             # Update object_versions
-            await self.db.execute(
+            await conn.execute(
                 """
                 UPDATE object_versions ov
                 SET md5_hash = $1,
@@ -951,7 +952,7 @@ class ObjectWriter:
             )
 
             # Mark MPU completed
-            await self.db.execute(
+            await conn.execute(
                 "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
                 upload_id,
             )
@@ -970,7 +971,7 @@ class ObjectWriter:
         body_iter: AsyncIterator[bytes],
     ) -> dict:
         """Append bytes with CAS, cache write-through, and enqueue (streaming)."""
-        row = await self.db.fetchrow(
+        row = await self.pool.fetchrow(
             """
             SELECT o.object_id, o.current_object_version AS cov
             FROM objects o
@@ -989,8 +990,8 @@ class ObjectWriter:
         next_part = None
         upload_id = None
 
-        async with self.db.transaction():
-            locked = await self.db.fetchrow(
+        async with self.pool.acquire() as conn, conn.transaction():
+            locked = await conn.fetchrow(
                 """
                 SELECT append_version
                   FROM object_versions
@@ -1006,7 +1007,7 @@ class ObjectWriter:
             if expected_version != current_version:
                 raise AppendPreconditionFailed(current_version)
 
-            next_part = await self.db.fetchval(
+            next_part = await conn.fetchval(
                 """
                 SELECT COALESCE(MAX(part_number), 0) + 1
                   FROM parts
@@ -1015,7 +1016,7 @@ class ObjectWriter:
                 object_id,
                 cov,
             )
-            upload_row = await self.db.fetchrow(
+            upload_row = await conn.fetchrow(
                 "SELECT upload_id FROM multipart_uploads WHERE object_id = $1 ORDER BY initiated_at DESC LIMIT 1",
                 object_id,
             )
@@ -1023,7 +1024,7 @@ class ObjectWriter:
                 upload_id = str(upload_row["upload_id"])
             else:
                 upload_id = str(uuid.uuid4())
-                await self.db.execute(
+                await conn.execute(
                     """
                     INSERT INTO multipart_uploads (upload_id, bucket_id, object_key, initiated_at, is_completed, content_type, metadata, object_id)
                     VALUES ($1, (SELECT bucket_id FROM buckets WHERE bucket_name = $2 LIMIT 1), $3, NOW(), TRUE, 'application/octet-stream', '{}', $4)
@@ -1035,7 +1036,7 @@ class ObjectWriter:
                     object_id,
                 )
 
-            await self.db.execute(
+            await conn.execute(
                 """
                 INSERT INTO parts (part_id, upload_id, part_number, ipfs_cid, size_bytes, etag, uploaded_at, object_id, object_version, chunk_size_bytes)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -1057,7 +1058,7 @@ class ObjectWriter:
             raise RuntimeError("append_reservation_failed")
 
         async def _delete_part_row() -> None:
-            await self.db.execute(
+            await self.pool.execute(
                 "DELETE FROM parts WHERE object_id = $1 AND object_version = $2 AND part_number = $3",
                 object_id,
                 int(cov),
@@ -1129,8 +1130,8 @@ class ObjectWriter:
         num_chunks = int(meta.get("num_chunks", 0)) if meta else None
 
         try:
-            async with self.db.transaction():
-                locked = await self.db.fetchrow(
+            async with self.pool.acquire() as conn, conn.transaction():
+                locked = await conn.fetchrow(
                     """
                     SELECT append_version,
                            md5_hash,
@@ -1150,7 +1151,7 @@ class ObjectWriter:
 
                 seed_md5s = b""
                 if not bool(locked.get("has_etag_md5s")):
-                    parts = await self.db.fetch(
+                    parts = await conn.fetch(
                         "SELECT part_number, etag FROM parts WHERE object_id = $1 AND object_version = $2 ORDER BY part_number",
                         object_id,
                         cov,
@@ -1171,7 +1172,7 @@ class ObjectWriter:
                             md5s.append(bytes.fromhex(e))
                     seed_md5s = b"".join(md5s)
 
-                updated = await self.db.fetchrow(
+                updated = await conn.fetchrow(
                     """
                     UPDATE object_versions
                        SET size_bytes     = size_bytes + $3,
@@ -1212,7 +1213,7 @@ class ObjectWriter:
                     str(part_res.etag),
                 )
                 if not updated:
-                    fresh = await self.db.fetchval(
+                    fresh = await conn.fetchval(
                         "SELECT append_version FROM object_versions WHERE object_id = $1 AND object_version = $2",
                         object_id,
                         cov,

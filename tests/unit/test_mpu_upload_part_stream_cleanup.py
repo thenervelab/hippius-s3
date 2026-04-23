@@ -28,7 +28,7 @@ async def test_mpu_upload_part_stream_cleans_up_on_oversize(tmp_path, monkeypatc
     object_id = str(uuid.uuid4())
     fs_store = FileSystemPartsStore(str(tmp_path))
 
-    class DummyDB:
+    class DummyPool:
         async def fetchrow(self, *_args, **_kwargs):
             return {"bucket_id": "bucket", "storage_version": 5, "kek_id": "kek-1", "wrapped_dek": b"\x00" * 48}
 
@@ -49,7 +49,7 @@ async def test_mpu_upload_part_stream_cleans_up_on_oversize(tmp_path, monkeypatc
         yield b"abcd"
         yield b"ef"
 
-    writer = ObjectWriter(db=DummyDB(), redis_client=DummyRedis(), fs_store=fs_store)
+    writer = ObjectWriter(pool=DummyPool(), redis_client=DummyRedis(), fs_store=fs_store)
     monkeypatch.setattr(writer, "_ensure_and_get_v5_dek", fake_ensure_dek)
 
     try:

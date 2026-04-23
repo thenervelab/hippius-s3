@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import asyncpg
 from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import Request
@@ -24,7 +25,7 @@ async def get_public_object(
     bucket_name: str,
     object_key: str,
     request: Request,
-    db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
     redis_client: Any = Depends(dependencies.get_redis),
 ) -> Response:
     """Anonymous GET object endpoint for public buckets."""
@@ -37,7 +38,7 @@ async def get_public_object(
             status_code=403,
         )
     # Call the regular get_object handler with anonymous account
-    response = await handle_get_object(bucket_name, object_key, request, db, redis_client)
+    response = await handle_get_object(bucket_name, object_key, request, pool, redis_client)
 
     # Add anonymous access header
     response.headers["x-hippius-access-mode"] = "anon"
@@ -49,7 +50,7 @@ async def head_public_object(
     bucket_name: str,
     object_key: str,
     request: Request,
-    db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
 ) -> Response:
     """Anonymous HEAD object endpoint for public buckets."""
     # Whitelist: only allow HEAD with no special query parameters
@@ -60,7 +61,7 @@ async def head_public_object(
             status_code=403,
         )
     # Call the regular head_object handler with anonymous account
-    response = await handle_head_object(bucket_name, object_key, request, db)
+    response = await handle_head_object(bucket_name, object_key, request, pool)
 
     # Add anonymous access header
     response.headers["x-hippius-access-mode"] = "anon"

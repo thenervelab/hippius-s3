@@ -7,6 +7,7 @@ from datetime import datetime
 from datetime import timezone
 from typing import Any
 
+import asyncpg
 from fastapi import Request
 from fastapi import Response
 from opentelemetry import trace
@@ -33,7 +34,7 @@ async def handle_get_object(
     bucket_name: str,
     object_key: str,
     request: Request,
-    db: Any,
+    pool: asyncpg.Pool,
     redis_client: Any,
 ) -> Response:
     """Isolated GET object endpoint handler."""
@@ -43,13 +44,14 @@ async def handle_get_object(
             from hippius_s3.api.s3.objects.tagging_endpoint import get_object_tags  # local import to avoid cycles
 
             account = getattr(request.state, "account", None)
-            return await get_object_tags(
-                bucket_name,
-                object_key,
-                db,
-                getattr(request.state, "seed_phrase", ""),
-                account.main_account if account else "",
-            )
+            async with pool.acquire() as conn:
+                return await get_object_tags(
+                    bucket_name,
+                    object_key,
+                    conn,
+                    getattr(request.state, "seed_phrase", ""),
+                    account.main_account if account else "",
+                )
 
     # List parts for an ongoing multipart upload
     if "uploadId" in request.query_params:
@@ -60,7 +62,8 @@ async def handle_get_object(
         ):
             from hippius_s3.api.s3.multipart import list_parts_internal
 
-            return await list_parts_internal(bucket_name, object_key, request, db)
+            async with pool.acquire() as conn:
+                return await list_parts_internal(bucket_name, object_key, request, conn)
 
     # Parse versionId query parameter
     version_id = None
@@ -91,6 +94,7 @@ async def handle_get_object(
             f"GET start {bucket_name}/{object_key} read_mode={hdr_mode or 'auto'} range={bool(range_header)} version={version_id or 'current'}"
         )
 
+    db = await pool.acquire()
     try:
         # Gateway now handles all ACL/permission checks
         # Backend trusts the account information from gateway
@@ -391,3 +395,6 @@ async def handle_get_object(
             message=f"We encountered an internal error: {str(e)}. Please try again.",
             status_code=500,
         )
+
+    finally:
+        await pool.release(db)
