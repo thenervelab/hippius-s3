@@ -21,7 +21,12 @@ async def cache_control_middleware(
 
     if request.method not in ("GET", "HEAD"):
         return response
+
+    # Explicit no-store on non-cacheable statuses (4xx/5xx) prevents ATS from
+    # falling back to its heuristic negative-caching defaults and serving a
+    # stale 404 for minutes after the object has been uploaded.
     if response.status_code not in (200, 206, 304):
+        response.headers["Cache-Control"] = PRIVATE_CACHE_CONTROL
         return response
 
     bucket = getattr(request.state, "s3_bucket", None)
