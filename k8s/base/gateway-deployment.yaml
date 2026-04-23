@@ -131,6 +131,16 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_DELETE_BACKENDS
+            - name: ATS_CACHE_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ATS_CACHE_ENDPOINT
+            - name: ATS_CACHE_OFFLOAD_BUCKETS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ATS_CACHE_OFFLOAD_BUCKETS
           startupProbe:
             httpGet:
               path: /health
