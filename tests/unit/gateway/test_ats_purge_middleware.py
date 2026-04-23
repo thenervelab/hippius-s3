@@ -9,7 +9,16 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
+from gateway import config as gateway_config
 from gateway.middlewares.ats_purge import ats_purge_middleware
+
+
+@pytest.fixture(autouse=True)  # type: ignore[misc]
+def _ats_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ATS_CACHE_ENDPOINT", "http://ats.local:8080")
+    gateway_config._config = None
+    yield
+    gateway_config._config = None
 
 
 @pytest.fixture  # type: ignore[misc]
@@ -162,3 +171,16 @@ async def test_host_header_propagated(app: Any, captured_purges: list[tuple[str,
         r = await client.put("/mybucket/k", content=b"x")
     assert r.status_code == 200
     assert captured_purges == [("s3-staging.hippius.com", "mybucket/k")]
+
+
+@pytest.mark.asyncio
+async def test_middleware_is_noop_when_endpoint_unset(
+    app: Any, captured_purges: list[tuple[str, str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Early-return path: no PURGE scheduled when ATS_CACHE_ENDPOINT is empty."""
+    monkeypatch.setenv("ATS_CACHE_ENDPOINT", "")
+    gateway_config._config = None
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://s3.hippius.com") as client:
+        r = await client.put("/mybucket/k", content=b"x")
+    assert r.status_code == 200
+    assert captured_purges == []

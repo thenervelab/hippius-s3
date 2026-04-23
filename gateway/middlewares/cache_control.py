@@ -26,7 +26,10 @@ async def cache_control_middleware(
     if response.status_code not in (200, 206, 304):
         return response
 
-    bucket, key = parse_s3_path(request.url.path)
+    bucket = getattr(request.state, "s3_bucket", None)
+    key = getattr(request.state, "s3_key", None)
+    if bucket is None:
+        bucket, key = parse_s3_path(request.url.path)
     if not bucket or not key:
         response.headers["Cache-Control"] = PRIVATE_CACHE_CONTROL
         return response

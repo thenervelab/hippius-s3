@@ -12,7 +12,17 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
+from gateway import config as gateway_config
 from gateway.middlewares.acl import acl_middleware
+
+
+@pytest.fixture(autouse=True)  # type: ignore[misc]
+def _ats_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Enable ATS so the anonymous_read_allowed probe runs."""
+    monkeypatch.setenv("ATS_CACHE_ENDPOINT", "http://ats.local:8080")
+    gateway_config._config = None
+    yield
+    gateway_config._config = None
 
 
 def _build_app(acl_service: Any, *, account_id: str | None = None) -> Any:
@@ -132,3 +142,17 @@ async def test_authenticated_check_permission_called_twice() -> None:
     assert service.check_permission.await_count == 2
     seen_account_ids = {call.kwargs["account_id"] for call in service.check_permission.await_args_list}
     assert seen_account_ids == {"alice", None}
+
+
+@pytest.mark.asyncio
+async def test_probe_skipped_when_ats_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When ATS is off, the anon-read probe is skipped to save a Redis round-trip."""
+    monkeypatch.setenv("ATS_CACHE_ENDPOINT", "")
+    gateway_config._config = None
+    service = _make_service(primary_permits=True, anon_permits=True)
+    app = _build_app(service, account_id="alice")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.get("/public-bucket/foo.txt")
+    assert r.status_code == 200
+    assert r.json()["anonymous_read_allowed"] is False
+    assert service.check_permission.await_count == 1

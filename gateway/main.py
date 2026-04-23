@@ -200,9 +200,7 @@ def factory() -> FastAPI:
     app.middleware("http")(input_validation_middleware)
     if config.read_only_mode:
         app.middleware("http")(read_only_middleware)
-    # Cache-Control header injection + ATS PURGE dispatch on successful writes.
-    # Registered just inside CORS so their response-path edits happen before
-    # CORS headers are layered onto the outgoing response.
+    # Inside CORS so Cache-Control lands before CORS wraps the response.
     app.middleware("http")(ats_purge_middleware)
     app.middleware("http")(cache_control_middleware)
     # Outermost: CORS must wrap everything so error responses get CORS headers

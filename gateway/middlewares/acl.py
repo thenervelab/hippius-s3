@@ -4,6 +4,7 @@ from typing import Callable
 from fastapi import Request
 from fastapi import Response
 
+from gateway.config import get_config
 from gateway.utils.errors import s3_error_response
 from hippius_s3.models.acl import Permission
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
@@ -89,6 +90,8 @@ async def acl_middleware(
         return await call_next(request)
 
     bucket, key = parse_s3_path(path)
+    request.state.s3_bucket = bucket
+    request.state.s3_key = key
 
     if bucket is None:
         return await call_next(request)
@@ -163,13 +166,16 @@ async def acl_middleware(
     is_anonymous = account_id is None or account_id == "anonymous"
     request.state.is_anonymous_access = is_anonymous
 
-    # anonymous_read_allowed drives the Cache-Control emitted by cache_control_middleware.
-    # Only True when the object is readable by GROUP:AllUsers — the signal ATS needs to
-    # know it can hand a cached body to a different client. Master-token bypass above
-    # returns early, so those reads default to False (private) — acceptable since the
-    # first anon reader will populate the ATS cache.
+    # Only probe AllUsers grant when ATS caching is active — otherwise no consumer.
+    # Master-token bypass above returns early, so those reads default to False and won't
+    # populate the ATS cache; the next anon reader will.
     request.state.anonymous_read_allowed = False
-    if request.method in ("GET", "HEAD") and key is not None and permission == Permission.READ:
+    if (
+        get_config().ats_cache_endpoint
+        and request.method in ("GET", "HEAD")
+        and key is not None
+        and permission == Permission.READ
+    ):
         if is_anonymous:
             request.state.anonymous_read_allowed = True
         else:

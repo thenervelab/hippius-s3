@@ -12,11 +12,20 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
+from gateway import config as gateway_config
 from gateway.middlewares.acl import acl_middleware
 from gateway.middlewares.ats_purge import ats_purge_middleware
 from gateway.middlewares.cache_control import PRIVATE_CACHE_CONTROL
 from gateway.middlewares.cache_control import REVALIDATE_ALWAYS
 from gateway.middlewares.cache_control import cache_control_middleware
+
+
+@pytest.fixture(autouse=True)  # type: ignore[misc]
+def _ats_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ATS_CACHE_ENDPOINT", "http://ats.local:8080")
+    gateway_config._config = None
+    yield
+    gateway_config._config = None
 
 
 def _make_service(*, primary: bool = True, anon: bool = False) -> Any:
