@@ -164,7 +164,6 @@ jobs:
             --from-literal=HIPPIUS_DOWNLOAD_BACKENDS='${{ secrets.HIPPIUS_DOWNLOAD_BACKENDS }}' \
             --from-literal=HIPPIUS_DELETE_BACKENDS='${{ secrets.HIPPIUS_DELETE_BACKENDS }}' \
             --from-literal=ATS_CACHE_ENDPOINT='${{ secrets.ATS_CACHE_ENDPOINT }}' \
-            --from-literal=ATS_CACHE_OFFLOAD_BUCKETS='${{ secrets.ATS_CACHE_OFFLOAD_BUCKETS }}' \
             --namespace=hippius-s3-staging \
             --dry-run=client -o yaml | kubectl apply -f -
 
@@ -294,7 +293,6 @@ jobs:
             --from-literal=HIPPIUS_DOWNLOAD_BACKENDS="${{ secrets.HIPPIUS_DOWNLOAD_BACKENDS }}" \
             --from-literal=HIPPIUS_DELETE_BACKENDS="${{ secrets.HIPPIUS_DELETE_BACKENDS }}" \
             --from-literal=ATS_CACHE_ENDPOINT="${{ secrets.ATS_CACHE_ENDPOINT }}" \
-            --from-literal=ATS_CACHE_OFFLOAD_BUCKETS="${{ secrets.ATS_CACHE_OFFLOAD_BUCKETS }}" \
             --namespace=hippius-s3-prod \
             --dry-run=client -o yaml | kubectl apply -f -
 

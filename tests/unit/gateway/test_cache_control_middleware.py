@@ -9,10 +9,8 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.config import get_config
 from gateway.middlewares.cache_control import PRIVATE_CACHE_CONTROL
-from gateway.middlewares.cache_control import REVALIDATE_ALWAYS
-from gateway.middlewares.cache_control import STANDARD_PUBLIC
+from gateway.middlewares.cache_control import PUBLIC_CACHE_CONTROL
 from gateway.middlewares.cache_control import cache_control_middleware
 
 
@@ -42,28 +40,17 @@ async def test_private_bucket_gets_no_store(app: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_public_bucket_default_is_revalidate_always(app: Any) -> None:
+async def test_public_bucket_gets_cacheable_policy(app: Any) -> None:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         r = await client.get("/public-bucket/foo.txt", headers={"x-test-anon-read": "true"})
-    assert r.headers["Cache-Control"] == REVALIDATE_ALWAYS
+    assert r.headers["Cache-Control"] == PUBLIC_CACHE_CONTROL
 
 
 @pytest.mark.asyncio
-async def test_offload_bucket_gets_standard_public(app: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    get_config().ats_cache_offload_buckets.add("assets")
-    try:
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            r = await client.get("/assets/icon.png", headers={"x-test-anon-read": "true"})
-        assert r.headers["Cache-Control"] == STANDARD_PUBLIC
-    finally:
-        get_config().ats_cache_offload_buckets.discard("assets")
-
-
-@pytest.mark.asyncio
-async def test_head_public_bucket_gets_revalidate_always(app: Any) -> None:
+async def test_head_public_bucket_gets_cacheable_policy(app: Any) -> None:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         r = await client.head("/public-bucket/foo.txt", headers={"x-test-anon-read": "true"})
-    assert r.headers["Cache-Control"] == REVALIDATE_ALWAYS
+    assert r.headers["Cache-Control"] == PUBLIC_CACHE_CONTROL
 
 
 @pytest.mark.asyncio
@@ -98,7 +85,7 @@ async def test_304_response_still_gets_cache_control(app: Any) -> None:
             headers={"x-test-status": "304", "x-test-anon-read": "true"},
         )
     assert r.status_code == 304
-    assert r.headers["Cache-Control"] == REVALIDATE_ALWAYS
+    assert r.headers["Cache-Control"] == PUBLIC_CACHE_CONTROL
 
 
 @pytest.mark.asyncio
@@ -109,7 +96,7 @@ async def test_partial_content_206_gets_cache_control(app: Any) -> None:
             headers={"x-test-status": "206", "x-test-anon-read": "true"},
         )
     assert r.status_code == 206
-    assert r.headers["Cache-Control"] == REVALIDATE_ALWAYS
+    assert r.headers["Cache-Control"] == PUBLIC_CACHE_CONTROL
 
 
 @pytest.mark.asyncio

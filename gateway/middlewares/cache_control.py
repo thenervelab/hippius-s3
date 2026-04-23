@@ -6,12 +6,10 @@ from typing import Callable
 from fastapi import Request
 from fastapi import Response
 
-from gateway.config import get_config
 from gateway.middlewares.acl import parse_s3_path
 
 
-REVALIDATE_ALWAYS = "public, max-age=0, must-revalidate"
-STANDARD_PUBLIC = "public, max-age=300, stale-while-revalidate=60"
+PUBLIC_CACHE_CONTROL = "public, max-age=300, stale-while-revalidate=60"
 PRIVATE_CACHE_CONTROL = "private, no-store"
 
 
@@ -34,14 +32,8 @@ async def cache_control_middleware(
         response.headers["Cache-Control"] = PRIVATE_CACHE_CONTROL
         return response
 
-    anon_readable = bool(getattr(request.state, "anonymous_read_allowed", False))
-    if not anon_readable:
-        response.headers["Cache-Control"] = PRIVATE_CACHE_CONTROL
-        return response
-
-    offload = get_config().ats_cache_offload_buckets
-    if bucket in offload:
-        response.headers["Cache-Control"] = STANDARD_PUBLIC
+    if getattr(request.state, "anonymous_read_allowed", False):
+        response.headers["Cache-Control"] = PUBLIC_CACHE_CONTROL
     else:
-        response.headers["Cache-Control"] = REVALIDATE_ALWAYS
+        response.headers["Cache-Control"] = PRIVATE_CACHE_CONTROL
     return response

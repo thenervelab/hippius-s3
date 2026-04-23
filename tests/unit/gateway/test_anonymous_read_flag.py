@@ -25,7 +25,13 @@ def _ats_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     gateway_config._config = None
 
 
-def _build_app(acl_service: Any, *, account_id: str | None = None) -> Any:
+def _build_app(
+    acl_service: Any,
+    *,
+    account_id: str | None = None,
+    auth_method: str | None = None,
+    token_type: str | None = None,
+) -> Any:
     app = FastAPI()
     app.state.acl_service = acl_service
 
@@ -35,6 +41,8 @@ def _build_app(acl_service: Any, *, account_id: str | None = None) -> Any:
 
     async def stub_auth(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
         request.state.account_id = account_id
+        request.state.auth_method = auth_method
+        request.state.token_type = token_type
         return await call_next(request)
 
     app.middleware("http")(acl_middleware)
@@ -156,3 +164,28 @@ async def test_probe_skipped_when_ats_disabled(monkeypatch: pytest.MonkeyPatch) 
     assert r.status_code == 200
     assert r.json()["anonymous_read_allowed"] is False
     assert service.check_permission.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_master_token_read_on_public_bucket_sets_flag_true() -> None:
+    """Master-token owner reading a public object — flag must be True so ATS caches it.
+
+    Regression guard: the master-token bypass runs AFTER anonymous_read_allowed is computed.
+    """
+    service = _make_service(primary_permits=True, anon_permits=True)
+    app = _build_app(service, account_id="owner-id", auth_method="access_key", token_type="master")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.get("/public-bucket/foo.txt")
+    assert r.status_code == 200
+    assert r.json()["anonymous_read_allowed"] is True
+
+
+@pytest.mark.asyncio
+async def test_master_token_read_on_private_object_sets_flag_false() -> None:
+    """Master-token owner reading a private object — flag False so ATS does not cache it."""
+    service = _make_service(primary_permits=True, anon_permits=False)
+    app = _build_app(service, account_id="owner-id", auth_method="access_key", token_type="master")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.get("/private-bucket/foo.txt")
+    assert r.status_code == 200
+    assert r.json()["anonymous_read_allowed"] is False

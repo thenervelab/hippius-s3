@@ -16,7 +16,7 @@ from gateway import config as gateway_config
 from gateway.middlewares.acl import acl_middleware
 from gateway.middlewares.ats_purge import ats_purge_middleware
 from gateway.middlewares.cache_control import PRIVATE_CACHE_CONTROL
-from gateway.middlewares.cache_control import REVALIDATE_ALWAYS
+from gateway.middlewares.cache_control import PUBLIC_CACHE_CONTROL
 from gateway.middlewares.cache_control import cache_control_middleware
 
 
@@ -83,7 +83,7 @@ async def test_anon_get_public_bucket_emits_public_cache_control(monkeypatch: py
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://s3.hippius.com") as client:
         r = await client.get("/public-bucket/foo.txt")
     assert r.status_code == 200
-    assert r.headers["Cache-Control"] == REVALIDATE_ALWAYS
+    assert r.headers["Cache-Control"] == PUBLIC_CACHE_CONTROL
     assert purges == []
 
 
