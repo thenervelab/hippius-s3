@@ -5,6 +5,7 @@ from typing import Any
 from typing import AsyncGenerator
 from typing import Union
 
+import asyncpg
 from fastapi import HTTPException
 from fastapi import Request
 from redis.asyncio import Redis
@@ -54,6 +55,14 @@ async def get_postgres(request: Request) -> AsyncGenerator["DBConnection", None]
         yield db
     finally:
         await db.close()
+
+
+def get_db_pool(request: Request) -> asyncpg.Pool:
+    """Return the pool directly. Use for endpoints with long-running non-DB
+    work (streaming, slow client reads, FS/Arion I/O) so a connection isn't
+    held idle across the entire request."""
+    pool: asyncpg.Pool = request.app.state.postgres_pool
+    return pool
 
 
 def get_config(request: Request) -> Config:

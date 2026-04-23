@@ -10,7 +10,6 @@ resources:
   - postgres-cluster.yaml
   - postgres-scheduledbackup.yaml
   - redis-statefulsets.yaml
-  - ipfs-statefulset.yaml
   - migration-job.yaml
   - api-deployment.yaml
   - gateway-deployment.yaml

@@ -11,8 +11,27 @@ from httpx import ASGITransport
 from httpx import AsyncClient
 
 from hippius_s3.api.s3.buckets.router import router
-from hippius_s3.dependencies import get_postgres
+from hippius_s3.dependencies import get_db_pool
 from hippius_s3.models.account import HippiusAccount
+
+
+def _make_mock_pool() -> Any:
+    mock_db = AsyncMock()
+
+    @asynccontextmanager
+    async def dummy_transaction() -> Any:
+        yield
+
+    mock_db.transaction = dummy_transaction
+    mock_db.fetchrow = AsyncMock()
+
+    @asynccontextmanager
+    async def acquire() -> Any:
+        yield mock_db
+
+    mock_pool = AsyncMock()
+    mock_pool.acquire = acquire
+    return mock_pool
 
 
 @pytest.fixture
@@ -31,17 +50,7 @@ def bucket_app() -> Any:
         )
         return await call_next(request)
 
-    @asynccontextmanager
-    async def dummy_transaction() -> Any:
-        yield
-
-    async def override_get_postgres() -> Any:
-        mock_db = AsyncMock()
-        mock_db.transaction = dummy_transaction
-        mock_db.fetchrow = AsyncMock()
-        yield mock_db
-
-    app.dependency_overrides[get_postgres] = override_get_postgres
+    app.dependency_overrides[get_db_pool] = _make_mock_pool
 
     return app
 
@@ -76,17 +85,7 @@ async def test_create_bucket_allows_own_ss58_address() -> None:
         )
         return await call_next(request)
 
-    @asynccontextmanager
-    async def dummy_transaction() -> Any:
-        yield
-
-    async def override_get_postgres() -> Any:
-        mock_db = AsyncMock()
-        mock_db.transaction = dummy_transaction
-        mock_db.fetchrow = AsyncMock()
-        yield mock_db
-
-    app.dependency_overrides[get_postgres] = override_get_postgres
+    app.dependency_overrides[get_db_pool] = _make_mock_pool
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.put(f"/{ss58_bucket}")

@@ -100,7 +100,9 @@ async def handle_append(
     # Endpoint delegates CAS and locking to writer.append
 
     # PHASE 2 (out-of-DB): delegate to ObjectWriter to append, cache, and update version
-    writer = ObjectWriter(db=db, redis_client=redis_client, fs_store=request.app.state.fs_store)
+    writer = ObjectWriter(
+        pool=request.app.state.postgres_pool, redis_client=redis_client, fs_store=request.app.state.fs_store
+    )
     try:
         result = await writer.append_stream(
             bucket_id=bucket_id,

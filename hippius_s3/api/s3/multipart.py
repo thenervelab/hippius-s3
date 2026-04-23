@@ -13,6 +13,7 @@ from datetime import timezone
 from typing import Any
 from urllib.parse import unquote
 
+import asyncpg
 from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import Request
@@ -66,7 +67,7 @@ async def handle_post_object(
     bucket_name: str,
     object_key: str,
     request: Request,
-    db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
 ) -> Response:
     """
     Handle POST requests for objects:
@@ -78,12 +79,13 @@ async def handle_post_object(
     # Check for uploads parameter (Initiate Multipart Upload)
     if "uploads" in request.query_params:
         with tracer.start_as_current_span("multipart.route_initiate"):
-            return await initiate_multipart_upload(
-                bucket_name,
-                object_key,
-                request,
-                db,
-            )
+            async with pool.acquire() as conn:
+                return await initiate_multipart_upload(
+                    bucket_name,
+                    object_key,
+                    request,
+                    conn,
+                )
 
     # Check for uploadId parameter (Complete Multipart Upload)
     if "uploadId" in request.query_params:
@@ -93,13 +95,14 @@ async def handle_post_object(
                 "multipart.route_complete",
                 attributes={"upload_id": upload_id, "has_upload_id": True},
             ):
-                return await complete_multipart_upload(
-                    bucket_name,
-                    object_key,
-                    upload_id,
-                    request,
-                    db,
-                )
+                async with pool.acquire() as conn:
+                    return await complete_multipart_upload(
+                        bucket_name,
+                        object_key,
+                        upload_id,
+                        request,
+                        conn,
+                    )
 
     # Not a multipart operation we handle
     return s3_error_response("InvalidRequest", "Unsupported multipart POST request", status_code=400)
@@ -338,7 +341,7 @@ async def get_all_cached_chunks(
 
 async def upload_part(
     request: Request,
-    db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    pool: asyncpg.Pool,
 ) -> Response:
     """Upload a part for a multipart upload (PUT with partNumber & uploadId)."""
     # These two parameters are required for multipart upload parts
@@ -369,7 +372,7 @@ async def upload_part(
         )
 
     # Check if the multipart upload exists
-    ongoing_multipart_upload = await db.fetchrow(
+    ongoing_multipart_upload = await pool.fetchrow(
         get_query("get_multipart_upload"),
         upload_id,
     )
@@ -419,16 +422,16 @@ async def upload_part(
             range_end = int(m.group(2))
 
         # Resolve source object and fetch bytes from IPFS (require CID available)
-        _ = await db.fetchrow(
+        _ = await pool.fetchrow(
             get_query("get_or_create_user_by_main_account"),
             request.state.account.main_account,
             datetime.now(timezone.utc),
         )
-        source_bucket = await db.fetchrow(get_query("get_bucket_by_name"), source_bucket_name)
+        source_bucket = await pool.fetchrow(get_query("get_bucket_by_name"), source_bucket_name)
         if not source_bucket:
             return s3_error_response("NoSuchBucket", f"Bucket {source_bucket_name} does not exist", status_code=404)
 
-        source_obj = await db.fetchrow(get_query("get_object_by_path"), source_bucket["bucket_id"], source_object_key)
+        source_obj = await pool.fetchrow(get_query("get_object_by_path"), source_bucket["bucket_id"], source_object_key)
         if not source_obj:
             return s3_error_response("NoSuchKey", f"Key {source_object_key} not found", status_code=404)
 
@@ -446,7 +449,7 @@ async def upload_part(
 
         object_id_str = str(source_obj["object_id"])
         src_ver = int(source_obj.get("object_version") or 1)
-        parts = await read_parts_list(db, object_id_str, src_ver)
+        parts = await read_parts_list(pool, object_id_str, src_ver)
         rng = None
         source_size = int(source_obj.get("size_bytes") or 0)
         if range_start is not None and range_end is not None:
@@ -457,7 +460,7 @@ async def upload_part(
             from hippius_s3.reader.types import RangeRequest  # local import
 
             rng = RangeRequest(start=int(range_start), end=int(range_end))
-        plan = await build_chunk_plan(db, object_id_str, parts, rng, object_version=src_ver)
+        plan = await build_chunk_plan(pool, object_id_str, parts, rng, object_version=src_ver)
 
         # Enqueue downloader for any missing chunk indices in cache
         obj_cache = RedisObjectPartsCache(request.app.state.redis_client)
@@ -471,7 +474,7 @@ async def upload_part(
             dl_parts: list[PartToDownload] = []
             for pn, idxs in indices_by_part.items():
                 try:
-                    rows = await db.fetch(
+                    rows = await pool.fetch(
                         get_query("get_part_chunks_by_object_and_number"),
                         object_id_str,
                         src_ver,
@@ -575,7 +578,7 @@ async def upload_part(
         # Store in Redis via chunked cache API (encrypt for private, meta-first for readiness)
         # Resolve destination bucket name for key lookup
         try:
-            row = await db.fetchrow(
+            row = await pool.fetchrow(
                 """
                 SELECT b.bucket_name
                 FROM multipart_uploads mu
@@ -594,7 +597,7 @@ async def upload_part(
 
         redis_start = time.time()
         # Route through ObjectWriter for standardized behavior
-        writer = ObjectWriter(db=db, redis_client=redis_client, fs_store=request.app.state.fs_store)
+        writer = ObjectWriter(pool=pool, redis_client=redis_client, fs_store=request.app.state.fs_store)
         try:
             part_res = await writer.mpu_upload_part_stream(
                 upload_id=str(upload_id),
@@ -708,12 +711,11 @@ async def upload_part(
         raise
 
 
-@router.delete("/{bucket_name}/{object_key:path}", status_code=204)
 async def abort_multipart_upload(
     _: str,
     __: str,
     request: Request,
-    db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    db: Any,
 ) -> Response:
     """Abort a multipart upload (DELETE with uploadId)."""
     upload_id = request.query_params.get("uploadId")
@@ -1014,7 +1016,11 @@ async def complete_multipart_upload(
                 status_code=400,
             )
 
-        writer = ObjectWriter(db=db, redis_client=request.app.state.redis_client, fs_store=request.app.state.fs_store)
+        writer = ObjectWriter(
+            pool=request.app.state.postgres_pool,
+            redis_client=request.app.state.redis_client,
+            fs_store=request.app.state.fs_store,
+        )
         complete_res = await writer.mpu_complete(
             bucket_name=bucket_name,
             object_id=str(object_id),
