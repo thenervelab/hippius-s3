@@ -10,8 +10,10 @@ from fastapi import Response
 from gateway.config import get_config
 from gateway.middlewares.account import account_middleware
 from gateway.middlewares.acl import acl_middleware
+from gateway.middlewares.ats_purge import ats_purge_middleware
 from gateway.middlewares.audit_log import audit_log_middleware
 from gateway.middlewares.auth_router import auth_router_middleware
+from gateway.middlewares.cache_control import cache_control_middleware
 from gateway.middlewares.cors import cors_middleware
 from gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
 from gateway.middlewares.input_validation import input_validation_middleware
@@ -129,11 +131,16 @@ def factory() -> FastAPI:
 
     @app.on_event("shutdown")
     async def shutdown() -> None:
+        from gateway.services import ats_cache_client
+
         logger.info("Shutting down Hippius S3 Gateway...")
 
         if hasattr(app.state, "arion_client"):
             await app.state.arion_client.close()
             logger.info("ArionClient closed")
+
+        await ats_cache_client.close()
+        logger.info("ATS cache client closed")
 
         if hasattr(app.state, "forward_service"):
             await app.state.forward_service.close()
@@ -193,6 +200,9 @@ def factory() -> FastAPI:
     app.middleware("http")(input_validation_middleware)
     if config.read_only_mode:
         app.middleware("http")(read_only_middleware)
+    # Inside CORS so Cache-Control lands before CORS wraps the response.
+    app.middleware("http")(ats_purge_middleware)
+    app.middleware("http")(cache_control_middleware)
     # Outermost: CORS must wrap everything so error responses get CORS headers
     app.middleware("http")(cors_middleware)
 
