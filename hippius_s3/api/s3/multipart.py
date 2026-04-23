@@ -13,6 +13,7 @@ from datetime import timezone
 from typing import Any
 from urllib.parse import unquote
 
+import asyncpg
 from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import Request
@@ -66,7 +67,7 @@ async def handle_post_object(
     bucket_name: str,
     object_key: str,
     request: Request,
-    db: dependencies.DBConnection = Depends(dependencies.get_postgres),
+    pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
 ) -> Response:
     """
     Handle POST requests for objects:
@@ -78,12 +79,13 @@ async def handle_post_object(
     # Check for uploads parameter (Initiate Multipart Upload)
     if "uploads" in request.query_params:
         with tracer.start_as_current_span("multipart.route_initiate"):
-            return await initiate_multipart_upload(
-                bucket_name,
-                object_key,
-                request,
-                db,
-            )
+            async with pool.acquire() as conn:
+                return await initiate_multipart_upload(
+                    bucket_name,
+                    object_key,
+                    request,
+                    conn,
+                )
 
     # Check for uploadId parameter (Complete Multipart Upload)
     if "uploadId" in request.query_params:
@@ -93,13 +95,14 @@ async def handle_post_object(
                 "multipart.route_complete",
                 attributes={"upload_id": upload_id, "has_upload_id": True},
             ):
-                return await complete_multipart_upload(
-                    bucket_name,
-                    object_key,
-                    upload_id,
-                    request,
-                    db,
-                )
+                async with pool.acquire() as conn:
+                    return await complete_multipart_upload(
+                        bucket_name,
+                        object_key,
+                        upload_id,
+                        request,
+                        conn,
+                    )
 
     # Not a multipart operation we handle
     return s3_error_response("InvalidRequest", "Unsupported multipart POST request", status_code=400)

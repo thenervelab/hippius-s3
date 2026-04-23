@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Any
 
+import asyncpg
 from fastapi import Response
 from lxml import etree as ET  # ty: ignore[unresolved-import]
 
@@ -22,12 +22,12 @@ def _format_s3_timestamp(dt: datetime) -> str:
 async def handle_list_objects(
     bucket_name: str,
     ctx: RequestContext,
-    db: Any,
+    pool: asyncpg.Pool,
     prefix: str | None,
 ) -> Response:
     try:
         logger.error(f"bucket name {bucket_name}")
-        bucket = await db.fetchrow(
+        bucket = await pool.fetchrow(
             get_query("get_bucket_by_name"),
             bucket_name,
         )
@@ -42,7 +42,7 @@ async def handle_list_objects(
         bucket_id = bucket["bucket_id"]
         # list-objects supports optional Prefix filtering
 
-        results = await db.fetch(get_query("list_objects"), bucket_id, prefix)
+        results = await pool.fetch(get_query("list_objects"), bucket_id, prefix)
         # Defensive filter if backend query ignored prefix
         if prefix:
             results = [r for r in results if str(r["object_key"]).startswith(prefix)]
