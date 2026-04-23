@@ -4,6 +4,7 @@ from typing import Callable
 from fastapi import Request
 from fastapi import Response
 
+from gateway.config import get_config
 from gateway.utils.errors import s3_error_response
 from hippius_s3.models.acl import Permission
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
@@ -89,6 +90,8 @@ async def acl_middleware(
         return await call_next(request)
 
     bucket, key = parse_s3_path(path)
+    request.state.s3_bucket = bucket
+    request.state.s3_key = key
 
     if bucket is None:
         return await call_next(request)
@@ -122,6 +125,20 @@ async def acl_middleware(
         return await call_next(request)
 
     request.state.bucket_owner_id = bucket_owner_id
+
+    # Compute anonymous_read_allowed once, before any auth-bypass paths, so
+    # master-token and presigned-URL reads of public objects also populate ATS cache.
+    # Gated on ATS being active to avoid a Redis round-trip when there's no consumer.
+    request.state.anonymous_read_allowed = False
+    if get_config().ats_cache_endpoint and request.method in ("GET", "HEAD") and key is not None:
+        request.state.anonymous_read_allowed = await acl_service.check_permission(
+            account_id=None,
+            bucket=bucket,
+            key=key,
+            permission=Permission.READ,
+            access_key=None,
+            bucket_owner_id=bucket_owner_id,
+        )
 
     if auth_method == "access_key" and token_type == "master" and bucket_owner_id == account_id:
         logger.info(f"Master token bypass for account {account_id} on bucket {bucket}")

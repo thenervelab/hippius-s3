@@ -12,6 +12,7 @@ from opentelemetry import trace
 
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.common import if_none_match_matches
 from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
 from hippius_s3.utils import get_query
@@ -156,6 +157,9 @@ async def handle_head_object(
                         )
                 except Exception:
                     md5_hash = md5_hash or ""
+        if md5_hash and if_none_match_matches(request.headers.get("if-none-match"), md5_hash):
+            return Response(status_code=304, headers={"ETag": f'"{md5_hash}"'})
+
         content_type = row["content_type"]
         headers: dict[str, str] = {
             "Content-Type": content_type,
