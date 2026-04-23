@@ -67,8 +67,7 @@ async def put_object(
     upload_id = request.query_params.get("uploadId")
     part_number = request.query_params.get("partNumber")
     if upload_id and part_number:
-        async with pool.acquire() as conn:
-            return await upload_part(request, conn)
+        return await upload_part(request, pool)
     if "tagging" in request.query_params:
         async with pool.acquire() as conn:
             return await tags_set_object_tags(
@@ -77,8 +76,7 @@ async def put_object(
     if request.headers.get("x-amz-copy-source"):
         async with pool.acquire() as conn:
             return await handle_copy_object(bucket_name, object_key, request, conn, redis_client)
-    async with pool.acquire() as conn:
-        return await handle_put_object(bucket_name, object_key, request, conn, redis_client)
+    return await handle_put_object(bucket_name, object_key, request, pool, redis_client)
 
 
 @router.delete("/{bucket_name}/{object_key:path}", status_code=204)

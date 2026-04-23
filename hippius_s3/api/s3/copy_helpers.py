@@ -206,7 +206,9 @@ async def handle_streaming_copy(
     )
 
     content_type = str(source_object["content_type"])
-    ow = ObjectWriter(db=db, redis_client=redis_client, fs_store=request.app.state.fs_store)
+    ow = ObjectWriter(
+        pool=request.app.state.postgres_pool, redis_client=redis_client, fs_store=request.app.state.fs_store
+    )
     put_res = await ow.put_simple_stream_full(
         bucket_id=str(dest_bucket["bucket_id"]),
         bucket_name=dest_bucket["bucket_name"],

@@ -224,7 +224,7 @@ async def migrate_one(
     from hippius_s3.cache import FileSystemPartsStore  # local import
 
     fs_store = FileSystemPartsStore(config.object_cache_dir)
-    writer = ObjectWriter(db=db, redis_client=redis_client, fs_store=fs_store)
+    writer = ObjectWriter(pool=db, redis_client=redis_client, fs_store=fs_store)
     new_version = await writer.create_version_for_migration(
         object_id=object_id,
         content_type=content_type,
@@ -608,7 +608,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
             task_db: Any | None = None
             try:
-                task_db = await asyncpg.connect(config.database_url)
+                task_db = await asyncpg.create_pool(config.database_url, min_size=1, max_size=2)
                 address = str(o.get("main_account_id", ""))
 
                 if args.dry_run:
