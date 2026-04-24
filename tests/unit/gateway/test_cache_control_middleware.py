@@ -68,13 +68,34 @@ async def test_delete_gets_no_cache_control_header(app: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_error_responses_get_no_cache_control(app: Any) -> None:
+async def test_error_responses_get_no_store_to_prevent_negative_caching(app: Any) -> None:
+    """ATS's heuristic negative caching must be overridden — stale 404s block post-upload reads."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         r = await client.get(
             "/public-bucket/foo.txt",
             headers={"x-test-status": "500", "x-test-anon-read": "true"},
         )
-    assert "Cache-Control" not in r.headers
+    assert r.headers["Cache-Control"] == PRIVATE_CACHE_CONTROL
+
+
+@pytest.mark.asyncio
+async def test_404_gets_no_store(app: Any) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.get(
+            "/public-bucket/foo.txt",
+            headers={"x-test-status": "404"},
+        )
+    assert r.headers["Cache-Control"] == PRIVATE_CACHE_CONTROL
+
+
+@pytest.mark.asyncio
+async def test_403_gets_no_store(app: Any) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.get(
+            "/public-bucket/foo.txt",
+            headers={"x-test-status": "403"},
+        )
+    assert r.headers["Cache-Control"] == PRIVATE_CACHE_CONTROL
 
 
 @pytest.mark.asyncio

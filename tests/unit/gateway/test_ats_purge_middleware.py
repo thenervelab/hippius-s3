@@ -62,7 +62,11 @@ async def test_delete_object_purges_key(app: Any, captured_purges: list[tuple[st
 
 
 @pytest.mark.asyncio
-async def test_copy_object_purges_both_source_and_destination(app: Any, captured_purges: list[tuple[str, str]]) -> None:
+async def test_copy_object_purges_only_destination(app: Any, captured_purges: list[tuple[str, str]]) -> None:
+    """COPY reads the source but only mutates the destination — only purge the dest key.
+
+    Purging the source would needlessly cold its cache entry for a read-only operation.
+    """
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://s3.hippius.com") as client:
         r = await client.put(
             "/destbucket/dest/key",
@@ -70,9 +74,7 @@ async def test_copy_object_purges_both_source_and_destination(app: Any, captured
             headers={"x-amz-copy-source": "/srcbucket/src/key"},
         )
     assert r.status_code == 200
-    assert ("s3.hippius.com", "destbucket/dest/key") in captured_purges
-    assert ("s3.hippius.com", "srcbucket/src/key") in captured_purges
-    assert len(captured_purges) == 2
+    assert captured_purges == [("s3.hippius.com", "destbucket/dest/key")]
 
 
 @pytest.mark.asyncio
@@ -110,19 +112,27 @@ async def test_batch_delete_does_not_purge_in_v1(app: Any, captured_purges: list
 
 
 @pytest.mark.asyncio
-async def test_bucket_acl_flip_purges_wildcard(app: Any, captured_purges: list[tuple[str, str]]) -> None:
+async def test_bucket_acl_flip_does_not_fire_wildcard_purge(
+    app: Any, captured_purges: list[tuple[str, str]]
+) -> None:
+    """Stock ATS HTTP PURGE doesn't support globs — bucket-level invalidation is a no-op.
+
+    Objects age out within the 5-min TTL; regex_revalidate plugin could close this gap later.
+    """
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://s3.hippius.com") as client:
         r = await client.put("/mybucket?acl", content=b"<AccessControlPolicy/>")
     assert r.status_code == 200
-    assert captured_purges == [("s3.hippius.com", "mybucket/*")]
+    assert captured_purges == []
 
 
 @pytest.mark.asyncio
-async def test_bucket_delete_purges_wildcard(app: Any, captured_purges: list[tuple[str, str]]) -> None:
+async def test_bucket_delete_does_not_fire_wildcard_purge(
+    app: Any, captured_purges: list[tuple[str, str]]
+) -> None:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://s3.hippius.com") as client:
         r = await client.delete("/mybucket")
     assert r.status_code == 200
-    assert captured_purges == [("s3.hippius.com", "mybucket/*")]
+    assert captured_purges == []
 
 
 @pytest.mark.asyncio

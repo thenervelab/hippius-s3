@@ -20,7 +20,7 @@ async def ats_purge_middleware(
 ) -> Response:
     response = await call_next(request)
 
-    if not get_config().ats_cache_endpoint:
+    if not get_config().ats_cache_endpoints:
         return response
     if response.status_code >= 300:
         return response
@@ -32,26 +32,25 @@ async def ats_purge_middleware(
     key = getattr(request.state, "s3_key", None)
     if bucket is None:
         bucket, key = parse_s3_path(request.url.path)
-    if not bucket:
+    if not bucket or not key:
+        # Bucket-level invalidation (ACL flip, bucket delete) isn't supported:
+        # stock ATS HTTP PURGE takes a literal cache key, not a glob. Objects
+        # age out naturally within the 5-min TTL. Revisit via regex_revalidate
+        # plugin if that turns out to be too long a window.
         return response
 
     qs = request.query_params
-    host = request.headers.get("host", DEFAULT_HOST)
 
-    if not key:
-        is_bucket_purge = (method == "PUT" and "acl" in qs) or method == "DELETE"
-        if is_bucket_purge:
-            schedule_purge(host, f"{bucket}/*")
+    if method == "PUT" and "partNumber" in qs:
+        # MPU part upload — not visible until CompleteMultipartUpload, skip.
         return response
 
-    if method == "PUT":
-        if "partNumber" in qs:
-            return response
+    host = request.headers.get("host", DEFAULT_HOST)
+    is_complete_mpu = method == "POST" and "uploadId" in qs and "partNumber" not in qs
+    if method in ("PUT", "DELETE") or is_complete_mpu:
         schedule_purge(host, f"{bucket}/{key}")
-        copy_source = request.headers.get("x-amz-copy-source")
-        if copy_source:
-            schedule_purge(host, copy_source.lstrip("/"))
-    elif method == "DELETE" or (method == "POST" and "uploadId" in qs and "partNumber" not in qs):
-        schedule_purge(host, f"{bucket}/{key}")
+        # NOTE: x-amz-copy-source is deliberately NOT purged. COPY reads the
+        # source; its contents haven't changed. Purging would needlessly cold
+        # the cache for what could be a hot source object.
 
     return response

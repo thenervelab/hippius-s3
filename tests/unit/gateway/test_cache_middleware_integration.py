@@ -136,14 +136,15 @@ async def test_authenticated_denied_no_purge_no_cache_header(monkeypatch: pytest
 
 
 @pytest.mark.asyncio
-async def test_bucket_acl_flip_fires_wildcard_purge(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_bucket_acl_flip_does_not_fire_purge(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stock ATS HTTP PURGE is single-key only; bucket-level invalidation is intentionally unsupported."""
     service = _make_service(primary=True, anon=False)
     purges: list[tuple[str, str]] = []
     app = _build_app(service, captured_purges=purges, account_id="alice", monkeypatch=monkeypatch)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://s3.hippius.com") as client:
         r = await client.put("/public-bucket?acl", content=b"<AccessControlPolicy/>")
     assert r.status_code == 200
-    assert purges == [("s3.hippius.com", "public-bucket/*")]
+    assert purges == []
 
 
 @pytest.mark.asyncio
