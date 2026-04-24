@@ -20,7 +20,7 @@ async def ats_purge_middleware(
 ) -> Response:
     response = await call_next(request)
 
-    if not get_config().ats_cache_endpoint:
+    if not get_config().ats_cache_endpoints:
         return response
     if response.status_code >= 300:
         return response
