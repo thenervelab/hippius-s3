@@ -130,7 +130,7 @@ async def acl_middleware(
     # master-token and presigned-URL reads of public objects also populate ATS cache.
     # Gated on ATS being active to avoid a Redis round-trip when there's no consumer.
     request.state.anonymous_read_allowed = False
-    if get_config().ats_cache_endpoint and request.method in ("GET", "HEAD") and key is not None:
+    if get_config().ats_cache_endpoints and request.method in ("GET", "HEAD") and key is not None:
         request.state.anonymous_read_allowed = await acl_service.check_permission(
             account_id=None,
             bucket=bucket,

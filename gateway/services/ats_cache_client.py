@@ -32,15 +32,19 @@ async def _purge(endpoint: str, host: str, key: str) -> None:
     try:
         response = await _get_client().request("PURGE", url, headers={"Host": host})
     except httpx.HTTPError as e:
-        logger.warning("ATS PURGE request failed host=%s key=%s: %s", host, key, e)
+        logger.warning("ATS PURGE request failed endpoint=%s host=%s key=%s: %s", endpoint, host, key, e)
         return
     if response.status_code >= 400:
-        logger.warning("ATS PURGE host=%s key=%s status=%d", host, key, response.status_code)
+        logger.warning("ATS PURGE endpoint=%s host=%s key=%s status=%d", endpoint, host, key, response.status_code)
+
+
+async def _purge_all(endpoints: list[str], host: str, key: str) -> None:
+    await asyncio.gather(*(_purge(ep, host, key) for ep in endpoints), return_exceptions=True)
 
 
 def schedule_purge(host: str, key: str) -> None:
-    """Fire-and-forget PURGE against ATS. No-op when ATS_CACHE_ENDPOINT is unset."""
-    endpoint = get_config().ats_cache_endpoint
-    if not endpoint:
+    """Fire-and-forget PURGE against every configured ATS endpoint in parallel. No-op when empty."""
+    endpoints = get_config().ats_cache_endpoints
+    if not endpoints:
         return
-    asyncio.create_task(_purge(endpoint, host, key))
+    asyncio.create_task(_purge_all(endpoints, host, key))
