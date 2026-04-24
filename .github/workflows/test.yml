@@ -103,10 +103,12 @@ jobs:
           uv pip install -e ".[dev]"
 
       - name: Run pip-audit
+        # CVE-2026-3219 ignored until pip 26.1 ships to PyPI (fix merged in pypa/pip#13870).
+        # Keep in sync with .pre-commit-config.yaml.
         run: |
           source .venv/bin/activate
           uv tool install pip-audit
-          pip-audit --ignore-vuln CVE-2024-23342 --ignore-vuln CVE-2026-4539 --ignore-vuln CVE-2026-25645
+          pip-audit --ignore-vuln CVE-2024-23342 --ignore-vuln CVE-2026-4539 --ignore-vuln CVE-2026-25645 --ignore-vuln CVE-2026-3219
 
   unit-integration:
     name: Unit & Integration Tests
