@@ -38,11 +38,24 @@ jobs:
           AWS_SECRET_KEY: ${{ secrets.HIPPIUS_PROD_SECRET_KEY }}
         run: |
           mkdir -p reports
-          pytest tests/smoke/ \
+          set +e
+          pytest tests/smoke/test_smoke_production.py \
             -v \
             --tb=short \
             --json-report \
-            --json-report-file=reports/smoke-tests.json
+            --json-report-file=reports/smoke-production.json
+          PROD_EXIT=$?
+          pytest tests/smoke/test_smoke_regional.py \
+            -n auto \
+            -v \
+            --tb=short \
+            --json-report \
+            --json-report-file=reports/smoke-regional.json
+          REG_EXIT=$?
+          if [ $PROD_EXIT -ne 0 ] || [ $REG_EXIT -ne 0 ]; then
+            echo "production-exit=$PROD_EXIT regional-exit=$REG_EXIT"
+            exit 1
+          fi
 
       - name: Upload test results
         if: always()
