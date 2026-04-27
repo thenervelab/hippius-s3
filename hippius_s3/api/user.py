@@ -2,8 +2,10 @@
 
 import base64
 import ipaddress
+import json
 import logging
 from typing import Optional
+from typing import Union
 
 from fastapi import APIRouter
 from fastapi import Depends
@@ -11,11 +13,14 @@ from fastapi import HTTPException
 from fastapi import Query
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from redis.asyncio import Redis
+from redis.asyncio.cluster import RedisCluster
 from starlette import status
 
 from hippius_s3.config import get_config
 from hippius_s3.dependencies import DBConnection
 from hippius_s3.dependencies import get_postgres
+from hippius_s3.dependencies import get_redis
 from hippius_s3.services.acl_helper import has_public_read_acl
 from hippius_s3.substrate_client import SubstrateClient
 from hippius_s3.utils import get_query
@@ -236,6 +241,52 @@ async def list_objects(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to list objects",
         ) from e
+
+
+RECENT_UPLOADS_CACHE_TTL_SECONDS = 5
+
+
+@router.get("/recent_uploads")
+async def recent_uploads(
+    main_account_id: str = Query(..., description="Main account ID to list recent uploads for"),
+    db: DBConnection = Depends(get_postgres),
+    redis: Union[Redis, RedisCluster] = Depends(get_redis),
+) -> JSONResponse:
+    cache_key = f"recent_uploads:{main_account_id}"
+
+    cached = await redis.get(cache_key)  # ty: ignore[unresolved-attribute]
+    if cached is not None:
+        return JSONResponse(json.loads(cached))
+
+    rows = await db.fetch(
+        get_query("get_recent_uploads_for_account"),
+        main_account_id,
+    )
+
+    uploads = [
+        {
+            "object_id": str(row["object_id"]),
+            "object_key": row["object_key"],
+            "bucket_id": str(row["bucket_id"]),
+            "bucket_name": row["bucket_name"],
+            "size_bytes": row["size_bytes"],
+            "content_type": row["content_type"],
+            "md5_hash": row["md5_hash"],
+            "ipfs_cid": row["ipfs_cid"],
+            "uploaded_at": row["uploaded_at"].isoformat() if row["uploaded_at"] is not None else None,
+        }
+        for row in rows
+    ]
+
+    payload = {
+        "main_account_id": main_account_id,
+        "count": len(uploads),
+        "uploads": uploads,
+    }
+
+    await redis.setex(cache_key, RECENT_UPLOADS_CACHE_TTL_SECONDS, json.dumps(payload))  # ty: ignore[unresolved-attribute]
+
+    return JSONResponse(payload)
 
 
 @router.post("/unban")
