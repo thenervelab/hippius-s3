@@ -1,34 +1,36 @@
 # APPLY job for the recent_uploads index migration.
-# Builds the per-bucket composite index CONCURRENTLY (no write lock on objects),
-# validates the result, then inserts the schema_migrations row so dbmate skips
-# the corresponding committed migration on the next deploy.
+# Builds the per-bucket composite partial index CONCURRENTLY (no write lock on
+# objects), validates the result, then inserts the schema_migrations row so
+# dbmate skips the corresponding committed migration on the next deploy.
+#
+# IMPORTANT: namespace below is hardcoded. Edit between staging and prod runs.
 #
 # Pre-flight (REQUIRED):
 #   1. Run the dryrun job, review its output. Confirm:
 #      - no INVALID indexes on objects
 #      - no long-running transactions older than ~1 minute
-#      - schema_migrations row 20260427160000 is absent
+#      - schema_migrations row 20260427170000 is absent
 #      - we're outside the backup window
-#   2. Pause CI/CD deploys to hippius-s3-prod for the duration of this build
-#      (5-30 min expected; cap is 2h). A deploy in flight will queue behind the
-#      build's lock and the deploy's db-migrations job may time out.
+#   2. Pause CI/CD deploys to the target namespace for the duration of this
+#      build (5-30 min expected; cap is 2h). A deploy in flight will queue
+#      behind the build's lock and the deploy's db-migrations job may time out.
 #
 # Run with:   kubectl create -f k8s/migrate-recent-uploads-index-apply.yaml
-# Watch:      kubectl -n hippius-s3-prod logs job/migrate-recent-uploads-index-apply --follow
-# In another shell, monitor build progress:
-#   kubectl -n hippius-s3-prod exec postgres-1 -c postgres -- psql -U postgres -d hippius -c \
+# Watch:      kubectl -n <namespace> logs job/migrate-recent-uploads-index-apply --follow
+# In another shell, monitor build progress (replace <namespace> + postgres pod):
+#   kubectl -n <namespace> exec postgres-1 -c postgres -- psql -U postgres -d hippius -c \
 #     "SELECT now(), phase, blocks_done, blocks_total FROM pg_stat_progress_create_index WHERE relid='public.objects'::regclass;"
 #
 # Re-run after a failure (only after manual cleanup of any INVALID index — see job logs):
-#   kubectl -n hippius-s3-prod delete job migrate-recent-uploads-index-apply
-#   kubectl -n hippius-s3-prod exec postgres-1 -c postgres -- psql -U postgres -d hippius -c \
-#     "DROP INDEX CONCURRENTLY IF EXISTS idx_objects_bucket_last_modified_active;"
+#   kubectl -n <namespace> delete job migrate-recent-uploads-index-apply
+#   kubectl -n <namespace> exec postgres-1 -c postgres -- psql -U postgres -d hippius -c \
+#     "DROP INDEX CONCURRENTLY IF EXISTS idx_objects_bucket_created_desc_active;"
 #   kubectl create -f k8s/migrate-recent-uploads-index-apply.yaml
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: migrate-recent-uploads-index-apply
-  namespace: hippius-s3-prod
+  namespace: hippius-s3-staging
   labels:
     app: migrate-recent-uploads-index
     mode: apply
@@ -55,9 +57,9 @@ spec:
             - name: PGCONNECT_TIMEOUT
               value: "10"
             - name: MIGRATION_VERSION
-              value: "20260427160000"
+              value: "20260427170000"
             - name: INDEX_NAME
-              value: "idx_objects_bucket_last_modified_active"
+              value: "idx_objects_bucket_created_desc_active"
           command:
             - /bin/bash
             - -c
@@ -101,14 +103,14 @@ spec:
               echo "expected duration: 5-30 min; activeDeadlineSeconds=7200"
               echo "started at: $(date -u +%FT%TZ)"
 
-              # CONCURRENTLY cannot run inside a transaction. psql with -c runs each
-              # statement in its own implicit transaction; setting session params via
-              # PGOPTIONS so they apply to the CREATE INDEX without needing a SET
-              # statement (which would attach the SET to the same implicit tx).
+              # CONCURRENTLY cannot run inside a transaction. psql -c runs each
+              # statement in its own implicit transaction; setting session params
+              # via PGOPTIONS so they apply to the CREATE INDEX without needing
+              # a SET statement (which would attach to the same implicit tx).
               PGOPTIONS="-c lock_timeout=0 -c statement_timeout=0 -c idle_in_transaction_session_timeout=0" \
                 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "
                   CREATE INDEX CONCURRENTLY IF NOT EXISTS ${INDEX_NAME}
-                    ON public.objects (bucket_id, last_modified DESC)
+                    ON public.objects (bucket_id, created_at DESC)
                     WHERE deleted_at IS NULL;
                 "
 
@@ -122,11 +124,11 @@ spec:
                 JOIN pg_class c ON c.oid = i.indexrelid
                 WHERE c.relname = '${INDEX_NAME}';
               ")
-              if [ "$VALIDITY" != "t" ]; then
+              if [ "$VALIDITY" != "true" ]; then
                 echo "ABORT: index ${INDEX_NAME} is not VALID (indisvalid=${VALIDITY:-MISSING})."
                 echo "Operator must investigate. To re-attempt:"
-                echo "  DROP INDEX CONCURRENTLY IF EXISTS ${INDEX_NAME};  -- in a separate session"
-                echo "  kubectl -n hippius-s3-prod delete job migrate-recent-uploads-index-apply"
+                echo "  DROP INDEX CONCURRENTLY IF EXISTS ${INDEX_NAME};  # in a separate session"
+                echo "  kubectl -n <namespace> delete job migrate-recent-uploads-index-apply"
                 echo "  kubectl create -f k8s/migrate-recent-uploads-index-apply.yaml"
                 exit 1
               fi
@@ -153,4 +155,3 @@ spec:
               echo
               echo "=== apply complete at: $(date -u +%FT%TZ) ==="
               echo "next step: deploy normally. dbmate will see ${MIGRATION_VERSION} already applied and skip it."
-              echo "reminder: do NOT commit the drop migration (20260427160001) until the new index is observed working in prod."
