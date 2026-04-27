@@ -11,7 +11,7 @@ SELECT
     ov.content_type,
     ov.md5_hash,
     COALESCE(c.cid, ov.ipfs_cid) AS ipfs_cid,
-    ov.last_modified AS uploaded_at
+    o.last_modified AS uploaded_at
 FROM objects o
 JOIN buckets b ON b.bucket_id = o.bucket_id
 JOIN object_versions ov
@@ -21,5 +21,5 @@ LEFT JOIN cids c ON c.id = ov.cid_id
 WHERE b.main_account_id = $1
   AND o.deleted_at IS NULL
   AND ov.status <> 'failed'
-ORDER BY ov.last_modified DESC
+ORDER BY o.last_modified DESC
 LIMIT 10
