@@ -102,9 +102,7 @@ async def test_cache_hit_skips_db(app: FastAPI, mocks: tuple[MagicMock, MagicMoc
 
 
 @pytest.mark.asyncio
-async def test_cache_miss_queries_db_and_populates_cache(
-    app: FastAPI, mocks: tuple[MagicMock, MagicMock]
-) -> None:
+async def test_cache_miss_queries_db_and_populates_cache(app: FastAPI, mocks: tuple[MagicMock, MagicMock]) -> None:
     mock_db, mock_redis = mocks
     rows = [
         _make_row(
@@ -185,17 +183,22 @@ async def test_missing_main_account_id_returns_422(app: FastAPI) -> None:
 
 
 @pytest.mark.asyncio
-async def test_query_caps_at_10_and_takes_only_account_id() -> None:
+async def test_sql_contract() -> None:
     sql = get_query("get_recent_uploads_for_account")
+
     assert "LIMIT 10" in sql
     assert "$1" in sql
     assert "$2" not in sql
 
+    assert "ov.last_modified" in sql
+    assert "o.last_modified" not in sql
+
+    assert "deleted_at IS NULL" in sql
+    assert "ov.status <> 'failed'" in sql
+
 
 @pytest.mark.asyncio
-async def test_response_uses_cached_blob_verbatim_round_trip(
-    app: FastAPI, mocks: tuple[MagicMock, MagicMock]
-) -> None:
+async def test_response_uses_cached_blob_verbatim_round_trip(app: FastAPI, mocks: tuple[MagicMock, MagicMock]) -> None:
     mock_db, mock_redis = mocks
     rows = [
         _make_row(
