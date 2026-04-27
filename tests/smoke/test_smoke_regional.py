@@ -25,7 +25,7 @@ from botocore.config import Config
 
 REGIONAL_ENDPOINTS = [
     "https://eu-central-1.hippius.com",
-    "https://us-central-1.hippius.com",
+    "https://us-east-1.hippius.com",
 ]
 
 
