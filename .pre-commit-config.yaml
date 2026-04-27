@@ -39,8 +39,11 @@ repos:
         types: [python]
 
       - id: pip-audit
+        # CVE-2026-3219: pip concatenated tar/zip handling. Fix landed upstream (pypa/pip#13870)
+        # but pip 26.1 not yet released to PyPI as of 2026-04-24 — only 26.0.1 is up. Remove
+        # this ignore once 26.1 ships.
         name: pip-audit (dependency scan)
-        entry: pip-audit --ignore-vuln CVE-2024-23342 --ignore-vuln CVE-2026-4539 --ignore-vuln CVE-2026-25645
+        entry: pip-audit --ignore-vuln CVE-2024-23342 --ignore-vuln CVE-2026-4539 --ignore-vuln CVE-2026-25645 --ignore-vuln CVE-2026-3219
         language: system
         stages: [pre-commit]
         pass_filenames: false
