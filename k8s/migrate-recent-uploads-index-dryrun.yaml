@@ -1,0 +1,126 @@
+# DRYRUN job for the recent_uploads index migration.
+# Read-only. Prints prod state and the exact DDL that the apply job would run.
+# IMPORTANT: namespace below is hardcoded. Edit between staging and prod runs.
+# Run with:   kubectl create -f k8s/migrate-recent-uploads-index-dryrun.yaml
+# Re-run:     kubectl -n <namespace> delete job migrate-recent-uploads-index-dryrun \
+#               && kubectl create -f k8s/migrate-recent-uploads-index-dryrun.yaml
+# Inspect:    kubectl -n <namespace> logs job/migrate-recent-uploads-index-dryrun --follow
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate-recent-uploads-index-dryrun
+  namespace: hippius-s3-staging
+  labels:
+    app: migrate-recent-uploads-index
+    mode: dryrun
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: migrate-recent-uploads-index
+        mode: dryrun
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: dryrun
+          image: postgres:15
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+            - name: PGCONNECT_TIMEOUT
+              value: "10"
+            - name: MIGRATION_VERSION
+              value: "20260427170000"
+            - name: INDEX_NAME
+              value: "idx_objects_bucket_created_desc_active"
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+
+              echo "=== sanity: which database am I connected to? ==="
+              psql "$DATABASE_URL" -tA -c "SELECT current_database(), current_user, inet_server_addr();"
+              CURDB=$(psql "$DATABASE_URL" -tA -c "SELECT current_database();")
+              if [ "$CURDB" != "hippius" ]; then
+                echo "ABORT: expected database 'hippius', got '$CURDB'"
+                exit 1
+              fi
+
+              echo
+              echo "=== sizing ==="
+              psql "$DATABASE_URL" -c "
+                SELECT
+                  (SELECT count(*) FROM objects WHERE deleted_at IS NULL) AS active_objects,
+                  pg_size_pretty(pg_total_relation_size('public.objects')) AS objects_total_size;
+              "
+
+              echo "=== current state of the new index (should be empty rows = not built yet) ==="
+              psql "$DATABASE_URL" -c "
+                SELECT indexname, indexdef
+                FROM pg_indexes
+                WHERE indexname = '${INDEX_NAME}';
+              "
+
+              echo "=== INVALID indexes left over from prior failed attempts (must be empty) ==="
+              psql "$DATABASE_URL" -c "
+                SELECT i.indexrelid::regclass AS index_name, i.indisvalid, i.indisready
+                FROM pg_index i
+                JOIN pg_class c ON c.oid = i.indrelid
+                WHERE c.relname = 'objects' AND NOT i.indisvalid;
+              "
+
+              echo "=== schema_migrations row for ${MIGRATION_VERSION} (should be absent) ==="
+              psql "$DATABASE_URL" -c "
+                SELECT version FROM schema_migrations WHERE version = '${MIGRATION_VERSION}';
+              "
+
+              echo "=== long-running txns that would delay CONCURRENTLY's final wait ==="
+              psql "$DATABASE_URL" -c "
+                SELECT pid, age(now(), xact_start) AS xact_age, state, substr(query, 1, 100) AS query
+                FROM pg_stat_activity
+                WHERE state <> 'idle'
+                  AND xact_start IS NOT NULL
+                  AND xact_start < now() - interval '30 seconds'
+                ORDER BY xact_start ASC
+                LIMIT 10;
+              "
+
+              echo "=== any in-progress index build right now (must be empty) ==="
+              psql "$DATABASE_URL" -c "SELECT * FROM pg_stat_progress_create_index;"
+
+              echo "=== baseline EXPLAIN (no ANALYZE) for the new query shape ==="
+              psql "$DATABASE_URL" -c "
+                EXPLAIN
+                SELECT o.object_id, o.created_at
+                FROM buckets b
+                JOIN objects o ON o.bucket_id = b.bucket_id
+                JOIN object_versions ov
+                  ON ov.object_id = o.object_id
+                 AND ov.object_version = o.current_object_version
+                WHERE b.main_account_id = '5EvT2ccmmY6t3q1U3PXwjzwFBjE2KzvWdC6mMsCvBbiBDs55'
+                  AND o.deleted_at IS NULL
+                  AND ov.status <> 'failed'
+                ORDER BY o.created_at DESC
+                LIMIT 10;
+              "
+
+              echo
+              echo "=== APPLY JOB WOULD RUN: ==="
+              cat <<SQL
+
+              CREATE INDEX CONCURRENTLY IF NOT EXISTS ${INDEX_NAME}
+                  ON public.objects (bucket_id, created_at DESC)
+                  WHERE deleted_at IS NULL;
+
+              -- (then validate indisvalid, then INSERT INTO schema_migrations VALUES ('${MIGRATION_VERSION}'))
+              SQL
+
+              echo
+              echo "=== dryrun complete ==="

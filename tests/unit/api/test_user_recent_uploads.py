@@ -190,8 +190,7 @@ async def test_sql_contract() -> None:
     assert "$1" in sql
     assert "$2" not in sql
 
-    assert "ov.last_modified" in sql
-    assert "o.last_modified" not in sql
+    assert "ORDER BY o.created_at DESC" in sql
 
     assert "deleted_at IS NULL" in sql
     assert "ov.status <> 'failed'" in sql
