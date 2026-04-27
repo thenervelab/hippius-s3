@@ -15,6 +15,7 @@ import hashlib
 import os
 import uuid
 from datetime import datetime
+from datetime import timezone
 
 import boto3
 import pytest
@@ -125,5 +126,5 @@ def test_regional_presigned_url_roundtrip(regional_s3_client, session_tracker, f
 
 @pytest.fixture(scope="session", autouse=True)
 def _regional_session_banner():
-    print(f"Regional smoke tests starting at {datetime.utcnow().isoformat()} against {REGIONAL_ENDPOINTS}")
+    print(f"Regional smoke tests starting at {datetime.now(timezone.utc).isoformat()} against {REGIONAL_ENDPOINTS}")
     yield

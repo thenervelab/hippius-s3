@@ -42,6 +42,8 @@ jobs:
           pytest tests/smoke/test_smoke_production.py \
             -v \
             --tb=short \
+            -W "ignore::DeprecationWarning:botocore" \
+            -W "ignore::DeprecationWarning:dateutil" \
             --json-report \
             --json-report-file=reports/smoke-production.json
           PROD_EXIT=$?
@@ -49,6 +51,8 @@ jobs:
             -n auto \
             -v \
             --tb=short \
+            -W "ignore::DeprecationWarning:botocore" \
+            -W "ignore::DeprecationWarning:dateutil" \
             --json-report \
             --json-report-file=reports/smoke-regional.json
           REG_EXIT=$?

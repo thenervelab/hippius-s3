@@ -39,6 +39,8 @@ jobs:
           pytest tests/smoke/test_smoke_production.py \
             -v \
             --tb=short \
+            -W "ignore::DeprecationWarning:botocore" \
+            -W "ignore::DeprecationWarning:dateutil" \
             --json-report \
             --json-report-file=reports/smoke-tests.json
 
