@@ -1,5 +1,6 @@
 import json
 from datetime import datetime
+from datetime import timezone
 
 
 class SessionTracker:
@@ -38,7 +39,11 @@ class SessionTracker:
         return json.loads(obj["Body"].read())
 
     def save_manifest(self):
-        manifest = {"session_id": self.session_id, "timestamp": datetime.utcnow().isoformat(), "files": self.files}
+        manifest = {
+            "session_id": self.session_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "files": self.files,
+        }
 
         key = f"smoke-test/.index/{self.session_id}.json"
         self.s3.put_object(

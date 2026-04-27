@@ -3,6 +3,7 @@ import os
 import random
 import uuid
 from datetime import datetime
+from datetime import timezone
 
 import httpx
 import pytest
@@ -14,7 +15,7 @@ def test_01_cleanup_old_files(production_s3_client, session_tracker):
     bucket = session_tracker.bucket
     prefix = "smoke-test/"
     retention_days = 30
-    cutoff = datetime.utcnow() - timedelta(days=retention_days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
 
     deleted_count = 0
     paginator = production_s3_client.get_paginator("list_objects_v2")
@@ -33,7 +34,7 @@ def test_01_cleanup_old_files(production_s3_client, session_tracker):
                 continue
 
             try:
-                session_ts = datetime.strptime(parts[1], "%Y%m%d-%H%M%S")
+                session_ts = datetime.strptime(parts[1], "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc)
                 if session_ts < cutoff:
                     production_s3_client.delete_object(Bucket=bucket, Key=key)
                     deleted_count += 1
@@ -48,7 +49,7 @@ def test_02_upload_simple_file(production_s3_client, session_tracker, file_gener
     data, hash_md5 = file_generator(size)
 
     key = f"smoke-test/{session_tracker.session_id}/simple/{hash_md5}.bin"
-    upload_time = datetime.utcnow().isoformat()
+    upload_time = datetime.now(timezone.utc).isoformat()
 
     response = production_s3_client.put_object(
         Bucket=session_tracker.bucket,
@@ -81,7 +82,7 @@ def test_03_upload_multipart_file(production_s3_client, session_tracker, file_ge
     data, hash_md5 = file_generator(total_size)
 
     key = f"smoke-test/{session_tracker.session_id}/multipart/{hash_md5}.bin"
-    upload_time = datetime.utcnow().isoformat()
+    upload_time = datetime.now(timezone.utc).isoformat()
 
     create_response = production_s3_client.create_multipart_upload(
         Bucket=session_tracker.bucket,
