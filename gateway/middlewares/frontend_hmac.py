@@ -4,9 +4,9 @@ import logging
 from typing import Awaitable
 from typing import Callable
 
-from fastapi import HTTPException
 from fastapi import Request
 from fastapi import Response
+from fastapi.responses import JSONResponse
 from starlette import status
 
 from gateway.config import get_config
@@ -36,7 +36,10 @@ async def verify_frontend_hmac_middleware(
     hmac_signature = request.headers.get("x-hmac-signature")
     if not hmac_signature:
         logger.warning(f"Missing X-HMAC-Signature header for {request.method} {request.url.path}")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing X-HMAC-Signature header")
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"detail": "Missing X-HMAC-Signature header"},
+        )
 
     # Create the message to sign: method + path + query_string
     message = request.method + request.url.path
@@ -57,7 +60,10 @@ async def verify_frontend_hmac_middleware(
         logger.warning(
             f"Frontend HMAC verification failed for {request.method} {request.url.path}, raw message={message}"
         )
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid HMAC signature")
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={"detail": "Invalid HMAC signature"},
+        )
 
     logger.debug(
         f"Frontend HMAC verification successful for {request.method} {request.url.path} {message=} {expected_signature=}"
