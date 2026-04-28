@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 from typing import NoReturn
 
 from fastapi import APIRouter
@@ -28,7 +29,9 @@ from fastapi.responses import JSONResponse
 from fastapi.responses import Response
 from pydantic import BaseModel
 from pydantic import Field
+from redis.exceptions import RedisError
 
+from gateway.services.sub_token_scope_cache import SCOPE_CACHE_TTL_SECONDS
 from gateway.services.sub_token_scope_cache import scope_cache_key
 from hippius_s3.dependencies import DBConnection
 from hippius_s3.dependencies import get_postgres
@@ -133,6 +136,18 @@ async def _resolve_bucket_ids(db: DBConnection, account_id: str, bucket_names: l
         _raise("AccessDenied", f"Buckets not owned by account_id: {unauthorized}", status.HTTP_403_FORBIDDEN)
 
     return [str(by_name[n]["bucket_id"]) for n in bucket_names]
+
+
+async def _invalidate_scope_cache(redis_client: Any, access_key_id: str) -> None:
+    # Best-effort: the DB row is the source of truth, and a stale cache entry
+    # times out in SCOPE_CACHE_TTL_SECONDS — a Redis blip must not fail the write.
+    try:
+        await redis_client.delete(scope_cache_key(access_key_id))
+    except RedisError as exc:
+        logger.warning(
+            f"scope cache: redis DELETE failed for {access_key_id[:8]}*** "
+            f"(stale entry will expire in <={SCOPE_CACHE_TTL_SECONDS}s): {exc}"
+        )
 
 
 async def _verify_access_key_owned_by_account(access_key_id: str, account_id: str) -> None:
@@ -250,6 +265,14 @@ async def put_scope(
         _raise("InvalidArgument", "bucket_scope='specific' requires non-empty buckets", status.HTTP_400_BAD_REQUEST)
     if body.bucket_scope is BucketScope.all and body.buckets:
         _raise("InvalidArgument", "bucket_scope='all' must not specify buckets", status.HTTP_400_BAD_REQUEST)
+    # Mirrors the ck_sub_token_scopes_bucket_ids_max DB constraint (≤1000) so
+    # callers see a 400 with a clear message instead of a 500 from a CHECK violation.
+    if len(body.buckets) > 1000:
+        _raise(
+            "InvalidArgument",
+            f"buckets list too large: got {len(body.buckets)}, max 1000",
+            status.HTTP_400_BAD_REQUEST,
+        )
 
     # Run the token validation and bucket resolution concurrently — they're
     # independent and the slow path is the account-API call.
@@ -261,7 +284,8 @@ async def put_scope(
     repo: SubTokenScopeRepository = request.app.state.sub_token_scope_repo
     redis_client = request.app.state.redis_client
 
-    # Upsert and cache-invalidate in parallel.
+    # Upsert and cache-invalidate in parallel. The cache delete is best-effort —
+    # see _invalidate_scope_cache for why we don't fail the request on Redis errors.
     scope, _ = await asyncio.gather(
         repo.upsert(
             access_key_id=access_key_id,
@@ -270,7 +294,7 @@ async def put_scope(
             bucket_scope=body.bucket_scope,
             bucket_ids=bucket_ids,
         ),
-        redis_client.delete(scope_cache_key(access_key_id)),
+        _invalidate_scope_cache(redis_client, access_key_id),
     )
 
     logger.info(
@@ -312,7 +336,7 @@ async def delete_scope(
 
     deleted, _ = await asyncio.gather(
         repo.delete(access_key_id),
-        redis_client.delete(scope_cache_key(access_key_id)),
+        _invalidate_scope_cache(redis_client, access_key_id),
     )
 
     logger.info(f"Sub-token scope deleted: access_key={access_key_id[:8]}***, existed={deleted}")

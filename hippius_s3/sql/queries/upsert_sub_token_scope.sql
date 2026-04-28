@@ -1,5 +1,5 @@
 INSERT INTO sub_token_scopes (access_key_id, account_id, permission, bucket_scope, bucket_ids)
-VALUES ($1, $2, $3, $4, $5)
+VALUES ($1, $2, $3, $4, $5::uuid[])
 ON CONFLICT (access_key_id)
 DO UPDATE SET
     account_id   = EXCLUDED.account_id,

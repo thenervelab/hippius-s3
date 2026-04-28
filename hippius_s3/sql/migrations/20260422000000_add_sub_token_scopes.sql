@@ -16,6 +16,9 @@ CREATE TABLE sub_token_scopes (
     ),
     CONSTRAINT ck_sub_token_scopes_specific_needs_buckets CHECK (
         bucket_scope = 'all' OR array_length(bucket_ids, 1) > 0
+    ),
+    CONSTRAINT ck_sub_token_scopes_bucket_ids_max CHECK (
+        COALESCE(array_length(bucket_ids, 1), 0) <= 1000
     )
 );
 
