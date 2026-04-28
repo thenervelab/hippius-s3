@@ -395,11 +395,11 @@ Kustomize-based. Namespaces: `hippius-s3-staging` and `hippius-s3-prod`.
 
 ### 10.1 CI/CD
 
-[.github/workflows/k8s-deploy.yaml](.github/workflows/k8s-deploy.yaml). Three top-level jobs:
+[.github/workflows/deploy.yaml](.github/workflows/deploy.yaml). Three top-level jobs:
 
 - `deploy-staging` — on pushes to the `staging` branch.
 - `deploy-production` — on pushes to the `k8s-production` branch.
-- `deploy-cache-production` ([k8s-deploy.yaml:370-498](/.github/workflows/k8s-deploy.yaml)) — **currently DISABLED** (`if: false` at line 373). This was the regional cache rollout for `us-0` / `eu-0`; to be re-enabled once the FS cache NVMe PVC story is finalized per region.
+- `deploy-cache-production` ([deploy.yaml:370-498](/.github/workflows/deploy.yaml)) — **currently DISABLED** (`if: false` at line 373). This was the regional cache rollout for `us-0` / `eu-0`; to be re-enabled once the FS cache NVMe PVC story is finalized per region.
 
 ### 10.2 Monitoring
 

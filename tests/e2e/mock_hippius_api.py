@@ -127,8 +127,12 @@ async def get_file_status(file_id: str):
 async def token_auth(payload: TokenAuthRequest):
     """Mock access key authentication endpoint.
 
-    Accepts any hip_* key and returns a valid encrypted secret
-    that the gateway can decrypt with HIPPIUS_AUTH_ENCRYPTION_KEY.
+    Convention used by the e2e stack:
+      - `hip_sub_*`  -> sub-token (token_type="sub")
+      - any other `hip_*` -> master (token_type="master")
+      - anything else -> invalid
+    All valid keys map to the same MOCK_ACCOUNT_ADDRESS so the sub-token
+    enforcement logic sees the owner-match intra-account case.
     """
     access_key = payload.accessKeyId
     if not access_key.startswith("hip_"):
@@ -141,11 +145,12 @@ async def token_auth(payload: TokenAuthRequest):
             nonce="",
         )
 
+    token_type = "sub" if access_key.startswith("hip_sub_") else "master"
     return TokenAuthResponse(
         valid=True,
         status="active",
         account_address=MOCK_ACCOUNT_ADDRESS,
-        token_type="master",
+        token_type=token_type,
         encrypted_secret=ENCRYPTED_SECRET_B64,
         nonce=NONCE_B64,
     )

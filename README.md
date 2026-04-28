@@ -243,7 +243,7 @@ Get access keys at: https://console.hippius.com/dashboard/settings
 
 ## GitHub Actions Secrets
 
-Secrets required for CI/CD deployment (configured in `.github/workflows/k8s-deploy.yaml`):
+Secrets required for CI/CD deployment (configured in `.github/workflows/production.yaml`):
 
 | Category | Secret | Description |
 |----------|--------|-------------|
@@ -359,7 +359,7 @@ Pre-built Grafana dashboards: Hippius S3 Overview (API performance, request rate
 
 ![Daily benchmark](https://s3.hippius.com/hippius-benchmarks/daily.svg)
 
-Automated daily benchmark measuring PUT/GET throughput for 1MB, 100MB, and 1GB objects against production. Runs via GitHub Actions at 6 AM UTC ([`.github/workflows/daily-bench.yml`](.github/workflows/daily-bench.yml)).
+Automated daily benchmark measuring PUT/GET throughput for 1MB, 100MB, and 1GB objects against production. Runs via GitHub Actions at 6 AM UTC ([`.github/workflows/production-daily-benchmark.yml`](.github/workflows/production-daily-benchmark.yml)).
 
 ## License
 

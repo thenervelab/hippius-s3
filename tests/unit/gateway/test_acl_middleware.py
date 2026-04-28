@@ -95,6 +95,9 @@ class TestACLMiddleware:
     def mock_acl_service(self) -> Any:
         service = AsyncMock()
         service.check_permission = AsyncMock(return_value=True)
+        service.get_bucket_owner = AsyncMock(return_value="test-owner-id")
+        service.get_bucket_id = AsyncMock(return_value="test-bucket-id")
+        service.get_bucket_owner_and_id = AsyncMock(return_value=("test-owner-id", "test-bucket-id"))
         return service
 
     @pytest.fixture

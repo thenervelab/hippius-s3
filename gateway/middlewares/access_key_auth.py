@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import logging
 import re
+from dataclasses import dataclass
 
 from fastapi import Request
 from redis.asyncio import Redis
@@ -18,6 +19,8 @@ from gateway.middlewares.sigv4 import extract_signature_from_auth_header
 from gateway.middlewares.sigv4 import extract_signed_headers
 from gateway.services.auth_cache import cached_auth
 from gateway.services.auth_service import decrypt_secret
+from hippius_s3.models.sub_token import ACCESS_KEY_PATTERN
+from hippius_s3.models.sub_token import SS58_PATTERN
 
 
 logger = logging.getLogger(__name__)
@@ -28,25 +31,26 @@ class AccessKeyAuthError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class TokenAuth:
+    access_key: str
+    account_address: str
+    token_type: str
+
+
 ALLOWED_TOKEN_TYPES = {"master", "sub"}
-ACCESS_KEY_PATTERN = re.compile(r"^hip_[a-zA-Z0-9_-]{1,240}$")
 
 
 async def verify_access_key_signature(
     request: Request,
     access_key: str,
     redis_client: "Redis",
-) -> tuple[bool, str, str]:
-    """
-    Verify AWS SigV4 signature using access key authentication.
+) -> TokenAuth:
+    """Verify AWS SigV4 signature using access key authentication.
 
-    Args:
-        request: FastAPI request object
-        access_key: Access key ID (starts with hip_)
-        redis_client: Redis client for auth caching
-
-    Returns:
-        (is_valid, account_address, token_type)
+    Returns a TokenAuth on success. Raises AccessKeyAuthError on any failure
+    (invalid format, missing headers, signature mismatch, unknown/inactive key,
+    malformed API response, unsupported token type).
     """
     if not access_key or not ACCESS_KEY_PATTERN.match(access_key):
         logger.warning(f"Invalid access key format: {access_key[:8] if access_key else 'empty'}***")
@@ -66,13 +70,13 @@ async def verify_access_key_signature(
 
     if not token_response.valid or token_response.status != "active":
         logger.warning(f"Invalid or inactive access key: {access_key[:8]}***, status={token_response.status}")
-        return False, "", ""
+        raise AccessKeyAuthError("Invalid or inactive access key")
 
     if not token_response.account_address:
         logger.error(f"API returned empty account_address for key: {access_key[:8]}***")
         raise AccessKeyAuthError("Invalid API response: missing account_address")
 
-    if not re.match(r"^[1-9A-HJ-NP-Za-km-z]{47,48}$", token_response.account_address):
+    if not SS58_PATTERN.match(token_response.account_address):
         logger.error(f"Invalid account address format: {token_response.account_address}")
         raise AccessKeyAuthError("Invalid account address format")
 
@@ -121,36 +125,31 @@ async def verify_access_key_signature(
         service=service,
     )
 
-    # provided_signature is guaranteed non-empty by earlier validation
-    is_valid = hmac.compare_digest(calculated_signature, provided_signature or "")
+    if not hmac.compare_digest(calculated_signature, provided_signature or ""):
+        logger.warning(f"Signature mismatch for access key: {access_key[:8]}***")
+        raise AccessKeyAuthError("Signature mismatch")
 
-    if is_valid:
-        logger.info(
-            f"Access key auth successful: key={access_key[:8]}***, account={token_response.account_address}, type={token_response.token_type}"
-        )
-        if token_response.token_type == "master":
-            logger.info(f"AUDIT: Master token used: key={access_key[:8]}***, account={token_response.account_address}")
-        return True, token_response.account_address, token_response.token_type
-
-    logger.warning(f"Signature mismatch for access key: {access_key[:8]}***")
-    return False, "", ""
+    logger.info(
+        f"Access key auth successful: key={access_key[:8]}***, "
+        f"account={token_response.account_address}, type={token_response.token_type}"
+    )
+    if token_response.token_type == "master":
+        logger.info(f"AUDIT: Master token used: key={access_key[:8]}***, account={token_response.account_address}")
+    return TokenAuth(
+        access_key=access_key,
+        account_address=token_response.account_address,
+        token_type=token_response.token_type,
+    )
 
 
 async def verify_access_key_presigned_url(
     request: Request,
     access_key: str,
     redis_client: "Redis",
-) -> tuple[bool, str, str]:
-    """
-    Verify AWS SigV4 query-string (presigned URL) signature using access key authentication.
+) -> TokenAuth:
+    """Verify AWS SigV4 query-string (presigned URL) signature.
 
-    Args:
-        request: FastAPI request object
-        access_key: Access key ID (starts with hip_)
-        redis_client: Redis client for auth caching
-
-    Returns:
-        (is_valid, account_address, token_type)
+    Returns a TokenAuth on success. Raises AccessKeyAuthError on any failure.
     """
     if not access_key or not ACCESS_KEY_PATTERN.match(access_key):
         logger.warning(f"Invalid access key format in presigned URL: {access_key[:8] if access_key else 'empty'}***")
@@ -169,7 +168,6 @@ async def verify_access_key_presigned_url(
         logger.error("Missing required X-Amz-* query parameters for presigned URL verification")
         raise AccessKeyAuthError("Missing required presigned URL parameters")
 
-    # Narrow types after the all() check above guarantees non-None
     assert credential is not None
     assert expires_str is not None
     assert signed_headers_str is not None
@@ -193,7 +191,6 @@ async def verify_access_key_presigned_url(
         logger.error(f"Presigned URL credential ID mismatch: header={access_key[:8]}***, query={credential_id[:8]}***")
         raise AccessKeyAuthError("Credential does not match access key")
 
-    # Ensure credential scope date matches X-Amz-Date date prefix (YYYYMMDD)
     if not amz_date or len(amz_date) < 8 or date_scope != amz_date[:8]:
         logger.error(f"X-Amz-Date ({amz_date}) and credential scope date ({date_scope}) mismatch in presigned URL")
         raise AccessKeyAuthError("Invalid credential scope")
@@ -221,11 +218,10 @@ async def verify_access_key_presigned_url(
         logger.info(
             f"Presigned URL expired: signed_at={signed_at.isoformat()}, expires_in={expires}s, now={now.isoformat()}"
         )
-        return False, "", ""
+        raise AccessKeyAuthError("Presigned URL expired")
 
     signed_headers = signed_headers_str.split(";")
 
-    # Require host to be part of the signed headers, as per AWS SigV4 requirements
     if "host" not in signed_headers:
         logger.error("Presigned URL missing required 'host' header in X-Amz-SignedHeaders")
         raise AccessKeyAuthError("Invalid signed headers")
@@ -236,13 +232,13 @@ async def verify_access_key_presigned_url(
         logger.warning(
             f"Invalid or inactive access key for presigned URL: {access_key[:8]}***, status={token_response.status}"
         )
-        return False, "", ""
+        raise AccessKeyAuthError("Invalid or inactive access key")
 
     if not token_response.account_address:
         logger.error(f"API returned empty account_address for presigned key: {access_key[:8]}***")
         raise AccessKeyAuthError("Invalid API response: missing account_address")
 
-    if not re.match(r"^[1-9A-HJ-NP-Za-km-z]{47,48}$", token_response.account_address):
+    if not SS58_PATTERN.match(token_response.account_address):
         logger.error(f"Invalid account address format: {token_response.account_address}")
         raise AccessKeyAuthError("Invalid account address format")
 
@@ -256,10 +252,7 @@ async def verify_access_key_presigned_url(
         config.hippius_secret_decryption_material,
     )
 
-    # Build canonical request with presigned query canonicalization
     canonical_query = canonicalize_presigned_query_string(request.url.query)
-
-    # Path must also match what the client signed; derive from raw_path.
     canonical_path = canonical_path_from_scope(request)
 
     canonical_request = await create_canonical_request(
@@ -282,20 +275,21 @@ async def verify_access_key_presigned_url(
         service=service,
     )
 
-    # provided_signature is validated above as non-empty
-    is_valid = hmac.compare_digest(calculated_signature, str(provided_signature))
+    if not hmac.compare_digest(calculated_signature, str(provided_signature)):
+        logger.warning(f"Presigned URL signature mismatch for access key: {access_key[:8]}***")
+        raise AccessKeyAuthError("Signature mismatch")
 
-    if is_valid:
+    logger.info(
+        f"Presigned URL access key auth successful: key={access_key[:8]}***, "
+        f"account={token_response.account_address}, type={token_response.token_type}"
+    )
+    if token_response.token_type == "master":
         logger.info(
-            f"Presigned URL access key auth successful: key={access_key[:8]}***, "
-            f"account={token_response.account_address}, type={token_response.token_type}"
+            f"AUDIT: Master token used via presigned URL: key={access_key[:8]}***, "
+            f"account={token_response.account_address}"
         )
-        if token_response.token_type == "master":
-            logger.info(
-                f"AUDIT: Master token used via presigned URL: key={access_key[:8]}***, "
-                f"account={token_response.account_address}"
-            )
-        return True, token_response.account_address, token_response.token_type
-
-    logger.warning(f"Presigned URL signature mismatch for access key: {access_key[:8]}***")
-    return False, "", ""
+    return TokenAuth(
+        access_key=access_key,
+        account_address=token_response.account_address,
+        token_type=token_response.token_type,
+    )

@@ -100,13 +100,11 @@ async def test_access_key_signature_uses_raw_path_for_canonical_path() -> None:
                 new=fake_create_canonical_request,
             ):
                 with patch("gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"):
-                    is_valid, out_account, out_token_type = await verify_access_key_signature(
-                        request, access_key, mock_redis
-                    )
+                    token_auth = await verify_access_key_signature(request, access_key, mock_redis)
 
-    assert is_valid is True
-    assert out_account == account_address
-    assert out_token_type == token_type
+    assert token_auth.access_key == access_key
+    assert token_auth.account_address == account_address
+    assert token_auth.token_type == token_type
     # Path used for signing must be the percent-encoded wire path
     assert captured_path == "/aff/conflict65%20(3).jpg"
 
