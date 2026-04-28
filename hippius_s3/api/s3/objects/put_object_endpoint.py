@@ -6,6 +6,7 @@ from datetime import datetime
 from datetime import timezone
 from typing import Any
 
+import asyncpg
 from fastapi import Request
 from fastapi import Response
 from opentelemetry import trace
@@ -30,7 +31,7 @@ async def handle_put_object(
     bucket_name: str,
     object_key: str,
     request: Request,
-    db: Any,
+    pool: asyncpg.Pool,
     redis_client: Any,
 ) -> Response:
     try:
@@ -40,14 +41,14 @@ async def handle_put_object(
         with tracer.start_as_current_span(
             "put_object.get_or_create_user", attributes={"hippius.account.main": main_account_id}
         ):
-            await db.fetchrow(
+            await pool.fetchrow(
                 get_query("get_or_create_user_by_main_account"),
                 main_account_id,
                 datetime.now(timezone.utc),
             )
 
         with tracer.start_as_current_span("put_object.get_bucket", attributes={"bucket_name": bucket_name}):
-            bucket = await db.fetchrow(
+            bucket = await pool.fetchrow(
                 get_query("get_bucket_by_name"),
                 bucket_name,
             )
@@ -69,7 +70,7 @@ async def handle_put_object(
         if meta_append:
             return await handle_append(
                 request,
-                db,
+                pool,
                 redis_client,
                 bucket=bucket,
                 bucket_id=bucket_id,
@@ -95,7 +96,7 @@ async def handle_put_object(
 
         # Capture previous object (to clean up multipart parts if overwriting)
         with tracer.start_as_current_span("put_object.check_existing_object") as span:
-            prev = await db.fetchrow(
+            prev = await pool.fetchrow(
                 get_query("get_object_by_path"),
                 bucket_id,
                 object_key,
@@ -127,7 +128,7 @@ async def handle_put_object(
                 "storage_version": config.target_storage_version,
             },
         ) as span:
-            writer = ObjectWriter(db=db, redis_client=redis_client, fs_store=request.app.state.fs_store)
+            writer = ObjectWriter(pool=pool, redis_client=redis_client, fs_store=request.app.state.fs_store)
 
             put_res = await writer.put_simple_stream_full(
                 bucket_id=bucket_id,
@@ -172,7 +173,7 @@ async def handle_put_object(
 
         # Mark upload completed to prevent CASCADE deletion of chunk_backend on DELETE
         # Maintains parity with append (sets TRUE immediately) and multipart (sets TRUE in mpu_complete)
-        await db.execute(
+        await pool.execute(
             "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
             put_res.upload_id,
         )

@@ -2,6 +2,7 @@ import hashlib
 import os
 from datetime import datetime
 from datetime import timedelta
+from datetime import timezone
 
 import boto3
 import pytest
@@ -33,7 +34,7 @@ def production_s3_client():
 
 @pytest.fixture(scope="session")
 def session_tracker(production_s3_client):
-    session_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    session_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     bucket = "hippius-smoke-tests"
 
     tracker = SessionTracker(s3_client=production_s3_client, session_id=session_id, bucket_name=bucket)
@@ -56,7 +57,7 @@ def cleanup_old_files(production_s3_client):
     bucket = "hippius-smoke-tests"
     prefix = "smoke-test/"
     retention_days = 30
-    cutoff = datetime.utcnow() - timedelta(days=retention_days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
 
     try:
         production_s3_client.create_bucket(Bucket=bucket)
@@ -84,7 +85,7 @@ def cleanup_old_files(production_s3_client):
                 continue
 
             try:
-                session_ts = datetime.strptime(parts[1], "%Y%m%d-%H%M%S")
+                session_ts = datetime.strptime(parts[1], "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc)
                 if session_ts < cutoff:
                     production_s3_client.delete_object(Bucket=bucket, Key=key)
                     deleted_count += 1

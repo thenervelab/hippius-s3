@@ -442,8 +442,8 @@ async def run_downloader_loop(
             if needs_redis_reconnect:
                 logger.warning(f"[{backend_name}] Rebuilding cache redis client after task error")
                 with contextlib.suppress(Exception):
-                    await redis_client.aclose()  # ty: ignore[unresolved-attribute]
-                redis_client = create_redis_client(config.redis_url)  # ty: ignore[invalid-assignment]
+                    await redis_client.aclose()
+                redis_client = create_redis_client(config.redis_url)
                 initialize_cache_client(redis_client)
                 obj_cache = RedisObjectPartsCache(redis_client, queues_client=redis_queues_client, fs_store=fs_store)
                 needs_redis_reconnect = False

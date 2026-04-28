@@ -132,6 +132,13 @@ class GatewayConfig:
     )
     arion_service_key: str = dataclasses.field(default_factory=lambda: os.getenv("ARION_SERVICE_KEY", ""))
 
+    # ATS (Apache Traffic Server) reverse-proxy cache endpoints (CSV). When ATS_CACHE_ENDPOINT is unset,
+    # all PURGE + public Cache-Control logic becomes a no-op — safe default for local dev.
+    # Multiple endpoints are purged in parallel so every ATS pod's cache stays consistent.
+    ats_cache_endpoints: list[str] = dataclasses.field(
+        default_factory=lambda: _parse_csv(os.getenv("ATS_CACHE_ENDPOINT", ""))
+    )
+
 
 _config: GatewayConfig | None = None
 

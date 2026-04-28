@@ -5,12 +5,14 @@ import logging
 from typing import Any
 from typing import Optional
 
+import asyncpg
 from fastapi import Request
 from fastapi import Response
 from opentelemetry import trace
 
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.common import if_none_match_matches
 from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
 from hippius_s3.utils import get_query
@@ -73,7 +75,7 @@ async def handle_head_object(
     bucket_name: str,
     object_key: str,
     request: Request,
-    db: Any,
+    pool: asyncpg.Pool,
 ) -> Response:
     # Gateway now handles all ACL/permission checks
     # Backend trusts the account information from gateway
@@ -101,7 +103,8 @@ async def handle_head_object(
     if "tagging" in request.query_params:
         with tracer.start_as_current_span("head_object.check_tagging_request"):
             try:
-                await _get_object_with_permissions_min(bucket_name, object_key, db, main_account_id, version_id)
+                async with pool.acquire() as conn:
+                    await _get_object_with_permissions_min(bucket_name, object_key, conn, main_account_id, version_id)
                 return Response(status_code=200)
             except errors.S3Error as e:
                 return Response(
@@ -115,6 +118,7 @@ async def handle_head_object(
                 logger.exception("Error in HEAD tagging request")
                 return Response(status_code=500)
 
+    db = await pool.acquire()
     try:
         with tracer.start_as_current_span("head_object.get_object_metadata") as span:
             row = await _get_object_with_permissions_min(bucket_name, object_key, db, main_account_id, version_id)
@@ -153,6 +157,9 @@ async def handle_head_object(
                         )
                 except Exception:
                     md5_hash = md5_hash or ""
+        if md5_hash and if_none_match_matches(request.headers.get("if-none-match"), md5_hash):
+            return Response(status_code=304, headers={"ETag": f'"{md5_hash}"'})
+
         content_type = row["content_type"]
         headers: dict[str, str] = {
             "Content-Type": content_type,
@@ -234,3 +241,6 @@ async def handle_head_object(
     except Exception as e:
         logger.exception(f"Error getting object metadata: {e}")
         return Response(status_code=500)
+
+    finally:
+        await pool.release(db)

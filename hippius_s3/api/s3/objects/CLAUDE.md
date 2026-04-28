@@ -105,4 +105,13 @@ Full spec: [docs/s4.md](../../../../docs/s4.md).
 | #2411 | 10:53 PM | 🔵 | GetObject endpoint retrieves objects via get_object_for_download_with_permissions queries | ~343 |
 | #2410 | " | 🔵 | HeadObject endpoint implementation and database queries | ~331 |
 | #2409 | " | 🔵 | S3 object router implementation using FastAPI | ~304 |
+
+### Apr 23, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #6914 | 12:20 PM | 🔄 | Migrated put_object and delete_object routes to scoped connection acquisition | ~571 |
+| #6912 | 12:13 PM | 🔄 | HEAD object endpoint refactored to use connection pool with scoped acquisition | ~549 |
+| #6911 | 12:11 PM | 🔄 | Migrated head_object and get_object routes to pool-based connection lifecycle | ~503 |
+| #6902 | 11:55 AM | 🔵 | S3 object router shows all operations including MPU parts acquire database connections | ~555 |
 </claude-mem-context>

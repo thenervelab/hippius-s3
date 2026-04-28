@@ -4,6 +4,7 @@ from typing import Callable
 from fastapi import Request
 from fastapi import Response
 
+from gateway.config import get_config
 from gateway.services.sub_token_scope import OP_LIST_BUCKETS
 from gateway.services.sub_token_scope import evaluate as evaluate_sub_token_scope
 from gateway.services.sub_token_scope import permission_allows
@@ -97,6 +98,8 @@ async def acl_middleware(
         return await call_next(request)
 
     bucket, key = parse_s3_path(path)
+    request.state.s3_bucket = bucket
+    request.state.s3_key = key
     query_params = dict(request.query_params)
 
     auth_method = getattr(request.state, "auth_method", None)
@@ -188,6 +191,22 @@ async def acl_middleware(
     if bucket_owner_id is None:
         logger.info(f"Bucket not found in ACL check: {bucket}, passing through to backend for proper S3 error")
         return await call_next(request)
+
+    request.state.bucket_owner_id = bucket_owner_id
+
+    # Compute anonymous_read_allowed once, before any auth-bypass paths, so
+    # master-token and presigned-URL reads of public objects also populate ATS cache.
+    # Gated on ATS being active to avoid a Redis round-trip when there's no consumer.
+    request.state.anonymous_read_allowed = False
+    if get_config().ats_cache_endpoints and request.method in ("GET", "HEAD") and key is not None:
+        request.state.anonymous_read_allowed = await acl_service.check_permission(
+            account_id=None,
+            bucket=bucket,
+            key=key,
+            permission=Permission.READ,
+            access_key=None,
+            bucket_owner_id=bucket_owner_id,
+        )
 
     if auth_method == "access_key" and token_type == "master" and bucket_owner_id == account_id:
         logger.info(f"Master token bypass for account {account_id} on bucket {bucket}")

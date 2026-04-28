@@ -242,7 +242,7 @@ def env(key: str, convert: Callable[[str], T] = typing.cast(Callable[[str], T], 
 
         raise KeyError(key_val)
 
-    return typing.cast(T, dataclasses.field(default_factory=default_factory, **kwargs))
+    return dataclasses.field(default_factory=default_factory, **kwargs)
 
 
 @functools.cache

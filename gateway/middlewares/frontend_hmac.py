@@ -41,7 +41,10 @@ async def verify_frontend_hmac_middleware(
     hmac_signature = request.headers.get("x-hmac-signature")
     if not hmac_signature:
         logger.warning(f"Missing X-HMAC-Signature header for {request.method} {request.url.path}")
-        return _error(status.HTTP_401_UNAUTHORIZED, "Missing X-HMAC-Signature header")
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"detail": "Missing X-HMAC-Signature header"},
+        )
 
     message = request.method + request.url.path
     if request.url.query:
@@ -57,7 +60,10 @@ async def verify_frontend_hmac_middleware(
         logger.warning(
             f"Frontend HMAC verification failed for {request.method} {request.url.path}, raw message={message}"
         )
-        return _error(status.HTTP_403_FORBIDDEN, "Invalid HMAC signature")
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={"detail": "Invalid HMAC signature"},
+        )
 
     logger.debug(f"Frontend HMAC verification successful for {request.method} {request.url.path}")
     return await call_next(request)

@@ -1,7 +1,11 @@
 import hashlib
+import os
 import random
+import uuid
 from datetime import datetime
+from datetime import timezone
 
+import httpx
 import pytest
 
 
@@ -11,7 +15,7 @@ def test_01_cleanup_old_files(production_s3_client, session_tracker):
     bucket = session_tracker.bucket
     prefix = "smoke-test/"
     retention_days = 30
-    cutoff = datetime.utcnow() - timedelta(days=retention_days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
 
     deleted_count = 0
     paginator = production_s3_client.get_paginator("list_objects_v2")
@@ -30,7 +34,7 @@ def test_01_cleanup_old_files(production_s3_client, session_tracker):
                 continue
 
             try:
-                session_ts = datetime.strptime(parts[1], "%Y%m%d-%H%M%S")
+                session_ts = datetime.strptime(parts[1], "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc)
                 if session_ts < cutoff:
                     production_s3_client.delete_object(Bucket=bucket, Key=key)
                     deleted_count += 1
@@ -45,7 +49,7 @@ def test_02_upload_simple_file(production_s3_client, session_tracker, file_gener
     data, hash_md5 = file_generator(size)
 
     key = f"smoke-test/{session_tracker.session_id}/simple/{hash_md5}.bin"
-    upload_time = datetime.utcnow().isoformat()
+    upload_time = datetime.now(timezone.utc).isoformat()
 
     response = production_s3_client.put_object(
         Bucket=session_tracker.bucket,
@@ -78,7 +82,7 @@ def test_03_upload_multipart_file(production_s3_client, session_tracker, file_ge
     data, hash_md5 = file_generator(total_size)
 
     key = f"smoke-test/{session_tracker.session_id}/multipart/{hash_md5}.bin"
-    upload_time = datetime.utcnow().isoformat()
+    upload_time = datetime.now(timezone.utc).isoformat()
 
     create_response = production_s3_client.create_multipart_upload(
         Bucket=session_tracker.bucket,
@@ -193,3 +197,88 @@ def test_06_write_session_manifest(production_s3_client, session_tracker):
     assert len(retrieved_manifest["files"]) == 2
 
     print(f"Session manifest saved: {manifest_key}")
+
+
+def test_07_presigned_url_roundtrip(production_s3_client, session_tracker, file_generator):
+    size = 1 * 1024 * 1024
+    data, expected_hash = file_generator(size)
+    key = f"smoke-test/{session_tracker.session_id}/presigned/{uuid.uuid4()}.bin"
+
+    put_url = production_s3_client.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": session_tracker.bucket, "Key": key},
+        ExpiresIn=300,
+    )
+    put_resp = httpx.put(put_url, content=data, timeout=60)
+    assert put_resp.status_code == 200, f"presigned PUT failed: {put_resp.status_code} {put_resp.text[:200]}"
+
+    get_url = production_s3_client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": session_tracker.bucket, "Key": key},
+        ExpiresIn=300,
+    )
+    get_resp = httpx.get(get_url, timeout=60)
+    assert get_resp.status_code == 200, f"presigned GET failed: {get_resp.status_code} {get_resp.text[:200]}"
+
+    downloaded_hash = hashlib.md5(get_resp.content).hexdigest()
+    assert downloaded_hash == expected_hash, f"hash mismatch: {downloaded_hash} != {expected_hash}"
+    assert len(get_resp.content) == size
+
+    print(f"Presigned roundtrip validated: {key} ({size} bytes, hash={expected_hash[:8]}...)")
+
+
+def test_08_cors_preflight_on_presigned_url(production_s3_client, session_tracker):
+    key = f"smoke-test/{session_tracker.session_id}/cors-probe-{uuid.uuid4()}.bin"
+    put_url = production_s3_client.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": session_tracker.bucket, "Key": key},
+        ExpiresIn=60,
+    )
+
+    resp = httpx.options(
+        put_url,
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "PUT",
+            "Access-Control-Request-Headers": "content-type",
+        },
+        timeout=10,
+    )
+
+    assert resp.status_code in (200, 204), (
+        f"preflight failed (ATS may be rejecting OPTIONS): status={resp.status_code} body={resp.text[:200]}"
+    )
+    assert resp.headers.get("Access-Control-Allow-Origin") == "*", (
+        f"missing/unexpected Access-Control-Allow-Origin: {resp.headers.get('Access-Control-Allow-Origin')!r}"
+    )
+    allow_methods = resp.headers.get("Access-Control-Allow-Methods", "")
+    assert "PUT" in allow_methods, f"PUT not in Access-Control-Allow-Methods: {allow_methods!r}"
+    allow_headers = resp.headers.get("Access-Control-Allow-Headers", "").lower()
+    assert "content-type" in allow_headers, f"content-type not echoed in Access-Control-Allow-Headers: {allow_headers!r}"
+
+    print(f"CORS preflight on presigned URL OK: status={resp.status_code}, methods={allow_methods}")
+
+
+def test_09_cors_preflight_on_direct_path(session_tracker):
+    endpoint = os.environ.get("HIPPIUS_ENDPOINT", "https://s3.hippius.com").rstrip("/")
+    direct_url = f"{endpoint}/{session_tracker.bucket}/smoke-cors-probe-{uuid.uuid4()}.bin"
+
+    resp = httpx.options(
+        direct_url,
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "PUT",
+            "Access-Control-Request-Headers": "content-type,authorization",
+        },
+        timeout=10,
+    )
+
+    assert resp.status_code in (200, 204), (
+        f"preflight failed: status={resp.status_code} body={resp.text[:200]}"
+    )
+    assert resp.headers.get("Access-Control-Allow-Origin") == "*"
+    allow_headers = resp.headers.get("Access-Control-Allow-Headers", "").lower()
+    assert "content-type" in allow_headers
+    assert "authorization" in allow_headers
+
+    print(f"CORS preflight on direct path OK: {direct_url}")
