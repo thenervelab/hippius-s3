@@ -63,8 +63,36 @@ PERMISSION_MATRIX: dict[Permission, frozenset[Op]] = {
 }
 
 
-# Subresource query params that turn a bucket op into a bucket-metadata op.
-_BUCKET_META_SUBRESOURCES = frozenset({"acl", "tagging", "policy", "cors", "lifecycle"})
+# Bucket subresource query params that turn the request into a bucket-metadata op.
+# Mirrors the AWS S3 surface: every bucket subresource that is a read/write of
+# bucket configuration (NOT a data listing — `uploads` and `versions` list data
+# and stay as `list_bucket`).
+_BUCKET_META_SUBRESOURCES = frozenset(
+    {
+        "accelerate",
+        "acl",
+        "analytics",
+        "cors",
+        "encryption",
+        "intelligent-tiering",
+        "inventory",
+        "lifecycle",
+        "location",
+        "logging",
+        "metrics",
+        "notification",
+        "object-lock",
+        "ownershipControls",
+        "policy",
+        "policyStatus",
+        "publicAccessBlock",
+        "replication",
+        "requestPayment",
+        "tagging",
+        "versioning",
+        "website",
+    }
+)
 
 _OBJECT_OPS: dict[str, Op] = {
     "GET": Op.read_object,
@@ -98,6 +126,12 @@ def required_op(method: str, has_key: bool, query_params: dict[str, str]) -> Op:
     """
     if has_key:
         return _OBJECT_OPS.get(method, Op.write_object)
+
+    # POST /bucket?delete is the bulk DeleteObjects operation. Its semantic
+    # cost is per-object delete, not bucket-metadata write — must be gated on
+    # the same scope as DeleteObject so `object_read_write` works as expected.
+    if method == "POST" and "delete" in query_params:
+        return Op.delete_object
 
     is_meta_subresource = any(q in query_params for q in _BUCKET_META_SUBRESOURCES)
     if is_meta_subresource:

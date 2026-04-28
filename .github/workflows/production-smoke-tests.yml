@@ -62,6 +62,26 @@ jobs:
             --json-report \
             --json-report-file=reports/smoke-regional.json
 
+      - name: Run sub-token scope smoke tests against s3.hippius.com
+        if: always()
+        env:
+          AWS_ACCESS_KEY: ${{ secrets.HIPPIUS_PROD_ACCESS_KEY }}
+          AWS_SECRET_KEY: ${{ secrets.HIPPIUS_PROD_SECRET_KEY }}
+          HIPPIUS_ENDPOINT: https://s3.hippius.com
+          FRONTEND_HMAC_SECRET: ${{ secrets.FRONTEND_HMAC_SECRET_PROD }}
+          HIPPIUS_USER_TOKEN: ${{ secrets.HIPPIUS_USER_TOKEN_PROD }}
+          HIPPIUS_MASTER_ACCOUNT_ID: ${{ secrets.HIPPIUS_MASTER_ACCOUNT_ID_PROD }}
+        run: |
+          mkdir -p reports
+          pytest tests/smoke/test_smoke_subtoken_scope.py \
+            -v \
+            --tb=short \
+            -m smoke_subtoken \
+            -W "ignore::DeprecationWarning:botocore" \
+            -W "ignore::DeprecationWarning:dateutil" \
+            --json-report \
+            --json-report-file=reports/smoke-subtoken-scope.json
+
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4

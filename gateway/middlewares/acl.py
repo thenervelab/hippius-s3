@@ -6,12 +6,35 @@ from fastapi import Response
 
 from gateway.config import get_config
 from gateway.services.sub_token_scope import OP_LIST_BUCKETS
+from gateway.services.sub_token_scope import OP_READ_OBJECT
+from gateway.services.sub_token_scope import bucket_in_scope
 from gateway.services.sub_token_scope import evaluate as evaluate_sub_token_scope
 from gateway.services.sub_token_scope import permission_allows
 from gateway.services.sub_token_scope_cache import get_cached_sub_token_scope
 from gateway.utils.errors import s3_error_response
 from hippius_s3.models.acl import Permission
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
+
+
+def _parse_copy_source_bucket(header_value: str) -> str | None:
+    """Extract the source bucket from an `x-amz-copy-source` header.
+
+    Accepted formats (per AWS S3 SDKs):
+      - `/sourcebucket/sourcekey`
+      - `sourcebucket/sourcekey`
+      - `sourcebucket/sourcekey?versionId=v1`
+
+    The ARN form (`arn:aws:s3:::bucket/key`) is not supported and returns None.
+    The bucket portion is never URL-encoded in real-world traffic — only the
+    key — so we don't need to decode.
+    """
+    if not header_value or header_value.startswith("arn:"):
+        return None
+    val = header_value.lstrip("/").split("?", 1)[0]
+    parts = val.split("/", 1)
+    if not parts or not parts[0]:
+        return None
+    return parts[0]
 
 
 def parse_s3_path(path: str) -> tuple[str | None, str | None]:
@@ -163,6 +186,28 @@ async def acl_middleware(
             )
             if not allowed:
                 return _access_denied()
+
+            # CopyObject / UploadPartCopy: scope must also cover the source
+            # bucket. The destination check above only validates write access
+            # to the destination — without this second check, a sub-token
+            # scoped to bucket B could copy data from bucket A (which it
+            # cannot read) into B. Cross-account sources fall through to the
+            # backend / bucket-ACL flow (existing contractor pattern).
+            copy_source = request.headers.get("x-amz-copy-source")
+            if copy_source and key is not None and scope is not None:
+                src_bucket_name = _parse_copy_source_bucket(copy_source)
+                if src_bucket_name:
+                    src_owner_id, src_bucket_id = await acl_service.get_bucket_owner_and_id(src_bucket_name)
+                    if src_owner_id == account_id:
+                        src_allowed = bucket_in_scope(src_bucket_id, scope) and permission_allows(
+                            scope.permission, OP_READ_OBJECT
+                        )
+                        if not src_allowed:
+                            logger.info(
+                                f"Sub-token copy denied: source bucket {src_bucket_name} "
+                                f"(id={src_bucket_id}) not in scope for account={account_id}"
+                            )
+                            return _access_denied()
 
             request.state.is_anonymous_access = False
             return await call_next(request)
