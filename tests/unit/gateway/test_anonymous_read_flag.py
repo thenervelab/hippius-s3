@@ -53,6 +53,8 @@ def _build_app(
 def _make_service(*, primary_permits: bool = True, anon_permits: bool = False) -> Any:
     service = AsyncMock()
     service.get_bucket_owner = AsyncMock(return_value="owner-id")
+    service.get_bucket_id = AsyncMock(return_value="bucket-id")
+    service.get_bucket_owner_and_id = AsyncMock(return_value=("owner-id", "bucket-id"))
 
     async def check_permission(
         *, account_id: str | None, bucket: str, key: str | None, permission: Any, access_key: Any, bucket_owner_id: Any
