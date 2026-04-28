@@ -295,10 +295,14 @@ def test_scope_update_invalidates_cache_immediately(
     scoped_bucket: str,
 ) -> None:
     """Flip the scope from read-only → write and verify the new permission
-    takes effect on the very next request (cache invalidation on PUT scope)."""
+    takes effect on the very next request (cache invalidation on PUT scope).
+
+    Use DELETE (no body) to probe the read-only denial — a body-bearing 403
+    leaves boto3's HTTP keepalive in a state that breaks the follow-up PUT.
+    """
     _put_small_object(boto3_master_client, scoped_bucket, "cache-test.txt", b"v0")
 
-    # Start as read-only.
+    # Start as read-only — DELETE should be denied.
     sub_token_scope_client.put(
         test_sub_token_access_key,
         {
@@ -308,10 +312,11 @@ def test_scope_update_invalidates_cache_immediately(
             "buckets": [scoped_bucket],
         },
     )
-    with pytest.raises(ClientError):
-        boto3_sub_token_client.put_object(Bucket=scoped_bucket, Key="cache-test.txt", Body=b"v1")
+    with pytest.raises(ClientError) as exc:
+        boto3_sub_token_client.delete_object(Bucket=scoped_bucket, Key="cache-test.txt")
+    assert _is_forbidden(exc.value)
 
-    # Upgrade to read+write — should work on the next call without waiting 60s.
+    # Upgrade to read+write — should work on the very next call (cache invalidated).
     sub_token_scope_client.put(
         test_sub_token_access_key,
         {
