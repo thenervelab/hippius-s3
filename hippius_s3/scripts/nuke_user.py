@@ -244,7 +244,7 @@ async def main_async(args: argparse.Namespace) -> int:
             )
             return 0
         finally:
-            await redis_queues_client.aclose()
+            await redis_queues_client.close()
 
     db = await asyncpg.connect(config.database_url)
 
@@ -328,7 +328,7 @@ async def main_async(args: argparse.Namespace) -> int:
     finally:
         await db.close()
         if redis_queues_client:
-            await redis_queues_client.aclose()
+            await redis_queues_client.close()
 
 
 def main() -> None:
