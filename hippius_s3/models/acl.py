@@ -2,6 +2,9 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
+from hippius_s3.models.sub_token import ACCESS_KEY_PATTERN
+from hippius_s3.models.sub_token import SS58_PATTERN
+
 
 class WellKnownGroups:
     """AWS S3 predefined group URIs for ACL grants."""
@@ -114,8 +117,6 @@ def validate_grant_grantees(acl: ACL) -> None:
     Raises ValueError if any grantee has invalid data.
     """
     aws_canonical_id_pattern = re.compile(r"^[a-f0-9]{64}$")
-    substrate_account_id_pattern = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{47,48}$")
-    access_key_pattern = re.compile(r"^hip_[a-zA-Z0-9_-]{1,240}$")
     valid_group_uris = {
         WellKnownGroups.ALL_USERS,
         WellKnownGroups.AUTHENTICATED_USERS,
@@ -129,7 +130,7 @@ def validate_grant_grantees(acl: ACL) -> None:
         if grantee.type == GranteeType.CANONICAL_USER:
             if not grantee.id:
                 raise ValueError("CanonicalUser grantee must have id")
-            if not (aws_canonical_id_pattern.match(grantee.id) or substrate_account_id_pattern.match(grantee.id)):
+            if not (aws_canonical_id_pattern.match(grantee.id) or SS58_PATTERN.match(grantee.id)):
                 raise ValueError(
                     f"Invalid canonical user ID: {grantee.id}. Must be 64-character hex string or Substrate account ID."
                 )
@@ -137,7 +138,7 @@ def validate_grant_grantees(acl: ACL) -> None:
         elif grantee.type == GranteeType.ACCESS_KEY:
             if not grantee.id:
                 raise ValueError("AccessKey grantee must have id")
-            if not access_key_pattern.match(grantee.id):
+            if not ACCESS_KEY_PATTERN.match(grantee.id):
                 raise ValueError(
                     f"Invalid access key format: {grantee.id}. Must match pattern hip_[a-zA-Z0-9_-]{{1,240}}"
                 )

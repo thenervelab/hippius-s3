@@ -195,7 +195,6 @@ async def _verify_access_key_owned_by_account(access_key_id: str, account_id: st
     ),
 )
 async def get_scope(
-    request: Request,
     access_key_id: str = FPath(..., description="Sub-token access key ID, e.g. `hip_abcdef012345...`."),
     account_id: str = Query(..., description="SS58 of the owning account — must match the stored record."),
     db: DBConnection = Depends(get_postgres),
