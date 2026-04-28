@@ -52,7 +52,6 @@ jobs:
           HIPPIUS_ENDPOINT: https://s3-staging.hippius.com
           FRONTEND_HMAC_SECRET: ${{ secrets.FRONTEND_HMAC_SECRET }}
           HIPPIUS_USER_TOKEN: ${{ secrets.HIPPIUS_USER_TOKEN }}
-          HIPPIUS_MASTER_ACCOUNT_ID: ${{ secrets.HIPPIUS_MASTER_ACCOUNT_ID }}
         run: |
           mkdir -p reports
           pytest tests/smoke/test_smoke_subtoken_scope.py \

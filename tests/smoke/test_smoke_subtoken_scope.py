@@ -11,9 +11,13 @@ teardown so re-running is idempotent.
 # Add to .aws.cli.env (gitignored) once:
 #   export AWS_ACCESS_KEY=hip_master_...
 #   export AWS_SECRET_KEY=...
-#   export HIPPIUS_USER_TOKEN=49a1c15ce4dd780727127137294071bd04a3dfce
-#   export HIPPIUS_MASTER_ACCOUNT_ID=5FH...your-ss58
+#   export HIPPIUS_USER_TOKEN=<your-drf-token-from-api.hippius.com>
 #   export HIPPIUS_ENDPOINT=https://s3-staging.hippius.com
+#
+# The account SS58 is auto-derived from AWS_ACCESS_KEY/AWS_SECRET_KEY via
+# list_buckets — the DRF token in HIPPIUS_USER_TOKEN must belong to the
+# *same* Hippius account those AWS keys do, otherwise PUT scope rejects
+# with "Buckets not owned by account_id".
 #
 # Then before each run:
 #   source .aws.cli.env
