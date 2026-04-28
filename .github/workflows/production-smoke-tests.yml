@@ -68,9 +68,8 @@ jobs:
           AWS_ACCESS_KEY: ${{ secrets.HIPPIUS_PROD_ACCESS_KEY }}
           AWS_SECRET_KEY: ${{ secrets.HIPPIUS_PROD_SECRET_KEY }}
           HIPPIUS_ENDPOINT: https://s3.hippius.com
-          FRONTEND_HMAC_SECRET: ${{ secrets.FRONTEND_HMAC_SECRET_PROD }}
-          HIPPIUS_USER_TOKEN: ${{ secrets.HIPPIUS_USER_TOKEN_PROD }}
-          HIPPIUS_MASTER_ACCOUNT_ID: ${{ secrets.HIPPIUS_MASTER_ACCOUNT_ID_PROD }}
+          FRONTEND_HMAC_SECRET: ${{ secrets.FRONTEND_HMAC_SECRET }}
+          HIPPIUS_USER_TOKEN: ${{ secrets.HIPPIUS_USER_TOKEN }}
         run: |
           mkdir -p reports
           pytest tests/smoke/test_smoke_subtoken_scope.py \

@@ -140,11 +140,13 @@ def hippius_user_token():
 
 
 @pytest.fixture(scope="session")
-def hippius_master_account_ss58():
-    ss58 = os.environ.get("HIPPIUS_MASTER_ACCOUNT_ID")
-    if not ss58:
-        pytest.skip("HIPPIUS_MASTER_ACCOUNT_ID (test-account SS58) not set")
-    return ss58
+def hippius_master_account_ss58(production_s3_client):
+    """Discover the SS58 of whatever account the AWS_ACCESS_KEY/AWS_SECRET_KEY
+    creds belong to. Avoids drift between the boto3 master client and the
+    body.account_id we send to PUT /user/sub-tokens/{key}/scope: when both
+    derive from the same source, swapping CI credentials between staging /
+    prod / a smoke-test account just works."""
+    return production_s3_client.list_buckets()["Owner"]["ID"]
 
 
 @pytest.fixture(scope="session", autouse=True)
