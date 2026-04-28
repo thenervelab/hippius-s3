@@ -456,7 +456,7 @@ Say you're adding a `reconciler` worker that compares DB state with Arion state 
 2. Add the default to `.env.defaults`.
 3. Add the `.env.example` line so people know it exists.
 4. Add to the secrets table in the root `CLAUDE.md` (section 8) if it needs a real value in prod.
-5. If prod/staging reads it from k8s secrets, update `.github/workflows/k8s-deploy.yaml`.
+5. If prod/staging reads it from k8s secrets, update `.github/workflows/deploy.yaml`.
 
 ### 6.6 Trace down a 500 that reached prod
 

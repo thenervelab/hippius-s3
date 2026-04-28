@@ -354,6 +354,120 @@ def boto3_access_key_client(test_access_key: str, test_access_key_secret: str) -
 
 
 @pytest.fixture
+def test_master_access_key() -> str:
+    """Hardcoded master access key for sub-token e2e tests.
+
+    Intentionally NOT reading from HIPPIUS_KEY like `test_access_key` does —
+    the e2e mock API accepts any hip_* key and we want deterministic behavior
+    regardless of CI secrets. `HIPPIUS_KEY` in CI is not always a `hip_*` value,
+    which silently routes requests through the seed-phrase auth path and yields
+    SignatureDoesNotMatch.
+    """
+    return "hip_e2e_master"
+
+
+@pytest.fixture
+def boto3_master_client(test_master_access_key: str, test_access_key_secret: str) -> Any:
+    """boto3 S3 client authenticated as a master hip_* access key (no env override)."""
+    return boto3.client(
+        "s3",
+        endpoint_url="http://localhost:8080",
+        aws_access_key_id=test_master_access_key,
+        aws_secret_access_key=test_access_key_secret,
+        region_name="us-east-1",
+        config=Config(
+            s3={"addressing_style": "path"},
+            signature_version="s3v4",
+            connect_timeout=5,
+            read_timeout=30,
+        ),
+    )
+
+
+@pytest.fixture
+def test_sub_token_access_key() -> str:
+    """Sub-token access key; the mock API returns token_type='sub' for `hip_sub_*`."""
+    return "hip_sub_e2e_test"
+
+
+@pytest.fixture
+def boto3_sub_token_client(test_sub_token_access_key: str, test_access_key_secret: str) -> Any:
+    """boto3 S3 client authenticated as a sub-token."""
+    return boto3.client(
+        "s3",
+        endpoint_url="http://localhost:8080",
+        aws_access_key_id=test_sub_token_access_key,
+        aws_secret_access_key=test_access_key_secret,
+        region_name="us-east-1",
+        config=Config(
+            s3={"addressing_style": "path"},
+            signature_version="s3v4",
+            connect_timeout=5,
+            read_timeout=30,
+        ),
+    )
+
+
+@pytest.fixture
+def mock_account_ss58() -> str:
+    """SS58 address the mock hippius API returns for every valid access key."""
+    return "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+
+
+@pytest.fixture
+def frontend_hmac_secret() -> str:
+    return os.getenv("FRONTEND_HMAC_SECRET", "test_secret")
+
+
+@pytest.fixture
+def sub_token_scope_client(frontend_hmac_secret: str) -> Any:
+    """HTTP client for /user/sub-tokens/ control-plane endpoints.
+
+    Returns a helper object with `get`, `put`, `delete` methods that compute
+    the `X-HMAC-Signature` header automatically.
+    """
+    import hashlib
+    import hmac as hmac_mod
+    from dataclasses import dataclass
+
+    import requests  # type: ignore[import-untyped]
+
+    @dataclass
+    class ScopeClient:
+        base_url: str
+        secret: str
+
+        def _sign(self, method: str, path: str, query: str = "") -> str:
+            message = f"{method}{path}?{query}" if query else f"{method}{path}"
+            return hmac_mod.new(self.secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+
+        def get(self, access_key_id: str, account_id: str) -> requests.Response:
+            path = f"/user/sub-tokens/{access_key_id}/scope"
+            query = f"account_id={account_id}"
+            return requests.get(
+                f"{self.base_url}{path}?{query}",
+                headers={"X-HMAC-Signature": self._sign("GET", path, query)},
+            )
+
+        def put(self, access_key_id: str, body: dict[str, Any]) -> requests.Response:
+            path = f"/user/sub-tokens/{access_key_id}/scope"
+            return requests.put(
+                f"{self.base_url}{path}",
+                json=body,
+                headers={"X-HMAC-Signature": self._sign("PUT", path)},
+            )
+
+        def delete(self, access_key_id: str) -> requests.Response:
+            path = f"/user/sub-tokens/{access_key_id}/scope"
+            return requests.delete(
+                f"{self.base_url}{path}",
+                headers={"X-HMAC-Signature": self._sign("DELETE", path)},
+            )
+
+    return ScopeClient(base_url="http://localhost:8080", secret=frontend_hmac_secret)
+
+
+@pytest.fixture
 def signed_http_get(boto3_client: Any) -> Any:
     """Return a boto3-backed GET helper that mimics requests' response shape.
 

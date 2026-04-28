@@ -32,13 +32,12 @@ jobs:
           pip install --upgrade pip
           pip install -r tests/smoke/requirements.txt
 
-      - name: Run smoke tests
+      - name: Run smoke tests against s3.hippius.com
         env:
           AWS_ACCESS_KEY: ${{ secrets.HIPPIUS_PROD_ACCESS_KEY }}
           AWS_SECRET_KEY: ${{ secrets.HIPPIUS_PROD_SECRET_KEY }}
         run: |
           mkdir -p reports
-          set +e
           pytest tests/smoke/test_smoke_production.py \
             -v \
             --tb=short \
@@ -46,7 +45,14 @@ jobs:
             -W "ignore::DeprecationWarning:dateutil" \
             --json-report \
             --json-report-file=reports/smoke-production.json
-          PROD_EXIT=$?
+
+      - name: Run smoke tests against regional caches
+        if: always()
+        env:
+          AWS_ACCESS_KEY: ${{ secrets.HIPPIUS_PROD_ACCESS_KEY }}
+          AWS_SECRET_KEY: ${{ secrets.HIPPIUS_PROD_SECRET_KEY }}
+        run: |
+          mkdir -p reports
           pytest tests/smoke/test_smoke_regional.py \
             -n auto \
             -v \
@@ -55,11 +61,6 @@ jobs:
             -W "ignore::DeprecationWarning:dateutil" \
             --json-report \
             --json-report-file=reports/smoke-regional.json
-          REG_EXIT=$?
-          if [ $PROD_EXIT -ne 0 ] || [ $REG_EXIT -ne 0 ]; then
-            echo "production-exit=$PROD_EXIT regional-exit=$REG_EXIT"
-            exit 1
-          fi
 
       - name: Upload test results
         if: always()

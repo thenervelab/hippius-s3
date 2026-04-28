@@ -120,7 +120,7 @@ The benchmark will:
 
 ## Daily Benchmark (CI/CD)
 
-The daily benchmark runs automatically via GitHub Actions (`.github/workflows/daily-bench.yml`) at 6 AM UTC:
+The daily benchmark runs automatically via GitHub Actions (`.github/workflows/production-daily-benchmark.yml`) at 6 AM UTC:
 
 1. Runs `daily_bench.py` against production (https://s3.hippius.com)
 2. Tests 1MB, 100MB, and 1GB uploads/downloads (3 iterations each)

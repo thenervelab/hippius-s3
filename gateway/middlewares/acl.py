@@ -5,6 +5,10 @@ from fastapi import Request
 from fastapi import Response
 
 from gateway.config import get_config
+from gateway.services.sub_token_scope import OP_LIST_BUCKETS
+from gateway.services.sub_token_scope import evaluate as evaluate_sub_token_scope
+from gateway.services.sub_token_scope import permission_allows
+from gateway.services.sub_token_scope_cache import get_cached_sub_token_scope
 from gateway.utils.errors import s3_error_response
 from hippius_s3.models.acl import Permission
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
@@ -68,6 +72,10 @@ def get_required_permission(
     raise ValueError(f"Unknown HTTP method: {method}")
 
 
+def _access_denied() -> Response:
+    return s3_error_response(code="AccessDenied", message="Access Denied", status_code=403)
+
+
 async def acl_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
@@ -92,11 +100,79 @@ async def acl_middleware(
     bucket, key = parse_s3_path(path)
     request.state.s3_bucket = bucket
     request.state.s3_key = key
+    query_params = dict(request.query_params)
 
+    auth_method = getattr(request.state, "auth_method", None)
+    token_type = getattr(request.state, "token_type", None)
+    account_id = getattr(request.state, "account_id", None)
+    access_key = (
+        getattr(request.state, "access_key", None) if auth_method in ("access_key", "bearer_access_key") else None
+    )
+
+    acl_service = request.app.state.acl_service
+
+    # Resolve bucket ownership / id in a single query when a bucket is in play.
+    bucket_owner_id: str | None = None
+    bucket_id: str | None = None
+    if bucket is not None:
+        bucket_owner_id, bucket_id = await acl_service.get_bucket_owner_and_id(bucket)
+        if bucket_owner_id is not None:
+            request.state.bucket_owner_id = bucket_owner_id
+
+    # -------------------------------------------------------------------------
+    # Sub-token branch (R2-style): authoritative for intra-account requests,
+    # falls through to bucket ACL grants for cross-account (contractor) access.
+    # -------------------------------------------------------------------------
+    if auth_method in ("access_key", "bearer_access_key") and token_type == "sub" and access_key:
+        is_cross_account = bucket_owner_id is not None and bucket_owner_id != account_id
+        if not is_cross_account:
+            repo = request.app.state.sub_token_scope_repo
+            redis_client = request.app.state.redis_client
+            scope = await get_cached_sub_token_scope(access_key, repo, redis_client)
+
+            # ListBuckets: no bucket in play.
+            if bucket is None:
+                if scope is None or not permission_allows(scope.permission, OP_LIST_BUCKETS):
+                    logger.info(
+                        f"Sub-token ListBuckets denied: account={account_id}, "
+                        f"permission={scope.permission if scope else 'none'}"
+                    )
+                    return _access_denied()
+                logger.info(f"Sub-token ListBuckets allowed: account={account_id}, permission={scope.permission}")
+                return await call_next(request)
+
+            # Bucket does not exist yet AND this is CreateBucket (PUT /bucket, no key, no query).
+            # evaluate_sub_token_scope handles the OP_CREATE_BUCKET check including scope='all'.
+            if bucket_owner_id is None:
+                is_create_bucket = request.method == "PUT" and key is None and len(query_params) == 0
+                if not is_create_bucket:
+                    # Non-create op on a nonexistent bucket: pass through so backend returns NoSuchBucket.
+                    return await call_next(request)
+
+            allowed, reason = evaluate_sub_token_scope(
+                scope=scope,
+                bucket_id=bucket_id,
+                method=request.method,
+                has_key=key is not None,
+                query_params=query_params,
+            )
+            logger.info(
+                f"Sub-token scope check: account={account_id}, bucket={bucket}, key={key or 'None'}, "
+                f"method={request.method}, result={'GRANTED' if allowed else 'DENIED'}"
+                f"{'' if allowed else f' ({reason})'}"
+            )
+            if not allowed:
+                return _access_denied()
+
+            request.state.is_anonymous_access = False
+            return await call_next(request)
+        # cross-account sub-token falls through to check_permission below.
+
+    # -------------------------------------------------------------------------
+    # Master token + all other auth paths below here.
+    # -------------------------------------------------------------------------
     if bucket is None:
         return await call_next(request)
-
-    query_params = dict(request.query_params)
 
     is_create_bucket = request.method == "PUT" and key is None and len(query_params) == 0
     if is_create_bucket:
@@ -112,14 +188,6 @@ async def acl_middleware(
         logger.info(f"Bypassing ACL check for CreateBucket: {bucket}")
         return await call_next(request)
 
-    account_id = getattr(request.state, "account_id", None)
-    auth_method = getattr(request.state, "auth_method", None)
-    token_type = getattr(request.state, "token_type", None)
-    access_key = getattr(request.state, "access_key", None) if auth_method == "access_key" else None
-
-    acl_service = request.app.state.acl_service
-
-    bucket_owner_id = await acl_service.get_bucket_owner(bucket)
     if bucket_owner_id is None:
         logger.info(f"Bucket not found in ACL check: {bucket}, passing through to backend for proper S3 error")
         return await call_next(request)
@@ -142,7 +210,6 @@ async def acl_middleware(
 
     if auth_method == "access_key" and token_type == "master" and bucket_owner_id == account_id:
         logger.info(f"Master token bypass for account {account_id} on bucket {bucket}")
-        request.state.bucket_owner_id = bucket_owner_id
         request.state.is_anonymous_access = False
         return await call_next(request)
 
@@ -152,13 +219,11 @@ async def acl_middleware(
         has_key=key is not None,
     )
 
-    check_key = key
-
     try:
         has_permission = await acl_service.check_permission(
             account_id=account_id,
             bucket=bucket,
-            key=check_key,
+            key=key,
             permission=permission,
             access_key=access_key,
             bucket_owner_id=bucket_owner_id,
@@ -171,11 +236,7 @@ async def acl_middleware(
 
     if not has_permission:
         logger.info(f"Access denied: account={account_id}, bucket={bucket}, key={key}, permission={permission.value}")
-        return s3_error_response(
-            code="AccessDenied",
-            message="Access Denied",
-            status_code=403,
-        )
+        return _access_denied()
 
     is_anonymous = account_id is None or account_id == "anonymous"
     request.state.is_anonymous_access = is_anonymous
