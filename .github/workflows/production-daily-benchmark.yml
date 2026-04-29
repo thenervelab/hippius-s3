@@ -1,4 +1,4 @@
-name: Daily S3 Benchmark
+name: production-daily-benchmark
 
 on:
   schedule:

@@ -1,4 +1,4 @@
-name: "Staging: S3 Benchmark"
+name: staging-daily-benchmark
 
 on:
   workflow_dispatch:
