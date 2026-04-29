@@ -84,6 +84,10 @@ async def verify_access_key_signature(
         logger.error(f"Invalid token type: {token_response.token_type}")
         raise AccessKeyAuthError(f"Invalid token type: {token_response.token_type}")
 
+    if not token_response.encrypted_secret or not token_response.nonce:
+        logger.error(f"API returned valid token without crypto material: key={access_key[:8]}***")
+        raise AccessKeyAuthError("Invalid API response: missing encrypted_secret or nonce")
+
     decrypted_secret = decrypt_secret(
         token_response.encrypted_secret,
         token_response.nonce,
@@ -245,6 +249,10 @@ async def verify_access_key_presigned_url(
     if token_response.token_type not in ALLOWED_TOKEN_TYPES:
         logger.error(f"Invalid token type for presigned URL: {token_response.token_type}")
         raise AccessKeyAuthError(f"Invalid token type: {token_response.token_type}")
+
+    if not token_response.encrypted_secret or not token_response.nonce:
+        logger.error(f"API returned valid token without crypto material: key={access_key[:8]}***")
+        raise AccessKeyAuthError("Invalid API response: missing encrypted_secret or nonce")
 
     decrypted_secret = decrypt_secret(
         token_response.encrypted_secret,
