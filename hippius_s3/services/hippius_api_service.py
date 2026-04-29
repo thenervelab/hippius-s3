@@ -65,12 +65,18 @@ class UnpinResponse(BaseModel):
 
 
 class TokenAuthResponse(BaseModel):
+    # api.hippius.com returns one of two shapes from POST /objectstore/tokens/auth/:
+    #   - valid key  → {valid: true, status, account_address, token_type, encrypted_secret, nonce}
+    #   - unknown    → {valid: false, detail: "unknown accessKeyId"}
+    # All except `valid` are optional so the error shape parses cleanly; callers
+    # gate on `valid` before consuming the rest.
     valid: bool
-    status: str
-    account_address: str
-    token_type: str
-    encrypted_secret: str
-    nonce: str
+    status: str | None = None
+    account_address: str | None = None
+    token_type: str | None = None
+    encrypted_secret: str | None = None
+    nonce: str | None = None
+    detail: str | None = None
 
 
 class UploadResponse(BaseModel):

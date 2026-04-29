@@ -1,4 +1,4 @@
-name: Production Smoke Tests
+name: production-smoke-tests
 
 on:
   schedule:

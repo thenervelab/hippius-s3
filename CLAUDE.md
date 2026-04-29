@@ -395,11 +395,12 @@ Kustomize-based. Namespaces: `hippius-s3-staging` and `hippius-s3-prod`.
 
 ### 10.1 CI/CD
 
-[.github/workflows/deploy.yaml](.github/workflows/deploy.yaml). Three top-level jobs:
+Two deploy workflows, one per environment:
 
-- `deploy-staging` — on pushes to the `staging` branch.
-- `deploy-production` — on pushes to the `k8s-production` branch.
-- `deploy-cache-production` ([deploy.yaml:370-498](/.github/workflows/deploy.yaml)) — **currently DISABLED** (`if: false` at line 373). This was the regional cache rollout for `us-0` / `eu-0`; to be re-enabled once the FS cache NVMe PVC story is finalized per region.
+- [.github/workflows/staging-deploy.yaml](.github/workflows/staging-deploy.yaml) — triggers on pushes to the `staging` branch. Job: `deploy-staging`.
+- [.github/workflows/production-deploy.yaml](.github/workflows/production-deploy.yaml) — triggers on pushes to the `k8s-production` branch. Jobs: `deploy-production`, `deploy-cache-production` (**currently DISABLED** via `if: false` — regional cache rollout for `us-0` / `eu-0`, to be re-enabled once the FS cache NVMe PVC story is finalized per region).
+
+Both share the same `build-base` and `build-images` jobs (duplicated, since GitHub Actions can't share jobs across workflows without `workflow_call`).
 
 ### 10.2 Monitoring
 

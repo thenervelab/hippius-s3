@@ -1,4 +1,4 @@
-name: "Staging: Smoke Tests"
+name: staging-smoke-tests
 
 on:
   workflow_dispatch:
