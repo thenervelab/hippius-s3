@@ -8,6 +8,7 @@ import pytest
 
 from hippius_s3.services.hippius_api_service import FileStatusResponse
 from hippius_s3.services.hippius_api_service import HippiusApiClient
+from hippius_s3.services.hippius_api_service import TokenAuthResponse
 from hippius_s3.services.hippius_api_service import UploadResponse
 
 
@@ -251,3 +252,64 @@ async def test_upload_file_json_content():
         files_param = call_args.kwargs["files"]
         file_tuple = files_param["file"]
         assert file_tuple[2] == "application/json"
+
+
+# ---- TokenAuthResponse — error-shape parsing -------------------------------
+#
+# api.hippius.com returns one of two shapes from POST /objectstore/tokens/auth/:
+#   - valid key  → all six fields populated
+#   - unknown    → {"valid": false, "detail": "unknown accessKeyId"}
+#
+# Before the fix in this PR the model required all six populated fields, so
+# the error shape raised pydantic.ValidationError and the FastAPI handler
+# returned 500. The /user/sub-tokens/{key}/scope endpoint surfaces this bug
+# any time the operator-supplied access_key_id is unknown.
+
+
+def test_token_auth_response_parses_unknown_key_error_shape():
+    """Regression: error response shape must parse without ValidationError."""
+    parsed = TokenAuthResponse.model_validate({"valid": False, "detail": "unknown accessKeyId"})
+    assert parsed.valid is False
+    assert parsed.detail == "unknown accessKeyId"
+    assert parsed.status is None
+    assert parsed.account_address is None
+    assert parsed.token_type is None
+    assert parsed.encrypted_secret is None
+    assert parsed.nonce is None
+
+
+def test_token_auth_response_parses_valid_key_full_shape():
+    """Happy path: a valid key still parses with every field populated."""
+    parsed = TokenAuthResponse.model_validate(
+        {
+            "valid": True,
+            "status": "active",
+            "account_address": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+            "token_type": "master",
+            "encrypted_secret": "AAAA",
+            "nonce": "BBBB",
+        }
+    )
+    assert parsed.valid is True
+    assert parsed.status == "active"
+    assert parsed.token_type == "master"
+    assert parsed.encrypted_secret == "AAAA"
+
+
+@pytest.mark.asyncio
+async def test_auth_returns_unknown_key_response_without_500():
+    """End-to-end on the client: an `unknown accessKeyId` 200 response should
+    parse cleanly into a TokenAuthResponse with `valid=False`. Callers gate on
+    `valid` to translate this into a 4xx, never a 500."""
+    client = HippiusApiClient()
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"valid": False, "detail": "unknown accessKeyId"}
+    mock_response.raise_for_status = MagicMock()
+
+    with patch.object(client._client, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_response
+        result = await client.auth(access_key="hip_does_not_exist")
+
+    assert result.valid is False
+    assert result.detail == "unknown accessKeyId"
