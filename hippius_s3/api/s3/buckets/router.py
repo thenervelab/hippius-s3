@@ -60,7 +60,18 @@ async def get_bucket(
         async with pool.acquire() as conn:
             return await policy_get_bucket_policy(bucket_name, conn, request.state.account.main_account)
     ctx = get_request_context(request)
-    return await handle_list_objects(bucket_name, ctx, pool, request.query_params.get("prefix"))
+    qp = request.query_params
+    return await handle_list_objects(
+        bucket_name,
+        ctx,
+        pool,
+        prefix=qp.get("prefix"),
+        start_after=qp.get("start-after"),
+        continuation_token=qp.get("continuation-token"),
+        max_keys=qp.get("max-keys"),
+        encoding_type=qp.get("encoding-type"),
+        delimiter=qp.get("delimiter"),
+    )
 
 
 @router.put("/{bucket_name}")

@@ -1,5 +1,5 @@
--- List objects in a bucket with optional prefix
--- Parameters: $1: bucket_id, $2: prefix (optional)
+-- List objects in a bucket with optional prefix and keyset pagination.
+-- Parameters: $1: bucket_id, $2: prefix (optional), $3: cursor / start-after key (optional), $4: limit
 SELECT o.object_id, o.bucket_id, o.object_key, o.current_object_version,
        COALESCE(c.cid, ov.ipfs_cid) as ipfs_cid,
        cb_arion.backend_identifier as arion_file_hash,
@@ -29,5 +29,7 @@ LEFT JOIN chunk_backend cb_arion ON cb_arion.chunk_id = pc0.id
   AND cb_arion.backend_identifier IS NOT NULL
 WHERE o.bucket_id = $1
   AND ($2::text IS NULL OR o.object_key LIKE $2::text || '%')
+  AND ($3::text IS NULL OR o.object_key > $3::text)
   AND o.deleted_at IS NULL
 ORDER BY o.object_key COLLATE "C"
+LIMIT $4::int

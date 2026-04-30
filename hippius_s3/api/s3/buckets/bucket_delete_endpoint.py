@@ -85,6 +85,8 @@ async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redi
             get_query("list_objects"),
             bucket["bucket_id"],
             None,
+            None,
+            1,
         )
 
         # S3 semantics: refuse to delete a non-empty bucket
