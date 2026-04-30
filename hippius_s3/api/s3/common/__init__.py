@@ -1,3 +1,4 @@
+from .format import format_s3_timestamp  # re-export
 from .headers import build_headers  # re-export
 from .headers import if_none_match_matches  # re-export
 from .req import parse_range  # re-export

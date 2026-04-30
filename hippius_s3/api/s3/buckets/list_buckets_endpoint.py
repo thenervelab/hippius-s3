@@ -1,22 +1,18 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 from typing import Any
 
 from fastapi import Response
 from lxml import etree as ET  # ty: ignore[unresolved-import]
 
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.common import format_s3_timestamp
 from hippius_s3.dependencies import RequestContext
 from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
-
-
-def _format_s3_timestamp(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 async def handle_list_buckets(ctx: RequestContext, db: Any) -> Response:
@@ -31,7 +27,7 @@ async def handle_list_buckets(ctx: RequestContext, db: Any) -> Response:
         for row in results:
             bucket = ET.SubElement(buckets, "Bucket")
             ET.SubElement(bucket, "Name").text = row["bucket_name"]
-            ET.SubElement(bucket, "CreationDate").text = _format_s3_timestamp(row["created_at"])
+            ET.SubElement(bucket, "CreationDate").text = format_s3_timestamp(row["created_at"])
         xml_content = ET.tostring(root, encoding="UTF-8", xml_declaration=True, pretty_print=True)
         return Response(content=xml_content, media_type="application/xml")
     except Exception:
