@@ -3,16 +3,18 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
-from datetime import datetime
 from urllib.parse import quote as urlquote
 
 import asyncpg
 from fastapi import Response
-from lxml import etree as ET  # ty: ignore[unresolved-import]
 
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.common import format_s3_timestamp
 from hippius_s3.dependencies import RequestContext
 from hippius_s3.utils import get_query
+from hippius_s3.xml_helpers import add_subelement
+from hippius_s3.xml_helpers import create_element
+from hippius_s3.xml_helpers import to_xml_bytes
 
 
 logger = logging.getLogger(__name__)
@@ -23,8 +25,8 @@ DEFAULT_MAX_KEYS = 1000
 MAX_CONTINUATION_TOKEN_LEN = 4096
 
 
-def _format_s3_timestamp(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+def _invalid_arg(message: str) -> Response:
+    return errors.s3_error_response(code="InvalidArgument", message=message, status_code=400)
 
 
 def _encode_continuation_token(last_key: str) -> str:
@@ -58,7 +60,7 @@ async def handle_list_objects(
     if delimiter:
         logger.info("ListObjectsV2 delimiter=%r ignored (CommonPrefixes not implemented yet)", delimiter)
 
-    # Treat empty query strings as absent (FastAPI hands "?prefix=" through as "").
+    # FastAPI hands "?prefix=" / "?start-after=" through as "" — treat as absent.
     prefix = prefix or None
     start_after = start_after or None
 
@@ -68,42 +70,21 @@ async def handle_list_objects(
         try:
             effective_max_keys = int(max_keys)
         except ValueError:
-            return errors.s3_error_response(
-                code="InvalidArgument",
-                message="max-keys must be an integer",
-                status_code=400,
-            )
+            return _invalid_arg("max-keys must be an integer")
         if effective_max_keys < 0:
-            return errors.s3_error_response(
-                code="InvalidArgument",
-                message="max-keys must be non-negative",
-                status_code=400,
-            )
+            return _invalid_arg("max-keys must be non-negative")
         effective_max_keys = min(effective_max_keys, MAX_KEYS_LIMIT)
 
-    cursor: str | None
+    cursor: str | None = start_after
     if continuation_token:
         if len(continuation_token) > MAX_CONTINUATION_TOKEN_LEN:
-            return errors.s3_error_response(
-                code="InvalidArgument",
-                message="The continuation token provided is incorrect",
-                status_code=400,
-            )
+            return _invalid_arg("The continuation token provided is incorrect")
         try:
             cursor = _decode_continuation_token(continuation_token)
         except (binascii.Error, UnicodeDecodeError, ValueError):
-            return errors.s3_error_response(
-                code="InvalidArgument",
-                message="The continuation token provided is incorrect",
-                status_code=400,
-            )
-    else:
-        cursor = start_after
+            return _invalid_arg("The continuation token provided is incorrect")
 
-    bucket = await pool.fetchrow(
-        get_query("get_bucket_by_name"),
-        bucket_name,
-    )
+    bucket = await pool.fetchrow(get_query("get_bucket_by_name"), bucket_name)
     if not bucket:
         return errors.s3_error_response(
             code="NoSuchBucket",
@@ -125,54 +106,37 @@ async def handle_list_objects(
 
     # Element order follows the AWS ListObjectsV2 response schema so strict XML
     # validators (some Java SDKs, S3-spec test suites) accept it.
-    root = ET.Element("ListBucketResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
-    ET.SubElement(root, "Name").text = bucket_name
-    ET.SubElement(root, "Prefix").text = _maybe_url_encode(prefix or "", encoding_type)
+    root = create_element("ListBucketResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+    add_subelement(root, "Name", bucket_name)
+    add_subelement(root, "Prefix", _maybe_url_encode(prefix or "", encoding_type))
     if continuation_token:
-        ET.SubElement(root, "ContinuationToken").text = continuation_token
+        add_subelement(root, "ContinuationToken", continuation_token)
     if start_after:
-        ET.SubElement(root, "StartAfter").text = _maybe_url_encode(start_after, encoding_type)
-    ET.SubElement(root, "MaxKeys").text = str(effective_max_keys)
+        add_subelement(root, "StartAfter", _maybe_url_encode(start_after, encoding_type))
+    add_subelement(root, "MaxKeys", str(effective_max_keys))
     if delimiter:
-        ET.SubElement(root, "Delimiter").text = _maybe_url_encode(delimiter, encoding_type)
-    ET.SubElement(root, "IsTruncated").text = "true" if is_truncated else "false"
+        add_subelement(root, "Delimiter", _maybe_url_encode(delimiter, encoding_type))
+    add_subelement(root, "IsTruncated", "true" if is_truncated else "false")
     if encoding_type:
-        ET.SubElement(root, "EncodingType").text = encoding_type
-    ET.SubElement(root, "KeyCount").text = str(len(rows))
+        add_subelement(root, "EncodingType", encoding_type)
+    add_subelement(root, "KeyCount", str(len(rows)))
     if is_truncated and rows:
-        ET.SubElement(root, "NextContinuationToken").text = _encode_continuation_token(rows[-1]["object_key"])
+        add_subelement(root, "NextContinuationToken", _encode_continuation_token(rows[-1]["object_key"]))
 
     for obj in rows:
-        content = ET.SubElement(root, "Contents")
-        ET.SubElement(content, "Key").text = _maybe_url_encode(obj["object_key"], encoding_type)
-        ET.SubElement(content, "LastModified").text = _format_s3_timestamp(obj["created_at"])
+        content = add_subelement(root, "Contents")
+        add_subelement(content, "Key", _maybe_url_encode(obj["object_key"], encoding_type))
+        add_subelement(content, "LastModified", format_s3_timestamp(obj["created_at"]))
         # ETag is a quoted hex string per S3 spec; SDKs round-trip the quotes.
-        md5 = obj.get("md5_hash") or ""
-        ET.SubElement(content, "ETag").text = f'"{md5}"'
-        ET.SubElement(content, "Size").text = str(obj["size_bytes"])
-        ET.SubElement(content, "StorageClass").text = "STANDARD"
-        owner = ET.SubElement(content, "Owner")
-        ET.SubElement(owner, "ID").text = bucket_owner
-        ET.SubElement(owner, "DisplayName").text = bucket_owner
-
-    xml_content = ET.tostring(root, encoding="UTF-8", xml_declaration=True, pretty_print=True)
-
-    total_objects = len(rows)
-    objects_with_cid = sum(1 for obj in rows if obj.get("arion_file_hash"))
-    status_counts: dict[str, int] = {}
-    for obj in rows:
-        status = obj.get("status", "unknown")
-        status_counts[status] = status_counts.get(status, 0) + 1
-
-    headers = {
-        "x-hippius-total-objects": str(total_objects),
-        "x-hippius-objects-with-cid": str(objects_with_cid),
-        "x-hippius-status-counts": ",".join(f"{k}:{v}" for k, v in status_counts.items()),
-    }
+        add_subelement(content, "ETag", f'"{obj["md5_hash"] or ""}"')
+        add_subelement(content, "Size", str(obj["size_bytes"]))
+        add_subelement(content, "StorageClass", "STANDARD")
+        owner = add_subelement(content, "Owner")
+        add_subelement(owner, "ID", bucket_owner)
+        add_subelement(owner, "DisplayName", bucket_owner)
 
     return Response(
-        content=xml_content,
+        content=to_xml_bytes(root, pretty_print=False),
         media_type="application/xml",
         status_code=200,
-        headers=headers,
     )

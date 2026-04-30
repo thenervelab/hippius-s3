@@ -29,11 +29,10 @@ def _row(key: str, *, size: int = 100, md5: str = "deadbeef", multipart: bool = 
         "object_key": key,
         "size_bytes": size,
         "md5_hash": md5,
+        "content_type": "application/octet-stream",
         "created_at": SAMPLE_TS,
         "multipart": multipart,
         "status": "uploaded",
-        "arion_file_hash": None,
-        "ipfs_cid": None,
     }
 
 
@@ -442,7 +441,7 @@ async def test_encoding_type_url_percent_encodes_keys_and_prefix() -> None:
 async def test_owner_is_bucket_owner_not_requestor() -> None:
     # Even though the requestor is "5HWAJ-test-account", Owner must report the
     # bucket's main_account_id so that listings against shared/public buckets
-    # don't impersonate the caller (P1 from PR #161 review).
+    # don't impersonate the caller.
     pool = _make_pool(bucket_row=_bucket(owner="5BUCKET-OWNER"), list_rows=[_row("k")])
     resp = await handle_list_objects(
         "b",
@@ -523,8 +522,7 @@ async def test_prefix_is_passed_to_sql() -> None:
 
 @pytest.mark.asyncio
 async def test_oversized_continuation_token_returns_400_without_db_call() -> None:
-    # P2 from PR #161 review: cap token length to avoid an attacker forcing a
-    # 10 MB DB cursor bind.
+    # Cap token length so an attacker can't force a multi-megabyte DB cursor bind.
     pool = _make_pool(bucket_row=_bucket(), list_rows=[])
     huge = "A" * (list_objects_endpoint.MAX_CONTINUATION_TOKEN_LEN + 1)
     resp = await handle_list_objects(
