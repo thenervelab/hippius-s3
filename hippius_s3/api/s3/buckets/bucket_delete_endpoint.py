@@ -81,10 +81,13 @@ async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redi
                 BucketName=bucket_name,
             )
 
+        # (prefix, cursor, limit=1): we only need to know whether any object exists.
         objects = await db.fetch(
             get_query("list_objects"),
             bucket["bucket_id"],
             None,
+            None,
+            1,
         )
 
         # S3 semantics: refuse to delete a non-empty bucket
