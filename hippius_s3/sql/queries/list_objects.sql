@@ -31,5 +31,10 @@ WHERE o.bucket_id = $1
   AND ($2::text IS NULL OR o.object_key LIKE $2::text || '%')
   AND ($3::text IS NULL OR o.object_key > $3::text)
   AND o.deleted_at IS NULL
-ORDER BY o.object_key COLLATE "C"
+-- No COLLATE clause: the database is created with C collation, so the default
+-- text ordering is already byte-order. An explicit COLLATE "C" here prevents
+-- the planner from using the (bucket_id, object_key) index for an ordered scan,
+-- which makes this query fall back to a Sort and re-introduces the timeout
+-- on large buckets.
+ORDER BY o.object_key
 LIMIT $4::int

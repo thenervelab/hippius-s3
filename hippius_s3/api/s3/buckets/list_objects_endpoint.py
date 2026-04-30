@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 MAX_KEYS_LIMIT = 1000
 DEFAULT_MAX_KEYS = 1000
+# Cap continuation token length to avoid an attacker forcing a giant DB cursor bind.
+MAX_CONTINUATION_TOKEN_LEN = 4096
 
 
 def _format_s3_timestamp(dt: datetime) -> str:
@@ -56,6 +58,10 @@ async def handle_list_objects(
     if delimiter:
         logger.info("ListObjectsV2 delimiter=%r ignored (CommonPrefixes not implemented yet)", delimiter)
 
+    # Treat empty query strings as absent (FastAPI hands "?prefix=" through as "").
+    prefix = prefix or None
+    start_after = start_after or None
+
     if max_keys is None or max_keys == "":
         effective_max_keys = DEFAULT_MAX_KEYS
     else:
@@ -77,6 +83,12 @@ async def handle_list_objects(
 
     cursor: str | None
     if continuation_token:
+        if len(continuation_token) > MAX_CONTINUATION_TOKEN_LEN:
+            return errors.s3_error_response(
+                code="InvalidArgument",
+                message="The continuation token provided is incorrect",
+                status_code=400,
+            )
         try:
             cursor = _decode_continuation_token(continuation_token)
         except (binascii.Error, UnicodeDecodeError, ValueError):
@@ -86,7 +98,7 @@ async def handle_list_objects(
                 status_code=400,
             )
     else:
-        cursor = start_after or None
+        cursor = start_after
 
     bucket = await pool.fetchrow(
         get_query("get_bucket_by_name"),
@@ -101,6 +113,7 @@ async def handle_list_objects(
         )
 
     bucket_id = bucket["bucket_id"]
+    bucket_owner = bucket["main_account_id"] or ctx.main_account_id
 
     # Fetch one extra row so we can detect truncation without a separate count query.
     fetch_limit = effective_max_keys + 1 if effective_max_keys > 0 else 0
@@ -110,20 +123,22 @@ async def handle_list_objects(
     if is_truncated:
         rows = rows[:effective_max_keys]
 
+    # Element order follows the AWS ListObjectsV2 response schema so strict XML
+    # validators (some Java SDKs, S3-spec test suites) accept it.
     root = ET.Element("ListBucketResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
     ET.SubElement(root, "Name").text = bucket_name
     ET.SubElement(root, "Prefix").text = _maybe_url_encode(prefix or "", encoding_type)
-    if delimiter:
-        ET.SubElement(root, "Delimiter").text = _maybe_url_encode(delimiter, encoding_type)
-    if start_after is not None:
-        ET.SubElement(root, "StartAfter").text = _maybe_url_encode(start_after, encoding_type)
     if continuation_token:
         ET.SubElement(root, "ContinuationToken").text = continuation_token
-    ET.SubElement(root, "KeyCount").text = str(len(rows))
+    if start_after:
+        ET.SubElement(root, "StartAfter").text = _maybe_url_encode(start_after, encoding_type)
     ET.SubElement(root, "MaxKeys").text = str(effective_max_keys)
+    if delimiter:
+        ET.SubElement(root, "Delimiter").text = _maybe_url_encode(delimiter, encoding_type)
+    ET.SubElement(root, "IsTruncated").text = "true" if is_truncated else "false"
     if encoding_type:
         ET.SubElement(root, "EncodingType").text = encoding_type
-    ET.SubElement(root, "IsTruncated").text = "true" if is_truncated else "false"
+    ET.SubElement(root, "KeyCount").text = str(len(rows))
     if is_truncated and rows:
         ET.SubElement(root, "NextContinuationToken").text = _encode_continuation_token(rows[-1]["object_key"])
 
@@ -137,8 +152,8 @@ async def handle_list_objects(
         ET.SubElement(content, "Size").text = str(obj["size_bytes"])
         ET.SubElement(content, "StorageClass").text = "STANDARD"
         owner = ET.SubElement(content, "Owner")
-        ET.SubElement(owner, "ID").text = ctx.main_account_id
-        ET.SubElement(owner, "DisplayName").text = ctx.main_account_id
+        ET.SubElement(owner, "ID").text = bucket_owner
+        ET.SubElement(owner, "DisplayName").text = bucket_owner
 
     xml_content = ET.tostring(root, encoding="UTF-8", xml_declaration=True, pretty_print=True)
 
