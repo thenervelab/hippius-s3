@@ -31,6 +31,19 @@ def test_01_cleanup_old_files(production_s3_client, session_tracker):
                 continue
 
             if parts[1] == ".index":
+                # Sweep stale manifests too — keeping them around after their
+                # data files were deleted is what causes test_05 to download
+                # NoSuchKey ghosts.
+                if len(parts) < 3:
+                    continue
+                manifest_session_id = parts[2].removesuffix(".json")
+                try:
+                    manifest_ts = datetime.strptime(manifest_session_id, "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                if manifest_ts < cutoff:
+                    production_s3_client.delete_object(Bucket=bucket, Key=key)
+                    deleted_count += 1
                 continue
 
             try:
@@ -254,7 +267,9 @@ def test_08_cors_preflight_on_presigned_url(production_s3_client, session_tracke
     allow_methods = resp.headers.get("Access-Control-Allow-Methods", "")
     assert "PUT" in allow_methods, f"PUT not in Access-Control-Allow-Methods: {allow_methods!r}"
     allow_headers = resp.headers.get("Access-Control-Allow-Headers", "").lower()
-    assert "content-type" in allow_headers, f"content-type not echoed in Access-Control-Allow-Headers: {allow_headers!r}"
+    assert "content-type" in allow_headers, (
+        f"content-type not echoed in Access-Control-Allow-Headers: {allow_headers!r}"
+    )
 
     print(f"CORS preflight on presigned URL OK: status={resp.status_code}, methods={allow_methods}")
 
@@ -273,9 +288,7 @@ def test_09_cors_preflight_on_direct_path(session_tracker):
         timeout=10,
     )
 
-    assert resp.status_code in (200, 204), (
-        f"preflight failed: status={resp.status_code} body={resp.text[:200]}"
-    )
+    assert resp.status_code in (200, 204), f"preflight failed: status={resp.status_code} body={resp.text[:200]}"
     assert resp.headers.get("Access-Control-Allow-Origin") == "*"
     allow_headers = resp.headers.get("Access-Control-Allow-Headers", "").lower()
     assert "content-type" in allow_headers
