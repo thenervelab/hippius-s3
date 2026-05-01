@@ -84,6 +84,21 @@ def cleanup_old_files(production_s3_client):
                     continue
 
                 if parts[1] == ".index":
+                    # Sweep stale manifests too — keeping them around after their
+                    # data files were deleted is what causes test_05 to download
+                    # NoSuchKey ghosts.
+                    if len(parts) < 3:
+                        continue
+                    manifest_session_id = parts[2].removesuffix(".json")
+                    try:
+                        manifest_ts = datetime.strptime(manifest_session_id, "%Y%m%d-%H%M%S").replace(
+                            tzinfo=timezone.utc
+                        )
+                    except ValueError:
+                        continue
+                    if manifest_ts < cutoff:
+                        production_s3_client.delete_object(Bucket=bucket, Key=key)
+                        deleted_count += 1
                     continue
 
                 try:

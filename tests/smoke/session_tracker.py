@@ -1,5 +1,6 @@
 import json
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 
 
@@ -24,14 +25,27 @@ class SessionTracker:
     def get_files(self):
         return self.files
 
-    def list_historical_sessions(self, max_count=20):
-        response = self.s3.list_objects_v2(Bucket=self.bucket, Prefix="smoke-test/.index/")
+    def list_historical_sessions(self, max_count=20, retention_days=30):
+        # Manifests outlive their data files (cleanup deletes data >retention_days
+        # but keeps the manifest), so filter by session age here to avoid handing
+        # back manifests pointing at already-swept files. Paginate so we don't
+        # silently miss recent sessions once the bucket grows past 1000 keys.
+        cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        paginator = self.s3.get_paginator("list_objects_v2")
 
-        if "Contents" not in response:
-            return []
+        fresh_keys = []
+        for page in paginator.paginate(Bucket=self.bucket, Prefix="smoke-test/.index/"):
+            for obj in page.get("Contents", []) or []:
+                key = obj["Key"]
+                session_id = key.rsplit("/", 1)[-1].removesuffix(".json")
+                try:
+                    ts = datetime.strptime(session_id, "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                if ts >= cutoff:
+                    fresh_keys.append(key)
 
-        keys = sorted([obj["Key"] for obj in response["Contents"]])
-        return keys[-max_count:]
+        return sorted(fresh_keys)[-max_count:]
 
     def get_manifest(self, session_id):
         key = f"smoke-test/.index/{session_id}.json"
