@@ -3,8 +3,10 @@ from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic import ValidationError
 
 from gateway.services.acl_service import ACLService
+from gateway.services.acl_service import BucketLookup
 from hippius_s3.models.acl import Grant
 from hippius_s3.models.acl import Grantee
 from hippius_s3.models.acl import GranteeType
@@ -625,3 +627,94 @@ class TestAccessKeyGrants:
         )
 
         assert has_permission is True
+
+
+class TestGetBucketOwnerAndId:
+    """Tests for the multi-field bucket lookup that powers acl_middleware + cache_control."""
+
+    @pytest.mark.asyncio
+    async def test_returns_bucket_lookup_with_warm_true(self, acl_service: Any, mock_db_pool: Any) -> None:
+        mock_db_pool.fetchrow.return_value = {
+            "main_account_id": "owner-1",
+            "bucket_id": "bucket-uuid-1",
+            "is_cache_warm": True,
+        }
+
+        result = await acl_service.get_bucket_owner_and_id("warm-bucket")
+
+        assert isinstance(result, BucketLookup)
+        assert result.owner_id == "owner-1"
+        assert result.bucket_id == "bucket-uuid-1"
+        assert result.is_cache_warm is True
+
+    @pytest.mark.asyncio
+    async def test_returns_bucket_lookup_with_warm_false(self, acl_service: Any, mock_db_pool: Any) -> None:
+        mock_db_pool.fetchrow.return_value = {
+            "main_account_id": "owner-1",
+            "bucket_id": "bucket-uuid-1",
+            "is_cache_warm": False,
+        }
+
+        result = await acl_service.get_bucket_owner_and_id("cold-bucket")
+
+        assert isinstance(result, BucketLookup)
+        assert result.is_cache_warm is False
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_bucket_does_not_exist(self, acl_service: Any, mock_db_pool: Any) -> None:
+        mock_db_pool.fetchrow.return_value = None
+
+        result = await acl_service.get_bucket_owner_and_id("missing-bucket")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_query_selects_warm_flag_column(self, acl_service: Any, mock_db_pool: Any) -> None:
+        """Schema invariant: the SQL must reference is_cache_warm so adding the column to the
+        SELECT list isn't accidentally dropped in a future refactor."""
+        mock_db_pool.fetchrow.return_value = {
+            "main_account_id": "owner-1",
+            "bucket_id": "bucket-uuid-1",
+            "is_cache_warm": False,
+        }
+
+        await acl_service.get_bucket_owner_and_id("any-bucket")
+
+        sql_text = mock_db_pool.fetchrow.call_args.args[0]
+        assert "is_cache_warm" in sql_text
+        assert "main_account_id" in sql_text
+        assert "bucket_id" in sql_text
+
+    @pytest.mark.asyncio
+    async def test_coerces_db_types_to_python(self, acl_service: Any, mock_db_pool: Any) -> None:
+        """asyncpg may return UUID objects or driver-specific bool wrappers; we normalize to str/bool."""
+        mock_db_pool.fetchrow.return_value = {
+            "main_account_id": 12345,  # not a string — must be coerced
+            "bucket_id": 67890,
+            "is_cache_warm": 1,  # truthy non-bool
+        }
+
+        result = await acl_service.get_bucket_owner_and_id("any-bucket")
+
+        assert isinstance(result, BucketLookup)
+        assert result.owner_id == "12345"
+        assert result.bucket_id == "67890"
+        assert result.is_cache_warm is True
+
+
+class TestBucketLookupModel:
+    """Trivial model invariants worth pinning so future refactors don't drop fields silently."""
+
+    def test_required_fields(self) -> None:
+        with pytest.raises(ValidationError):
+            BucketLookup()  # type: ignore[call-arg]
+
+    def test_is_cache_warm_required(self) -> None:
+        with pytest.raises(ValidationError):
+            BucketLookup(owner_id="x", bucket_id="y")  # type: ignore[call-arg]
+
+    def test_construct_with_all_fields(self) -> None:
+        m = BucketLookup(owner_id="x", bucket_id="y", is_cache_warm=True)
+        assert m.owner_id == "x"
+        assert m.bucket_id == "y"
+        assert m.is_cache_warm is True

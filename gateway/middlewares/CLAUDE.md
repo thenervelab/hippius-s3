@@ -98,28 +98,28 @@ See [todo.md](../../todo.md) P2 for re-enablement discussion.
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #1670 | 10:15 AM | 🔵 | Auth Router Middleware Dispatches Authentication and Populates Request State | ~623 |
-| #1669 | 10:14 AM | 🔵 | Comprehensive Authentication Architecture Analysis - No STS/OAuth Implementation Exists | ~806 |
-| #1664 | 10:12 AM | 🔵 | ACL Middleware Permission Enforcement for S3 Operations | ~669 |
-| #1662 | 10:11 AM | 🔵 | Access Key Authentication with AWS SigV4 Verification | ~695 |
+| #1670 | 9:15 AM | 🔵 | Auth Router Middleware Dispatches Authentication and Populates Request State | ~623 |
+| #1669 | 9:14 AM | 🔵 | Comprehensive Authentication Architecture Analysis - No STS/OAuth Implementation Exists | ~806 |
+| #1664 | 9:12 AM | 🔵 | ACL Middleware Permission Enforcement for S3 Operations | ~669 |
+| #1662 | 9:11 AM | 🔵 | Access Key Authentication with AWS SigV4 Verification | ~695 |
 
 ### Feb 20, 2026
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #2808 | 2:43 AM | 🔵 | Comprehensive monitoring infrastructure discovered with queue metrics and three specialized Grafana dashboards | ~831 |
-| #2793 | 2:42 AM | 🔵 | Gateway metrics middleware tracks request duration, status codes, and account-level errors | ~493 |
+| #2808 | 1:43 AM | 🔵 | Comprehensive monitoring infrastructure discovered with queue metrics and three specialized Grafana dashboards | ~831 |
+| #2793 | 1:42 AM | 🔵 | Gateway metrics middleware tracks request duration, status codes, and account-level errors | ~493 |
 
 ### Apr 20, 2026
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #6633 | 6:47 PM | 🔵 | Access Key Authentication Returns token_type But Does Not Enforce Sub-Token Scopes | ~485 |
-| #6603 | 6:33 PM | 🔵 | ACL Middleware Logic for S3 Permission Enforcement | ~447 |
+| #6633 | 5:47 PM | 🔵 | Access Key Authentication Returns token_type But Does Not Enforce Sub-Token Scopes | ~485 |
+| #6603 | 5:33 PM | 🔵 | ACL Middleware Logic for S3 Permission Enforcement | ~447 |
 
 ### Apr 21, 2026
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #6656 | 10:19 AM | 🔴 | Modified verify_access_key_signature to Return Token ACL Data | ~426 |
+| #6656 | 9:19 AM | 🔴 | Modified verify_access_key_signature to Return Token ACL Data | ~426 |
 </claude-mem-context>

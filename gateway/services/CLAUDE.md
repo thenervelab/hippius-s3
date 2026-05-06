@@ -76,27 +76,27 @@ Proxies `/docs` to the internal Swagger UI when `ENABLE_API_DOCS=true`. Redis-ca
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #71 | 10:03 AM | 🔵 | Multi-Method Authentication Orchestrator Implementation | ~521 |
+| #71 | 9:03 AM | 🔵 | Multi-Method Authentication Orchestrator Implementation | ~521 |
 
 ### Feb 13, 2026
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #1671 | 10:17 AM | 🔵 | Forward Service Proxies Requests with Authenticated Context Headers | ~713 |
-| #1669 | 10:14 AM | 🔵 | Comprehensive Authentication Architecture Analysis - No STS/OAuth Implementation Exists | ~806 |
-| #1666 | 10:13 AM | 🔵 | ACL Service Permission Resolution and Grant Matching Logic | ~709 |
-| #1661 | 10:11 AM | 🔵 | Account Service Implementation for Seed Phrase and Access Key Authentication | ~694 |
-| #1657 | 10:10 AM | 🔵 | Hippius S3 Gateway Authentication Architecture | ~562 |
+| #1671 | 9:17 AM | 🔵 | Forward Service Proxies Requests with Authenticated Context Headers | ~713 |
+| #1669 | 9:14 AM | 🔵 | Comprehensive Authentication Architecture Analysis - No STS/OAuth Implementation Exists | ~806 |
+| #1666 | 9:13 AM | 🔵 | ACL Service Permission Resolution and Grant Matching Logic | ~709 |
+| #1661 | 9:11 AM | 🔵 | Account Service Implementation for Seed Phrase and Access Key Authentication | ~694 |
+| #1657 | 9:10 AM | 🔵 | Hippius S3 Gateway Authentication Architecture | ~562 |
 
 ### Apr 20, 2026
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #6606 | 6:33 PM | 🔵 | Authentication Flow Retrieves token_type from Hippius API | ~473 |
+| #6606 | 5:33 PM | 🔵 | Authentication Flow Retrieves token_type from Hippius API | ~473 |
 
 ### Apr 21, 2026
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #6659 | 10:20 AM | 🔴 | Added token_acl Field to AuthResult Dataclass | ~385 |
+| #6659 | 9:20 AM | 🔴 | Added token_acl Field to AuthResult Dataclass | ~385 |
 </claude-mem-context>

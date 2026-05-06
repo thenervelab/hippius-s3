@@ -2,6 +2,7 @@ import logging
 
 import asyncpg
 import redis.asyncio as redis
+from pydantic import BaseModel
 
 from gateway.repositories.cached_acl_repository import CachedACLRepository
 from hippius_s3.models.acl import ACL
@@ -13,6 +14,14 @@ from hippius_s3.repositories.acl_repository import ACLRepository
 
 
 logger = logging.getLogger(__name__)
+
+
+class BucketLookup(BaseModel):
+    """Result of resolving a bucket name to its owner / id / cache state in one query."""
+
+    owner_id: str
+    bucket_id: str
+    is_cache_warm: bool
 
 
 class ACLService:
@@ -64,18 +73,22 @@ class ACLService:
         row = await self.acl_repo.db.fetchrow(query, bucket)
         return str(row["bucket_id"]) if row else None
 
-    async def get_bucket_owner_and_id(self, bucket: str) -> tuple[str | None, str | None]:
-        """Fetch (owner_account_id, bucket_id) in a single query.
+    async def get_bucket_owner_and_id(self, bucket: str) -> BucketLookup | None:
+        """Fetch owner_id / bucket_id / is_cache_warm in a single query.
 
         Preferred over calling get_bucket_owner() + get_bucket_id() separately
-        on hot paths (e.g. acl_middleware). Returns (None, None) when the
-        bucket does not exist.
+        on hot paths (e.g. acl_middleware). Returns None when the bucket does
+        not exist.
         """
-        query = "SELECT main_account_id, bucket_id FROM buckets WHERE bucket_name = $1"
+        query = "SELECT main_account_id, bucket_id, is_cache_warm FROM buckets WHERE bucket_name = $1"
         row = await self.acl_repo.db.fetchrow(query, bucket)
         if row is None:
-            return None, None
-        return str(row["main_account_id"]), str(row["bucket_id"])
+            return None
+        return BucketLookup(
+            owner_id=str(row["main_account_id"]),
+            bucket_id=str(row["bucket_id"]),
+            is_cache_warm=bool(row["is_cache_warm"]),
+        )
 
     async def get_object_owner(self, bucket: str, key: str) -> str | None:
         """Get object owner (inherits from bucket owner)."""

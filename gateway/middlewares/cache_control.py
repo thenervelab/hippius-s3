@@ -10,6 +10,10 @@ from gateway.middlewares.acl import parse_s3_path
 
 
 PUBLIC_CACHE_CONTROL = "public, max-age=300, stale-while-revalidate=60"
+# 30d fresh + 1d stale-while-revalidate. Effectively indefinite — used for buckets
+# the cache-control service has flagged as is_cache_warm. Combined with PURGE on
+# write, ATS holds bodies until either the next write or LRU eviction.
+WARM_PUBLIC_CACHE_CONTROL = "public, max-age=2592000, stale-while-revalidate=86400"
 PRIVATE_CACHE_CONTROL = "private, no-store"
 
 
@@ -37,8 +41,13 @@ async def cache_control_middleware(
         response.headers["Cache-Control"] = PRIVATE_CACHE_CONTROL
         return response
 
-    if getattr(request.state, "anonymous_read_allowed", False):
-        response.headers["Cache-Control"] = PUBLIC_CACHE_CONTROL
-    else:
+    if not getattr(request.state, "anonymous_read_allowed", False):
         response.headers["Cache-Control"] = PRIVATE_CACHE_CONTROL
+        return response
+
+    if getattr(request.state, "bucket_is_cache_warm", False):
+        response.headers["Cache-Control"] = WARM_PUBLIC_CACHE_CONTROL
+        return response
+
+    response.headers["Cache-Control"] = PUBLIC_CACHE_CONTROL
     return response

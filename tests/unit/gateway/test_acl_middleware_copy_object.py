@@ -27,6 +27,7 @@ from httpx import AsyncClient
 
 from gateway.middlewares.acl import _parse_copy_source_bucket
 from gateway.middlewares.acl import acl_middleware
+from gateway.services.acl_service import BucketLookup
 from hippius_s3.models.sub_token import BucketScope
 from hippius_s3.models.sub_token import Permission
 from hippius_s3.models.sub_token import SubTokenScope
@@ -63,8 +64,11 @@ def _make_app(
     acl_service = AsyncMock()
     acl_service.check_permission = AsyncMock(return_value=True)
 
-    async def _lookup(bucket_name: str) -> tuple[str | None, str | None]:
-        return bucket_owner_lookup.get(bucket_name, (None, None))
+    async def _lookup(bucket_name: str) -> BucketLookup | None:
+        owner_id, bucket_id = bucket_owner_lookup.get(bucket_name, (None, None))
+        if owner_id is None or bucket_id is None:
+            return None
+        return BucketLookup(owner_id=owner_id, bucket_id=bucket_id, is_cache_warm=False)
 
     acl_service.get_bucket_owner_and_id = AsyncMock(side_effect=_lookup)
     app.state.acl_service = acl_service

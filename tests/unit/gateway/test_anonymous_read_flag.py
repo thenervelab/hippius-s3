@@ -14,6 +14,7 @@ from httpx import AsyncClient
 
 from gateway import config as gateway_config
 from gateway.middlewares.acl import acl_middleware
+from gateway.services.acl_service import BucketLookup
 
 
 @pytest.fixture(autouse=True)  # type: ignore[misc]
@@ -54,7 +55,9 @@ def _make_service(*, primary_permits: bool = True, anon_permits: bool = False) -
     service = AsyncMock()
     service.get_bucket_owner = AsyncMock(return_value="owner-id")
     service.get_bucket_id = AsyncMock(return_value="bucket-id")
-    service.get_bucket_owner_and_id = AsyncMock(return_value=("owner-id", "bucket-id"))
+    service.get_bucket_owner_and_id = AsyncMock(
+        return_value=BucketLookup(owner_id="owner-id", bucket_id="bucket-id", is_cache_warm=False)
+    )
 
     async def check_permission(
         *, account_id: str | None, bucket: str, key: str | None, permission: Any, access_key: Any, bucket_owner_id: Any
