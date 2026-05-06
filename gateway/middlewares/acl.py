@@ -134,13 +134,18 @@ async def acl_middleware(
 
     acl_service = request.app.state.acl_service
 
-    # Resolve bucket ownership / id in a single query when a bucket is in play.
+    # Resolve bucket ownership / id / warm-cache flag in a single query when a bucket is in play.
     bucket_owner_id: str | None = None
     bucket_id: str | None = None
     if bucket is not None:
-        bucket_owner_id, bucket_id = await acl_service.get_bucket_owner_and_id(bucket)
-        if bucket_owner_id is not None:
+        lookup = await acl_service.get_bucket_owner_and_id(bucket)
+        if lookup is not None:
+            bucket_owner_id = lookup.owner_id
+            bucket_id = lookup.bucket_id
+            request.state.bucket_is_cache_warm = lookup.is_cache_warm
             request.state.bucket_owner_id = bucket_owner_id
+        else:
+            request.state.bucket_is_cache_warm = False
 
     # -------------------------------------------------------------------------
     # Sub-token branch (R2-style): authoritative for intra-account requests,
@@ -197,7 +202,9 @@ async def acl_middleware(
             if copy_source and key is not None and scope is not None:
                 src_bucket_name = _parse_copy_source_bucket(copy_source)
                 if src_bucket_name:
-                    src_owner_id, src_bucket_id = await acl_service.get_bucket_owner_and_id(src_bucket_name)
+                    src_lookup = await acl_service.get_bucket_owner_and_id(src_bucket_name)
+                    src_owner_id = src_lookup.owner_id if src_lookup else None
+                    src_bucket_id = src_lookup.bucket_id if src_lookup else None
                     if src_owner_id == account_id:
                         src_allowed = bucket_in_scope(src_bucket_id, scope) and permission_allows(
                             scope.permission, OP_READ_OBJECT

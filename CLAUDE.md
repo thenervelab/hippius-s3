@@ -408,6 +408,44 @@ OTel instrumentation across FastAPI, asyncpg, httpx, redis. Standard span attrib
 
 Key dashboards: Hippius S3 Overview (request rates, latencies, error rates, queue depths), S3 Workers (backend latency, retry rates), FS cache (age buckets, pressure mode, hot parts).
 
+### 10.3 Querying Loki on prod
+
+Loki is the LGTM stack's log store. It runs in the `monitoring` namespace as `loki-0` and is exposed via the `loki` service on port 3100. Grafana is at `monitoring/grafana` (NodePort 31337). Current kubectl context: `hippius`.
+
+**Connect (port-forward):**
+```bash
+kubectl -n monitoring port-forward svc/loki 3100:3100 >/tmp/loki-pf.log 2>&1 &
+sleep 2
+curl -s http://localhost:3100/loki/api/v1/labels   # sanity check
+```
+The pod's container has no `wget`/`curl`, so always port-forward and curl from your host.
+
+**Useful labels** (from `/loki/api/v1/labels`): `namespace`, `app`, `pod`, `node`, `container`, `level`.
+
+**Namespaces of interest:** `hippius-s3-prod`, `hippius-s3-staging`, `hippius-arion`, `hippius-arion-staging`, `hippius-indexer`.
+
+**`app` values in `hippius-s3-prod`:** `gateway`, `api`, `arion-uploader`, `arion-downloader`, `arion-unpinner`, `janitor`, `account-cacher`, `cachet-health-checker`, 1`redis-queues`, `redis-accounts`, `otel-collector`.
+
+**Run a query (LogQL):**
+```bash
+END=$(date +%s)000000000
+START=$(( $(date +%s) - 3600 ))000000000   # 1h window
+curl -sG "http://localhost:3100/loki/api/v1/query_range" \
+  --data-urlencode 'query={namespace="hippius-s3-prod",app="gateway"} |= "S3_OPERATION_SUCCESS"' \
+  --data-urlencode "start=$START" --data-urlencode "end=$END" --data-urlencode "limit=5000"
+```
+Response shape: `{"status":"success","data":{"resultType":"streams","result":[{"stream":{...labels...},"values":[[ts_ns,line], ...]}, ...]}}`. Pipe into `python3 -c '...'` or `jq` to parse.
+
+**LogQL filters:** `|= "literal"` (substring), `|~ "regex"` (regex), `!= "literal"`, `!~ "regex"`. Stack them: `{namespace="hippius-s3-prod",app="gateway"} |= "S3_OPERATION_SUCCESS" |~ "/affine-datasets/" != "list-type"`.
+
+**Audit log shape (gateway):** lines start with `S3_OPERATION_SUCCESS:` followed by JSON with `ray_id`, `account_id`, `client_ip`, `method`, `path`, `query_params`, `status_code`, `processing_time_ms`, `content_length`. Use these for per-account and latency analysis.
+
+**Gotchas:**
+- `query_range` caps at `limit=5000` per call. For wider windows, narrow with extra filters first or split the time range.
+- Long ranges (>3-4 days) on broad queries can time out — paginate by hour.
+- Audit success lines log `processing_time_ms` and response `content_length`. Throughput = `content_length / processing_time_ms`. Streaming responses with chunked transfer may report `content_length` of 0 — filter those out.
+- The gateway is the canonical place to query for *user-visible* request behavior (account_id, ACL decisions, processing time). The internal `api` app logs the per-stream details (chunk planning, cache vs pipeline).
+
 ---
 
 ## 11. Operational runbooks (quick pointers)

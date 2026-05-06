@@ -9,6 +9,7 @@ from httpx import AsyncClient
 from gateway.middlewares.acl import acl_middleware
 from gateway.middlewares.acl import get_required_permission
 from gateway.middlewares.acl import parse_s3_path
+from gateway.services.acl_service import BucketLookup
 from hippius_s3.models.acl import Permission
 
 
@@ -97,7 +98,9 @@ class TestACLMiddleware:
         service.check_permission = AsyncMock(return_value=True)
         service.get_bucket_owner = AsyncMock(return_value="test-owner-id")
         service.get_bucket_id = AsyncMock(return_value="test-bucket-id")
-        service.get_bucket_owner_and_id = AsyncMock(return_value=("test-owner-id", "test-bucket-id"))
+        service.get_bucket_owner_and_id = AsyncMock(
+            return_value=BucketLookup(owner_id="test-owner-id", bucket_id="test-bucket-id", is_cache_warm=False)
+        )
         return service
 
     @pytest.fixture
