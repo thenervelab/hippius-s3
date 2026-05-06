@@ -18,6 +18,7 @@ from botocore.config import Config
 from httpx import ASGITransport
 from httpx import AsyncClient
 
+from gateway.services.acl_service import BucketLookup
 from tests.e2e.conftest import is_real_aws
 
 
@@ -241,7 +242,9 @@ async def gateway_app(
     mock_acl_service.check_permission = AsyncMock(return_value=True)
     mock_acl_service.get_bucket_owner = AsyncMock(return_value="test-owner-id")
     mock_acl_service.get_bucket_id = AsyncMock(side_effect=lambda b: b)
-    mock_acl_service.get_bucket_owner_and_id = AsyncMock(return_value=("test-owner-id", "test-bucket-id"))
+    mock_acl_service.get_bucket_owner_and_id = AsyncMock(
+        return_value=BucketLookup(owner_id="test-owner-id", bucket_id="test-bucket-id", is_cache_warm=False)
+    )
     app.state.acl_service = mock_acl_service
 
     mock_scope_repo = MagicMock()
@@ -299,7 +302,9 @@ async def gateway_app_no_auth(
     mock_acl_service.check_permission = AsyncMock(return_value=True)
     mock_acl_service.get_bucket_owner = AsyncMock(return_value="test-owner-id")
     mock_acl_service.get_bucket_id = AsyncMock(side_effect=lambda b: b)
-    mock_acl_service.get_bucket_owner_and_id = AsyncMock(return_value=("test-owner-id", "test-bucket-id"))
+    mock_acl_service.get_bucket_owner_and_id = AsyncMock(
+        return_value=BucketLookup(owner_id="test-owner-id", bucket_id="test-bucket-id", is_cache_warm=False)
+    )
     app.state.acl_service = mock_acl_service
 
     mock_scope_repo = MagicMock()
