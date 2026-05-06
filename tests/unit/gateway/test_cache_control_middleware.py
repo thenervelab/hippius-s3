@@ -180,6 +180,18 @@ async def test_warm_304_keeps_warm_policy(app: Any) -> None:
 
 
 @pytest.mark.asyncio
+async def test_warm_head_304_keeps_warm_policy(app: Any) -> None:
+    """HEAD revalidations on warm objects must also propagate the long max-age, mirroring GET."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.head(
+            "/warm-bucket/foo.txt",
+            headers={"x-test-status": "304", "x-test-anon-read": "true", "x-test-warm": "true"},
+        )
+    assert r.status_code == 304
+    assert r.headers["Cache-Control"] == WARM_PUBLIC_CACHE_CONTROL
+
+
+@pytest.mark.asyncio
 async def test_warm_206_keeps_warm_policy(app: Any) -> None:
     """Range responses on warm objects must keep the long max-age."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

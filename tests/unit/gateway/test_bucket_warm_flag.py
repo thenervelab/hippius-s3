@@ -166,3 +166,32 @@ async def test_warm_flag_set_on_write_requests_too() -> None:
         r = await client.put("/warm-bucket/foo.txt", content=b"x")
     assert r.status_code == 200
     assert r.json()["bucket_is_cache_warm"] is True
+
+
+@pytest.mark.asyncio
+async def test_copy_source_warm_flag_does_not_leak_to_destination() -> None:
+    """Invariant: when COPY source bucket is warm but destination is cold, request.state.bucket_is_cache_warm
+    must reflect the DESTINATION (cold) — never the source. Pins against future refactors that might
+    accidentally overwrite the destination flag with the source lookup result."""
+    dest_lookup = BucketLookup(owner_id="owner-1", bucket_id="dest-id", is_cache_warm=False)
+    src_lookup = BucketLookup(owner_id="owner-1", bucket_id="src-id", is_cache_warm=True)
+
+    service = AsyncMock()
+
+    async def lookup_dispatch(bucket: str) -> BucketLookup:
+        return dest_lookup if bucket == "dest-bucket" else src_lookup
+
+    service.get_bucket_owner_and_id = AsyncMock(side_effect=lookup_dispatch)
+    service.check_permission = AsyncMock(return_value=True)
+
+    app = _build_app(service, account_id="owner-1")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.put(
+            "/dest-bucket/dest-key",
+            content=b"x",
+            headers={"x-amz-copy-source": "/src-bucket/src-key"},
+        )
+    assert r.status_code == 200
+    # Destination is cold; warm source must NOT leak.
+    assert r.json()["bucket_is_cache_warm"] is False

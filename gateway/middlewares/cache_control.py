@@ -13,6 +13,10 @@ PUBLIC_CACHE_CONTROL = "public, max-age=300, stale-while-revalidate=60"
 # 30d fresh + 1d stale-while-revalidate. Effectively indefinite — used for buckets
 # the cache-control service has flagged as is_cache_warm. Combined with PURGE on
 # write, ATS holds bodies until either the next write or LRU eviction.
+#
+# Only emitted when anonymous_read_allowed is also True — a private object in a
+# warm bucket still gets PRIVATE_CACHE_CONTROL because object-level ACL grants
+# can override bucket-level public-read.
 WARM_PUBLIC_CACHE_CONTROL = "public, max-age=2592000, stale-while-revalidate=86400"
 PRIVATE_CACHE_CONTROL = "private, no-store"
 
