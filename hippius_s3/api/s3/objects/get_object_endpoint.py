@@ -132,7 +132,7 @@ async def handle_get_object(
                         """
                         SELECT 1 FROM objects o
                         JOIN buckets b ON o.bucket_id = b.bucket_id
-                        WHERE b.bucket_name = $1 AND o.object_key = $2
+                        WHERE b.bucket_name = $1 AND o.object_key = $2 AND b.deleted_at IS NULL
                         """,
                         bucket_name,
                         object_key,

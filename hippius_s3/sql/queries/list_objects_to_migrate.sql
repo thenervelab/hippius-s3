@@ -21,6 +21,7 @@ WITH cur AS (
     ON c.id = ov.cid_id
   JOIN buckets b ON b.bucket_id = o.bucket_id
   WHERE o.deleted_at IS NULL
+    AND b.deleted_at IS NULL
     AND ov.storage_version < $1
     AND (c.cid IS NULL OR LOWER(TRIM(c.cid)) <> 'pending')
     AND NOT EXISTS (

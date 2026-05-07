@@ -584,6 +584,7 @@ async def upload_part(
                 FROM multipart_uploads mu
                 JOIN buckets b ON b.bucket_id = mu.bucket_id
                 WHERE mu.upload_id = $1
+                  AND b.deleted_at IS NULL
                 LIMIT 1
                 """,
                 upload_id,

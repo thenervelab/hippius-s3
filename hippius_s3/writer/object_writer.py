@@ -1027,7 +1027,7 @@ class ObjectWriter:
                 await conn.execute(
                     """
                     INSERT INTO multipart_uploads (upload_id, bucket_id, object_key, initiated_at, is_completed, content_type, metadata, object_id)
-                    VALUES ($1, (SELECT bucket_id FROM buckets WHERE bucket_name = $2 LIMIT 1), $3, NOW(), TRUE, 'application/octet-stream', '{}', $4)
+                    VALUES ($1, (SELECT bucket_id FROM buckets WHERE bucket_name = $2 AND deleted_at IS NULL LIMIT 1), $3, NOW(), TRUE, 'application/octet-stream', '{}', $4)
                     ON CONFLICT (upload_id) DO NOTHING
                     """,
                     upload_id,

@@ -10,4 +10,5 @@ SELECT
 FROM buckets b
 LEFT JOIN bucket_acls ba ON ba.bucket_id = b.bucket_id
 WHERE b.bucket_name = $1
+  AND b.deleted_at IS NULL
 LIMIT 1
