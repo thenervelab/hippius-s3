@@ -24,6 +24,7 @@ from starlette.requests import ClientDisconnect
 
 from hippius_s3 import dependencies
 from hippius_s3 import utils
+from hippius_s3.api.s3.common import format_s3_timestamp
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
@@ -181,7 +182,7 @@ async def list_parts_internal(
         # Use CreatedAt as LastModified if available
         ts = part.get("created_at")
         if ts:
-            add_subelement(p, "LastModified", ts.isoformat())
+            add_subelement(p, "LastModified", format_s3_timestamp(ts))
 
     xml_content = to_xml_bytes(root)
     return Response(
@@ -584,6 +585,7 @@ async def upload_part(
                 FROM multipart_uploads mu
                 JOIN buckets b ON b.bucket_id = mu.bucket_id
                 WHERE mu.upload_id = $1
+                  AND b.deleted_at IS NULL
                 LIMIT 1
                 """,
                 upload_id,
@@ -681,7 +683,7 @@ async def upload_part(
             xml = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <CopyPartResult>
   <ETag>\"{part_result["etag"]}\"</ETag>
-  <LastModified>{datetime.now(timezone.utc).isoformat()}</LastModified>
+  <LastModified>{format_s3_timestamp(datetime.now(timezone.utc))}</LastModified>
 </CopyPartResult>
 """.encode("utf-8")
             return Response(content=xml, media_type="application/xml", status_code=200)
@@ -852,7 +854,7 @@ async def list_multipart_uploads(
                 "UploadId",
                 str(upload["upload_id"]) if upload.get("upload_id") is not None else "",
             )
-            add_subelement(upload_elem, "Initiated", upload["initiated_at"].isoformat())
+            add_subelement(upload_elem, "Initiated", format_s3_timestamp(upload["initiated_at"]))
 
         # Generate XML with proper declaration
         xml_content = to_xml_bytes(root)
