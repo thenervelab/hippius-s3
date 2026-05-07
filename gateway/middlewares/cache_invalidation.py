@@ -30,7 +30,10 @@ async def cache_invalidation_middleware(
     if not _is_successful_bucket_delete(request, response):
         return response
 
-    bucket_name = _bucket_from_path(request.url.path)
+    # Prefer the bucket name parsed by acl_middleware (`request.state.s3_bucket`)
+    # so we use the same key the cache was written under. Fall back to the raw
+    # path when state isn't populated (e.g. early failure paths).
+    bucket_name = getattr(request.state, "s3_bucket", None) or _bucket_from_path(request.url.path)
     if not bucket_name:
         return response
 
@@ -38,7 +41,14 @@ async def cache_invalidation_middleware(
     if acl_service is None:
         return response
 
-    await _invalidate_bucket_acl_cache(acl_service, bucket_name)
+    # Best-effort invalidation. If redis-acl is unreachable, swallow and log:
+    # the upstream API has already committed the soft-delete, and a 500 here
+    # would confuse the client (DeleteBucket appears to have failed but the
+    # bucket IS deleted). Cache TTL bounds staleness to 600s.
+    try:
+        await _invalidate_bucket_acl_cache(acl_service, bucket_name)
+    except Exception:
+        logger.exception(f"Failed to invalidate ACL cache for soft-deleted bucket {bucket_name}")
     return response
 
 

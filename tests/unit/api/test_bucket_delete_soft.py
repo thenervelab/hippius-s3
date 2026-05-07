@@ -5,13 +5,15 @@ Verifies the Phase 1 contract:
 - 404 NoSuchBucket on a repeat DeleteBucket — NOT 403 (the previous endpoint
   returned 403 here, conflating "no permission" with "already deleted").
 - 409 BucketNotEmpty when objects or in-flight MPUs exist.
-- BucketReapRequest is enqueued on success.
+
+There is intentionally no Redis queue; the Phase 2 reaper polls
+`buckets WHERE deleted_at IS NOT NULL` (via idx_buckets_deleted_at_pending)
+as the source of truth.
 """
 
 from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import AsyncMock
-from unittest.mock import patch
 
 import pytest
 from fastapi import FastAPI
@@ -84,7 +86,7 @@ def _bucket_app(pool_factory: Any) -> Any:
 
 
 @pytest.mark.asyncio
-async def test_delete_bucket_returns_204_and_enqueues_reap() -> None:
+async def test_delete_bucket_returns_204_on_success() -> None:
     bucket_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
     pool = _make_mock_pool(
         bucket_row={"bucket_id": bucket_id, "bucket_name": "alpha", "main_account_id": "test-main-account"},
@@ -94,16 +96,10 @@ async def test_delete_bucket_returns_204_and_enqueues_reap() -> None:
     )
     app = _bucket_app(lambda: pool)
 
-    enqueue_mock = AsyncMock()
-    with patch("hippius_s3.api.s3.buckets.bucket_delete_endpoint.enqueue_bucket_reap_request", enqueue_mock):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.delete("/alpha")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.delete("/alpha")
 
     assert response.status_code == 204
-    enqueue_mock.assert_awaited_once()
-    payload = enqueue_mock.await_args.args[0]
-    assert payload.bucket_id == bucket_id
-    assert payload.bucket_name == "alpha"
 
 
 @pytest.mark.asyncio
@@ -128,12 +124,8 @@ async def test_delete_bucket_idempotent_returns_404_not_403() -> None:
     )
     app = _bucket_app(lambda: pool)
 
-    with patch(
-        "hippius_s3.api.s3.buckets.bucket_delete_endpoint.enqueue_bucket_reap_request",
-        AsyncMock(),
-    ):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.delete("/alpha")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.delete("/alpha")
 
     assert response.status_code == 404
     assert "NoSuchBucket" in response.text
