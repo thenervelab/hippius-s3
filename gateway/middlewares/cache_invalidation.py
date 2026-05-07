@@ -30,10 +30,7 @@ async def cache_invalidation_middleware(
     if not _is_successful_bucket_delete(request, response):
         return response
 
-    # Prefer the bucket name parsed by acl_middleware (`request.state.s3_bucket`)
-    # so we use the same key the cache was written under. Fall back to the raw
-    # path when state isn't populated (e.g. early failure paths).
-    bucket_name = getattr(request.state, "s3_bucket", None) or _bucket_from_path(request.url.path)
+    bucket_name = _bucket_from_path(request.url.path)
     if not bucket_name:
         return response
 
