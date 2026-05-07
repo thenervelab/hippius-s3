@@ -128,6 +128,17 @@ async def handle_get_object(
                     version_id,
                 )
                 if not object_info:
+                    bucket_exists = await db.fetchval(
+                        "SELECT 1 FROM buckets WHERE bucket_name = $1 AND deleted_at IS NULL",
+                        bucket_name,
+                    )
+                    if not bucket_exists:
+                        return errors.s3_error_response(
+                            code="NoSuchBucket",
+                            message=f"The specified bucket {bucket_name} does not exist",
+                            status_code=404,
+                            BucketName=bucket_name,
+                        )
                     object_exists = await db.fetchval(
                         """
                         SELECT 1 FROM objects o
@@ -158,6 +169,17 @@ async def handle_get_object(
                     object_key,
                 )
                 if not object_info:
+                    bucket_exists = await db.fetchval(
+                        "SELECT 1 FROM buckets WHERE bucket_name = $1 AND deleted_at IS NULL",
+                        bucket_name,
+                    )
+                    if not bucket_exists:
+                        return errors.s3_error_response(
+                            code="NoSuchBucket",
+                            message=f"The specified bucket {bucket_name} does not exist",
+                            status_code=404,
+                            BucketName=bucket_name,
+                        )
                     return errors.s3_error_response(
                         code="NoSuchKey",
                         message=f"The specified key {object_key} does not exist or you don't have permission to access it",
