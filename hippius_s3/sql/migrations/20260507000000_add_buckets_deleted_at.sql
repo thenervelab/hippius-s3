@@ -20,15 +20,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS buckets_bucket_name_active_key
 CREATE INDEX IF NOT EXISTS idx_buckets_deleted_at_pending
     ON public.buckets (deleted_at) WHERE deleted_at IS NOT NULL;
 
--- Backfill: the prod bucket pagination-test-40k-1777583359 has been stuck
--- in the cascade-timeout state since 2026-05-04. Without this backfill it
--- reappears as "live" once the column lands. Idempotent: WHERE clause
--- ensures the UPDATE no-ops on staging or any DB where the row is absent.
-UPDATE public.buckets
-   SET deleted_at = now()
- WHERE bucket_id = '799b6ccc-5aae-4db7-8e92-40c864165d70'
-   AND deleted_at IS NULL;
-
 -- migrate:down
 
 DROP INDEX IF EXISTS idx_buckets_deleted_at_pending;
