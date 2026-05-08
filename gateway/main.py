@@ -14,6 +14,7 @@ from gateway.middlewares.ats_purge import ats_purge_middleware
 from gateway.middlewares.audit_log import audit_log_middleware
 from gateway.middlewares.auth_router import auth_router_middleware
 from gateway.middlewares.cache_control import cache_control_middleware
+from gateway.middlewares.cache_invalidation import cache_invalidation_middleware
 from gateway.middlewares.cors import cors_middleware
 from gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
 from gateway.middlewares.input_validation import input_validation_middleware
@@ -205,6 +206,7 @@ def factory() -> FastAPI:
     if config.read_only_mode:
         app.middleware("http")(read_only_middleware)
     # Inside CORS so Cache-Control lands before CORS wraps the response.
+    app.middleware("http")(cache_invalidation_middleware)
     app.middleware("http")(ats_purge_middleware)
     app.middleware("http")(cache_control_middleware)
     # Outermost: CORS must wrap everything so error responses get CORS headers
@@ -221,5 +223,10 @@ if __name__ == "__main__":
     config = get_config()
     debug_mode = os.getenv("DEBUG", "false").lower() == "true"
     uvicorn.run(
-        "gateway.main:factory", host="0.0.0.0", port=config.port, reload=debug_mode, access_log=True, factory=True
+        "gateway.main:factory",
+        host="0.0.0.0",
+        port=config.port,
+        reload=debug_mode,
+        access_log=True,
+        factory=True,
     )

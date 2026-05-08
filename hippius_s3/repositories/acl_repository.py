@@ -15,7 +15,7 @@ class ACLRepository:
         self.db = db_pool
 
     async def _get_bucket_id(self, bucket_name: str) -> Optional[str]:
-        query = "SELECT bucket_id FROM buckets WHERE bucket_name = $1"
+        query = "SELECT bucket_id FROM buckets WHERE bucket_name = $1 AND deleted_at IS NULL"
         row = await self.db.fetchrow(query, bucket_name)
         return str(row["bucket_id"]) if row else None
 
@@ -24,7 +24,7 @@ class ACLRepository:
         SELECT o.object_id
         FROM objects o
         JOIN buckets b ON o.bucket_id = b.bucket_id
-        WHERE b.bucket_name = $1 AND o.object_key = $2
+        WHERE b.bucket_name = $1 AND o.object_key = $2 AND b.deleted_at IS NULL
         """
         row = await self.db.fetchrow(query, bucket_name, object_key)
         return str(row["object_id"]) if row else None
@@ -49,7 +49,7 @@ class ACLRepository:
         SELECT ba.owner_id, ba.acl_json
         FROM bucket_acls ba
         JOIN buckets b ON ba.bucket_id = b.bucket_id
-        WHERE b.bucket_name = $1
+        WHERE b.bucket_name = $1 AND b.deleted_at IS NULL
         """
         row = await self.db.fetchrow(query, bucket_name)
         if not row:
@@ -114,7 +114,7 @@ class ACLRepository:
         FROM object_acls oa
         JOIN objects o ON oa.object_id = o.object_id
         JOIN buckets b ON o.bucket_id = b.bucket_id
-        WHERE b.bucket_name = $1 AND o.object_key = $2
+        WHERE b.bucket_name = $1 AND o.object_key = $2 AND b.deleted_at IS NULL
         """
         row = await self.db.fetchrow(query, bucket_name, object_key)
         if not row:
@@ -131,7 +131,7 @@ class ACLRepository:
         SELECT b.bucket_id, $1, $2, $3::jsonb
         FROM objects o
         JOIN buckets b ON o.bucket_id = b.bucket_id
-        WHERE o.object_id = $1
+        WHERE o.object_id = $1 AND b.deleted_at IS NULL
         ON CONFLICT (bucket_id, object_id)
         DO UPDATE SET
             owner_id = EXCLUDED.owner_id,
@@ -166,7 +166,7 @@ class ACLRepository:
         SELECT b.bucket_name, ba.acl_json
         FROM bucket_acls ba
         JOIN buckets b ON ba.bucket_id = b.bucket_id
-        WHERE ba.owner_id = $1
+        WHERE ba.owner_id = $1 AND b.deleted_at IS NULL
         ORDER BY b.bucket_name
         """
         rows = await self.db.fetch(query, owner_id)
@@ -185,7 +185,7 @@ class ACLRepository:
         FROM object_acls oa
         JOIN objects o ON oa.object_id = o.object_id
         JOIN buckets b ON oa.bucket_id = b.bucket_id
-        WHERE b.bucket_name = $1
+        WHERE b.bucket_name = $1 AND b.deleted_at IS NULL
         ORDER BY o.object_key
         """
         rows = await self.db.fetch(query, bucket_name)
@@ -203,7 +203,7 @@ class ACLRepository:
         query = """
         SELECT 1 FROM objects o
         JOIN buckets b ON o.bucket_id = b.bucket_id
-        WHERE b.bucket_name = $1 AND o.object_key = $2
+        WHERE b.bucket_name = $1 AND o.object_key = $2 AND b.deleted_at IS NULL
         LIMIT 1
         """
         row = await self.db.fetchrow(query, bucket_name, object_key)

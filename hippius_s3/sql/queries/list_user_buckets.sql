@@ -3,4 +3,5 @@
 SELECT bucket_id, bucket_name, created_at, is_public, tags
 FROM buckets
 WHERE main_account_id = $1
+  AND deleted_at IS NULL
 ORDER BY created_at DESC

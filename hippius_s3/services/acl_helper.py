@@ -10,7 +10,7 @@ from hippius_s3.models.acl import WellKnownGroups
 
 
 async def get_bucket_owner(db: asyncpg.Pool, bucket: str) -> str | None:
-    query = "SELECT main_account_id FROM buckets WHERE bucket_name = $1"
+    query = "SELECT main_account_id FROM buckets WHERE bucket_name = $1 AND deleted_at IS NULL"
     row = await db.fetchrow(query, bucket)
     return str(row["main_account_id"]) if row else None
 

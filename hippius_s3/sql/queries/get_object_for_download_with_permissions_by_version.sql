@@ -30,6 +30,7 @@ WITH object_info AS (
     JOIN buckets b ON o.bucket_id = b.bucket_id
     LEFT JOIN cids c ON ov.cid_id = c.id
     WHERE b.bucket_name = $1
+      AND b.deleted_at IS NULL
       AND o.object_key = $2
       AND o.deleted_at IS NULL
 ),

@@ -40,11 +40,21 @@ async def _get_object_with_permissions_min(
             bucket_name, object_key, version, main_account_id
         )
         if not row:
+            bucket_exists = await db.fetchval(
+                "SELECT 1 FROM buckets WHERE bucket_name = $1 AND deleted_at IS NULL",
+                bucket_name,
+            )
+            if not bucket_exists:
+                raise errors.S3Error(
+                    code="NoSuchBucket",
+                    status_code=404,
+                    message=f"The specified bucket {bucket_name} does not exist",
+                )
             object_exists = await db.fetchval(
                 """
                 SELECT 1 FROM objects o
                 JOIN buckets b ON o.bucket_id = b.bucket_id
-                WHERE b.bucket_name = $1 AND o.object_key = $2
+                WHERE b.bucket_name = $1 AND o.object_key = $2 AND b.deleted_at IS NULL
                 """,
                 bucket_name,
                 object_key,
@@ -63,6 +73,16 @@ async def _get_object_with_permissions_min(
     else:
         row = await ObjectRepository(db).get_for_download_with_permissions(bucket_name, object_key, main_account_id)
         if not row:
+            bucket_exists = await db.fetchval(
+                "SELECT 1 FROM buckets WHERE bucket_name = $1 AND deleted_at IS NULL",
+                bucket_name,
+            )
+            if not bucket_exists:
+                raise errors.S3Error(
+                    code="NoSuchBucket",
+                    status_code=404,
+                    message=f"The specified bucket {bucket_name} does not exist",
+                )
             raise errors.S3Error(
                 code="NoSuchKey",
                 status_code=404,

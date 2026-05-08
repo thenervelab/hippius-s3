@@ -33,6 +33,7 @@ JOIN object_versions ov
    AND ov.object_version = recent.current_object_version
 LEFT JOIN cids c ON c.id = ov.cid_id
 WHERE b.main_account_id = $1
+  AND b.deleted_at IS NULL
   AND ov.status <> 'failed'
 ORDER BY recent.created_at DESC
 LIMIT 10

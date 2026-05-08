@@ -13,5 +13,6 @@ LEFT JOIN bucket_acls ba ON ba.bucket_id = b.bucket_id
 LEFT JOIN objects o ON o.bucket_id = b.bucket_id
 LEFT JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
 WHERE b.main_account_id = $1
+  AND b.deleted_at IS NULL
 GROUP BY b.bucket_id, b.bucket_name, b.created_at, ba.acl_json, b.tags
 ORDER BY b.created_at DESC

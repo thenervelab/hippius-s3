@@ -63,13 +63,13 @@ class ACLService:
 
     async def get_bucket_owner(self, bucket: str) -> str | None:
         """Get bucket owner from buckets table."""
-        query = "SELECT main_account_id FROM buckets WHERE bucket_name = $1"
+        query = "SELECT main_account_id FROM buckets WHERE bucket_name = $1 AND deleted_at IS NULL"
         row = await self.acl_repo.db.fetchrow(query, bucket)
         return str(row["main_account_id"]) if row else None
 
     async def get_bucket_id(self, bucket: str) -> str | None:
         """Get bucket UUID from buckets table."""
-        query = "SELECT bucket_id FROM buckets WHERE bucket_name = $1"
+        query = "SELECT bucket_id FROM buckets WHERE bucket_name = $1 AND deleted_at IS NULL"
         row = await self.acl_repo.db.fetchrow(query, bucket)
         return str(row["bucket_id"]) if row else None
 
@@ -80,7 +80,10 @@ class ACLService:
         on hot paths (e.g. acl_middleware). Returns None when the bucket does
         not exist.
         """
-        query = "SELECT main_account_id, bucket_id, is_cache_warm FROM buckets WHERE bucket_name = $1"
+        query = (
+            "SELECT main_account_id, bucket_id, is_cache_warm FROM buckets "
+            "WHERE bucket_name = $1 AND deleted_at IS NULL"
+        )
         row = await self.acl_repo.db.fetchrow(query, bucket)
         if row is None:
             return None
@@ -96,7 +99,7 @@ class ACLService:
             SELECT b.main_account_id
             FROM objects o
             JOIN buckets b ON o.bucket_id = b.bucket_id
-            WHERE b.bucket_name = $1 AND o.object_key = $2
+            WHERE b.bucket_name = $1 AND o.object_key = $2 AND b.deleted_at IS NULL
         """
         row = await self.acl_repo.db.fetchrow(query, bucket, key)
         return str(row["main_account_id"]) if row else None
