@@ -7,14 +7,10 @@ from fastapi import Request
 from fastapi import Response
 
 from hippius_s3.api.s3 import errors
-from hippius_s3.config import get_config
-from hippius_s3.queue import BucketReapRequest
-from hippius_s3.queue import enqueue_bucket_reap_request
 from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
-config = get_config()
 
 
 async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redis_client: Any) -> Response:
@@ -22,10 +18,14 @@ async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redi
     Delete a bucket using S3 protocol (DELETE /{bucket_name}).
     Also handles removing bucket tags (DELETE /{bucket_name}?tagging).
 
-    Soft-deletes the bucket by setting buckets.deleted_at and enqueues a
-    BucketReapRequest for the async reaper worker to drain child rows. Returns
-    204 in O(1) — the previous synchronous DELETE FROM buckets cascade hit
-    the API's statement_timeout for buckets with significant child-row residue.
+    Soft-deletes the bucket by setting buckets.deleted_at. Returns 204 in O(1).
+    The Phase 2 bucket_reaper worker discovers soft-deleted buckets by polling
+    `buckets WHERE deleted_at IS NOT NULL` (via idx_buckets_deleted_at_pending)
+    and drains child rows leaves-up. There is intentionally no Redis queue —
+    the DB partial index is the single source of truth.
+
+    The previous synchronous DELETE FROM buckets cascade hit the API's
+    statement_timeout for buckets with significant child-row residue.
     """
     # If tagging is in query params, we're just deleting tags
     if "tagging" in request.query_params:
@@ -112,14 +112,5 @@ async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redi
             status_code=404,
             BucketName=bucket_name,
         )
-
-    ray_id = getattr(request.state, "ray_id", None)
-    await enqueue_bucket_reap_request(
-        BucketReapRequest(
-            bucket_id=str(soft_deleted["bucket_id"]),
-            bucket_name=str(soft_deleted["bucket_name"]),
-            ray_id=ray_id,
-        ),
-    )
 
     return Response(status_code=204)

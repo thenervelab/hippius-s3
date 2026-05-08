@@ -344,48 +344,6 @@ async def move_due_unpin_retries(
     return moved
 
 
-BUCKET_REAP_QUEUE = "bucket_reap_requests"
-
-
-class BucketReapRequest(RetryableRequest):
-    """Request to reap a soft-deleted bucket. Phase 1 produces these from the
-    DeleteBucket endpoint; the bucket_reaper worker (Phase 2) consumes them
-    and batch-deletes child rows leaves-up before hard-deleting the bucket row.
-    """
-
-    bucket_id: str
-    bucket_name: str
-
-    @property
-    def name(self) -> str:
-        return f"reap::{self.bucket_id}"
-
-
-async def enqueue_bucket_reap_request(payload: BucketReapRequest) -> None:
-    """Enqueue a bucket-reap request. Single queue (no backend fan-out)."""
-    client = get_queue_client()
-    if payload.request_id is None:
-        payload.request_id = uuid.uuid4().hex
-    if payload.first_enqueued_at is None:
-        payload.first_enqueued_at = time.time()
-    if payload.attempts is None:
-        payload.attempts = 0
-
-    raw = payload.model_dump_json()
-    await client.lpush(BUCKET_REAP_QUEUE, raw)
-    logger.info(f"Enqueued bucket reap {payload.name=} queue={BUCKET_REAP_QUEUE}")
-
-
-async def dequeue_bucket_reap_request() -> BucketReapRequest | None:
-    """Phase 2 reaper consumes from this queue."""
-    client = get_queue_client()
-    result = await client.brpop(BUCKET_REAP_QUEUE, timeout=3)
-    if result:
-        _, queue_data = result
-        return BucketReapRequest.model_validate_json(queue_data)
-    return None
-
-
 async def enqueue_download_request(payload: DownloadChainRequest) -> None:
     """Add a download request to per-backend download queues."""
     client = get_queue_client()
