@@ -42,8 +42,12 @@ repos:
         # CVE-2026-3219: pip concatenated tar/zip handling. Fix landed upstream (pypa/pip#13870)
         # but pip 26.1 not yet released to PyPI as of 2026-04-24 — only 26.0.1 is up. Remove
         # this ignore once 26.1 ships.
+        # CVE-2026-6357: pip self-update deferred imports ACE. Also fixed in pip 26.1
+        # (released 2026-04-26). Same situation — pip-audit's hook env still resolves
+        # 26.0.1 even though the project venv is on 26.1. Remove once the hook env
+        # picks up 26.1.
         name: pip-audit (dependency scan)
-        entry: pip-audit --ignore-vuln CVE-2024-23342 --ignore-vuln CVE-2026-4539 --ignore-vuln CVE-2026-25645 --ignore-vuln CVE-2026-3219
+        entry: pip-audit --ignore-vuln CVE-2024-23342 --ignore-vuln CVE-2026-4539 --ignore-vuln CVE-2026-25645 --ignore-vuln CVE-2026-3219 --ignore-vuln CVE-2026-6357
         language: system
         stages: [pre-commit]
         pass_filenames: false

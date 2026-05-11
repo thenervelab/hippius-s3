@@ -1,5 +1,8 @@
 -- List objects in a bucket with optional prefix and keyset pagination.
 -- Parameters: $1: bucket_id, $2: prefix (optional), $3: cursor / start-after key (optional), $4: limit
+-- LATERAL is required so the planner uses idx_objects_bucket_prefix as an ordered range scan
+-- and stops after LIMIT rows. The previous correlated-subquery JOIN forced a full hash join over
+-- objects + object_versions on large buckets (~5+ min on hyperliquid → asyncpg 30s timeout).
 SELECT o.object_id,
        o.object_key,
        ov.size_bytes,
@@ -8,17 +11,22 @@ SELECT o.object_id,
        ov.md5_hash,
        ov.status,
        ov.multipart
-FROM objects o
-JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = (
-    -- Skip incomplete multipart placeholders (InitiateMultipartUpload without Complete)
-    SELECT v.object_version
-    FROM object_versions v
-    WHERE v.object_id = o.object_id
-      AND v.object_version <= o.current_object_version
-      AND (v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
-    ORDER BY v.object_version DESC
-    LIMIT 1
-)
+FROM objects o,
+     LATERAL (
+         -- Skip incomplete multipart placeholders (InitiateMultipartUpload without Complete)
+         SELECT v.object_version,
+                v.size_bytes,
+                v.content_type,
+                v.md5_hash,
+                v.status,
+                v.multipart
+         FROM object_versions v
+         WHERE v.object_id = o.object_id
+           AND v.object_version <= o.current_object_version
+           AND (v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
+         ORDER BY v.object_version DESC
+         LIMIT 1
+     ) ov
 WHERE o.bucket_id = $1
   AND ($2::text IS NULL OR o.object_key LIKE $2::text || '%')
   AND ($3::text IS NULL OR o.object_key > $3::text)
