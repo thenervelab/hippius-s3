@@ -22,7 +22,7 @@ def test_each_param_maps_to_correct_header() -> None:
         "response-content-encoding": ("Content-Encoding", "gzip"),
         "response-content-language": ("Content-Language", "en-US"),
         "response-cache-control": ("Cache-Control", "no-cache, max-age=0"),
-        "response-expires": ("Expires", "Thu, 01 Dec 2026 16:00:00 GMT"),
+        "response-expires": ("Expires", "Thu, 03 Dec 2026 16:00:00 GMT"),
     }
     for qparam, (header_name, value) in cases.items():
         result = parse_response_overrides(QueryParams([(qparam, value)]), "user-123")

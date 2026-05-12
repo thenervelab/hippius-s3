@@ -59,7 +59,7 @@ def test_get_object_with_all_six_overrides(
         ResponseContentEncoding="identity",
         ResponseContentLanguage="en-US",
         ResponseCacheControl="no-cache, max-age=0",
-        ResponseExpires="Thu, 01 Dec 2026 16:00:00 GMT",
+        ResponseExpires="Thu, 03 Dec 2026 16:00:00 GMT",
     )
     assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
     headers = resp["ResponseMetadata"]["HTTPHeaders"]
@@ -68,7 +68,7 @@ def test_get_object_with_all_six_overrides(
     assert headers.get("content-encoding") == "identity"
     assert headers.get("content-language") == "en-US"
     assert headers.get("cache-control") == "no-cache, max-age=0"
-    assert headers.get("expires") == "Thu, 01 Dec 2026 16:00:00 GMT"
+    assert headers.get("expires") == "Thu, 03 Dec 2026 16:00:00 GMT"
     assert resp["Body"].read() == body
 
 
