@@ -37,6 +37,17 @@ async def cache_control_middleware(
         response.headers["Cache-Control"] = PRIVATE_CACHE_CONTROL
         return response
 
+    # Honor the S3 response-cache-control override when a signed client opted in.
+    # Anonymous callers can't set this — parse_response_overrides on the API side
+    # ignores it for them, so any cache-control they smuggle won't be on the
+    # response anyway. We additionally guard here so the gateway can't be tricked
+    # by an unsigned URL that happens to carry the query param.
+    if (
+        "response-cache-control" in request.query_params
+        and getattr(request.state, "auth_method", None) != "anonymous"
+    ):
+        return response
+
     bucket = getattr(request.state, "s3_bucket", None)
     key = getattr(request.state, "s3_key", None)
     if bucket is None:
