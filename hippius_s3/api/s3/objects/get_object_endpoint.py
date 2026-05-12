@@ -14,9 +14,11 @@ from opentelemetry import trace
 
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.common import apply_response_overrides
 from hippius_s3.api.s3.common import if_none_match_matches
 from hippius_s3.api.s3.common import parse_range
 from hippius_s3.api.s3.common import parse_read_mode
+from hippius_s3.api.s3.common import parse_response_overrides
 from hippius_s3.api.s3.range_utils import parse_range_header
 from hippius_s3.config import get_config
 from hippius_s3.monitoring import get_metrics_collector
@@ -95,14 +97,26 @@ async def handle_get_object(
             f"GET start {bucket_name}/{object_key} read_mode={hdr_mode or 'auto'} range={bool(range_header)} version={version_id or 'current'}"
         )
 
+    # Gateway now handles all ACL/permission checks
+    # Backend trusts the account information from gateway
+    account = getattr(request.state, "account", None)
+    account_id = account.main_account if account else "anonymous"
+    # Anonymous reads on a public bucket still carry the bucket owner as main_account,
+    # so we gate on account.id. Gateway sets it to literal "anonymous" for unsigned requests;
+    # an empty string would mean the gateway didn't run account_middleware — treat as anon.
+    is_anonymous = account is None or account.id in ("", "anonymous")
+
+    try:
+        response_overrides = parse_response_overrides(request.query_params, is_anonymous=is_anonymous)
+    except ValueError as e:
+        return errors.s3_error_response(
+            code="InvalidArgument",
+            message=str(e),
+            status_code=400,
+        )
+
     db = await pool.acquire()
     try:
-        # Gateway now handles all ACL/permission checks
-        # Backend trusts the account information from gateway
-        account = getattr(request.state, "account", None)
-
-        account_id = account.main_account if account else "anonymous"
-
         # Skip user creation for anonymous accounts
         if account and account.main_account != "anonymous":
             with tracer.start_as_current_span(
@@ -351,6 +365,7 @@ async def handle_get_object(
         if response.status_code in (200, 206):
             object_version = int(object_info.get("object_version") or 1)
             response.headers["x-amz-version-id"] = str(object_version)
+            apply_response_overrides(response.headers, response_overrides)
 
             bytes_transferred = int(object_info["size_bytes"])
             if range_header and start_byte is not None and end_byte is not None:
