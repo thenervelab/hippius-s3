@@ -101,9 +101,13 @@ async def handle_get_object(
     # Backend trusts the account information from gateway
     account = getattr(request.state, "account", None)
     account_id = account.main_account if account else "anonymous"
+    # Anonymous reads on a public bucket still carry the bucket owner as main_account,
+    # so we gate on account.id. Gateway sets it to literal "anonymous" for unsigned requests;
+    # an empty string would mean the gateway didn't run account_middleware — treat as anon.
+    is_anonymous = account is None or account.id in ("", "anonymous")
 
     try:
-        response_overrides = parse_response_overrides(request.query_params, account_id)
+        response_overrides = parse_response_overrides(request.query_params, is_anonymous=is_anonymous)
     except ValueError as e:
         return errors.s3_error_response(
             code="InvalidArgument",
