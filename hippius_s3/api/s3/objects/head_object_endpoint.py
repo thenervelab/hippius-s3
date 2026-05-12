@@ -12,7 +12,9 @@ from opentelemetry import trace
 
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.common import apply_response_overrides
 from hippius_s3.api.s3.common import if_none_match_matches
+from hippius_s3.api.s3.common import parse_response_overrides
 from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
 from hippius_s3.utils import get_query
@@ -138,6 +140,21 @@ async def handle_head_object(
                 logger.exception("Error in HEAD tagging request")
                 return Response(status_code=500)
 
+    # Anonymous reads on a public bucket still carry the bucket owner as main_account,
+    # so we gate on account.id. Gateway sets it to literal "anonymous" for unsigned requests;
+    # an empty string would mean the gateway didn't run account_middleware — treat as anon.
+    is_anonymous = account is None or account.id in ("", "anonymous")
+    try:
+        response_overrides = parse_response_overrides(request.query_params, is_anonymous=is_anonymous)
+    except ValueError as e:
+        return Response(
+            status_code=400,
+            headers={
+                "x-amz-error-code": "InvalidArgument",
+                "x-amz-error-message": str(e),
+            },
+        )
+
     db = await pool.acquire()
     try:
         with tracer.start_as_current_span("head_object.get_object_metadata") as span:
@@ -248,6 +265,7 @@ async def handle_head_object(
             for k, v in meta_val.items():
                 if k != "ipfs" and not isinstance(v, dict):
                     headers[f"x-amz-meta-{k}"] = str(v)
+        apply_response_overrides(headers, response_overrides)
         return Response(status_code=200, headers=headers)
 
     except errors.S3Error as e:
