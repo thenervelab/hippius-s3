@@ -42,10 +42,7 @@ async def cache_control_middleware(
     # ignores it for them, so any cache-control they smuggle won't be on the
     # response anyway. We additionally guard here so the gateway can't be tricked
     # by an unsigned URL that happens to carry the query param.
-    if (
-        "response-cache-control" in request.query_params
-        and getattr(request.state, "auth_method", None) != "anonymous"
-    ):
+    if "response-cache-control" in request.query_params and getattr(request.state, "auth_method", None) != "anonymous":
         return response
 
     bucket = getattr(request.state, "s3_bucket", None)
