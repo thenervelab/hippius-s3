@@ -3,7 +3,7 @@
 from typing import Any
 from typing import Callable
 
-import httpx
+import pytest
 import requests
 
 from .conftest import is_real_aws
@@ -180,6 +180,8 @@ def test_get_object_with_crlf_override_rejected(
     if is_real_aws():
         return
 
+    from botocore.exceptions import ClientError
+
     bucket_name = unique_bucket_name("rcd-crlf")
     cleanup_buckets(bucket_name)
     boto3_client.create_bucket(Bucket=bucket_name)
@@ -188,15 +190,11 @@ def test_get_object_with_crlf_override_rejected(
     body = b"abc"
     boto3_client.put_object(Bucket=bucket_name, Key=key, Body=body, ContentType="application/octet-stream")
 
-    presigned_url = boto3_client.generate_presigned_url(
-        ClientMethod="get_object",
-        Params={
-            "Bucket": bucket_name,
-            "Key": key,
-            "ResponseContentDisposition": "evil\r\nX-Injected: yes",
-        },
-        ExpiresIn=300,
-    )
-    response = httpx.get(presigned_url, timeout=10)
-    assert response.status_code == 400
-    assert b"InvalidArgument" in response.content
+    with pytest.raises(ClientError) as exc_info:
+        boto3_client.get_object(
+            Bucket=bucket_name,
+            Key=key,
+            ResponseContentDisposition="evil\r\nX-Injected: yes",
+        )
+    assert exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc_info.value.response["Error"]["Code"] == "InvalidArgument"
