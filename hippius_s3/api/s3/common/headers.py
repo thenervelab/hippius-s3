@@ -22,14 +22,14 @@ RESPONSE_OVERRIDE_PARAMS: dict[str, str] = {
 MAX_OVERRIDE_VALUE_LEN = 4096
 
 
-def parse_response_overrides(query_params: QueryParams, auth_method: str | None) -> dict[str, str]:
+def parse_response_overrides(query_params: QueryParams, account_id: str | None) -> dict[str, str]:
     """Parse the six S3 response-header override query params.
 
     Returns a mapping of {Response-Header-Name: value}. Empty for anonymous requests
     (per S3 spec, overrides only apply to signed requests).
     Raises ValueError on CRLF or oversize values to prevent header injection.
     """
-    if auth_method == "anonymous":
+    if account_id == "anonymous" or account_id is None:
         return {}
     out: dict[str, str] = {}
     for qparam, header_name in RESPONSE_OVERRIDE_PARAMS.items():

@@ -97,23 +97,22 @@ async def handle_get_object(
             f"GET start {bucket_name}/{object_key} read_mode={hdr_mode or 'auto'} range={bool(range_header)} version={version_id or 'current'}"
         )
 
+    # Gateway now handles all ACL/permission checks
+    # Backend trusts the account information from gateway
+    account = getattr(request.state, "account", None)
+    account_id = account.main_account if account else "anonymous"
+
+    try:
+        response_overrides = parse_response_overrides(request.query_params, account_id)
+    except ValueError as e:
+        return errors.s3_error_response(
+            code="InvalidArgument",
+            message=str(e),
+            status_code=400,
+        )
+
     db = await pool.acquire()
     try:
-        # Gateway now handles all ACL/permission checks
-        # Backend trusts the account information from gateway
-        account = getattr(request.state, "account", None)
-
-        account_id = account.main_account if account else "anonymous"
-
-        try:
-            response_overrides = parse_response_overrides(request.query_params, account_id)
-        except ValueError as e:
-            return errors.s3_error_response(
-                code="InvalidArgument",
-                message=str(e),
-                status_code=400,
-            )
-
         # Skip user creation for anonymous accounts
         if account and account.main_account != "anonymous":
             with tracer.start_as_current_span(

@@ -105,17 +105,6 @@ async def handle_head_object(
 
     main_account_id = account.main_account if account else "anonymous"
 
-    try:
-        response_overrides = parse_response_overrides(request.query_params, main_account_id)
-    except ValueError as e:
-        return Response(
-            status_code=400,
-            headers={
-                "x-amz-error-code": "InvalidArgument",
-                "x-amz-error-message": str(e),
-            },
-        )
-
     # Parse versionId query parameter
     version_id = None
     if "versionId" in request.query_params:
@@ -150,6 +139,17 @@ async def handle_head_object(
             except Exception:
                 logger.exception("Error in HEAD tagging request")
                 return Response(status_code=500)
+
+    try:
+        response_overrides = parse_response_overrides(request.query_params, main_account_id)
+    except ValueError as e:
+        return Response(
+            status_code=400,
+            headers={
+                "x-amz-error-code": "InvalidArgument",
+                "x-amz-error-message": str(e),
+            },
+        )
 
     db = await pool.acquire()
     try:

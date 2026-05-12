@@ -78,9 +78,9 @@ def test_anonymous_returns_empty() -> None:
     assert parse_response_overrides(params, "anonymous") == {}
 
 
-def test_none_auth_does_not_short_circuit() -> None:
+def test_none_account_returns_empty() -> None:
     params = QueryParams([("response-content-type", "image/png")])
-    assert parse_response_overrides(params, None) == {"Content-Type": "image/png"}
+    assert parse_response_overrides(params, None) == {}
 
 
 @pytest.mark.parametrize(
