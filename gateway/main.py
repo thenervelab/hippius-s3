@@ -1,5 +1,7 @@
 import asyncio
 import time
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
 from typing import Dict
 
 import asyncpg
@@ -45,16 +47,9 @@ def factory() -> FastAPI:
     configure_otel("hippius-s3-gateway")
 
     init_sentry("hippius-s3-gateway")
-    app = FastAPI(
-        title="Hippius S3 API",
-        version="1.0.0",
-        docs_url=None,
-        redoc_url=None,
-        openapi_url=None,
-    )
 
-    @app.on_event("startup")
-    async def startup() -> None:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         from hippius_s3.redis_utils import create_redis_client
 
         logger.info("Starting Hippius S3 Gateway...")
@@ -134,8 +129,8 @@ def factory() -> FastAPI:
 
         logger.info("Gateway startup complete")
 
-    @app.on_event("shutdown")
-    async def shutdown() -> None:
+        yield
+
         from gateway.services import ats_cache_client
 
         logger.info("Shutting down Hippius S3 Gateway...")
@@ -175,6 +170,15 @@ def factory() -> FastAPI:
             logger.info("Redis ACL client closed")
 
         logger.info("Gateway shutdown complete")
+
+    app = FastAPI(
+        title="Hippius S3 API",
+        version="1.0.0",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=lifespan,
+    )
 
     @app.get("/health")
     async def health() -> Dict[str, str]:
