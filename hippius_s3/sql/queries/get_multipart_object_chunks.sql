@@ -7,6 +7,7 @@ JOIN buckets b ON o.bucket_id = b.bucket_id
 JOIN parts p ON p.object_id = o.object_id AND p.object_version = ov.object_version
 JOIN cids c ON p.cid_id = c.id
 WHERE b.bucket_name = $1
+  AND b.deleted_at IS NULL
   AND o.object_key = $2
   AND b.main_account_id = $3
   AND ov.multipart = TRUE

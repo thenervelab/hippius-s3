@@ -3,4 +3,5 @@
 SELECT acl_json
 FROM bucket_acls ba
 JOIN buckets b ON ba.bucket_id = b.bucket_id
-WHERE b.bucket_name = $1;
+WHERE b.bucket_name = $1
+  AND b.deleted_at IS NULL;

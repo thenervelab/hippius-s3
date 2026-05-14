@@ -1,5 +1,7 @@
 import asyncio
 import time
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
 from typing import Dict
 
 import asyncpg
@@ -14,6 +16,7 @@ from gateway.middlewares.ats_purge import ats_purge_middleware
 from gateway.middlewares.audit_log import audit_log_middleware
 from gateway.middlewares.auth_router import auth_router_middleware
 from gateway.middlewares.cache_control import cache_control_middleware
+from gateway.middlewares.cache_invalidation import cache_invalidation_middleware
 from gateway.middlewares.cors import cors_middleware
 from gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
 from gateway.middlewares.input_validation import input_validation_middleware
@@ -44,16 +47,9 @@ def factory() -> FastAPI:
     configure_otel("hippius-s3-gateway")
 
     init_sentry("hippius-s3-gateway")
-    app = FastAPI(
-        title="Hippius S3 API",
-        version="1.0.0",
-        docs_url=None,
-        redoc_url=None,
-        openapi_url=None,
-    )
 
-    @app.on_event("startup")
-    async def startup() -> None:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         from hippius_s3.redis_utils import create_redis_client
 
         logger.info("Starting Hippius S3 Gateway...")
@@ -133,8 +129,8 @@ def factory() -> FastAPI:
 
         logger.info("Gateway startup complete")
 
-    @app.on_event("shutdown")
-    async def shutdown() -> None:
+        yield
+
         from gateway.services import ats_cache_client
 
         logger.info("Shutting down Hippius S3 Gateway...")
@@ -175,6 +171,15 @@ def factory() -> FastAPI:
 
         logger.info("Gateway shutdown complete")
 
+    app = FastAPI(
+        title="Hippius S3 API",
+        version="1.0.0",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=lifespan,
+    )
+
     @app.get("/health")
     async def health() -> Dict[str, str]:
         return {"status": "healthy", "service": "gateway"}
@@ -205,6 +210,7 @@ def factory() -> FastAPI:
     if config.read_only_mode:
         app.middleware("http")(read_only_middleware)
     # Inside CORS so Cache-Control lands before CORS wraps the response.
+    app.middleware("http")(cache_invalidation_middleware)
     app.middleware("http")(ats_purge_middleware)
     app.middleware("http")(cache_control_middleware)
     # Outermost: CORS must wrap everything so error responses get CORS headers
@@ -221,5 +227,10 @@ if __name__ == "__main__":
     config = get_config()
     debug_mode = os.getenv("DEBUG", "false").lower() == "true"
     uvicorn.run(
-        "gateway.main:factory", host="0.0.0.0", port=config.port, reload=debug_mode, access_log=True, factory=True
+        "gateway.main:factory",
+        host="0.0.0.0",
+        port=config.port,
+        reload=debug_mode,
+        access_log=True,
+        factory=True,
     )

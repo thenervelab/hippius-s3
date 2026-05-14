@@ -12,7 +12,9 @@ from opentelemetry import trace
 
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.common import apply_response_overrides
 from hippius_s3.api.s3.common import if_none_match_matches
+from hippius_s3.api.s3.common import parse_response_overrides
 from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
 from hippius_s3.utils import get_query
@@ -40,11 +42,21 @@ async def _get_object_with_permissions_min(
             bucket_name, object_key, version, main_account_id
         )
         if not row:
+            bucket_exists = await db.fetchval(
+                "SELECT 1 FROM buckets WHERE bucket_name = $1 AND deleted_at IS NULL",
+                bucket_name,
+            )
+            if not bucket_exists:
+                raise errors.S3Error(
+                    code="NoSuchBucket",
+                    status_code=404,
+                    message=f"The specified bucket {bucket_name} does not exist",
+                )
             object_exists = await db.fetchval(
                 """
                 SELECT 1 FROM objects o
                 JOIN buckets b ON o.bucket_id = b.bucket_id
-                WHERE b.bucket_name = $1 AND o.object_key = $2
+                WHERE b.bucket_name = $1 AND o.object_key = $2 AND b.deleted_at IS NULL
                 """,
                 bucket_name,
                 object_key,
@@ -63,6 +75,16 @@ async def _get_object_with_permissions_min(
     else:
         row = await ObjectRepository(db).get_for_download_with_permissions(bucket_name, object_key, main_account_id)
         if not row:
+            bucket_exists = await db.fetchval(
+                "SELECT 1 FROM buckets WHERE bucket_name = $1 AND deleted_at IS NULL",
+                bucket_name,
+            )
+            if not bucket_exists:
+                raise errors.S3Error(
+                    code="NoSuchBucket",
+                    status_code=404,
+                    message=f"The specified bucket {bucket_name} does not exist",
+                )
             raise errors.S3Error(
                 code="NoSuchKey",
                 status_code=404,
@@ -117,6 +139,21 @@ async def handle_head_object(
             except Exception:
                 logger.exception("Error in HEAD tagging request")
                 return Response(status_code=500)
+
+    # Anonymous reads on a public bucket still carry the bucket owner as main_account,
+    # so we gate on account.id. Gateway sets it to literal "anonymous" for unsigned requests;
+    # an empty string would mean the gateway didn't run account_middleware — treat as anon.
+    is_anonymous = account is None or account.id in ("", "anonymous")
+    try:
+        response_overrides = parse_response_overrides(request.query_params, is_anonymous=is_anonymous)
+    except ValueError as e:
+        return Response(
+            status_code=400,
+            headers={
+                "x-amz-error-code": "InvalidArgument",
+                "x-amz-error-message": str(e),
+            },
+        )
 
     db = await pool.acquire()
     try:
@@ -228,6 +265,7 @@ async def handle_head_object(
             for k, v in meta_val.items():
                 if k != "ipfs" and not isinstance(v, dict):
                     headers[f"x-amz-meta-{k}"] = str(v)
+        apply_response_overrides(headers, response_overrides)
         return Response(status_code=200, headers=headers)
 
     except errors.S3Error as e:
