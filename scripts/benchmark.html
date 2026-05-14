@@ -1,0 +1,626 @@
+<!doctype html>
+<!--
+  Hippius S3 benchmark dashboard. Source for scripts/s3-benchmark.py output.
+  Hosted at https://s3.hippius.com/veggies/s3/benchmark.html (publicly readable).
+  Re-upload after edits:
+    aws s3 cp scripts/benchmark.html s3://veggies/s3/benchmark.html \
+      --endpoint-url https://s3.hippius.com \
+      --acl public-read \
+      --content-type "text/html; charset=utf-8" \
+      --cache-control "public, max-age=300"
+  Loads benchmark JSONs from s3://veggies/s3/{eu,us}/results/ via anonymous
+  ListBucket — no credentials are transmitted.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hippius S3 Benchmarks</title>
+<meta name="theme-color" content="#3167DD">
+<link rel="icon" type="image/svg+xml" href="/veggies/favicon.svg">
+<style>
+  :root {
+    --bg: #F8FAFC;
+    --fg: #3F3F46;
+    --muted: #71717A;
+    --card: #FFFFFF;
+    --border: #E5E7EB;
+    --accent: #3167DD;
+    --eu: #3167DD;
+    --us: #DC2626;
+    --grid: rgba(0,0,0,0.05);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .container { max-width: 1024px; margin: 0 auto; padding: 2.5rem 1rem; }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 2rem;
+  }
+  .brand { display: flex; align-items: center; gap: 0.75rem; }
+  .brand img { height: 32px; width: auto; display: block; }
+  .brand h1 {
+    margin: 0; font-size: 1.25rem; font-weight: 600; color: #18181B;
+    letter-spacing: -0.01em;
+  }
+  .pill {
+    display: inline-block; padding: 0.5rem 0.75rem;
+    background: var(--accent); color: #fff;
+    text-decoration: none; border-radius: 0.25rem;
+    font-size: 0.875rem; font-weight: 600;
+  }
+  .pill:hover { background: #2553C3; }
+  .pill-secondary {
+    background: #FFFFFF; color: var(--accent);
+    border: 1px solid var(--accent);
+  }
+  .pill-secondary:hover { background: rgba(49, 103, 221, 0.06); }
+  .header-links { display: flex; gap: 0.5rem; align-items: center; }
+  .lede {
+    color: var(--muted); font-size: 0.95rem; margin: 0 0 0.5rem 0;
+    max-width: 720px;
+  }
+  .quickstart-link {
+    color: #A1A1AA; font-size: 0.85rem; margin: 0 0 2rem 0;
+    max-width: 720px;
+  }
+  .quickstart-link a { color: inherit; text-decoration: underline; }
+  .quickstart-link a:hover { color: var(--accent); }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    padding: 1.5rem;
+    margin-bottom: 0;
+  }
+  .charts {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 1.25rem;
+    margin-bottom: 1.25rem;
+  }
+  @media (max-width: 720px) {
+    .charts { grid-template-columns: 1fr; }
+  }
+  .card h2 {
+    margin: 0 0 0.25rem 0; font-size: 1rem; font-weight: 600; color: #18181B;
+  }
+  .card .subtitle { color: var(--muted); font-size: 0.85rem; margin: 0 0 1rem 0; min-height: 2.4em; }
+  .chart-wrap { position: relative; height: 280px; }
+  .chart-wrap-sm { height: 180px; }
+  .card-compact { margin-top: 1.25rem; }
+  .chart-legend {
+    list-style: none; padding: 0;
+    margin: 0 0 0.5rem 0;
+    display: flex; flex-wrap: wrap;
+    gap: 0.25rem 1.25rem;
+    font-size: 12px; color: #52525B;
+  }
+  .chart-legend li {
+    display: inline-flex; align-items: center; gap: 0.55rem;
+    cursor: pointer; user-select: none;
+    padding: 0.35rem 0.6rem;
+    margin: -0.35rem -0.6rem;
+    border-radius: 4px;
+    transition: background 0.12s, opacity 0.12s;
+  }
+  .chart-legend li:hover { background: rgba(0, 0, 0, 0.04); }
+  .chart-legend li.is-hidden { opacity: 0.4; }
+  .chart-legend li.is-hidden:hover { opacity: 0.6; }
+  .chart-legend li.is-hidden .legend-text { text-decoration: line-through; }
+  .chart-legend .legend-marker {
+    display: inline-block; width: 28px; height: 3px;
+    border-radius: 1px; flex-shrink: 0;
+  }
+  .empty {
+    color: var(--muted); font-size: 0.9rem; text-align: center;
+    padding: 4rem 0;
+  }
+  footer {
+    margin-top: 2rem; padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+    color: var(--muted); font-size: 0.8rem;
+    line-height: 1.6;
+  }
+  footer pre {
+    margin: 0.5rem 0 0 0; padding: 0.75rem 1rem;
+    background: #F1F5F9; border-radius: 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.75rem; color: #475569;
+    overflow-x: auto; line-height: 1.5;
+  }
+  footer a { color: var(--accent); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .tt {
+    position: absolute; pointer-events: auto;
+    background: #fff; border: 1px solid var(--border);
+    border-radius: 6px; padding: 0.5rem 0.75rem;
+    font-size: 0.85rem; color: var(--fg);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+    opacity: 0; transition: opacity 0.12s;
+    z-index: 50; min-width: 180px;
+    transform: translate(-50%, calc(-100% - 12px));
+  }
+  .tt-title { font-size: 0.72rem; color: var(--muted); margin-bottom: 0.35rem; }
+  .tt-table { border-collapse: collapse; margin: 0; width: 100%; }
+  .tt-table td { padding: 0.05rem 0; border: 0; vertical-align: middle; line-height: 1.4; }
+  .tt-bar-cell { padding-right: 0.55rem !important; width: 14px; }
+  .tt-bar { display: block; width: 14px; height: 2px; border-radius: 1px; }
+  .tt-label { white-space: nowrap; }
+  .tt-value { padding-left: 0.9rem !important; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .tt-faint { color: #A1A1AA; }
+  .tt-sep td { padding: 0.45rem 0 0.35rem 0 !important; }
+  .tt-hr { border: 0; border-top: 1px solid rgba(0, 0, 0, 0.06); margin: 0 0 0.25rem 0; }
+  .tt-sha {
+    display: inline-block; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.7rem; color: #A1A1AA; text-decoration: none; letter-spacing: -0.02em;
+  }
+  .tt-sha:hover { color: var(--accent); text-decoration: underline; }
+  footer code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: #F1F5F9; padding: 0.05rem 0.3rem; border-radius: 3px;
+    color: #475569;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div class="brand">
+      <img src="/veggies/favicon.svg" alt="Hippius">
+      <h1>S3 Benchmarks</h1>
+    </div>
+    <div class="header-links">
+      <a class="pill pill-secondary" href="https://status.hippius.com/">Status</a>
+      <a class="pill" href="https://docs.hippius.com/use/quickstart">Quickstart &rarr;</a>
+    </div>
+  </header>
+
+  <p class="lede">
+    Throughput benchmarks for our two supported regions:
+    <strong>eu-central-1.hippius.com</strong> (also reachable as
+    <strong>s3.hippius.com</strong>) and <strong>us-east-1.hippius.com</strong>.
+    Each datapoint is one run, recording min/max/avg over 3 trials.
+  </p>
+  <p class="quickstart-link">
+    See <a href="https://docs.hippius.com/use/quickstart">https://docs.hippius.com/use/quickstart</a> to try out Hippius S3 and store your first file.
+  </p>
+
+  <div class="charts">
+    <div class="card">
+      <h2>Upload throughput</h2>
+      <p class="subtitle">How fast clients can upload a 2&nbsp;GB object to each region.</p>
+      <ul class="chart-legend" id="legend-chart-upload"></ul>
+      <div class="chart-wrap"><canvas id="chart-upload"></canvas></div>
+    </div>
+
+    <div class="card">
+      <h2>Upload latency</h2>
+      <p class="subtitle">End-to-end time to PUT a 2&nbsp;GB object.</p>
+      <ul class="chart-legend" id="legend-chart-upload-lat"></ul>
+      <div class="chart-wrap"><canvas id="chart-upload-lat"></canvas></div>
+    </div>
+
+    <div class="card">
+      <h2>Download throughput</h2>
+      <p class="subtitle">Typical download &mdash; content served from the regional cache.</p>
+      <ul class="chart-legend" id="legend-chart-cached"></ul>
+      <div class="chart-wrap"><canvas id="chart-cached"></canvas></div>
+    </div>
+
+    <div class="card">
+      <h2>Download TTFB</h2>
+      <p class="subtitle">Time to first byte for typical downloads served from the regional cache.</p>
+      <ul class="chart-legend" id="legend-chart-cached-ttfb"></ul>
+      <div class="chart-wrap"><canvas id="chart-cached-ttfb"></canvas></div>
+    </div>
+
+    <div class="card">
+      <h2>Uncached download throughput</h2>
+      <p class="subtitle">First-time download of a fresh object &mdash; content fetched from origin storage.</p>
+      <ul class="chart-legend" id="legend-chart-uncached"></ul>
+      <div class="chart-wrap"><canvas id="chart-uncached"></canvas></div>
+    </div>
+
+    <div class="card">
+      <h2>Uncached download TTFB</h2>
+      <p class="subtitle">Time to first byte on first-time downloads.</p>
+      <ul class="chart-legend" id="legend-chart-uncached-ttfb"></ul>
+      <div class="chart-wrap"><canvas id="chart-uncached-ttfb"></canvas></div>
+    </div>
+  </div>
+
+  <div class="card card-compact">
+    <h2>Benchmark runtime</h2>
+    <p class="subtitle">Active S3 time per run — first upload to last download, excluding file generation and setup.</p>
+    <ul class="chart-legend" id="legend-chart-runtime"></ul>
+    <div class="chart-wrap chart-wrap-sm"><canvas id="chart-runtime"></canvas></div>
+  </div>
+
+  <footer>
+    All benchmarks use 2&nbsp;GB test files via a single PUT request (no multipart upload). Each run records 3 trials.
+    All timestamps are in UTC.
+    Equivalent AWS CLI invocations:
+<pre># Upload — single PUT, no multipart
+aws s3api put-object --bucket BUCKET --key KEY --body ./file.bin \
+  --endpoint-url https://eu-central-1.hippius.com
+
+# Download
+aws s3 cp s3://BUCKET/KEY ./file.bin \
+  --endpoint-url https://eu-central-1.hippius.com</pre>
+    <p style="margin-top: 1rem;">
+      Source: <a href="https://github.com/thenervelab/hippius-s3/blob/main/scripts/s3-benchmark.py">scripts/s3-benchmark.py</a> in the <a href="https://github.com/thenervelab/hippius-s3">hippius-s3</a> repo.
+    </p>
+  </footer>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/date-fns@3.6.0/cdn.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<script>
+(() => {
+  // HTML legend plugin — renders the legend as real DOM elements outside the canvas
+  // so the browser handles cursor:pointer, click hit boxes, and hover styles natively.
+  // Chart.js v4's canvas-drawn legend has finicky hit detection and no built-in cursor.
+  const htmlLegendPlugin = {
+    id: "htmlLegend",
+    afterUpdate(chart, args, options) {
+      const containerID = options.containerID;
+      const ul = containerID ? document.getElementById(containerID) : null;
+      if (!ul) return;
+      while (ul.firstChild) ul.firstChild.remove();
+      const labels = chart.options.plugins.legend.labels;
+      let items = labels.generateLabels ? labels.generateLabels(chart) : Chart.defaults.plugins.legend.labels.generateLabels(chart);
+      if (labels.filter) items = items.filter((it) => labels.filter(it, chart.data));
+      items.forEach((item) => {
+        const li = document.createElement("li");
+        const ds = chart.data.datasets[item.datasetIndex];
+        const zone = ds && ds.zone;
+        const isHidden = zone
+          ? chart.data.datasets.some((d, i) => d.zone === zone && chart.getDatasetMeta(i).hidden === true)
+          : chart.getDatasetMeta(item.datasetIndex).hidden === true;
+        if (isHidden) li.classList.add("is-hidden");
+        const marker = document.createElement("span");
+        marker.className = "legend-marker";
+        marker.style.background = item.strokeStyle || item.fillStyle;
+        const text = document.createElement("span");
+        text.className = "legend-text";
+        text.innerHTML = item.text;
+        li.appendChild(marker);
+        li.appendChild(text);
+        li.addEventListener("click", () => {
+          if (zone) {
+            const anyHidden = chart.data.datasets.some(
+              (d, i) => d.zone === zone && chart.getDatasetMeta(i).hidden === true,
+            );
+            chart.data.datasets.forEach((d, i) => {
+              if (d.zone === zone) chart.getDatasetMeta(i).hidden = !anyHidden;
+            });
+          } else {
+            const meta = chart.getDatasetMeta(item.datasetIndex);
+            meta.hidden = !meta.hidden;
+          }
+          chart.update();
+        });
+        ul.appendChild(li);
+      });
+    },
+  };
+  Chart.register(htmlLegendPlugin);
+
+  // Custom interaction mode. For each zone, we treat the area between min and max
+  // (the visible band) as the hover region. Cursor y inside that band at the cursor's
+  // nearest x = hit. Multiple zones can match simultaneously (overlap) and all are
+  // returned, so the tooltip groups both into one panel.
+  Chart.Interaction.modes.byZone = function (chart, e) {
+    const pos = Chart.helpers.getRelativePosition(e, chart);
+    const xScale = chart.scales.x;
+    const yScale = chart.scales.y;
+    if (!xScale || !yScale) return [];
+    const Y_TOL = 6;       // extra y-pixel tolerance around band edges
+    const SCALAR_TOL = 22; // y-pixel tolerance for single-line (runtime) charts
+
+    const byZone = {};
+    chart.data.datasets.forEach((ds, dsIdx) => {
+      if (!ds.zone) return;
+      (byZone[ds.zone] ||= []).push({ ds, dsIdx });
+    });
+
+    const items = [];
+    for (const zone of Object.keys(byZone)) {
+      const group = byZone[zone];
+      const sample = group[0].ds;
+      if (!sample.data || sample.data.length === 0) continue;
+      // pick the data index whose x is nearest to the cursor x
+      let nearestIdx = 0;
+      let nearestDist = Infinity;
+      for (let i = 0; i < sample.data.length; i++) {
+        const px = xScale.getPixelForValue(sample.data[i].x);
+        const d = Math.abs(px - pos.x);
+        if (d < nearestDist) { nearestDist = d; nearestIdx = i; }
+      }
+      const minEntry = group.find(g => g.ds.role === "min");
+      const maxEntry = group.find(g => g.ds.role === "max");
+      const avgEntry = group.find(g => g.ds.role === "avg");
+
+      let inBand = false;
+      if (minEntry && maxEntry) {
+        const pY1 = yScale.getPixelForValue(minEntry.ds.data[nearestIdx].y);
+        const pY2 = yScale.getPixelForValue(maxEntry.ds.data[nearestIdx].y);
+        const top = Math.min(pY1, pY2) - Y_TOL;
+        const bottom = Math.max(pY1, pY2) + Y_TOL;
+        if (pos.y >= top && pos.y <= bottom) inBand = true;
+      } else if (avgEntry) {
+        const pY = yScale.getPixelForValue(avgEntry.ds.data[nearestIdx].y);
+        if (Math.abs(pos.y - pY) <= SCALAR_TOL) inBand = true;
+      }
+      if (!inBand) continue;
+
+      group.forEach(({ ds, dsIdx }) => {
+        const meta = chart.getDatasetMeta(dsIdx);
+        if (meta.hidden) return;
+        if (meta.data && meta.data[nearestIdx]) {
+          items.push({ element: meta.data[nearestIdx], datasetIndex: dsIdx, index: nearestIdx });
+        }
+      });
+    }
+    return items;
+  };
+
+  const BUCKET_ENDPOINT = "https://s3.hippius.com/veggies";
+  const GH_COMMIT_BASE = "https://github.com/thenervelab/hippius-s3/commit/";
+  const ZONE_PALETTE = {
+    eu: { min: "#6B8DD6", avg: "#3167DD", max: "#1E3A8A", fill: "rgba(49, 103, 221, 0.14)" },
+    us: { min: "#F87171", avg: "#DC2626", max: "#7F1D1D", fill: "rgba(220, 38, 38, 0.14)" },
+  };
+  const ZONE_LABELS = {
+    eu: "eu-central-1.hippius.com",
+    us: "us-east-1.hippius.com",
+  };
+  const ROLE_ORDER = ["max", "avg", "min"];
+  const METRICS = [
+    { id: "chart-upload",        field: "upload_mb_s",                     unit: "MB/s", decimals: 1 },
+    { id: "chart-uncached",      field: "download_uncached_mb_s",          unit: "MB/s", decimals: 1 },
+    { id: "chart-cached",        field: "download_cached_mb_s",            unit: "MB/s", decimals: 1 },
+    { id: "chart-upload-lat",    field: "upload_seconds",                  unit: "s",    decimals: 2 },
+    { id: "chart-uncached-ttfb", field: "download_uncached_ttfb_seconds",  unit: "s",    decimals: 3 },
+    { id: "chart-cached-ttfb",   field: "download_cached_ttfb_seconds",    unit: "s",    decimals: 3 },
+    { id: "chart-runtime",       field: "total_runtime_seconds",           unit: "s",    decimals: 1, scalar: true },
+  ];
+
+  async function listResults() {
+    const res = await fetch(`${BUCKET_ENDPOINT}/?list-type=2&prefix=s3/`, { cache: "no-store" });
+    if (!res.ok) throw new Error(`list failed: ${res.status}`);
+    const xml = new DOMParser().parseFromString(await res.text(), "application/xml");
+    const keys = [];
+    for (const node of xml.getElementsByTagName("Key")) {
+      const k = node.textContent || "";
+      if (/^s3\/(eu|us)\/results\/benchmark_.+\.json$/.test(k)) keys.push(k);
+    }
+    return keys;
+  }
+
+  async function loadResult(key) {
+    const r = await fetch(`${BUCKET_ENDPOINT}/${key}`, { cache: "no-store" });
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (!j || !j.zone || !j.timestamp) return null;
+    return j;
+  }
+
+  function datasetsFor(metricField, results, scalar) {
+    const byZone = {};
+    for (const r of results) {
+      const v = r[metricField];
+      if (v === undefined || v === null) continue;
+      (byZone[r.zone] ||= []).push({ t: r.timestamp, s: v, sha: r.commit_sha || null });
+    }
+    const datasets = [];
+    for (const [zone, points] of Object.entries(byZone)) {
+      const palette = ZONE_PALETTE[zone] || ZONE_PALETTE.eu;
+      const label = ZONE_LABELS[zone] || zone.toUpperCase();
+      points.sort((a, b) => a.t.localeCompare(b.t));
+      const xs = points.map(p => p.t);
+      const shas = points.map(p => p.sha);
+      if (scalar) {
+        datasets.push({
+          label,
+          data: xs.map((t, i) => ({ x: t, y: points[i].s })),
+          borderColor: palette.avg, backgroundColor: palette.avg,
+          borderWidth: 2.5, pointRadius: 3, tension: 0.2, fill: false,
+          pointBackgroundColor: palette.avg, pointBorderColor: palette.avg,
+          pointStyle: "line",
+          zone, role: "avg", commitShas: shas, scalar: true,
+        });
+        continue;
+      }
+      datasets.push({
+        label: `${label} min`,
+        data: xs.map((t, i) => ({ x: t, y: points[i].s.min })),
+        borderColor: palette.min, backgroundColor: palette.min,
+        borderWidth: 0.75, pointRadius: 0, tension: 0.2, fill: false,
+        pointStyle: "line",
+        zone, role: "min",
+      });
+      datasets.push({
+        label: `${label} max`,
+        data: xs.map((t, i) => ({ x: t, y: points[i].s.max })),
+        borderColor: palette.max, backgroundColor: palette.fill,
+        borderWidth: 0.75, pointRadius: 0, tension: 0.2, fill: "-1",
+        pointStyle: "line",
+        zone, role: "max",
+      });
+      datasets.push({
+        label: `${label} avg`,
+        data: xs.map((t, i) => ({ x: t, y: points[i].s.avg })),
+        borderColor: palette.avg, backgroundColor: palette.avg,
+        borderWidth: 2.5, pointRadius: 3, tension: 0.2, fill: false,
+        pointBackgroundColor: palette.avg, pointBorderColor: palette.avg,
+        pointStyle: "line",
+        zone, role: "avg", commitShas: shas,
+      });
+    }
+    return datasets;
+  }
+
+  let tooltipHideTimer = null;
+  function ensureTooltipEl() {
+    let el = document.getElementById("cjs-tt");
+    if (el) return el;
+    el = document.createElement("div");
+    el.id = "cjs-tt";
+    el.className = "tt";
+    el.addEventListener("mouseenter", () => {
+      if (tooltipHideTimer) { clearTimeout(tooltipHideTimer); tooltipHideTimer = null; }
+    });
+    el.addEventListener("mouseleave", () => { el.style.opacity = 0; });
+    document.body.appendChild(el);
+    return el;
+  }
+
+  function externalTooltipHandler(unit, decimals) {
+    return function (context) {
+      const el = ensureTooltipEl();
+      const { tooltip, chart } = context;
+      if (tooltip.opacity === 0) {
+        if (tooltipHideTimer) clearTimeout(tooltipHideTimer);
+        tooltipHideTimer = setTimeout(() => { el.style.opacity = 0; }, 180);
+        return;
+      }
+      if (tooltipHideTimer) { clearTimeout(tooltipHideTimer); tooltipHideTimer = null; }
+
+      const title = (tooltip.title && tooltip.title[0]) || "";
+      const byZone = {};
+      for (const dp of tooltip.dataPoints) {
+        const ds = dp.dataset;
+        if (!ds.zone || !ds.role) continue;
+        (byZone[ds.zone] ||= {})[ds.role] = dp;
+      }
+
+      const zones = Object.keys(byZone);
+      let bodyHtml = "";
+      zones.forEach((zone, zoneIdx) => {
+        const group = byZone[zone];
+        const zoneLabel = ZONE_LABELS[zone] || zone;
+        let zoneSha = null;
+        for (const role of ROLE_ORDER) {
+          const dp = group[role];
+          if (!dp) continue;
+          const color = dp.dataset.borderColor;
+          const value = dp.parsed.y.toFixed(decimals);
+          if (role === "avg" && dp.dataset.commitShas) {
+            zoneSha = dp.dataset.commitShas[dp.dataIndex] || null;
+          }
+          const roleLabel = dp.dataset.scalar ? "" : ` ${role}`;
+          const faint = role === "avg" ? "" : " tt-faint";
+          bodyHtml += `<tr><td class="tt-bar-cell"><span class="tt-bar" style="background:${color}"></span></td><td class="tt-label${faint}">${zoneLabel}${roleLabel}</td><td class="tt-value${faint}">${value} ${unit}</td></tr>`;
+        }
+        if (zoneSha) {
+          const short = zoneSha.slice(0, 7);
+          const sepClass = zoneIdx === zones.length - 1 ? "tt-sep tt-sep-last" : "tt-sep";
+          bodyHtml += `<tr class="${sepClass}"><td colspan="3"><hr class="tt-hr"><a class="tt-sha" href="${GH_COMMIT_BASE}${zoneSha}" target="_blank" rel="noopener">@${short}</a></td></tr>`;
+        }
+      });
+      el.innerHTML = `<div class="tt-title">${title}</div><table class="tt-table">${bodyHtml}</table>`;
+
+      const canvasRect = chart.canvas.getBoundingClientRect();
+      el.style.left = (canvasRect.left + window.scrollX + tooltip.caretX) + "px";
+      el.style.top = (canvasRect.top + window.scrollY + tooltip.caretY) + "px";
+      el.style.opacity = 1;
+    };
+  }
+
+  function renderChart(canvasId, datasets, unit, decimals, scalar) {
+    const ctx = document.getElementById(canvasId);
+    if (!ctx) return;
+    if (datasets.length === 0) {
+      const parent = ctx.parentElement;
+      parent.innerHTML = '<div class="empty">No benchmark runs available yet.</div>';
+      return;
+    }
+    new Chart(ctx, {
+      type: "line",
+      data: { datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: "byZone", intersect: false, axis: "xy" },
+        plugins: {
+          legend: {
+            display: false,
+            labels: {
+              filter: (item) => scalar ? true : / avg$/.test(item.text),
+            },
+          },
+          htmlLegend: { containerID: `legend-${canvasId}` },
+          tooltip: {
+            enabled: false,
+            external: externalTooltipHandler(unit, decimals),
+            mode: "byZone",
+            intersect: false,
+            axis: "xy",
+          },
+        },
+        scales: {
+          x: {
+            type: "time",
+            time: {
+              tooltipFormat: "dd/MM/yy HH:mm 'UTC'",
+              minUnit: "minute",
+              displayFormats: {
+                minute: "dd/MM/yy HH:mm",
+                hour: "dd/MM/yy HH:mm",
+                day: "dd/MM/yy",
+                week: "dd/MM/yy",
+                month: "MM/yy",
+              },
+            },
+            ticks: {
+              source: "auto",
+              autoSkip: true,
+              autoSkipPadding: 24,
+              maxRotation: 45,
+              minRotation: 45,
+              color: "#71717A",
+              font: { size: 11 },
+            },
+            grid: { color: "rgba(0,0,0,0.05)" },
+          },
+          y: {
+            title: { display: true, text: unit, color: "#71717A", font: { size: 11 } },
+            beginAtZero: true,
+            ticks: { color: "#71717A", font: { size: 11 } },
+            grid: { color: "rgba(0,0,0,0.05)" },
+            afterFit: function (scale) { scale.width = 56; },
+          },
+        },
+      },
+    });
+  }
+
+  async function main() {
+    const keys = await listResults();
+    const results = (await Promise.all(keys.map(loadResult))).filter(Boolean);
+    for (const m of METRICS) {
+      renderChart(m.id, datasetsFor(m.field, results, m.scalar), m.unit, m.decimals, m.scalar);
+    }
+  }
+
+  main().catch(err => {
+    console.error(err);
+    for (const m of METRICS) {
+      const el = document.getElementById(m.id);
+      if (el) el.parentElement.innerHTML = `<div class="empty">Failed to load results: ${err.message}</div>`;
+    }
+  });
+})();
+</script>
+</body>
+</html>
