@@ -14,6 +14,7 @@ from gateway.middlewares.account import account_middleware
 from gateway.middlewares.acl import acl_middleware
 from gateway.middlewares.ats_purge import ats_purge_middleware
 from gateway.middlewares.audit_log import audit_log_middleware
+from gateway.middlewares.auth_probe import auth_probe_middleware
 from gateway.middlewares.auth_router import auth_router_middleware
 from gateway.middlewares.cache_control import cache_control_middleware
 from gateway.middlewares.cache_invalidation import cache_invalidation_middleware
@@ -196,6 +197,10 @@ def factory() -> FastAPI:
 
     # Starlette executes middleware last-registered-first (last = outermost).
     # The list below runs innermost → outermost on the request path.
+    # auth_probe short-circuits ATS authproxy subrequests with a 200 OK once
+    # auth_router + acl_middleware have validated; placing it innermost keeps
+    # ray_id / audit / metrics / tracing running on probe traffic.
+    app.middleware("http")(auth_probe_middleware)
     app.middleware("http")(ray_id_middleware)
     if config.enable_audit_logging:
         app.middleware("http")(audit_log_middleware)
