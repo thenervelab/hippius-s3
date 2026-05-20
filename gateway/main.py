@@ -14,6 +14,7 @@ from gateway.middlewares.account import account_middleware
 from gateway.middlewares.acl import acl_middleware
 from gateway.middlewares.ats_purge import ats_purge_middleware
 from gateway.middlewares.audit_log import audit_log_middleware
+from gateway.middlewares.auth_probe import auth_probe_middleware
 from gateway.middlewares.auth_router import auth_router_middleware
 from gateway.middlewares.cache_control import cache_control_middleware
 from gateway.middlewares.cache_invalidation import cache_invalidation_middleware
@@ -194,8 +195,19 @@ def factory() -> FastAPI:
         forward_service = request.app.state.forward_service
         return await forward_service.forward_request(request)
 
-    # Starlette executes middleware last-registered-first (last = outermost).
-    # The list below runs innermost → outermost on the request path.
+    # Starlette: last-registered = outermost. On the request path, outer
+    # middlewares run first; the handler runs last; the response unwinds back
+    # through them. The list below is ordered innermost → outermost, so
+    # auth_probe (first call) is the INNERMOST middleware and runs LAST on
+    # the request path — after auth_router + acl_middleware have already
+    # validated. A denied request is short-circuited by those with 401/403
+    # and never reaches the probe. Keeping the probe innermost also means
+    # ray_id / audit / metrics / tracing still execute on probe traffic.
+    #
+    # WARNING: do NOT move auth_probe_middleware later in this list. Doing so
+    # makes it OUTER to auth_router/acl, which would let unauthenticated
+    # callers short-circuit with 200 OK.
+    app.middleware("http")(auth_probe_middleware)
     app.middleware("http")(ray_id_middleware)
     if config.enable_audit_logging:
         app.middleware("http")(audit_log_middleware)

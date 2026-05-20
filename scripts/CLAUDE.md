@@ -10,6 +10,9 @@ Top-level ops scripts. Smaller in scope than [hippius_s3/scripts/](../hippius_s3
 | [deploy_smoke.py](deploy_smoke.py) | Post-deploy smoke-test harness invoked from CI. Exercises a small matrix of PUT/GET/LIST against the deploy target. |
 | [retryable-mpu.py](retryable-mpu.py) | Multipart upload retry helper for manual use when a client lost an MPU mid-flight. Notes in [retryable-mpu.md](../retryable-mpu.md) (or wherever the doc landed — check git log). |
 | [bench_multipart.py](bench_multipart.py) | Benchmark MPU throughput against a target endpoint. Not part of CI. |
+| [s3-benchmark.py](s3-benchmark.py) | Single-PUT throughput + TTFB benchmark for cached vs uncached downloads. Reads `HIPPIUS_BENCH_ZONE` from `.aws.cli.env`, picks the regional endpoint, and publishes a JSON datapoint (schema 3, with the latest `k8s-production` commit SHA) to `s3://veggies/s3/<zone>/results/`. |
+| [benchmark.html](benchmark.html) | Static dashboard for `s3-benchmark.py` results. Loaded anonymously from `s3://veggies/s3/benchmark.html`; lists JSONs from the same bucket and renders Chart.js time-series for EU vs US (3 throughput + 3 latency charts). |
+| [favicon.svg](favicon.svg) | Hippius logo SVG used by `benchmark.html` for the page favicon and inline header logo. |
 
 ## Invocation
 
