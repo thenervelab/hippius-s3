@@ -46,8 +46,13 @@ repos:
         # (released 2026-04-26). Same situation — pip-audit's hook env still resolves
         # 26.0.1 even though the project venv is on 26.1. Remove once the hook env
         # picks up 26.1.
+        # CVE-2026-45409 (idna), PYSEC-2026-141 / PYSEC-2026-142 (urllib3):
+        # pip-audit's own tool env carries idna 3.11 and urllib3 2.6.3. Our project
+        # venv is already on idna 3.15 and urllib3 2.7.0 (clean). The hook scans the
+        # tool's env, not ours, so the only way to unblock the hook is to ignore.
+        # Remove once `uv tool upgrade pip-audit` lands fixed deps in the tool env.
         name: pip-audit (dependency scan)
-        entry: pip-audit --ignore-vuln CVE-2024-23342 --ignore-vuln CVE-2026-4539 --ignore-vuln CVE-2026-25645 --ignore-vuln CVE-2026-3219 --ignore-vuln CVE-2026-6357
+        entry: pip-audit --ignore-vuln CVE-2024-23342 --ignore-vuln CVE-2026-4539 --ignore-vuln CVE-2026-25645 --ignore-vuln CVE-2026-3219 --ignore-vuln CVE-2026-6357 --ignore-vuln CVE-2026-45409 --ignore-vuln PYSEC-2026-141 --ignore-vuln PYSEC-2026-142
         language: system
         stages: [pre-commit]
         pass_filenames: false

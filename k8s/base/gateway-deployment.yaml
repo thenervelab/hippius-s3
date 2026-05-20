@@ -136,6 +136,11 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: ATS_CACHE_ENDPOINT
+            - name: HIPPIUS_AUTH_PROBE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_AUTH_PROBE_SECRET
           startupProbe:
             httpGet:
               path: /health

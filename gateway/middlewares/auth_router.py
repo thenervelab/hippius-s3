@@ -4,6 +4,7 @@ from typing import Callable
 from fastapi import Request
 from fastapi import Response
 
+from gateway.middlewares.auth_probe import is_valid_auth_probe
 from gateway.services.auth_orchestrator import authenticate_request
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 
@@ -27,6 +28,14 @@ async def auth_router_middleware(
 
     path = request.url.path
     if any(path.startswith(exempt_path) or path == exempt_path for exempt_path in exempt_paths):
+        return await call_next(request)
+
+    # PURGE from the gateway → ATS bounces back here via authproxy. There is
+    # no Authorization header on internal PURGE traffic; the probe secret is
+    # the trust boundary (same defense-in-depth as auth_probe_middleware uses
+    # for cached reads). Without this bypass, auth_router would 403 every
+    # PURGE and ats_purge_middleware's invalidation-on-write would break.
+    if request.method == "PURGE" and is_valid_auth_probe(request):
         return await call_next(request)
 
     auth_result = await authenticate_request(request)
