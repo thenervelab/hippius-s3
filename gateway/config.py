@@ -143,7 +143,11 @@ class GatewayConfig:
     # rule on the auth-host remap. The gateway short-circuits with 200 OK when the
     # header value matches (constant-time compare). Empty value disables the feature
     # entirely — auth_probe_middleware becomes a pass-through. Required for prod use.
-    auth_probe_secret: str = dataclasses.field(default_factory=lambda: os.getenv("HIPPIUS_AUTH_PROBE_SECRET", ""))
+    # repr=False so a stray `str(config)` / `print(config)` doesn't leak the secret.
+    auth_probe_secret: str = dataclasses.field(
+        default_factory=lambda: os.getenv("HIPPIUS_AUTH_PROBE_SECRET", ""),
+        repr=False,
+    )
 
 
 _config: GatewayConfig | None = None
