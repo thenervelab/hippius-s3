@@ -10,7 +10,25 @@ from fastapi import Response
 from gateway.config import get_config
 
 
+__all__ = ["AUTH_PROBE_HEADER", "auth_probe_middleware", "is_valid_auth_probe"]
+
+
 AUTH_PROBE_HEADER = "x-hippius-auth-probe"
+
+
+def is_valid_auth_probe(request: Request) -> bool:
+    """Constant-time compare X-Hippius-Auth-Probe header against the configured
+    secret. Returns False when the secret is unset (fail-closed) or the header
+    is missing/wrong. Used by auth_probe_middleware (innermost short-circuit)
+    AND by auth_router + acl to early-exempt PURGE traffic that ATS bounces
+    back via authproxy."""
+    secret = get_config().auth_probe_secret
+    if not secret:
+        return False
+    provided = request.headers.get(AUTH_PROBE_HEADER, "")
+    if not provided:
+        return False
+    return hmac.compare_digest(provided, secret)
 
 
 async def auth_probe_middleware(
@@ -34,15 +52,12 @@ async def auth_probe_middleware(
     #
     # Registered as the innermost middleware so observability (ray_id, audit,
     # metrics, tracing) still runs for probe requests.
-    secret = get_config().auth_probe_secret
-    if secret:
-        provided = request.headers.get(AUTH_PROBE_HEADER, "")
-        if provided and hmac.compare_digest(provided, secret):
-            # Flag for outer middlewares (cache_control, etc.) on the response
-            # path so they can skip mutating a probe response. Set BEFORE
-            # returning so the state is visible to every middleware as the
-            # response bubbles out.
-            request.state.is_auth_probe = True
-            return Response(status_code=200, content=b"")
+    if is_valid_auth_probe(request):
+        # Flag for outer middlewares (cache_control, etc.) on the response
+        # path so they can skip mutating a probe response. Set BEFORE
+        # returning so the state is visible to every middleware as the
+        # response bubbles out.
+        request.state.is_auth_probe = True
+        return Response(status_code=200, content=b"")
 
     return await call_next(request)
