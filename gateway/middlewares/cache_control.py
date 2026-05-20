@@ -6,6 +6,7 @@ from typing import Callable
 from fastapi import Request
 from fastapi import Response
 
+from gateway.config import get_config
 from gateway.middlewares.acl import parse_s3_path
 
 
@@ -69,12 +70,13 @@ async def cache_control_middleware(
     anonymous_read_allowed = getattr(request.state, "anonymous_read_allowed", False)
 
     if not anonymous_read_allowed:
-        if bucket_is_cache_warm:
-            # Warm-private: emit cache-friendly directives so ATS stores the
-            # response for 30d, plus a sentinel that triggers ATS header_rewrite
-            # to demote Cache-Control to "private, no-store" on egress to the
-            # real client. Per-request authorization is enforced by ATS
-            # authproxy subrequests carrying X-Hippius-Auth-Probe.
+        # Warm-private only makes sense with ATS in front: the cache-friendly
+        # Cache-Control + X-Hippius-Visibility sentinel pair relies on ATS
+        # header_rewrite to demote the response to "private, no-store" on
+        # egress. With no ATS configured, the sentinel is meaningless and
+        # `public, max-age=30d` would leak straight to browsers, letting them
+        # cache and serve private bodies. Fall back to PRIVATE_CACHE_CONTROL.
+        if bucket_is_cache_warm and get_config().ats_cache_endpoints:
             response.headers["Cache-Control"] = WARM_PUBLIC_CACHE_CONTROL
             response.headers[VISIBILITY_HEADER] = "private"
             return response
