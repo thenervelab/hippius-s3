@@ -26,6 +26,7 @@ from hippius_s3 import dependencies
 from hippius_s3 import utils
 from hippius_s3.api.s3.common import format_s3_timestamp
 from hippius_s3.api.s3.errors import s3_error_response
+from hippius_s3.api.s3.object_lock_guard import maybe_object_lock_not_implemented_response
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.monitoring import get_metrics_collector
@@ -75,6 +76,9 @@ async def handle_post_object(
     1. InitiateMultipartUpload (if ?uploads is in query params)
     2. CompleteMultipartUpload (if ?uploadId=X is in query params)
     """
+    object_lock_response = maybe_object_lock_not_implemented_response(request)
+    if object_lock_response is not None:
+        return object_lock_response
     logger.info(f"[POST] {bucket_name}/{object_key} - {dict(request.query_params)}")
 
     # Check for uploads parameter (Initiate Multipart Upload)

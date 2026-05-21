@@ -21,6 +21,7 @@ from hippius_s3.api.s3.buckets.bucket_tagging_endpoint import get_bucket_tags as
 from hippius_s3.api.s3.buckets.delete_objects_endpoint import handle_delete_objects
 from hippius_s3.api.s3.buckets.list_buckets_endpoint import handle_list_buckets
 from hippius_s3.api.s3.buckets.list_objects_endpoint import handle_list_objects
+from hippius_s3.api.s3.object_lock_guard import maybe_object_lock_not_implemented_response
 from hippius_s3.dependencies import RequestContext
 from hippius_s3.dependencies import get_request_context
 
@@ -43,6 +44,9 @@ async def get_bucket(
     request: Request,
     pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
 ) -> Response:
+    object_lock_response = maybe_object_lock_not_implemented_response(request)
+    if object_lock_response is not None:
+        return object_lock_response
     if "location" in request.query_params:
         return await handle_get_bucket_location(bucket_name)
     if "tagging" in request.query_params:
@@ -80,6 +84,9 @@ async def create_or_modify_bucket(
     request: Request,
     pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
 ) -> Response:
+    object_lock_response = maybe_object_lock_not_implemented_response(request)
+    if object_lock_response is not None:
+        return object_lock_response
     # Delegate to the new comprehensive handler (supports create/tagging/lifecycle/policy)
     async with pool.acquire() as conn:
         return await handle_create_bucket(bucket_name, request, conn)
