@@ -27,6 +27,7 @@ from hippius_s3.api.s3.buckets.delete_objects_endpoint import handle_delete_obje
 from hippius_s3.api.s3.buckets.list_buckets_endpoint import handle_list_buckets
 from hippius_s3.api.s3.buckets.list_object_versions_endpoint import handle_list_object_versions
 from hippius_s3.api.s3.buckets.list_objects_endpoint import handle_list_objects
+from hippius_s3.api.s3.object_lock_guard import maybe_object_lock_not_implemented_response
 from hippius_s3.dependencies import RequestContext
 from hippius_s3.dependencies import get_request_context
 
@@ -49,6 +50,9 @@ async def get_bucket(
     request: Request,
     pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
 ) -> Response:
+    object_lock_response = maybe_object_lock_not_implemented_response(request)
+    if object_lock_response is not None:
+        return object_lock_response
     if "acl" in request.query_params:
         return await get_bucket_acl(bucket_name, request)
     if "location" in request.query_params:
@@ -103,6 +107,9 @@ async def create_or_modify_bucket(
     request: Request,
     pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
 ) -> Response:
+    object_lock_response = maybe_object_lock_not_implemented_response(request)
+    if object_lock_response is not None:
+        return object_lock_response
     if "acl" in request.query_params:
         return await put_bucket_acl(bucket_name, request)
     # Must precede handle_create_bucket: without this branch ?versioning fell through to the
