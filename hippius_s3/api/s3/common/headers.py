@@ -1,6 +1,53 @@
 from __future__ import annotations
 
 import json
+from typing import Protocol
+
+from starlette.datastructures import QueryParams
+
+
+class _HeadersLike(Protocol):
+    def __setitem__(self, key: str, value: str, /) -> None: ...
+
+
+RESPONSE_OVERRIDE_PARAMS: dict[str, str] = {
+    "response-content-type": "Content-Type",
+    "response-content-disposition": "Content-Disposition",
+    "response-content-encoding": "Content-Encoding",
+    "response-content-language": "Content-Language",
+    "response-cache-control": "Cache-Control",
+    "response-expires": "Expires",
+}
+
+MAX_OVERRIDE_VALUE_LEN = 4096
+
+
+def parse_response_overrides(query_params: QueryParams, *, is_anonymous: bool) -> dict[str, str]:
+    """Parse the six S3 response-header override query params.
+
+    Returns a mapping of {Response-Header-Name: value}. Empty for anonymous requests
+    (per S3 spec, overrides only apply to signed requests).
+    Raises ValueError on CRLF or oversize values to prevent header injection.
+    """
+    if is_anonymous:
+        return {}
+    out: dict[str, str] = {}
+    for qparam, header_name in RESPONSE_OVERRIDE_PARAMS.items():
+        if qparam not in query_params:
+            continue
+        value = query_params[qparam]
+        if len(value) > MAX_OVERRIDE_VALUE_LEN:
+            raise ValueError(f"{qparam} value exceeds {MAX_OVERRIDE_VALUE_LEN} bytes")
+        if "\r" in value or "\n" in value:
+            raise ValueError(f"{qparam} contains forbidden CRLF")
+        out[header_name] = value
+    return out
+
+
+def apply_response_overrides(headers: _HeadersLike, overrides: dict[str, str]) -> None:
+    """Overwrite the given headers mapping with parsed response-header overrides."""
+    for name, value in overrides.items():
+        headers[name] = value
 
 
 def if_none_match_matches(header_value: str | None, md5_hash: str) -> bool:

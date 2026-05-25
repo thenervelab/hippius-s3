@@ -26,7 +26,11 @@ def app() -> Any:
         # Simulate acl_middleware wiring
         request.state.anonymous_read_allowed = request.headers.get("x-test-anon-read") == "true"
         request.state.bucket_is_cache_warm = request.headers.get("x-test-warm") == "true"
-        return Response(status_code=status, content=b"ok")
+        # Simulate auth_router wiring
+        request.state.auth_method = request.headers.get("x-test-auth-method", "anonymous")
+        upstream_cc = request.headers.get("x-test-upstream-cc")
+        headers = {"Cache-Control": upstream_cc} if upstream_cc else None
+        return Response(status_code=status, content=b"ok", headers=headers)
 
     return app
 
@@ -153,6 +157,42 @@ async def test_warm_flag_ignored_when_not_anon_readable(app: Any) -> None:
         r = await client.get(
             "/warm-but-private/foo.txt",
             headers={"x-test-warm": "true"},  # warm=true but no anon-read
+        )
+    assert r.headers["Cache-Control"] == PRIVATE_CACHE_CONTROL
+
+
+@pytest.mark.asyncio
+async def test_signed_response_cache_control_override_preserved(app: Any) -> None:
+    """A signed request with ?response-cache-control= must keep upstream Cache-Control."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.get(
+            "/private-bucket/foo.txt?response-cache-control=no-cache%2C%20max-age%3D0",
+            headers={
+                "x-test-auth-method": "access_key",
+                "x-test-upstream-cc": "no-cache, max-age=0",
+            },
+        )
+    assert r.headers["Cache-Control"] == "no-cache, max-age=0"
+
+
+@pytest.mark.asyncio
+async def test_anonymous_cannot_smuggle_response_cache_control(app: Any) -> None:
+    """An anonymous request carrying ?response-cache-control= must be ignored."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.get(
+            "/private-bucket/foo.txt?response-cache-control=public%2C%20max-age%3D999999",
+            headers={"x-test-upstream-cc": "public, max-age=999999"},
+        )
+    assert r.headers["Cache-Control"] == PRIVATE_CACHE_CONTROL
+
+
+@pytest.mark.asyncio
+async def test_signed_request_without_override_uses_default_policy(app: Any) -> None:
+    """A signed request that does NOT carry response-cache-control still gets the gateway's policy."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.get(
+            "/private-bucket/foo.txt",
+            headers={"x-test-auth-method": "access_key"},
         )
     assert r.headers["Cache-Control"] == PRIVATE_CACHE_CONTROL
 
