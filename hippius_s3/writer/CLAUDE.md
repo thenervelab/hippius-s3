@@ -96,4 +96,21 @@ The `parts.chunk_size_bytes` column is per-part; simple PUT uses `config.object_
 | #2431 | 10:57 PM | 🔵 | upsert_object_basic wrapper executes upsert_object_basic.sql query | ~307 |
 | #2429 | 10:56 PM | 🔵 | put_simple_stream_full reserves version via upsert_object_basic | ~319 |
 | #2424 | 10:55 PM | 🔵 | ObjectWriter updates object_versions table after multipart completion | ~308 |
+
+### Apr 23, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #6965 | 2:08 PM | 🔵 | Code reuse analysis identifies test fixture duplication and typing improvements | ~864 |
+| #6953 | 1:31 PM | 🔵 | PR #150 security review identifies P1 transaction atomicity bug in append_stream | ~859 |
+| #6929 | 12:58 PM | 🔴 | Fixed append_stream to use transaction connection instead of pool | ~412 |
+| #6926 | 12:57 PM | 🔄 | Migrated ObjectWriter._ensure_and_get_v5_dek to scoped connection with explicit pool acquisition | ~535 |
+| #6925 | " | ✅ | Migrated mpu_complete transaction to scoped connection acquisition pattern | ~507 |
+
+### May 21, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #8177 | 6:24 PM | 🔵 | Comprehensive latency analysis identifies KMS cold-path as primary bottleneck | ~567 |
+| #8176 | 6:23 PM | 🔵 | Mapped PUT request critical path with 6-8 database roundtrips | ~398 |
 </claude-mem-context>

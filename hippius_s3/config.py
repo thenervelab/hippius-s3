@@ -119,6 +119,9 @@ class Config:
     db_pool_max_queries: int = env("API_DB_POOL_MAX_QUERIES:50000", convert=int)
     db_pool_max_inactive_lifetime: int = env("API_DB_POOL_MAX_INACTIVE_LIFETIME:300", convert=int)
     db_pool_command_timeout: int = env("API_DB_POOL_COMMAND_TIMEOUT:30", convert=int)
+    # Bounded wait for a free pooled connection. asyncpg blocks indefinitely by default;
+    # a timeout lets the hot path fail fast with a retryable 503 instead of hanging under contention.
+    db_pool_acquire_timeout: float = env("API_DB_POOL_ACQUIRE_TIMEOUT:5.0", convert=float)
 
     # API signing key for pre-signed URLs
     # Generated on first run if not provided

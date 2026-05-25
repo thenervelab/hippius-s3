@@ -65,4 +65,11 @@ Long-running migrations use `/tmp/migration_progress.txt` (or similar) as a resu
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
 | #422 | 2:57 PM | 🔵 | Migration Script Uses asyncpg Library for PostgreSQL Connections | ~394 |
+
+### Apr 23, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #6960 | 2:03 PM | 🔴 | Additional handlers migrated to pool-based pattern in follow-up commit | ~680 |
+| #6944 | 1:02 PM | 🔄 | Updated migrate_objects script to use pool parameter name for ObjectWriter | ~383 |
 </claude-mem-context>
