@@ -10,7 +10,7 @@ def test_timeout_maps_to_503_slowdown() -> None:
     resp = pool_saturation_response(asyncio.TimeoutError())
     assert resp is not None
     assert resp.status_code == 503
-    assert resp.headers.get("Retry-After") == "1"
+    assert resp.headers.get("Retry-After") == "3"
     assert resp.headers.get("x-amz-error-code") == "SlowDown"
     assert b"SlowDown" in bytes(resp.body)
 
@@ -19,7 +19,7 @@ def test_too_many_connections_maps_to_503() -> None:
     resp = pool_saturation_response(asyncpg.TooManyConnectionsError("too many"))
     assert resp is not None
     assert resp.status_code == 503
-    assert resp.headers.get("Retry-After") == "1"
+    assert resp.headers.get("Retry-After") == "3"
 
 
 @pytest.mark.parametrize("exc", [ValueError("x"), RuntimeError("y"), KeyError("z")])
