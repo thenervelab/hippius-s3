@@ -2,8 +2,11 @@
 
 import uuid
 
+import asyncpg
 from fastapi import Response
 from lxml import etree as ET  # ty: ignore[unresolved-import]
+
+from hippius_s3.db_pool import PoolAcquireTimeout
 
 
 class S3Error(Exception):
@@ -94,3 +97,22 @@ def s3_error_response(
         headers.update({k: str(v) for k, v in extra_headers.items()})
 
     return Response(content=xml_content, media_type="application/xml", status_code=status_code, headers=headers)
+
+
+def pool_saturation_response(exc: BaseException) -> Response | None:
+    """Map a DB connection-pool acquire failure to a retryable 503 SlowDown.
+
+    Matches only the dedicated ``PoolAcquireTimeout`` (raised by ``db_pool.acquire_with_timeout``
+    when the acquire itself times out) and server-side ``TooManyConnectionsError``. It deliberately
+    does NOT match a bare ``asyncio.TimeoutError``: asyncpg raises that for per-statement
+    ``command_timeout``s too, so matching the type would relabel a slow/lock-blocked query as
+    transient pool saturation and prompt a retry into the same contention. Returns ``None`` otherwise.
+    """
+    if isinstance(exc, (PoolAcquireTimeout, asyncpg.TooManyConnectionsError)):
+        return s3_error_response(
+            code="SlowDown",
+            message="Server busy. Please retry.",
+            status_code=503,
+            extra_headers={"Retry-After": "3"},
+        )
+    return None
