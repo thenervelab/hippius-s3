@@ -19,6 +19,7 @@ from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.cache import create_fs_store
 from hippius_s3.config import get_config
+from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.storage_version import require_supported_storage_version
@@ -224,7 +225,7 @@ class ObjectWriter:
                 "has_object_id": True,
             },
         ):
-            async with self.pool.acquire(timeout=self.config.db_pool_acquire_timeout) as conn, conn.transaction():
+            async with acquire_with_timeout(self.pool, self.config.db_pool_acquire_timeout) as conn, conn.transaction():
                 reserve_row = await upsert_object_basic(
                     conn,
                     object_id=object_id,
@@ -447,7 +448,7 @@ class ObjectWriter:
                 "storage_version": resolved_storage_version,
             },
         ):
-            async with self.pool.acquire(timeout=self.config.db_pool_acquire_timeout) as conn, conn.transaction():
+            async with acquire_with_timeout(self.pool, self.config.db_pool_acquire_timeout) as conn, conn.transaction():
                 # Until this UPDATE sets non-empty size/md5 the version is invisible to downloads.
                 await conn.execute(
                     get_query("update_object_version_metadata"),
@@ -482,14 +483,10 @@ class ObjectWriter:
                     object_version=int(object_version),
                     chunk_cipher_sizes=chunk_cipher_sizes,
                 )
-
-                # Mark upload completed so a DELETE doesn't CASCADE the chunk_backend rows before
-                # the uploader worker has run. Folded into this tail transaction (previously the
-                # PUT endpoint issued it after enqueue) so all final writes commit atomically.
-                await conn.execute(
-                    "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
-                    str(upload_id),
-                )
+                # NOTE: `multipart_uploads.is_completed = TRUE` is intentionally NOT set here.
+                # It must be set only AFTER the upload is enqueued (the endpoint does it), so that
+                # if the enqueue fails the row stays is_completed=FALSE and remains eligible for the
+                # DELETE cascade cleanup instead of becoming an un-uploadable, un-evictable orphan.
         perf_post_ms = (time.monotonic() - perf_post_start) * 1000
 
         throughput_mbps = (
