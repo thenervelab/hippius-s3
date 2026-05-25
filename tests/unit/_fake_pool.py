@@ -108,18 +108,16 @@ class FakePool:
         self._rec.events.append({"method": "fetchval", "conn": "pool", "query": query, "in_txn": False, "args": args})
         return self._router("fetchval", query, args)
 
-    # --- scoped acquire ---
-    def acquire(self, *, timeout: float | None = None) -> Any:
+    # --- scoped acquire (asyncpg: `conn = await pool.acquire(timeout=...)`, `await pool.release(conn)`) ---
+    async def acquire(self, *, timeout: float | None = None) -> Any:  # noqa: ASYNC109 (mirrors asyncpg pool.acquire)
         self._rec.acquire_count += 1
         self._next_id += 1
         conn = FakeConn(self._rec, self._next_id, self._router)
         self._rec.events.append({"method": "acquire", "conn": conn.conn_id, "timeout": timeout})
+        return conn
 
-        @asynccontextmanager
-        async def _cm() -> Any:
-            yield conn
-
-        return _cm()
+    async def release(self, conn: Any) -> None:
+        self._rec.events.append({"method": "release", "conn": getattr(conn, "conn_id", None)})
 
 
 def make_fake_pool(router: Optional[Router] = None) -> FakePool:
