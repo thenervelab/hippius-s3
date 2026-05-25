@@ -5,6 +5,7 @@ from fastapi import Request
 from fastapi import Response
 
 from gateway.config import get_config
+from gateway.middlewares.auth_probe import is_valid_auth_probe
 from gateway.services.sub_token_scope import OP_LIST_BUCKETS
 from gateway.services.sub_token_scope import OP_READ_OBJECT
 from gateway.services.sub_token_scope import bucket_in_scope
@@ -118,6 +119,13 @@ async def acl_middleware(
         return await call_next(request)
 
     if request.method == "OPTIONS":
+        return await call_next(request)
+
+    # PURGE from gateway → ATS authproxy → here. The probe secret is the
+    # trust boundary. acl can't compute a required permission for PURGE
+    # anyway (get_required_permission raises). Skip; auth_probe (innermost)
+    # returns 200 so ATS proceeds with the actual cache invalidation.
+    if request.method == "PURGE" and is_valid_auth_probe(request):
         return await call_next(request)
 
     bucket, key = parse_s3_path(path)
