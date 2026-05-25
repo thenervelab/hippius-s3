@@ -16,6 +16,7 @@ from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.extensions.append import handle_append
 from hippius_s3.config import get_config
+from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.utils import get_query
 from hippius_s3.writer.object_writer import ObjectWriter
@@ -40,7 +41,7 @@ async def handle_put_object(
         # across the append branch below, so handle_append acquires its own connections.
         main_account_id = request.state.account.main_account
 
-        async with pool.acquire(timeout=config.db_pool_acquire_timeout) as conn:
+        async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
             with tracer.start_as_current_span(
                 "put_object.get_or_create_user", attributes={"hippius.account.main": main_account_id}
             ):
@@ -99,7 +100,7 @@ async def handle_put_object(
 
         # Capture previous object (to clean up multipart parts if overwriting)
         with tracer.start_as_current_span("put_object.check_existing_object") as span:
-            async with pool.acquire(timeout=config.db_pool_acquire_timeout) as conn:
+            async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
                 prev = await conn.fetchrow(
                     get_query("get_object_by_path"),
                     bucket_id,
@@ -175,9 +176,14 @@ async def handle_put_object(
                 ray_id=getattr(request.state, "ray_id", "no-ray-id"),
             )
 
-        # `multipart_uploads.is_completed = TRUE` is now set inside the writer's tail
-        # transaction (put_simple_stream_full) so it commits atomically with the final
-        # metadata/part writes — it must already be TRUE by the time we enqueue here.
+        # Mark upload completed only AFTER a successful enqueue. If enqueue fails above, this is
+        # skipped so the row stays is_completed=FALSE and remains eligible for the DELETE cascade
+        # cleanup, rather than becoming a durably-"complete" object that was never queued for upload.
+        async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
+            await conn.execute(
+                "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
+                str(put_res.upload_id),
+            )
 
         get_metrics_collector().record_s3_operation(
             operation="put_object",
@@ -204,6 +210,12 @@ async def handle_put_object(
         )
 
     except Exception as e:
+        # DB connection-pool saturation (acquire timeout / too-many-connections) is retryable:
+        # return 503 SlowDown, not a 500. This catch-all would otherwise mask it before the
+        # global handler in main.py can map it.
+        pool_busy = errors.pool_saturation_response(e)
+        if pool_busy is not None:
+            return pool_busy
         logger.exception(f"Error uploading object: {e}")
         get_metrics_collector().record_error(
             error_type="internal_error",
