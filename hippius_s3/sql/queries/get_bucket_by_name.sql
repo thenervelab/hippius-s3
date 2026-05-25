@@ -6,6 +6,7 @@ SELECT
     b.created_at,
     ba.acl_json,
     b.tags,
+    b.object_lock,
     b.main_account_id,
     b.versioning_status
 FROM buckets b

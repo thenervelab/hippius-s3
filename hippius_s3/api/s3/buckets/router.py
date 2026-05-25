@@ -18,6 +18,8 @@ from hippius_s3.api.s3.buckets.bucket_delete_endpoint import handle_delete_bucke
 from hippius_s3.api.s3.buckets.bucket_head_endpoint import handle_head_bucket
 from hippius_s3.api.s3.buckets.bucket_lifecycle_endpoint import handle_get_bucket_lifecycle
 from hippius_s3.api.s3.buckets.bucket_location_endpoint import handle_get_bucket_location
+from hippius_s3.api.s3.buckets.bucket_object_lock_endpoint import handle_get_bucket_object_lock
+from hippius_s3.api.s3.buckets.bucket_object_lock_endpoint import handle_put_bucket_object_lock
 from hippius_s3.api.s3.buckets.bucket_policy_endpoint import get_bucket_policy as policy_get_bucket_policy
 from hippius_s3.api.s3.buckets.bucket_tagging_endpoint import delete_bucket_tags as tags_delete_bucket_tags
 from hippius_s3.api.s3.buckets.bucket_tagging_endpoint import get_bucket_tags as tags_get_bucket_tags
@@ -53,6 +55,9 @@ async def get_bucket(
     object_lock_response = maybe_object_lock_not_implemented_response(request)
     if object_lock_response is not None:
         return object_lock_response
+    if "object-lock" in request.query_params:
+        async with pool.acquire() as conn:
+            return await handle_get_bucket_object_lock(bucket_name, conn, request.state.account.main_account)
     if "acl" in request.query_params:
         return await get_bucket_acl(bucket_name, request)
     if "location" in request.query_params:
@@ -110,6 +115,9 @@ async def create_or_modify_bucket(
     object_lock_response = maybe_object_lock_not_implemented_response(request)
     if object_lock_response is not None:
         return object_lock_response
+    if "object-lock" in request.query_params:
+        async with pool.acquire() as conn:
+            return await handle_put_bucket_object_lock(bucket_name, request, conn)
     if "acl" in request.query_params:
         return await put_bucket_acl(bucket_name, request)
     # Must precede handle_create_bucket: without this branch ?versioning fell through to the
