@@ -204,6 +204,12 @@ async def handle_put_object(
         )
 
     except Exception as e:
+        # DB connection-pool saturation (acquire timeout / too-many-connections) is retryable:
+        # return 503 SlowDown, not a 500. This catch-all would otherwise mask it before the
+        # global handler in main.py can map it.
+        pool_busy = errors.pool_saturation_response(e)
+        if pool_busy is not None:
+            return pool_busy
         logger.exception(f"Error uploading object: {e}")
         get_metrics_collector().record_error(
             error_type="internal_error",
