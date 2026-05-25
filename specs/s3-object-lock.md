@@ -1,8 +1,9 @@
 # Spec: S3 Object Lock
 
-Status: Tier 0 implemented. Tier 1 and Tier 2 are designed and have contract tests, but
-no implementation yet. Drives compatibility with `aws s3api put-object-lock-configuration`
-and the surrounding Object Lock APIs from the AWS S3 surface.
+Status: Tier 0 and Tier 1 implemented. Tier 2 is designed and has contract tests
+(`xfail`), but no implementation yet. Drives compatibility with
+`aws s3api put-object-lock-configuration` and the surrounding Object Lock APIs from the
+AWS S3 surface.
 
 ---
 
@@ -125,25 +126,48 @@ Error code: `NotImplemented`. Status: `501`. Message points the reader at this s
 
 Risk: zero — only error-path changes.
 
-### Tier 1 — persist & echo (future PR)
+### Tier 1 — persist & echo (IMPLEMENTED)
 
 Goal: round-trip the configuration so backup tools that probe for Object Lock support
 get a believable answer. Still no DELETE/PUT enforcement.
 
-Changes (sketch — full design done when this tier is picked up):
+What shipped:
 
-- New migration: `ALTER TABLE buckets ADD COLUMN object_lock JSONB` (one nullable column
-  storing `{"enabled": true, "mode": "GOVERNANCE", "days": 30}` or `null`).
-- New endpoint file `bucket_object_lock_endpoint.py` modelled on
-  `bucket_tagging_endpoint.py` — parse the request XML with `lxml` using the same
-  namespace-aware XPath idiom, validate `Mode`, `Days XOR Years`, etc., write to
-  `buckets.object_lock`, return 200. GET serialises back to `<ObjectLockConfiguration>`.
-- Wire into `buckets/router.py` GET (around line 46) and PUT (delegate from
-  `handle_create_bucket` like lifecycle does).
-- Honour `x-amz-bucket-object-lock-enabled-for-bucket: true` on `CreateBucket` to
-  pre-set the column.
+- Migration `20260521000000_add_buckets_object_lock.sql`: `ALTER TABLE buckets ADD COLUMN
+  object_lock JSONB`. Nullable; stores `{"enabled": true}` or
+  `{"enabled": true, "mode": "GOVERNANCE", "days": 30}` (or `"years": N`), or `NULL` when
+  never configured.
+- `hippius_s3/api/s3/buckets/bucket_object_lock_endpoint.py` — `handle_get_bucket_object_lock`
+  and `handle_put_bucket_object_lock`. PUT parses the `ObjectLockConfiguration` XML
+  (namespace-tolerant), validates `ObjectLockEnabled == Enabled`, `Mode ∈ {GOVERNANCE,
+  COMPLIANCE}`, exactly one of `Days`/`Years`, and a positive period; writes the
+  normalised dict via `update_bucket_object_lock.sql`. GET serialises the stored config
+  back to XML, or returns 404 `ObjectLockConfigurationNotFoundError` when the column is
+  NULL or `enabled` is falsy.
+- `buckets/router.py` routes GET/PUT `?object-lock` to the new endpoint.
+- `bucket_create_endpoint.py` honours `x-amz-bucket-object-lock-enabled: true` and writes
+  `{"enabled": true}` transactionally at creation time. (Wire header — boto3's
+  `ObjectLockEnabledForBucket=True` maps to it.)
+- The guard (`object_lock_guard.py`) no longer trips on `?object-lock` or
+  `x-amz-bucket-object-lock-enabled`; it still 501s the Tier 2 per-object surface.
+- The two bucket-lookup queries (`get_bucket_by_name`, `get_bucket_by_name_and_owner`)
+  now SELECT the `object_lock` column.
 
-Risk: low. No write-path or encryption changes. Reuses the tagging pattern verbatim.
+Storage schema in `buckets.object_lock` JSONB:
+
+```
+{"enabled": true}                                  # born with x-amz-bucket-object-lock-enabled
+{"enabled": true, "mode": "GOVERNANCE", "days": 30}
+{"enabled": true, "mode": "COMPLIANCE", "years": 1}
+null                                               # never configured
+```
+
+Risk: low. No write-path or encryption changes; reuses the tagging pattern.
+
+Tier 1 simplifications vs AWS (documented, acceptable for the backup-probe use case):
+- The `x-amz-bucket-object-lock-token` enablement gate is not enforced — a `PUT
+  ?object-lock` succeeds on any bucket, not only those born lock-enabled.
+- No versioning prerequisite is enforced (that lands in Tier 2).
 
 ### Tier 2 — real WORM enforcement (future epic)
 
@@ -181,10 +205,15 @@ Rough effort: 2–4 engineering weeks, tightly coupled to a versioning effort.
 
 ## Test inventory
 
-All tests live in this PR. Tier 0 must pass; Tier 1 and Tier 2 are
-`@pytest.mark.xfail(strict=False, reason="…tier N… see specs/s3-object-lock.md")`.
+Tier 0 and Tier 1 tests must pass. Tier 2 tests are
+`@pytest.mark.xfail(strict=False, reason="…tier 2… see specs/s3-object-lock.md")`.
 The `strict=False` form lets the CI build stay green; an unexpected pass is informative
 but not blocking.
+
+Tier 0 / Tier 1 live in `tests/e2e/test_BucketObjectLock.py` (bucket surface),
+`tests/e2e/test_ObjectRetention.py` and `tests/e2e/test_ObjectLegalHold.py` (per-object
+surface still 501), and `tests/unit/api/s3/test_object_lock_guard.py` (guard unit
+tests).
 
 ### Tier 0 — must pass
 

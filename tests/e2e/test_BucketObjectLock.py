@@ -1,8 +1,9 @@
 """E2E tests for S3 Object Lock — bucket-level configuration.
 
 Covers:
-- Tier 0 (must pass): every bucket-level Object Lock entry point returns 501 NotImplemented.
-- Tier 1 (xfail strict=False): round-trip persistence, validation, CreateBucket header.
+- Tier 0 (must pass): per-object Object Lock surface still returns 501 NotImplemented.
+- Tier 1 (must pass): bucket-level configuration round-trips through Postgres and the
+  CreateBucket lock-enabled header is honoured.
 
 See specs/s3-object-lock.md for the full surface and tier definitions.
 """
@@ -17,9 +18,6 @@ from botocore.awsrequest import AWSRequest  # type: ignore[import-untyped]
 from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
 
-TIER1_REASON = "Tier 1 — bucket Object Lock persistence not implemented; see specs/s3-object-lock.md"
-
-
 def _error(exc: ClientError) -> tuple[int, str]:
     """Extract (status_code, error_code) from a botocore ClientError."""
     meta = exc.response.get("ResponseMetadata", {})
@@ -29,98 +27,8 @@ def _error(exc: ClientError) -> tuple[int, str]:
 
 
 # ---------------------------------------------------------------------------
-# Tier 0 — must pass after implementation lands
+# Tier 0 — must still pass: per-object surface remains unimplemented
 # ---------------------------------------------------------------------------
-
-
-def test_put_object_lock_configuration_returns_not_implemented(
-    docker_services: Any,
-    boto3_client: Any,
-    unique_bucket_name: Callable[[str], str],
-    cleanup_buckets: Callable[[str], None],
-) -> None:
-    bucket_name = unique_bucket_name("ol-put")
-    cleanup_buckets(bucket_name)
-    boto3_client.create_bucket(Bucket=bucket_name)
-
-    with pytest.raises(ClientError) as excinfo:
-        boto3_client.put_object_lock_configuration(
-            Bucket=bucket_name,
-            ObjectLockConfiguration={
-                "ObjectLockEnabled": "Enabled",
-                "Rule": {"DefaultRetention": {"Mode": "GOVERNANCE", "Days": 30}},
-            },
-        )
-
-    status, code = _error(excinfo.value)
-    assert status == 501, f"expected 501, got {status} (code={code})"
-    assert code == "NotImplemented", f"expected NotImplemented, got {code}"
-
-
-def test_get_object_lock_configuration_returns_not_implemented(
-    docker_services: Any,
-    boto3_client: Any,
-    unique_bucket_name: Callable[[str], str],
-    cleanup_buckets: Callable[[str], None],
-) -> None:
-    bucket_name = unique_bucket_name("ol-get")
-    cleanup_buckets(bucket_name)
-    boto3_client.create_bucket(Bucket=bucket_name)
-
-    with pytest.raises(ClientError) as excinfo:
-        boto3_client.get_object_lock_configuration(Bucket=bucket_name)
-
-    status, code = _error(excinfo.value)
-    assert status == 501
-    assert code == "NotImplemented"
-
-
-def test_put_object_lock_configuration_on_missing_bucket_returns_not_implemented(
-    docker_services: Any,
-    boto3_client: Any,
-    unique_bucket_name: Callable[[str], str],
-) -> None:
-    """501 should win over NoSuchBucket — don't leak bucket existence via the wrong route."""
-    bucket_name = unique_bucket_name("ol-missing")
-
-    with pytest.raises(ClientError) as excinfo:
-        boto3_client.put_object_lock_configuration(
-            Bucket=bucket_name,
-            ObjectLockConfiguration={"ObjectLockEnabled": "Enabled"},
-        )
-
-    status, code = _error(excinfo.value)
-    assert status == 501
-    assert code == "NotImplemented"
-
-
-def test_create_bucket_with_object_lock_enabled_header_returns_not_implemented(
-    docker_services: Any,
-    boto3_client: Any,
-    unique_bucket_name: Callable[[str], str],
-    cleanup_buckets: Callable[[str], None],
-) -> None:
-    """CreateBucket with x-amz-bucket-object-lock-enabled-for-bucket: true must 501,
-    not silently create a normal bucket.
-    """
-    bucket_name = unique_bucket_name("ol-create-bucket")
-    cleanup_buckets(bucket_name)  # track for cleanup in case implementation accidentally creates it
-
-    with pytest.raises(ClientError) as excinfo:
-        boto3_client.create_bucket(
-            Bucket=bucket_name,
-            ObjectLockEnabledForBucket=True,
-        )
-
-    status, code = _error(excinfo.value)
-    assert status == 501, f"expected 501, got {status} (code={code})"
-    assert code == "NotImplemented"
-
-    # And the bucket must NOT exist after the failed call.
-    with pytest.raises(ClientError) as head_exc:
-        boto3_client.head_bucket(Bucket=bucket_name)
-    head_status = head_exc.value.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-    assert head_status == 404, f"bucket should not exist; head_bucket returned {head_status}"
 
 
 @pytest.mark.parametrize(
@@ -203,8 +111,8 @@ def test_delete_with_bypass_governance_header_is_noop(
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
 ) -> None:
-    """x-amz-bypass-governance-retention: true is meaningless in Tier 0 (no locks to bypass)
-    but should not break a normal DELETE. Documented as a no-op until Tier 2.
+    """x-amz-bypass-governance-retention: true is meaningless without per-object locks
+    (still Tier 2) but should not break a normal DELETE.
     """
     bucket_name = unique_bucket_name("ol-bypass")
     cleanup_buckets(bucket_name)
@@ -225,12 +133,11 @@ def test_delete_with_bypass_governance_header_is_noop(
 
 
 # ---------------------------------------------------------------------------
-# Tier 1 — xfail until persistence is implemented
+# Tier 1 — bucket-level configuration round-trips
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=False, reason=TIER1_REASON)
-def test_tier1_put_then_get_object_lock_configuration_roundtrips(
+def test_put_then_get_object_lock_configuration_roundtrips(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
@@ -255,8 +162,7 @@ def test_tier1_put_then_get_object_lock_configuration_roundtrips(
     assert cfg["Rule"]["DefaultRetention"]["Days"] == 30
 
 
-@pytest.mark.xfail(strict=False, reason=TIER1_REASON)
-def test_tier1_put_compliance_days_roundtrips(
+def test_put_compliance_days_roundtrips(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
@@ -280,8 +186,7 @@ def test_tier1_put_compliance_days_roundtrips(
     assert cfg["Rule"]["DefaultRetention"]["Days"] == 10
 
 
-@pytest.mark.xfail(strict=False, reason=TIER1_REASON)
-def test_tier1_put_governance_years_roundtrips(
+def test_put_governance_years_roundtrips(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
@@ -303,8 +208,7 @@ def test_tier1_put_governance_years_roundtrips(
     assert got["ObjectLockConfiguration"]["Rule"]["DefaultRetention"]["Years"] == 1
 
 
-@pytest.mark.xfail(strict=False, reason=TIER1_REASON)
-def test_tier1_put_replaces_previous_configuration(
+def test_put_replaces_previous_configuration(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
@@ -335,16 +239,17 @@ def test_tier1_put_replaces_previous_configuration(
     assert cfg["Rule"]["DefaultRetention"]["Days"] == 7
 
 
-@pytest.mark.xfail(strict=False, reason=TIER1_REASON)
-def test_tier1_get_on_unconfigured_bucket_returns_not_found(
+def test_get_on_bucket_without_lock_enabled_returns_not_found(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
 ) -> None:
+    """A bucket created WITHOUT ObjectLockEnabledForBucket=True returns
+    ObjectLockConfigurationNotFoundError on GET."""
     bucket_name = unique_bucket_name("ol-noconf")
     cleanup_buckets(bucket_name)
-    boto3_client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
+    boto3_client.create_bucket(Bucket=bucket_name)  # no lock-enabled header
 
     with pytest.raises(ClientError) as excinfo:
         boto3_client.get_object_lock_configuration(Bucket=bucket_name)
@@ -352,13 +257,13 @@ def test_tier1_get_on_unconfigured_bucket_returns_not_found(
     assert code == "ObjectLockConfigurationNotFoundError"
 
 
-@pytest.mark.xfail(strict=False, reason=TIER1_REASON)
-def test_tier1_create_bucket_with_lock_enabled_then_get(
+def test_create_bucket_with_lock_enabled_then_get(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
 ) -> None:
+    """Bucket born with ObjectLockEnabledForBucket=True: GET returns Enabled, no Rule."""
     bucket_name = unique_bucket_name("ol-creat")
     cleanup_buckets(bucket_name)
     boto3_client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
@@ -369,7 +274,22 @@ def test_tier1_create_bucket_with_lock_enabled_then_get(
     assert "Rule" not in cfg
 
 
-@pytest.mark.xfail(strict=False, reason=TIER1_REASON)
+def test_put_on_missing_bucket_returns_no_such_bucket(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+) -> None:
+    bucket_name = unique_bucket_name("ol-nobucket")
+
+    with pytest.raises(ClientError) as excinfo:
+        boto3_client.put_object_lock_configuration(
+            Bucket=bucket_name,
+            ObjectLockConfiguration={"ObjectLockEnabled": "Enabled"},
+        )
+    _, code = _error(excinfo.value)
+    assert code == "NoSuchBucket"
+
+
 @pytest.mark.parametrize(
     "bad_config",
     [
@@ -381,7 +301,7 @@ def test_tier1_create_bucket_with_lock_enabled_then_get(
     ],
     ids=["bad-mode", "days-and-years", "no-period", "zero-days", "disabled-not-allowed"],
 )
-def test_tier1_invalid_configuration_rejected(
+def test_invalid_configuration_rejected(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],

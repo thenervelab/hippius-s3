@@ -6,6 +6,7 @@ SELECT
     b.created_at,
     ba.acl_json,
     b.tags,
+    b.object_lock,
     b.main_account_id
 FROM buckets b
 LEFT JOIN bucket_acls ba ON ba.bucket_id = b.bucket_id

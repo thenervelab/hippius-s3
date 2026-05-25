@@ -208,6 +208,8 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
 
             # Check for x-amz-acl header
             x_amz_acl = request.headers.get("x-amz-acl")
+            # Object Lock enablement at bucket creation time (Tier 1, no enforcement).
+            object_lock_enabled = request.headers.get("x-amz-bucket-object-lock-enabled", "").strip().lower() == "true"
 
             # Start transaction for atomic bucket + ACL creation
             async with db.transaction():
@@ -220,6 +222,14 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
                     is_public,
                     main_account_id,
                 )
+
+                if object_lock_enabled:
+                    await db.fetchrow(
+                        get_query("update_bucket_object_lock"),
+                        bucket_id,
+                        json.dumps({"enabled": True}),
+                    )
+                    logger.info(f"Created bucket '{bucket_name}' with Object Lock enabled")
 
                 # Create ACL if x-amz-acl header is present
                 if x_amz_acl:
