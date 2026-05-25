@@ -440,6 +440,7 @@ async def upload_part(
         # Read plaintext via reader pipeline (parts → plan → stream decrypt)
         try:
             from hippius_s3.queue import DownloadChainRequest  # local import
+            from hippius_s3.queue import PartChunkSpec  # local import
             from hippius_s3.queue import PartToDownload  # local import
             from hippius_s3.queue import enqueue_download_request  # local import
             from hippius_s3.reader.db_meta import read_parts_list  # local import to avoid cycles
@@ -482,16 +483,16 @@ async def upload_part(
                         int(pn),
                     )
                     all_entries = [(int(r[0]), str(r[1]), int(r[2]) if r[2] is not None else None) for r in rows or []]
-                    chunk_specs = []
+                    chunk_specs: list[PartChunkSpec] = []
                     include = {int(i) for i in idxs}
                     for ci, cid, clen in all_entries:
                         if int(ci) in include:
                             chunk_specs.append(
-                                {
-                                    "index": int(ci),
-                                    "cid": str(cid),
-                                    "cipher_size_bytes": int(clen) if clen is not None else None,
-                                }
+                                PartChunkSpec(
+                                    index=int(ci),
+                                    cid=str(cid),
+                                    cipher_size_bytes=int(clen) if clen is not None else None,
+                                )
                             )
                     if not chunk_specs:
                         continue
