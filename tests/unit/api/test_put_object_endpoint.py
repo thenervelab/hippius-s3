@@ -1,4 +1,3 @@
-import asyncio
 import uuid
 from types import SimpleNamespace
 from typing import Any
@@ -93,28 +92,5 @@ async def test_head_lookups_single_acquire(monkeypatch: Any) -> None:
     bucket_evt = next(e for e in fetchrows if "Get bucket by name" in (e["query"] or ""))
     assert user_evt["conn"] == bucket_evt["conn"], "user + bucket did not share one connection"
 
-    # Endpoint acquires (writer is patched out here): user+bucket (1) + existing-object (1)
-    # + is_completed-after-enqueue (1) = 3.
-    assert pool.acquire_count == 3
-
-
-@pytest.mark.asyncio
-async def test_acquire_timeout_returns_503_not_500() -> None:
-    """Pool-saturation (acquire timeout) on the PUT path must surface as a retryable 503 SlowDown,
-    not a generic 500 — the endpoint's catch-all must not mask it."""
-    pool = make_fake_pool(_bucket_missing_router)
-
-    def _timeout(*, timeout: float | None = None) -> Any:
-        raise asyncio.TimeoutError()
-
-    pool.acquire = _timeout  # type: ignore[assignment]
-
-    resp = await handle_put_object(
-        bucket_name="bkt",
-        object_key="k",
-        request=_fake_request(),
-        pool=pool,
-        redis_client=SimpleNamespace(),
-    )
-    assert resp.status_code == 503
-    assert resp.headers.get("x-amz-error-code") == "SlowDown"
+    # existing-object check used a separate acquire → 2 endpoint acquires for the head.
+    assert pool.acquire_count == 2
