@@ -7,7 +7,6 @@ import pytest
 
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.config import get_config
-from hippius_s3.db_pool import PoolAcquireTimeout
 from hippius_s3.writer.object_writer import ObjectWriter
 from tests.unit._fake_pool import make_fake_pool
 
@@ -125,9 +124,9 @@ async def test_head_scope_single_transaction(patched_writer: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_tail_scope_single_transaction(patched_writer: Any) -> None:
-    """metadata + ensure_upload + part_placeholder run on ONE tail connection, inside a
-    transaction, on a connection distinct from the head."""
+async def test_tail_scope_single_transaction_with_is_completed(patched_writer: Any) -> None:
+    """metadata + ensure_upload + part_placeholder + is_completed run on ONE tail connection,
+    inside a transaction, and the tail connection differs from the head connection."""
     writer, pool, captured = patched_writer
     await _run(writer, b"payload")
 
@@ -137,20 +136,10 @@ async def test_tail_scope_single_transaction(patched_writer: Any) -> None:
     assert captured["tail_parts_in_txn"] is True
     assert tail_conn.conn_id != captured["head_conn"].conn_id
 
-    # All tail writes are inside the transaction.
     tail_executes = _events_on(pool, tail_conn.conn_id, "execute")
+    assert any("is_completed" in e["query"] and e["in_txn"] for e in tail_executes), "is_completed not in tail txn"
+    # All tail writes are inside the transaction.
     assert all(e["in_txn"] for e in tail_executes)
-
-
-@pytest.mark.asyncio
-async def test_is_completed_not_set_by_writer(patched_writer: Any) -> None:
-    """is_completed=TRUE must NOT be issued by the writer: the endpoint sets it only after a
-    successful enqueue, so an enqueue failure leaves the row cleanable (not an orphan)."""
-    writer, pool, _ = patched_writer
-    await _run(writer, b"payload")
-    assert not any("is_completed" in (e.get("query") or "") for e in pool.events), (
-        "writer must not set is_completed; that belongs after enqueue in the endpoint"
-    )
 
 
 @pytest.mark.asyncio
@@ -174,10 +163,9 @@ async def test_no_direct_pool_writes_for_object(patched_writer: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_acquire_timeout_raises_pool_acquire_timeout(patched_writer: Any) -> None:
-    """A head-acquire timeout surfaces as the dedicated PoolAcquireTimeout (translated by
-    acquire_with_timeout), so it maps to 503 — and is distinguishable from a query command_timeout
-    (a bare asyncio.TimeoutError raised by the body, which must NOT be relabeled)."""
+async def test_acquire_timeout_propagates(patched_writer: Any) -> None:
+    """If the head acquire times out, the writer surfaces asyncio.TimeoutError (it must NOT be
+    swallowed) so the global handler can map it to a 503 SlowDown."""
     writer, pool, _ = patched_writer
 
     def _boom(*, timeout: float | None = None) -> Any:
@@ -185,5 +173,5 @@ async def test_acquire_timeout_raises_pool_acquire_timeout(patched_writer: Any) 
 
     pool.acquire = _boom  # type: ignore[assignment]
 
-    with pytest.raises(PoolAcquireTimeout):
+    with pytest.raises(asyncio.TimeoutError):
         await _run(writer, b"payload")
