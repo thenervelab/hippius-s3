@@ -94,3 +94,25 @@ def s3_error_response(
         headers.update({k: str(v) for k, v in extra_headers.items()})
 
     return Response(content=xml_content, media_type="application/xml", status_code=status_code, headers=headers)
+
+
+def pool_saturation_response(exc: BaseException) -> Response | None:
+    """Map a DB connection-pool acquire failure to a retryable 503 SlowDown.
+
+    ``pool.acquire(timeout=...)`` raises ``asyncio.TimeoutError`` when no connection frees up in
+    time; server-side ``max_connections`` raises ``asyncpg.TooManyConnectionsError``. Both mean
+    "too busy, retry" rather than a hard failure. Returns ``None`` for unrelated exceptions so the
+    caller can keep matching. httpx timeouts are a different class and are intentionally not caught.
+    """
+    import asyncio
+
+    import asyncpg
+
+    if isinstance(exc, (asyncio.TimeoutError, asyncpg.TooManyConnectionsError)):
+        return s3_error_response(
+            code="SlowDown",
+            message="Server busy. Please retry.",
+            status_code=503,
+            extra_headers={"Retry-After": "3"},
+        )
+    return None

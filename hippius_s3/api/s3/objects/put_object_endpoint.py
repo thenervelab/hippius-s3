@@ -35,23 +35,26 @@ async def handle_put_object(
     redis_client: Any,
 ) -> Response:
     try:
-        # Get or create user and bucket for this main account
+        # Get or create user and bucket for this main account.
+        # Both reads run on ONE pooled connection (one acquire instead of two). We do NOT hold it
+        # across the append branch below, so handle_append acquires its own connections.
         main_account_id = request.state.account.main_account
 
-        with tracer.start_as_current_span(
-            "put_object.get_or_create_user", attributes={"hippius.account.main": main_account_id}
-        ):
-            await pool.fetchrow(
-                get_query("get_or_create_user_by_main_account"),
-                main_account_id,
-                datetime.now(timezone.utc),
-            )
+        async with pool.acquire(timeout=config.db_pool_acquire_timeout) as conn:
+            with tracer.start_as_current_span(
+                "put_object.get_or_create_user", attributes={"hippius.account.main": main_account_id}
+            ):
+                await conn.fetchrow(
+                    get_query("get_or_create_user_by_main_account"),
+                    main_account_id,
+                    datetime.now(timezone.utc),
+                )
 
-        with tracer.start_as_current_span("put_object.get_bucket", attributes={"bucket_name": bucket_name}):
-            bucket = await pool.fetchrow(
-                get_query("get_bucket_by_name"),
-                bucket_name,
-            )
+            with tracer.start_as_current_span("put_object.get_bucket", attributes={"bucket_name": bucket_name}):
+                bucket = await conn.fetchrow(
+                    get_query("get_bucket_by_name"),
+                    bucket_name,
+                )
 
         if not bucket:
             return errors.s3_error_response(
@@ -96,11 +99,12 @@ async def handle_put_object(
 
         # Capture previous object (to clean up multipart parts if overwriting)
         with tracer.start_as_current_span("put_object.check_existing_object") as span:
-            prev = await pool.fetchrow(
-                get_query("get_object_by_path"),
-                bucket_id,
-                object_key,
-            )
+            async with pool.acquire(timeout=config.db_pool_acquire_timeout) as conn:
+                prev = await conn.fetchrow(
+                    get_query("get_object_by_path"),
+                    bucket_id,
+                    object_key,
+                )
             set_span_attributes(span, {"is_overwrite": prev is not None})
 
         # Candidate object_id: DB may override on (bucket_id, object_key) conflict
@@ -171,12 +175,9 @@ async def handle_put_object(
                 ray_id=getattr(request.state, "ray_id", "no-ray-id"),
             )
 
-        # Mark upload completed to prevent CASCADE deletion of chunk_backend on DELETE
-        # Maintains parity with append (sets TRUE immediately) and multipart (sets TRUE in mpu_complete)
-        await pool.execute(
-            "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
-            put_res.upload_id,
-        )
+        # `multipart_uploads.is_completed = TRUE` is now set inside the writer's tail
+        # transaction (put_simple_stream_full) so it commits atomically with the final
+        # metadata/part writes — it must already be TRUE by the time we enqueue here.
 
         get_metrics_collector().record_s3_operation(
             operation="put_object",

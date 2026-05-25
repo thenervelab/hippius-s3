@@ -311,6 +311,10 @@ def factory() -> FastAPI:
                 message="Object not ready for download yet. Please retry.",
                 status_code=503,
             )
+        # DB connection-pool saturation → retryable 503 SlowDown (see errors.pool_saturation_response).
+        pool_busy = s3_errors.pool_saturation_response(exc)
+        if pool_busy is not None:
+            return pool_busy
         if isinstance(exc, UnsupportedStorageVersionError):
             return s3_errors.s3_error_response(
                 code="NotImplemented",
