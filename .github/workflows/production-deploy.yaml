@@ -132,7 +132,7 @@ jobs:
 
       - name: Update secrets
         run: |
-          DATABASE_URL="postgresql://postgres:${{ secrets.DATABASE_PASSWORD }}@postgres-rw:5432/hippius?sslmode=disable"
+          DATABASE_URL="postgresql://postgres:${{ secrets.DATABASE_PASSWORD }}@postgres-nvme-rw:5432/hippius?sslmode=disable"
 
           kubectl create secret generic hippius-s3-secrets \
             --from-literal=DATABASE_URL="${DATABASE_URL}" \
@@ -273,7 +273,7 @@ jobs:
         run: |
           CACHE_NS="${{ steps.ns.outputs.namespace }}"
           CLUSTER_URL="redis://redis-cluster.${CACHE_NS}.svc.cluster.local:6379?cluster=true"
-          DATABASE_URL="postgresql://postgres:${{ secrets.DATABASE_PASSWORD }}@postgres-rw.hippius-s3-prod.svc.cluster.local:5432/hippius?sslmode=disable"
+          DATABASE_URL="postgresql://postgres:${{ secrets.DATABASE_PASSWORD }}@postgres-nvme-rw.hippius-s3-prod.svc.cluster.local:5432/hippius?sslmode=disable"
 
           kubectl create secret generic hippius-s3-secrets \
             --from-literal=DATABASE_URL="${DATABASE_URL}" \
