@@ -287,6 +287,7 @@ def main() -> int:
     # .aws.cli.env is a bash script with `aws configure set ...` and `echo` lines
     # that dotenv warns about per-line. Silence those — credentials still load.
     import logging
+
     logging.getLogger("dotenv.main").setLevel(logging.ERROR)
     load_dotenv(REPO_ROOT / ".aws.cli.env", override=False)
 
@@ -297,8 +298,7 @@ def main() -> int:
     zone = (args.zone or os.environ.get("HIPPIUS_BENCH_ZONE", "")).strip().lower()
     if zone not in ENDPOINT_BY_ZONE:
         print(
-            f"ERROR: HIPPIUS_BENCH_ZONE must be one of {sorted(ENDPOINT_BY_ZONE)} "
-            "(set in .aws.cli.env or pass --zone)",
+            f"ERROR: HIPPIUS_BENCH_ZONE must be one of {sorted(ENDPOINT_BY_ZONE)} (set in .aws.cli.env or pass --zone)",
             file=sys.stderr,
         )
         return 2
@@ -309,7 +309,9 @@ def main() -> int:
     s3 = make_s3_client(endpoint)
     print(f"Zone:            {zone}")
     print(f"Endpoint:        {endpoint}")
-    print(f"Tracked SHA:     {commit_sha[:12] + '…' if commit_sha else 'unavailable'} ({GITHUB_REPO}@{GITHUB_TRACKED_BRANCH})")
+    print(
+        f"Tracked SHA:     {commit_sha[:12] + '…' if commit_sha else 'unavailable'} ({GITHUB_REPO}@{GITHUB_TRACKED_BRANCH})"
+    )
     print(f"Private bucket:  {args.private_bucket}  (Cache-Control: private,no-store → ATS bypass)")
     print(f"Public bucket:   {args.public_bucket}  (Cache-Control: public,max-age=300 → ATS caches)")
     print(f"Size: {args.size} MB | Trials: {args.trials} | Warm replays per trial: {args.warm_replays}")
@@ -429,17 +431,35 @@ def main() -> int:
             w = csv.writer(f)
             w.writerow(
                 [
-                    "label", "bucket", "key", "status", "bytes",
-                    "ttfb_s", "total_s", "age", "ats_hit", "source", "ray_id", "md5",
+                    "label",
+                    "bucket",
+                    "key",
+                    "status",
+                    "bytes",
+                    "ttfb_s",
+                    "total_s",
+                    "age",
+                    "ats_hit",
+                    "source",
+                    "ray_id",
+                    "md5",
                 ]
             )
             for r in rows:
                 w.writerow(
                     [
-                        r.label, r.bucket, r.key, r.status, r.bytes_received,
-                        f"{r.ttfb_seconds:.4f}", f"{r.total_seconds:.4f}",
+                        r.label,
+                        r.bucket,
+                        r.key,
+                        r.status,
+                        r.bytes_received,
+                        f"{r.ttfb_seconds:.4f}",
+                        f"{r.total_seconds:.4f}",
                         r.age if r.age is not None else "",
-                        int(r.ats_hit), r.x_hippius_source or "", r.x_hippius_ray_id or "", r.md5,
+                        int(r.ats_hit),
+                        r.x_hippius_source or "",
+                        r.x_hippius_ray_id or "",
+                        r.md5,
                     ]
                 )
         print(f"CSV written to {args.csv}")
