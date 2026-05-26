@@ -3,7 +3,10 @@ kind: ScheduledBackup
 metadata:
   name: daily-backup
 spec:
-  schedule: "0 2 * * *"
+  # CNPG cron is 6-field, seconds-first (sec min hour dom mon dow).
+  # "0 2 * * *" was a 5-field expression misread as sec=0 min=2 hour=* => hourly at HH:02,
+  # which piled up a multi-hundred backup backlog. This is true daily at 02:00:00.
+  schedule: "0 0 2 * * *"
   backupOwnerReference: self
   method: plugin
   pluginConfiguration:
