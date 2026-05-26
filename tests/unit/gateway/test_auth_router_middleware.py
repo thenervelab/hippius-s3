@@ -43,6 +43,10 @@ def auth_router_app() -> Any:
     async def put_test_endpoint(request: Request) -> dict[str, str]:
         return {"message": "ok"}
 
+    @app.api_route("/purge-target/{bucket}/{key:path}", methods=["PURGE"])
+    async def purge_endpoint(request: Request, bucket: str, key: str) -> dict[str, str]:
+        return {"message": "purged", "bucket": bucket, "key": key}
+
     @app.get("/health")
     async def health_endpoint() -> dict[str, str]:
         return {"status": "healthy"}
@@ -281,3 +285,82 @@ async def test_presigned_get_with_non_hip_credential_rejected(auth_router_app: A
     # v1 behavior: non-hip credentials in presigned URLs should be treated as invalid access keys
     assert response.status_code == 403
     assert b"InvalidAccessKeyId" in response.content
+
+
+# ---------------------------------------------------------------------------
+# PURGE-from-ATS-authproxy bypass
+# ---------------------------------------------------------------------------
+#
+# When ATS authproxy is in front of the gateway, gateway-initiated PURGEs to
+# ATS get bounced back to the gateway as auth subrequests carrying a stamped
+# X-Hippius-Auth-Probe header. Those PURGEs have no Authorization header, so
+# the regular auth_router rule (PUT/POST/DELETE/PURGE without Authorization →
+# 403) would block them and ats_purge_middleware's invalidation-on-write
+# would break. Bypass auth when method == PURGE AND the probe secret matches.
+PURGE_PROBE_SECRET = "fake-test-probe-secret-not-real"
+
+
+@pytest.fixture  # type: ignore[misc]
+def configured_probe_secret(monkeypatch: pytest.MonkeyPatch) -> str:
+    from gateway.config import GatewayConfig
+    from gateway.middlewares import auth_probe as auth_probe_mod
+
+    cfg = GatewayConfig(auth_probe_secret=PURGE_PROBE_SECRET)
+    monkeypatch.setattr(auth_probe_mod, "get_config", lambda: cfg)
+    return PURGE_PROBE_SECRET
+
+
+@pytest.mark.asyncio
+async def test_purge_with_valid_probe_secret_bypasses_auth(
+    auth_router_app: Any, configured_probe_secret: str
+) -> None:
+    """PURGE with the matching probe secret skips auth_router validation
+    (no Authorization header needed)."""
+    async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
+        response = await client.request(
+            "PURGE",
+            "/purge-target/some-bucket/some/key.txt",
+            headers={"x-hippius-auth-probe": configured_probe_secret},
+        )
+    assert response.status_code == 200
+    assert response.json()["message"] == "purged"
+
+
+@pytest.mark.asyncio
+async def test_purge_without_probe_header_returns_403(
+    auth_router_app: Any, configured_probe_secret: str
+) -> None:
+    """PURGE without the probe header still gets the existing 403 — only the
+    ATS authproxy bounce-back can bypass."""
+    async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
+        response = await client.request("PURGE", "/purge-target/some-bucket/some/key.txt")
+    assert response.status_code == 403
+    assert b"InvalidAccessKeyId" in response.content
+
+
+@pytest.mark.asyncio
+async def test_purge_with_wrong_probe_value_returns_403(
+    auth_router_app: Any, configured_probe_secret: str
+) -> None:
+    """Constant-time compare protects against guessed probe values."""
+    for bad in ("", "1", "wrong-secret", PURGE_PROBE_SECRET[:-1], PURGE_PROBE_SECRET + "x"):
+        async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
+            response = await client.request(
+                "PURGE",
+                "/purge-target/some-bucket/some/key.txt",
+                headers={"x-hippius-auth-probe": bad},
+            )
+        assert response.status_code == 403, f"value={bad!r}"
+
+
+@pytest.mark.asyncio
+async def test_purge_with_probe_when_secret_unset_returns_403(auth_router_app: Any) -> None:
+    """Fail-closed: if HIPPIUS_AUTH_PROBE_SECRET is unset, the bypass is
+    disabled and PURGE without auth gets the standard 403."""
+    async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
+        response = await client.request(
+            "PURGE",
+            "/purge-target/some-bucket/some/key.txt",
+            headers={"x-hippius-auth-probe": "anything"},
+        )
+    assert response.status_code == 403

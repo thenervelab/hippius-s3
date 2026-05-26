@@ -19,6 +19,7 @@ from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.cache import create_fs_store
 from hippius_s3.config import get_config
+from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.storage_version import require_supported_storage_version
@@ -199,8 +200,24 @@ class ObjectWriter:
 
         part_number = 1
 
-        # Reserve the version upfront by upserting with placeholder values
-        # This ensures we write chunks to the correct version from the start
+        suite_id = "hip-enc/aes256gcm"
+        # New DEK per overwrite/write (this code path reserves a new object_version upfront).
+        # KEK lookup + DEK generation run OUTSIDE the head transaction: the KEK lives on a
+        # separate keystore pool and may make a KMS round-trip on cache miss, so we must not
+        # hold a main-pool connection open across it.
+        from hippius_s3.services.envelope_service import generate_dek
+        from hippius_s3.services.envelope_service import wrap_dek
+        from hippius_s3.services.kek_service import get_or_create_active_bucket_kek
+
+        dek = generate_dek()
+        kek_id, kek_bytes = await get_or_create_active_bucket_kek(bucket_id=bucket_id)
+        key_bytes = dek
+
+        # HEAD scope: reserve the version upfront (placeholder size/md5) and write the envelope
+        # in ONE transaction on ONE pooled connection. Reserving upfront ensures we write chunks
+        # to the correct version from the start; committing reserve+envelope atomically closes the
+        # window where a concurrent GET could see a bumped current_object_version with NULL
+        # kek_id/wrapped_dek and 500 with v5_missing_envelope_metadata.
         with tracer.start_as_current_span(
             "put_simple_stream_full.reserve_version",
             attributes={
@@ -208,58 +225,46 @@ class ObjectWriter:
                 "has_object_id": True,
             },
         ):
-            reserve_row = await upsert_object_basic(
-                self.pool,
-                object_id=object_id,
-                bucket_id=bucket_id,
-                object_key=object_key,
-                content_type=content_type,
-                metadata=metadata,
-                md5_hash="",
-                size_bytes=0,
-                storage_version=resolved_storage_version,
-                upload_backends=self.config.upload_backends,
-            )
-            # IMPORTANT: `object_id` is authoritative from DB. Under concurrent creates,
-            # our candidate UUID may conflict with an existing (bucket_id, object_key).
-            # We must use the DB-returned object_id for cache keys, crypto binding, and enqueue.
-            if reserve_row and reserve_row.get("object_id") is None:
-                raise RuntimeError("reserve_version_missing_object_id")
-            object_id = str(reserve_row.get("object_id") or object_id) if reserve_row else str(object_id)
-            object_version = int(reserve_row.get("current_object_version") or 1) if reserve_row else 1
+            async with acquire_with_timeout(self.pool, self.config.db_pool_acquire_timeout) as conn, conn.transaction():
+                reserve_row = await upsert_object_basic(
+                    conn,
+                    object_id=object_id,
+                    bucket_id=bucket_id,
+                    object_key=object_key,
+                    content_type=content_type,
+                    metadata=metadata,
+                    md5_hash="",
+                    size_bytes=0,
+                    storage_version=resolved_storage_version,
+                    upload_backends=self.config.upload_backends,
+                )
+                # IMPORTANT: `object_id` is authoritative from DB. Under concurrent creates,
+                # our candidate UUID may conflict with an existing (bucket_id, object_key).
+                # We must use the DB-returned object_id for cache keys, crypto binding, and enqueue.
+                if reserve_row and reserve_row.get("object_id") is None:
+                    raise RuntimeError("reserve_version_missing_object_id")
+                object_id = str(reserve_row.get("object_id") or object_id) if reserve_row else str(object_id)
+                object_version = int(reserve_row.get("current_object_version") or 1) if reserve_row else 1
 
-        suite_id = "hip-enc/aes256gcm"
-        # New DEK per overwrite/write (this code path reserves a new object_version upfront)
-        from hippius_s3.services.envelope_service import generate_dek
-        from hippius_s3.services.envelope_service import wrap_dek
-        from hippius_s3.services.kek_service import get_or_create_active_bucket_kek
-
-        dek = generate_dek()
-        kek_id, kek_bytes = await get_or_create_active_bucket_kek(bucket_id=bucket_id)
-        aad = f"hippius-dek:{bucket_id}:{object_id}:{int(object_version)}".encode("utf-8")
-        wrapped_dek = wrap_dek(kek=kek_bytes, dek=dek, aad=aad)
-        key_bytes = dek
-
-        # Write envelope to DB immediately so concurrent GETs never see NULL kek_id/wrapped_dek.
-        # Without this, a GET between the upsert (which bumps current_object_version) and this
-        # UPDATE would hit v5_missing_envelope_metadata → 500.
-        await self.pool.execute(
-            """
-            UPDATE object_versions
-               SET encryption_version = 5,
-                   enc_suite_id = $1,
-                   enc_chunk_size_bytes = $2,
-                   kek_id = $3,
-                   wrapped_dek = $4
-             WHERE object_id = $5 AND object_version = $6
-            """,
-            str(suite_id),
-            int(chunk_size),
-            kek_id,
-            wrapped_dek,
-            object_id,
-            int(object_version),
-        )
+                aad = f"hippius-dek:{bucket_id}:{object_id}:{int(object_version)}".encode("utf-8")
+                wrapped_dek = wrap_dek(kek=kek_bytes, dek=dek, aad=aad)
+                await conn.execute(
+                    """
+                    UPDATE object_versions
+                       SET encryption_version = 5,
+                           enc_suite_id = $1,
+                           enc_chunk_size_bytes = $2,
+                           kek_id = $3,
+                           wrapped_dek = $4
+                     WHERE object_id = $5 AND object_version = $6
+                    """,
+                    str(suite_id),
+                    int(chunk_size),
+                    kek_id,
+                    wrapped_dek,
+                    object_id,
+                    int(object_version),
+                )
 
         hasher = hashlib.md5()
         total_size = 0
@@ -427,7 +432,10 @@ class ObjectWriter:
             plain_size=int(total_size),
         )
 
-        # Update the reserved object_versions row with final md5/size
+        # TAIL scope: finalize the version (size/md5 makes it serveable), create the upload row,
+        # the part placeholder, and mark the upload completed — all in ONE transaction on ONE
+        # pooled connection. The connection is NOT held across the streaming phase above, so a
+        # slow/large upload never pins a main-pool connection.
         perf_post_start = time.monotonic()
         with tracer.start_as_current_span(
             "put_simple_stream_full.update_metadata",
@@ -440,39 +448,45 @@ class ObjectWriter:
                 "storage_version": resolved_storage_version,
             },
         ):
-            await self.pool.execute(
-                get_query("update_object_version_metadata"),
-                int(total_size),
-                md5_hash,
-                content_type,
-                json.dumps(metadata),
-                datetime.now(timezone.utc),
-                object_id,
-                int(object_version),
-            )
-            # Envelope (kek_id, wrapped_dek) was already written immediately after
-            # the upsert to prevent the read-race on concurrent overwrites.
+            async with acquire_with_timeout(self.pool, self.config.db_pool_acquire_timeout) as conn, conn.transaction():
+                # Until this UPDATE sets non-empty size/md5 the version is invisible to downloads.
+                await conn.execute(
+                    get_query("update_object_version_metadata"),
+                    int(total_size),
+                    md5_hash,
+                    content_type,
+                    json.dumps(metadata),
+                    datetime.now(timezone.utc),
+                    object_id,
+                    int(object_version),
+                )
+                # Envelope (kek_id, wrapped_dek) was already written in the head transaction
+                # to prevent the read-race on concurrent overwrites.
 
-        upload_id = await ensure_upload_row(
-            self.pool,
-            object_id=object_id,
-            bucket_id=bucket_id,
-            object_key=object_key,
-            content_type=content_type,
-            metadata=metadata,
-        )
+                upload_id = await ensure_upload_row(
+                    conn,
+                    object_id=object_id,
+                    bucket_id=bucket_id,
+                    object_key=object_key,
+                    content_type=content_type,
+                    metadata=metadata,
+                )
 
-        await upsert_part_placeholder(
-            self.pool,
-            object_id=object_id,
-            upload_id=str(upload_id),
-            part_number=int(part_number),
-            size_bytes=int(total_size),
-            etag=md5_hash,
-            chunk_size_bytes=int(chunk_size),
-            object_version=int(object_version),
-            chunk_cipher_sizes=chunk_cipher_sizes,
-        )
+                await upsert_part_placeholder(
+                    conn,
+                    object_id=object_id,
+                    upload_id=str(upload_id),
+                    part_number=int(part_number),
+                    size_bytes=int(total_size),
+                    etag=md5_hash,
+                    chunk_size_bytes=int(chunk_size),
+                    object_version=int(object_version),
+                    chunk_cipher_sizes=chunk_cipher_sizes,
+                )
+                # NOTE: `multipart_uploads.is_completed = TRUE` is intentionally NOT set here.
+                # It must be set only AFTER the upload is enqueued (the endpoint does it), so that
+                # if the enqueue fails the row stays is_completed=FALSE and remains eligible for the
+                # DELETE cascade cleanup instead of becoming an un-uploadable, un-evictable orphan.
         perf_post_ms = (time.monotonic() - perf_post_start) * 1000
 
         throughput_mbps = (

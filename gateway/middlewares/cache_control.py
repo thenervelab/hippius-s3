@@ -6,6 +6,7 @@ from typing import Callable
 from fastapi import Request
 from fastapi import Response
 
+from gateway.config import get_config
 from gateway.middlewares.acl import parse_s3_path
 
 
@@ -14,11 +15,16 @@ PUBLIC_CACHE_CONTROL = "public, max-age=300, stale-while-revalidate=60"
 # the cache-control service has flagged as is_cache_warm. Combined with PURGE on
 # write, ATS holds bodies until either the next write or LRU eviction.
 #
-# Only emitted when anonymous_read_allowed is also True — a private object in a
-# warm bucket still gets PRIVATE_CACHE_CONTROL because object-level ACL grants
-# can override bucket-level public-read.
+# Emitted in two scenarios:
+#  - warm bucket, anonymous-readable (browsers + ATS may cache).
+#  - warm bucket, NOT anonymous-readable. In this case ATS stores under this
+#    cache-friendly directive but header_rewrite on the ATS side rewrites the
+#    response to "private, no-store" before egress to the client (based on the
+#    X-Hippius-Visibility: private sentinel set below). Per-request access is
+#    gated by ATS authproxy → gateway /__authcheck probe.
 WARM_PUBLIC_CACHE_CONTROL = "public, max-age=2592000, stale-while-revalidate=86400"
 PRIVATE_CACHE_CONTROL = "private, no-store"
+VISIBILITY_HEADER = "X-Hippius-Visibility"
 
 
 async def cache_control_middleware(
@@ -26,6 +32,13 @@ async def cache_control_middleware(
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
     response = await call_next(request)
+
+    # ATS authproxy subrequests are short-circuited by auth_probe_middleware
+    # (innermost) which marks the request before returning. Their response
+    # isn't stored in the ATS cache and never reaches the real client, so
+    # leave it untouched.
+    if getattr(request.state, "is_auth_probe", False):
+        return response
 
     if request.method not in ("GET", "HEAD"):
         return response
@@ -53,11 +66,24 @@ async def cache_control_middleware(
         response.headers["Cache-Control"] = PRIVATE_CACHE_CONTROL
         return response
 
-    if not getattr(request.state, "anonymous_read_allowed", False):
+    bucket_is_cache_warm = getattr(request.state, "bucket_is_cache_warm", False)
+    anonymous_read_allowed = getattr(request.state, "anonymous_read_allowed", False)
+
+    if not anonymous_read_allowed:
+        # Warm-private only makes sense with ATS in front: the cache-friendly
+        # Cache-Control + X-Hippius-Visibility sentinel pair relies on ATS
+        # header_rewrite to demote the response to "private, no-store" on
+        # egress. With no ATS configured, the sentinel is meaningless and
+        # `public, max-age=30d` would leak straight to browsers, letting them
+        # cache and serve private bodies. Fall back to PRIVATE_CACHE_CONTROL.
+        if bucket_is_cache_warm and get_config().ats_cache_endpoints:
+            response.headers["Cache-Control"] = WARM_PUBLIC_CACHE_CONTROL
+            response.headers[VISIBILITY_HEADER] = "private"
+            return response
         response.headers["Cache-Control"] = PRIVATE_CACHE_CONTROL
         return response
 
-    if getattr(request.state, "bucket_is_cache_warm", False):
+    if bucket_is_cache_warm:
         response.headers["Cache-Control"] = WARM_PUBLIC_CACHE_CONTROL
         return response
 

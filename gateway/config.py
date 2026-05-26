@@ -139,6 +139,16 @@ class GatewayConfig:
         default_factory=lambda: _parse_csv(os.getenv("ATS_CACHE_ENDPOINT", ""))
     )
 
+    # Shared secret stamped on the X-Hippius-Auth-Probe header by an ATS header_rewrite
+    # rule on the auth-host remap. The gateway short-circuits with 200 OK when the
+    # header value matches (constant-time compare). Empty value disables the feature
+    # entirely — auth_probe_middleware becomes a pass-through. Required for prod use.
+    # repr=False so a stray `str(config)` / `print(config)` doesn't leak the secret.
+    auth_probe_secret: str = dataclasses.field(
+        default_factory=lambda: os.getenv("HIPPIUS_AUTH_PROBE_SECRET", ""),
+        repr=False,
+    )
+
 
 _config: GatewayConfig | None = None
 

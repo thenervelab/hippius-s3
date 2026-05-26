@@ -66,6 +66,10 @@ def configure_otel(service_name: str) -> None:
     # Auto-instrument libraries (replaces what opentelemetry-instrument CLI was doing)
     FastAPIInstrumentor().instrument()
     RedisInstrumentor().instrument()
+    # AsyncPGInstrumentor creates a span PER query. On the hot PUT path (~13 DB ops/request) this
+    # adds measurable per-request overhead for little benefit — the writer/endpoint already emit
+    # manual spans for the key phases. Disabled by default; set ENABLE_DB_QUERY_TRACING=true to
+    # re-enable per-query DB spans for debugging.
     AsyncPGInstrumentor().instrument()
     HTTPXClientInstrumentor().instrument()
 
