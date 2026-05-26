@@ -70,8 +70,7 @@ def configure_otel(service_name: str) -> None:
     # adds measurable per-request overhead for little benefit — the writer/endpoint already emit
     # manual spans for the key phases. Disabled by default; set ENABLE_DB_QUERY_TRACING=true to
     # re-enable per-query DB spans for debugging.
-    if os.environ.get("ENABLE_DB_QUERY_TRACING", "false").lower() in ("true", "1"):
-        AsyncPGInstrumentor().instrument()
+    AsyncPGInstrumentor().instrument()
     HTTPXClientInstrumentor().instrument()
 
     logger.info(f"OTel programmatic init complete for {service_name} (pid={os.getpid()}, endpoint={endpoint})")
