@@ -27,7 +27,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: postgres-nvme-rw
+  name: postgres-rw
 spec:
   type: ExternalName
-  externalName: postgres-nvme-rw.hippius-s3-prod.svc.cluster.local
+  externalName: postgres-rw.hippius-s3-prod.svc.cluster.local
