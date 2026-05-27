@@ -152,6 +152,8 @@ async def acl_middleware(
             bucket_id = lookup.bucket_id
             request.state.bucket_is_cache_warm = lookup.is_cache_warm
             request.state.bucket_owner_id = bucket_owner_id
+            # Forwarded to the API so it can skip its own get_bucket_by_name lookup.
+            request.state.bucket_id = bucket_id
         else:
             request.state.bucket_is_cache_warm = False
 

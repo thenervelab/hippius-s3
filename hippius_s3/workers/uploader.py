@@ -75,14 +75,23 @@ def extract_http_status_code(error: Exception) -> str:
     return ""
 
 
+def is_billing_error(error: Exception) -> bool:
+    """True if the error is Arion rejecting the upload for insufficient credit (HTTP 402)."""
+    return extract_http_status_code(error) == "402" or "payment required" in str(error).lower()
+
+
 def classify_error(error: Exception) -> str:
-    """Classify error as transient, permanent, or unknown."""
+    """Classify error as transient, permanent, billing, or unknown."""
     err_str = str(error).lower()
     err_type = type(error).__name__.lower()
 
     status_code = extract_http_status_code(error)
     if status_code == "507":
         return "permanent"
+
+    # 402 means the account ran out of credit; retrying is pointless until it tops up.
+    if is_billing_error(error):
+        return "billing"
 
     if any(
         keyword in err_str
@@ -264,18 +273,28 @@ class Uploader:
             logger.debug(f"Uploading {len(chunks)} chunks for object_id={object_id}")
 
             semaphore = asyncio.Semaphore(concurrency)
+            # Once one chunk hits a 402, stop firing the rest at Arion — the whole object is doomed
+            # until the account tops up, so there's no point billing every remaining chunk.
+            billing_abort = asyncio.Event()
 
             async def upload_chunk(chunk: Chunk) -> ChunkUploadResult:
                 async with semaphore:
-                    return await self._upload_single_chunk(
-                        object_id=object_id,
-                        object_key=object_key,
-                        chunk=chunk,
-                        upload_id=upload_id,
-                        object_version=int(object_version),
-                        account_ss58=account_ss58,
-                        extra_headers=extra_headers,
-                    )
+                    if billing_abort.is_set():
+                        raise RuntimeError("billing_aborted")
+                    try:
+                        return await self._upload_single_chunk(
+                            object_id=object_id,
+                            object_key=object_key,
+                            chunk=chunk,
+                            upload_id=upload_id,
+                            object_version=int(object_version),
+                            account_ss58=account_ss58,
+                            extra_headers=extra_headers,
+                        )
+                    except Exception as e:
+                        if is_billing_error(e):
+                            billing_abort.set()
+                        raise
 
             chunks_sorted = sorted(chunks, key=lambda c: c.id)
 
@@ -286,8 +305,11 @@ class Uploader:
             first_result = await upload_chunk(chunks_sorted[0])
 
             if len(chunks_sorted) > 1:
-                remaining_results = await asyncio.gather(*[upload_chunk(c) for c in chunks_sorted[1:]])
-                all_results = [first_result] + list(remaining_results)
+                results = await asyncio.gather(*[upload_chunk(c) for c in chunks_sorted[1:]], return_exceptions=True)
+                errors = [r for r in results if isinstance(r, Exception)]
+                if errors:
+                    raise next((e for e in errors if is_billing_error(e)), errors[0])
+                all_results = [first_result] + [r for r in results if isinstance(r, ChunkUploadResult)]
             else:
                 all_results = [first_result]
 

@@ -66,8 +66,10 @@ async def _check_can_upload(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
         )
 
-    # Cache successful result for 60s — denials are NOT cached so users can retry after topping up
-    await redis_accounts.set(cache_key, b"1", ex=60)
+    # Cache successful result briefly (can_upload_cache_ttl_seconds) — denials are NOT cached so users
+    # can retry after topping up. Short TTL bounds how long an exhausted account keeps slipping uploads
+    # through after its balance is gone.
+    await redis_accounts.set(cache_key, b"1", ex=config.can_upload_cache_ttl_seconds)
 
     return None
 

@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import uuid
 from typing import Any
 from typing import AsyncIterator
@@ -21,6 +22,29 @@ class DummyRedis:
 
     async def set(self, *_a: Any, **_k: Any) -> None:
         return None
+
+
+class CountingFS(FileSystemPartsStore):
+    """FileSystemPartsStore that records every set_chunk / set_meta call.
+
+    Used to prove the upload path writes each chunk and each part's meta exactly
+    once — the pre-2026-04-21 Redis mirror used to write them a second time.
+    """
+
+    def __init__(self, root: str) -> None:
+        super().__init__(root)
+        self.chunk_calls: list[tuple[int, int]] = []
+        self.meta_calls: list[int] = []
+
+    async def set_chunk(
+        self, object_id: Any, object_version: int, part_number: int, chunk_index: int, data: bytes
+    ) -> None:
+        self.chunk_calls.append((int(part_number), int(chunk_index)))
+        await super().set_chunk(object_id, object_version, part_number, chunk_index, data)
+
+    async def set_meta(self, object_id: Any, object_version: int, part_number: int, **kwargs: Any) -> None:
+        self.meta_calls.append(int(part_number))
+        await super().set_meta(object_id, object_version, part_number, **kwargs)
 
 
 async def _body(*pieces: bytes) -> AsyncIterator[bytes]:
@@ -187,3 +211,56 @@ async def test_acquire_timeout_raises_pool_acquire_timeout(patched_writer: Any) 
 
     with pytest.raises(PoolAcquireTimeout):
         await _run(writer, b"payload")
+
+
+@pytest.fixture
+def counting_writer(tmp_path: Any, monkeypatch: Any):
+    """Like patched_writer but with a CountingFS so we can assert no double writes."""
+    cfg = get_config()
+    monkeypatch.setattr("hippius_s3.writer.object_writer.get_config", lambda: cfg)
+
+    async def fake_kek(*, bucket_id: str) -> tuple[str, bytes]:
+        return ("kek-1", b"\x00" * 32)
+
+    async def fake_upsert(db: Any, **kw: Any) -> dict:
+        return {"object_id": kw["object_id"], "current_object_version": 1}
+
+    async def fake_ensure(db: Any, **kw: Any) -> str:
+        return str(uuid.uuid4())
+
+    async def fake_parts(db: Any, **kw: Any) -> None:
+        return None
+
+    monkeypatch.setattr("hippius_s3.services.kek_service.get_or_create_active_bucket_kek", fake_kek)
+    monkeypatch.setattr("hippius_s3.writer.object_writer.upsert_object_basic", fake_upsert)
+    monkeypatch.setattr("hippius_s3.writer.object_writer.ensure_upload_row", fake_ensure)
+    monkeypatch.setattr("hippius_s3.writer.object_writer.upsert_part_placeholder", fake_parts)
+
+    pool = make_fake_pool()
+    fs_store = CountingFS(str(tmp_path))
+    writer = ObjectWriter(pool=pool, redis_client=DummyRedis(), fs_store=fs_store)
+    return writer, fs_store
+
+
+@pytest.mark.asyncio
+async def test_each_chunk_written_to_fs_once(counting_writer: Any) -> None:
+    """Regression for the double-FS-write: removing the obj_cache.set_chunks mirror means
+    every chunk hits the FS store exactly once (the consumer's set_chunk is the sole write)."""
+    writer, fs_store = counting_writer
+    # Force >1 chunk so a per-chunk duplicate would be obvious.
+    chunk_size = writer.config.object_chunk_size_bytes
+    await _run(writer, b"a" * (chunk_size * 2 + 7))
+
+    counts = collections.Counter(fs_store.chunk_calls)
+    assert all(n == 1 for n in counts.values()), f"a chunk was written more than once: {counts}"
+    # 3 distinct chunks (two full + remainder), each on part 1.
+    assert sorted(fs_store.chunk_calls) == [(1, 0), (1, 1), (1, 2)]
+
+
+@pytest.mark.asyncio
+async def test_meta_written_to_fs_once(counting_writer: Any) -> None:
+    """Regression for the double-meta-write: meta (the part-complete marker, with its
+    file+dir fsync) is written exactly once per part, not twice."""
+    writer, fs_store = counting_writer
+    await _run(writer, b"hello world")
+    assert fs_store.meta_calls == [1], f"meta written {len(fs_store.meta_calls)} times, expected once"
