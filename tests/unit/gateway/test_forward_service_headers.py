@@ -1,4 +1,29 @@
+from types import SimpleNamespace
+from typing import Any
+
 from gateway.services.forward_service import _filter_hop_by_hop_raw_headers
+from gateway.services.forward_service import _trusted_hippius_headers
+
+
+def _request(**state: Any) -> Any:
+    return SimpleNamespace(state=SimpleNamespace(**state))
+
+
+def test_forwards_bucket_id_when_resolved() -> None:
+    headers = _trusted_hippius_headers(_request(account_id="acct", bucket_owner_id="owner", bucket_id="buck-123"))
+    assert headers["X-Hippius-Bucket-Id"] == "buck-123"
+    assert headers["X-Hippius-Bucket-Owner"] == "owner"
+
+
+def test_omits_bucket_id_when_absent() -> None:
+    # No bucket in play (e.g. ListBuckets) — the header must not be emitted.
+    headers = _trusted_hippius_headers(_request(account_id="acct"))
+    assert "X-Hippius-Bucket-Id" not in headers
+
+
+def test_omits_bucket_id_when_empty() -> None:
+    headers = _trusted_hippius_headers(_request(account_id="acct", bucket_id=""))
+    assert "X-Hippius-Bucket-Id" not in headers
 
 
 def test_filters_standard_hop_by_hop_headers() -> None:

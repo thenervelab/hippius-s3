@@ -10,6 +10,7 @@ import asyncpg
 from fastapi import Request
 from fastapi import Response
 from opentelemetry import trace
+from redis.exceptions import RedisError
 
 from hippius_s3 import utils
 from hippius_s3.api.middlewares.tracing import set_span_attributes
@@ -27,6 +28,23 @@ logger = logging.getLogger(__name__)
 config = get_config()
 tracer = trace.get_tracer(__name__)
 
+USER_SEEN_CACHE_TTL_SECONDS = 86400
+
+
+async def _user_needs_upsert(redis_client: Any, main_account_id: str) -> bool:
+    """Whether this main account needs the get_or_create_user DB upsert.
+
+    Uses Redis SET NX so only the first PUT per account within the TTL window touches Postgres
+    (SET NX returns truthy only when the key was absent). Best-effort: a Redis hiccup fails open
+    so we never skip a genuinely-needed upsert.
+    """
+    try:
+        was_set = await redis_client.set(f"user_seen:{main_account_id}", "1", nx=True, ex=USER_SEEN_CACHE_TTL_SECONDS)
+    except RedisError as exc:
+        logger.warning(f"user-seen cache: redis SET failed, running upsert: {exc}")
+        return True
+    return bool(was_set)
+
 
 async def handle_put_object(
     bucket_name: str,
@@ -36,52 +54,69 @@ async def handle_put_object(
     redis_client: Any,
 ) -> Response:
     try:
-        # Get or create user and bucket for this main account.
-        # Both reads run on ONE pooled connection (one acquire instead of two). We do NOT hold it
-        # across the append branch below, so handle_append acquires its own connections.
         main_account_id = request.state.account.main_account
 
-        async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
-            with tracer.start_as_current_span(
-                "put_object.get_or_create_user", attributes={"hippius.account.main": main_account_id}
-            ):
-                await conn.fetchrow(
-                    get_query("get_or_create_user_by_main_account"),
-                    main_account_id,
-                    datetime.now(timezone.utc),
-                )
+        # Detect S4 append semantics via metadata (header-only, no DB).
+        meta_append = request.headers.get("x-amz-meta-append", "").lower() == "true"
 
-            with tracer.start_as_current_span("put_object.get_bucket", attributes={"bucket_name": bucket_name}):
-                bucket = await conn.fetchrow(
-                    get_query("get_bucket_by_name"),
-                    bucket_name,
-                )
+        # The gateway's ACL middleware already resolved this bucket and forwards its id as
+        # X-Hippius-Bucket-Id, so the common PUT path can skip a duplicate get_bucket_by_name.
+        # Append still needs the full bucket row, so it always does the lookup.
+        forwarded_bucket_id = getattr(request.state, "bucket_id", "") or ""
+        needs_bucket_row = meta_append or not forwarded_bucket_id
 
-        if not bucket:
-            return errors.s3_error_response(
-                "NoSuchBucket",
-                f"The specified bucket {bucket_name} does not exist",
-                status_code=404,
-                BucketName=bucket_name,
-            )
+        # Skip the per-PUT user upsert for accounts we've seen recently (Redis NX cache).
+        user_needs_upsert = await _user_needs_upsert(redis_client, main_account_id)
 
-        bucket_id = bucket["bucket_id"]
+        # Acquire a pooled connection only when there is DB work. For a known account on a
+        # forwarded-bucket PUT, both reads are skipped and we never touch the pool here. We do NOT
+        # hold the connection across the append branch below, so handle_append acquires its own.
+        bucket = None
+        if user_needs_upsert or needs_bucket_row:
+            async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
+                if user_needs_upsert:
+                    with tracer.start_as_current_span(
+                        "put_object.get_or_create_user", attributes={"hippius.account.main": main_account_id}
+                    ):
+                        await conn.fetchrow(
+                            get_query("get_or_create_user_by_main_account"),
+                            main_account_id,
+                            datetime.now(timezone.utc),
+                        )
+
+                if needs_bucket_row:
+                    with tracer.start_as_current_span("put_object.get_bucket", attributes={"bucket_name": bucket_name}):
+                        bucket = await conn.fetchrow(
+                            get_query("get_bucket_by_name"),
+                            bucket_name,
+                        )
 
         content_type = request.headers.get("Content-Type", "application/octet-stream")
 
-        # Detect S4 append semantics via metadata
-        meta_append = request.headers.get("x-amz-meta-append", "").lower() == "true"
-        if meta_append:
-            return await handle_append(
-                request,
-                pool,
-                redis_client,
-                bucket=bucket,
-                bucket_id=bucket_id,
-                bucket_name=bucket_name,
-                object_key=object_key,
-                body_iter=utils.iter_request_body(request),
-            )
+        if needs_bucket_row:
+            if not bucket:
+                return errors.s3_error_response(
+                    "NoSuchBucket",
+                    f"The specified bucket {bucket_name} does not exist",
+                    status_code=404,
+                    BucketName=bucket_name,
+                )
+            bucket_id = bucket["bucket_id"]
+            # Append is handled here, where `bucket` is known non-None (meta_append forces
+            # needs_bucket_row, so the row was fetched above) and handle_append requires the full row.
+            if meta_append:
+                return await handle_append(
+                    request,
+                    pool,
+                    redis_client,
+                    bucket=bucket,
+                    bucket_id=bucket_id,
+                    bucket_name=bucket_name,
+                    object_key=object_key,
+                    body_iter=utils.iter_request_body(request),
+                )
+        else:
+            bucket_id = forwarded_bucket_id
 
         # Regular non-append PutObject path (streamed)
         content_length = request.headers.get("content-length")

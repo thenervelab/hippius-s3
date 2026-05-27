@@ -20,6 +20,7 @@ patches:
   - path: services-patch.yaml
   - path: local-cache-patch.yaml
   - path: local-cache-configmap-patch.yaml
+  - path: postgres-nvme-initwait-patch.yaml
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api

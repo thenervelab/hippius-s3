@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from redis.exceptions import ConnectionError as RedisConnectionError
 from starlette.datastructures import Headers
 
 from hippius_s3.api.s3.objects import put_object_endpoint
@@ -37,6 +38,44 @@ def _bucket_missing_router(method: str, query: str, args: tuple) -> Any:
     return None
 
 
+class _FakeRedis:
+    """Minimal Redis double for the user-seen SET NX cache.
+
+    nx_result mimics redis-py: True when the key was set (first sighting), None when it already
+    existed (cache hit). Records calls so tests can assert the cache was consulted.
+    """
+
+    def __init__(self, nx_result: Any = True) -> None:
+        self.nx_result = nx_result
+        self.set_calls: list[tuple[str, bool, Any]] = []
+
+    async def set(self, key: str, value: str, nx: bool = False, ex: Any = None) -> Any:
+        self.set_calls.append((key, nx, ex))
+        return self.nx_result
+
+
+def _has_query(pool: Any, needle: str) -> bool:
+    return any(needle in (e.get("query") or "") for e in pool.events)
+
+
+def _patch_writer(monkeypatch: Any, captured: dict[str, Any]) -> None:
+    async def fake_put(self: Any, **kw: Any) -> PutResult:
+        captured["bucket_id"] = kw["bucket_id"]
+        return PutResult(
+            object_id=str(uuid.uuid4()),
+            etag="etag",
+            size_bytes=3,
+            upload_id=str(uuid.uuid4()),
+            object_version=1,
+        )
+
+    async def fake_enqueue(**_kw: Any) -> None:
+        return None
+
+    monkeypatch.setattr(put_object_endpoint.ObjectWriter, "put_simple_stream_full", fake_put)
+    monkeypatch.setattr(put_object_endpoint, "writer_enqueue_upload", fake_enqueue)
+
+
 @pytest.mark.asyncio
 async def test_missing_bucket_404_inside_scope() -> None:
     """Missing bucket returns 404 NoSuchBucket; user+bucket resolved in a single acquire and the
@@ -47,7 +86,7 @@ async def test_missing_bucket_404_inside_scope() -> None:
         object_key="k",
         request=_fake_request(),
         pool=pool,
-        redis_client=SimpleNamespace(),
+        redis_client=_FakeRedis(),
     )
     assert resp.status_code == 404
     assert b"NoSuchBucket" in bytes(resp.body)
@@ -81,7 +120,7 @@ async def test_head_lookups_single_acquire(monkeypatch: Any) -> None:
         object_key="k/o.json",
         request=_fake_request({"Content-Type": "application/json"}),
         pool=pool,
-        redis_client=SimpleNamespace(),
+        redis_client=_FakeRedis(),
     )
     assert resp.status_code == 200
 
@@ -114,7 +153,116 @@ async def test_acquire_timeout_returns_503_not_500() -> None:
         object_key="k",
         request=_fake_request(),
         pool=pool,
-        redis_client=SimpleNamespace(),
+        redis_client=_FakeRedis(),
     )
     assert resp.status_code == 503
     assert resp.headers.get("x-amz-error-code") == "SlowDown"
+
+
+@pytest.mark.asyncio
+async def test_skips_bucket_lookup_when_forwarded(monkeypatch: Any) -> None:
+    """Fix 2: when the gateway forwards X-Hippius-Bucket-Id (request.state.bucket_id), the
+    non-append PUT path reuses it and skips its own get_bucket_by_name."""
+    pool = make_fake_pool(_bucket_present_router)
+    captured: dict[str, Any] = {}
+    _patch_writer(monkeypatch, captured)
+
+    fwd_id = str(uuid.uuid4())
+    req = _fake_request({"Content-Type": "application/json"})
+    req.state.bucket_id = fwd_id
+
+    resp = await handle_put_object(
+        bucket_name="bkt",
+        object_key="k/o.json",
+        request=req,
+        pool=pool,
+        redis_client=_FakeRedis(nx_result=True),
+    )
+    assert resp.status_code == 200
+    assert not _has_query(pool, "Get bucket by name"), "forwarded bucket_id should skip the API lookup"
+    assert captured["bucket_id"] == fwd_id
+
+
+@pytest.mark.asyncio
+async def test_skips_user_upsert_when_cached(monkeypatch: Any) -> None:
+    """Fix 5: a Redis SET NX cache-hit (key already present) skips the per-PUT user upsert."""
+    pool = make_fake_pool(_bucket_present_router)
+    captured: dict[str, Any] = {}
+    _patch_writer(monkeypatch, captured)
+
+    redis = _FakeRedis(nx_result=None)  # None == key already existed == cache hit
+    resp = await handle_put_object(
+        bucket_name="bkt",
+        object_key="k/o.json",
+        request=_fake_request({"Content-Type": "application/json"}),
+        pool=pool,
+        redis_client=redis,
+    )
+    assert resp.status_code == 200
+    assert redis.set_calls and redis.set_calls[0][1] is True, "user-seen cache must use SET NX"
+    assert not _has_query(pool, "Get or create"), "cached user must not trigger the upsert"
+
+
+@pytest.mark.asyncio
+async def test_runs_user_upsert_on_first_sight(monkeypatch: Any) -> None:
+    """Fix 5: the first PUT for an account (SET NX returns truthy) still runs the upsert."""
+    pool = make_fake_pool(_bucket_present_router)
+    captured: dict[str, Any] = {}
+    _patch_writer(monkeypatch, captured)
+
+    resp = await handle_put_object(
+        bucket_name="bkt",
+        object_key="k/o.json",
+        request=_fake_request({"Content-Type": "application/json"}),
+        pool=pool,
+        redis_client=_FakeRedis(nx_result=True),
+    )
+    assert resp.status_code == 200
+    assert _has_query(pool, "Get or create"), "first sighting must run the user upsert"
+
+
+@pytest.mark.asyncio
+async def test_user_upsert_runs_when_redis_errors(monkeypatch: Any) -> None:
+    """Fix 5 fail-open: a Redis outage must not skip the upsert — it falls back to running it."""
+    pool = make_fake_pool(_bucket_present_router)
+    captured: dict[str, Any] = {}
+    _patch_writer(monkeypatch, captured)
+
+    class _ErrRedis:
+        async def set(self, *_a: Any, **_k: Any) -> Any:
+            raise RedisConnectionError("redis down")
+
+    resp = await handle_put_object(
+        bucket_name="bkt",
+        object_key="k/o.json",
+        request=_fake_request({"Content-Type": "application/json"}),
+        pool=pool,
+        redis_client=_ErrRedis(),
+    )
+    assert resp.status_code == 200
+    assert _has_query(pool, "Get or create"), "redis error must fall open to running the upsert"
+
+
+@pytest.mark.asyncio
+async def test_no_head_acquire_when_user_cached_and_bucket_forwarded(monkeypatch: Any) -> None:
+    """Fix 2 + Fix 5 compose: a known account on a forwarded-bucket PUT does zero head-scope DB
+    work. Only the existing-object check and the post-enqueue is_completed update acquire."""
+    pool = make_fake_pool(_bucket_present_router)
+    captured: dict[str, Any] = {}
+    _patch_writer(monkeypatch, captured)
+
+    req = _fake_request({"Content-Type": "application/json"})
+    req.state.bucket_id = str(uuid.uuid4())
+
+    resp = await handle_put_object(
+        bucket_name="bkt",
+        object_key="k/o.json",
+        request=req,
+        pool=pool,
+        redis_client=_FakeRedis(nx_result=None),
+    )
+    assert resp.status_code == 200
+    assert not _has_query(pool, "Get or create")
+    assert not _has_query(pool, "Get bucket by name")
+    # existing-object check (1) + is_completed-after-enqueue (1); the head user+bucket acquire is gone.
+    assert pool.acquire_count == 2

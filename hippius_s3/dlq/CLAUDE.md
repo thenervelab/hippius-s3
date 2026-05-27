@@ -79,20 +79,5 @@ The janitor scans DLQs to protect object_ids from cache eviction while the DLQ e
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #1758 | 10:57 AM | ✅ | Added Ty Type Ignore Comment for HTTPX Response Attribute | ~363 |
-| #1669 | 10:14 AM | 🔵 | Comprehensive Authentication Architecture Analysis - No STS/OAuth Implementation Exists | ~806 |
-| #1663 | 10:12 AM | 🔵 | Hippius API Client Architecture and Authentication Flow | ~741 |
-
-### Feb 14, 2026
-
-| ID | Time | T | Title | Read |
-|----|------|---|-------|------|
-| #1900 | 9:22 PM | ⚖️ | System Already Supports Variable Chunk Sizes with Full Backward Compatibility | ~614 |
-| #1889 | 9:18 PM | 🔵 | Parts Table Stores Chunk Size Per Part in Database Schema | ~395 |
-
-### Apr 20, 2026
-
-| ID | Time | T | Title | Read |
-|----|------|---|-------|------|
-| #6608 | 6:34 PM | 🔵 | API Client and ACL Service Tests Reveal Sub-Token Action Check Gap | ~503 |
+| #1756 | 10:57 AM | ✅ | Added Ty Type Ignore Comment for Pydantic Field Assignment | ~401 |
 </claude-mem-context>

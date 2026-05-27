@@ -3,6 +3,7 @@ import logging
 import asyncpg
 import redis.asyncio as redis
 from pydantic import BaseModel
+from redis.exceptions import RedisError
 
 from gateway.repositories.cached_acl_repository import CachedACLRepository
 from hippius_s3.models.acl import ACL
@@ -29,12 +30,41 @@ class ACLService:
 
     def __init__(self, db_pool: asyncpg.Pool, redis_client: redis.Redis | None = None, cache_ttl: int = 600):
         base_repo = ACLRepository(db_pool)
+        self._redis = redis_client
+        self._cache_ttl = cache_ttl
         if redis_client:
             self.acl_repo = CachedACLRepository(base_repo, redis_client, cache_ttl)
             logger.info(f"ACLService initialized with Redis caching (TTL={cache_ttl}s)")
         else:
             self.acl_repo = base_repo
             logger.info("ACLService initialized (direct DB queries, no caching)")
+
+    @staticmethod
+    def _bucket_meta_key(bucket: str) -> str:
+        return f"hippius_acl:bucketmeta:{bucket}"
+
+    async def _cache_get_bucket_meta(self, bucket: str) -> BucketLookup | None:
+        # Best-effort: a Redis hiccup falls back to the DB so bucket resolution never hard-depends
+        # on Redis being up — master-token / anonymous requests bypass check_permission and must
+        # keep working during a redis-acl outage.
+        if self._redis is None:
+            return None
+        try:
+            cached = await self._redis.get(self._bucket_meta_key(bucket))
+        except RedisError as exc:
+            logger.warning(f"bucket-meta cache: redis GET failed, falling through to DB: {exc}")
+            cached = None
+        if cached:
+            return BucketLookup.model_validate_json(cached)
+        return None
+
+    async def _cache_set_bucket_meta(self, bucket: str, lookup: BucketLookup) -> None:
+        if self._redis is None:
+            return
+        try:
+            await self._redis.setex(self._bucket_meta_key(bucket), self._cache_ttl, lookup.model_dump_json())
+        except RedisError as exc:
+            logger.warning(f"bucket-meta cache: redis SETEX failed (best-effort, continuing): {exc}")
 
     async def canned_acl_to_acl(self, canned_acl: str, owner_id: str, bucket: str | None = None) -> ACL:
         """Convert canned ACL name to ACL object with grants."""
@@ -79,7 +109,16 @@ class ACLService:
         Preferred over calling get_bucket_owner() + get_bucket_id() separately
         on hot paths (e.g. acl_middleware). Returns None when the bucket does
         not exist.
+
+        Redis-cached (hits only) to spare every request a buckets-table query. Owner/id are
+        immutable for a bucket's lifetime; is_cache_warm can flip, so it lags by at most the TTL.
+        Non-existent buckets are never cached, so a freshly-created bucket is visible immediately.
+        The cache is a pure optimization — a Redis outage transparently falls back to the DB.
         """
+        cached = await self._cache_get_bucket_meta(bucket)
+        if cached is not None:
+            return cached
+
         query = (
             "SELECT main_account_id, bucket_id, is_cache_warm FROM buckets "
             "WHERE bucket_name = $1 AND deleted_at IS NULL"
@@ -87,11 +126,14 @@ class ACLService:
         row = await self.acl_repo.db.fetchrow(query, bucket)
         if row is None:
             return None
-        return BucketLookup(
+        lookup = BucketLookup(
             owner_id=str(row["main_account_id"]),
             bucket_id=str(row["bucket_id"]),
             is_cache_warm=bool(row["is_cache_warm"]),
         )
+
+        await self._cache_set_bucket_meta(bucket, lookup)
+        return lookup
 
     async def get_object_owner(self, bucket: str, key: str) -> str | None:
         """Get object owner (inherits from bucket owner)."""
