@@ -111,4 +111,5 @@ Writes to a full disk raise `OSError(ENOSPC)`. The API has [fs_cache_pressure_mi
 | #6828 | 1:36 PM | 🔴 | Fixed FileSystemPartsStore to handle UUID objects from asyncpg | ~531 |
 | #6801 | 1:01 PM | 🟣 | Committed comprehensive PR #146 code review fixes addressing critical safety issues | ~1390 |
 | #6786 | 12:49 PM | 🔄 | Removed Redis download cache classes from cache module public API | ~477 |
+| #6761 | 12:40 PM | 🔵 | Critical s3-backup PR #7 parity review reveals data loss risk | ~878 |
 </claude-mem-context>

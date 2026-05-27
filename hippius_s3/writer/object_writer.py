@@ -283,34 +283,6 @@ class ObjectWriter:
         write_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(maxsize=16)
         consumer_error: BaseException | None = None
 
-        # Write-through: FS writes in consumer loop (fatal), Redis batched after stream (best-effort)
-        redis_chunks: list[bytes] = []
-        redis_batch_start_index = 0
-        perf_redis_ms = 0.0
-
-        async def _flush_redis_batch() -> None:
-            nonlocal perf_redis_ms, redis_batch_start_index
-            if not redis_chunks:
-                return
-            t0 = time.monotonic()
-            try:
-                await self.obj_cache.set_chunks(
-                    object_id,
-                    int(object_version),
-                    int(part_number),
-                    list(redis_chunks),
-                    ttl=ttl,
-                    start_index=redis_batch_start_index,
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Redis batch chunk write failed (best-effort): object_id={object_id} "
-                    f"v={object_version} part={part_number} chunks={len(redis_chunks)}: {e}"
-                )
-            perf_redis_ms += (time.monotonic() - t0) * 1000
-            redis_batch_start_index += len(redis_chunks)
-            redis_chunks.clear()
-
         async def _consumer() -> None:
             nonlocal consumer_error, perf_fs_ms
             while True:
@@ -332,9 +304,6 @@ class ObjectWriter:
                     break
                 t_io_end = time.monotonic()
                 io_ms = (t_io_end - t_io_start) * 1000
-                redis_chunks.append(ct)
-                if len(redis_chunks) >= 16:
-                    await _flush_redis_batch()
                 perf_fs_ms += io_ms
                 logger.debug(f"PERF chunk {chunk_idx}: io={io_ms:.1f}ms (fs) size={len(ct)}")
 
@@ -403,9 +372,6 @@ class ObjectWriter:
             await consumer_task
             if consumer_error:
                 raise consumer_error
-
-            # Flush remaining Redis batch (best-effort)
-            await _flush_redis_batch()
 
             md5_hash = hasher.hexdigest()
             perf_stream_total_ms = (time.monotonic() - perf_stream_start) * 1000
@@ -495,7 +461,7 @@ class ObjectWriter:
         logger.info(
             f"PERF put_simple object_id={object_id} size={total_size} chunks={num_chunks} "
             f"stream={perf_stream_total_ms:.0f}ms (enc={perf_encrypt_ms:.0f}ms io={perf_fs_ms:.0f}ms queue_wait={perf_queue_wait_ms:.0f}ms) "
-            f"redis={perf_redis_ms:.0f}ms post_db={perf_post_ms:.0f}ms throughput={throughput_mbps:.1f}MB/s"
+            f"post_db={perf_post_ms:.0f}ms throughput={throughput_mbps:.1f}MB/s"
         )
 
         return PutResult(
@@ -743,34 +709,6 @@ class ObjectWriter:
                         int(part_number),
                     )
 
-        # Write-through: FS writes in consumer loop (fatal), Redis batched after stream (best-effort)
-        mpu_redis_chunks: list[bytes] = []
-        mpu_redis_batch_start_index = 0
-        perf_redis_ms = 0.0
-
-        async def _flush_mpu_redis_batch() -> None:
-            nonlocal perf_redis_ms, mpu_redis_batch_start_index
-            if not mpu_redis_chunks:
-                return
-            t0 = time.monotonic()
-            try:
-                await self.obj_cache.set_chunks(
-                    str(object_id),
-                    int(object_version),
-                    int(part_number),
-                    list(mpu_redis_chunks),
-                    ttl=ttl,
-                    start_index=mpu_redis_batch_start_index,
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Redis batch chunk write failed (best-effort): object_id={object_id} "
-                    f"v={object_version} part={part_number} chunks={len(mpu_redis_chunks)}: {e}"
-                )
-            perf_redis_ms += (time.monotonic() - t0) * 1000
-            mpu_redis_batch_start_index += len(mpu_redis_chunks)
-            mpu_redis_chunks.clear()
-
         async def _consumer() -> None:
             nonlocal consumer_error, perf_fs_ms
             while True:
@@ -792,9 +730,6 @@ class ObjectWriter:
                     break
                 t_io_end = time.monotonic()
                 io_ms = (t_io_end - t_io_start) * 1000
-                mpu_redis_chunks.append(ct)
-                if len(mpu_redis_chunks) >= 16:
-                    await _flush_mpu_redis_batch()
                 written_chunk_indices.append(chunk_idx)
                 perf_fs_ms += io_ms
                 logger.debug(f"PERF mpu chunk {chunk_idx}: io={io_ms:.1f}ms (fs) size={len(ct)}")
@@ -874,9 +809,6 @@ class ObjectWriter:
             if consumer_error:
                 raise consumer_error
 
-            # Flush remaining Redis batch (best-effort)
-            await _flush_mpu_redis_batch()
-
             await writer.write_meta(
                 str(object_id),
                 int(object_version),
@@ -914,7 +846,7 @@ class ObjectWriter:
         logger.info(
             f"PERF mpu_part object_id={object_id} part={part_number} size={total_size} chunks={next_chunk_index} "
             f"stream={perf_stream_total_ms:.0f}ms (enc={perf_encrypt_ms:.0f}ms io={perf_fs_ms:.0f}ms queue_wait={perf_queue_wait_ms:.0f}ms) "
-            f"redis={perf_redis_ms:.0f}ms post_db={perf_post_ms:.0f}ms throughput={throughput_mbps:.1f}MB/s"
+            f"post_db={perf_post_ms:.0f}ms throughput={throughput_mbps:.1f}MB/s"
         )
 
         return PartResult(etag=md5_hash, size_bytes=int(total_size), part_number=int(part_number))

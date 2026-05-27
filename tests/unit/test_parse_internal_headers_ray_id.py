@@ -20,6 +20,7 @@ def api_app() -> Any:
             "ray_id": getattr(request.state, "ray_id", "not-set"),
             "has_logger": hasattr(request.state, "logger"),
             "account_id": getattr(request.state, "account_id", "not-set"),
+            "bucket_id": getattr(request.state, "bucket_id", "not-set"),
         }
 
     app.middleware("http")(parse_internal_headers_middleware)
@@ -72,3 +73,22 @@ async def test_parse_internal_headers_preserves_other_headers(api_app: Any) -> N
     data = response.json()
     assert data["ray_id"] == "a1b2c3d4e5f67890"
     assert data["account_id"] == "test-account-123"
+
+
+@pytest.mark.asyncio
+async def test_parse_internal_headers_extracts_bucket_id(api_app: Any) -> None:
+    async with AsyncClient(transport=ASGITransport(app=api_app), base_url="http://test") as client:
+        response = await client.get("/test", headers={"X-Hippius-Bucket-Id": "buck-abc-123"})
+
+    assert response.status_code == 200
+    assert response.json()["bucket_id"] == "buck-abc-123"
+
+
+@pytest.mark.asyncio
+async def test_parse_internal_headers_defaults_bucket_id_empty(api_app: Any) -> None:
+    async with AsyncClient(transport=ASGITransport(app=api_app), base_url="http://test") as client:
+        response = await client.get("/test")
+
+    assert response.status_code == 200
+    # Absent header → empty string (falsy), so the endpoint falls back to its own lookup.
+    assert response.json()["bucket_id"] == ""

@@ -25,6 +25,41 @@ _HOP_BY_HOP_HEADERS = {
 }
 
 
+def _trusted_hippius_headers(request: Request) -> dict[str, str]:
+    """Build the trusted X-Hippius-* context headers injected into forwarded requests.
+
+    The gateway strips any client-supplied X-Hippius-* headers and replaces them with these,
+    derived from authenticated request.state. X-Hippius-Gateway-Time-Ms is added separately by
+    forward_request since it depends on elapsed time.
+    """
+    headers: dict[str, str] = {}
+
+    if hasattr(request.state, "ray_id"):
+        headers["X-Hippius-Ray-ID"] = request.state.ray_id
+
+    if hasattr(request.state, "account_id"):
+        headers["X-Hippius-Request-User"] = request.state.account_id
+
+    bucket_owner = getattr(request.state, "bucket_owner_id", None) or getattr(request.state, "account_id", "")
+    if bucket_owner:
+        headers["X-Hippius-Bucket-Owner"] = bucket_owner
+        headers["X-Hippius-Main-Account"] = bucket_owner
+
+    # Forwarded so the API can skip its own get_bucket_by_name lookup (resolved by the ACL middleware).
+    bucket_id = getattr(request.state, "bucket_id", None)
+    if bucket_id:
+        headers["X-Hippius-Bucket-Id"] = str(bucket_id)
+
+    if hasattr(request.state, "seed_phrase"):
+        headers["X-Hippius-Seed"] = request.state.seed_phrase
+    if hasattr(request.state, "account"):
+        headers["X-Hippius-Has-Credits"] = str(request.state.account.has_credits)
+        headers["X-Hippius-Can-Upload"] = str(request.state.account.upload)
+        headers["X-Hippius-Can-Delete"] = str(request.state.account.delete)
+
+    return headers
+
+
 def _filter_hop_by_hop_raw_headers(raw_headers: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
     """
     Filter hop-by-hop headers from raw (multi-value preserving) header list.
@@ -74,23 +109,7 @@ class ForwardService:
                 logger.warning(f"Stripped client-provided header: {key}")
 
         # Add authenticated context headers from gateway
-        if hasattr(request.state, "ray_id"):
-            headers["X-Hippius-Ray-ID"] = request.state.ray_id
-
-        if hasattr(request.state, "account_id"):
-            headers["X-Hippius-Request-User"] = request.state.account_id
-
-        bucket_owner = getattr(request.state, "bucket_owner_id", None) or getattr(request.state, "account_id", "")
-        if bucket_owner:
-            headers["X-Hippius-Bucket-Owner"] = bucket_owner
-            headers["X-Hippius-Main-Account"] = bucket_owner
-
-        if hasattr(request.state, "seed_phrase"):
-            headers["X-Hippius-Seed"] = request.state.seed_phrase
-        if hasattr(request.state, "account"):
-            headers["X-Hippius-Has-Credits"] = str(request.state.account.has_credits)
-            headers["X-Hippius-Can-Upload"] = str(request.state.account.upload)
-            headers["X-Hippius-Can-Delete"] = str(request.state.account.delete)
+        headers.update(_trusted_hippius_headers(request))
 
         # Remove proxy-related headers that shouldn't be forwarded
         for key in list(headers.keys()):
