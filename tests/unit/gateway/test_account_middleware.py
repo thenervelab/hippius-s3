@@ -30,6 +30,7 @@ def mock_config_no_bypass() -> Any:
     config = MagicMock()
     config.bypass_credit_check = False
     config.substrate_url = "ws://localhost:9944"
+    config.can_upload_cache_ttl_seconds = 10
     return config
 
 
@@ -404,7 +405,7 @@ async def test_can_upload_cache_hit_skips_arion_call(mock_config_no_bypass: Any,
 
 @pytest.mark.asyncio
 async def test_can_upload_cache_miss_calls_arion_and_caches(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
-    """On cache miss, Arion is called and a successful result is cached with 60s TTL."""
+    """On cache miss, Arion is called and a successful result is cached with the configured TTL."""
     mock_arion = MockArionService(allow_upload=True)
     mock_redis = AsyncMock()
     mock_redis.get = AsyncMock(return_value=None)
@@ -420,7 +421,7 @@ async def test_can_upload_cache_miss_calls_arion_and_caches(mock_config_no_bypas
     mock_redis.set.assert_called_once_with(
         "can_upload:5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
         b"1",
-        ex=60,
+        ex=10,
     )
 
 
