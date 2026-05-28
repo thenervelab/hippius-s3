@@ -1,7 +1,7 @@
 # Prod-only override: point the init-container DB readiness waits at the NVMe
-# cluster (postgres-rw) instead of the Ceph cluster (postgres-rw).
+# cluster (postgres-nvme-rw) instead of the Ceph cluster (postgres-rw).
 #
-# This lives in the PRODUCTION overlay only. The shared base (k8s/base) keeps
+# Lives in the PRODUCTION overlay only. The shared base (k8s/base) keeps
 # `postgres-rw` so STAGING — which has no postgres-nvme cluster — is unaffected.
 # Required before decommissioning the Ceph `postgres` cluster, otherwise these
 # gates would hang once the postgres-rw Service is removed.
@@ -17,7 +17,7 @@ spec:
           command:
             - sh
             - -c
-            - until pg_isready -h postgres-rw -p 5432 -U postgres; do echo waiting for postgres; sleep 5; done
+            - until pg_isready -h postgres-nvme-rw -p 5432 -U postgres; do echo waiting for postgres; sleep 5; done
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -31,7 +31,7 @@ spec:
           command:
             - sh
             - -c
-            - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
+            - until nc -z postgres-nvme-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -45,7 +45,7 @@ spec:
           command:
             - sh
             - -c
-            - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
+            - until nc -z postgres-nvme-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -59,7 +59,7 @@ spec:
           command:
             - sh
             - -c
-            - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
+            - until nc -z postgres-nvme-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -73,7 +73,7 @@ spec:
           command:
             - sh
             - -c
-            - until nc -z postgres-rw 5432 && nc -z redis 6379; do echo waiting for services; sleep 5; done
+            - until nc -z postgres-nvme-rw 5432 && nc -z redis 6379; do echo waiting for services; sleep 5; done
 ---
 apiVersion: batch/v1
 kind: Job
@@ -87,4 +87,4 @@ spec:
           command:
             - sh
             - -c
-            - until pg_isready -h postgres-rw -p 5432 -U postgres; do echo waiting for postgres; sleep 5; done
+            - until pg_isready -h postgres-nvme-rw -p 5432 -U postgres; do echo waiting for postgres; sleep 5; done

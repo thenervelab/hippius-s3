@@ -38,10 +38,9 @@ async def cache_invalidation_middleware(
     if acl_service is None:
         return response
 
-    # Best-effort invalidation. If redis-acl is unreachable, swallow and log:
-    # the upstream API has already committed the soft-delete, and a 500 here
-    # would confuse the client (DeleteBucket appears to have failed but the
-    # bucket IS deleted). Cache TTL bounds staleness to 600s.
+    # Best-effort: a redis-acl outage at delete time must not turn a successful
+    # 204 into a 500 (the upstream API has already committed the soft-delete).
+    # Cache TTL (600s) bounds staleness if invalidation fails.
     try:
         await _invalidate_bucket_acl_cache(acl_service, bucket_name)
     except Exception:
