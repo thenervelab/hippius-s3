@@ -188,6 +188,8 @@ jobs:
         run: |
           sed -i "s|OVH_BACKUP_BUCKET_PLACEHOLDER|${{ secrets.OVH_BACKUP_BUCKET }}|g" k8s/production/postgres-objectstore.yaml
           sed -i "s|OVH_BACKUP_ENDPOINT_URL_PLACEHOLDER|${{ secrets.OVH_BACKUP_ENDPOINT_URL }}|g" k8s/production/postgres-objectstore.yaml
+          sed -i "s|OVH_BACKUP_BUCKET_PLACEHOLDER|${{ secrets.OVH_BACKUP_BUCKET }}|g" k8s/production/postgres-nvme-objectstore.yaml
+          sed -i "s|OVH_BACKUP_ENDPOINT_URL_PLACEHOLDER|${{ secrets.OVH_BACKUP_ENDPOINT_URL }}|g" k8s/production/postgres-nvme-objectstore.yaml
 
       - name: Substitute Arion configuration values
         run: |

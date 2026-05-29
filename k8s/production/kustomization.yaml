@@ -6,6 +6,8 @@ namespace: hippius-s3-prod
 resources:
   - ../base
   - postgres-objectstore.yaml
+  - postgres-nvme-objectstore.yaml
+  - postgres-nvme-scheduledbackup.yaml
   - gateway-nodeport.yaml
   - pv-local-cache.yaml
   - pvc-local-cache.yaml

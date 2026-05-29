@@ -1,0 +1,15 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: daily-backup-nvme
+spec:
+  # CNPG cron is 6-field, seconds-first (sec min hour dom mon dow).
+  # Daily at 02:30 UTC — 30 min after the Ceph daily-backup so the two
+  # don't race on the OVH bucket / network during the bake period.
+  schedule: "0 30 2 * * *"
+  backupOwnerReference: self
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+  cluster:
+    name: postgres-nvme
