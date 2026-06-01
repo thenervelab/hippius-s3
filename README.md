@@ -299,7 +299,6 @@ gateway/               Public-facing FastAPI gateway (port 8080)
 workers/               Worker entry points (run_*_in_loop.py)
 cacher/                Substrate account data cacher
 tests/                 Unit, integration, E2E, ACL test suites
-benchmark/             Performance benchmarking tools
 examples/              Python and JavaScript client examples
 docs/                  Architecture and specification docs
 k8s/                   Kubernetes manifests (base, staging, production, otel)
@@ -355,11 +354,9 @@ docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
 
 Pre-built Grafana dashboards: Hippius S3 Overview (API performance, request rates, error rates) and S3 Workers (queue depths, processing rates, backend latency).
 
-## Daily S3 Benchmark (last 30 days)
+## Benchmarks
 
-![Daily benchmark](https://s3.hippius.com/hippius-benchmarks/daily.svg)
-
-Automated daily benchmark measuring PUT/GET throughput for 1MB, 100MB, and 1GB objects against production. Runs via GitHub Actions at 6 AM UTC ([`.github/workflows/production-daily-benchmark.yml`](.github/workflows/production-daily-benchmark.yml)).
+Performance benchmarks live in the separate [`hippius-benchmarks`](https://github.com/thenervelab/hippius-benchmarks) repo. The public S3 dashboard is at <https://s3.hippius.com/veggies/s3/benchmark.html>.
 
 ## License
 

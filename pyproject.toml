@@ -130,7 +130,6 @@ max-complexity = 13 # TODO: get this down to 8
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 "examples/*.py" = ["T201", "PTH"]
-"benchmark/*.py" = ["T201", "SIM108", "PTH123"]
 "tests/**/*.py" = [
     "T201",      # print statements
     "ERA001",    # commented out code

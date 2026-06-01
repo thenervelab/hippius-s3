@@ -54,9 +54,10 @@ The pipeline is deliberately split so the user-facing path (gateway + API) is fa
 ├── docs/                    # Architecture and spec docs (s4.md, s3-compatibility.md)
 ├── k8s/                     # Kustomize manifests: base/, staging/, production/, cache/, otel/
 ├── monitoring/              # Grafana dashboards, observability config
-├── examples/                # Python and JavaScript client examples
-└── benchmark/               # Performance benchmarking
+└── examples/                # Python and JavaScript client examples
 ```
+
+Performance benchmarks live in the separate `hippius-benchmarks` repo, not here.
 
 A **subsystem index** with links to per-directory `CLAUDE.md` files is in section 7 below.
 
@@ -259,7 +260,7 @@ Canonicalization uses `request.scope["raw_path"]` (bytes) rather than `request.u
 
 ### Scripts
 - [hippius_s3/scripts/CLAUDE.md](hippius_s3/scripts/CLAUDE.md) — operational and migration scripts.
-- [scripts/CLAUDE.md](scripts/CLAUDE.md) — top-level ops scripts (benchmarks, smoke tests, dump generators).
+- [scripts/CLAUDE.md](scripts/CLAUDE.md) — top-level ops scripts (smoke tests, dump generators).
 
 ### Tests
 - [tests/unit/CLAUDE.md](tests/unit/CLAUDE.md), [tests/integration/CLAUDE.md](tests/integration/CLAUDE.md), [tests/e2e/CLAUDE.md](tests/e2e/CLAUDE.md).
