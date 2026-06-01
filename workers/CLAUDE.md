@@ -100,4 +100,12 @@ Config:
 |----|------|---|-------|------|
 | #6801 | 1:01 PM | 🟣 | Committed comprehensive PR #146 code review fixes addressing critical safety issues | ~1390 |
 | #6779 | 12:48 PM | ✅ | Janitor documentation strengthened to emphasize absolute replication safety | ~726 |
+| #6761 | 12:40 PM | 🔵 | Critical s3-backup PR #7 parity review reveals data loss risk | ~878 |
+
+### May 12, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #7721 | 11:50 AM | 🔵 | Complete Sentry integration pattern documented for hippius-s3 | ~629 |
+| #7720 | 11:49 AM | 🔵 | Sentry configuration pattern in hippius-s3 repository | ~506 |
 </claude-mem-context>

@@ -111,4 +111,11 @@ Unit tests for gateway-specific logic: [tests/unit/gateway/](../tests/unit/gatew
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
 | #6615 | 6:35 PM | 🔵 | Gateway Application Initializes ACLService with Database and Redis | ~451 |
+
+### May 12, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #7721 | 11:50 AM | 🔵 | Complete Sentry integration pattern documented for hippius-s3 | ~629 |
+| #7720 | 11:49 AM | 🔵 | Sentry configuration pattern in hippius-s3 repository | ~506 |
 </claude-mem-context>

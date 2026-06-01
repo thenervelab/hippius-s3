@@ -1,15 +1,15 @@
 apiVersion: postgresql.cnpg.io/v1
 kind: ScheduledBackup
 metadata:
-  name: daily-backup
+  name: daily-backup-nvme
 spec:
   # CNPG cron is 6-field, seconds-first (sec min hour dom mon dow).
-  # "0 2 * * *" was a 5-field expression misread as sec=0 min=2 hour=* => hourly at HH:02,
-  # which piled up a multi-hundred backup backlog. This is true daily at 02:00:00.
-  schedule: "0 0 2 * * *"
+  # Daily at 02:30 UTC — 30 min after the Ceph daily-backup so the two
+  # don't race on the OVH bucket / network during the bake period.
+  schedule: "0 30 2 * * *"
   backupOwnerReference: self
   method: plugin
   pluginConfiguration:
     name: barman-cloud.cloudnative-pg.io
   cluster:
-    name: postgres
+    name: postgres-nvme

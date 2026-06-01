@@ -84,6 +84,11 @@ class GatewayConfig:
     acl_cache_ttl_seconds: int = dataclasses.field(
         default_factory=lambda: int(os.getenv("ACL_CACHE_TTL_SECONDS", "300"))
     )
+    # How long a positive can_upload result is cached per main_account. Kept short so an account that
+    # exhausts its credit mid-burst stops slipping uploads through the cache within seconds.
+    can_upload_cache_ttl_seconds: int = dataclasses.field(
+        default_factory=lambda: int(os.getenv("CAN_UPLOAD_CACHE_TTL_SECONDS", "10"))
+    )
     public_bucket_cache_ttl_seconds: int = dataclasses.field(
         default_factory=lambda: int(os.getenv("PUBLIC_BUCKET_CACHE_TTL_SECONDS", "300"))
     )

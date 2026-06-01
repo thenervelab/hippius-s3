@@ -51,6 +51,12 @@ _POOL_LOCK = asyncio.Lock()
 _KEK_CACHE: dict[tuple[str, str], tuple[bytes, float]] = {}
 _KEK_CACHE_LOCK = asyncio.Lock()
 
+# Maps bucket_id -> (active_kek_id, expires_at). Lets the hot path resolve the active KEK id
+# without a keystore roundtrip; combined with _KEK_CACHE it makes a steady-state PUT touch
+# neither the keystore DB nor KMS. A bucket KEK rotation lags by at most one TTL window — safe,
+# since the kek_id actually used is persisted per object_version, so reads always unwrap correctly.
+_ACTIVE_KEK_CACHE: dict[str, tuple[uuid.UUID, float]] = {}
+
 # KMS client singleton. In "required" mode, set at startup via init_kms_client().
 # In "disabled" mode, always None.
 _KMS_CLIENT: "OVHKMSClient | None" = None
@@ -303,6 +309,33 @@ async def _set_cached_kek(bucket_id: str, kek_id: uuid.UUID, kek_bytes: bytes) -
         _KEK_CACHE[key] = (bytes(kek_bytes), expires_at)
 
 
+async def _get_cached_active_kek_id(bucket_id: str) -> uuid.UUID | None:
+    cfg = get_config()
+    ttl = int(cfg.kek_cache_ttl_seconds)
+    if ttl <= 0:
+        return None
+    now = time.monotonic()
+    async with _KEK_CACHE_LOCK:
+        entry = _ACTIVE_KEK_CACHE.get(str(bucket_id))
+        if not entry:
+            return None
+        kek_id, expires_at = entry
+        if expires_at <= now:
+            _ACTIVE_KEK_CACHE.pop(str(bucket_id), None)
+            return None
+        return kek_id
+
+
+async def _set_cached_active_kek_id(bucket_id: str, kek_id: uuid.UUID) -> None:
+    cfg = get_config()
+    ttl = int(cfg.kek_cache_ttl_seconds)
+    if ttl <= 0:
+        return
+    expires_at = time.monotonic() + ttl
+    async with _KEK_CACHE_LOCK:
+        _ACTIVE_KEK_CACHE[str(bucket_id)] = (kek_id, expires_at)
+
+
 async def _ensure_tables(conn: asyncpg.Connection) -> None:
     """Create bucket_keks table.
 
@@ -349,13 +382,22 @@ async def get_or_create_active_bucket_kek(
 
     The returned kek_bytes is always the plaintext KEK (suitable for DEK operations).
 
-    Hot path: If KEK is cached, returns immediately without unwrap.
-    Cold path: Fetches from DB, unwraps, caches plaintext.
+    Hot path: if the active kek_id and its plaintext are both cached, returns with no keystore
+    DB roundtrip and no KMS unwrap.
+    Cold path: fetches the active kek_id from the keystore DB, unwraps, caches both.
     """
     cfg = get_config()
     dsn: Optional[str] = getattr(cfg, "encryption_database_url", None)
     if not dsn:
         raise RuntimeError("kek_database_unavailable")
+
+    # Fast path: skip the keystore pool entirely when both the active kek_id and its plaintext
+    # are cached for this bucket.
+    cached_active_kek_id = await _get_cached_active_kek_id(bucket_id)
+    if cached_active_kek_id is not None:
+        cached_bytes = await _get_cached_kek(bucket_id, cached_active_kek_id)
+        if cached_bytes is not None:
+            return cached_active_kek_id, cached_bytes
 
     pool = await _get_pool(dsn)
     async with pool.acquire() as conn:
@@ -378,6 +420,7 @@ async def get_or_create_active_bucket_kek(
 
         if row is not None:
             kek_id = uuid.UUID(str(row["kek_id"]))
+            await _set_cached_active_kek_id(bucket_id, kek_id)
 
             # Check for cached KEK first
             cached = await _get_cached_kek(bucket_id, kek_id)
@@ -413,6 +456,7 @@ async def get_or_create_active_bucket_kek(
                 row = await _fetch_active()
                 if row is not None:
                     kek_id = uuid.UUID(str(row["kek_id"]))
+                    await _set_cached_active_kek_id(bucket_id, kek_id)
 
                     # Check cache first
                     cached = await _get_cached_kek(bucket_id, kek_id)
@@ -428,6 +472,7 @@ async def get_or_create_active_bucket_kek(
                     return kek_id, kek_bytes
             raise
 
+        await _set_cached_active_kek_id(bucket_id, kek_id)
         await _set_cached_kek(bucket_id, kek_id, kek_bytes)
         return kek_id, kek_bytes
 
@@ -491,6 +536,7 @@ async def close_kek_pool() -> None:
 
     async with _KEK_CACHE_LOCK:
         _KEK_CACHE.clear()
+        _ACTIVE_KEK_CACHE.clear()
 
     async with _TABLES_LOCK:
         _TABLES_ENSURED = False

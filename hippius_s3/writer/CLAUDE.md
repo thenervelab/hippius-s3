@@ -44,14 +44,14 @@ Entry point is [`ObjectWriter`](object_writer.py); the heavy lifting is in [`put
 
 ## Known issues
 
-### Double FS writes
+### Double FS writes (fixed)
 
-See [todo.md](../../todo.md) P1. The same chunk is written to FS twice per upload today:
-
-- Once by the consumer ([object_writer.py:317-323](object_writer.py) → `fs_store.set_chunk`).
-- Once by `_flush_redis_batch` → `obj_cache.set_chunks` → which internally loops `fs.set_chunk` ([../cache/object_parts.py:159-160](../cache/object_parts.py)). Same pattern in `WriteThroughPartsWriter.write_chunks` at [write_through_writer.py:95-103](write_through_writer.py).
-
-Safe (deterministic content + atomic rename) but wasteful. The "Redis path" from before the FS migration is now just another FS write. Remove `set_chunks` from the write path; benchmark.
+Historically each chunk and each `meta.json` was written to FS twice per upload: once directly
+(`fs_store.set_chunk` / `fs_store.set_meta`) and again via the post-migration `obj_cache` /
+`redis_cache` mirror, which just looped back to `fs_store`. The mirror has been removed — the
+streaming consumer's `fs_store.set_chunk` is the sole chunk write, and `WriteThroughPartsWriter`
+now only writes meta/chunks to FS (its `redis_cache` arg is retained for call-site compatibility
+but unused). `RedisObjectPartsCache.set_chunks` / `set_meta` remain for the downloader/read paths.
 
 ### Meta.json visibility race (handled)
 
