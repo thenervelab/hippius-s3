@@ -128,7 +128,8 @@ class ListFilesResponse(BaseModel):
 class DeleteResult(BaseModel):
     status: str
     file_id: str
-    user_id: str
+    folder_hash: str | None = None
+    user_id: str | None = None
 
 
 class DeleteSuccessResponse(BaseModel):

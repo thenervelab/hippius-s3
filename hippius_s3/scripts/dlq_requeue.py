@@ -238,7 +238,7 @@ async def main() -> None:
     )
     parser.add_argument(
         "--backend",
-        choices=["ipfs", "arion"],
+        choices=["ipfs", "arion", "ovh"],
         default="ipfs",
         help="Backend name for upload worker (default: ipfs)",
     )
@@ -326,7 +326,7 @@ async def main() -> None:
                     print(f"Object Version: {entry.get('object_version')}")
                 print(f"Attempts: {entry.get('attempts')}")
                 print(f"Error Type: {entry.get('error_type')}")
-                print(f"Last Error: {entry.get('last_error', '')[:100]}...")
+                print(f"Last Error: {(entry.get('last_error') or '')[:100]}...")
                 print(f"First Enqueued: {entry.get('first_enqueued_at')}")
                 print(f"Last Attempt: {entry.get('last_attempt_at')}")
 
