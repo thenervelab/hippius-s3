@@ -11,6 +11,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from hippius_s3.cache.notifier import ChunkNotifier
 from hippius_s3.cache.notifier import build_chunk_key
@@ -182,6 +183,52 @@ async def test_wait_transient_miss_retries_once() -> None:
 
     assert result == b"retry-win"
     assert len(call_log) == 4
+
+
+@pytest.mark.asyncio
+async def test_wait_survives_transient_redis_read_timeout() -> None:
+    """A redis socket read timeout from listen() must NOT kill the wait.
+
+    Reproduces the incident where the pub/sub connection's short socket read
+    timeout fired (redis.exceptions.TimeoutError) before the slow downloader
+    delivered the chunk. The wait should swallow it, re-check the FS, and keep
+    waiting up to the real timeout — then succeed once the chunk lands.
+    """
+    redis = FakeRedis()
+    notifier = ChunkNotifier(redis)
+
+    # listen() raises a redis TimeoutError on its first call (the socket read
+    # window), then on the second call blocks until the worker injects a message.
+    listen_calls = 0
+
+    async def flaky_listen():
+        nonlocal listen_calls
+        listen_calls += 1
+        if listen_calls == 1:
+            raise RedisTimeoutError("Timeout reading from redis-queues:6379")
+        while True:
+            msg = await redis.pubsub_instance._messages.get()
+            yield msg
+
+    redis.pubsub_instance.listen = flaky_listen  # type: ignore[method-assign]
+
+    available = False
+
+    async def fetch(oid, v, pn, ci):
+        return b"late-chunk" if available else None
+
+    async def simulate_slow_worker():
+        nonlocal available
+        await asyncio.sleep(0.02)
+        available = True
+        redis.pubsub_instance.inject_message(f"notify:{build_chunk_key(OBJ, 1, 1, 0)}")
+
+    worker = asyncio.create_task(simulate_slow_worker())
+    result = await notifier.wait_for_chunk(OBJ, 1, 1, 0, fetch_fn=fetch, timeout=2.0)
+    await worker
+
+    assert result == b"late-chunk"
+    assert listen_calls >= 2  # proves we retried after the transient timeout
 
 
 @pytest.mark.asyncio
