@@ -1,18 +1,19 @@
-from hippius_s3.workers.uploader import classify_error
+"""Backward-compatible re-export shim.
+
+The classifier lives in `hippius_s3.workers.errors`. This module is kept so
+existing imports (`from hippius_s3.workers.error_classifier import classify_unpin_error`)
+continue to work without churn.
+"""
+
+from hippius_s3.workers.errors import classify_download_error
+from hippius_s3.workers.errors import classify_error
+from hippius_s3.workers.errors import classify_unpin_error
+from hippius_s3.workers.errors import classify_upload_error
 
 
-def classify_unpin_error(error: Exception) -> str:
-    """Classify errors specifically for unpin operations.
-
-    Key difference: 404 is TRANSIENT for unpins (pin not complete yet).
-    For all other errors, delegates to the shared classify_error function.
-    """
-    err_str = str(error).lower()
-
-    if hasattr(error, "response") and hasattr(error.response, "status_code") and error.response.status_code == 404:
-        return "transient"
-
-    if "404" in err_str or "not found" in err_str:
-        return "transient"
-
-    return classify_error(error)
+__all__ = [
+    "classify_download_error",
+    "classify_error",
+    "classify_unpin_error",
+    "classify_upload_error",
+]

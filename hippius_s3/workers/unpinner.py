@@ -28,8 +28,8 @@ from hippius_s3.redis_utils import with_redis_retry
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 from hippius_s3.services.ray_id_service import ray_id_context
 from hippius_s3.utils import get_query
-from hippius_s3.workers.error_classifier import classify_unpin_error
-from hippius_s3.workers.uploader import compute_backoff_ms
+from hippius_s3.workers.errors import classify_unpin_error
+from hippius_s3.workers.errors import compute_backoff_ms
 
 
 logger = logging.getLogger(__name__)
