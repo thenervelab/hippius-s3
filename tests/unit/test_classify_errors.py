@@ -10,39 +10,23 @@ from __future__ import annotations
 import asyncio
 import errno
 from types import SimpleNamespace
-from typing import Any
 
+import httpx
 import pytest
+from botocore.exceptions import ClientError
+from botocore.exceptions import ConnectTimeoutError
+from botocore.exceptions import EndpointConnectionError
+from botocore.exceptions import ReadTimeoutError
 
-# Lazy imports for httpx / botocore so unit tests don't hard-depend on them.
-try:
-    import httpx
-except Exception:  # pragma: no cover
-    httpx = None  # type: ignore
-
-try:
-    from botocore.exceptions import (
-        BotoCoreError,
-        ClientError,
-        ConnectTimeoutError,
-        EndpointConnectionError,
-        ReadTimeoutError,
-    )
-except Exception:  # pragma: no cover
-    ClientError = None  # type: ignore
-    BotoCoreError = None  # type: ignore
-
-from hippius_s3.workers.errors import (
-    classify_download_error,
-    classify_error,
-    classify_unpin_error,
-    classify_upload_error,
-    compute_backoff_ms,
-    extract_boto_error_code,
-    extract_http_status_code,
-    is_billing_error,
-    is_retryable,
-)
+from hippius_s3.workers.errors import classify_download_error
+from hippius_s3.workers.errors import classify_error
+from hippius_s3.workers.errors import classify_unpin_error
+from hippius_s3.workers.errors import classify_upload_error
+from hippius_s3.workers.errors import compute_backoff_ms
+from hippius_s3.workers.errors import extract_boto_error_code
+from hippius_s3.workers.errors import extract_http_status_code
+from hippius_s3.workers.errors import is_billing_error
+from hippius_s3.workers.errors import is_retryable
 
 
 # --------------------------------------------------------------------------- #
@@ -64,8 +48,6 @@ def _client_error(
     op: str = "PutObject",
 ) -> ClientError:
     """Realistic botocore ClientError shape."""
-    if ClientError is None:  # pragma: no cover
-        pytest.skip("botocore not installed")
     return ClientError(
         {
             "Error": {"Code": code, "Message": message},
@@ -243,24 +225,26 @@ def test_upload_oserror_unknown_errno_falls_through_to_keywords() -> None:
     assert classify_upload_error(exc) == "unknown"
 
 
-@pytest.mark.skipif(httpx is None, reason="httpx not installed")
 def test_upload_httpx_classes_are_transient() -> None:
     assert classify_upload_error(httpx.ConnectError("refused")) == "transient"
     assert classify_upload_error(httpx.ReadError("eof")) == "transient"
     assert classify_upload_error(httpx.WriteError("eof")) == "transient"
-    # TimeoutException requires a Request kwarg in newer httpx
-    try:
-        exc = httpx.TimeoutException("slow", request=httpx.Request("GET", "http://x"))
-    except Exception:
-        exc = httpx.TimeoutException("slow")  # type: ignore[call-arg]
+    exc = httpx.TimeoutException("slow", request=httpx.Request("GET", "http://x"))
     assert classify_upload_error(exc) == "transient"
 
 
-@pytest.mark.skipif(ClientError is None, reason="botocore not installed")
 def test_upload_botocore_transport_classes_are_transient() -> None:
     assert classify_upload_error(EndpointConnectionError(endpoint_url="https://example")) == "transient"
     assert classify_upload_error(ConnectTimeoutError(endpoint_url="https://example")) == "transient"
     assert classify_upload_error(ReadTimeoutError(endpoint_url="https://example")) == "transient"
+
+
+def test_upload_botocore_param_validation_is_not_transient() -> None:
+    # ParamValidationError subclasses BotoCoreError but is a client-side permanent
+    # failure — the transient tuple must not include the broad BotoCoreError base.
+    from botocore.exceptions import ParamValidationError
+
+    assert classify_upload_error(ParamValidationError(report="bad input")) != "transient"
 
 
 # =========================================================================== #
@@ -394,6 +378,15 @@ def test_unpin_404_is_transient_not_permanent() -> None:
     assert classify_unpin_error(_HTTPLikeError(404)) == "transient"
     assert classify_unpin_error(_client_error(404, code="NoSuchKey")) == "transient"
     assert classify_unpin_error(Exception("HTTP 404 not found")) == "transient"
+
+
+def test_unpin_no_such_key_string_is_transient() -> None:
+    """String-shaped NoSuchKey must agree with the boto-code special case:
+    transient on unpin, permanent on upload/download."""
+    for msg in ("NoSuchKey: key gone", "no such key"):
+        assert classify_unpin_error(Exception(msg)) == "transient"
+        assert classify_upload_error(Exception(msg)) == "permanent"
+        assert classify_download_error(Exception(msg)) == "permanent"
 
 
 def test_unpin_5xx_and_403_match_upload() -> None:

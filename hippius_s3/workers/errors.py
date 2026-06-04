@@ -79,7 +79,7 @@ def is_billing_error(error: Exception) -> bool:
     if extract_http_status_code(error) == "402":
         return True
     msg = str(error).lower()
-    return "payment required" in msg or "402" in msg and "credit" in msg
+    return "payment required" in msg or ("402" in msg and "credit" in msg)
 
 
 # --------------------------------------------------------------------------- #
@@ -109,12 +109,14 @@ def _transient_exception_classes() -> tuple[type, ...]:
     except Exception:
         pass
     try:
-        from botocore.exceptions import BotoCoreError
         from botocore.exceptions import ConnectTimeoutError
         from botocore.exceptions import EndpointConnectionError
         from botocore.exceptions import ReadTimeoutError
 
-        classes.extend([EndpointConnectionError, ConnectTimeoutError, ReadTimeoutError, BotoCoreError])
+        # Deliberately NOT the broad BotoCoreError base: it covers client-side
+        # permanent failures too (ParamValidationError, NoCredentialsError, ...)
+        # which must not be retried forever.
+        classes.extend([EndpointConnectionError, ConnectTimeoutError, ReadTimeoutError])
     except Exception:
         pass
     return tuple(classes)
@@ -240,7 +242,6 @@ _PERMANENT_KEYWORDS = (
     "signature does not match",
     "signaturedoesnotmatch",
     "no such bucket",
-    "no such key",
     "not implemented",
     "method not allowed",
     "access denied",
@@ -250,13 +251,20 @@ _PERMANENT_KEYWORDS = (
     "permission denied",
     "authentication failed",
     "nosuchbucket",
-    "nosuchkey",
     "invalid token",
     "expired token",
     "filesystem cache",  # FS evicted source bytes between enqueue and processing
     "key too long",
     "hippius api",  # explicit Hippius API failures don't self-heal (the
     # client's @retry_on_error decorator already burned its budget)
+)
+
+# 404-shaped strings live outside _PERMANENT_KEYWORDS because their meaning is
+# path-dependent: permanent on upload/download, transient on unpin (pin commit
+# pending upstream) — mirrors the NoSuchKey boto-code special case in _classify.
+_PERMANENT_404ISH_KEYWORDS = (
+    "no such key",
+    "nosuchkey",
 )
 
 # Custom-exception class names that should always classify permanent. Matched
@@ -337,13 +345,16 @@ def _classify(
     # ---- 7) Keyword fallback --------------------------------------------- #
     if any(k in err_str for k in _PERMANENT_KEYWORDS):
         return "permanent"
+    if treat_404_as == "permanent" and any(k in err_str for k in _PERMANENT_404ISH_KEYWORDS):
+        return "permanent"
     if any(k in err_str for k in _TRANSIENT_KEYWORDS):
         return "transient"
 
-    # ---- 8) Path-specific tail rule: unpin treats bare "404"/"not found" - #
-    # strings as transient. Upload/download fall through to "unknown" because
-    # without a real exception we cannot confirm a 404 vs a stale log line.
-    if treat_404_as == "transient" and ("404" in err_str or "not found" in err_str):
+    # ---- 8) Path-specific tail rule: unpin treats 404-shaped strings ----- #
+    # ("404" / "not found" / "no such key") as transient. Upload/download fall
+    # through to "unknown" because without a real exception we cannot confirm
+    # a 404 vs a stale log line.
+    if treat_404_as == "transient" and any(k in err_str for k in ("404", "not found", *_PERMANENT_404ISH_KEYWORDS)):
         return "transient"
 
     # ---- 9) Walk into __cause__ once before giving up -------------------- #
