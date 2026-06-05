@@ -1,0 +1,75 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: postgres-nvme
+spec:
+  affinity:
+    enablePodAntiAffinity: true
+    nodeSelector:
+      hippius.io/role: postgresql
+    podAntiAffinityType: required
+    tolerations:
+    - effect: NoSchedule
+      key: hippius.io/postgresql
+      operator: Equal
+      value: 'true'
+    topologyKey: kubernetes.io/hostname
+  bootstrap:
+    initdb:
+      database: app
+      owner: app
+      encoding: UTF8
+      localeCollate: C
+      localeCType: C
+  enableSuperuserAccess: true
+  instances: 3
+  monitoring:
+    enablePodMonitor: false
+  postgresql:
+    parameters:
+      checkpoint_completion_target: '0.9'
+      checkpoint_timeout: 15min
+      default_statistics_target: '500'
+      effective_cache_size: 48GB
+      effective_io_concurrency: '200'
+      maintenance_work_mem: 4GB
+      max_connections: '1000'
+      max_parallel_maintenance_workers: '4'
+      max_parallel_workers: '12'
+      max_parallel_workers_per_gather: '4'
+      max_slot_wal_keep_size: 30GB
+      max_wal_size: 4GB
+      max_worker_processes: '48'
+      min_wal_size: 1GB
+      random_page_cost: '1.1'
+      shared_buffers: 16GB
+      wal_buffers: 64MB
+      wal_level: replica
+      work_mem: 128MB
+  primaryUpdateStrategy: unsupervised
+  replicationSlots:
+    highAvailability:
+      enabled: true
+      slotPrefix: _cnpg_
+    synchronizeReplicas:
+      enabled: true
+    updateInterval: 30
+  resources:
+    limits:
+      cpu: '10'
+      memory: 56Gi
+    requests:
+      cpu: '2'
+      memory: 16Gi
+  smartShutdownTimeout: 180
+  startDelay: 3600
+  stopDelay: 1800
+  storage:
+    size: 800Gi
+    storageClass: local-postgresql
+  switchoverDelay: 3600
+  plugins:
+  - name: barman-cloud.cloudnative-pg.io
+    isWALArchiver: true
+    parameters:
+      barmanObjectName: ovh-postgres-backup-nvme

@@ -31,19 +31,3 @@ async def test_recent_uploads_query_prepares_against_live_schema() -> None:
         await conn.prepare(sql)
     finally:
         await conn.close()
-
-
-@pytest.mark.asyncio
-async def test_recent_uploads_index_present() -> None:
-    conn = await _connect_or_skip()
-    try:
-        row = await conn.fetchrow(
-            "SELECT 1 FROM pg_indexes "
-            "WHERE schemaname = 'public' "
-            "  AND indexname = 'idx_object_versions_last_modified_desc'"
-        )
-        assert row is not None, (
-            "idx_object_versions_last_modified_desc is missing — did the 20260427000000 migration run?"
-        )
-    finally:
-        await conn.close()

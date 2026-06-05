@@ -34,12 +34,6 @@ Operational and migration scripts. Most are invoked manually by an operator duri
 | [nuke_user.py](nuke_user.py) | **⚠️ DESTRUCTIVE**. Deletes a user and all their buckets/objects. Usually invoked for GDPR requests or test cleanup. |
 | [purge_buckets.py](purge_buckets.py) | **⚠️ DESTRUCTIVE**. Delete one or more buckets and their contents. |
 
-### Benchmarks
-
-| Script | Purpose |
-|---|---|
-| [benchmark_copy_vs_append.py](benchmark_copy_vs_append.py) | Perf comparison: standard S3 MPU CopyObject vs S4 append. |
-
 ## Invocation
 
 All scripts expect the venv active and env loaded:

@@ -19,6 +19,9 @@ from typing import AsyncIterator
 from typing import Awaitable
 from typing import Callable
 
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
+
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +115,26 @@ class ChunkNotifier:
                     if msg["type"] == "message":
                         return
 
-            await asyncio.wait_for(_listen(), timeout=timeout)
+            # The pub/sub connection has its own (short) socket read timeout, so a
+            # blocking `listen()` can raise redis TimeoutError/ConnectionError long
+            # before `timeout` if the downloader is simply slower than that socket
+            # read window. Treat those as transient: re-check the FS (the chunk may
+            # have landed) and keep waiting up to the real `timeout` deadline rather
+            # than killing the stream. See the 5s-read-timeout incident.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError(f"timed out waiting for chunk {chunk_key}")
+                try:
+                    await asyncio.wait_for(_listen(), timeout=remaining)
+                    break
+                except (RedisTimeoutError, RedisConnectionError) as exc:
+                    data = await fetch_fn(object_id, int(object_version), int(part_number), int(chunk_index))
+                    if data is not None:
+                        return data
+                    logger.debug("pubsub read interrupted for %s (%s); still waiting", chunk_key, exc)
 
         # Worker published — fetch it. Retry once on transient miss (e.g. a
         # janitor delete or CephFS replication lag).

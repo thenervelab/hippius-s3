@@ -7,6 +7,7 @@ resources:
   - ../base
   - postgres-objectstore.yaml
   - postgres-nvme-objectstore.yaml
+  - postgres-nvme-cluster.yaml
   - postgres-nvme-scheduledbackup.yaml
   - gateway-nodeport.yaml
   - pv-local-cache.yaml
