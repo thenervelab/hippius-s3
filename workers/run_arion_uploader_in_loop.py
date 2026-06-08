@@ -27,10 +27,10 @@ from hippius_s3.sentry import init_sentry
 from hippius_s3.services.arion_service import ArionClient
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 from hippius_s3.services.ray_id_service import ray_id_context
+from hippius_s3.workers.errors import classify_error
+from hippius_s3.workers.errors import compute_backoff_ms
+from hippius_s3.workers.errors import extract_http_status_code
 from hippius_s3.workers.uploader import Uploader
-from hippius_s3.workers.uploader import classify_error
-from hippius_s3.workers.uploader import compute_backoff_ms
-from hippius_s3.workers.uploader import extract_http_status_code
 
 
 config = get_config()

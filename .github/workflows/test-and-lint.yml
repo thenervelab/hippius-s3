@@ -73,7 +73,9 @@ jobs:
           uv venv
           source .venv/bin/activate
           uv pip install -e ".[dev]"
-          uv tool install ty
+          # Pinned: an unpinned install floats to the newest ty release, which
+          # can start flagging pre-existing code and break unrelated PRs.
+          uv tool install ty==0.0.43
 
       - name: Type check with ty
         run: |
