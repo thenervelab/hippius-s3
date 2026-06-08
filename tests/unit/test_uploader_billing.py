@@ -8,10 +8,10 @@ from fakeredis.aioredis import FakeRedis
 from hippius_s3.dlq.upload_dlq import UploadDLQManager
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
+from hippius_s3.workers.errors import classify_error
+from hippius_s3.workers.errors import is_billing_error
 from hippius_s3.workers.uploader import ChunkUploadResult
 from hippius_s3.workers.uploader import Uploader
-from hippius_s3.workers.uploader import classify_error
-from hippius_s3.workers.uploader import is_billing_error
 
 
 def _billing_req(object_id: str = "bill-1", upload_id: str = "up-1") -> UploadChainRequest:

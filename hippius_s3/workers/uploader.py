@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import random
 import time
 from abc import ABC
 from abc import abstractmethod
@@ -21,6 +20,7 @@ from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.utils import get_query
+from hippius_s3.workers.errors import is_billing_error
 
 
 logger = logging.getLogger(__name__)
@@ -66,80 +66,6 @@ class BackendClient(ABC):
 class ChunkUploadResult(BaseModel):
     cids: List[str]
     part_number: int
-
-
-def extract_http_status_code(error: Exception) -> str:
-    """Extract HTTP status code from exception, or empty string if not an HTTP error."""
-    if hasattr(error, "response") and hasattr(error.response, "status_code"):
-        return str(error.response.status_code)
-    return ""
-
-
-def is_billing_error(error: Exception) -> bool:
-    """True if the error is Arion rejecting the upload for insufficient credit (HTTP 402)."""
-    return extract_http_status_code(error) == "402" or "payment required" in str(error).lower()
-
-
-def classify_error(error: Exception) -> str:
-    """Classify error as transient, permanent, billing, or unknown."""
-    err_str = str(error).lower()
-    err_type = type(error).__name__.lower()
-
-    status_code = extract_http_status_code(error)
-    if status_code == "507":
-        return "permanent"
-
-    # 402 means the account ran out of credit; retrying is pointless until it tops up.
-    if is_billing_error(error):
-        return "billing"
-
-    if any(
-        keyword in err_str
-        for keyword in [
-            "malformed",
-            "invalid",
-            "negative size",
-            "missing part",
-            "validation error",
-            "integrity",
-            "insufficient storage",
-        ]
-    ):
-        return "permanent"
-
-    if any(keyword in err_str for keyword in ["pin", "unpin", "hippius api", "hippiusapi"]) or "hippiusapi" in err_type:
-        return "permanent"
-
-    if any(
-        keyword in err_str
-        for keyword in [
-            "timeout",
-            "connection",
-            "network",
-            "5xx",
-            "503",
-            "502",
-            "504",
-            "404",
-            "not found",
-            "unavailable",
-            "throttled",
-            "rate limit",
-            "429",
-            "part_meta_not_ready",
-            "part_row_missing",
-        ]
-    ) or any(keyword in err_type for keyword in ["connectionerror", "timeouterror", "httperror"]):
-        return "transient"
-
-    return "unknown"
-
-
-def compute_backoff_ms(attempt: int, base_ms: int = 1000, max_ms: int = 30000) -> float:
-    """Compute exponential backoff with jitter."""
-    exp_backoff = base_ms * (2 ** (attempt - 1))
-    jitter = random.uniform(0, exp_backoff * 0.1)
-    return float(min(exp_backoff + jitter, max_ms))
 
 
 class Uploader:
