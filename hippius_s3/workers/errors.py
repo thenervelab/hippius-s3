@@ -228,6 +228,11 @@ _TRANSIENT_KEYWORDS = (
     "429",
     "part_meta_not_ready",
     "part_row_missing",
+    # Defense-in-depth for the meta-write/race-window error shape — the
+    # consumer (arion-uploader, s3-backup) now polls meta within a bounded
+    # deadline before raising, so this string should not appear in practice.
+    # Kept here so any stray race-window raise still classifies as transient.
+    "missing meta in filesystem cache for",
 )
 
 _PERMANENT_KEYWORDS = (
@@ -253,7 +258,14 @@ _PERMANENT_KEYWORDS = (
     "nosuchbucket",
     "invalid token",
     "expired token",
-    "filesystem cache",  # FS evicted source bytes between enqueue and processing
+    # Source bytes are genuinely gone — the data is unrecoverable. These two
+    # cover (a) the after-deadline raise from arion-uploader / s3-backup once
+    # the meta-poll deadline expires (writer crashed or chunks evicted) and
+    # (b) the operator misconfig case where the cache root is unmounted. The
+    # transient race-window form ("missing meta in filesystem cache for ...")
+    # is intentionally NOT covered by these — it gets retried.
+    "missing meta in filesystem cache after",
+    "filesystem cache directory missing",
     "key too long",
     "hippius api",  # explicit Hippius API failures don't self-heal (the
     # client's @retry_on_error decorator already burned its budget)

@@ -268,7 +268,15 @@ class Uploader:
             },
         ) as span:
             logger.debug(f"Uploading chunk object_id={object_id} part={part_number}")
-            meta = await self.fs_store.get_meta(object_id, int(object_version), part_number)
+            meta_wait_s = float(getattr(self.config, "fs_meta_wait_seconds", 30.0))
+            meta = await self.fs_store.get_meta_with_wait(
+                object_id, int(object_version), part_number, deadline_seconds=meta_wait_s
+            )
+            if meta is None:
+                raise RuntimeError(
+                    f"Missing meta in filesystem cache after {meta_wait_s}s for upload: "
+                    f"object_id={object_id} version={int(object_version)} part={part_number}"
+                )
             num_chunks_meta = int(meta.get("num_chunks", 0)) if isinstance(meta, dict) else 0
 
             resolved_upload_id: Optional[str] = upload_id
@@ -315,46 +323,63 @@ class Uploader:
                 return ChunkUploadResult(cids=[], part_number=part_number)
 
             if num_chunks_meta > 0 and part_id:
-                all_file_hashes: list[str] = []
-                for ci in range(num_chunks_meta):
-                    piece = await self.fs_store.get_chunk(object_id, int(object_version), part_number, ci)
-                    if not isinstance(piece, (bytes, bytearray)):
-                        raise RuntimeError("missing_cipher_chunk")
+                # Upload a part's cipher chunks concurrently (bounded by pin_parallelism).
+                # A large object is a single part with many chunks; uploading them one at a
+                # time pinned the worker on that object for tens of seconds (serial dequeue
+                # loop), starving every other request behind it. Mirrors the part-level
+                # gather pattern above; chunk order is preserved in the returned hashes.
+                chunk_semaphore = asyncio.Semaphore(max(1, int(self.config.uploader_pin_parallelism)))
 
-                    async with self._acquire_conn() as conn:
-                        chunk_id = await conn.fetchval(
-                            "SELECT id FROM part_chunks WHERE part_id = $1 AND chunk_index = $2",
-                            part_id,
-                            int(ci),
+                async def upload_one_chunk(ci: int) -> tuple[int, str]:
+                    async with chunk_semaphore:
+                        piece = await self.fs_store.get_chunk(object_id, int(object_version), part_number, ci)
+                        if not isinstance(piece, (bytes, bytearray)):
+                            raise RuntimeError("missing_cipher_chunk")
+
+                        async with self._acquire_conn() as conn:
+                            chunk_id = await conn.fetchval(
+                                "SELECT id FROM part_chunks WHERE part_id = $1 AND chunk_index = $2",
+                                part_id,
+                                int(ci),
+                            )
+                        if not chunk_id:
+                            raise RuntimeError("part_chunk_row_missing")
+
+                        chunk_upload_result = await self.backend_client.upload_file_and_get_cid(
+                            file_data=bytes(piece),
+                            file_name=str(chunk_id),
+                            content_type="application/octet-stream",
+                            account_ss58=account_ss58,
+                            extra_headers=extra_headers,
                         )
-                    if not chunk_id:
-                        raise RuntimeError("part_chunk_row_missing")
 
-                    chunk_upload_result = await self.backend_client.upload_file_and_get_cid(
-                        file_data=bytes(piece),
-                        file_name=str(chunk_id),
-                        content_type="application/octet-stream",
-                        account_ss58=account_ss58,
-                        extra_headers=extra_headers,
-                    )
-
-                    upload_id = str(chunk_upload_result.cid)
-                    file_hash = str(chunk_upload_result.id)
-                    all_file_hashes.append(file_hash)
-
-                    logger.info(
-                        f"Uploaded chunk: backend={self.backend_name} object_id={object_id} part={part_number} "
-                        f"chunk={ci} file_id={file_hash} upload_id={upload_id} status={chunk_upload_result.status}"
-                    )
-
-                    async with self._acquire_conn() as conn:
-                        await conn.fetchval(
-                            get_query("insert_chunk_backend"),
-                            part_id,
-                            int(ci),
-                            self.backend_name,
-                            file_hash,
+                        file_hash = str(chunk_upload_result.id)
+                        logger.info(
+                            f"Uploaded chunk: backend={self.backend_name} object_id={object_id} part={part_number} "
+                            f"chunk={ci} file_id={file_hash} upload_id={chunk_upload_result.cid} "
+                            f"status={chunk_upload_result.status}"
                         )
+
+                        async with self._acquire_conn() as conn:
+                            await conn.fetchval(
+                                get_query("insert_chunk_backend"),
+                                part_id,
+                                int(ci),
+                                self.backend_name,
+                                file_hash,
+                            )
+                        return ci, file_hash
+
+                results = await asyncio.gather(
+                    *[upload_one_chunk(ci) for ci in range(num_chunks_meta)],
+                    return_exceptions=True,
+                )
+                errors = [r for r in results if isinstance(r, Exception)]
+                if errors:
+                    raise next((e for e in errors if is_billing_error(e)), errors[0])
+
+                ok_results = sorted((r for r in results if isinstance(r, tuple)), key=lambda t: t[0])
+                all_file_hashes: list[str] = [fh for _, fh in ok_results]
 
                 span.set_attribute("result.num_piece_cids", len(all_file_hashes))
                 span.set_attribute("result.cids", ",".join(all_file_hashes))

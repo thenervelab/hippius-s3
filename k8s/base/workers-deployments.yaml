@@ -575,6 +575,15 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_OVH_KMS_OKMS_ID
+            # Must match the api/uploader fleet (arion,ovh). The janitor uses this for
+            # the replication-gate fallback (empty-upload_backends versions) and to
+            # enumerate every upload backend's DLQ for deletion protection. Defaulting
+            # to ["arion"] silently skipped the ovh DLQ and under-required the gate.
+            - name: HIPPIUS_UPLOAD_BACKENDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_UPLOAD_BACKENDS
           volumeMounts:
             - name: object-cache
               mountPath: /var/lib/hippius/object_cache

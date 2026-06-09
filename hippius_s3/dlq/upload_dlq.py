@@ -22,7 +22,7 @@ class UploadDLQManager(BaseDLQManager[UploadChainRequest]):
             """Enqueue upload request to specific backend queue."""
             client = get_queue_client()
             raw = payload.model_dump_json()
-            await client.lpush(self._queue_name, raw)
+            await client.lpush(self._queue_name, raw)  # ty: ignore[invalid-await]
 
         super().__init__(
             redis_client=redis_client,
@@ -52,7 +52,7 @@ class UploadDLQManager(BaseDLQManager[UploadChainRequest]):
 
     async def _find_and_remove_entry(self, identifier: str) -> Optional[Dict[str, Any]]:
         """Find and remove entry by object_id."""
-        all_entries = await self.redis_client.lrange(self.dlq_key, 0, -1)
+        all_entries = await self.redis_client.lrange(self.dlq_key, 0, -1)  # ty: ignore[invalid-await]
         target_entry: Optional[Dict[str, Any]] = None
 
         for entry_json in all_entries:
@@ -61,7 +61,7 @@ class UploadDLQManager(BaseDLQManager[UploadChainRequest]):
             except json.JSONDecodeError:
                 continue
             if entry.get("object_id") == identifier:
-                removed = await self.redis_client.lrem(self.dlq_key, 1, entry_json)
+                removed = await self.redis_client.lrem(self.dlq_key, 1, entry_json)  # ty: ignore[invalid-await]
                 if removed:
                     target_entry = entry
                     break
