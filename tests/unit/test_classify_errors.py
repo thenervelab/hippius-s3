@@ -33,6 +33,7 @@ from hippius_s3.workers.errors import is_retryable
 # Helpers — small fakes that match real exception shapes
 # --------------------------------------------------------------------------- #
 
+
 class _HTTPLikeError(Exception):
     """Mimics httpx.HTTPStatusError: ``error.response.status_code`` is set."""
 
@@ -69,6 +70,7 @@ class _HippiusAuthenticationError(_HippiusAPIError):
 # extract_http_status_code
 # =========================================================================== #
 
+
 def test_extract_from_httpx_like() -> None:
     assert extract_http_status_code(_HTTPLikeError(503)) == "503"
 
@@ -103,6 +105,7 @@ def test_extract_walks_into_chained_cause() -> None:
 # extract_boto_error_code
 # =========================================================================== #
 
+
 def test_extract_boto_code_present() -> None:
     assert extract_boto_error_code(_client_error(503, code="SlowDown")) == "SlowDown"
 
@@ -114,6 +117,7 @@ def test_extract_boto_code_absent_on_httpx_like() -> None:
 # =========================================================================== #
 # is_billing_error
 # =========================================================================== #
+
 
 def test_is_billing_402_status() -> None:
     assert is_billing_error(_HTTPLikeError(402)) is True
@@ -132,6 +136,7 @@ def test_is_billing_false_on_other_codes() -> None:
 # classify_upload_error — status-code layer
 # =========================================================================== #
 
+
 @pytest.mark.parametrize(
     "error, expected",
     [
@@ -141,15 +146,15 @@ def test_is_billing_false_on_other_codes() -> None:
         (_HTTPLikeError(503), "transient"),
         (_HTTPLikeError(504), "transient"),
         # special codes
-        (_HTTPLikeError(408), "transient"),   # request timeout
-        (_HTTPLikeError(429), "transient"),   # too many requests
-        (_HTTPLikeError(507), "permanent"),   # disk full upstream
-        (_HTTPLikeError(402), "billing"),     # out of credit (upload-only bucket)
+        (_HTTPLikeError(408), "transient"),  # request timeout
+        (_HTTPLikeError(429), "transient"),  # too many requests
+        (_HTTPLikeError(507), "permanent"),  # disk full upstream
+        (_HTTPLikeError(402), "billing"),  # out of credit (upload-only bucket)
         # 4xx (non-special) → permanent
-        (_HTTPLikeError(400), "permanent"),   # bad request
-        (_HTTPLikeError(401), "permanent"),   # unauthorized
-        (_HTTPLikeError(403), "permanent"),   # forbidden
-        (_HTTPLikeError(404), "permanent"),   # bad URL on upload
+        (_HTTPLikeError(400), "permanent"),  # bad request
+        (_HTTPLikeError(401), "permanent"),  # unauthorized
+        (_HTTPLikeError(403), "permanent"),  # forbidden
+        (_HTTPLikeError(404), "permanent"),  # bad URL on upload
         (_HTTPLikeError(409), "permanent"),
         (_HTTPLikeError(413), "permanent"),
         (_HTTPLikeError(415), "permanent"),
@@ -163,6 +168,7 @@ def test_upload_status_codes(error: Exception, expected: str) -> None:
 # =========================================================================== #
 # classify_upload_error — botocore error code layer
 # =========================================================================== #
+
 
 @pytest.mark.parametrize(
     "code, http_status, expected",
@@ -193,6 +199,7 @@ def test_upload_boto_codes(code: str, http_status: int, expected: str) -> None:
 # classify_upload_error — exception class layer
 # =========================================================================== #
 
+
 def test_upload_asyncio_timeout_is_transient() -> None:
     assert classify_upload_error(asyncio.TimeoutError()) == "transient"
 
@@ -205,15 +212,18 @@ def test_upload_builtin_timeout_error_is_transient() -> None:
     assert classify_upload_error(TimeoutError("deadline")) == "transient"
 
 
-@pytest.mark.parametrize("errno_value", [
-    errno.ECONNRESET,
-    errno.ECONNREFUSED,
-    errno.ETIMEDOUT,
-    errno.EHOSTUNREACH,
-    errno.ENETUNREACH,
-    errno.EPIPE,
-    errno.EAGAIN,
-])
+@pytest.mark.parametrize(
+    "errno_value",
+    [
+        errno.ECONNRESET,
+        errno.ECONNREFUSED,
+        errno.ETIMEDOUT,
+        errno.EHOSTUNREACH,
+        errno.ENETUNREACH,
+        errno.EPIPE,
+        errno.EAGAIN,
+    ],
+)
 def test_upload_oserror_errno_is_transient(errno_value: int) -> None:
     exc = OSError(errno_value, "broken")
     assert classify_upload_error(exc) == "transient"
@@ -251,40 +261,47 @@ def test_upload_botocore_param_validation_is_not_transient() -> None:
 # classify_upload_error — keyword fallback layer
 # =========================================================================== #
 
-@pytest.mark.parametrize("error, expected", [
-    # Transient keywords
-    (Exception("connection refused"), "transient"),
-    (Exception("read timed out"), "transient"),
-    (Exception("network is unreachable"), "transient"),
-    (Exception("503 Service Unavailable"), "transient"),
-    (Exception("429 Too Many Requests"), "transient"),
-    (Exception("rate limit exceeded"), "transient"),
-    (Exception("request was throttled"), "transient"),
-    (Exception("could not connect to host"), "transient"),
-    (Exception("connection pool is exhausted"), "transient"),
-    (Exception("remote disconnected without sending response"), "transient"),
-    (Exception("deadline exceeded"), "transient"),
-    (Exception("part_meta_not_ready"), "transient"),
-    (Exception("part_row_missing"), "transient"),
-    # Permanent keywords
-    (Exception("Malformed request body"), "permanent"),
-    (Exception("invalid chunk index"), "permanent"),
-    (Exception("validation error: bad field"), "permanent"),
-    (Exception("integrity check failed"), "permanent"),
-    (Exception("insufficient storage on device"), "permanent"),
-    (Exception("SignatureDoesNotMatch"), "permanent"),
-    (Exception("Hippius API rejected publish"), "permanent"),
-    (Exception("forbidden by policy"), "permanent"),
-    (Exception("unauthorized"), "permanent"),
-    (Exception("access denied"), "permanent"),
-    (Exception("filesystem cache missing"), "permanent"),  # FS evicted
-    # Custom exception classes
-    (_HippiusAPIError("publish failed"), "permanent"),
-    (_HippiusAuthenticationError("token expired"), "permanent"),
-    # Nothing matches → unknown (these go to DLQ flagged for review)
-    (Exception("totally novel failure"), "unknown"),
-    (Exception(""), "unknown"),
-])
+
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        # Transient keywords
+        (Exception("connection refused"), "transient"),
+        (Exception("read timed out"), "transient"),
+        (Exception("network is unreachable"), "transient"),
+        (Exception("503 Service Unavailable"), "transient"),
+        (Exception("429 Too Many Requests"), "transient"),
+        (Exception("rate limit exceeded"), "transient"),
+        (Exception("request was throttled"), "transient"),
+        (Exception("could not connect to host"), "transient"),
+        (Exception("connection pool is exhausted"), "transient"),
+        (Exception("remote disconnected without sending response"), "transient"),
+        (Exception("deadline exceeded"), "transient"),
+        (Exception("part_meta_not_ready"), "transient"),
+        (Exception("part_row_missing"), "transient"),
+        # Permanent keywords
+        (Exception("Malformed request body"), "permanent"),
+        (Exception("invalid chunk index"), "permanent"),
+        (Exception("validation error: bad field"), "permanent"),
+        (Exception("integrity check failed"), "permanent"),
+        (Exception("insufficient storage on device"), "permanent"),
+        (Exception("SignatureDoesNotMatch"), "permanent"),
+        (Exception("Hippius API rejected publish"), "permanent"),
+        (Exception("forbidden by policy"), "permanent"),
+        (Exception("unauthorized"), "permanent"),
+        (Exception("access denied"), "permanent"),
+        (
+            Exception("Missing meta in filesystem cache after 30s for upload: object_id=abc"),
+            "permanent",
+        ),  # after-deadline = FS evicted / writer crashed
+        # Custom exception classes
+        (_HippiusAPIError("publish failed"), "permanent"),
+        (_HippiusAuthenticationError("token expired"), "permanent"),
+        # Nothing matches → unknown (these go to DLQ flagged for review)
+        (Exception("totally novel failure"), "unknown"),
+        (Exception(""), "unknown"),
+    ],
+)
 def test_upload_keyword_and_class_fallbacks(error: Exception, expected: str) -> None:
     assert classify_upload_error(error) == expected
 
@@ -292,6 +309,7 @@ def test_upload_keyword_and_class_fallbacks(error: Exception, expected: str) -> 
 # =========================================================================== #
 # classify_upload_error — chained __cause__ walk-through
 # =========================================================================== #
+
 
 def test_upload_walks_chained_cause_for_transient() -> None:
     inner = ConnectionError("upstream dropped")
@@ -319,6 +337,7 @@ def test_upload_walks_chained_cause_for_permanent() -> None:
 # classify_upload_error — disk full 507 wins over the billing check
 # =========================================================================== #
 
+
 def test_507_wins_over_billing() -> None:
     # Pathological: a 507 with "Payment Required" in the message. 507 wins because
     # the status-code layer runs before the billing keyword fallback in is_billing_error.
@@ -328,6 +347,7 @@ def test_507_wins_over_billing() -> None:
 # =========================================================================== #
 # classify_error backward-compat alias
 # =========================================================================== #
+
 
 def test_classify_error_alias_matches_upload() -> None:
     # Several call sites still import classify_error; it must equal classify_upload_error.
@@ -339,6 +359,7 @@ def test_classify_error_alias_matches_upload() -> None:
 # =========================================================================== #
 # classify_download_error — the 404 divergence is the headline behaviour
 # =========================================================================== #
+
 
 @pytest.mark.parametrize(
     "error, expected",
@@ -371,6 +392,7 @@ def test_download_never_returns_billing() -> None:
 # =========================================================================== #
 # classify_unpin_error — 404 transient, everything else same as upload
 # =========================================================================== #
+
 
 def test_unpin_404_is_transient_not_permanent() -> None:
     """The headline difference from upload/download: 404 means the pin commit
@@ -412,6 +434,7 @@ def test_three_classifiers_diverge_on_404() -> None:
 # is_retryable — wraps classify_upload_error + attempt budget
 # =========================================================================== #
 
+
 def test_retryable_true_for_transient_under_budget() -> None:
     assert is_retryable(_HTTPLikeError(503), attempts=0, max_attempts=5) is True
     assert is_retryable(_HTTPLikeError(503), attempts=3, max_attempts=5) is True
@@ -435,11 +458,15 @@ def test_retryable_false_for_billing() -> None:
 # compute_backoff_ms — exponential with jitter, capped
 # =========================================================================== #
 
-@pytest.mark.parametrize("attempt, base_floor, base_ceiling", [
-    (1, 1000, 1100),
-    (2, 2000, 2200),
-    (3, 4000, 4400),
-])
+
+@pytest.mark.parametrize(
+    "attempt, base_floor, base_ceiling",
+    [
+        (1, 1000, 1100),
+        (2, 2000, 2200),
+        (3, 4000, 4400),
+    ],
+)
 def test_backoff_within_bounds(attempt: int, base_floor: int, base_ceiling: int) -> None:
     for _ in range(40):
         v = compute_backoff_ms(attempt, base_ms=1000, max_ms=10**9)
@@ -462,28 +489,78 @@ def test_backoff_grows_per_attempt() -> None:
 # Real-world DLQ-shaped failure messages (regression coverage for "unknown" leak)
 # =========================================================================== #
 
-@pytest.mark.parametrize("real_message, expected", [
-    # ----- patterns observed in the 2026-06-04 prod arion_upload_requests:dlq sample -----
-    ("all connection attempts failed", "transient"),                # 137× / 200 sample
-    ("Server disconnected without sending a response.", "transient"),  # 22× / 200
-    ("[Errno -5] No address associated with hostname", "transient"),  # 2× — DNS resolver blip
-    (
-        "Authentication failed: Client error '401 Unauthorized' for url 'https://arion.hippius.com/upload' "
-        "For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/401",
-        "permanent",
-    ),
-    # ----- additional real-world shapes (httpx, boto, generic transport) -----
-    ("Connection reset by peer", "transient"),
-    ("HTTPConnectionPool(host='arion.hippius.com', port=443): Max retries exceeded", "transient"),
-    ("upstream request timeout", "transient"),
-    ("HTTP/1.1 502 Bad Gateway", "transient"),
-    ("Temporary failure in name resolution", "transient"),
-    # Real arion-unpinner validation rejection (what we saw in the day-2 digest)
-    ("Failed to unpin arion identifier=abc123: 1 validation error", "permanent"),
-    # Real api STREAM fetch failed (the PR #177 territory)
-    ("STREAM fetch failed object_id=... v=1 part=14 chunk=2", "unknown"),
-    # boto SlowDown verbose form
-    ("An error occurred (SlowDown) when calling the PutObject operation: Please reduce your request rate.", "transient"),
-])
+
+@pytest.mark.parametrize(
+    "real_message, expected",
+    [
+        # ----- patterns observed in the 2026-06-04 prod arion_upload_requests:dlq sample -----
+        ("all connection attempts failed", "transient"),  # 137× / 200 sample
+        ("Server disconnected without sending a response.", "transient"),  # 22× / 200
+        ("[Errno -5] No address associated with hostname", "transient"),  # 2× — DNS resolver blip
+        (
+            "Authentication failed: Client error '401 Unauthorized' for url 'https://arion.hippius.com/upload' "
+            "For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/401",
+            "permanent",
+        ),
+        # ----- additional real-world shapes (httpx, boto, generic transport) -----
+        ("Connection reset by peer", "transient"),
+        ("HTTPConnectionPool(host='arion.hippius.com', port=443): Max retries exceeded", "transient"),
+        ("upstream request timeout", "transient"),
+        ("HTTP/1.1 502 Bad Gateway", "transient"),
+        ("Temporary failure in name resolution", "transient"),
+        # Real arion-unpinner validation rejection (what we saw in the day-2 digest)
+        ("Failed to unpin arion identifier=abc123: 1 validation error", "permanent"),
+        # Real api STREAM fetch failed (the PR #177 territory)
+        ("STREAM fetch failed object_id=... v=1 part=14 chunk=2", "unknown"),
+        # boto SlowDown verbose form
+        (
+            "An error occurred (SlowDown) when calling the PutObject operation: Please reduce your request rate.",
+            "transient",
+        ),
+    ],
+)
 def test_real_world_error_messages(real_message: str, expected: str) -> None:
     assert classify_upload_error(Exception(real_message)) == expected
+
+
+# =========================================================================== #
+# Meta-write race: must NOT permanently DLQ the race-window message
+# =========================================================================== #
+
+
+@pytest.mark.parametrize(
+    "msg, expected",
+    [
+        # Pre-deadline race-window message — defense-in-depth: arion-uploader /
+        # s3-backup now polls and only raises after the deadline, but if this
+        # string is ever raised it MUST classify as transient and retry.
+        (
+            "Missing meta in filesystem cache for backup: object_id=abc-123 version=1 part=1",
+            "transient",
+        ),
+        (
+            "Missing meta in filesystem cache for upload: object_id=abc-123 version=1 part=1",
+            "transient",
+        ),
+        # After-deadline raise — writer crashed, data evicted, etc. Permanent.
+        (
+            "Missing meta in filesystem cache after 30.0s for upload: object_id=abc-123 version=1 part=1",
+            "permanent",
+        ),
+        (
+            "Missing meta in filesystem cache after 30.0s for backup: object_id=abc-123 version=1 part=1",
+            "permanent",
+        ),
+        # Operator misconfig (cache root unmounted) — permanent.
+        ("Filesystem cache directory missing: /var/lib/hippius/object_cache", "permanent"),
+    ],
+)
+def test_filesystem_cache_race_classification(msg: str, expected: str) -> None:
+    assert classify_upload_error(Exception(msg)) == expected
+    # Same expectation for download / unpin classifiers — the race shape is
+    # consumer-agnostic.
+    from hippius_s3.workers.errors import classify_download_error
+    from hippius_s3.workers.errors import classify_unpin_error
+
+    assert classify_download_error(Exception(msg)) == expected
+    assert classify_unpin_error(Exception(msg)) == expected

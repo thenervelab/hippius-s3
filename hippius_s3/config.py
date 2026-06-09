@@ -149,6 +149,16 @@ class Config:
     uploader_pin_parallelism: int = env("HIPPIUS_UPLOADER_PIN_PARALLELISM:5", convert=int)
     # Heavy validation gating (legacy PINNER_VALIDATE_COVERAGE supported for compat)
     uploader_validate_coverage: bool = env("UPLOADER_VALIDATE_COVERAGE:false", convert=lambda x: x.lower() == "true")
+    # Deadline (seconds) for polling meta.json on the shared FS cache before
+    # giving up. The api pod writes meta last after fsync. On prod the api and
+    # consumer workers are co-located on the cache node so reads see meta
+    # immediately. On staging (and as defence-in-depth on prod) the worker
+    # may live on a different node from the producer, so meta visibility can
+    # lag the producer's fsync by ~hundreds of ms on a RWX CephFS mount.
+    # Within this window a missing meta = "writer hasn't propagated yet" =
+    # poll. After the window = genuine fault → raise (classifier routes
+    # to DLQ as permanent).
+    fs_meta_wait_seconds: float = env("HIPPIUS_FS_META_WAIT_SECONDS:30", convert=float)
 
     # Unpinner configuration
     unpinner_parallelism: int = env("HIPPIUS_UNPINNER_PARALLELISM:5", convert=int)

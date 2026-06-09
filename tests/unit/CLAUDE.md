@@ -64,11 +64,12 @@ Put them under the matching subdirectory. Naming: `test_<module>_<behavior>.py`.
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #6741 | 12:26 PM | 🔄 | Downloader tests migrated to FileSystemPartsStore | ~296 |
+| #6801 | 1:01 PM | 🟣 | Committed comprehensive PR #146 code review fixes addressing critical safety issues | ~1390 |
+| #6798 | 12:58 PM | 🔄 | Deleted obsolete download cache dual-read test file | ~271 |
 
-### May 27, 2026
+### Apr 23, 2026
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #8225 | 10:49 AM | ✅ | Performance optimization suite completed and verified | ~570 |
+| #6965 | 2:08 PM | 🔵 | Code reuse analysis identifies test fixture duplication and typing improvements | ~864 |
 </claude-mem-context>

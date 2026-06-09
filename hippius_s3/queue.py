@@ -154,7 +154,7 @@ async def enqueue_upload_to_backends(request: UploadChainRequest) -> None:
     raw = request.model_dump_json()
     for backend in request.upload_backends:
         queue_name = f"{backend}_upload_requests"
-        await client.lpush(queue_name, raw)
+        await client.lpush(queue_name, raw)  # ty: ignore[invalid-await]
     logger.info(f"Enqueued upload request {request.name=} backends={request.upload_backends}")
 
 
@@ -167,7 +167,7 @@ async def dequeue_upload_request(queue_name: str) -> UploadChainRequest | None:
     """Get the next upload request from the Redis queue."""
     client = get_queue_client()
 
-    result = await client.brpop(_normalize_queue_name(queue_name), timeout=0.5)
+    result = await client.brpop(_normalize_queue_name(queue_name), timeout=0.5)  # ty: ignore[invalid-await, invalid-argument-type]
     if result:
         _, queue_data = result
         queue_data = json.loads(queue_data)
@@ -248,7 +248,7 @@ async def enqueue_unpin_request(payload: UnpinChainRequest, *, queue_name: str |
     raw = payload.model_dump_json()
 
     if queue_name is not None:
-        await client.lpush(_normalize_queue_name(queue_name), raw)
+        await client.lpush(_normalize_queue_name(queue_name), raw)  # ty: ignore[invalid-await]
         logger.info(f"Enqueued unpin request {payload.name=} queue={queue_name}")
     else:
         config = get_config()
@@ -277,14 +277,14 @@ async def enqueue_unpin_request(payload: UnpinChainRequest, *, queue_name: str |
         backends = effective or config.delete_backends
         queue_names = [f"{b}_unpin_requests" for b in backends]
         for qname in queue_names:
-            await client.lpush(qname, raw)
+            await client.lpush(qname, raw)  # ty: ignore[invalid-await]
         logger.info(f"Enqueued unpin request {payload.name=} queues={queue_names}")
 
 
 async def dequeue_unpin_request(queue_name: str = "unpin_requests") -> UnpinChainRequest | None:
     """Get the next unpin request from the Redis queue."""
     client = get_queue_client()
-    result = await client.brpop(_normalize_queue_name(queue_name), timeout=3)
+    result = await client.brpop(_normalize_queue_name(queue_name), timeout=3)  # ty: ignore[invalid-await, invalid-argument-type]
     if result:
         _, queue_data = result
         return UnpinChainRequest.model_validate_json(queue_data)
@@ -379,7 +379,7 @@ async def enqueue_download_request(payload: DownloadChainRequest) -> None:
     queue_names = [f"{b}_download_requests" for b in payload.download_backends]
 
     for qname in queue_names:
-        await client.lpush(qname, raw)
+        await client.lpush(qname, raw)  # ty: ignore[invalid-await]
 
     logger.info(f"Enqueued download request {payload.name=} queues={queue_names}")
 
@@ -387,7 +387,7 @@ async def enqueue_download_request(payload: DownloadChainRequest) -> None:
 async def dequeue_download_request(queue_name: str) -> DownloadChainRequest | None:
     """Get the next download request from a backend-specific download queue."""
     client = get_queue_client()
-    result = await client.brpop(_normalize_queue_name(queue_name), timeout=5)
+    result = await client.brpop(_normalize_queue_name(queue_name), timeout=5)  # ty: ignore[invalid-await, invalid-argument-type]
     if result:
         _, queue_data = result
         return DownloadChainRequest.model_validate_json(queue_data)

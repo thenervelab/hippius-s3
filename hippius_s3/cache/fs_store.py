@@ -386,6 +386,32 @@ class FileSystemPartsStore:
             logger.warning(f"FS meta read failed: object_id={object_id} v={object_version} part={part_number}: {e}")
             return None
 
+    async def get_meta_with_wait(
+        self,
+        object_id: str,
+        object_version: int,
+        part_number: int,
+        deadline_seconds: float = 30.0,
+    ) -> Optional[dict]:
+        # Poll get_meta with exponential backoff. The uploader writes meta last
+        # (after all chunks), and the consumer may dequeue before the writer's
+        # fsync has propagated across the shared cache mount. Within the
+        # deadline, "missing" = "writer hasn't finished" = wait. After the
+        # deadline, "missing" = genuine fault (writer crashed / FS-evicted /
+        # never written) = let the caller raise an after-deadline error so the
+        # classifier can route it as permanent.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + deadline_seconds
+        backoff = 0.1
+        while True:
+            meta = await self.get_meta(object_id, object_version, part_number)
+            if meta is not None:
+                return meta
+            if loop.time() >= deadline:
+                return None
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 2.0)
+
     async def delete_part(self, object_id: str, object_version: int, part_number: int) -> None:
         """Delete a part directory and attempt to prune empty parent directories.
 

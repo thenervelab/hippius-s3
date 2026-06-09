@@ -190,7 +190,7 @@ class BanHammerService:
             end
             return ttl
             """
-            with_ttl = await self.redis.eval(script, 1, block_key, value, str(ban_seconds))
+            with_ttl = await self.redis.eval(script, 1, block_key, value, str(ban_seconds))  # ty: ignore[invalid-await]
             logger.warning(
                 "banhammer_ban ip=%s profile=%s ban_seconds=%s effective_ttl=%s count=%s reason=%s",
                 ip,
