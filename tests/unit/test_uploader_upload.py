@@ -420,3 +420,162 @@ async def test_process_upload_no_longer_calls_pin_on_api(mock_config, mock_db_po
 
         assert "QmCID1" in result
         assert not hasattr(uploader, "pin_on_api")
+
+
+# ============================================================================ #
+# Meta-write race: end-to-end chain that the original DLQ pileup hinged on.
+#
+# The chain we MUST keep working:
+#   _upload_single_chunk
+#     → fs_store.get_meta_with_wait(...) returns None  (poll deadline expired)
+#     → raise RuntimeError("Missing meta in filesystem cache after Ns ...")
+#     → classify_upload_error(error) == "permanent"
+#     → uploader's main loop routes to DLQ as permanent (no infinite retry)
+#
+# Unit tests already cover each link in isolation (get_meta_with_wait polling
+# in test_fs_store.py; the classifier in test_classify_errors.py). The
+# regression risk is in the SEAM between them — that the upload code raises
+# the EXACT message shape the classifier recognises.
+# ============================================================================ #
+
+
+@pytest.mark.asyncio
+async def test_upload_raises_after_deadline_message_when_meta_missing(
+    mock_config, mock_db_pool, mock_fs_store
+):
+    """The uploader must raise the after-deadline message (not the pre-deadline
+    one) when get_meta_with_wait returns None — otherwise the classifier would
+    mark it transient and the worker would retry the failing slot forever."""
+    redis = FakeRedis()
+    redis_queues = FakeRedis()
+    mock_config.fs_meta_wait_seconds = 0.1
+
+    # The whole point of the race fix: get_meta_with_wait returns None when
+    # the writer hasn't propagated meta within the deadline.
+    mock_fs_store.get_meta_with_wait = AsyncMock(return_value=None)
+
+    uploader = Uploader(
+        mock_db_pool, redis, redis_queues, mock_config, backend_name="arion", backend_client=MagicMock()
+    )
+    uploader.fs_store = mock_fs_store
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await uploader._upload_single_chunk(
+            object_id="obj-race-1",
+            object_key="test-key",
+            chunk=Chunk(id=1),
+            upload_id="upload-race-1",
+            object_version=1,
+            account_ss58="5FakeTestAccountAddress123456789012345678901234",
+        )
+
+    msg = str(excinfo.value)
+    # The exact substring the classifier's _PERMANENT_KEYWORDS keys on. If this
+    # ever drifts, the classifier will mis-route the failure (back to
+    # transient) and we will retry until DLQ — re-creating the original bug.
+    assert "missing meta in filesystem cache after" in msg.lower()
+    assert "object_id=obj-race-1" in msg
+    assert "version=1" in msg
+    assert "part=1" in msg
+
+    # And the deadline-poll must have been awaited with the configured value,
+    # not skipped or hardcoded.
+    mock_fs_store.get_meta_with_wait.assert_awaited_once()
+    _, kwargs = mock_fs_store.get_meta_with_wait.call_args
+    assert kwargs.get("deadline_seconds") == 0.1
+
+
+@pytest.mark.asyncio
+async def test_uploader_after_deadline_message_classifies_as_permanent(
+    mock_config, mock_db_pool, mock_fs_store
+):
+    """End-to-end seam check: take the EXACT exception the uploader produces
+    on a stuck meta and run it through the actual classifier. The original
+    bug was a mismatch between the message string and the keyword list — this
+    test exists to make any future drift between them an immediate red CI."""
+    from hippius_s3.workers.errors import classify_upload_error
+
+    redis = FakeRedis()
+    redis_queues = FakeRedis()
+    mock_config.fs_meta_wait_seconds = 0.05
+    mock_fs_store.get_meta_with_wait = AsyncMock(return_value=None)
+
+    uploader = Uploader(
+        mock_db_pool, redis, redis_queues, mock_config, backend_name="arion", backend_client=MagicMock()
+    )
+    uploader.fs_store = mock_fs_store
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await uploader._upload_single_chunk(
+            object_id="obj-race-2",
+            object_key="test-key",
+            chunk=Chunk(id=1),
+            upload_id="upload-race-2",
+            object_version=1,
+            account_ss58="5FakeTestAccountAddress123456789012345678901234",
+        )
+
+    # The whole reason we changed the message string and the keyword list
+    # together: this exception, raised by THIS code path, must be permanent.
+    # If the classifier returns "transient" we'd retry forever on a fault.
+    # If it returns "unknown" we'd land in DLQ but mark it for human review
+    # (also wrong — this IS a genuine permanent failure).
+    assert classify_upload_error(excinfo.value) == "permanent"
+
+
+@pytest.mark.asyncio
+async def test_uploader_does_not_raise_when_meta_lands_within_deadline(
+    mock_config, mock_db_pool, mock_fs_store
+):
+    """The race-fix sibling assertion: when get_meta_with_wait succeeds (the
+    common case in production, where api + workers share a node), the upload
+    path takes the normal happy path with no error and no retry overhead."""
+    redis = FakeRedis()
+    redis_queues = FakeRedis()
+    mock_config.fs_meta_wait_seconds = 30.0
+
+    # Meta returns normally — this is the steady-state production behavior.
+    mock_fs_store.get_meta_with_wait = AsyncMock(
+        return_value={"num_chunks": 1, "chunk_size": 1024}
+    )
+
+    chunk_uuid = "aaaabbbb-cccc-dddd-eeee-ffffffffffff"
+    mock_conn = AsyncMock()
+    mock_conn.fetchrow = AsyncMock(return_value=MockRow({"part_id": "part-uuid"}))
+    mock_conn.fetchval = AsyncMock(side_effect=[chunk_uuid, 1])
+    mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
+
+    mock_upload_response = UploadResponse(
+        id="file-uuid-happy",
+        original_name="test.part1.chunk0",
+        content_type="application/octet-stream",
+        size_bytes=1024,
+        sha256_hex="abc",
+        cid="QmHappy",
+        status="completed",
+        file_url="https://example.com/file",
+        created_at="2025-11-27T12:00:00Z",
+        updated_at="2025-11-27T12:00:00Z",
+    )
+    mock_api_instance = AsyncMock()
+    mock_api_instance.upload_file_and_get_cid = AsyncMock(return_value=mock_upload_response)
+    mock_api_instance.__aenter__ = AsyncMock(return_value=mock_api_instance)
+    mock_api_instance.__aexit__ = AsyncMock()
+
+    uploader = Uploader(
+        mock_db_pool, redis, redis_queues, mock_config, backend_name="arion", backend_client=mock_api_instance
+    )
+    uploader.fs_store = mock_fs_store
+
+    # Should NOT raise.
+    await uploader._upload_single_chunk(
+        object_id="obj-happy",
+        object_key="test-key",
+        chunk=Chunk(id=1),
+        upload_id="upload-happy",
+        object_version=1,
+        account_ss58="5FakeTestAccountAddress123456789012345678901234",
+    )
+
+    # And the upload actually proceeded — no early bail-out hiding a regression.
+    assert mock_api_instance.upload_file_and_get_cid.call_count == 1
