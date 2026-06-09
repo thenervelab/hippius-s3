@@ -51,7 +51,7 @@ class BaseDLQManager(Generic[T]):
         """Release lock only if token matches (atomic compare-and-delete)."""
         script = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
         with contextlib.suppress(Exception):
-            await self.redis_client.eval(script, 1, self._lock_key(identifier), token)
+            await self.redis_client.eval(script, 1, self._lock_key(identifier), token)  # ty: ignore[invalid-await]
 
     async def push(self, payload: T, last_error: str, error_type: str) -> None:
         """Push a failed request to the Dead-Letter Queue."""
@@ -61,7 +61,7 @@ class BaseDLQManager(Generic[T]):
 
         dlq_entry = self._create_entry(payload, last_error, etype)
 
-        await self.redis_client.lpush(self.dlq_key, json.dumps(dlq_entry))
+        await self.redis_client.lpush(self.dlq_key, json.dumps(dlq_entry))  # ty: ignore[invalid-await]
         identifier = self._get_identifier(payload)
         logger.warning(
             f"Pushed to DLQ ({self.dlq_key}): identifier={identifier}, error_type={etype}, error={last_error}"
@@ -84,7 +84,7 @@ class BaseDLQManager(Generic[T]):
 
     async def peek(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Peek at DLQ entries without removing them."""
-        raw = await self.redis_client.lrange(self.dlq_key, -limit, -1)
+        raw = await self.redis_client.lrange(self.dlq_key, -limit, -1)  # ty: ignore[invalid-await]
         out: List[Dict[str, Any]] = []
         for entry_json in raw:
             try:
@@ -95,11 +95,11 @@ class BaseDLQManager(Generic[T]):
 
     async def stats(self) -> Dict[str, Any]:
         """Get DLQ statistics."""
-        count = await self.redis_client.llen(self.dlq_key)
+        count = await self.redis_client.llen(self.dlq_key)  # ty: ignore[invalid-await]
         error_types = {"transient": 0, "permanent": 0, "unknown": 0}
 
         if count > 0:
-            all_entries = await self.redis_client.lrange(self.dlq_key, 0, -1)
+            all_entries = await self.redis_client.lrange(self.dlq_key, 0, -1)  # ty: ignore[invalid-await]
             for entry_json in all_entries:
                 try:
                     entry = json.loads(entry_json)
@@ -131,7 +131,7 @@ class BaseDLQManager(Generic[T]):
                 logger.error(
                     f"Refusing to requeue permanent error for identifier: {identifier}. Use --force to override."
                 )
-                await self.redis_client.lpush(self.dlq_key, json.dumps(entry))
+                await self.redis_client.lpush(self.dlq_key, json.dumps(entry))  # ty: ignore[invalid-await]
                 return False
 
             payload_data = entry["payload"]
@@ -151,7 +151,7 @@ class BaseDLQManager(Generic[T]):
             logger.error(f"Failed to requeue identifier: {identifier}, error: {e}")
             with contextlib.suppress(Exception):
                 if "entry" in locals() and entry:
-                    await self.redis_client.lpush(self.dlq_key, json.dumps(entry))
+                    await self.redis_client.lpush(self.dlq_key, json.dumps(entry))  # ty: ignore[invalid-await]
             return False
         finally:
             with contextlib.suppress(Exception):
@@ -180,7 +180,7 @@ class BaseDLQManager(Generic[T]):
                 entry = json.loads(entry_json)
                 if entry.get("error_type") == "permanent" and not force:
                     # Put permanent errors back
-                    await self.redis_client.lpush(self.dlq_key, entry_json)
+                    await self.redis_client.lpush(self.dlq_key, entry_json)  # ty: ignore[invalid-await]
                     total_skipped += 1
                     continue
                 payload_data = entry["payload"]
@@ -219,14 +219,14 @@ class BaseDLQManager(Generic[T]):
         if identifier:
             entry = await self._find_and_remove_entry(identifier)
             return 1 if entry else 0
-        count = int(await self.redis_client.llen(self.dlq_key))
+        count = int(await self.redis_client.llen(self.dlq_key))  # ty: ignore[invalid-await]
         await self.redis_client.delete(self.dlq_key)
         return count
 
     async def export(self, file_path: str) -> bool:
         """Export DLQ contents to a JSON file."""
         try:
-            all_entries = await self.redis_client.lrange(self.dlq_key, 0, -1)
+            all_entries = await self.redis_client.lrange(self.dlq_key, 0, -1)  # ty: ignore[invalid-await]
             entries = []
             for entry_json in all_entries:
                 try:
@@ -257,7 +257,7 @@ class BaseDLQManager(Generic[T]):
             entries = await asyncio.to_thread(_read_json)
 
             for entry in entries:
-                await self.redis_client.lpush(self.dlq_key, json.dumps(entry))
+                await self.redis_client.lpush(self.dlq_key, json.dumps(entry))  # ty: ignore[invalid-await]
 
             logger.info(f"Imported {len(entries)} entries from {file_path}")
             return True

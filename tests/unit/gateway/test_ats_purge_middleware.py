@@ -112,9 +112,7 @@ async def test_batch_delete_does_not_purge_in_v1(app: Any, captured_purges: list
 
 
 @pytest.mark.asyncio
-async def test_bucket_acl_flip_does_not_fire_wildcard_purge(
-    app: Any, captured_purges: list[tuple[str, str]]
-) -> None:
+async def test_bucket_acl_flip_does_not_fire_wildcard_purge(app: Any, captured_purges: list[tuple[str, str]]) -> None:
     """Stock ATS HTTP PURGE doesn't support globs — bucket-level invalidation is a no-op.
 
     Objects age out within the 5-min TTL; regex_revalidate plugin could close this gap later.
@@ -126,9 +124,7 @@ async def test_bucket_acl_flip_does_not_fire_wildcard_purge(
 
 
 @pytest.mark.asyncio
-async def test_bucket_delete_does_not_fire_wildcard_purge(
-    app: Any, captured_purges: list[tuple[str, str]]
-) -> None:
+async def test_bucket_delete_does_not_fire_wildcard_purge(app: Any, captured_purges: list[tuple[str, str]]) -> None:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://s3.hippius.com") as client:
         r = await client.delete("/mybucket")
     assert r.status_code == 200
@@ -181,6 +177,80 @@ async def test_host_header_propagated(app: Any, captured_purges: list[tuple[str,
         r = await client.put("/mybucket/k", content=b"x")
     assert r.status_code == 200
     assert captured_purges == [("s3-staging.hippius.com", "mybucket/k")]
+
+
+@pytest.mark.asyncio
+async def test_x_forwarded_host_wins_over_inbound_host(app: Any, captured_purges: list[tuple[str, str]]) -> None:
+    """In prod the on-wire Host is the upstream rewritten by ATS — the public
+    Host that built the cache key lives on x-forwarded-host. Must use that."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://192.168.1.199:30081") as client:
+        r = await client.put(
+            "/mybucket/k",
+            content=b"x",
+            headers={"x-forwarded-host": "s3.hippius.com"},
+        )
+    assert r.status_code == 200
+    assert captured_purges == [("s3.hippius.com", "mybucket/k")]
+
+
+@pytest.mark.asyncio
+async def test_x_original_host_used_when_no_x_forwarded_host(app: Any, captured_purges: list[tuple[str, str]]) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://192.168.1.199:30081") as client:
+        r = await client.put(
+            "/mybucket/k",
+            content=b"x",
+            headers={"x-original-host": "eu-central-1.hippius.com"},
+        )
+    assert r.status_code == 200
+    assert captured_purges == [("eu-central-1.hippius.com", "mybucket/k")]
+
+
+@pytest.mark.asyncio
+async def test_default_port_stripped_from_host(app: Any, captured_purges: list[tuple[str, str]]) -> None:
+    """`s3.hippius.com:80` and `s3.hippius.com` must produce the same cache
+    key — the cachekey.so plugin keys on the URL including port, but HTTP
+    clients omit default ports in the URL the GET uses."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://x") as client:
+        r = await client.put(
+            "/mybucket/k",
+            content=b"x",
+            headers={"x-forwarded-host": "s3.hippius.com:80"},
+        )
+    assert r.status_code == 200
+    assert captured_purges == [("s3.hippius.com", "mybucket/k")]
+
+
+@pytest.mark.asyncio
+async def test_falls_back_to_default_host_when_no_headers(
+    app: Any, captured_purges: list[tuple[str, str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """For requests with no usable Host hint (in-cluster service DNS that
+    doesn't map cleanly), fall back to s3.hippius.com so PURGEs at least hit
+    a remap-mapped name instead of being rejected as ERR_INVALID_URL."""
+    # ASGITransport always sends a Host header; simulate the no-host case by
+    # invoking the middleware directly with a constructed scope.
+    from fastapi import Request as _Request
+
+    captured_purges.clear()
+    scope = {
+        "type": "http",
+        "method": "PUT",
+        "path": "/mybucket/k",
+        "raw_path": b"/mybucket/k",
+        "query_string": b"",
+        "headers": [],  # no host at all
+        "scheme": "http",
+        "server": ("testserver", 80),
+        "client": ("127.0.0.1", 1234),
+        "state": {},
+    }
+    request = _Request(scope)
+
+    async def _next(req: _Request) -> Response:
+        return Response(status_code=200, content=b"ok")
+
+    await ats_purge_middleware(request, _next)
+    assert captured_purges == [("s3.hippius.com", "mybucket/k")]
 
 
 @pytest.mark.asyncio

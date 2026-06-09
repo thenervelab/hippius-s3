@@ -443,7 +443,7 @@ async def run_downloader_loop(
                 logger.warning(f"[{backend_name}] Rebuilding cache redis client after task error")
                 with contextlib.suppress(Exception):
                     await redis_client.aclose()
-                redis_client = create_redis_client(config.redis_url)
+                redis_client = create_redis_client(config.redis_url)  # ty: ignore[invalid-assignment]
                 initialize_cache_client(redis_client)
                 obj_cache = RedisObjectPartsCache(redis_client, queues_client=redis_queues_client, fs_store=fs_store)
                 needs_redis_reconnect = False
@@ -465,7 +465,7 @@ async def run_downloader_loop(
             except (BusyLoadingError, RedisConnectionError, RedisTimeoutError) as exc:
                 logger.warning(f"[{backend_name}] Redis error dequeuing: {exc}. Reconnecting…")
                 with contextlib.suppress(Exception):
-                    await redis_queues_client.aclose()  # ty: ignore[unresolved-attribute]
+                    await redis_queues_client.aclose()
                 await asyncio.sleep(2)
                 redis_queues_client = async_redis.from_url(config.redis_queues_url)
                 initialize_queue_client(redis_queues_client)
@@ -503,6 +503,6 @@ async def run_downloader_loop(
         logger.error(f"[{backend_name}] Fatal loop error: {exc}", exc_info=True)
         raise
     finally:
-        await redis_client.aclose()  # ty: ignore[unresolved-attribute]
-        await redis_queues_client.aclose()  # ty: ignore[unresolved-attribute]
+        await redis_client.aclose()
+        await redis_queues_client.aclose()
         await db_pool.close()

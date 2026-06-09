@@ -254,7 +254,7 @@ async def recent_uploads(
 ) -> JSONResponse:
     cache_key = f"recent_uploads:{main_account_id}"
 
-    cached = await redis.get(cache_key)  # ty: ignore[unresolved-attribute]
+    cached = await redis.get(cache_key)
     if cached is not None:
         return JSONResponse(json.loads(cached))
 
@@ -284,7 +284,7 @@ async def recent_uploads(
         "uploads": uploads,
     }
 
-    await redis.setex(cache_key, RECENT_UPLOADS_CACHE_TTL_SECONDS, json.dumps(payload))  # ty: ignore[unresolved-attribute]
+    await redis.setex(cache_key, RECENT_UPLOADS_CACHE_TTL_SECONDS, json.dumps(payload))
 
     return JSONResponse(payload)
 

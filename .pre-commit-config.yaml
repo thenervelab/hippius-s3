@@ -2,14 +2,16 @@ repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.13.0
     hooks:
+      # Lint + auto-fix in place. --fix means staged files get corrected
+      # automatically; only unfixable findings fail the commit.
       - id: ruff
         args: [--fix]
         stages: [pre-commit]
-        files: ^hippius_s3/
+        files: ^(hippius_s3|gateway|tests)/
+      # Format in place (no --check). Equivalent to `ruff format` on save.
       - id: ruff-format
-        args: [--check]
         stages: [pre-commit]
-        files: ^hippius_s3/
+        files: ^(hippius_s3|gateway|tests)/
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
@@ -30,29 +32,23 @@ repos:
 
   - repo: local
     hooks:
+      # Use `.venv/bin/ty` (not PATH) so the version is the one pinned in
+      # pyproject.toml (ty==0.0.43). Scope matches CI:
+      # `.github/workflows/test-and-lint.yml` runs `ty check hippius_s3 gateway`.
       - id: ty
         name: ty (type check)
-        entry: ty check hippius_s3
+        entry: .venv/bin/ty check hippius_s3 gateway
         language: system
         stages: [pre-commit]
         pass_filenames: false
         types: [python]
 
+      # Audit the project venv (which we control via uv.lock) — NOT pip-audit's
+      # own tool env (which we don't). The `uv run` invocation ensures the
+      # audited interpreter is `.venv/bin/python`.
       - id: pip-audit
-        # CVE-2026-3219: pip concatenated tar/zip handling. Fix landed upstream (pypa/pip#13870)
-        # but pip 26.1 not yet released to PyPI as of 2026-04-24 — only 26.0.1 is up. Remove
-        # this ignore once 26.1 ships.
-        # CVE-2026-6357: pip self-update deferred imports ACE. Also fixed in pip 26.1
-        # (released 2026-04-26). Same situation — pip-audit's hook env still resolves
-        # 26.0.1 even though the project venv is on 26.1. Remove once the hook env
-        # picks up 26.1.
-        # CVE-2026-45409 (idna), PYSEC-2026-141 / PYSEC-2026-142 (urllib3):
-        # pip-audit's own tool env carries idna 3.11 and urllib3 2.6.3. Our project
-        # venv is already on idna 3.15 and urllib3 2.7.0 (clean). The hook scans the
-        # tool's env, not ours, so the only way to unblock the hook is to ignore.
-        # Remove once `uv tool upgrade pip-audit` lands fixed deps in the tool env.
         name: pip-audit (dependency scan)
-        entry: pip-audit --ignore-vuln CVE-2024-23342 --ignore-vuln CVE-2026-4539 --ignore-vuln CVE-2026-25645 --ignore-vuln CVE-2026-3219 --ignore-vuln CVE-2026-6357 --ignore-vuln CVE-2026-45409 --ignore-vuln PYSEC-2026-141 --ignore-vuln PYSEC-2026-142
+        entry: uv run --extra dev pip-audit
         language: system
         stages: [pre-commit]
         pass_filenames: false

@@ -17,8 +17,14 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+# Public type alias: every code path treats the Redis client polymorphically
+# (we never reach into cluster-only or standalone-only attributes). Exposing
+# a named union here is what lets call sites annotate cleanly without
+# importing both classes separately.
+RedisClient = Union[Redis, RedisCluster]
 
-def create_redis_client(redis_url: str) -> Union[Redis, RedisCluster]:
+
+def create_redis_client(redis_url: str) -> RedisClient:
     """
     Create a Redis client from URL, automatically detecting cluster vs standalone.
 
@@ -39,7 +45,7 @@ def create_redis_client(redis_url: str) -> Union[Redis, RedisCluster]:
             socket_timeout=5,
             health_check_interval=30,
             socket_keepalive=True,
-            retry_on_error=[RedisConnectionError, RedisTimeoutError],  # ty: ignore[invalid-argument-type]
+            retry_on_error=[RedisConnectionError, RedisTimeoutError],
         )
     logger.info("Creating Redis client")
     return Redis.from_url(redis_url)

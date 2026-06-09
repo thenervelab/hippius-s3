@@ -14,6 +14,27 @@ from gateway.services.ats_cache_client import schedule_purge
 DEFAULT_HOST = "s3.hippius.com"
 
 
+def _public_host(request: Request) -> str:
+    # The cache key in ATS is built from the inbound URL the GET hit, so the
+    # PURGE must carry the same public Host. By the time the request reaches
+    # the gateway pod, the on-wire `Host` has been rewritten by ATS to the
+    # upstream NodePort (or by in-cluster callers to the k8s service DNS),
+    # which would produce a different cache key. The original public host is
+    # preserved on `x-forwarded-host` / `x-original-host` — same fallback
+    # chain SigV4 uses (gateway/middlewares/sigv4.py).
+    host = (
+        request.headers.get("x-forwarded-host")
+        or request.headers.get("x-original-host")
+        or request.headers.get("host")
+        or DEFAULT_HOST
+    )
+    # cachekey.so includes scheme://host[:port]/path; default ports are
+    # implicit so '<host>:80' and '<host>:443' must collapse to '<host>'.
+    if host.endswith(":80") or host.endswith(":443"):
+        host = host.rsplit(":", 1)[0]
+    return host
+
+
 async def ats_purge_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
@@ -45,7 +66,7 @@ async def ats_purge_middleware(
         # MPU part upload — not visible until CompleteMultipartUpload, skip.
         return response
 
-    host = request.headers.get("host", DEFAULT_HOST)
+    host = _public_host(request)
     is_complete_mpu = method == "POST" and "uploadId" in qs and "partNumber" not in qs
     if method in ("PUT", "DELETE") or is_complete_mpu:
         schedule_purge(host, f"{bucket}/{key}")

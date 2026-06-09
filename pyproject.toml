@@ -61,7 +61,11 @@ dev = [
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
     "ruff>=0.12.0",
-    "ty>=0.0.16",
+    # ty must be pinned exactly: the same code can be "clean" on one version
+    # and "broken" on the next. Keep this in lockstep with
+    # .github/workflows/test-and-lint.yml `uv tool install ty==X.Y.Z` and
+    # .pre-commit-config.yaml (which runs `.venv/bin/ty` so it inherits this pin).
+    "ty==0.0.43",
     "pip-audit>=2.10.0",
     "pre-commit>=3.5.0",
     "minio>=7.1.15",
@@ -69,7 +73,11 @@ dev = [
     "types-boto3",
     "types-botocore",
     "types-requests",
-    "types-redis",
+    # types-redis intentionally NOT pinned here: the `redis` package ships its
+    # own inline stubs (`redis-stubs/` in site-packages) since 5.x, and adding
+    # the standalone types-redis (4.6.x) confuses ty by stacking two stub sets
+    # — one of them missing methods like aclose, the other inconsistent on
+    # close() signatures. Bundled stubs only.
     "requests>=2.31.0",
     "psycopg[binary]>=3.1",
     "fakeredis>=2.23.0",

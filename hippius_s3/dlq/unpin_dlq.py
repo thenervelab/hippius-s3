@@ -35,7 +35,7 @@ class UnpinDLQManager(BaseDLQManager[UnpinChainRequest]):
 
     async def _find_and_remove_entry(self, identifier: str) -> Optional[Dict[str, Any]]:
         """Find and remove entry by CID or object_id."""
-        all_entries = await self.redis_client.lrange(self.dlq_key, 0, -1)
+        all_entries = await self.redis_client.lrange(self.dlq_key, 0, -1)  # ty: ignore[invalid-await]
         target_entry: Optional[Dict[str, Any]] = None
 
         for entry_json in all_entries:
@@ -45,7 +45,7 @@ class UnpinDLQManager(BaseDLQManager[UnpinChainRequest]):
                 continue
 
             if entry.get("cid") == identifier or entry.get("object_id") == identifier:
-                removed = await self.redis_client.lrem(self.dlq_key, 1, entry_json)
+                removed = await self.redis_client.lrem(self.dlq_key, 1, entry_json)  # ty: ignore[invalid-await]
                 if removed:
                     target_entry = entry
                     break
