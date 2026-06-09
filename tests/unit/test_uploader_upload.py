@@ -16,6 +16,7 @@ from hippius_s3.workers.uploader import Uploader
 def mock_config():
     config = MagicMock()
     config.uploader_multipart_max_concurrency = 5
+    config.uploader_pin_parallelism = 5
     config.cache_ttl_seconds = 1800
     config.object_cache_dir = "/tmp/test_cache"
     return config
@@ -579,3 +580,133 @@ async def test_uploader_does_not_raise_when_meta_lands_within_deadline(
 
     # And the upload actually proceeded — no early bail-out hiding a regression.
     assert mock_api_instance.upload_file_and_get_cid.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_part_chunks_upload_concurrently_bounded_by_pin_parallelism(mock_config, mock_db_pool, mock_fs_store):
+    """A multi-chunk part uploads its chunks CONCURRENTLY, capped at
+    pin_parallelism — not one at a time. This is the regression guard for the
+    serial inner loop that pinned a worker on a large object for tens of
+    seconds and starved every other queued request."""
+    import asyncio
+
+    mock_config.uploader_pin_parallelism = 4
+    num_chunks = 8
+    mock_fs_store.get_meta_with_wait = AsyncMock(return_value={"num_chunks": num_chunks, "chunk_size": 1024})
+
+    redis = FakeRedis()
+    redis_queues = FakeRedis()
+
+    # Record the peak number of simultaneously in-flight Arion uploads.
+    inflight = {"cur": 0, "max": 0}
+
+    async def fake_upload(**kwargs):
+        inflight["cur"] += 1
+        inflight["max"] = max(inflight["max"], inflight["cur"])
+        await asyncio.sleep(0.05)
+        inflight["cur"] -= 1
+        return UploadResponse(
+            id=f"hash-{kwargs['file_name']}",
+            original_name="x",
+            content_type="application/octet-stream",
+            size_bytes=1024,
+            sha256_hex="abc",
+            cid=f"Qm-{kwargs['file_name']}",
+            status="completed",
+            file_url="https://example.com/file",
+            created_at="2025-11-27T12:00:00Z",
+            updated_at="2025-11-27T12:00:00Z",
+        )
+
+    mock_api = AsyncMock()
+    mock_api.upload_file_and_get_cid = AsyncMock(side_effect=fake_upload)
+
+    uploader = Uploader(
+        mock_db_pool, redis, redis_queues, mock_config, backend_name="arion", backend_client=mock_api
+    )
+    uploader.fs_store = mock_fs_store
+
+    mock_conn = AsyncMock()
+    mock_conn.fetchrow = AsyncMock(return_value=MockRow({"part_id": "part-uuid"}))
+
+    def fake_fetchval(sql, *args):
+        if sql == "INSERT_SENTINEL":
+            return 1
+        # the chunk_id SELECT: args == (part_id, chunk_index)
+        return f"chunk-{args[1]}"
+
+    mock_conn.fetchval = AsyncMock(side_effect=fake_fetchval)
+    mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
+
+    with patch("hippius_s3.workers.uploader.get_query", return_value="INSERT_SENTINEL"):
+        result = await uploader._upload_single_chunk(
+            object_id="obj-multi",
+            object_key="test-key",
+            chunk=Chunk(id=1),
+            upload_id="upload-multi",
+            object_version=1,
+            account_ss58="5FakeTestAccountAddress123456789012345678901234",
+        )
+
+    # Every chunk was uploaded.
+    assert mock_api.upload_file_and_get_cid.call_count == num_chunks
+    # They overlapped (parallel), and never exceeded the configured bound.
+    assert inflight["max"] > 1, "chunks uploaded serially — within-part parallelization regressed"
+    assert inflight["max"] <= 4
+    # Returned hashes preserve chunk order 0..N-1 despite concurrent completion.
+    assert result.cids == [f"hash-chunk-{ci}" for ci in range(num_chunks)]
+    # Exactly one chunk_backend row written per chunk.
+    insert_calls = [c for c in mock_conn.fetchval.call_args_list if c.args[0] == "INSERT_SENTINEL"]
+    assert len(insert_calls) == num_chunks
+
+
+@pytest.mark.asyncio
+async def test_part_chunk_upload_failure_propagates(mock_config, mock_db_pool, mock_fs_store):
+    """If any chunk in a part fails, the whole part upload raises (so the
+    request is retried / DLQ'd) — concurrency must not swallow errors."""
+    import asyncio
+
+    mock_config.uploader_pin_parallelism = 4
+    num_chunks = 6
+    mock_fs_store.get_meta_with_wait = AsyncMock(return_value={"num_chunks": num_chunks, "chunk_size": 1024})
+
+    async def fake_upload(**kwargs):
+        await asyncio.sleep(0.01)
+        if kwargs["file_name"] == "chunk-3":
+            raise RuntimeError("arion boom on chunk 3")
+        return UploadResponse(
+            id=f"hash-{kwargs['file_name']}",
+            original_name="x",
+            content_type="application/octet-stream",
+            size_bytes=1024,
+            sha256_hex="abc",
+            cid="Qm",
+            status="completed",
+            file_url="https://example.com/file",
+            created_at="2025-11-27T12:00:00Z",
+            updated_at="2025-11-27T12:00:00Z",
+        )
+
+    mock_api = AsyncMock()
+    mock_api.upload_file_and_get_cid = AsyncMock(side_effect=fake_upload)
+
+    uploader = Uploader(
+        mock_db_pool, FakeRedis(), FakeRedis(), mock_config, backend_name="arion", backend_client=mock_api
+    )
+    uploader.fs_store = mock_fs_store
+
+    mock_conn = AsyncMock()
+    mock_conn.fetchrow = AsyncMock(return_value=MockRow({"part_id": "part-uuid"}))
+    mock_conn.fetchval = AsyncMock(side_effect=lambda sql, *a: 1 if sql == "INSERT_SENTINEL" else f"chunk-{a[1]}")
+    mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
+
+    with patch("hippius_s3.workers.uploader.get_query", return_value="INSERT_SENTINEL"):
+        with pytest.raises(RuntimeError, match="arion boom on chunk 3"):
+            await uploader._upload_single_chunk(
+                object_id="obj-fail",
+                object_key="test-key",
+                chunk=Chunk(id=1),
+                upload_id="upload-fail",
+                object_version=1,
+                account_ss58="5FakeTestAccountAddress123456789012345678901234",
+            )

@@ -312,31 +312,40 @@ async def cleanup_stale_parts(
                     )
                     continue
 
-                # Cross-check DB: skip deletion if there was recent part activity
+                # Decide, in one query, which of three states this part is in:
+                #   row is None        → no `parts` row at all. The object's DB rows are
+                #                        gone (Phase 4 hard-delete cascades parts →
+                #                        part_chunks → chunk_backend) or this is orphaned
+                #                        FS with no record. mtime>1d already rules out an
+                #                        in-flight write (chunks land before the parts
+                #                        row), so it is safe to reap → fall through.
+                #   row["recent"] true → row exists and was (re)written recently → leave it.
+                #   row["recent"] false→ row exists but is old → only reap once every chunk
+                #                        is replicated to every required backend. A
+                #                        not-yet-replicated part is a pending or aborted
+                #                        upload and must be protected (no data loss).
+                # Distinguishing "no DB row" (orphan, reap) from "DB row but not replicated"
+                # (pending, protect) is what keeps deleted-object cache cleanup working
+                # without ever deleting data that hasn't been backed up.
                 try:
-                    recent = await db.fetchval(
+                    row = await db.fetchrow(
                         """
-                        SELECT 1
+                        SELECT (uploaded_at > """
+                        + cutoff_sql
+                        + """) AS recent
                         FROM parts
                         WHERE object_id = $1 AND object_version = $2 AND part_number = $3
-                          AND uploaded_at > """
-                        + cutoff_sql
-                        + " LIMIT 1",
+                        LIMIT 1""",
                         object_id,
                         object_version,
                         part_number,
                         stale_threshold_seconds,
                     )
-                    if recent:
-                        continue
-
-                    # ABSOLUTE replication gate (identical to Phase 2 GC): never
-                    # delete a part until every chunk is replicated to every required
-                    # backend for its version This deliberately also protects not-yet-replicated
-                    # aborted-MPU orphans — they must be reaped by a path that confirms
-                    # the upload is truly dead, never by blind staleness.
-                    if not await is_replicated_on_all_backends(db, object_id, object_version, part_number):
-                        continue
+                    if row is not None:
+                        if row["recent"]:
+                            continue
+                        if not await is_replicated_on_all_backends(db, object_id, object_version, part_number):
+                            continue
                 except Exception:
                     # If any DB check fails, be extra conservative: skip deletion
                     continue
