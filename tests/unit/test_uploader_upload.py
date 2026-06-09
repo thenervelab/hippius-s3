@@ -17,6 +17,9 @@ def mock_config():
     config = MagicMock()
     config.uploader_multipart_max_concurrency = 5
     config.uploader_pin_parallelism = 5
+    config.arion_upload_concurrency = 5
+    config.arion_breaker_failure_threshold = 8
+    config.arion_breaker_cooldown_seconds = 10.0
     config.cache_ttl_seconds = 1800
     config.object_cache_dir = "/tmp/test_cache"
     return config
@@ -441,9 +444,7 @@ async def test_process_upload_no_longer_calls_pin_on_api(mock_config, mock_db_po
 
 
 @pytest.mark.asyncio
-async def test_upload_raises_after_deadline_message_when_meta_missing(
-    mock_config, mock_db_pool, mock_fs_store
-):
+async def test_upload_raises_after_deadline_message_when_meta_missing(mock_config, mock_db_pool, mock_fs_store):
     """The uploader must raise the after-deadline message (not the pre-deadline
     one) when get_meta_with_wait returns None — otherwise the classifier would
     mark it transient and the worker would retry the failing slot forever."""
@@ -487,9 +488,7 @@ async def test_upload_raises_after_deadline_message_when_meta_missing(
 
 
 @pytest.mark.asyncio
-async def test_uploader_after_deadline_message_classifies_as_permanent(
-    mock_config, mock_db_pool, mock_fs_store
-):
+async def test_uploader_after_deadline_message_classifies_as_permanent(mock_config, mock_db_pool, mock_fs_store):
     """End-to-end seam check: take the EXACT exception the uploader produces
     on a stuck meta and run it through the actual classifier. The original
     bug was a mismatch between the message string and the keyword list — this
@@ -525,9 +524,7 @@ async def test_uploader_after_deadline_message_classifies_as_permanent(
 
 
 @pytest.mark.asyncio
-async def test_uploader_does_not_raise_when_meta_lands_within_deadline(
-    mock_config, mock_db_pool, mock_fs_store
-):
+async def test_uploader_does_not_raise_when_meta_lands_within_deadline(mock_config, mock_db_pool, mock_fs_store):
     """The race-fix sibling assertion: when get_meta_with_wait succeeds (the
     common case in production, where api + workers share a node), the upload
     path takes the normal happy path with no error and no retry overhead."""
@@ -536,9 +533,7 @@ async def test_uploader_does_not_raise_when_meta_lands_within_deadline(
     mock_config.fs_meta_wait_seconds = 30.0
 
     # Meta returns normally — this is the steady-state production behavior.
-    mock_fs_store.get_meta_with_wait = AsyncMock(
-        return_value={"num_chunks": 1, "chunk_size": 1024}
-    )
+    mock_fs_store.get_meta_with_wait = AsyncMock(return_value={"num_chunks": 1, "chunk_size": 1024})
 
     chunk_uuid = "aaaabbbb-cccc-dddd-eeee-ffffffffffff"
     mock_conn = AsyncMock()
@@ -583,14 +578,13 @@ async def test_uploader_does_not_raise_when_meta_lands_within_deadline(
 
 
 @pytest.mark.asyncio
-async def test_part_chunks_upload_concurrently_bounded_by_pin_parallelism(mock_config, mock_db_pool, mock_fs_store):
-    """A multi-chunk part uploads its chunks CONCURRENTLY, capped at
-    pin_parallelism — not one at a time. This is the regression guard for the
-    serial inner loop that pinned a worker on a large object for tens of
-    seconds and starved every other queued request."""
+async def test_part_chunks_upload_concurrently_bounded_by_arion_concurrency(mock_config, mock_db_pool, mock_fs_store):
+    """A multi-chunk part uploads its chunks CONCURRENTLY, capped by the shared
+    per-pod arion_upload_concurrency semaphore — not one at a time. Regression
+    guard for the serial inner loop that pinned a worker on a large object."""
     import asyncio
 
-    mock_config.uploader_pin_parallelism = 4
+    mock_config.arion_upload_concurrency = 4
     num_chunks = 8
     mock_fs_store.get_meta_with_wait = AsyncMock(return_value={"num_chunks": num_chunks, "chunk_size": 1024})
 
@@ -621,9 +615,7 @@ async def test_part_chunks_upload_concurrently_bounded_by_pin_parallelism(mock_c
     mock_api = AsyncMock()
     mock_api.upload_file_and_get_cid = AsyncMock(side_effect=fake_upload)
 
-    uploader = Uploader(
-        mock_db_pool, redis, redis_queues, mock_config, backend_name="arion", backend_client=mock_api
-    )
+    uploader = Uploader(mock_db_pool, redis, redis_queues, mock_config, backend_name="arion", backend_client=mock_api)
     uploader.fs_store = mock_fs_store
 
     mock_conn = AsyncMock()
@@ -661,12 +653,71 @@ async def test_part_chunks_upload_concurrently_bounded_by_pin_parallelism(mock_c
 
 
 @pytest.mark.asyncio
+async def test_put_semaphore_bounds_arion_posts_across_concurrent_requests(mock_config, mock_db_pool, mock_fs_store):
+    """The shared per-pod _put_semaphore caps concurrent Arion POSTs across
+    MULTIPLE in-flight requests on one Uploader — the core throttle that lets
+    outer request-concurrency scale without stampeding the backend."""
+    import asyncio
+
+    mock_config.arion_upload_concurrency = 3
+    mock_fs_store.get_meta_with_wait = AsyncMock(return_value={"num_chunks": 4, "chunk_size": 1024})
+
+    inflight = {"cur": 0, "max": 0}
+
+    async def fake_upload(**kwargs):
+        inflight["cur"] += 1
+        inflight["max"] = max(inflight["max"], inflight["cur"])
+        await asyncio.sleep(0.03)
+        inflight["cur"] -= 1
+        return UploadResponse(
+            id=f"h-{kwargs['file_name']}",
+            original_name="x",
+            content_type="application/octet-stream",
+            size_bytes=1024,
+            sha256_hex="a",
+            cid="Qm",
+            status="completed",
+            file_url="https://example.com/file",
+            created_at="2025-11-27T12:00:00Z",
+            updated_at="2025-11-27T12:00:00Z",
+        )
+
+    mock_api = AsyncMock()
+    mock_api.upload_file_and_get_cid = AsyncMock(side_effect=fake_upload)
+    uploader = Uploader(
+        mock_db_pool, FakeRedis(), FakeRedis(), mock_config, backend_name="arion", backend_client=mock_api
+    )
+    uploader.fs_store = mock_fs_store
+
+    mock_conn = AsyncMock()
+    mock_conn.fetchrow = AsyncMock(return_value=MockRow({"part_id": "p"}))
+    mock_conn.fetchval = AsyncMock(side_effect=lambda sql, *a: 1 if sql == "INSERT_SENTINEL" else f"c-{a[1]}")
+    mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
+
+    addr = "5FakeTestAccountAddress123456789012345678901234"
+    with patch("hippius_s3.workers.uploader.get_query", return_value="INSERT_SENTINEL"):
+        await asyncio.gather(
+            uploader._upload_single_chunk(
+                object_id="o1", object_key="k", chunk=Chunk(id=1), upload_id="u1", object_version=1, account_ss58=addr
+            ),
+            uploader._upload_single_chunk(
+                object_id="o2", object_key="k", chunk=Chunk(id=1), upload_id="u2", object_version=1, account_ss58=addr
+            ),
+        )
+
+    # 2 requests x 4 chunks = 8 POSTs, but the shared semaphore caps concurrency at 3.
+    assert mock_api.upload_file_and_get_cid.call_count == 8
+    assert inflight["max"] > 1, "no overlap — shared semaphore not parallelizing"
+    assert inflight["max"] <= 3, "shared per-pod Arion concurrency bound breached"
+
+
+@pytest.mark.asyncio
 async def test_part_chunk_upload_failure_propagates(mock_config, mock_db_pool, mock_fs_store):
     """If any chunk in a part fails, the whole part upload raises (so the
     request is retried / DLQ'd) — concurrency must not swallow errors."""
     import asyncio
 
-    mock_config.uploader_pin_parallelism = 4
+    mock_config.arion_upload_concurrency = 4
     num_chunks = 6
     mock_fs_store.get_meta_with_wait = AsyncMock(return_value={"num_chunks": num_chunks, "chunk_size": 1024})
 

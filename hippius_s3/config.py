@@ -147,6 +147,19 @@ class Config:
     uploader_backoff_max_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_MAX_MS:60000", convert=int)
     uploader_multipart_max_concurrency: int = env("HIPPIUS_UPLOADER_MULTIPART_MAX_CONCURRENCY:5", convert=int)
     uploader_pin_parallelism: int = env("HIPPIUS_UPLOADER_PIN_PARALLELISM:5", convert=int)
+    # Per-pod request concurrency: how many upload requests one uploader pod processes
+    # at once. The serial outer loop was the aggregate-throughput ceiling on the
+    # 1-chunk-dominated queue (within-part parallelism can't help single-chunk objects).
+    uploader_max_inflight: int = env("HIPPIUS_UPLOADER_MAX_INFLIGHT:4", convert=int)
+    # Single shared per-pod bound on concurrent Arion upload POSTs across ALL in-flight
+    # requests — the one throttle on the scarce resource (Arion calls), so outer
+    # concurrency can't stampede the backend.
+    arion_upload_concurrency: int = env("HIPPIUS_ARION_UPLOAD_CONCURRENCY:8", convert=int)
+    uploader_db_pool_max: int = env("HIPPIUS_UPLOADER_DB_POOL_MAX:20", convert=int)
+    # Circuit breaker around Arion uploads: trip open after N consecutive failures,
+    # stay open (fail-fast → transient requeue with backoff) for the cooldown, then probe.
+    arion_breaker_failure_threshold: int = env("HIPPIUS_ARION_BREAKER_FAILS:8", convert=int)
+    arion_breaker_cooldown_seconds: float = env("HIPPIUS_ARION_BREAKER_COOLDOWN_S:10", convert=float)
     # Heavy validation gating (legacy PINNER_VALIDATE_COVERAGE supported for compat)
     uploader_validate_coverage: bool = env("UPLOADER_VALIDATE_COVERAGE:false", convert=lambda x: x.lower() == "true")
     # Deadline (seconds) for polling meta.json on the shared FS cache before

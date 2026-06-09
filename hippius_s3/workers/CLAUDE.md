@@ -38,7 +38,7 @@ Error classification lives in [errors.py](errors.py) — three path-specific cla
 
 Transient failures go back to the queue with backoff; permanent failures go to the upload DLQ ([../dlq/upload_dlq.py](../dlq/upload_dlq.py)) for manual intervention.
 
-**Single-instance design**: Only one uploader pod per backend per region — ensures deterministic CID assignment and controlled rate-limit usage against Arion. Scale via `pin_parallelism` / `multipart_max_concurrency`, not replicas.
+**Concurrency model**: the uploader runs many replicas, and each pod processes up to `HIPPIUS_UPLOADER_MAX_INFLIGHT` upload requests concurrently (bounded-dispatch loop mirroring the downloader). Total concurrent Arion POSTs **per pod** are capped by a single shared `HIPPIUS_ARION_UPLOAD_CONCURRENCY` semaphore on the `Uploader` instance (the one throttle on the scarce resource), and a circuit breaker fails fast (→ transient requeue) when Arion is sustained-failing. CID assignment is content-deterministic and `insert_chunk_backend` is idempotent (`ON CONFLICT`), so cross-request/cross-pod concurrency is safe. Scale aggregate throughput by raising `MAX_INFLIGHT` + `ARION_UPLOAD_CONCURRENCY` (watch Arion 429/5xx), not just replicas.
 
 ## Downloader
 
