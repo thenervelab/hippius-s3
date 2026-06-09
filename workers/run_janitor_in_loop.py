@@ -329,8 +329,16 @@ async def cleanup_stale_parts(
                     )
                     if recent:
                         continue
+
+                    # ABSOLUTE replication gate (identical to Phase 2 GC): never
+                    # delete a part until every chunk is replicated to every required
+                    # backend for its version This deliberately also protects not-yet-replicated
+                    # aborted-MPU orphans — they must be reaped by a path that confirms
+                    # the upload is truly dead, never by blind staleness.
+                    if not await is_replicated_on_all_backends(db, object_id, object_version, part_number):
+                        continue
                 except Exception:
-                    # If DB check fails, be extra conservative: skip deletion
+                    # If any DB check fails, be extra conservative: skip deletion
                     continue
 
                 try:
