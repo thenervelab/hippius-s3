@@ -43,6 +43,7 @@ def mock_fs_store():
     store = MagicMock(spec=FileSystemPartsStore)
     store.get_chunk = AsyncMock(return_value=b"encrypted_chunk_data_123")
     store.get_meta = AsyncMock(return_value={"num_chunks": 1, "chunk_size": 1024})
+    store.get_meta_with_wait = AsyncMock(return_value={"num_chunks": 1, "chunk_size": 1024})
     return store
 
 
@@ -96,7 +97,7 @@ async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock
     mock_api_instance.__aexit__ = AsyncMock()
     uploader.backend_client = mock_api_instance
 
-    result = await uploader._upload_single_chunk(
+    await uploader._upload_single_chunk(
         object_id="obj-123",
         object_key="test-key",
         chunk=Chunk(id=1),

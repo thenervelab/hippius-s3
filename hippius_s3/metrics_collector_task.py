@@ -88,10 +88,10 @@ class BackgroundMetricsCollector:
                 self.metrics_collector.set_queue_length(queue_name, length)
 
             for queue_name in self.ZSET_QUEUES:
-                length = int(await rc.zcard(queue_name) or 0)  # ty: ignore
+                length = int(await rc.zcard(queue_name) or 0)
                 self.metrics_collector.set_queue_length(queue_name, length)
 
-            info = await self.redis_client.info("memory")  # ty: ignore
+            info = await self.redis_client.info("memory")
             self.metrics_collector._used_mem = info.get("used_memory", 0)
             self.metrics_collector._max_mem = info.get("maxmemory", 0)
 

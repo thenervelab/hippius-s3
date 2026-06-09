@@ -76,6 +76,42 @@ async def test_get_meta_missing_returns_none(fs: FileSystemPartsStore) -> None:
     assert await fs.get_meta(OBJ, 1, 99) is None
 
 
+@pytest.mark.asyncio
+async def test_get_meta_with_wait_returns_immediately_when_present(fs: FileSystemPartsStore) -> None:
+    await fs.set_meta(OBJ, 1, 1, chunk_size=4096, num_chunks=2, size_bytes=8192)
+    t0 = time.monotonic()
+    meta = await fs.get_meta_with_wait(OBJ, 1, 1, deadline_seconds=5.0)
+    elapsed = time.monotonic() - t0
+    assert meta == {"chunk_size": 4096, "num_chunks": 2, "size_bytes": 8192}
+    # Fast-path: should not wait at all when meta is already present.
+    assert elapsed < 0.05
+
+
+@pytest.mark.asyncio
+async def test_get_meta_with_wait_returns_none_after_deadline(fs: FileSystemPartsStore) -> None:
+    t0 = time.monotonic()
+    meta = await fs.get_meta_with_wait(OBJ, 1, 99, deadline_seconds=0.3)
+    elapsed = time.monotonic() - t0
+    assert meta is None
+    # Should have actually waited for the deadline (not returned immediately).
+    assert 0.25 <= elapsed <= 1.5
+
+
+@pytest.mark.asyncio
+async def test_get_meta_with_wait_picks_up_late_write(fs: FileSystemPartsStore) -> None:
+    """Simulates the producer-consumer race: consumer starts polling first,
+    producer writes meta partway through, consumer should return the meta."""
+
+    async def write_after(delay: float) -> None:
+        await asyncio.sleep(delay)
+        await fs.set_meta(OBJ, 1, 1, chunk_size=4096, num_chunks=1, size_bytes=4096)
+
+    writer = asyncio.create_task(write_after(0.2))
+    meta = await fs.get_meta_with_wait(OBJ, 1, 1, deadline_seconds=5.0)
+    await writer
+    assert meta == {"chunk_size": 4096, "num_chunks": 1, "size_bytes": 4096}
+
+
 # -------- atomic writes ----------
 
 

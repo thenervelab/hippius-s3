@@ -268,7 +268,15 @@ class Uploader:
             },
         ) as span:
             logger.debug(f"Uploading chunk object_id={object_id} part={part_number}")
-            meta = await self.fs_store.get_meta(object_id, int(object_version), part_number)
+            meta_wait_s = float(getattr(self.config, "fs_meta_wait_seconds", 30.0))
+            meta = await self.fs_store.get_meta_with_wait(
+                object_id, int(object_version), part_number, deadline_seconds=meta_wait_s
+            )
+            if meta is None:
+                raise RuntimeError(
+                    f"Missing meta in filesystem cache after {meta_wait_s}s for upload: "
+                    f"object_id={object_id} version={int(object_version)} part={part_number}"
+                )
             num_chunks_meta = int(meta.get("num_chunks", 0)) if isinstance(meta, dict) else 0
 
             resolved_upload_id: Optional[str] = upload_id
