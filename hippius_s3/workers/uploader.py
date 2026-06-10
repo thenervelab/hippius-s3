@@ -329,8 +329,8 @@ class Uploader:
             if num_chunks_meta > 0 and part_id:
                 # Upload a part's cipher chunks concurrently. Each chunk's backend POST is
                 # bounded by the shared per-pod `_put_semaphore` (all in-flight requests on
-                # this pod share one Arion concurrency budget) and guarded by the circuit
-                # breaker. Chunk order is preserved in the returned hashes.
+                # this pod share one Arion concurrency budget). Chunk order is preserved in
+                # the returned hashes.
                 async def upload_one_chunk(ci: int) -> tuple[int, str]:
                     async with self._put_semaphore:
                         piece = await self.fs_store.get_chunk(object_id, int(object_version), part_number, ci)

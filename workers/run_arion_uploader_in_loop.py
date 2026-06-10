@@ -152,9 +152,8 @@ async def run_arion_uploader_loop():
     def _reap(tasks: set[asyncio.Task[None]]) -> None:
         # Surface task errors only. Per-request failures are already routed to retry/DLQ
         # inside _handle_upload (which never re-raises), so a task raises here only on a
-        # routing-path failure. The asyncpg pool self-heals dropped connections on the
-        # next acquire and the queue client recovers via its own pool, so there is no
-        # separate pod-level reconnect to perform.
+        # routing-path failure (rare). The asyncpg pool self-heals dropped connections on
+        # the next acquire, so there is no separate pod-level DB reconnect to perform.
         for t in tasks:
             inflight.discard(t)
             err = t.exception()

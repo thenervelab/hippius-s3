@@ -181,3 +181,56 @@ async def test_graceful_shutdown_cancels_inflight():
     await asyncio.wait_for(h.run(), timeout=5.0)
     assert len(h.process_calls) == 2
     assert cancelled["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_handle_upload_requeues_transient_failure():
+    """A transient process_upload failure is requeued (not DLQ'd) — covers the
+    failure-routing the rework moved into _handle_upload, under the new loop."""
+    from unittest.mock import patch
+
+    uploader = MagicMock()
+    uploader.process_upload = AsyncMock(side_effect=ValueError("arion blip"))
+    uploader._push_to_dlq = AsyncMock()
+    req = _req("obj-transient")
+
+    with (
+        patch.object(up, "classify_error", return_value="transient"),
+        patch.object(up, "extract_http_status_code", return_value=""),
+        patch.object(up, "enqueue_retry_request", new=AsyncMock()) as enqueue,
+        patch.object(up, "get_metrics_collector", return_value=MagicMock()),
+        patch.object(up, "get_logger_with_ray_id", return_value=MagicMock()),
+    ):
+        await up._handle_upload(uploader, MagicMock(), req)
+
+    enqueue.assert_awaited_once()
+    uploader._push_to_dlq.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_upload_dlqs_permanent_failure_and_marks_failed():
+    """A permanent failure goes to the DLQ and marks object_versions failed —
+    must NOT requeue (would loop forever)."""
+    from unittest.mock import patch
+
+    uploader = MagicMock()
+    uploader.process_upload = AsyncMock(side_effect=ValueError("malformed object"))
+    uploader._push_to_dlq = AsyncMock()
+    conn = AsyncMock()
+    db_pool = MagicMock()
+    db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=conn), __aexit__=AsyncMock()))
+    req = _req("obj-permanent")
+
+    with (
+        patch.object(up, "classify_error", return_value="permanent"),
+        patch.object(up, "extract_http_status_code", return_value="400"),
+        patch.object(up, "enqueue_retry_request", new=AsyncMock()) as enqueue,
+        patch.object(up, "get_metrics_collector", return_value=MagicMock()),
+        patch.object(up, "get_logger_with_ray_id", return_value=MagicMock()),
+    ):
+        await up._handle_upload(uploader, db_pool, req)
+
+    uploader._push_to_dlq.assert_awaited_once()
+    enqueue.assert_not_called()
+    assert conn.execute.await_count == 1
+    assert "status = 'failed'" in conn.execute.await_args.args[0]
