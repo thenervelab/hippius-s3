@@ -155,7 +155,12 @@ class Config:
     # requests — the one throttle on the scarce resource (Arion calls), so outer
     # concurrency can't stampede the backend.
     arion_upload_concurrency: int = env("HIPPIUS_ARION_UPLOAD_CONCURRENCY:8", convert=int)
-    uploader_db_pool_max: int = env("HIPPIUS_UPLOADER_DB_POOL_MAX:20", convert=int)
+    # Per-pod uploader DB pool size. Concurrent conn demand/pod is ~arion_upload_concurrency
+    # (chunk tasks, one short acquire at a time) + a few outer acquires. Keep this modest:
+    # it's multiplied by the uploader replica count against Postgres max_connections — e.g.
+    # 40 pods x 12 = 480, leaving headroom for api/gateway/downloader/etc. Raise alongside
+    # arion_upload_concurrency, watching total connections.
+    uploader_db_pool_max: int = env("HIPPIUS_UPLOADER_DB_POOL_MAX:12", convert=int)
     # Circuit breaker around Arion uploads: trip open after N consecutive failures,
     # stay open (fail-fast → transient requeue with backoff) for the cooldown, then probe.
     arion_breaker_failure_threshold: int = env("HIPPIUS_ARION_BREAKER_FAILS:8", convert=int)

@@ -29,12 +29,19 @@ class CircuitBreaker:
         failure_threshold: int,
         cooldown_seconds: float,
         monotonic: Callable[[], float] = time.monotonic,
+        should_count: Callable[[Exception], bool] | None = None,
     ) -> None:
         self.name = name
         self.failure_threshold = max(1, int(failure_threshold))
         self.cooldown_seconds = float(cooldown_seconds)
+        # `should_count(exc)` decides whether an exception reflects backend health.
+        # Per-account / permanent errors (e.g. billing 402, malformed object) must NOT
+        # trip the breaker — the backend is fine, so tripping would stall everyone else.
+        # Default: count every failure.
+        self._should_count = should_count
         self._consecutive_failures = 0
         self._opened_at: float | None = None
+        self._half_open = False
         self._lock = asyncio.Lock()
         self._monotonic = monotonic
 
@@ -51,8 +58,12 @@ class CircuitBreaker:
                         f"{self.name} circuit open; backend temporarily unavailable "
                         f"({self.cooldown_seconds - elapsed:.1f}s cooldown left)"
                     )
-                # Cooldown elapsed: clear the open marker so this call probes (half-open).
-                self._opened_at = None
+                # Cooldown elapsed → half-open: admit exactly ONE probe; everyone else
+                # keeps fast-failing until the probe resolves (no thundering herd).
+                if self._half_open:
+                    raise CircuitBreakerOpen(f"{self.name} circuit half-open; probe in flight")
+                self._half_open = True
+                # NOTE: keep `_opened_at` set — only a probe success (in __aexit__) closes it.
         return self
 
     async def __aexit__(
@@ -62,9 +73,20 @@ class CircuitBreaker:
         tb: TracebackType | None,
     ) -> bool:
         async with self._lock:
-            if exc_type is None:
+            was_half_open = self._half_open
+            self._half_open = False
+            if exc is None:
                 self._consecutive_failures = 0
                 self._opened_at = None
+            elif not isinstance(exc, Exception):
+                # BaseException (e.g. CancelledError on shutdown) — not a backend signal.
+                pass
+            elif self._should_count is not None and not self._should_count(exc):
+                # Not a backend-health signal (billing/permanent) — leave state unchanged.
+                pass
+            elif was_half_open:
+                # Probe failed → straight back to open with a fresh cooldown.
+                self._opened_at = self._monotonic()
             else:
                 self._consecutive_failures += 1
                 if self._consecutive_failures >= self.failure_threshold:

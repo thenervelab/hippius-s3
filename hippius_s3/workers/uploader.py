@@ -21,6 +21,7 @@ from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.services.circuit_breaker import CircuitBreaker
 from hippius_s3.utils import get_query
+from hippius_s3.workers.errors import classify_upload_error
 from hippius_s3.workers.errors import is_billing_error
 
 
@@ -96,6 +97,9 @@ class Uploader:
             f"{backend_name}-upload",
             failure_threshold=int(getattr(config, "arion_breaker_failure_threshold", 8)),
             cooldown_seconds=float(getattr(config, "arion_breaker_cooldown_seconds", 10.0)),
+            # Only backend-health failures count. Billing (402) and permanent errors are
+            # per-object/per-account conditions — they must not trip a pod-wide breaker.
+            should_count=lambda e: not is_billing_error(e) and classify_upload_error(e) != "permanent",
         )
 
     class _ConnCtx:

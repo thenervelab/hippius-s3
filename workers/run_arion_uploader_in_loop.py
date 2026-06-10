@@ -101,11 +101,7 @@ async def _handle_upload(uploader, db_pool, upload_request) -> None:
 
 async def run_arion_uploader_loop():
     from redis.asyncio import Redis
-    from redis.exceptions import BusyLoadingError
-    from redis.exceptions import ConnectionError as RedisConnectionError
-    from redis.exceptions import TimeoutError as RedisTimeoutError
 
-    from hippius_s3.cache import RedisObjectPartsCache
     from hippius_s3.queue import initialize_queue_client
     from hippius_s3.redis_utils import create_redis_client
 
@@ -133,10 +129,13 @@ async def run_arion_uploader_loop():
     # Periodic retry-mover — one per pod, off the per-request hot path (running it
     # per dequeue across N concurrent workers would multiply Redis load).
     async def _retry_mover() -> None:
-        nonlocal redis_queues_client
         while True:
             try:
-                moved, redis_queues_client = await with_redis_retry(
+                # `dequeue_upload_request` / `move_due_upload_retries` use the module-global
+                # queue client (set by initialize_queue_client), not the passed `rc`, so the
+                # client returned here is unused — don't reassign the shared var (the main
+                # loop owns it; concurrent reassignment would be a race).
+                moved, _ = await with_redis_retry(
                     lambda rc: move_due_upload_retries(backend_name="arion", now_ts=time.time(), max_items=256),
                     redis_queues_client,
                     config.redis_queues_url,
@@ -149,44 +148,23 @@ async def run_arion_uploader_loop():
             await asyncio.sleep(2.0)
 
     inflight: set[asyncio.Task[None]] = set()
-    needs_redis_reconnect = False
-    needs_db_reconnect = False
 
     def _reap(tasks: set[asyncio.Task[None]]) -> None:
-        nonlocal needs_redis_reconnect, needs_db_reconnect
+        # Surface task errors only. Per-request failures are already routed to retry/DLQ
+        # inside _handle_upload (which never re-raises), so a task raises here only on a
+        # routing-path failure. The asyncpg pool self-heals dropped connections on the
+        # next acquire and the queue client recovers via its own pool, so there is no
+        # separate pod-level reconnect to perform.
         for t in tasks:
             inflight.discard(t)
             err = t.exception()
-            if err is None or isinstance(err, asyncio.CancelledError):
-                continue
-            logger.error(f"inflight uploader task error: {err}")
-            if isinstance(err, (BusyLoadingError, RedisConnectionError, RedisTimeoutError)):
-                needs_redis_reconnect = True
-            elif isinstance(err, asyncpg.InterfaceError):
-                needs_db_reconnect = True
+            if err is not None and not isinstance(err, asyncio.CancelledError):
+                logger.error(f"inflight uploader task error: {err}")
 
     mover_task = asyncio.create_task(_retry_mover())
     try:
         while True:
             _reap({t for t in inflight if t.done()})
-
-            if needs_db_reconnect:
-                logger.warning("Recreating uploader DB pool after task error")
-                with contextlib.suppress(Exception):
-                    await db_pool.close()
-                db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=pool_max)
-                uploader.db = db_pool
-                needs_db_reconnect = False
-
-            if needs_redis_reconnect:
-                logger.warning("Rebuilding cache redis client after task error")
-                with contextlib.suppress(Exception):
-                    await redis_client.aclose()
-                redis_client = create_redis_client(config.redis_url)
-                initialize_cache_client(redis_client)
-                # obj_cache is the only consumer of the cache client; rebuild it.
-                uploader.obj_cache = RedisObjectPartsCache(redis_client)
-                needs_redis_reconnect = False
 
             # Capacity gate — keep at most max_inflight requests processing at once.
             if len(inflight) >= max_inflight:
