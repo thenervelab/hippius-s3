@@ -164,6 +164,7 @@ jobs:
             --from-literal=ATS_CACHE_ENDPOINT='${{ secrets.ATS_CACHE_ENDPOINT }}' \
             --from-literal=HIPPIUS_AUTH_PROBE_SECRET='${{ secrets.HIPPIUS_AUTH_PROBE_SECRET }}' \
             --from-literal=HIPPIUS_UPLOADER_MAX_INFLIGHT='${{ secrets.HIPPIUS_UPLOADER_MAX_INFLIGHT || '4' }}' \
+            --from-literal=HIPPIUS_UNPINNER_MAX_INFLIGHT='${{ secrets.HIPPIUS_UNPINNER_MAX_INFLIGHT || '4' }}' \
             --namespace=hippius-s3-staging \
             --dry-run=client -o yaml | kubectl apply -f -
 

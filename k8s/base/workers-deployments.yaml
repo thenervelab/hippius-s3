@@ -351,7 +351,7 @@ metadata:
   name: arion-unpinner
 
 spec:
-  replicas: 1
+  replicas: 3
   strategy:
     type: Recreate
   selector:
@@ -393,6 +393,11 @@ spec:
               value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
             - name: WORKER_SCRIPT
               value: "workers/run_arion_unpinner_in_loop.py"
+            - name: HIPPIUS_UNPINNER_MAX_INFLIGHT
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_UNPINNER_MAX_INFLIGHT
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

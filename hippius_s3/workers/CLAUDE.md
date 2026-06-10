@@ -73,6 +73,8 @@ Key config ([../config.py](../config.py)):
 
 Delete pin on backend → mark `chunk_backend.deleted = true, deleted_at = now()` (soft delete). Retries with backoff (`HIPPIUS_UNPINNER_MAX_ATTEMPTS=5`, `HIPPIUS_UNPINNER_BACKOFF_BASE_MS=1000`, `_MAX_MS=60000`). Failures go to [../dlq/unpin_dlq.py](../dlq/unpin_dlq.py).
 
+**Concurrency model**: runs many replicas; each pod processes up to `HIPPIUS_UNPINNER_MAX_INFLIGHT` unpin requests concurrently (bounded-dispatch loop mirroring the uploader). One request expands to N chunk identifiers — their backend DELETEs run concurrently bounded by a single shared per-pod `HIPPIUS_UNPINNER_PARALLELISM` semaphore (the one throttle on Arion DELETEs). Atomic dequeue + idempotent DELETE (404 tolerated) + idempotent soft-delete make cross-pod/cross-request concurrency safe. Scale via `MAX_INFLIGHT` + `PARALLELISM`, not just replicas.
+
 ## Tracing
 
 All worker operations emit OTel spans with `hippius.ray_id`, `hippius.account.main`, and backend-specific attributes. See [downloader.py:114-123](downloader.py) for the standard span shape.
