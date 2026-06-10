@@ -87,6 +87,10 @@ class Uploader:
         self.obj_cache = RedisObjectPartsCache(redis_client)
         self.fs_store = create_fs_store(config)
         self.dlq_manager = UploadDLQManager(redis_queues_client, backend_name=backend_name)
+        # Single shared per-pod bound on concurrent backend POSTs across ALL in-flight
+        # requests, so outer request-concurrency can't stampede the backend. Replaces
+        # the old per-request chunk semaphore.
+        self._put_semaphore = asyncio.Semaphore(max(1, int(getattr(config, "arion_upload_concurrency", 8))))
 
     class _ConnCtx:
         def __init__(self, conn: Any) -> None:
@@ -323,15 +327,12 @@ class Uploader:
                 return ChunkUploadResult(cids=[], part_number=part_number)
 
             if num_chunks_meta > 0 and part_id:
-                # Upload a part's cipher chunks concurrently (bounded by pin_parallelism).
-                # A large object is a single part with many chunks; uploading them one at a
-                # time pinned the worker on that object for tens of seconds (serial dequeue
-                # loop), starving every other request behind it. Mirrors the part-level
-                # gather pattern above; chunk order is preserved in the returned hashes.
-                chunk_semaphore = asyncio.Semaphore(max(1, int(self.config.uploader_pin_parallelism)))
-
+                # Upload a part's cipher chunks concurrently. Each chunk's backend POST is
+                # bounded by the shared per-pod `_put_semaphore` (all in-flight requests on
+                # this pod share one Arion concurrency budget). Chunk order is preserved in
+                # the returned hashes.
                 async def upload_one_chunk(ci: int) -> tuple[int, str]:
-                    async with chunk_semaphore:
+                    async with self._put_semaphore:
                         piece = await self.fs_store.get_chunk(object_id, int(object_version), part_number, ci)
                         if not isinstance(piece, (bytes, bytearray)):
                             raise RuntimeError("missing_cipher_chunk")

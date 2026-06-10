@@ -163,6 +163,7 @@ jobs:
             --from-literal=HIPPIUS_DELETE_BACKENDS="${{ secrets.HIPPIUS_DELETE_BACKENDS }}" \
             --from-literal=ATS_CACHE_ENDPOINT="${{ secrets.ATS_CACHE_ENDPOINT }}" \
             --from-literal=HIPPIUS_AUTH_PROBE_SECRET="${{ secrets.HIPPIUS_AUTH_PROBE_SECRET }}" \
+            --from-literal=HIPPIUS_UPLOADER_MAX_INFLIGHT="${{ secrets.HIPPIUS_UPLOADER_MAX_INFLIGHT || '4' }}" \
             --namespace=hippius-s3-prod \
             --dry-run=client -o yaml | kubectl apply -f -
 
@@ -301,6 +302,7 @@ jobs:
             --from-literal=RESUBMISSION_SEED_PHRASE="${{ secrets.RESUBMISSION_SEED_PHRASE }}" \
             --from-literal=HIPPIUS_DOWNLOAD_BACKENDS="${{ secrets.HIPPIUS_DOWNLOAD_BACKENDS }}" \
             --from-literal=HIPPIUS_AUTH_PROBE_SECRET="${{ secrets.HIPPIUS_AUTH_PROBE_SECRET }}" \
+            --from-literal=HIPPIUS_UPLOADER_MAX_INFLIGHT="${{ secrets.HIPPIUS_UPLOADER_MAX_INFLIGHT || '4' }}" \
             --namespace=${CACHE_NS} \
             --dry-run=client -o yaml | kubectl apply -f -
 
