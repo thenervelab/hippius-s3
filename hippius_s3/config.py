@@ -146,7 +146,20 @@ class Config:
     uploader_backoff_base_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_BASE_MS:500", convert=int)
     uploader_backoff_max_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_MAX_MS:60000", convert=int)
     uploader_multipart_max_concurrency: int = env("HIPPIUS_UPLOADER_MULTIPART_MAX_CONCURRENCY:5", convert=int)
-    uploader_pin_parallelism: int = env("HIPPIUS_UPLOADER_PIN_PARALLELISM:5", convert=int)
+    # Per-pod request concurrency: how many upload requests one uploader pod processes
+    # at once. The serial outer loop was the aggregate-throughput ceiling on the
+    # 1-chunk-dominated queue (within-part parallelism can't help single-chunk objects).
+    uploader_max_inflight: int = env("HIPPIUS_UPLOADER_MAX_INFLIGHT:4", convert=int)
+    # Single shared per-pod bound on concurrent Arion upload POSTs across ALL in-flight
+    # requests — the one throttle on the scarce resource (Arion calls), so outer
+    # concurrency can't stampede the backend.
+    arion_upload_concurrency: int = env("HIPPIUS_ARION_UPLOAD_CONCURRENCY:8", convert=int)
+    # Per-pod uploader DB pool size. Concurrent conn demand/pod is ~arion_upload_concurrency
+    # (chunk tasks, one short acquire at a time) + a few outer acquires. Keep this modest:
+    # it's multiplied by the uploader replica count against Postgres max_connections — e.g.
+    # 40 pods x 12 = 480, leaving headroom for api/gateway/downloader/etc. Raise alongside
+    # arion_upload_concurrency, watching total connections.
+    uploader_db_pool_max: int = env("HIPPIUS_UPLOADER_DB_POOL_MAX:12", convert=int)
     # Heavy validation gating (legacy PINNER_VALIDATE_COVERAGE supported for compat)
     uploader_validate_coverage: bool = env("UPLOADER_VALIDATE_COVERAGE:false", convert=lambda x: x.lower() == "true")
     # Deadline (seconds) for polling meta.json on the shared FS cache before

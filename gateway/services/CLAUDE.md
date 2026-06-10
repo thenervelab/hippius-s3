@@ -105,4 +105,10 @@ Proxies `/docs` to the internal Swagger UI when `ENABLE_API_DOCS=true`. Redis-ca
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
 | #8177 | 6:24 PM | 🔵 | Comprehensive latency analysis identifies KMS cold-path as primary bottleneck | ~567 |
+
+### Jun 10, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #8876 | 11:36 AM | 🔵 | Current Upload Architecture Uses Streaming Encryption with 16-Slot AsyncIO Queue | ~810 |
 </claude-mem-context>
