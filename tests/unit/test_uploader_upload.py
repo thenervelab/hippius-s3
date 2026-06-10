@@ -16,7 +16,6 @@ from hippius_s3.workers.uploader import Uploader
 def mock_config():
     config = MagicMock()
     config.uploader_multipart_max_concurrency = 5
-    config.uploader_pin_parallelism = 5
     config.arion_upload_concurrency = 5
     config.cache_ttl_seconds = 1800
     config.object_cache_dir = "/tmp/test_cache"

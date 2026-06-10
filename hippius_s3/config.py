@@ -146,7 +146,6 @@ class Config:
     uploader_backoff_base_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_BASE_MS:500", convert=int)
     uploader_backoff_max_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_MAX_MS:60000", convert=int)
     uploader_multipart_max_concurrency: int = env("HIPPIUS_UPLOADER_MULTIPART_MAX_CONCURRENCY:5", convert=int)
-    uploader_pin_parallelism: int = env("HIPPIUS_UPLOADER_PIN_PARALLELISM:5", convert=int)
     # Per-pod request concurrency: how many upload requests one uploader pod processes
     # at once. The serial outer loop was the aggregate-throughput ceiling on the
     # 1-chunk-dominated queue (within-part parallelism can't help single-chunk objects).

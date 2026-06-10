@@ -32,7 +32,8 @@ Concrete: `ArionClient` ([../services/arion_service.py](../services/arion_servic
 - `HIPPIUS_UPLOADER_MAX_ATTEMPTS=5`
 - `HIPPIUS_UPLOADER_BACKOFF_BASE_MS=500`, `_MAX_MS=60000`
 - `HIPPIUS_UPLOADER_MULTIPART_MAX_CONCURRENCY=5` (per-part parallelism within an upload)
-- `HIPPIUS_UPLOADER_PIN_PARALLELISM=5` (concurrent Arion calls).
+
+Per-pod request concurrency and the shared Arion-POST ceiling are covered under **Concurrency model** below.
 
 Error classification lives in [errors.py](errors.py) — three path-specific classifiers sharing one rule engine (`classify_upload_error`, `classify_download_error`, `classify_unpin_error`). The key divergence is 404: permanent on upload/download, transient on unpin (pin commit pending upstream). Upload-only: `402` → `billing`. Layers: custom exception class → boto `Error.Code` → HTTP status → exception class/errno → keyword fallback → chained `__cause__`. Unmatched errors return `"unknown"` and go to the DLQ. (`error_classifier.py` is a back-compat re-export shim.)
 
