@@ -19,9 +19,7 @@ from hippius_s3.dlq.upload_dlq import UploadDLQManager
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
-from hippius_s3.services.circuit_breaker import CircuitBreaker
 from hippius_s3.utils import get_query
-from hippius_s3.workers.errors import classify_upload_error
 from hippius_s3.workers.errors import is_billing_error
 
 
@@ -93,14 +91,6 @@ class Uploader:
         # requests, so outer request-concurrency can't stampede the backend. Replaces
         # the old per-request chunk semaphore.
         self._put_semaphore = asyncio.Semaphore(max(1, int(getattr(config, "arion_upload_concurrency", 8))))
-        self._breaker = CircuitBreaker(
-            f"{backend_name}-upload",
-            failure_threshold=int(getattr(config, "arion_breaker_failure_threshold", 8)),
-            cooldown_seconds=float(getattr(config, "arion_breaker_cooldown_seconds", 10.0)),
-            # Only backend-health failures count. Billing (402) and permanent errors are
-            # per-object/per-account conditions — they must not trip a pod-wide breaker.
-            should_count=lambda e: not is_billing_error(e) and classify_upload_error(e) != "permanent",
-        )
 
     class _ConnCtx:
         def __init__(self, conn: Any) -> None:
@@ -356,14 +346,13 @@ class Uploader:
                         if not chunk_id:
                             raise RuntimeError("part_chunk_row_missing")
 
-                        async with self._breaker:
-                            chunk_upload_result = await self.backend_client.upload_file_and_get_cid(
-                                file_data=bytes(piece),
-                                file_name=str(chunk_id),
-                                content_type="application/octet-stream",
-                                account_ss58=account_ss58,
-                                extra_headers=extra_headers,
-                            )
+                        chunk_upload_result = await self.backend_client.upload_file_and_get_cid(
+                            file_data=bytes(piece),
+                            file_name=str(chunk_id),
+                            content_type="application/octet-stream",
+                            account_ss58=account_ss58,
+                            extra_headers=extra_headers,
+                        )
 
                         file_hash = str(chunk_upload_result.id)
                         logger.info(

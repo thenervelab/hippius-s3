@@ -18,8 +18,6 @@ def mock_config():
     config.uploader_multipart_max_concurrency = 5
     config.uploader_pin_parallelism = 5
     config.arion_upload_concurrency = 5
-    config.arion_breaker_failure_threshold = 8
-    config.arion_breaker_cooldown_seconds = 10.0
     config.cache_ttl_seconds = 1800
     config.object_cache_dir = "/tmp/test_cache"
     return config

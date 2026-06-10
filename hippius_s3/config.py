@@ -161,10 +161,6 @@ class Config:
     # 40 pods x 12 = 480, leaving headroom for api/gateway/downloader/etc. Raise alongside
     # arion_upload_concurrency, watching total connections.
     uploader_db_pool_max: int = env("HIPPIUS_UPLOADER_DB_POOL_MAX:12", convert=int)
-    # Circuit breaker around Arion uploads: trip open after N consecutive failures,
-    # stay open (fail-fast → transient requeue with backoff) for the cooldown, then probe.
-    arion_breaker_failure_threshold: int = env("HIPPIUS_ARION_BREAKER_FAILS:8", convert=int)
-    arion_breaker_cooldown_seconds: float = env("HIPPIUS_ARION_BREAKER_COOLDOWN_S:10", convert=float)
     # Heavy validation gating (legacy PINNER_VALIDATE_COVERAGE supported for compat)
     uploader_validate_coverage: bool = env("UPLOADER_VALIDATE_COVERAGE:false", convert=lambda x: x.lower() == "true")
     # Deadline (seconds) for polling meta.json on the shared FS cache before
