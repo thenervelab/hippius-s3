@@ -94,3 +94,13 @@ jobs:
         run: |
           echo "Smoke tests failed - check artifacts"
           echo "Run ID: ${{ github.run_id }}"
+
+      - name: Notify Mattermost on failure
+        if: failure()
+        env:
+          WEBHOOK_URL: ${{ secrets.MATTERMOST_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d "{\"text\": \":rotating_light: **s3.hippius.com smoke tests failed**\n[View run #${{ github.run_id }}]($RUN_URL)\"}" \
+            "$WEBHOOK_URL"
