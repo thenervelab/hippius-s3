@@ -12,6 +12,7 @@ resources:
   - gateway-nodeport.yaml
   - pv-local-cache.yaml
   - pvc-local-cache.yaml
+  - disk-canary-deployment.yaml
 
 patches:
   - path: namespace-patch.yaml

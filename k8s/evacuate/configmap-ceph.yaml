@@ -1,0 +1,5 @@
+# Evacuate-to-ceph env flip: ceph becomes the primary (and only) cache.
+# Failback: the normal production deploy re-applies local-cache-configmap-patch.yaml.
+data:
+  HIPPIUS_OBJECT_CACHE_DIR: "/var/lib/hippius/object_cache"
+  HIPPIUS_OBJECT_CACHE_FALLBACK_DIR: ""
