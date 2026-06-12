@@ -149,6 +149,19 @@ def _effective_hot_retention(mode: int) -> float:
     return base
 
 
+def _safe_iterdir(path: Path) -> list[Path]:
+    """List a directory, tolerating concurrent removal.
+
+    The cleanup workers delete (and prune empty parent) directories while the
+    producer is still walking the tree, so a vanished dir is expected — return
+    an empty list rather than letting FileNotFoundError abort the whole walk.
+    """
+    try:
+        return list(path.iterdir())
+    except OSError:
+        return []
+
+
 def _update_disk_metrics(root: Path) -> None:
     """Refresh disk-usage + pressure gauges from a single statvfs.
 
@@ -179,7 +192,15 @@ async def _run_worker_pool(
     deletion loop (DB-roundtrip bound at ~25/s) into a parallel one.
 
     Returns the number of items for which `handle` returned True (i.e. deleted).
+
+    Resilience: workers swallow per-item errors (a dead pool / DB blip on one
+    part must not wedge the whole sweep), and the producer drain is wrapped so
+    sentinels are always sent and every worker is always awaited — even if the
+    producer itself raises (it walks the tree while workers delete from it, so
+    a concurrent prune can surface FileNotFoundError mid-walk). This guarantees
+    no orphaned tasks and no deadlock.
     """
+    concurrency = max(1, concurrency)  # 0/neg would mean an unbounded queue + no workers (silent no-op)
     queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=concurrency * 4)
     cleaned = 0
 
@@ -193,15 +214,21 @@ async def _run_worker_pool(
                 async with pool.acquire() as conn:
                     if await handle(conn, item):
                         cleaned += 1
+            except Exception as e:
+                # Never let one item kill a worker — that would strand the queue
+                # and could deadlock the producer on a full queue.
+                logger.warning(f"Janitor worker item failed: {e}")
             finally:
                 queue.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
-    async for item in producer:
-        await queue.put(item)
-    for _ in workers:
-        await queue.put(None)
-    await asyncio.gather(*workers)
+    try:
+        async for item in producer:
+            await queue.put(item)
+    finally:
+        for _ in workers:
+            await queue.put(None)
+        await asyncio.gather(*workers)
     return cleaned
 
 
@@ -341,11 +368,11 @@ async def cleanup_stale_parts(
 
     async def candidates() -> AsyncIterator[tuple[str, int, int]]:
         scanned = 0
-        for object_dir in root.iterdir():
+        for object_dir in _safe_iterdir(root):
             if not object_dir.is_dir():
                 continue
             object_id = object_dir.name
-            for version_dir in object_dir.iterdir():
+            for version_dir in _safe_iterdir(object_dir):
                 if not version_dir.is_dir() or not version_dir.name.startswith("v"):
                     continue
                 try:
@@ -353,7 +380,7 @@ async def cleanup_stale_parts(
                 except (ValueError, IndexError):
                     continue
 
-                for part_dir in version_dir.iterdir():
+                for part_dir in _safe_iterdir(version_dir):
                     if not part_dir.is_dir() or not part_dir.name.startswith("part_"):
                         continue
                     try:
@@ -602,14 +629,14 @@ async def cleanup_old_parts_by_mtime(
     async def candidates() -> AsyncIterator[tuple[str, int, int, bool]]:
         scanned = 0
         # Walk the FS hierarchy: <root>/<object_id>/v<version>/part_<n>/
-        for object_dir in root.iterdir():
+        for object_dir in _safe_iterdir(root):
             if not object_dir.is_dir():
                 continue
 
             object_id = object_dir.name
             is_dlq_protected = object_id in dlq_object_ids
 
-            for version_dir in object_dir.iterdir():
+            for version_dir in _safe_iterdir(object_dir):
                 if not version_dir.is_dir() or not version_dir.name.startswith("v"):
                     continue
 
@@ -618,7 +645,7 @@ async def cleanup_old_parts_by_mtime(
                 except (ValueError, IndexError):
                     continue
 
-                for part_dir in version_dir.iterdir():
+                for part_dir in _safe_iterdir(version_dir):
                     if not part_dir.is_dir() or not part_dir.name.startswith("part_"):
                         continue
                     stats["parts_seen"] += 1
@@ -776,7 +803,7 @@ async def gc_soft_deleted_objects(pool: asyncpg.Pool) -> int:
 
 async def run_janitor_loop():
     """Main janitor loop: periodically clean stale and old parts."""
-    concurrency = config.janitor_concurrency
+    concurrency = max(1, config.janitor_concurrency)
     db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=concurrency + 4)
     fs_store = create_fs_store(config)
     redis_client = Redis.from_url(config.redis_queues_url)

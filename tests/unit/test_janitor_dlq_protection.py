@@ -49,6 +49,10 @@ def mock_config():
     config.fs_cache_gc_max_age_seconds = 604800  # 7 days
     config.object_cache_dir = "/tmp/test_janitor_cache"
     config.janitor_concurrency = 4
+    # get_all_dlq_object_ids builds DLQ keys from upload_backends — populate_dlq
+    # writes to `arion_upload_requests:dlq`, so this must be a concrete ["arion"].
+    config.upload_backends = ["arion"]
+    config.backup_backends = []
     return config
 
 
@@ -175,64 +179,51 @@ class TestJanitorDlqProtection:
     """Test suite for janitor cleanup with DLQ protection."""
 
     @pytest.mark.asyncio
-    async def test_cleanup_stale_parts_protects_dlq_objects(self, mock_config, redis_with_dlq, populate_dlq):
-        """Test that cleanup_stale_parts skips objects in DLQ."""
+    async def test_cleanup_stale_parts_protects_dlq_objects(self, tmp_path, mock_config, redis_with_dlq, populate_dlq):
+        """A DLQ-protected object's part survives Phase 1; a non-protected orphan
+        (no `parts` row) is reaped. Uses a real on-disk FS so the assertions are
+        meaningful (the previous version of this test asserted nothing)."""
+        import os
+        import shutil
+        import time
+
         from run_janitor_in_loop import cleanup_stale_parts
 
-        # Populate DLQ with protected objects
-        await populate_dlq(["obj-protected-1", "obj-protected-2"])
+        protected = "aaaaaaaa-1111-1111-1111-111111111111"
+        orphan = "bbbbbbbb-2222-2222-2222-222222222222"
+        await populate_dlq([protected])
 
-        # Create mock DB connection
+        old = time.time() - 200000
+        for oid in (protected, orphan):
+            part = tmp_path / oid / "v1" / "part_1"
+            part.mkdir(parents=True)
+            (part / "chunk_0.bin").write_bytes(b"x")
+            (part / "meta.json").write_text("{}")
+            os.utime(part / "meta.json", (old, old))
+
+        class _FsStore:
+            def __init__(self, root):
+                self.root = root
+                self.deleted = []
+
+            async def delete_part(self, oid, ov, pn):
+                self.deleted.append((oid, int(ov), int(pn)))
+                p = self.root / oid / f"v{ov}" / f"part_{pn}"
+                if p.exists():
+                    shutil.rmtree(p)
+
+        fs_store = _FsStore(tmp_path)
+
+        # fetchrow=None → no parts row → orphan → reap (replication gate not consulted).
         mock_db = AsyncMock()
-        mock_db.fetchval = AsyncMock(return_value=None)  # No recent DB activity
+        mock_db.fetchrow = AsyncMock(return_value=None)
 
-        # Create mock FS store with parts
-        mock_fs_store = MagicMock(spec=FileSystemPartsStore)
-        mock_root = MagicMock()
-        mock_fs_store.root = mock_root
-        mock_root.exists.return_value = True
-
-        # Create directory structure
-        obj_protected = MagicMock()
-        obj_protected.is_dir.return_value = True
-        obj_protected.name = "obj-protected-1"
-
-        obj_not_protected = MagicMock()
-        obj_not_protected.is_dir.return_value = True
-        obj_not_protected.name = "obj-not-in-dlq"
-
-        mock_root.iterdir.return_value = [obj_protected, obj_not_protected]
-
-        # Mock version directories
-        version_dir = MagicMock()
-        version_dir.is_dir.return_value = True
-        version_dir.name = "v1"
-
-        obj_protected.iterdir.return_value = [version_dir]
-        obj_not_protected.iterdir.return_value = [version_dir]
-
-        # Mock part directories
-        part_dir = MagicMock()
-        part_dir.is_dir.return_value = True
-        part_dir.name = "part_1"
-
-        meta_file = MagicMock()
-        meta_file.exists.return_value = True
-        meta_file.stat.return_value.st_mtime = 0  # Very old (more than 1 day)
-
-        part_dir.__truediv__ = lambda self, x: meta_file
-
-        version_dir.iterdir.return_value = [part_dir]
-
-        mock_fs_store.delete_part = AsyncMock()
-
-        # Run cleanup
         with patch("run_janitor_in_loop.config", mock_config):
-            await cleanup_stale_parts(_FakePool(mock_db), mock_fs_store, redis_with_dlq)
+            await cleanup_stale_parts(_FakePool(mock_db), fs_store, redis_with_dlq)
 
-        # Protected object should NOT be deleted
-        # Non-protected object should be checked and potentially deleted
-        # Since we mocked DB to return None (no recent activity), non-protected would be deleted
+        assert (tmp_path / protected / "v1" / "part_1").exists(), "DLQ-protected part must survive"
+        assert not (tmp_path / orphan / "v1" / "part_1").exists(), "orphan must be reaped"
+        assert fs_store.deleted == [(orphan, 1, 1)]
 
     @pytest.mark.asyncio
     async def test_cleanup_old_parts_protects_dlq_objects(self, mock_config, redis_with_dlq, populate_dlq):
