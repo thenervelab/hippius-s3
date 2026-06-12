@@ -45,6 +45,31 @@ OBJ = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 STALE = 86400  # mpu_stale_seconds used throughout
 
 
+class _PoolCtx:
+    def __init__(self, conn) -> None:
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+
+class _FakePool:
+    """Minimal asyncpg.Pool stand-in: every acquire() yields the same conn mock."""
+
+    def __init__(self, conn) -> None:
+        self._conn = conn
+
+    def acquire(self) -> _PoolCtx:
+        return _PoolCtx(self._conn)
+
+
+def _pool(conn) -> _FakePool:
+    return _FakePool(conn)
+
+
 def _make_part(
     fs_root: Path,
     object_id: str,
@@ -137,7 +162,7 @@ async def test_orphan_no_parts_row_is_reaped(fs_root, fs_store, redis_mock):
     db = _db(None)  # fetchrow finds no parts row
 
     with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock()) as repl:
-        await janitor.cleanup_stale_parts(db, fs_store, redis_mock)
+        await janitor.cleanup_stale_parts(_pool(db), fs_store, redis_mock)
 
     assert not _exists(fs_root), "orphaned cache dir must be reclaimed"
     assert (OBJ, 1, 1) in fs_store.deleted
@@ -155,7 +180,7 @@ async def test_existing_part_not_replicated_is_protected(fs_root, fs_store, redi
     db = _db({"recent": False})
 
     with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock(return_value=False)) as repl:
-        await janitor.cleanup_stale_parts(db, fs_store, redis_mock)
+        await janitor.cleanup_stale_parts(_pool(db), fs_store, redis_mock)
 
     assert _exists(fs_root), "un-replicated tracked part must NOT be deleted"
     assert fs_store.deleted == []
@@ -172,7 +197,7 @@ async def test_existing_part_fully_replicated_is_reaped(fs_root, fs_store, redis
     db = _db({"recent": False})
 
     with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock(return_value=True)) as repl:
-        await janitor.cleanup_stale_parts(db, fs_store, redis_mock)
+        await janitor.cleanup_stale_parts(_pool(db), fs_store, redis_mock)
 
     assert not _exists(fs_root), "replicated cold part should be reclaimed"
     assert (OBJ, 1, 1) in fs_store.deleted
@@ -190,7 +215,7 @@ async def test_recent_uploaded_at_is_skipped(fs_root, fs_store, redis_mock):
     db = _db({"recent": True})
 
     with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock()) as repl:
-        await janitor.cleanup_stale_parts(db, fs_store, redis_mock)
+        await janitor.cleanup_stale_parts(_pool(db), fs_store, redis_mock)
 
     assert _exists(fs_root)
     assert fs_store.deleted == []
@@ -206,7 +231,7 @@ async def test_recent_mtime_is_skipped_before_any_db_call(fs_root, fs_store, red
     db = _db(None)
 
     with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock()) as repl:
-        await janitor.cleanup_stale_parts(db, fs_store, redis_mock)
+        await janitor.cleanup_stale_parts(_pool(db), fs_store, redis_mock)
 
     assert _exists(fs_root), "in-flight part must not be touched"
     db.fetchrow.assert_not_awaited()
@@ -223,7 +248,7 @@ async def test_dlq_protected_object_is_skipped(fs_root, fs_store, redis_mock):
     db = _db(None)
 
     with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock()) as repl:
-        await janitor.cleanup_stale_parts(db, fs_store, redis_mock)
+        await janitor.cleanup_stale_parts(_pool(db), fs_store, redis_mock)
 
     assert _exists(fs_root), "DLQ-protected object must not be deleted"
     db.fetchrow.assert_not_awaited()
@@ -240,7 +265,7 @@ async def test_fetchrow_error_skips_deletion(fs_root, fs_store, redis_mock):
     db = AsyncMock()
     db.fetchrow = AsyncMock(side_effect=RuntimeError("db down"))
 
-    await janitor.cleanup_stale_parts(db, fs_store, redis_mock)
+    await janitor.cleanup_stale_parts(_pool(db), fs_store, redis_mock)
 
     assert _exists(fs_root), "must not delete when the DB check fails"
     assert fs_store.deleted == []
@@ -253,10 +278,8 @@ async def test_replication_check_error_skips_deletion(fs_root, fs_store, redis_m
     _make_part(fs_root, OBJ, 1, 1)
     db = _db({"recent": False})
 
-    with patch.object(
-        janitor, "is_replicated_on_all_backends", AsyncMock(side_effect=RuntimeError("boom"))
-    ):
-        await janitor.cleanup_stale_parts(db, fs_store, redis_mock)
+    with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock(side_effect=RuntimeError("boom"))):
+        await janitor.cleanup_stale_parts(_pool(db), fs_store, redis_mock)
 
     assert _exists(fs_root)
     assert fs_store.deleted == []
@@ -299,7 +322,7 @@ async def test_mixed_batch_classified_correctly(fs_root, fs_store, redis_mock):
         return object_id == replicated  # only the replicated object passes the gate
 
     with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock(side_effect=fake_repl)):
-        await janitor.cleanup_stale_parts(db, fs_store, redis_mock)
+        await janitor.cleanup_stale_parts(_pool(db), fs_store, redis_mock)
 
     assert not _exists(fs_root, orphan), "orphan reclaimed"
     assert not _exists(fs_root, replicated), "replicated reclaimed"

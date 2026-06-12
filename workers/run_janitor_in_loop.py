@@ -22,7 +22,6 @@ Disk-pressure modes (all still replication-gated):
 """
 
 import asyncio
-import contextlib
 import json
 import logging
 import os
@@ -30,7 +29,11 @@ import shutil
 import socket
 import sys
 import time
+from collections.abc import AsyncIterator
+from collections.abc import Awaitable
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import asyncpg
 from opentelemetry import metrics as otel_metrics
@@ -146,6 +149,62 @@ def _effective_hot_retention(mode: int) -> float:
     return base
 
 
+def _update_disk_metrics(root: Path) -> None:
+    """Refresh disk-usage + pressure gauges from a single statvfs.
+
+    Called at the top of every cycle so disk visibility never depends on a full
+    GC pass completing — the GC walk over millions of parts can take hours, and
+    operators need to see a filling disk long before then.
+    """
+    global _fs_disk_used_bytes, _fs_disk_total_bytes, _fs_pressure_mode
+    usage = shutil.disk_usage(root)
+    _fs_disk_used_bytes = usage.used
+    _fs_disk_total_bytes = usage.total
+    ratio = usage.used / usage.total if usage.total else 0.0
+    _fs_pressure_mode = 2 if ratio >= PRESSURE_CRITICAL else 1 if ratio >= PRESSURE_ELEVATED else 0
+
+
+async def _run_worker_pool(
+    pool: asyncpg.Pool,
+    producer: AsyncIterator[Any],
+    handle: Callable[[Any, Any], Awaitable[bool]],
+    concurrency: int,
+) -> int:
+    """Drain an async `producer` of candidate items through `handle(conn, item)`
+    with bounded concurrency over a connection pool.
+
+    The producer walks the FS (cheap, stat-only) and yields candidates; N
+    workers run the expensive per-part DB checks + deletes in parallel, each on
+    its own pooled connection. This is what turns the serial, single-connection
+    deletion loop (DB-roundtrip bound at ~25/s) into a parallel one.
+
+    Returns the number of items for which `handle` returned True (i.e. deleted).
+    """
+    queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=concurrency * 4)
+    cleaned = 0
+
+    async def worker() -> None:
+        nonlocal cleaned
+        while True:
+            item = await queue.get()
+            try:
+                if item is None:
+                    return
+                async with pool.acquire() as conn:
+                    if await handle(conn, item):
+                        cleaned += 1
+            finally:
+                queue.task_done()
+
+    workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
+    async for item in producer:
+        await queue.put(item)
+    for _ in workers:
+        await queue.put(None)
+    await asyncio.gather(*workers)
+    return cleaned
+
+
 def _setup_janitor_metrics() -> None:
     global _janitor_deleted_counter, _janitor_tmp_deleted_counter
 
@@ -251,7 +310,7 @@ async def get_all_dlq_object_ids(redis_client: Redis) -> set[str]:
 
 
 async def cleanup_stale_parts(
-    db: asyncpg.Connection,
+    pool: asyncpg.Pool,
     fs_store: FileSystemPartsStore,
     redis_client: Redis,
 ) -> int:
@@ -261,6 +320,11 @@ async def cleanup_stale_parts(
     To avoid accidental deletion of active uploads, we prefer a conservative
     approach: remove only parts whose meta/dir mtime is older than the
     configured stale threshold and which have no recent DB part activity.
+
+    The FS walk (cheap, stat-only) runs in the producer; the per-part DB checks
+    and deletes run with bounded concurrency over a connection pool — see
+    `_run_worker_pool`. At 3M+ parts the old serial single-connection loop could
+    not complete a pass in a day; this parallelizes the DB-roundtrip bottleneck.
     """
     stale_threshold_seconds = config.mpu_stale_seconds
     cutoff_sql = "NOW() - INTERVAL '1 second' * $4"
@@ -269,98 +333,108 @@ async def cleanup_stale_parts(
     if dlq_object_ids:
         logger.info(f"Protecting {len(dlq_object_ids)} DLQ objects from stale cleanup")
 
-    parts_cleaned = 0
     root = fs_store.root
     if not root.exists():
         return 0
 
-    for object_dir in root.iterdir():
-        if not object_dir.is_dir():
-            continue
-        for version_dir in object_dir.iterdir():
-            if not version_dir.is_dir() or not version_dir.name.startswith("v"):
+    mtime_cutoff = time.time() - stale_threshold_seconds
+
+    async def candidates() -> AsyncIterator[tuple[str, int, int]]:
+        scanned = 0
+        for object_dir in root.iterdir():
+            if not object_dir.is_dir():
                 continue
-            try:
-                object_id = object_dir.name
-                object_version = int(version_dir.name[1:])
-            except Exception:
-                continue
-
-            for part_dir in version_dir.iterdir():
-                if not part_dir.is_dir() or not part_dir.name.startswith("part_"):
+            object_id = object_dir.name
+            for version_dir in object_dir.iterdir():
+                if not version_dir.is_dir() or not version_dir.name.startswith("v"):
                     continue
                 try:
-                    part_number = int(part_dir.name.split("_")[1])
-                except Exception:
+                    object_version = int(version_dir.name[1:])
+                except (ValueError, IndexError):
                     continue
 
-                meta_file = part_dir / "meta.json"
-                check_path = meta_file if meta_file.exists() else part_dir
-                try:
-                    mtime = check_path.stat().st_mtime
-                except Exception:
-                    continue
+                for part_dir in version_dir.iterdir():
+                    if not part_dir.is_dir() or not part_dir.name.startswith("part_"):
+                        continue
+                    try:
+                        part_number = int(part_dir.name.split("_")[1])
+                    except (ValueError, IndexError):
+                        continue
 
-                if mtime > (time.time() - stale_threshold_seconds):
-                    # Recently touched, skip
-                    continue
+                    scanned += 1
+                    if scanned % 5000 == 0:
+                        await asyncio.sleep(0)  # yield so workers drain while we walk
 
-                # Skip deletion if object is in DLQ
-                if object_id in dlq_object_ids:
-                    logger.debug(
-                        f"Skipping DLQ-protected part: object_id={object_id} v={object_version} part={part_number}"
-                    )
-                    continue
+                    meta_file = part_dir / "meta.json"
+                    check_path = meta_file if meta_file.exists() else part_dir
+                    try:
+                        mtime = check_path.stat().st_mtime
+                    except OSError:
+                        continue
 
-                # Decide, in one query, which of three states this part is in:
-                #   row is None        → no `parts` row at all. The object's DB rows are
-                #                        gone (Phase 4 hard-delete cascades parts →
-                #                        part_chunks → chunk_backend) or this is orphaned
-                #                        FS with no record. mtime>1d already rules out an
-                #                        in-flight write (chunks land before the parts
-                #                        row), so it is safe to reap → fall through.
-                #   row["recent"] true → row exists and was (re)written recently → leave it.
-                #   row["recent"] false→ row exists but is old → only reap once every chunk
-                #                        is replicated to every required backend. A
-                #                        not-yet-replicated part is a pending or aborted
-                #                        upload and must be protected (no data loss).
-                # Distinguishing "no DB row" (orphan, reap) from "DB row but not replicated"
-                # (pending, protect) is what keeps deleted-object cache cleanup working
-                # without ever deleting data that hasn't been backed up.
-                try:
-                    row = await db.fetchrow(
-                        """
-                        SELECT (uploaded_at > """
-                        + cutoff_sql
-                        + """) AS recent
-                        FROM parts
-                        WHERE object_id = $1 AND object_version = $2 AND part_number = $3
-                        LIMIT 1""",
-                        object_id,
-                        object_version,
-                        part_number,
-                        stale_threshold_seconds,
-                    )
-                    if row is not None:
-                        if row["recent"]:
-                            continue
-                        if not await is_replicated_on_all_backends(db, object_id, object_version, part_number):
-                            continue
-                except Exception:
-                    # If any DB check fails, be extra conservative: skip deletion
-                    continue
+                    if mtime > mtime_cutoff:
+                        # Recently touched, skip
+                        continue
 
-                try:
-                    await fs_store.delete_part(object_id, object_version, part_number)
-                    parts_cleaned += 1
-                    logger.info(
-                        f"Cleaned stale part by mtime: object_id={object_id} v={object_version} part={part_number}"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to clean part: object_id={object_id} v={object_version} part={part_number}: {e}"
-                    )
+                    # Skip deletion if object is in DLQ
+                    if object_id in dlq_object_ids:
+                        logger.debug(
+                            f"Skipping DLQ-protected part: object_id={object_id} v={object_version} part={part_number}"
+                        )
+                        continue
 
+                    yield (object_id, object_version, part_number)
+
+    async def handle(conn: asyncpg.Connection, item: tuple[str, int, int]) -> bool:
+        object_id, object_version, part_number = item
+
+        # Decide, in one query, which of three states this part is in:
+        #   row is None        → no `parts` row at all. The object's DB rows are
+        #                        gone (Phase 4 hard-delete cascades parts →
+        #                        part_chunks → chunk_backend) or this is orphaned
+        #                        FS with no record. mtime>1d already rules out an
+        #                        in-flight write (chunks land before the parts
+        #                        row), so it is safe to reap → fall through.
+        #   row["recent"] true → row exists and was (re)written recently → leave it.
+        #   row["recent"] false→ row exists but is old → only reap once every chunk
+        #                        is replicated to every required backend. A
+        #                        not-yet-replicated part is a pending or aborted
+        #                        upload and must be protected (no data loss).
+        # Distinguishing "no DB row" (orphan, reap) from "DB row but not replicated"
+        # (pending, protect) is what keeps deleted-object cache cleanup working
+        # without ever deleting data that hasn't been backed up.
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT (uploaded_at > """
+                + cutoff_sql
+                + """) AS recent
+                FROM parts
+                WHERE object_id = $1 AND object_version = $2 AND part_number = $3
+                LIMIT 1""",
+                object_id,
+                object_version,
+                part_number,
+                stale_threshold_seconds,
+            )
+            if row is not None:
+                if row["recent"]:
+                    return False
+                if not await is_replicated_on_all_backends(conn, object_id, object_version, part_number):
+                    return False
+        except Exception:
+            # If any DB check fails, be extra conservative: skip deletion
+            return False
+
+        try:
+            await fs_store.delete_part(object_id, object_version, part_number)
+            logger.info(f"Cleaned stale part by mtime: object_id={object_id} v={object_version} part={part_number}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to clean part: object_id={object_id} v={object_version} part={part_number}: {e}")
+            return False
+
+    parts_cleaned = await _run_worker_pool(pool, candidates(), handle, config.janitor_concurrency)
     logger.info(f"Janitor cleaned {parts_cleaned} stale parts by mtime threshold")
     return parts_cleaned
 
@@ -462,7 +536,7 @@ async def cleanup_orphan_tmp_files(fs_store: FileSystemPartsStore) -> int:
 
 
 async def cleanup_old_parts_by_mtime(
-    db: asyncpg.Connection,
+    pool: asyncpg.Pool,
     fs_store: FileSystemPartsStore,
     redis_client: Redis,
 ) -> int:
@@ -487,6 +561,12 @@ async def cleanup_old_parts_by_mtime(
 
     Under critical pressure with nothing replicated, the janitor is stuck.
     That is the correct outcome — it logs an ERROR so operators page.
+
+    Metric accumulation (parts_seen, age buckets, hot parts) happens in the
+    producer walk; the replication check + delete run with bounded concurrency
+    over the connection pool. The FS-level gates (DLQ, hot, age-under-normal)
+    are applied in the producer so only genuine deletion candidates reach a
+    worker — the replication gate itself is unchanged.
     """
     max_age_seconds = config.fs_cache_gc_max_age_seconds
     logger.info(f"Scanning FS parts eligible for GC (max_age={max_age_seconds}s, replication-gated)")
@@ -499,7 +579,6 @@ async def cleanup_old_parts_by_mtime(
     if not root.exists():
         return 0
 
-    parts_cleaned = 0
     cutoff_time = time.time() - max_age_seconds
     pressure = _pressure_mode(root)
     hot_window = _effective_hot_retention(pressure)
@@ -511,130 +590,148 @@ async def cleanup_old_parts_by_mtime(
     global _fs_parts_on_disk, _fs_oldest_age_seconds, _fs_disk_used_bytes
     global _fs_disk_total_bytes, _fs_age_buckets, _fs_hot_parts, _fs_pressure_mode
 
-    # Walk the FS hierarchy: <root>/<object_id>/v<version>/part_<n>/
-    oldest_mtime = None
-    parts_seen = 0
-    hot_parts = 0
-    age_counts: dict[str, int] = dict.fromkeys(AGE_BUCKET_NAMES, 0)
     now = time.time()
+    # Accumulated by the producer walk; read back after the pool drains.
+    stats: dict[str, Any] = {
+        "parts_seen": 0,
+        "hot_parts": 0,
+        "oldest_mtime": None,
+        "age_counts": dict.fromkeys(AGE_BUCKET_NAMES, 0),
+    }
 
-    for object_dir in root.iterdir():
-        if not object_dir.is_dir():
-            continue
-
-        object_id = object_dir.name
-        is_dlq_protected = object_id in dlq_object_ids
-
-        for version_dir in object_dir.iterdir():
-            if not version_dir.is_dir() or not version_dir.name.startswith("v"):
+    async def candidates() -> AsyncIterator[tuple[str, int, int, bool]]:
+        scanned = 0
+        # Walk the FS hierarchy: <root>/<object_id>/v<version>/part_<n>/
+        for object_dir in root.iterdir():
+            if not object_dir.is_dir():
                 continue
 
-            try:
-                object_version = int(version_dir.name[1:])
-            except (ValueError, IndexError):
-                continue
+            object_id = object_dir.name
+            is_dlq_protected = object_id in dlq_object_ids
 
-            for part_dir in version_dir.iterdir():
-                if not part_dir.is_dir() or not part_dir.name.startswith("part_"):
+            for version_dir in object_dir.iterdir():
+                if not version_dir.is_dir() or not version_dir.name.startswith("v"):
                     continue
-                parts_seen += 1
 
                 try:
-                    part_number = int(part_dir.name.split("_")[1])
+                    object_version = int(version_dir.name[1:])
                 except (ValueError, IndexError):
                     continue
 
-                # Check mtime (for age) and atime (for hot retention).
-                #
-                # ZFS + noatime note: in prod the local-cache volume is a ZFS
-                # dataset mounted `noatime` (see `mount | grep local_object_cache`
-                # → `rw,noatime,xattr,noacl,casesensitive`). `noatime` only
-                # blocks VFS-triggered atime updates on reads (the
-                # `file_accessed() → atime_needs_update() → dirty_inode()`
-                # path). It does NOT block explicit `utimensat(2)` metadata
-                # writes, which go through `setattr()`. Our reader refreshes
-                # atime on every chunk read via `os.utime(path, None)` in
-                # `fs_store.get_chunk`, so hot-retention works correctly here.
-                # OpenZFS PR #4482 ("Fix atime handling and relatime") made
-                # this behaviour consistent — atime is handled purely by VFS
-                # and explicit setattr writes are always honoured regardless
-                # of the mount's noatime flag.
-                #
-                # Side effect: `os.utime(path, None)` sets BOTH atime and
-                # mtime to "now" (UTIME_NOW on both). Recently-read chunks
-                # therefore show `atime == mtime` to the nanosecond — that's
-                # expected, not a bug. It also means reads push mtime
-                # forward, so the mtime-based age check below is more
-                # conservative on actively-read content (treats hot chunks
-                # as younger than their original landing time). Replication
-                # is still the absolute gate, so this only relaxes, never
-                # tightens, what we delete.
-                meta_file = part_dir / "meta.json"
-                check_path = meta_file if meta_file.exists() else part_dir
+                for part_dir in version_dir.iterdir():
+                    if not part_dir.is_dir() or not part_dir.name.startswith("part_"):
+                        continue
+                    stats["parts_seen"] += 1
 
-                try:
-                    stat = check_path.stat()
-                    mtime = stat.st_mtime
-                    atime = stat.st_atime
-                    if oldest_mtime is None or mtime < oldest_mtime:
-                        oldest_mtime = mtime
-
-                    part_age = now - mtime
-                    age_counts[_classify_age_bucket(part_age)] += 1
-
-                    is_hot = hot_window > 0 and atime > (now - hot_window)
-                    if is_hot:
-                        hot_parts += 1
-
-                    # Don't clean DLQ-protected parts (only count them for metrics)
-                    if is_dlq_protected:
+                    try:
+                        part_number = int(part_dir.name.split("_")[1])
+                    except (ValueError, IndexError):
                         continue
 
-                    # Hot files are protected. Under critical pressure
-                    # hot_window is 0, which forces is_hot=False, letting
-                    # fully-replicated parts become eligible even if recently read.
-                    if is_hot:
+                    scanned += 1
+                    if scanned % 5000 == 0:
+                        await asyncio.sleep(0)  # yield so workers drain while we walk
+
+                    # Check mtime (for age) and atime (for hot retention).
+                    #
+                    # ZFS + noatime note: in prod the local-cache volume is a ZFS
+                    # dataset mounted `noatime` (see `mount | grep local_object_cache`
+                    # → `rw,noatime,xattr,noacl,casesensitive`). `noatime` only
+                    # blocks VFS-triggered atime updates on reads (the
+                    # `file_accessed() → atime_needs_update() → dirty_inode()`
+                    # path). It does NOT block explicit `utimensat(2)` metadata
+                    # writes, which go through `setattr()`. Our reader refreshes
+                    # atime on every chunk read via `os.utime(path, None)` in
+                    # `fs_store.get_chunk`, so hot-retention works correctly here.
+                    # OpenZFS PR #4482 ("Fix atime handling and relatime") made
+                    # this behaviour consistent — atime is handled purely by VFS
+                    # and explicit setattr writes are always honoured regardless
+                    # of the mount's noatime flag.
+                    #
+                    # Side effect: `os.utime(path, None)` sets BOTH atime and
+                    # mtime to "now" (UTIME_NOW on both). Recently-read chunks
+                    # therefore show `atime == mtime` to the nanosecond — that's
+                    # expected, not a bug. It also means reads push mtime
+                    # forward, so the mtime-based age check below is more
+                    # conservative on actively-read content (treats hot chunks
+                    # as younger than their original landing time). Replication
+                    # is still the absolute gate, so this only relaxes, never
+                    # tightens, what we delete.
+                    meta_file = part_dir / "meta.json"
+                    check_path = meta_file if meta_file.exists() else part_dir
+
+                    # A single stat() can race a concurrent delete or return an
+                    # odd value; be conservative and skip the part rather than
+                    # abort the whole walk (matches the pre-split behaviour).
+                    try:
+                        stat = check_path.stat()
+                        mtime = stat.st_mtime
+                        atime = stat.st_atime
+                        if stats["oldest_mtime"] is None or mtime < stats["oldest_mtime"]:
+                            stats["oldest_mtime"] = mtime
+
+                        part_age = now - mtime
+                        stats["age_counts"][_classify_age_bucket(part_age)] += 1
+
+                        is_hot = hot_window > 0 and atime > (now - hot_window)
+                        if is_hot:
+                            stats["hot_parts"] += 1
+
+                        # Don't clean DLQ-protected parts (only count them for metrics)
+                        if is_dlq_protected:
+                            continue
+
+                        # Hot files are protected. Under critical pressure
+                        # hot_window is 0, which forces is_hot=False, letting
+                        # fully-replicated parts become eligible even if recently read.
+                        if is_hot:
+                            continue
+
+                        # A fully-replicated, cold, non-DLQ part is safe to evict.
+                        # Under normal pressure we additionally require age > cutoff
+                        # so we don't thrash. Under any pressure level we evict
+                        # replicated cold parts regardless of age. The replication
+                        # gate itself is enforced in the worker below.
+                        old_enough = mtime < cutoff_time
+                        if pressure == 0 and not old_enough:
+                            continue
+                    except Exception as e:
+                        logger.warning(f"Failed to classify part {part_dir}: {e}")
                         continue
 
-                    # ABSOLUTE safety gate: never delete non-replicated data.
-                    fully_replicated = await is_replicated_on_all_backends(
-                        db,
-                        object_id,
-                        object_version,
-                        part_number,
-                    )
-                    if not fully_replicated:
-                        continue
+                    yield (object_id, object_version, part_number, old_enough)
 
-                    # A fully-replicated, cold, non-DLQ part is safe to evict.
-                    # Under normal pressure we additionally require age > cutoff
-                    # so we don't thrash. Under any pressure level we evict
-                    # replicated cold parts regardless of age.
-                    old_enough = mtime < cutoff_time
-                    if pressure == 0 and not old_enough:
-                        continue
+    async def handle(conn: asyncpg.Connection, item: tuple[str, int, int, bool]) -> bool:
+        object_id, object_version, part_number, old_enough = item
 
-                    shutil.rmtree(part_dir)
-                    parts_cleaned += 1
-                    age = (now - mtime) / 3600
-                    logger.info(
-                        f"GC cleaned part: {part_dir} replicated=True "
-                        f"pressure={pressure} {old_enough=} (mtime {age=:.1f}h)"
-                    )
+        # ABSOLUTE safety gate: never delete non-replicated data.
+        try:
+            fully_replicated = await is_replicated_on_all_backends(conn, object_id, object_version, part_number)
+        except Exception as e:
+            logger.warning(f"Replication check failed for {object_id} v{object_version} part{part_number}: {e}")
+            return False
+        if not fully_replicated:
+            return False
 
-                    # Try to prune empty parents (idempotent; ignore if not empty)
-                    with contextlib.suppress(OSError):
-                        version_dir.rmdir()
-                    with contextlib.suppress(OSError):
-                        object_dir.rmdir()
-                except Exception as e:
-                    logger.warning(f"Failed to clean part {part_dir}: {e}")
+        try:
+            await fs_store.delete_part(object_id, object_version, part_number)
+            logger.info(
+                f"GC cleaned part: object_id={object_id} v={object_version} part={part_number} "
+                f"replicated=True pressure={pressure} {old_enough=}"
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to clean part: object_id={object_id} v={object_version} part={part_number}: {e}")
+            return False
+
+    parts_cleaned = await _run_worker_pool(pool, candidates(), handle, config.janitor_concurrency)
 
     # Update module-level metric variables (read by OTel observable gauge callbacks)
-    _fs_parts_on_disk = parts_seen
+    oldest_mtime = stats["oldest_mtime"]
+    _fs_parts_on_disk = stats["parts_seen"]
     _fs_oldest_age_seconds = max(0.0, now - float(oldest_mtime)) if oldest_mtime is not None else 0.0
-    _fs_age_buckets = age_counts
-    _fs_hot_parts = hot_parts
+    _fs_age_buckets = stats["age_counts"]
+    _fs_hot_parts = stats["hot_parts"]
     _fs_pressure_mode = pressure
 
     # Disk usage
@@ -645,40 +742,42 @@ async def cleanup_old_parts_by_mtime(
     if parts_cleaned > 0 and _janitor_deleted_counter is not None:
         _janitor_deleted_counter.add(parts_cleaned)
 
-    logger.info(f"GC cleaned {parts_cleaned=} hot_parts={hot_parts} pressure={pressure}")
+    logger.info(f"GC cleaned {parts_cleaned=} hot_parts={stats['hot_parts']} pressure={pressure}")
 
     # If we're under critical disk pressure but couldn't free any space,
     # every on-disk part is either hot (ignored under critical — nothing to
     # free) or non-replicated (we refuse to delete). Page the operator.
-    if pressure == 2 and parts_cleaned == 0 and parts_seen > 0:
+    if pressure == 2 and parts_cleaned == 0 and stats["parts_seen"] > 0:
         logger.error(
             "JANITOR_CRITICAL_PRESSURE_BLOCKED parts_seen=%d hot_parts=%d — "
             "disk is >=95%% full but all remaining parts are non-replicated. "
             "Operator action required; refusing to delete unreplicated data.",
-            parts_seen,
-            hot_parts,
+            stats["parts_seen"],
+            stats["hot_parts"],
         )
 
     return parts_cleaned
 
 
-async def gc_soft_deleted_objects(db: asyncpg.Connection) -> int:
+async def gc_soft_deleted_objects(pool: asyncpg.Pool) -> int:
     """Hard-delete objects where all backends have confirmed unpin."""
-    rows = await db.fetch(get_query("find_objects_ready_for_hard_delete"))
-    deleted = 0
-    for row in rows:
-        try:
-            await db.execute("DELETE FROM objects WHERE object_id = $1", row["object_id"])
-            deleted += 1
-            logger.info(f"Hard-deleted soft-deleted object: object_id={row['object_id']}")
-        except Exception as e:
-            logger.warning(f"Failed to hard-delete object {row['object_id']}: {e}")
+    async with pool.acquire() as db:
+        rows = await db.fetch(get_query("find_objects_ready_for_hard_delete"))
+        deleted = 0
+        for row in rows:
+            try:
+                await db.execute("DELETE FROM objects WHERE object_id = $1", row["object_id"])
+                deleted += 1
+                logger.info(f"Hard-deleted soft-deleted object: object_id={row['object_id']}")
+            except Exception as e:
+                logger.warning(f"Failed to hard-delete object {row['object_id']}: {e}")
     return deleted
 
 
 async def run_janitor_loop():
     """Main janitor loop: periodically clean stale and old parts."""
-    db = await asyncpg.connect(config.database_url)
+    concurrency = config.janitor_concurrency
+    db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=concurrency + 4)
     fs_store = create_fs_store(config)
     redis_client = Redis.from_url(config.redis_queues_url)
 
@@ -690,6 +789,7 @@ async def run_janitor_loop():
     logger.info(f"MPU stale threshold: {config.mpu_stale_seconds}s")
     logger.info(f"FS GC max age: {config.fs_cache_gc_max_age_seconds}s")
     logger.info(f"FS hot retention: {getattr(config, 'fs_cache_hot_retention_seconds', 10800)}s")
+    logger.info(f"Cleanup concurrency: {concurrency}")
 
     # Sleep intervals: shorter under disk pressure to catch up
     sleep_normal = 600  # 10m
@@ -698,6 +798,10 @@ async def run_janitor_loop():
     try:
         while True:
             logger.info("Janitor cycle starting...")
+            # Refresh disk/pressure gauges up front. The GC walk below can take
+            # hours over millions of parts; disk visibility must not wait on it.
+            _update_disk_metrics(fs_store.root)
+
             stale_count = 0
             gc_count = 0
             hard_deleted = 0
@@ -705,13 +809,13 @@ async def run_janitor_loop():
 
             # Phase 1: Clean stale MPU parts (aborted uploads)
             try:
-                stale_count = await cleanup_stale_parts(db, fs_store, redis_client)
+                stale_count = await cleanup_stale_parts(db_pool, fs_store, redis_client)
             except Exception as e:
                 logger.error(f"Phase 1 (stale cleanup) error: {e}", exc_info=True)
 
             # Phase 2: GC old parts by mtime + update disk/cache metrics
             try:
-                gc_count = await cleanup_old_parts_by_mtime(db, fs_store, redis_client)
+                gc_count = await cleanup_old_parts_by_mtime(db_pool, fs_store, redis_client)
             except Exception as e:
                 logger.error(f"Phase 2 (GC) error: {e}", exc_info=True)
 
@@ -723,7 +827,7 @@ async def run_janitor_loop():
 
             # Phase 4: Hard-delete soft-deleted objects where all unpins are confirmed
             try:
-                hard_deleted = await gc_soft_deleted_objects(db)
+                hard_deleted = await gc_soft_deleted_objects(db_pool)
             except Exception as e:
                 logger.error(f"Phase 4 (hard delete) error: {e}", exc_info=True)
 
@@ -739,8 +843,8 @@ async def run_janitor_loop():
     finally:
         if redis_client:
             await redis_client.close()
-        if db:
-            await db.close()
+        if db_pool:
+            await db_pool.close()
 
 
 if __name__ == "__main__":

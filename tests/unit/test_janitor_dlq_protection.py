@@ -21,12 +21,34 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "workers"))
 from run_janitor_in_loop import get_all_dlq_object_ids  # noqa: E402
 
 
+class _PoolCtx:
+    def __init__(self, conn) -> None:
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+
+class _FakePool:
+    """Minimal asyncpg.Pool stand-in: every acquire() yields the same conn mock."""
+
+    def __init__(self, conn) -> None:
+        self._conn = conn
+
+    def acquire(self) -> _PoolCtx:
+        return _PoolCtx(self._conn)
+
+
 @pytest.fixture
 def mock_config():
     config = MagicMock()
     config.mpu_stale_seconds = 86400  # 1 day
     config.fs_cache_gc_max_age_seconds = 604800  # 7 days
     config.object_cache_dir = "/tmp/test_janitor_cache"
+    config.janitor_concurrency = 4
     return config
 
 
@@ -205,7 +227,8 @@ class TestJanitorDlqProtection:
         mock_fs_store.delete_part = AsyncMock()
 
         # Run cleanup
-        await cleanup_stale_parts(mock_db, mock_fs_store, redis_with_dlq)
+        with patch("run_janitor_in_loop.config", mock_config):
+            await cleanup_stale_parts(_FakePool(mock_db), mock_fs_store, redis_with_dlq)
 
         # Protected object should NOT be deleted
         # Non-protected object should be checked and potentially deleted
@@ -256,7 +279,7 @@ class TestJanitorDlqProtection:
 
         # Run cleanup
         with patch("run_janitor_in_loop.config", mock_config):
-            result = await cleanup_old_parts_by_mtime(mock_db, mock_fs_store, redis_with_dlq)
+            result = await cleanup_old_parts_by_mtime(_FakePool(mock_db), mock_fs_store, redis_with_dlq)
 
         # Should be 0 because object is protected
         assert result == 0
