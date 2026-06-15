@@ -26,13 +26,15 @@ spec:
   monitoring:
     enablePodMonitor: false
   postgresql:
+    shared_preload_libraries:
+    - pg_stat_statements
     parameters:
       checkpoint_completion_target: '0.9'
       checkpoint_timeout: 15min
       default_statistics_target: '500'
       effective_cache_size: 48GB
       effective_io_concurrency: '200'
-      maintenance_work_mem: 4GB
+      maintenance_work_mem: 2GB
       max_connections: '1000'
       max_parallel_maintenance_workers: '4'
       max_parallel_workers: '12'
@@ -45,7 +47,7 @@ spec:
       shared_buffers: 16GB
       wal_buffers: 64MB
       wal_level: replica
-      work_mem: 128MB
+      work_mem: 48MB
   primaryUpdateStrategy: unsupervised
   replicationSlots:
     highAvailability:
@@ -57,10 +59,10 @@ spec:
   resources:
     limits:
       cpu: '10'
-      memory: 56Gi
+      memory: 48Gi
     requests:
       cpu: '2'
-      memory: 16Gi
+      memory: 48Gi
   smartShutdownTimeout: 180
   startDelay: 3600
   stopDelay: 1800
