@@ -216,7 +216,14 @@ async def run_unpinner_loop(
 
     redis_client = create_redis_client(config.redis_url)
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
-    pool_max = max(2, int(config.unpinner_db_pool_max))
+
+    delete_concurrency = max(1, int(config.unpinner_parallelism))
+    max_inflight = max(1, int(config.unpinner_max_inflight))
+    # Peak concurrent pool acquires = up to `delete_concurrency` soft-deletes (each held inside
+    # delete_sem) + up to `max_inflight` per-request initial fetches. Floor the pool to that sum so
+    # scaling the concurrency knobs can never starve acquire() and silently wedge the pod (asyncpg
+    # acquire blocks indefinitely with no timeout).
+    pool_max = max(2, int(config.unpinner_db_pool_max), delete_concurrency + max_inflight)
     db_pool = await asyncpg.create_pool(
         dsn=config.database_url,
         min_size=2,
@@ -232,11 +239,10 @@ async def run_unpinner_loop(
 
     dlq_manager = UnpinDLQManager(redis_queues_client)
 
-    delete_sem = asyncio.Semaphore(max(1, int(config.unpinner_parallelism)))
-    max_inflight = max(1, int(config.unpinner_max_inflight))
+    delete_sem = asyncio.Semaphore(delete_concurrency)
     logger.info(
         f"Starting {backend_name} unpinner service (queue={queue_name} max_inflight={max_inflight} "
-        f"delete_concurrency={config.unpinner_parallelism} db_pool_max={pool_max})"
+        f"delete_concurrency={delete_concurrency} db_pool_max={pool_max})"
     )
 
     async def _handle_unpin(request: UnpinChainRequest) -> None:
