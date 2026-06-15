@@ -48,9 +48,41 @@ def _make_part(
     return part_dir
 
 
+class _PoolCtx:
+    def __init__(self, conn) -> None:
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+
+class _FakePool:
+    """Minimal asyncpg.Pool stand-in: every acquire() yields the same conn mock."""
+
+    def __init__(self, conn) -> None:
+        self._conn = conn
+
+    def acquire(self) -> _PoolCtx:
+        return _PoolCtx(self._conn)
+
+
+def _pool(conn) -> _FakePool:
+    return _FakePool(conn)
+
+
 class _FakeFsStore:
     def __init__(self, root: Path) -> None:
         self.root = root
+
+    async def delete_part(self, object_id: str, object_version: int, part_number: int) -> None:
+        import shutil
+
+        p = self.root / object_id / f"v{object_version}" / f"part_{part_number}"
+        if p.exists():
+            shutil.rmtree(p)
 
 
 @pytest.fixture
@@ -89,15 +121,16 @@ def _patch_config(hot_retention: int = 10800, gc_max_age: int = 604800) -> None:
 
 
 @pytest.mark.asyncio
-async def test_normal_pressure_keeps_hot_files(fs_root, fs_store, redis_mock, db_mock):
+async def test_normal_pressure_keeps_hot_files(fs_root, fs_store, redis_mock, db_mock, monkeypatch):
     """Recently-read part (atime within hot window) survives GC."""
     _patch_config(hot_retention=10800, gc_max_age=60)
+    monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 0)  # pin: test runner disk may be >85%
 
     # mtime is ancient (past GC cutoff), atime is recent (within hot window)
     _make_part(fs_root, OBJ, 1, 1, mtime_offset=3600, atime_offset=60)
 
     with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock(return_value=True)):
-        count = await janitor.cleanup_old_parts_by_mtime(db_mock, fs_store, redis_mock)
+        count = await janitor.cleanup_old_parts_by_mtime(_pool(db_mock), fs_store, redis_mock)
 
     assert count == 0
     assert (fs_root / OBJ / "v1" / "part_1").exists()
@@ -106,43 +139,46 @@ async def test_normal_pressure_keeps_hot_files(fs_root, fs_store, redis_mock, db
 
 
 @pytest.mark.asyncio
-async def test_normal_pressure_deletes_cold_replicated(fs_root, fs_store, redis_mock, db_mock):
+async def test_normal_pressure_deletes_cold_replicated(fs_root, fs_store, redis_mock, db_mock, monkeypatch):
     """Old + replicated + cold atime → deleted."""
     _patch_config(hot_retention=10800, gc_max_age=60)
+    monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 0)  # pin: test runner disk may be >85%
 
     # atime_offset must exceed hot_retention (10800s) to count as cold
     _make_part(fs_root, OBJ, 1, 1, mtime_offset=20000, atime_offset=20000)
 
     with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock(return_value=True)):
-        count = await janitor.cleanup_old_parts_by_mtime(db_mock, fs_store, redis_mock)
+        count = await janitor.cleanup_old_parts_by_mtime(_pool(db_mock), fs_store, redis_mock)
 
     assert count == 1
     assert not (fs_root / OBJ / "v1" / "part_1").exists()
 
 
 @pytest.mark.asyncio
-async def test_normal_pressure_keeps_not_replicated_not_old(fs_root, fs_store, redis_mock, db_mock):
+async def test_normal_pressure_keeps_not_replicated_not_old(fs_root, fs_store, redis_mock, db_mock, monkeypatch):
     """Young part not yet replicated — keep it."""
     _patch_config(hot_retention=10800, gc_max_age=604800)
+    monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 0)  # pin: test runner disk may be >85%
 
     _make_part(fs_root, OBJ, 1, 1, mtime_offset=60, atime_offset=60)
 
     with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock(return_value=False)):
-        count = await janitor.cleanup_old_parts_by_mtime(db_mock, fs_store, redis_mock)
+        count = await janitor.cleanup_old_parts_by_mtime(_pool(db_mock), fs_store, redis_mock)
 
     assert count == 0
     assert (fs_root / OBJ / "v1" / "part_1").exists()
 
 
 @pytest.mark.asyncio
-async def test_hot_beats_replication(fs_root, fs_store, redis_mock, db_mock):
+async def test_hot_beats_replication(fs_root, fs_store, redis_mock, db_mock, monkeypatch):
     """A file that's replicated AND old but ALSO hot is kept."""
     _patch_config(hot_retention=10800, gc_max_age=60)
+    monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 0)  # pin: test runner disk may be >85%
 
     _make_part(fs_root, OBJ, 1, 1, mtime_offset=7200, atime_offset=600)
 
     with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock(return_value=True)):
-        count = await janitor.cleanup_old_parts_by_mtime(db_mock, fs_store, redis_mock)
+        count = await janitor.cleanup_old_parts_by_mtime(_pool(db_mock), fs_store, redis_mock)
 
     assert count == 0
     assert (fs_root / OBJ / "v1" / "part_1").exists()
@@ -160,7 +196,7 @@ async def test_elevated_pressure_halves_hot_window(fs_root, fs_store, redis_mock
     _make_part(fs_root, OBJ, 1, 1, mtime_offset=7200, atime_offset=8000)
 
     with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock(return_value=True)):
-        count = await janitor.cleanup_old_parts_by_mtime(db_mock, fs_store, redis_mock)
+        count = await janitor.cleanup_old_parts_by_mtime(_pool(db_mock), fs_store, redis_mock)
 
     assert count == 1  # elevated halves hot_window to 5400s, so 8000s > 5400s = cold
     assert janitor._fs_pressure_mode == 1
@@ -175,7 +211,7 @@ async def test_elevated_pressure_still_keeps_very_recent(fs_root, fs_store, redi
     _make_part(fs_root, OBJ, 1, 1, mtime_offset=7200, atime_offset=60)
 
     with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock(return_value=True)):
-        count = await janitor.cleanup_old_parts_by_mtime(db_mock, fs_store, redis_mock)
+        count = await janitor.cleanup_old_parts_by_mtime(_pool(db_mock), fs_store, redis_mock)
 
     assert count == 0
 
@@ -189,7 +225,7 @@ async def test_critical_pressure_ignores_hot_retention(fs_root, fs_store, redis_
     _make_part(fs_root, OBJ, 1, 1, mtime_offset=3600, atime_offset=10)
 
     with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock(return_value=True)):
-        count = await janitor.cleanup_old_parts_by_mtime(db_mock, fs_store, redis_mock)
+        count = await janitor.cleanup_old_parts_by_mtime(_pool(db_mock), fs_store, redis_mock)
 
     assert count == 1
 
@@ -207,7 +243,7 @@ async def test_critical_pressure_refuses_to_delete_non_replicated(fs_root, fs_st
     _make_part(fs_root, OBJ, 1, 1, mtime_offset=3600, atime_offset=3600)
 
     with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock(return_value=False)):
-        count = await janitor.cleanup_old_parts_by_mtime(db_mock, fs_store, redis_mock)
+        count = await janitor.cleanup_old_parts_by_mtime(_pool(db_mock), fs_store, redis_mock)
 
     assert count == 0
     assert (fs_root / OBJ / "v1" / "part_1").exists()
@@ -224,7 +260,7 @@ async def test_critical_pressure_evicts_replicated_cold_parts(fs_root, fs_store,
     _make_part(fs_root, OBJ, 1, 1, mtime_offset=60, atime_offset=60)
 
     with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock(return_value=True)):
-        count = await janitor.cleanup_old_parts_by_mtime(db_mock, fs_store, redis_mock)
+        count = await janitor.cleanup_old_parts_by_mtime(_pool(db_mock), fs_store, redis_mock)
 
     assert count == 1
 
@@ -261,7 +297,7 @@ async def test_backup_backends_unioned_into_replication_check(fs_root, fs_store,
 
     # Mock get_query to return a dummy SQL string flagged for our faker.
     with patch.object(janitor, "get_query", return_value="SELECT count_chunk_backends"):
-        count = await janitor.cleanup_old_parts_by_mtime(db_mock, fs_store, redis_mock)
+        count = await janitor.cleanup_old_parts_by_mtime(_pool(db_mock), fs_store, redis_mock)
 
     # Janitor called is_replicated_on_all_backends, which called
     # count_chunk_backends with an `expected` list unioning upload and backup backends.

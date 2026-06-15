@@ -174,7 +174,15 @@ class Config:
     fs_meta_wait_seconds: float = env("HIPPIUS_FS_META_WAIT_SECONDS:30", convert=float)
 
     # Unpinner configuration
+    # How many unpin requests one unpinner pod processes concurrently (outer bounded-dispatch,
+    # mirroring the uploader). The old loop was a serial consumer.
+    unpinner_max_inflight: int = env("HIPPIUS_UNPINNER_MAX_INFLIGHT:4", convert=int)
+    # Single shared per-pod bound on concurrent Arion DELETEs across ALL in-flight requests — one
+    # fat request expands to ~N chunk identifiers, so this is what actually unlocks delete throughput.
     unpinner_parallelism: int = env("HIPPIUS_UNPINNER_PARALLELISM:5", convert=int)
+    # Per-pod unpinner DB pool size (concurrent soft-deletes). Multiplied by replica count against
+    # Postgres max_connections — keep modest and raise alongside parallelism.
+    unpinner_db_pool_max: int = env("HIPPIUS_UNPINNER_DB_POOL_MAX:12", convert=int)
     unpinner_max_attempts: int = env("HIPPIUS_UNPINNER_MAX_ATTEMPTS:5", convert=int)
     unpinner_backoff_base_ms: int = env("HIPPIUS_UNPINNER_BACKOFF_BASE_MS:1000", convert=int)
     unpinner_backoff_max_ms: int = env("HIPPIUS_UNPINNER_BACKOFF_MAX_MS:60000", convert=int)
@@ -267,6 +275,10 @@ class Config:
     object_cache_fallback_dir: str = env("HIPPIUS_OBJECT_CACHE_FALLBACK_DIR:", convert=str)
     fs_cache_gc_max_age_seconds: int = env("HIPPIUS_FS_CACHE_GC_MAX_AGE_SECONDS:604800", convert=int)  # 7 days
     mpu_stale_seconds: int = env("HIPPIUS_MPU_STALE_SECONDS:86400", convert=int)  # 1 day
+    # Bounded concurrency for the janitor's per-part DB checks + deletes. The
+    # cleanup loops are DB-roundtrip bound; this is how many parts are processed
+    # in parallel (each over its own pooled connection).
+    janitor_concurrency: int = env("HIPPIUS_JANITOR_CONCURRENCY:16", convert=int)
 
     # Filesystem cache disk-pressure backoff (ingress control).
     # Threshold can be expressed as either absolute bytes or ratio; we trigger if ANY threshold is hit.
