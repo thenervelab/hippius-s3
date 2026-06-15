@@ -32,6 +32,7 @@ import time
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -149,17 +150,26 @@ def _effective_hot_retention(mode: int) -> float:
     return base
 
 
-def _safe_iterdir(path: Path) -> list[Path]:
-    """List a directory, tolerating concurrent removal.
+def _safe_iterdir(path: Path) -> Iterator[Path]:
+    """Lazily list a directory, tolerating concurrent removal.
 
     The cleanup workers delete (and prune empty parent) directories while the
-    producer is still walking the tree, so a vanished dir is expected — return
-    an empty list rather than letting FileNotFoundError abort the whole walk.
+    producer is still walking the tree, so a vanished dir/entry is expected.
+    Stays lazy — the cache root can hold millions of object dirs, so we must not
+    materialize it — and swallows the OSError rather than aborting the walk.
     """
     try:
-        return list(path.iterdir())
+        it = iter(path.iterdir())
     except OSError:
-        return []
+        return
+    while True:
+        try:
+            entry = next(it)
+        except StopIteration:
+            return
+        except OSError:
+            return
+        yield entry
 
 
 def _update_disk_metrics(root: Path) -> None:
@@ -173,8 +183,7 @@ def _update_disk_metrics(root: Path) -> None:
     usage = shutil.disk_usage(root)
     _fs_disk_used_bytes = usage.used
     _fs_disk_total_bytes = usage.total
-    ratio = usage.used / usage.total if usage.total else 0.0
-    _fs_pressure_mode = 2 if ratio >= PRESSURE_CRITICAL else 1 if ratio >= PRESSURE_ELEVATED else 0
+    _fs_pressure_mode = _pressure_mode(root)
 
 
 async def _run_worker_pool(
@@ -614,8 +623,8 @@ async def cleanup_old_parts_by_mtime(
             f"Disk pressure={pressure} ({'elevated' if pressure == 1 else 'critical'}); hot_window={hot_window}s"
         )
 
-    global _fs_parts_on_disk, _fs_oldest_age_seconds, _fs_disk_used_bytes
-    global _fs_disk_total_bytes, _fs_age_buckets, _fs_hot_parts, _fs_pressure_mode
+    global _fs_parts_on_disk, _fs_oldest_age_seconds
+    global _fs_age_buckets, _fs_hot_parts, _fs_pressure_mode
 
     now = time.time()
     # Accumulated by the producer walk; read back after the pool drains.
@@ -753,18 +762,15 @@ async def cleanup_old_parts_by_mtime(
 
     parts_cleaned = await _run_worker_pool(pool, candidates(), handle, config.janitor_concurrency)
 
-    # Update module-level metric variables (read by OTel observable gauge callbacks)
+    # Update the part-census gauges from the walk. Disk-usage + pressure gauges
+    # are owned by _update_disk_metrics (refreshed at cycle top) — don't re-stat
+    # the disk here.
     oldest_mtime = stats["oldest_mtime"]
     _fs_parts_on_disk = stats["parts_seen"]
     _fs_oldest_age_seconds = max(0.0, now - float(oldest_mtime)) if oldest_mtime is not None else 0.0
     _fs_age_buckets = stats["age_counts"]
     _fs_hot_parts = stats["hot_parts"]
     _fs_pressure_mode = pressure
-
-    # Disk usage
-    disk = shutil.disk_usage(root)
-    _fs_disk_used_bytes = disk.used
-    _fs_disk_total_bytes = disk.total
 
     if parts_cleaned > 0 and _janitor_deleted_counter is not None:
         _janitor_deleted_counter.add(parts_cleaned)
