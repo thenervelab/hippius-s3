@@ -7,11 +7,10 @@ resources:
   - ../base
   - gateway-nodeport.yaml
   - postgres-objectstore.yaml
-  # s3-2.0 trial: per-node local-SSD ingest tier (see README-local-ingest-trial.md).
+  # s3-2.0 trial: node-local-SSD ingest tier (see README-local-ingest-trial.md).
+  # Uses a hostPath (DirectoryOrCreate) volume — no PV/PVC, no manual node prep.
   # The replicator DaemonSet stub (replicator-daemonset-staging.yaml) is intentionally
   # NOT listed until the daemon image exists.
-  - pv-local-ingest-staging.yaml
-  - pvc-local-ingest-staging.yaml
   - api-local-deployments-staging.yaml
 
 patches:

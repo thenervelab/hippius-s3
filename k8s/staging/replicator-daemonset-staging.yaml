@@ -33,7 +33,8 @@
 #       labels:
 #         app: cache-replicator
 #     spec:
-#       # Pin to the same nodes that carry the local-ingest PVs.
+#       # Runs on every general worker that can host an api-local pod, so each
+#       # node's local ingest dir gets drained to ceph.
 #       affinity:
 #         nodeAffinity:
 #           requiredDuringSchedulingIgnoredDuringExecution:
@@ -41,7 +42,7 @@
 #               - matchExpressions:
 #                   - key: kubernetes.io/hostname
 #                     operator: In
-#                     values: [k8s-v3-node1, k8s-v3-node2, k8s-v3-node3]
+#                     values: [k8s-v3-node1, k8s-v3-node2, k8s-v3-node3, k8s-v3-node4, k8s-v3-node5]
 #       containers:
 #         - name: cache-replicator
 #           image: ghcr.io/thenervelab/hippius-s3/workers:latest   # TODO: replicator entrypoint
