@@ -1,0 +1,36 @@
+[package]
+name = "hippius-drain-allocator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "cephor singleton allocator (leader-elected; allocates the global Ceph write-budget)"
+
+# The live Ceph-mgr ceiling probe. On by default so the deployed binary can see
+# real near-full; `--no-default-features` drops `reqwest` and falls back to the
+# static ceiling, keeping a dependency-light build provable.
+[features]
+default = ["http"]
+http = ["dep:reqwest"]
+
+# The allocator contends for the leader lease and reads/writes the central state,
+# so it enables hippius-drain-core's `pg` feature.
+[dependencies]
+hippius-drain-core = { workspace = true, features = ["pg"] }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# The probe's HTTP client; gated behind `http` so a no-default-features build omits it.
+reqwest = { workspace = true, optional = true }
+
+[dev-dependencies]
+# For `#[sqlx::test]` against a real Postgres (migrations come from hippius-drain-core).
+sqlx = { workspace = true }
+# CancellationToken drives the shutdown signal in the run-loop tests.
+tokio-util = { workspace = true }
+# Mock HTTP server for the probe's status/timeout/parse edge tests.
+wiremock = { workspace = true }
+
+[lints]
+workspace = true

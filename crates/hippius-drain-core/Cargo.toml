@@ -1,0 +1,34 @@
+[package]
+name = "hippius-drain-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Core domain vocabulary and pure logic for the cephor drain service"
+
+[features]
+default = []
+# Optional serde support routed through each validated type's TryFrom, so
+# deserialization cannot bypass a construction-time invariant.
+serde = ["dep:serde"]
+# Exposes deterministic test helpers (e.g. TestClock) to downstream test code.
+test-util = []
+# Postgres-backed central state store (heartbeats, allocations, GC claims).
+pg = ["dep:sqlx", "dep:tokio"]
+# Enables GC of the shared CephFS pool folder. Off by default until the api
+# write-fence is confirmed (an owned task); SSD-local GC ships without it.
+gc-cephfs = []
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

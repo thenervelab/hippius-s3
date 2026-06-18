@@ -1,0 +1,73 @@
+[workspace]
+resolver = "3"
+members = ["crates/hippius-drain-core", "crates/hippius-drain-agent", "crates/hippius-drain-allocator"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+hippius-drain-core = { path = "crates/hippius-drain-core" }
+thiserror = "=2.0.18"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+proptest = "=1.11.0"
+tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "time", "fs", "io-util", "signal"] }
+# CancellationToken (hierarchical child tokens) for the agent task supervisor;
+# it lives in the always-on `sync` module, so no extra feature is needed.
+tokio-util = "=0.7.18"
+sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate"] }
+sha2 = "=0.11.0"
+tempfile = "=3.27.0"
+# Structured diagnostics for the agent runtime workers (axiom 163: tracing
+# fields over ad-hoc logs). Events only; the daemon binary installs a subscriber.
+tracing = "=0.1.44"
+# The subscriber the daemon binary installs; env-filter reads RUST_LOG.
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+# Safe statvfs wrapper for disk-pressure (the workspace forbids unsafe, so no
+# direct libc); only the `fs` module is needed.
+nix = { version = "=0.31.3", default-features = false, features = ["fs"] }
+# Ceph-mgr ceiling probe HTTP client (allocator-only, behind the `http` feature).
+# The mgr prometheus exporter is plain HTTP (:9283), so no TLS backend is pulled.
+reqwest = { version = "=0.13.4", default-features = false }
+# Mock HTTP server for the probe's edge tests (dev-only).
+wiremock = "=0.6.5"
+
+# Strict crate-level lints, shared across every member via `[lints] workspace = true`.
+# These crates perform no unsafe operations, so unsafe_code is forbidden workspace-wide;
+# this makes the unsafe/FFI review gates trivially satisfied (nothing to audit).
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Panic prevention: a long-running daemon must not abort on an unhandled path.
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+panic_in_result_fn = "deny"
+unimplemented = "deny"
+# No cheating the lints.
+allow_attributes = "deny"
+# Code hygiene.
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+# Concurrency / safety.
+await_holding_lock = "deny"
+large_futures = "deny"
+exit = "deny"
+mem_forget = "deny"
+# Pedantic relaxations (too noisy for this codebase).
+module_name_repetitions = "allow"
+similar_names = "allow"
