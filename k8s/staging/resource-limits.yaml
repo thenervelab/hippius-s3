@@ -20,7 +20,9 @@ kind: Deployment
 metadata:
   name: api
 spec:
-  replicas: 2
+  # s3-2.0 trial: scale the base (ceph) api fleet to 0 — ALL api pods run on the
+  # local-SSD ingest tier (api-local-node1/2/3). Restore to 2 on teardown.
+  replicas: 0
   template:
     spec:
       containers:

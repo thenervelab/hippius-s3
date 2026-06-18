@@ -1,0 +1,41 @@
+# Trial (s3-2.0 prototype): one PVC per node-local ingest PV, statically bound
+# by volumeName (storageClassName "" => no dynamic provisioning), mirroring the
+# prod local-cache PVC pattern (k8s/production/pvc-local-cache.yaml).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: local-ingest-pvc-node1
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: ""
+  volumeName: local-ingest-pv-node1
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: local-ingest-pvc-node2
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: ""
+  volumeName: local-ingest-pv-node2
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: local-ingest-pvc-node3
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: ""
+  volumeName: local-ingest-pv-node3
+  resources:
+    requests:
+      storage: 100Gi

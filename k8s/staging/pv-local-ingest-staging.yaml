@@ -1,0 +1,76 @@
+# Trial (s3-2.0 prototype): per-node local-SSD ingest tier on staging.
+# One node-local PersistentVolume per chosen general-worker node. Mirrors the
+# prod local-cache PV pattern (k8s/production/pv-local-cache.yaml) but small +
+# spread across nodes. The path must pre-exist on each node (local PVs do not
+# create it) — see README-local-ingest-trial.md.
+#
+# NOTE: `local` volumes do not enforce the capacity — 100Gi is nominal; the pod
+# can use up to the node root-disk free space. Keep the trial data bounded.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: local-ingest-pv-node1
+spec:
+  capacity:
+    storage: 100Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  local:
+    path: /var/lib/hippius/local_ingest
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - k8s-v3-node1
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: local-ingest-pv-node2
+spec:
+  capacity:
+    storage: 100Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  local:
+    path: /var/lib/hippius/local_ingest
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - k8s-v3-node2
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: local-ingest-pv-node3
+spec:
+  capacity:
+    storage: 100Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  local:
+    path: /var/lib/hippius/local_ingest
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - k8s-v3-node3

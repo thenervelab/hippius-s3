@@ -7,12 +7,30 @@ resources:
   - ../base
   - gateway-nodeport.yaml
   - postgres-objectstore.yaml
+  # s3-2.0 trial: per-node local-SSD ingest tier (see README-local-ingest-trial.md).
+  # The replicator DaemonSet stub (replicator-daemonset-staging.yaml) is intentionally
+  # NOT listed until the daemon image exists.
+  - pv-local-ingest-staging.yaml
+  - pvc-local-ingest-staging.yaml
+  - api-local-deployments-staging.yaml
 
 patches:
   - path: namespace-patch.yaml
   - path: environment-patch.yaml
   - path: resource-limits.yaml
   - path: services-patch.yaml
+  # s3-2.0 trial: the api fleet is entirely the local-ingest pods (base api scaled
+  # to 0 in resource-limits.yaml). Point the existing `api` Service — the gateway's
+  # GATEWAY_BACKEND_URL=http://api:8000 upstream — straight at them, so routing goes
+  # through the normal front door with no separate target.
+  - target:
+      kind: Service
+      name: api
+    patch: |-
+      - op: replace
+        path: /spec/selector
+        value:
+          app: api-local
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api

@@ -1,0 +1,65 @@
+# Trial (s3-2.0 prototype): PLACEHOLDER for the cache-replicator daemon.
+#
+# This is the linchpin component (see s3-2.0 §8). It is NOT built yet — this file
+# documents where it slots in and is intentionally LEFT OUT of kustomization.yaml
+# until the daemon image exists. Until it runs, anything ingested on the local
+# tier (api-local-*) is invisible to the ceph-reading workers (arion-uploader,
+# backup) and to GETs served by ceph api pods.
+#
+# What it must do (per s3-2.0 §8), reusing existing primitives:
+#   - run on each ingest node (DaemonSet pinned to the same nodes as api-local-*),
+#   - watch the node-local ingest dir for parts whose meta.json has landed,
+#   - copy chunks -> CephFS (object-cache-pvc) META-LAST (reuse fs_store atomic
+#     uuid-tmp + os.replace writes), then ring notify:{chunk} on redis-queues
+#     (reuse ChunkNotifier) so streamers/uploaders waiting on pub/sub wake up,
+#   - mark replicated; never delete local before ceph confirms,
+#   - rescan the ingest dir on restart (local SSD IS the to-do list),
+#   - bound concurrency via a shared semaphore + emit a replication-lag metric.
+#
+# Sketch (uncomment + set image once the daemon ships):
+#
+# apiVersion: apps/v1
+# kind: DaemonSet
+# metadata:
+#   name: cache-replicator
+#   labels:
+#     app: cache-replicator
+# spec:
+#   selector:
+#     matchLabels:
+#       app: cache-replicator
+#   template:
+#     metadata:
+#       labels:
+#         app: cache-replicator
+#     spec:
+#       # Pin to the same nodes that carry the local-ingest PVs.
+#       affinity:
+#         nodeAffinity:
+#           requiredDuringSchedulingIgnoredDuringExecution:
+#             nodeSelectorTerms:
+#               - matchExpressions:
+#                   - key: kubernetes.io/hostname
+#                     operator: In
+#                     values: [k8s-v3-node1, k8s-v3-node2, k8s-v3-node3]
+#       containers:
+#         - name: cache-replicator
+#           image: ghcr.io/thenervelab/hippius-s3/workers:latest   # TODO: replicator entrypoint
+#           envFrom:
+#             - configMapRef: { name: hippius-s3-defaults }
+#             - configMapRef: { name: hippius-s3-environment }
+#             - secretRef:    { name: hippius-s3-secrets }
+#           volumeMounts:
+#             - name: local-ingest
+#               mountPath: /var/lib/hippius/local_object_cache   # source (read)
+#               readOnly: true
+#             - name: object-cache
+#               mountPath: /var/lib/hippius/object_cache         # dest (write)
+#       volumes:
+#         - name: local-ingest
+#           hostPath:
+#             path: /var/lib/hippius/local_ingest                # the node's local dir
+#             type: Directory
+#         - name: object-cache
+#           persistentVolumeClaim:
+#             claimName: object-cache-pvc

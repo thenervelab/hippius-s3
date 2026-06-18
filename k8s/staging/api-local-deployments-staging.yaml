@@ -1,0 +1,369 @@
+# Trial (s3-2.0 prototype): sibling api deployments pinned to specific nodes,
+# each writing to that node's local-SSD ingest tier and read-falling-back to the
+# shared CephFS cache. These ARE the entire staging api fleet: the base (ceph)
+# `api` deployment is scaled to 0 (resource-limits.yaml), so all 3 api pods run
+# on local SSD, one per node. All workers stay on ceph, untouched.
+#
+# Routing is via the NORMAL front door: the existing `api` Service (the gateway's
+# GATEWAY_BACKEND_URL=http://api:8000 upstream) is patched to select `app: api-local`
+# (kustomization.yaml), so the gateway round-robins across these 3 pods with no
+# separate target. Each deployment has a unique selector (app: api-local +
+# ingest-node) so they manage only their own pod.
+#
+# Env: HIPPIUS_OBJECT_CACHE_DIR + _FALLBACK_DIR are set per-container here (NOT in
+# the shared configmap) so only these pods flip to local-write; the ceph pods are
+# untouched. env entries override the same keys coming from the configmap envFrom.
+# Secrets are pulled via envFrom secretRef (all keys map 1:1 to the env var names
+# the app reads) — equivalent to base api's explicit secretKeyRef list, kept
+# compact for the trial.
+#
+# IMPORTANT: until the replicator daemon copies these nodes' local chunks to ceph,
+# objects ingested here will NOT be visible to the ceph-reading arion-uploader /
+# backup / other api pods (they stall at `pending`). See README-local-ingest-trial.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-local-node1
+  labels:
+    app: api-local
+    ingest-node: k8s-v3-node1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-local
+      ingest-node: k8s-v3-node1
+  template:
+    metadata:
+      labels:
+        app: api-local
+        ingest-node: k8s-v3-node1
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k8s-v3-node1
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:15
+          command:
+            - sh
+            - -c
+            - until pg_isready -h postgres-rw -p 5432 -U postgres; do echo waiting for postgres; sleep 5; done
+      containers:
+        - name: api
+          image: ghcr.io/thenervelab/hippius-s3/api:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: hippius-s3-defaults
+            - configMapRef:
+                name: hippius-s3-environment
+            - secretRef:
+                name: hippius-s3-secrets
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
+            - name: HIPPIUS_OBJECT_CACHE_DIR
+              value: /var/lib/hippius/local_object_cache
+            - name: HIPPIUS_OBJECT_CACHE_FALLBACK_DIR
+              value: /var/lib/hippius/object_cache
+          volumeMounts:
+            - name: local-ingest
+              mountPath: /var/lib/hippius/local_object_cache
+            - name: object-cache
+              mountPath: /var/lib/hippius/object_cache
+              readOnly: true
+            - name: persist
+              mountPath: /var/lib/hippius/persist
+            - name: dlq
+              mountPath: /tmp/hippius_dlq
+            - name: kms-certs
+              mountPath: /kms_certs
+              readOnly: true
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 20
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 1000m
+              memory: 2Gi
+            limits:
+              cpu: 4000m
+              memory: 8Gi
+      volumes:
+        - name: local-ingest
+          persistentVolumeClaim:
+            claimName: local-ingest-pvc-node1
+        - name: object-cache
+          persistentVolumeClaim:
+            claimName: object-cache-pvc
+        - name: persist
+          persistentVolumeClaim:
+            claimName: persist-pvc
+        - name: dlq
+          persistentVolumeClaim:
+            claimName: dlq-pvc
+        - name: kms-certs
+          secret:
+            secretName: ovh-kms-certs
+            defaultMode: 0400
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-local-node2
+  labels:
+    app: api-local
+    ingest-node: k8s-v3-node2
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-local
+      ingest-node: k8s-v3-node2
+  template:
+    metadata:
+      labels:
+        app: api-local
+        ingest-node: k8s-v3-node2
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k8s-v3-node2
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:15
+          command:
+            - sh
+            - -c
+            - until pg_isready -h postgres-rw -p 5432 -U postgres; do echo waiting for postgres; sleep 5; done
+      containers:
+        - name: api
+          image: ghcr.io/thenervelab/hippius-s3/api:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: hippius-s3-defaults
+            - configMapRef:
+                name: hippius-s3-environment
+            - secretRef:
+                name: hippius-s3-secrets
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
+            - name: HIPPIUS_OBJECT_CACHE_DIR
+              value: /var/lib/hippius/local_object_cache
+            - name: HIPPIUS_OBJECT_CACHE_FALLBACK_DIR
+              value: /var/lib/hippius/object_cache
+          volumeMounts:
+            - name: local-ingest
+              mountPath: /var/lib/hippius/local_object_cache
+            - name: object-cache
+              mountPath: /var/lib/hippius/object_cache
+              readOnly: true
+            - name: persist
+              mountPath: /var/lib/hippius/persist
+            - name: dlq
+              mountPath: /tmp/hippius_dlq
+            - name: kms-certs
+              mountPath: /kms_certs
+              readOnly: true
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 20
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 1000m
+              memory: 2Gi
+            limits:
+              cpu: 4000m
+              memory: 8Gi
+      volumes:
+        - name: local-ingest
+          persistentVolumeClaim:
+            claimName: local-ingest-pvc-node2
+        - name: object-cache
+          persistentVolumeClaim:
+            claimName: object-cache-pvc
+        - name: persist
+          persistentVolumeClaim:
+            claimName: persist-pvc
+        - name: dlq
+          persistentVolumeClaim:
+            claimName: dlq-pvc
+        - name: kms-certs
+          secret:
+            secretName: ovh-kms-certs
+            defaultMode: 0400
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-local-node3
+  labels:
+    app: api-local
+    ingest-node: k8s-v3-node3
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-local
+      ingest-node: k8s-v3-node3
+  template:
+    metadata:
+      labels:
+        app: api-local
+        ingest-node: k8s-v3-node3
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k8s-v3-node3
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:15
+          command:
+            - sh
+            - -c
+            - until pg_isready -h postgres-rw -p 5432 -U postgres; do echo waiting for postgres; sleep 5; done
+      containers:
+        - name: api
+          image: ghcr.io/thenervelab/hippius-s3/api:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: hippius-s3-defaults
+            - configMapRef:
+                name: hippius-s3-environment
+            - secretRef:
+                name: hippius-s3-secrets
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
+            - name: HIPPIUS_OBJECT_CACHE_DIR
+              value: /var/lib/hippius/local_object_cache
+            - name: HIPPIUS_OBJECT_CACHE_FALLBACK_DIR
+              value: /var/lib/hippius/object_cache
+          volumeMounts:
+            - name: local-ingest
+              mountPath: /var/lib/hippius/local_object_cache
+            - name: object-cache
+              mountPath: /var/lib/hippius/object_cache
+              readOnly: true
+            - name: persist
+              mountPath: /var/lib/hippius/persist
+            - name: dlq
+              mountPath: /tmp/hippius_dlq
+            - name: kms-certs
+              mountPath: /kms_certs
+              readOnly: true
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 20
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 1000m
+              memory: 2Gi
+            limits:
+              cpu: 4000m
+              memory: 8Gi
+      volumes:
+        - name: local-ingest
+          persistentVolumeClaim:
+            claimName: local-ingest-pvc-node3
+        - name: object-cache
+          persistentVolumeClaim:
+            claimName: object-cache-pvc
+        - name: persist
+          persistentVolumeClaim:
+            claimName: persist-pvc
+        - name: dlq
+          persistentVolumeClaim:
+            claimName: dlq-pvc
+        - name: kms-certs
+          secret:
+            secretName: ovh-kms-certs
+            defaultMode: 0400
