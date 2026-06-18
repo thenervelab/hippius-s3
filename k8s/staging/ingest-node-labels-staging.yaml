@@ -1,0 +1,37 @@
+# Declarative source of truth for the STAGING local-ingest node set.
+#
+# This is the ONE list. `kubectl apply -k k8s/staging` (the deploy) applies the
+# `s3-staging-local-ingest=true` label to these nodes; the api-local Deployment and
+# the cache-replicator DaemonSet both select on that label, so they stay in lockstep
+# automatically. To change the set, edit the Node stanzas here.
+#
+# SHARED CLUSTER: staging and prod run on the same physical nodes, so their ingest
+# sets MUST be disjoint — prod uses a different label (s3-local-ingest) on DIFFERENT
+# nodes, so a staging and a prod api pod never share a node's /var/lib/hippius/local_ingest.
+#
+# CAVEAT: `apply` adds labels but does not PRUNE them. Removing a node here does not
+# clear its label — to retire an ingest node, delete its stanza AND run:
+#   kubectl label node <name> s3-staging-local-ingest-
+#
+# (These are partial Node objects: apply merges only metadata.labels and leaves all
+# other node fields untouched. Requires the deploy identity to be able to patch nodes.)
+apiVersion: v1
+kind: Node
+metadata:
+  name: k8s-v3-node1
+  labels:
+    s3-staging-local-ingest: "true"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: k8s-v3-node2
+  labels:
+    s3-staging-local-ingest: "true"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: k8s-v3-node3
+  labels:
+    s3-staging-local-ingest: "true"

@@ -1,66 +1,102 @@
-# Trial (s3-2.0 prototype): PLACEHOLDER for the cache-replicator daemon.
+# Trial (s3-2.0 prototype): the cache-replicator (ceph drainer) DaemonSet.
 #
-# This is the linchpin component (see s3-2.0 §8). It is NOT built yet — this file
-# documents where it slots in and is intentionally LEFT OUT of kustomization.yaml
-# until the daemon image exists. Until it runs, anything ingested on the local
-# tier (api-local-*) is invisible to the ceph-reading workers (arion-uploader,
-# backup) and to GETs served by ceph api pods.
+# Drains each node's local-SSD ingest dir to the shared CephFS cache. One pod per
+# node, on EXACTLY the node set the api-local pods can land on.
 #
-# What it must do (per s3-2.0 §8), reusing existing primitives:
-#   - run on each ingest node (DaemonSet pinned to the same nodes as api-local-*),
-#   - watch the node-local ingest dir for parts whose meta.json has landed,
-#   - copy chunks -> CephFS (object-cache-pvc) META-LAST (reuse fs_store atomic
-#     uuid-tmp + os.replace writes), then ring notify:{chunk} on redis-queues
-#     (reuse ChunkNotifier) so streamers/uploaders waiting on pub/sub wake up,
-#   - mark replicated; never delete local before ceph confirms,
-#   - rescan the ingest dir on restart (local SSD IS the to-do list),
-#   - bound concurrency via a shared semaphore + emit a replication-lag metric.
+# == How node alignment is guaranteed ==
+# Both this DaemonSet and the api-local Deployment select the SAME node label
+# `s3-staging-local-ingest=true` (the ONE list lives in ingest-node-labels-staging.yaml).
+# A DaemonSet runs one pod per matching node, so it covers every node an api pod can
+# land on — in lockstep by construction, no duplicated hostname list to drift. The
+# label also keeps the replicator OFF node6-cache (untainted, so a bare DaemonSet
+# would otherwise land there) and the psql/master nodes.
 #
-# Sketch (uncomment + set image once the daemon ships):
+# == Volume access ==
+#  * Local disk: the SAME hostPath the api pods write to (node-local),
+#    /var/lib/hippius/local_ingest_staging — the `_staging` denominator keeps it
+#    disjoint from prod's /var/lib/hippius/local_ingest_prod even on a shared node.
+#    Mounted RW so the daemon can mark-replicated / reclaim after ceph confirms.
+#  * Shared cache: object-cache-pvc — ReadWriteMany ceph-filesystem (already
+#    provisioned + Bound), so every replicator pod mounts it concurrently. Mounted
+#    RW (the api pods mount it read-only; the replicator is the writer into ceph).
 #
-# apiVersion: apps/v1
-# kind: DaemonSet
-# metadata:
-#   name: cache-replicator
-#   labels:
-#     app: cache-replicator
-# spec:
-#   selector:
-#     matchLabels:
-#       app: cache-replicator
-#   template:
-#     metadata:
-#       labels:
-#         app: cache-replicator
-#     spec:
-#       # Runs on every general worker that can host an api-local pod, so each
-#       # node's local ingest dir gets drained to ceph.
-#       affinity:
-#         nodeAffinity:
-#           requiredDuringSchedulingIgnoredDuringExecution:
-#             nodeSelectorTerms:
-#               - matchExpressions:
-#                   - key: kubernetes.io/hostname
-#                     operator: In
-#                     values: [k8s-v3-node1, k8s-v3-node2, k8s-v3-node3, k8s-v3-node4, k8s-v3-node5]
-#       containers:
-#         - name: cache-replicator
-#           image: ghcr.io/thenervelab/hippius-s3/workers:latest   # TODO: replicator entrypoint
-#           envFrom:
-#             - configMapRef: { name: hippius-s3-defaults }
-#             - configMapRef: { name: hippius-s3-environment }
-#             - secretRef:    { name: hippius-s3-secrets }
-#           volumeMounts:
-#             - name: local-ingest
-#               mountPath: /var/lib/hippius/local_object_cache   # source (read)
-#               readOnly: true
-#             - name: object-cache
-#               mountPath: /var/lib/hippius/object_cache         # dest (write)
-#       volumes:
-#         - name: local-ingest
-#           hostPath:
-#             path: /var/lib/hippius/local_ingest                # the node's local dir
-#             type: Directory
-#         - name: object-cache
-#           persistentVolumeClaim:
-#             claimName: object-cache-pvc
+# == NOT YET ENABLED ==
+# The daemon image does not exist yet. This file is a valid manifest but is left
+# OUT of kustomization.yaml. When the drainer image ships: set `image:` below and
+# add `- replicator-daemonset-staging.yaml` to kustomization.yaml resources.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cache-replicator
+  labels:
+    app: cache-replicator
+spec:
+  selector:
+    matchLabels:
+      app: cache-replicator
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: cache-replicator
+    spec:
+      # Same label as api-local — keeps them in lockstep (see header).
+      nodeSelector:
+        s3-staging-local-ingest: "true"
+      initContainers:
+        - name: prepare-ingest-dir
+          image: busybox
+          command:
+            - sh
+            - -c
+            - mkdir -p /var/lib/hippius/local_object_cache && chmod 0777 /var/lib/hippius/local_object_cache
+          volumeMounts:
+            - name: local-ingest
+              mountPath: /var/lib/hippius/local_object_cache
+      containers:
+        - name: cache-replicator
+          # TODO: set to the drainer entrypoint image once built.
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: hippius-s3-defaults
+            - configMapRef:
+                name: hippius-s3-environment
+            - secretRef:
+                name: hippius-s3-secrets
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Source (node-local ingest) + destination (shared ceph cache).
+            - name: HIPPIUS_OBJECT_CACHE_DIR
+              value: /var/lib/hippius/local_object_cache
+            - name: HIPPIUS_OBJECT_CACHE_FALLBACK_DIR
+              value: /var/lib/hippius/object_cache
+          volumeMounts:
+            - name: local-ingest
+              mountPath: /var/lib/hippius/local_object_cache
+            - name: object-cache
+              mountPath: /var/lib/hippius/object_cache
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+      volumes:
+        - name: local-ingest
+          hostPath:
+            path: /var/lib/hippius/local_ingest_staging
+            type: DirectoryOrCreate
+        - name: object-cache
+          persistentVolumeClaim:
+            claimName: object-cache-pvc

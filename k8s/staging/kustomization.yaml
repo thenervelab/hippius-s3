@@ -9,8 +9,11 @@ resources:
   - postgres-objectstore.yaml
   # s3-2.0 trial: node-local-SSD ingest tier (see README-local-ingest-trial.md).
   # Uses a hostPath (DirectoryOrCreate) volume — no PV/PVC, no manual node prep.
-  # The replicator DaemonSet stub (replicator-daemonset-staging.yaml) is intentionally
+  # ingest-node-labels-staging.yaml is the ONE list of ingest nodes: applying it
+  # labels them s3-staging-local-ingest=true, which api-local + the replicator select.
+  # The replicator DaemonSet (replicator-daemonset-staging.yaml) is intentionally
   # NOT listed until the daemon image exists.
+  - ingest-node-labels-staging.yaml
   - api-local-deployments-staging.yaml
 
 patches:

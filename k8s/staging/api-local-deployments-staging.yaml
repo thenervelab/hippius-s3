@@ -5,16 +5,21 @@
 # pod writes to its node's local dir and read-falls-back to the shared CephFS
 # cache. All workers stay on ceph, untouched.
 #
-# Volume: a `hostPath` with `type: DirectoryOrCreate` — the kubelet creates
-# /var/lib/hippius/local_ingest on whatever node the pod lands on (NO manual node
-# prep, so this deploys cleanly via CI). A root initContainer chmods it so the api
-# (which may run non-root) can write. This replaces the earlier local-PV approach,
-# which required pre-creating the dir on each node (impossible in CI) and pinned
-# pods to specific nodes (one of which was at its pod cap -> unschedulable).
+# Volume: a `hostPath` with `type: DirectoryOrCreate` — the kubelet creates the
+# node path on whatever node the pod lands on (NO manual node prep, so this deploys
+# cleanly via CI). A root initContainer chmods it so the api (which may run
+# non-root) can write. This replaces the earlier local-PV approach, which required
+# pre-creating the dir on each node (impossible in CI).
 #
-# Scheduling: restricted to the general workers, spread across distinct nodes via
-# preferred pod anti-affinity (so the 3 replicas land on 3 different nodes when
-# capacity allows, but still schedule if not).
+# The node path is /var/lib/hippius/local_ingest_STAGING (the `_staging` denominator
+# matters: staging + prod share the cluster, and prod uses /var/lib/hippius/local_ingest_prod
+# — so even if a staging and a prod pod land on the same node, their local disks
+# never collide).
+#
+# Scheduling: pinned to nodes labeled `s3-staging-local-ingest=true` (the ONE list
+# lives in ingest-node-labels-staging.yaml). The cache-replicator DaemonSet selects
+# the SAME label, so they stay in lockstep. Preferred pod anti-affinity spreads the
+# 3 replicas across the labeled nodes.
 #
 # Routing: the existing `api` Service (the gateway's GATEWAY_BACKEND_URL=
 # http://api:8000 upstream) is patched to select `app: api-local`
@@ -39,19 +44,9 @@ spec:
       labels:
         app: api-local
     spec:
+      nodeSelector:
+        s3-staging-local-ingest: "true"
       affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-              - matchExpressions:
-                  - key: kubernetes.io/hostname
-                    operator: In
-                    values:
-                      - k8s-v3-node1
-                      - k8s-v3-node2
-                      - k8s-v3-node3
-                      - k8s-v3-node4
-                      - k8s-v3-node5
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
             - weight: 100
@@ -149,7 +144,7 @@ spec:
       volumes:
         - name: local-ingest
           hostPath:
-            path: /var/lib/hippius/local_ingest
+            path: /var/lib/hippius/local_ingest_staging
             type: DirectoryOrCreate
         - name: object-cache
           persistentVolumeClaim:

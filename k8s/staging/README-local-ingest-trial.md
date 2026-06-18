@@ -13,6 +13,7 @@ it is installed.**
 | `api-local-deployments-staging.yaml` | `api-local` Deployment (**3 replicas**) writing local (`HIPPIUS_OBJECT_CACHE_DIR=local_object_cache`) with ceph read-fallback. **This is the whole api fleet.** |
 | `resource-limits.yaml` (modified) | Base (ceph) `api` deployment scaled to **0** — no ceph api pods. |
 | `kustomization.yaml` (inline patch) | `api` Service selector switched `app: api` → `app: api-local`, so the gateway routes to the local pods. |
+| `ingest-node-labels-staging.yaml` | **The ONE list** of staging ingest nodes — applying it labels them `s3-staging-local-ingest=true`. |
 | `replicator-daemonset-staging.yaml` | **Placeholder** for the replicator (NOT in kustomization; daemon not built yet). |
 
 Untouched / still on ceph: `gateway`, `arion-uploader/downloader/unpinner`, `janitor`, the
@@ -21,22 +22,37 @@ Untouched / still on ceph: `gateway`, `arion-uploader/downloader/unpinner`, `jan
 ## Storage: hostPath, self-provisioning (no manual node prep)
 
 Each pod mounts a `hostPath` volume `type: DirectoryOrCreate` at the node path
-`/var/lib/hippius/local_ingest` → container `/var/lib/hippius/local_object_cache`. The kubelet
+`/var/lib/hippius/local_ingest_staging` → container `/var/lib/hippius/local_object_cache`. The kubelet
 **creates the dir** on whatever node the pod lands on, and a root initContainer (`prepare-ingest-dir`)
 `chmod 0777`s it so the (possibly non-root) api can write. **No manual `mkdir` on nodes, so this
 deploys cleanly via CI.**
 
+> **Path denominator:** staging uses `…/local_ingest_staging`, prod uses `…/local_ingest_prod`.
+> staging + prod share the physical cluster, so this (on top of disjoint node labels below) guarantees
+> that even if a staging and a prod pod ever landed on the same node, their local disks never collide.
+>
 > This replaced an earlier `local`-PV-per-node design. A `local` PV requires the path to pre-exist on
-> the node — the kubelet fails the mount otherwise, and that prep can't run in a CI deploy. It also
-> pinned each pod to one node, and one of those nodes was at its 110-pod cap (unschedulable). The
-> hostPath + anti-affinity approach avoids both. `local` PV capacity is not enforced anyway; hostPath
-> likewise uses the node root disk — keep trial data bounded (no janitor on this tier yet).
+> the node — the kubelet fails the mount otherwise, and that prep can't run in a CI deploy. hostPath
+> uses the node root disk and isn't size-enforced — keep trial data bounded (no janitor on this tier yet).
 
-## Scheduling
+## Scheduling: one node-label list, api + replicator in lockstep
 
-`api-local` is restricted to general workers (`k8s-v3-node1..5`) and uses **preferred** pod
-anti-affinity, so the 3 replicas spread across distinct nodes when capacity allows (and still
-schedule if a node is full). Never lands on node6-cache or the psql nodes.
+Ingest nodes are declared **once** in `ingest-node-labels-staging.yaml` (partial `Node` objects that
+carry `s3-staging-local-ingest=true`). Deploying applies that label; **both** the `api-local`
+Deployment and the `cache-replicator` DaemonSet select on it (`nodeSelector`), so they always target
+the identical node set — no duplicated hostname list to drift. The DaemonSet (one pod per labeled
+node) therefore covers every node an api pod can land on. Current staging set: **node1, node2, node3**
+(node4/5 are near pod-cap and left for prod). `api-local` also uses preferred pod anti-affinity to
+spread its 3 replicas across the labeled nodes.
+
+**Shared cluster, disjoint sets:** prod will label *different* nodes with `s3-local-ingest=true`. Two
+distinct labels on distinct nodes + the per-env path denominator = staging and prod ingest never mix.
+
+**Retiring an ingest node:** delete its stanza in `ingest-node-labels-staging.yaml` **and** clear the
+label (`apply` does not prune): `kubectl label node <name> s3-staging-local-ingest-`.
+
+**Provisioning note:** the deploy identity must be able to `patch nodes` (to apply the label objects)
+— the staging deploy SA already has it.
 
 ## How routing works (the "proper" front door)
 
@@ -78,7 +94,8 @@ completes to Arion (`uploaded`→`published`), and a cross-node GET returns the 
 # in kustomization.yaml: remove the api-local-deployments resource + the inline api Service-selector
 # patch (restores selector to app: api); in resource-limits.yaml: set base api replicas back to 2.
 kubectl apply -k k8s/staging
-# optionally clear the node dirs: rm -rf /var/lib/hippius/local_ingest/* on each node via a privileged pod
+# optionally clear the node dirs: rm -rf /var/lib/hippius/local_ingest_staging/* on each node via a privileged pod
+# and clear the labels: kubectl label node k8s-v3-node1 k8s-v3-node2 k8s-v3-node3 s3-staging-local-ingest-
 ```
 
 ## Notes / risks
