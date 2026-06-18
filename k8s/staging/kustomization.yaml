@@ -10,11 +10,13 @@ resources:
   # s3-2.0 trial: node-local-SSD ingest tier (see README-local-ingest-trial.md).
   # Uses a hostPath (DirectoryOrCreate) volume — no PV/PVC, no manual node prep.
   # ingest-node-labels-staging.yaml is the ONE list of ingest nodes: applying it
-  # labels them s3-staging-local-ingest=true, which api-local + the replicator select.
-  # The replicator DaemonSet (replicator-daemonset-staging.yaml) is intentionally
-  # NOT listed until the daemon image exists.
+  # labels them s3-staging-local-ingest=true, which api-local + the drain agent select.
   - ingest-node-labels-staging.yaml
   - api-local-deployments-staging.yaml
+  # The hippius-drain stack: the singleton allocator (also the cephor_* schema owner)
+  # and the per-ingest-node drain agent DaemonSet. Both use the `drain` image.
+  - drain-allocator-deployment.yaml
+  - drain-agent-daemonset.yaml
 
 patches:
   - path: namespace-patch.yaml
@@ -40,4 +42,6 @@ images:
   - name: ghcr.io/thenervelab/hippius-s3/gateway
     newTag: latest
   - name: ghcr.io/thenervelab/hippius-s3/workers
+    newTag: latest
+  - name: ghcr.io/thenervelab/hippius-s3/drain
     newTag: latest

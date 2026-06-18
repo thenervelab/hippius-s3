@@ -1,0 +1,61 @@
+# The hippius-drain allocator: the singleton, leader-elected budget allocator.
+#
+# One replica. The allocator does NOT need the SSD/CephFS mounts — it only reads the
+# fleet's heartbeats and writes per-node write-budgets in Postgres. It is also the
+# schema owner: on startup it applies the hippius-drain-core migrations (the cephor_*
+# tables) before contending for leadership, so the agents come up against a ready
+# schema (allocator-first deploy). A DB leader-lease fences any accidental second
+# instance, so even a brief rollout overlap allocates from exactly one leader.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drain-allocator
+  labels:
+    app: drain-allocator
+spec:
+  replicas: 1
+  # One leader at a time: never run an old and a new allocator pod concurrently.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: drain-allocator
+  template:
+    metadata:
+      labels:
+        app: drain-allocator
+    spec:
+      # > the allocator tick + lease-relinquish on SIGTERM (graceful handoff).
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: allocator
+          image: ghcr.io/thenervelab/hippius-s3/drain:latest
+          imagePullPolicy: Always
+          command: ["/usr/local/bin/hippius-drain-allocator"]
+          env:
+            # The lease holder id — the pod name makes a restart a distinct holder.
+            - name: CEPHOR_ALLOCATOR_INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Reuse the api's DATABASE_URL secret; the cephor_* tables live in the
+            # same `hippius` database (distinct table names, no collision).
+            - name: CEPHOR_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+            - name: RUST_LOG
+              value: "info"
+            # Live ceph-mgr ceiling probe. Left unset for first bring-up so the
+            # allocator uses its static ceiling; enable once cross-namespace reach to
+            # rook-ceph is confirmed:
+            # - name: CEPHOR_CEPH_MGR_METRICS_URL
+            #   value: "http://rook-ceph-mgr.rook-ceph.svc:9283/metrics"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi

@@ -1,0 +1,99 @@
+# The hippius-drain agent: the per-node drain daemon (replaces the cache-replicator
+# placeholder). One pod per ingest node, draining that node's local-SSD ingest dir to
+# the shared CephFS pool, path-preservingly per the api part layout
+# (<object_id>/v<version>/part_<n>/). The reconciler is the sole trigger — it scans the
+# SSD for complete parts (a meta.json marker) with no replication row and records them,
+# so the api needs no change.
+#
+# == Node alignment ==
+# Selects the SAME node label `s3-staging-local-ingest=true` as the api-local
+# Deployment (the one list lives in ingest-node-labels-staging.yaml), so a DaemonSet
+# runs exactly one drain pod per node an api pod can land on — in lockstep, no
+# duplicated hostname list to drift, and off the cache/psql/master nodes.
+#
+# == Volumes ==
+#  * SSD source: the SAME hostPath the api pods write to,
+#    /var/lib/hippius/local_ingest_staging (the `_staging` suffix keeps it disjoint
+#    from prod on a shared node). RW so the agent can unlink a part after a verified,
+#    committed pool copy.
+#  * CephFS pool: object-cache-pvc — ReadWriteMany ceph-filesystem, mounted RW (the api
+#    pods mount it read-only; the agent is the writer into ceph).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: drain-agent
+  labels:
+    app: drain-agent
+spec:
+  selector:
+    matchLabels:
+      app: drain-agent
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: drain-agent
+    spec:
+      # Same label as api-local — keeps them in lockstep (see header).
+      nodeSelector:
+        s3-staging-local-ingest: "true"
+      # > the agent's shutdown grace (CEPHOR_GRACE_SECS default 30s): a burst winds
+      # down before the kubelet force-kills, so no in-flight part is stranded draining.
+      terminationGracePeriodSeconds: 40
+      initContainers:
+        - name: prepare-ingest-dir
+          image: busybox
+          command:
+            - sh
+            - -c
+            - mkdir -p /var/lib/hippius/local_object_cache && chmod 0777 /var/lib/hippius/local_object_cache
+          volumeMounts:
+            - name: local-ingest
+              mountPath: /var/lib/hippius/local_object_cache
+      containers:
+        - name: agent
+          image: ghcr.io/thenervelab/hippius-s3/drain:latest
+          imagePullPolicy: Always
+          command: ["/usr/local/bin/hippius-drain-agent"]
+          env:
+            # NodeId keys this node's heartbeat in the fleet; the k8s node name is
+            # stable and unique per node.
+            - name: CEPHOR_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Reuse the api's DATABASE_URL secret (cephor_* tables share the `hippius` DB).
+            - name: CEPHOR_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+            # Source (node-local SSD ingest) and destination (shared ceph pool) —
+            # mounted at the same paths the api uses, so the relative part dirs line up.
+            - name: CEPHOR_SSD_ROOT
+              value: /var/lib/hippius/local_object_cache
+            - name: CEPHOR_POOL_ROOT
+              value: /var/lib/hippius/object_cache
+            - name: RUST_LOG
+              value: "info"
+          volumeMounts:
+            - name: local-ingest
+              mountPath: /var/lib/hippius/local_object_cache
+            - name: object-cache
+              mountPath: /var/lib/hippius/object_cache
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+      volumes:
+        - name: local-ingest
+          hostPath:
+            path: /var/lib/hippius/local_ingest_staging
+            type: DirectoryOrCreate
+        - name: object-cache
+          persistentVolumeClaim:
+            claimName: object-cache-pvc
