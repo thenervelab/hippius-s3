@@ -5,7 +5,6 @@ namespace: hippius-s3-prod
 
 resources:
   - ../base
-  - postgres-objectstore.yaml
   - postgres-nvme-objectstore.yaml
   - postgres-nvme-cluster.yaml
   - postgres-nvme-scheduledbackup.yaml
@@ -17,7 +16,6 @@ patches:
   - path: namespace-patch.yaml
   - path: environment-patch.yaml
   - path: resource-limits.yaml
-  - path: postgres-tuning.yaml
   - path: redis-tuning.yaml
   - path: ingress-patch.yaml
   - path: services-patch.yaml
