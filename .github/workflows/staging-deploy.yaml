@@ -269,9 +269,13 @@ jobs:
           kubectl rollout status deployment/arion-downloader -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/arion-uploader -n hippius-s3-staging --timeout=10m
           # Drain stack, allocator-first: the allocator applies the cephor_* migrations
-          # on startup, so confirm it is Ready before the per-node agent DaemonSet.
+          # on startup, so confirm it is Ready (strict) before the per-node agent DaemonSet.
           kubectl rollout status deployment/drain-allocator -n hippius-s3-staging --timeout=5m
-          kubectl rollout status daemonset/drain-agent -n hippius-s3-staging --timeout=10m
+          # The agent is a DaemonSet: a labeled node at pod capacity legitimately cannot
+          # host its pod, which must not fail the whole deploy (the agents on schedulable
+          # ingest nodes are what matter). Surface a non-fatal warning instead.
+          kubectl rollout status daemonset/drain-agent -n hippius-s3-staging --timeout=5m \
+            || echo "::warning::drain-agent DaemonSet not fully rolled out (often a labeled node at pod capacity); check 'kubectl get ds drain-agent -n hippius-s3-staging'"
 
       - name: Restart external deployments
         run: |
