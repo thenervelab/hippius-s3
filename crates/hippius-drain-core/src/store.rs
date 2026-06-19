@@ -213,6 +213,11 @@ pub struct Store {
     /// How long a `draining` claim is honored before [`Store::claim_chunk`]
     /// treats it as abandoned and re-claims it (the H1 crash-recovery TTL).
     claim_lease: Duration,
+    /// The agent's node id. Parts live on node-local SSD, so a part may only be
+    /// drained by the node that holds it: `record_landed_part` stamps this and
+    /// `claim_part` scopes to it. `None` for the allocator, which records/claims
+    /// no parts.
+    node_id: Option<String>,
 }
 
 impl Store {
@@ -226,6 +231,7 @@ impl Store {
         Ok(Self {
             pool,
             claim_lease: DEFAULT_CLAIM_LEASE,
+            node_id: None,
         })
     }
 
@@ -235,6 +241,7 @@ impl Store {
         Self {
             pool,
             claim_lease: DEFAULT_CLAIM_LEASE,
+            node_id: None,
         }
     }
 
@@ -243,6 +250,15 @@ impl Store {
     #[must_use]
     pub fn with_claim_lease(mut self, lease: Duration) -> Self {
         self.claim_lease = lease;
+        self
+    }
+
+    /// Sets the agent's node id (the daemon wires this from `CEPHOR_NODE_ID`).
+    /// Required for `record_landed_part`/`claim_part` to scope parts to this node;
+    /// the allocator leaves it unset.
+    #[must_use]
+    pub fn with_node_id(mut self, node: &str) -> Self {
+        self.node_id = Some(node.to_owned());
         self
     }
 
@@ -516,13 +532,20 @@ impl Store {
     ///
     /// [`StoreError::Database`].
     pub async fn record_landed_part(&self, part: &PartKey) -> Result<()> {
+        // Stamp the recording node so `claim_part` only drains parts whose data is on
+        // this node's SSD. The UPSERT self-heals legacy rows: a row first written
+        // without a node (or by an older agent) is adopted by whichever node still
+        // holds the part locally and re-records it; a row already owned is left alone.
         sqlx::query(
-            "INSERT INTO cephor_replication_status (object_id, version, part_number, status) \
-             VALUES ($1, $2, $3, 'pending') ON CONFLICT (object_id, version, part_number) DO NOTHING",
+            "INSERT INTO cephor_replication_status (object_id, version, part_number, status, node_id) \
+             VALUES ($1, $2, $3, 'pending', $4) \
+             ON CONFLICT (object_id, version, part_number) \
+             DO UPDATE SET node_id = EXCLUDED.node_id WHERE cephor_replication_status.node_id IS NULL",
         )
         .bind(part.object().as_str())
         .bind(i64::from(part.version().get()))
         .bind(i64::from(part.part().get()))
+        .bind(self.node_id.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -546,13 +569,15 @@ impl Store {
             "UPDATE cephor_replication_status SET status = 'draining', updated_at = now(), claimed_at = now() \
              WHERE (object_id, version, part_number) IN ( \
                 SELECT object_id, version, part_number FROM cephor_replication_status \
-                WHERE status = 'pending' \
-                   OR (status = 'draining' AND claimed_at < now() - $1 * interval '1 second') \
+                WHERE node_id = $2 \
+                  AND ( status = 'pending' \
+                        OR (status = 'draining' AND claimed_at < now() - $1 * interval '1 second') ) \
                 ORDER BY landed_at \
                 FOR UPDATE SKIP LOCKED LIMIT 1 \
              ) RETURNING object_id, version, part_number",
         )
         .bind(self.claim_lease.as_secs_f64())
+        .bind(self.node_id.as_deref())
         .fetch_optional(&self.pool)
         .await?;
         row.map(PartRow::into_claimed).transpose()
@@ -731,6 +756,66 @@ mod tests {
         let fresh = store.load_fleet(Duration::ZERO).await.unwrap();
         assert!(fresh.is_empty(), "row stamped before the query instant is stale at window 0");
         assert_eq!(store.load_fleet(Duration::from_hours(1)).await.unwrap().len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn claim_part_is_scoped_to_the_recording_node(pool: PgPool) {
+        // G1 regression: parts live on node-local SSD, so an agent must only claim parts
+        // it recorded (holds locally). Before node-scoping, the global claim let an agent
+        // grab a peer's part and fail at the missing-local meta copy, churning forever.
+        use crate::apipart::{ObjectId, PartKey, PartNumber, Version};
+        let part_a = PartKey::new(
+            ObjectId::from_str("466916c0-d61b-4518-b81b-9576b574270a").unwrap(),
+            Version::new(1),
+            PartNumber::new(1),
+        );
+        let part_b = PartKey::new(
+            ObjectId::from_str("00000000-0000-4000-8000-000000000000").unwrap(),
+            Version::new(1),
+            PartNumber::new(1),
+        );
+        let node_a = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let node_b = Store::from_pool(pool.clone()).with_node_id("node-b");
+
+        node_a.record_landed_part(&part_a).await.unwrap();
+        node_b.record_landed_part(&part_b).await.unwrap();
+
+        let claim = node_a.claim_part().await.unwrap().expect("node-a claims its own part");
+        assert_eq!(claim.part(), &part_a);
+        assert!(
+            node_a.claim_part().await.unwrap().is_none(),
+            "node-a must not claim node-b's part (its only other pending row)",
+        );
+        let claim_b = node_b.claim_part().await.unwrap().expect("node-b claims its own part");
+        assert_eq!(claim_b.part(), &part_b);
+    }
+
+    #[sqlx::test]
+    async fn record_landed_part_adopts_a_legacy_nodeless_row(pool: PgPool) {
+        // The UPSERT self-heals rows written before node_id existed (NULL node): the node
+        // that still holds the part locally re-records it and stamps its node_id, so the
+        // claim then sees it.
+        use crate::apipart::{ObjectId, PartKey, PartNumber, Version};
+        let part = PartKey::new(
+            ObjectId::from_str("466916c0-d61b-4518-b81b-9576b574270a").unwrap(),
+            Version::new(2),
+            PartNumber::new(3),
+        );
+        sqlx::query("INSERT INTO cephor_replication_status (object_id, version, part_number, status) VALUES ($1, 2, 3, 'pending')")
+            .bind(part.object().as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let node_a = Store::from_pool(pool.clone()).with_node_id("node-a");
+        assert!(
+            node_a.claim_part().await.unwrap().is_none(),
+            "a NULL-node row is unclaimable until adopted"
+        );
+        node_a.record_landed_part(&part).await.unwrap();
+        assert!(
+            node_a.claim_part().await.unwrap().is_some(),
+            "after re-recording, node-a owns and claims it"
+        );
     }
 
     #[sqlx::test]

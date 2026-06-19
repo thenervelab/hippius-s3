@@ -31,7 +31,13 @@ async fn main() -> Result<(), StartupError> {
     // Honor the configured claim lease so a crashed/partitioned agent's claim is
     // re-claimable after the TTL (the H1 crash-recovery path) instead of the
     // store's hardcoded default.
-    let store = Store::connect(&config.database_url).await?.with_claim_lease(config.claim_lease);
+    // Scope claims/records to this node: parts live on node-local SSD, so this agent
+    // may only drain parts it holds (otherwise it claims a peer's part and fails on
+    // the missing local source). See migration 0006 + Store::with_node_id.
+    let store = Store::connect(&config.database_url)
+        .await?
+        .with_claim_lease(config.claim_lease)
+        .with_node_id(config.node_id.as_str());
 
     // The enforcer starts at the floor (conservative) with a one-second burst of
     // the node's capability; the allocation-pull worker raises it to the leader's

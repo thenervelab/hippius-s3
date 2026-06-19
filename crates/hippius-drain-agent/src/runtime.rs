@@ -138,7 +138,10 @@ async fn run_drain(token: CancellationToken, period: Duration, deps: DrainDeps) 
         // here — recording it again would double-count.
         match drain_until_empty(&deps.ceph, &deps.ssd, &deps.store, deps.enforcer.as_ref(), Some(&deps.snapshot), &token).await {
             Ok(drained) => tracing::debug!(drained, "drain cycle complete"),
-            Err(err) => tracing::warn!(error = %err, "drain cycle failed; SSD copy retained, will retry"),
+            // Debug-format the error so the `PartDrainError` variant + `DrainStep` + the
+            // underlying io errno surface; `%err` (Display) only prints the opaque
+            // "draining a part failed" and hides which step/errno actually failed.
+            Err(err) => tracing::warn!(error = ?err, "drain cycle failed; SSD copy retained, will retry"),
         }
 
         tokio::select! {
