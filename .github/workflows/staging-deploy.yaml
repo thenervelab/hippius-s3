@@ -110,10 +110,34 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  rust-gate:
+    # Block the drain image build (and thus the deploy) on the Rust quality gates
+    # (audit F2). Fast checks only -- fmt + clippy + supply chain; the full
+    # Postgres-backed test suite runs in the PR workflow (test-and-lint.yml).
+    name: Rust gate (fmt, clippy, cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: cargo-deny check
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
   build-drain:
     # The hippius-drain Rust binaries (agent + allocator) ship as one `drain` image.
-    # It is a self-contained Cargo workspace, so it needs no base image and runs in
-    # parallel with build-base/build-images.
+    # It is a self-contained Cargo workspace, so it needs no base image. Gated on
+    # rust-gate so a clippy/fmt/advisory failure blocks building+deploying the drain.
+    needs: rust-gate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -272,10 +296,21 @@ jobs:
           # on startup, so confirm it is Ready (strict) before the per-node agent DaemonSet.
           kubectl rollout status deployment/drain-allocator -n hippius-s3-staging --timeout=5m
           # The agent is a DaemonSet: a labeled node at pod capacity legitimately cannot
-          # host its pod, which must not fail the whole deploy (the agents on schedulable
-          # ingest nodes are what matter). Surface a non-fatal warning instead.
-          kubectl rollout status daemonset/drain-agent -n hippius-s3-staging --timeout=5m \
-            || echo "::warning::drain-agent DaemonSet not fully rolled out (often a labeled node at pod capacity); check 'kubectl get ds drain-agent -n hippius-s3-staging'"
+          # host its pod, which must not fail the whole deploy. But a blanket `|| echo`
+          # swallowed *every* failure (image pull, CrashLoop, bad config) and reported
+          # green (audit F8). Instead: require >= 1 agent Ready; warn only when it's a
+          # partial roll (some labeled node unschedulable), fail when zero are Ready.
+          if ! kubectl rollout status daemonset/drain-agent -n hippius-s3-staging --timeout=5m; then
+            ready=$(kubectl get ds drain-agent -n hippius-s3-staging -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+            desired=$(kubectl get ds drain-agent -n hippius-s3-staging -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
+            if [ "${ready:-0}" -ge 1 ]; then
+              echo "::warning::drain-agent rolled ${ready}/${desired} (a labeled node is likely at pod capacity); proceeding"
+            else
+              echo "::error::drain-agent has 0 Ready pods after 5m — rollout genuinely failed"
+              kubectl get pods -l app=drain-agent -n hippius-s3-staging -o wide || true
+              exit 1
+            fi
+          fi
 
       - name: Restart external deployments
         run: |

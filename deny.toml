@@ -1,6 +1,10 @@
 # cargo-deny configuration (run in CI: `cargo deny check`).
 [advisories]
 yanked = "deny"
+# Explicit advisory gates (audit F13): a known-vulnerable dep fails the build; an
+# unmaintained one warns. Don't rely on cargo-deny's version-dependent defaults.
+vulnerability = "deny"
+unmaintained = "warn"
 
 [licenses]
 # Permissive licenses compatible with this crate's MIT OR Apache-2.0 dual license.
