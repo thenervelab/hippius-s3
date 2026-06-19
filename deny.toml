@@ -1,10 +1,11 @@
 # cargo-deny configuration (run in CI: `cargo deny check`).
 [advisories]
+# Advisory gate (audit F13). In the current cargo-deny schema a matched advisory
+# (vulnerability/unsound/etc.) always fails `cargo deny check` — there is no per-class
+# severity knob — so a known-vulnerable dep blocks the build by default. We additionally
+# deny yanked crates and scope the unmaintained-advisory check to the workspace graph.
 yanked = "deny"
-# Explicit advisory gates (audit F13): a known-vulnerable dep fails the build; an
-# unmaintained one warns. Don't rely on cargo-deny's version-dependent defaults.
-vulnerability = "deny"
-unmaintained = "warn"
+unmaintained = "workspace"
 
 [licenses]
 # Permissive licenses compatible with this crate's MIT OR Apache-2.0 dual license.
@@ -21,7 +22,7 @@ allow = [
 
 [bans]
 multiple-versions = "warn"
-wildcard-dependencies = "deny"
+wildcards = "deny"
 
 [sources]
 unknown-registry = "deny"

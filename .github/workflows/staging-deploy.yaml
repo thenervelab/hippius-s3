@@ -128,10 +128,12 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: cargo-deny check
-        uses: EmbarkStudios/cargo-deny-action@v2
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
         with:
-          command: check
+          tool: cargo-deny
+      - name: cargo-deny check
+        run: cargo deny check
 
   build-drain:
     # The hippius-drain Rust binaries (agent + allocator) ship as one `drain` image.

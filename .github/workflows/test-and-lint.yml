@@ -265,7 +265,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: cargo-deny check
-        uses: EmbarkStudios/cargo-deny-action@v2
+      # Run cargo-deny on the runner's gnu toolchain (installed per rust-toolchain.toml)
+      # rather than the EmbarkStudios action, whose musl container lacks the toolchain.
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
         with:
-          command: check
+          toolchain: 1.95.0
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo-deny check
+        run: cargo deny check

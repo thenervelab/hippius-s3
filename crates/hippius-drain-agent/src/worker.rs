@@ -330,7 +330,7 @@ mod tests {
         let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
         let ceph = LocalFs::new(pool_dir.path());
-        let store = Store::from_pool(pool);
+        let store = Store::from_pool(pool).with_node_id("test-node");
         let part = part_at(5, 1);
         seed_part(ssd_dir.path(), &store, &part, &[b"hello cephor part", b"second chunk"]).await;
 
@@ -359,7 +359,7 @@ mod tests {
         let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
         let ceph = LocalFs::new(pool_dir.path());
-        let store = Store::from_pool(pool);
+        let store = Store::from_pool(pool).with_node_id("test-node");
         let part = part_at(5, 1);
         seed_part(ssd_dir.path(), &store, &part, &[b"throttled part bytes"]).await;
         let ssd_part = ssd_dir.path().join(part.relative_dir());
@@ -389,7 +389,7 @@ mod tests {
         let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
         let ceph = LocalFs::new(pool_dir.path());
-        let store = Store::from_pool(pool);
+        let store = Store::from_pool(pool).with_node_id("test-node");
         let snapshot = SnapshotCell::new();
         let part = part_at(5, 1);
         seed_part(ssd_dir.path(), &store, &part, &[b"timed part"]).await;
@@ -408,7 +408,7 @@ mod tests {
         let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
         let ceph = LocalFs::new(pool_dir.path());
-        let store = Store::from_pool(pool);
+        let store = Store::from_pool(pool).with_node_id("test-node");
 
         // Record a part as landed but never write its SSD files: the drain copy then
         // hits an I/O error mid-cycle (the meta source is "gone"). This is the H1
@@ -437,7 +437,7 @@ mod tests {
         let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
         let ceph = LocalFs::new(pool_dir.path());
-        let store = Store::from_pool(pool);
+        let store = Store::from_pool(pool).with_node_id("test-node");
         let snapshot = SnapshotCell::new();
         let part = part_at(5, 1);
         seed_part(ssd_dir.path(), &store, &part, &[b"counted part"]).await;
@@ -456,7 +456,7 @@ mod tests {
         let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
         let ceph = LocalFs::new(pool_dir.path());
-        let store = Store::from_pool(pool);
+        let store = Store::from_pool(pool).with_node_id("test-node");
         let snapshot = SnapshotCell::new();
 
         // Recorded landed but no SSD files -> the drain copy fails (one failed attempt).
@@ -475,7 +475,7 @@ mod tests {
         let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
         let ceph = LocalFs::new(pool_dir.path());
-        let store = Store::from_pool(pool);
+        let store = Store::from_pool(pool).with_node_id("test-node");
         let snapshot = SnapshotCell::new();
         let token = CancellationToken::new();
 
@@ -500,7 +500,7 @@ mod tests {
         let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
         let ceph = LocalFs::new(pool_dir.path());
-        let store = Store::from_pool(pool);
+        let store = Store::from_pool(pool).with_node_id("test-node");
 
         // Three honest parts pending under one object version.
         for number in 1..=3_u32 {
@@ -520,7 +520,7 @@ mod tests {
         let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
         let ceph = LocalFs::new(pool_dir.path());
-        let store = Store::from_pool(pool);
+        let store = Store::from_pool(pool).with_node_id("test-node");
 
         // A real backlog of three parts.
         for number in 1..=3_u32 {
