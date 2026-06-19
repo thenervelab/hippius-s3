@@ -66,20 +66,19 @@ impl Drop for PermitGuard<'_> {
 }
 
 /// The SSD byte size the bandwidth gate charges for this part: the sum of its chunk
-/// files. An unresolvable id or a failed stat (e.g. a vanished file) charges nothing,
-/// so the drain then surfaces the real error and records a failure rather than the
-/// gate silently admitting phantom work.
-async fn part_size(ssd: &LocalSsd, part: &PartKey) -> u64 {
-    let Ok(indices) = ssd.list_chunks(part).await else {
-        return 0;
-    };
+/// files. `None` if listing or stat-ing any chunk fails — the caller then denies
+/// admission and retries rather than charging 0 and draining unmetered (audit F7).
+/// Charging 0 on a stat race would defeat the rate gate exactly under SSD I/O
+/// pressure, when it matters most.
+async fn part_size(ssd: &LocalSsd, part: &PartKey) -> Option<u64> {
+    let indices = ssd.list_chunks(part).await.ok()?;
     let mut total = 0_u64;
     for index in indices {
-        if let Ok(path) = ssd.chunk_source(part, index) {
-            total = total.saturating_add(tokio::fs::metadata(&path).await.map_or(0, |meta| meta.len()));
-        }
+        let path = ssd.chunk_source(part, index).ok()?;
+        let meta = tokio::fs::metadata(&path).await.ok()?;
+        total = total.saturating_add(meta.len());
     }
-    total
+    Some(total)
 }
 
 /// Claims one pending part and drains it SSD → pool, gated by `enforcer`.
@@ -105,7 +104,15 @@ pub async fn drain_next(
     };
 
     if let Some(enforcer) = enforcer {
-        let bytes = part_size(ssd, claim.part()).await;
+        let Some(bytes) = part_size(ssd, claim.part()).await else {
+            // A stat/list failure must not admit the part at zero cost (audit F7): hand
+            // the claim back and retry next wake. With node-scoped claims (migration
+            // 0006) a missing local part dir no longer happens, so this is a genuine
+            // transient I/O error worth backing off on.
+            store.release_part(claim.part()).await?;
+            tracing::debug!("part size unavailable; part returned to pending");
+            return Ok(None);
+        };
         // The guard's scope ends before the drain await — a `MutexGuard` must never
         // cross an `.await` (axiom rust_quality_74). Poisoning recovers via
         // `into_inner`: the `Enforcer` is a small `Copy` value whose sync methods

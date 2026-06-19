@@ -153,6 +153,14 @@ impl TokenBucket {
         self.rate
     }
 
+    /// The burst ceiling (the max tokens the bucket holds — one second of rate). The
+    /// drain admission clamps an oversize part's charge to this so it can always make
+    /// progress (audit F1).
+    #[must_use]
+    pub fn burst(&self) -> u64 {
+        self.burst.get()
+    }
+
     fn refill(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.last);
         // Exact integer refill: tokens = (rate * elapsed_nanos + carried remainder)
@@ -304,11 +312,18 @@ impl Enforcer {
         if !self.breaker.allows(now) {
             return DrainDecision::Denied(DenyReason::BreakerOpen);
         }
-        if !self.bucket.try_take(bytes, now) {
+        // Clamp the bandwidth charge to the burst ceiling. A part larger than one second
+        // of rate could otherwise never be admitted — `tokens` caps at `burst`, so
+        // `tokens >= bytes` is unsatisfiable and the part loops `Denied(RateLimited)`
+        // forever, never draining (audit F1). An oversize part is admitted once the
+        // bucket is full and pays at most one burst; charge and refund use the same
+        // clamped value so a later concurrency denial still costs no budget.
+        let charge = bytes.min(self.bucket.burst());
+        if !self.bucket.try_take(charge, now) {
             return DrainDecision::Denied(DenyReason::RateLimited);
         }
         if !self.concurrency.try_acquire() {
-            self.bucket.refund(bytes);
+            self.bucket.refund(charge);
             return DrainDecision::Denied(DenyReason::AtConcurrencyLimit);
         }
         DrainDecision::Allowed
@@ -587,6 +602,24 @@ mod tests {
         // after releasing the permit, a 900-byte drain still fits the original 1000 burst.
         e.record_outcome(true, now);
         assert_eq!(e.try_drain(900, now), DrainDecision::Allowed);
+    }
+
+    #[test]
+    fn enforcer_admits_a_part_larger_than_the_burst_ceiling() {
+        // Regression for F1: a part bigger than one second of rate (burst) must still
+        // drain. Before the charge-clamp it looped Denied(RateLimited) forever because
+        // `tokens` caps at `burst`, so `tokens >= bytes` was unsatisfiable.
+        let now = t0();
+        let mut e = enforcer(now); // burst = 1_000
+        assert_eq!(
+            e.try_drain(5_000, now),
+            DrainDecision::Allowed,
+            "a 5_000-byte part must be admitted from a full 1_000 burst, not stalled",
+        );
+        // It paid at most one burst: the bucket is now empty, so the next drain is rate
+        // limited (and the oversize part did NOT overdraw into a negative balance).
+        e.record_outcome(true, now);
+        assert_eq!(e.try_drain(1, now), DrainDecision::Denied(DenyReason::RateLimited));
     }
 
     #[test]
