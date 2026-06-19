@@ -10,7 +10,7 @@ it is installed.**
 
 | File | What |
 |---|---|
-| `api-local-deployments-staging.yaml` | `api-local` Deployment (**3 replicas**) writing local (`HIPPIUS_OBJECT_CACHE_DIR=local_object_cache`) with ceph read-fallback. **This is the whole api fleet.** |
+| `api-local-deployments-staging.yaml` | `api-local` Deployment (**2 replicas**, one per ingest node) writing local (`HIPPIUS_OBJECT_CACHE_DIR=local_object_cache`) with ceph read-fallback. **This is the whole api fleet.** |
 | `resource-limits.yaml` (modified) | Base (ceph) `api` deployment scaled to **0** — no ceph api pods. |
 | `kustomization.yaml` (inline patch) | `api` Service selector switched `app: api` → `app: api-local`, so the gateway routes to the local pods. |
 | `ingest-node-labels-staging.yaml` | **The ONE list** of staging ingest nodes — applying it labels them `s3-staging-local-ingest=true`. |
@@ -41,9 +41,10 @@ Ingest nodes are declared **once** in `ingest-node-labels-staging.yaml` (partial
 carry `s3-staging-local-ingest=true`). Deploying applies that label; **both** the `api-local`
 Deployment and the `cache-replicator` DaemonSet select on it (`nodeSelector`), so they always target
 the identical node set — no duplicated hostname list to drift. The DaemonSet (one pod per labeled
-node) therefore covers every node an api pod can land on. Current staging set: **node1, node2, node3**
+node) therefore covers every node an api pod can land on. Current staging set: **node2, node3** (node1 is
+excluded — it runs at its pod cap, so the agent can't schedule there and would block the DaemonSet roll)
 (node4/5 are near pod-cap and left for prod). `api-local` also uses preferred pod anti-affinity to
-spread its 3 replicas across the labeled nodes.
+spread its 2 replicas across the labeled nodes.
 
 **Shared cluster, disjoint sets:** prod will label *different* nodes with `s3-local-ingest=true`. Two
 distinct labels on distinct nodes + the per-env path denominator = staging and prod ingest never mix.

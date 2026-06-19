@@ -1,6 +1,6 @@
 # Trial (s3-2.0 prototype): the entire staging api fleet on node-local SSD.
 #
-# A single `api-local` Deployment (3 replicas) — the base (ceph) `api` deployment
+# A single `api-local` Deployment (2 replicas, one per ingest node) — the base (ceph) `api` deployment
 # is scaled to 0 in resource-limits.yaml, so ALL api pods run on local SSD. Each
 # pod writes to its node's local dir and read-falls-back to the shared CephFS
 # cache. All workers stay on ceph, untouched.
@@ -19,7 +19,7 @@
 # Scheduling: pinned to nodes labeled `s3-staging-local-ingest=true` (the ONE list
 # lives in ingest-node-labels-staging.yaml). The cache-replicator DaemonSet selects
 # the SAME label, so they stay in lockstep. Preferred pod anti-affinity spreads the
-# 3 replicas across the labeled nodes.
+# 2 replicas across the labeled nodes.
 #
 # Routing: the existing `api` Service (the gateway's GATEWAY_BACKEND_URL=
 # http://api:8000 upstream) is patched to select `app: api-local`
@@ -35,7 +35,7 @@ metadata:
   labels:
     app: api-local
 spec:
-  replicas: 3
+  replicas: 2
   selector:
     matchLabels:
       app: api-local
