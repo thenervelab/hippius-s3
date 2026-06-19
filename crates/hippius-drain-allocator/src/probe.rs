@@ -236,11 +236,12 @@ ceph_health_detail{name=\"MON_DISK_LOW\",severity=\"HEALTH_WARN\"} 1.0
 
     #[tokio::test]
     async fn a_connection_error_decays_rather_than_panicking() {
-        // Drop the server so the port is closed: a transport error must fold to decay.
-        let server = MockServer::start().await;
-        let url = format!("{}/metrics", server.uri());
-        drop(server);
-        let probe = probe(url);
+        // A transport error must fold to decay. Point at a never-bound port directly
+        // instead of dropping a MockServer and reusing its freed port: under concurrent
+        // tests another MockServer can rebind that port, so the request would
+        // unexpectedly succeed (a flaky no-decay). 127.0.0.1:1 is never listened on, so
+        // the connect refuses deterministically.
+        let probe = probe("http://127.0.0.1:1/metrics".to_owned());
         assert_eq!(probe.ceiling().await, CephCeiling::Open(ByteRate::new(500_000_000)));
         assert_eq!(probe.consecutive_failures(), 1);
     }
