@@ -224,3 +224,56 @@ jobs:
         if: always()
         run: |
           docker compose -f docker-compose.yml -f docker-compose.e2e.yml down -v || true
+
+  rust:
+    name: Rust (fmt, clippy, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 5s --health-retries 12
+    env:
+      # The drain's #[sqlx::test] cases auto-create per-test DBs against this and apply
+      # the cephor_* migrations, so schema + queries (incl node-scoped claim) are exercised.
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.95.0 (pinned to the builder toolchain)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Tests (pure + Postgres-backed sqlx tiers)
+        run: cargo test --workspace --all-features --locked
+
+  rust-deny:
+    name: Rust (cargo-deny supply chain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Run cargo-deny on the runner's gnu toolchain (installed per rust-toolchain.toml)
+      # rather than the EmbarkStudios action, whose musl container lacks the toolchain.
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo-deny check
+        run: cargo deny check

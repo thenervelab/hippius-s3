@@ -312,18 +312,23 @@ impl Enforcer {
         if !self.breaker.allows(now) {
             return DrainDecision::Denied(DenyReason::BreakerOpen);
         }
-        // Clamp the bandwidth charge to the burst ceiling. A part larger than one second
-        // of rate could otherwise never be admitted — `tokens` caps at `burst`, so
-        // `tokens >= bytes` is unsatisfiable and the part loops `Denied(RateLimited)`
-        // forever, never draining (audit F1). An oversize part is admitted once the
-        // bucket is full and pays at most one burst; charge and refund use the same
-        // clamped value so a later concurrency denial still costs no budget.
-        let charge = bytes.min(self.bucket.burst());
-        if !self.bucket.try_take(charge, now) {
+        // Bandwidth gate. Normal path spends `bytes`. A part larger than the burst can
+        // never fit (tokens cap at `burst`), so it would loop `Denied(RateLimited)`
+        // forever (audit F1); admit it as a one-shot overdraft when the bucket is full,
+        // spending one burst. The `burst > 0` guard keeps a fully-throttled (zero-budget)
+        // bucket denying everything — without it `bytes.min(0) == 0` would admit any
+        // part free. The amount actually charged is refunded if concurrency then denies,
+        // so a rejected drain costs no budget.
+        let burst = self.bucket.burst();
+        let charged = if self.bucket.try_take(bytes, now) {
+            bytes
+        } else if bytes > burst && burst > 0 && self.bucket.try_take(burst, now) {
+            burst
+        } else {
             return DrainDecision::Denied(DenyReason::RateLimited);
-        }
+        };
         if !self.concurrency.try_acquire() {
-            self.bucket.refund(charge);
+            self.bucket.refund(charged);
             return DrainDecision::Denied(DenyReason::AtConcurrencyLimit);
         }
         DrainDecision::Allowed
@@ -620,6 +625,23 @@ mod tests {
         // limited (and the oversize part did NOT overdraw into a negative balance).
         e.record_outcome(true, now);
         assert_eq!(e.try_drain(1, now), DrainDecision::Denied(DenyReason::RateLimited));
+    }
+
+    #[test]
+    fn enforcer_with_zero_burst_denies_every_non_zero_part() {
+        // A fully-throttled bucket (burst 0) must admit nothing. Guards the F1 overdraft
+        // from degenerating into a free pass (the earlier `bytes.min(burst)` made
+        // charge 0 when burst was 0, so try_take(0) wrongly admitted every part).
+        let now = t0();
+        let mut e = Enforcer::new(
+            CircuitBreaker::new(BreakerConfig {
+                failure_threshold: 1,
+                cooldown: Duration::from_secs(5),
+            }),
+            TokenBucket::new(ByteRate::new(0), Bytes::new(0), now),
+            ConcurrencyLimiter::new(1),
+        );
+        assert_eq!(e.try_drain(20, now), DrainDecision::Denied(DenyReason::RateLimited));
     }
 
     #[test]
