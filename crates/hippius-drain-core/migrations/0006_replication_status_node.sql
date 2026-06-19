@@ -8,9 +8,18 @@
 -- missing, and failed at the meta copy (ENOENT) -- churning forever, draining nothing.
 --
 -- Add node_id so the per-node reconciler stamps the owning node (record_landed_part
--- UPSERT) and claim_part scopes to it. Legacy rows are NULL until the node that still
--- holds the part locally re-records and adopts them.
+-- UPSERT) and claim_part scopes to it.
 ALTER TABLE cephor_replication_status ADD COLUMN node_id TEXT;
+
+-- Existing non-terminal rows predate node ownership (node_id NULL) and are unclaimable
+-- under the node-scoped claim. They are NOT self-healing: the reconciler only records a
+-- part it sees as absent (status None), never one already 'pending'/'draining', so a
+-- NULL-node row would orphan forever. The node-local SSD is the source of truth, so
+-- clear the in-flight queue here and let each node's reconciler rebuild it node-aware
+-- (scan SSD -> status None -> record_landed stamps node_id). Terminal rows
+-- ('replicated'/'failed') are kept. This runs once; in steady state record_landed_part
+-- always stamps a node, so no node_id IS NULL rows are created.
+DELETE FROM cephor_replication_status WHERE node_id IS NULL AND status IN ('pending', 'draining');
 
 -- The claim selector is now (node_id = $node AND status = 'pending') ordered by
 -- landed_at; replace the global pending index with a node-scoped one that matches.
