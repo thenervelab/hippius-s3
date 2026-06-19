@@ -419,7 +419,7 @@ mod tests {
     async fn the_allocation_worker_applies_the_leaders_budget(pool: PgPool) {
         let ssd_dir = tempfile::tempdir().unwrap();
         let pool_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::from_pool(pool).with_node_id("test-node"));
+        let store = Arc::new(Store::from_pool(pool));
         let node = NodeId::from_str("node-alloc").unwrap();
 
         // The leader has already written this node a budget.
@@ -484,7 +484,7 @@ mod tests {
         // real time passes between the load and the assertion.
         let ssd_dir = tempfile::tempdir().unwrap();
         let pool_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::from_pool(pool.clone()).with_node_id("test-node"));
+        let store = Arc::new(Store::from_pool(pool.clone()));
         let node = NodeId::from_str("node-decay").unwrap();
         let budget = ByteRate::new(800_000);
         let floor = ByteRate::new(1_000);
@@ -570,7 +570,7 @@ mod tests {
     async fn the_heartbeat_worker_upserts_this_node_into_the_fleet(pool: PgPool) {
         let ssd_dir = tempfile::tempdir().unwrap();
         let pool_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::from_pool(pool).with_node_id("test-node"));
+        let store = Arc::new(Store::from_pool(pool));
         let node = NodeId::from_str("node-hb").unwrap();
         // A distinctive capability so the asserted row is unambiguously ours.
         let rate = ByteRate::new(7_000_000);
@@ -624,7 +624,7 @@ mod tests {
         // reconciler must record it pending so the drain worker then replicates it.
         let ssd_dir = tempfile::tempdir().unwrap();
         let pool_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::from_pool(pool).with_node_id("test-node"));
+        let store = Arc::new(Store::from_pool(pool));
 
         // Lay a complete part on SSD WITHOUT recording a landed row.
         let part = part_at(5, 1);
@@ -663,7 +663,7 @@ mod tests {
     async fn runtime_drains_a_seeded_backlog_then_shuts_down_cleanly(pool: PgPool) {
         let ssd_dir = tempfile::tempdir().unwrap();
         let pool_dir = tempfile::tempdir().unwrap();
-        let store = Store::from_pool(pool).with_node_id("test-node");
+        let store = Store::from_pool(pool);
 
         // Seed three honest parts and record them pending.
         let mut parts = Vec::new();

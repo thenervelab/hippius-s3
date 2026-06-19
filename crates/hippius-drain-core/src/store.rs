@@ -235,13 +235,16 @@ impl Store {
         })
     }
 
-    /// Wraps an existing pool (used by the integration tests).
+    /// Wraps an existing pool (used by the integration tests). Defaults a `node_id` so
+    /// the part claim/record tests work without each setting one; cross-node tests
+    /// override it via [`with_node_id`](Self::with_node_id). Production builds the store
+    /// with [`connect`](Self::connect) + `with_node_id`, never this.
     #[must_use]
     pub fn from_pool(pool: PgPool) -> Self {
         Self {
             pool,
             claim_lease: DEFAULT_CLAIM_LEASE,
-            node_id: None,
+            node_id: Some("test-node".to_owned()),
         }
     }
 
