@@ -9,6 +9,7 @@ from fakeredis.aioredis import FakeRedis
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import UploadChainRequest
+from hippius_s3.queue import defer_upload_request
 from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.queue import enqueue_unpin_retry_request
 from hippius_s3.queue import initialize_queue_client
@@ -56,6 +57,42 @@ async def test_enqueue_retry_request_sets_attempts_and_schedules() -> None:
     assert data["attempts"] == 2  # incremented
     assert data["last_error"] == "test error"
     assert data["request_id"] == "req-456"
+
+
+@pytest.mark.asyncio
+async def test_defer_upload_request_does_not_increment_attempts() -> None:
+    """defer_upload_request (the PR-7a not-ready path) must NOT burn the retry budget:
+    a part that hasn't drained to ceph yet is "too early", not a failure. It schedules
+    on the SAME retry ZSET (so the existing mover picks it up) and preserves
+    first_enqueued_at (the wall-clock DLQ ceiling)."""
+    redis = FakeRedis()
+    initialize_queue_client(redis)
+    enqueued_at = time.time() - 12.0
+    payload = UploadChainRequest(
+        address="user1",
+        bucket_name="test-bucket",
+        object_key="test-key",
+        object_id="obj-not-ready",
+        object_version=1,
+        chunks=[Chunk(id=1)],
+        upload_id=None,
+        attempts=3,
+        first_enqueued_at=enqueued_at,
+        request_id="req-789",
+    )
+
+    t0 = time.time()
+    await defer_upload_request(payload, backend_name="arion", delay_seconds=5.0)
+
+    members = await redis.zrange("arion_upload_retries", 0, -1, withscores=True)
+    assert len(members) == 1
+    stored_payload, score = members[0]
+    assert score >= t0 + 4.5  # scheduled with the delay
+
+    data = json.loads(stored_payload)
+    assert data["attempts"] == 3, "defer must NOT increment attempts"
+    assert data["first_enqueued_at"] == enqueued_at, "wall-clock origin preserved"
+    assert data["request_id"] == "req-789"
 
 
 @pytest.mark.asyncio
