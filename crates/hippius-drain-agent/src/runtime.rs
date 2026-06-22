@@ -136,7 +136,17 @@ async fn run_drain(token: CancellationToken, period: Duration, deps: DrainDeps) 
         // recorded and retried on the next poll; the backlog is never lost. Per-part
         // outcome counting lives in `drain_next`, so the burst result is only logged
         // here — recording it again would double-count.
-        match drain_until_empty(&deps.ceph, &deps.ssd, &deps.store, deps.enforcer.as_ref(), Some(&deps.snapshot), &token).await {
+        match drain_until_empty(
+            &deps.ceph,
+            &deps.ssd,
+            &deps.store,
+            deps.enforcer.as_ref(),
+            Some(&deps.snapshot),
+            &token,
+            DRAIN_CONCURRENCY as usize,
+        )
+        .await
+        {
             Ok(drained) => tracing::debug!(drained, "drain cycle complete"),
             // Debug-format the error so the `PartDrainError` variant + `DrainStep` + the
             // underlying io errno surface; `%err` (Display) only prints the opaque
