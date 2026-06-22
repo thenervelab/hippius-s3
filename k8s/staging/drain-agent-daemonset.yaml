@@ -1,5 +1,5 @@
-# The hippius-drain agent: the per-node drain daemon (replaces the cache-replicator
-# placeholder). One pod per ingest node, draining that node's local-SSD ingest dir to
+# The hippius-drain agent: the per-node drain daemon.
+# One pod per ingest node, draining that node's local-SSD ingest dir to
 # the shared CephFS pool, path-preservingly per the api part layout
 # (<object_id>/v<version>/part_<n>/). The reconciler is the sole trigger — it scans the
 # SSD for complete parts (a meta.json marker) with no replication row and records them,
@@ -38,6 +38,19 @@ spec:
       # Same label as api-local — keeps them in lockstep (see header).
       nodeSelector:
         s3-staging-local-ingest: "true"
+      affinity:
+        # Belt-and-suspenders with the nodeSelector label, identical to api-local's
+        # allow-list: a drain-agent only runs where an api-local pod can land. Keep in
+        # sync with ingest-node-labels-staging.yaml + api-local-deployments-staging.yaml.
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - k8s-v3-node2
+                      - k8s-v3-node3
       # > the agent's shutdown grace (CEPHOR_GRACE_SECS default 30s): a burst winds
       # down before the kubelet force-kills, so no in-flight part is stranded draining.
       terminationGracePeriodSeconds: 40

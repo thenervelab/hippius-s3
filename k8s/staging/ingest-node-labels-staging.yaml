@@ -2,8 +2,10 @@
 #
 # This is the ONE list. `kubectl apply -k k8s/staging` (the deploy) applies the
 # `s3-staging-local-ingest=true` label to these nodes; the api-local Deployment and
-# the cache-replicator DaemonSet both select on that label, so they stay in lockstep
-# automatically. To change the set, edit the Node stanzas here.
+# the drain-agent DaemonSet both select on that label, so they stay in lockstep
+# automatically. Both ALSO carry a required nodeAffinity hostname allow-list (node2,
+# node3) — keep that allow-list in sync with the stanzas below. To change the set,
+# edit the Node stanzas here AND both allow-lists.
 #
 # SHARED CLUSTER: staging and prod run on the same physical nodes, so their ingest
 # sets MUST be disjoint — prod uses a different label (s3-local-ingest) on DIFFERENT
