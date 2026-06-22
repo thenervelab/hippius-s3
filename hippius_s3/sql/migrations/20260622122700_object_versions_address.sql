@@ -1,3 +1,5 @@
+-- migrate:up
+
 -- s3-2.1 PR-7: the main-account address (SS58) for the drain-gated upload promoter.
 --
 -- The arion-uploader / ovh-backup workers re-derive everything they need about an
@@ -8,3 +10,7 @@
 -- (PR-7e), so the column is NULL for legacy/non-gated rows — harmless, the promoter
 -- only runs when the feature is enabled.
 ALTER TABLE object_versions ADD COLUMN IF NOT EXISTS address TEXT;
+
+-- migrate:down
+
+ALTER TABLE object_versions DROP COLUMN IF EXISTS address;
