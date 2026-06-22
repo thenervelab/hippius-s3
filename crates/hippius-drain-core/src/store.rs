@@ -14,6 +14,7 @@ use crate::gc::GcClaim;
 use crate::ids::{FileId, NodeId};
 use crate::partdrain::{ClaimedPart, PartReplicationStore, PartVerified};
 use crate::reconcile::PartLandingLog;
+use crate::reconcile::PartStatus;
 use crate::state::ReplicationState;
 use crate::units::{ByteRate, Bytes, DiskPressure};
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -181,12 +182,31 @@ impl PartRow {
         Ok(PartKey::new(object, Version::new(version), PartNumber::new(part)))
     }
 
-    fn into_claimed(self) -> Result<ClaimedPart> {
-        Ok(ClaimedPart::new(self.into_part()?))
-    }
-
     fn into_pending(self) -> Result<PendingPart> {
         Ok(PendingPart { part: self.into_part()? })
+    }
+}
+
+/// A claimed part read back from the `claim_part` UPDATE … RETURNING — the part
+/// identity plus the [`claim_seq`](ClaimedPart::claim_seq) fencing token the claim
+/// stamped, so the commit can prove it still holds the claim it was granted.
+#[derive(sqlx::FromRow)]
+struct ClaimedPartRow {
+    object_id: String,
+    version: i64,
+    part_number: i64,
+    claim_seq: i64,
+}
+
+impl ClaimedPartRow {
+    fn into_claimed(self) -> Result<ClaimedPart> {
+        let part = PartRow {
+            object_id: self.object_id,
+            version: self.version,
+            part_number: self.part_number,
+        }
+        .into_part()?;
+        Ok(ClaimedPart::new(part, self.claim_seq))
     }
 }
 
@@ -331,6 +351,15 @@ impl Store {
     ///
     /// [`StoreError::OutOfRange`] if a budget exceeds i64; [`StoreError::Database`] on failure.
     pub async fn write_allocations(&self, epoch: u64, allocations: &[Allocation]) -> Result<()> {
+        // F6: an empty plan carries no fleet information, so it must be a no-op. The
+        // node-absence zeroing below uses `node_id <> ALL($present)`, which with an
+        // empty `present` matches EVERY row — so an empty plan would zero the whole
+        // live fleet's budgets on a transient empty view. Stale budgets are already
+        // handled on read (load_allocation treats un-refreshed rows as absent), so
+        // there is nothing an empty plan needs to do here.
+        if allocations.is_empty() {
+            return Ok(());
+        }
         let epoch_i = to_i64(epoch)?;
         let mut tx = self.pool.begin().await?;
         let mut present: Vec<&str> = Vec::with_capacity(allocations.len());
@@ -568,8 +597,12 @@ impl Store {
     ///
     /// [`StoreError::Database`]; [`StoreError::Invalid`] if a stored part is malformed.
     pub async fn claim_part(&self) -> Result<Option<ClaimedPart>> {
-        let row = sqlx::query_as::<_, PartRow>(
-            "UPDATE cephor_replication_status SET status = 'draining', updated_at = now(), claimed_at = now() \
+        // Stamp a fresh fencing token (nextval) on the claim and return it: the commit
+        // (mark_replicated) is guarded by it, so a claim re-won here after lease expiry
+        // gets a NEW token and the prior claimant's stale commit fences out (F4).
+        let row = sqlx::query_as::<_, ClaimedPartRow>(
+            "UPDATE cephor_replication_status \
+             SET status = 'draining', updated_at = now(), claimed_at = now(), claim_seq = nextval('cephor_claim_seq') \
              WHERE (object_id, version, part_number) IN ( \
                 SELECT object_id, version, part_number FROM cephor_replication_status \
                 WHERE node_id = $2 \
@@ -577,13 +610,13 @@ impl Store {
                         OR (status = 'draining' AND claimed_at < now() - $1 * interval '1 second') ) \
                 ORDER BY landed_at \
                 FOR UPDATE SKIP LOCKED LIMIT 1 \
-             ) RETURNING object_id, version, part_number",
+             ) RETURNING object_id, version, part_number, claim_seq",
         )
         .bind(self.claim_lease.as_secs_f64())
         .bind(self.node_id.as_deref())
         .fetch_optional(&self.pool)
         .await?;
-        row.map(PartRow::into_claimed).transpose()
+        row.map(ClaimedPartRow::into_claimed).transpose()
     }
 
     /// Returns a claimed (`draining`) part to `pending` so it is re-claimed on a
@@ -647,17 +680,22 @@ impl PartReplicationStore for Store {
     }
 
     async fn mark_replicated(&self, claim: &ClaimedPart, _proof: &PartVerified) -> Result<()> {
-        // Guard on `draining`: only a part this agent claimed may be committed. Zero
-        // rows means the claim was lost (reset/re-claimed), so the caller must not
-        // unlink the SSD copy — surface PartClaimLost instead of a false Ok.
+        // Guard on `draining` AND the claim's fencing token: only the agent that still
+        // holds THIS claim may commit. Zero rows means the claim was lost — either the
+        // row left `draining`, or it was re-claimed (a new claim_seq) after the lease,
+        // e.g. this agent stalled past the lease and another re-won the part. Either
+        // way the caller must NOT unlink the SSD copy — surface PartClaimLost, not a
+        // false Ok. The claim_seq is what distinguishes "I still hold it" from "someone
+        // re-won it and it's draining again under them" (F4).
         let part = claim.part();
         let affected = sqlx::query(
             "UPDATE cephor_replication_status SET status = 'replicated', updated_at = now() \
-             WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining'",
+             WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining' AND claim_seq = $4",
         )
         .bind(part.object().as_str())
         .bind(i64::from(part.version().get()))
         .bind(i64::from(part.part().get()))
+        .bind(claim.claim_seq())
         .execute(&self.pool)
         .await?
         .rows_affected();
@@ -671,10 +709,12 @@ impl PartReplicationStore for Store {
 
     async fn mark_failed(&self, claim: &ClaimedPart, _reason: &str) -> Result<()> {
         // Terminal sink: a corrupt part is marked Failed regardless of its prior
-        // state, and an already-absent row is a harmless no-op (idempotent).
+        // state, and an already-absent row is a harmless no-op (idempotent). Clear
+        // claimed_at for consistency with release_part — a failed part holds no live
+        // claim, so its claim timestamp must not linger (F18).
         let part = claim.part();
         sqlx::query(
-            "UPDATE cephor_replication_status SET status = 'failed', updated_at = now() \
+            "UPDATE cephor_replication_status SET status = 'failed', updated_at = now(), claimed_at = NULL \
              WHERE object_id = $1 AND version = $2 AND part_number = $3",
         )
         .bind(part.object().as_str())
@@ -686,15 +726,35 @@ impl PartReplicationStore for Store {
     }
 }
 
-/// The part reconciler's view of the store: read a part's status and record a
-/// freshly-landed one. Delegates to the [`PartReplicationStore::status`] and the
-/// inherent [`Store::record_landed_part`], so the reconciler shares one definition
-/// of each operation with the drain path.
+/// The part reconciler's view of the store: read a part's status (+ adoptability)
+/// and record/adopt a freshly-landed one (via the inherent
+/// [`Store::record_landed_part`]), so the reconciler shares one definition of the
+/// landed write with the drain path.
 impl PartLandingLog for Store {
     type Error = StoreError;
 
-    async fn status(&self, part: &PartKey) -> Result<Option<ReplicationState>> {
-        <Self as PartReplicationStore>::status(self, part).await
+    async fn status(&self, part: &PartKey) -> Result<Option<PartStatus>> {
+        // One read returns both the state and adoptability — a `pending` row with no
+        // owning node is a legacy row the scanning node should adopt (G2). Reading
+        // node_id here (rather than writing every cycle) is what keeps the reconciler
+        // from a per-cycle write against the slow store for already-owned rows.
+        let row = sqlx::query_as::<_, (String, bool)>(
+            "SELECT status, (status = 'pending' AND node_id IS NULL) \
+             FROM cephor_replication_status \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            None => Ok(None),
+            Some((status, adoptable)) => Ok(Some(PartStatus {
+                state: state_from_db(&status)?,
+                adoptable,
+            })),
+        }
     }
 
     async fn record_landed(&self, part: &PartKey) -> Result<()> {
@@ -902,6 +962,32 @@ mod tests {
             store.load_allocation(&b, fresh).await.unwrap(),
             None,
             "the departed node's zeroed, sentinel-dated row reads as absent",
+        );
+    }
+
+    #[sqlx::test]
+    async fn write_allocations_with_an_empty_plan_is_a_noop(pool: PgPool) {
+        // F6: an empty plan carries no fleet info and must NOT run the node-absence
+        // zeroing (which, with no nodes present, matches every row and would wipe the
+        // live fleet's budgets). An existing budget survives an empty tick untouched.
+        let store = Store::from_pool(pool);
+        let node = NodeId::from_str("node-a").unwrap();
+        let fresh = Duration::from_hours(1);
+        store
+            .write_allocations(
+                1,
+                &[Allocation {
+                    node: node.clone(),
+                    budget: ByteRate::new(50_000_000),
+                }],
+            )
+            .await
+            .unwrap();
+        store.write_allocations(2, &[]).await.unwrap();
+        assert_eq!(
+            store.load_allocation(&node, fresh).await.unwrap().map(|s| s.budget),
+            Some(ByteRate::new(50_000_000)),
+            "an empty plan leaves existing budgets intact",
         );
     }
 
@@ -1192,8 +1278,9 @@ mod part_tests {
         let p = part(UUID_A, 5, 1);
         store.record_landed_part(&p).await.unwrap(); // status = pending, never claimed
         // A ClaimedPart constructed without claiming must NOT be able to commit: the
-        // row is still 'pending', so the 'draining' guard matches no row.
-        let unclaimed = ClaimedPart::new(p.clone());
+        // row is still 'pending', so the 'draining' guard matches no row (the token
+        // value is irrelevant here — the status guard already rejects it).
+        let unclaimed = ClaimedPart::new(p.clone(), 0);
         let err = store.mark_replicated(&unclaimed, &PartVerified::for_test()).await.unwrap_err();
         let expected = p.relative_dir().to_string_lossy().into_owned();
         assert!(
@@ -1216,6 +1303,65 @@ mod part_tests {
         store.mark_failed(&claimed, "chunk copy byte mismatch").await.unwrap();
         assert_eq!(store.status(&p).await.unwrap(), Some(ReplicationState::Failed));
         store.mark_failed(&claimed, "again").await.unwrap(); // idempotent no-op
+    }
+
+    #[sqlx::test]
+    async fn mark_failed_clears_claimed_at(pool: PgPool) {
+        // F18: a failed part holds no live claim, so its claimed_at must be nulled
+        // (mirroring release_part) — otherwise a lingering timestamp misrepresents it
+        // as freshly claimed.
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        let claimed = store.claim_part().await.unwrap().unwrap(); // stamps claimed_at
+        store.mark_failed(&claimed, "byte mismatch").await.unwrap();
+        let claimed_at_is_null: bool = sqlx::query_scalar(
+            "SELECT claimed_at IS NULL FROM cephor_replication_status \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(p.object().as_str())
+        .bind(i64::from(p.version().get()))
+        .bind(i64::from(p.part().get()))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(claimed_at_is_null, "mark_failed clears claimed_at");
+    }
+
+    #[sqlx::test]
+    async fn a_reclaim_after_lease_expiry_fences_the_stale_committer(pool: PgPool) {
+        // F4: the crash-recovery race. Agent 1 claims a part; its claim ages past the
+        // lease; another claim re-wins it (here the same store, after backdating
+        // claimed_at) and gets a FRESH fencing token. Agent 1 then finishes and tries
+        // to commit — the row is `draining` again (under the new claim), so the bare
+        // status guard would wrongly accept it and unlink the SSD copy. The claim_seq
+        // guard rejects the stale commit (PartClaimLost) while the live claim commits.
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        let first = store.claim_part().await.unwrap().expect("the pending part is claimable");
+
+        sqlx::query("UPDATE cephor_replication_status SET claimed_at = now() - interval '1 hour' WHERE object_id = $1")
+            .bind(p.object().as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let second = store.claim_part().await.unwrap().expect("the stale claim is re-won past the lease");
+        assert_ne!(first.claim_seq(), second.claim_seq(), "the re-claim gets a fresh fencing token");
+
+        let err = store.mark_replicated(&first, &PartVerified::for_test()).await.unwrap_err();
+        let expected = p.relative_dir().to_string_lossy().into_owned();
+        assert!(
+            matches!(err, StoreError::PartClaimLost { ref part } if part.as_ref() == expected),
+            "the stale claimant is fenced out, got: {err:?}",
+        );
+        assert_eq!(
+            store.status(&p).await.unwrap(),
+            Some(ReplicationState::Draining),
+            "the fenced commit leaves the live claim's draining row untouched",
+        );
+        store.mark_replicated(&second, &PartVerified::for_test()).await.unwrap();
+        assert_eq!(store.status(&p).await.unwrap(), Some(ReplicationState::Replicated));
     }
 
     #[sqlx::test]
@@ -1271,6 +1417,49 @@ mod part_tests {
         assert_eq!(report.recovered, 1, "the dropped-trigger part was recovered to pending");
 
         let claimed = store.claim_part().await.unwrap().expect("the recovered part is claimable");
+        assert_eq!(claimed.part(), &p);
+    }
+
+    #[sqlx::test]
+    async fn reconcile_adopts_a_legacy_nodeless_pending_part(pool: PgPool) {
+        // G2: a `pending` row with no owning node (written before node-scoping) is
+        // invisible to the node-scoped claim_part, so it never drains. The reconciler
+        // on the node that still holds the part on SSD adopts it (stamps its node_id)
+        // via the idempotent record_landed UPSERT, making it claimable again.
+        use crate::reconcile::{DiscoveredPart, PartScan, reconcile_parts};
+        use core::future::Future;
+
+        struct OnePart(DiscoveredPart);
+        impl PartScan for OnePart {
+            fn scan_parts(&self) -> impl Future<Output = std::io::Result<Vec<DiscoveredPart>>> + Send {
+                let parts = vec![self.0.clone()];
+                async move { Ok(parts) }
+            }
+        }
+
+        let p = part(UUID_A, 5, 1);
+        sqlx::query(
+            "INSERT INTO cephor_replication_status (object_id, version, part_number, status, node_id) \
+             VALUES ($1, $2, $3, 'pending', NULL)",
+        )
+        .bind(p.object().as_str())
+        .bind(i64::from(p.version().get()))
+        .bind(i64::from(p.part().get()))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let node_b = Store::from_pool(pool.clone()).with_node_id("node-b");
+        assert!(
+            node_b.claim_part().await.unwrap().is_none(),
+            "a NULL-node row is unclaimable by any node before adoption",
+        );
+
+        let scanner = OnePart(DiscoveredPart { part: p.clone() });
+        let report = reconcile_parts(&scanner, &node_b).await.unwrap();
+        assert_eq!(report.adopted, 1, "the legacy nodeless row was adopted by the scanning node");
+
+        let claimed = node_b.claim_part().await.unwrap().expect("the adopted part is now claimable by node-b");
         assert_eq!(claimed.part(), &p);
     }
 }
