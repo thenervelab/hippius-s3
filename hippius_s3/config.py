@@ -78,6 +78,18 @@ class Config:
     enable_bypass_credit_check: bool = env("HIPPIUS_BYPASS_CREDIT_CHECK:false", convert=lambda x: x.lower() == "true")
     read_only_mode: bool = env("HIPPIUS_READ_ONLY_MODE:false", convert=lambda x: x.lower() == "true")
 
+    # s3-2.1 PR-7: drain-gated upload. When true, the api persists object_versions.address
+    # and does NOT enqueue the backend upload at PUT/MPU-complete; the upload-promoter
+    # enqueues it once the part replicates to ceph (LISTEN cephor_replicated + a periodic
+    # sweep backstop). When false (default), the api enqueues at PUT time as today.
+    drain_gated_upload_enabled: bool = env(
+        "HIPPIUS_DRAIN_GATED_UPLOAD_ENABLED:false", convert=lambda x: x.lower() == "true"
+    )
+    # How often the upload-promoter sweeps for replicated-but-unpromoted parts (the
+    # backstop for a missed NOTIFY), and the max parts promoted per sweep.
+    promoter_sweep_interval_seconds: float = env("HIPPIUS_PROMOTER_SWEEP_INTERVAL_SECONDS:30", convert=float)
+    promoter_sweep_batch: int = env("HIPPIUS_PROMOTER_SWEEP_BATCH:512", convert=int)
+
     # S3 Validation Limits
     min_bucket_name_length: int = env("MIN_BUCKET_NAME_LENGTH", convert=int)
     max_bucket_name_length: int = env("MAX_BUCKET_NAME_LENGTH", convert=int)
