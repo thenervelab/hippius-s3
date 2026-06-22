@@ -172,85 +172,58 @@ async def test_root_path_does_not_purge(app: Any, captured_purges: list[tuple[st
 
 
 @pytest.mark.asyncio
-async def test_host_header_propagated(app: Any, captured_purges: list[tuple[str, str]]) -> None:
+async def test_purge_host_is_constant_ignoring_inbound_host(app: Any, captured_purges: list[tuple[str, str]]) -> None:
+    """ATS keys its cache on the remapped upstream, so the key is identical for
+    every public alias — the PURGE uses a fixed canonical host (ats_purge_host),
+    never the client's. Inbound Host of s3-staging must not change the target."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://s3-staging.hippius.com") as client:
         r = await client.put("/mybucket/k", content=b"x")
     assert r.status_code == 200
-    assert captured_purges == [("s3-staging.hippius.com", "mybucket/k")]
+    assert captured_purges == [("s3.hippius.com", "mybucket/k")]
 
 
 @pytest.mark.asyncio
-async def test_x_forwarded_host_wins_over_inbound_host(app: Any, captured_purges: list[tuple[str, str]]) -> None:
-    """In prod the on-wire Host is the upstream rewritten by ATS — the public
-    Host that built the cache key lives on x-forwarded-host. Must use that."""
+async def test_forwarded_host_is_ignored(app: Any, captured_purges: list[tuple[str, str]]) -> None:
+    """x-forwarded-host / x-original-host are NOT replayed onto the PURGE — the
+    cache key is host-agnostic so the canonical host is always used."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://192.168.1.199:30081") as client:
         r = await client.put(
             "/mybucket/k",
             content=b"x",
-            headers={"x-forwarded-host": "s3.hippius.com"},
+            headers={"x-forwarded-host": "eu-central-1.hippius.com", "x-original-host": "us-east-1.hippius.com"},
         )
     assert r.status_code == 200
     assert captured_purges == [("s3.hippius.com", "mybucket/k")]
 
 
 @pytest.mark.asyncio
-async def test_x_original_host_used_when_no_x_forwarded_host(app: Any, captured_purges: list[tuple[str, str]]) -> None:
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://192.168.1.199:30081") as client:
-        r = await client.put(
-            "/mybucket/k",
-            content=b"x",
-            headers={"x-original-host": "eu-central-1.hippius.com"},
-        )
+async def test_internal_service_dns_host_does_not_leak_into_purge(
+    app: Any, captured_purges: list[tuple[str, str]]
+) -> None:
+    """Regression for the PURGE storm: JuiceFS / in-cluster writers reach the
+    gateway with an internal Host (k8s service DNS) that ATS cannot remap. The
+    PURGE must still target the canonical host, not the unmappable internal one
+    (which produced ERR_INVALID_URL on ATS)."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://gateway.hippius-s3-prod.svc.cluster.local:8080"
+    ) as client:
+        r = await client.put("/hippius-juicefs-data/hippius-fs/chunks/0/566/566312_4_4194304", content=b"x")
     assert r.status_code == 200
-    assert captured_purges == [("eu-central-1.hippius.com", "mybucket/k")]
+    assert captured_purges == [("s3.hippius.com", "hippius-juicefs-data/hippius-fs/chunks/0/566/566312_4_4194304")]
 
 
 @pytest.mark.asyncio
-async def test_default_port_stripped_from_host(app: Any, captured_purges: list[tuple[str, str]]) -> None:
-    """`s3.hippius.com:80` and `s3.hippius.com` must produce the same cache
-    key — the cachekey.so plugin keys on the URL including port, but HTTP
-    clients omit default ports in the URL the GET uses."""
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://x") as client:
-        r = await client.put(
-            "/mybucket/k",
-            content=b"x",
-            headers={"x-forwarded-host": "s3.hippius.com:80"},
-        )
-    assert r.status_code == 200
-    assert captured_purges == [("s3.hippius.com", "mybucket/k")]
-
-
-@pytest.mark.asyncio
-async def test_falls_back_to_default_host_when_no_headers(
+async def test_purge_host_honors_env_override(
     app: Any, captured_purges: list[tuple[str, str]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """For requests with no usable Host hint (in-cluster service DNS that
-    doesn't map cleanly), fall back to s3.hippius.com so PURGEs at least hit
-    a remap-mapped name instead of being rejected as ERR_INVALID_URL."""
-    # ASGITransport always sends a Host header; simulate the no-host case by
-    # invoking the middleware directly with a constructed scope.
-    from fastapi import Request as _Request
-
-    captured_purges.clear()
-    scope = {
-        "type": "http",
-        "method": "PUT",
-        "path": "/mybucket/k",
-        "raw_path": b"/mybucket/k",
-        "query_string": b"",
-        "headers": [],  # no host at all
-        "scheme": "http",
-        "server": ("testserver", 80),
-        "client": ("127.0.0.1", 1234),
-        "state": {},
-    }
-    request = _Request(scope)
-
-    async def _next(req: _Request) -> Response:
-        return Response(status_code=200, content=b"ok")
-
-    await ats_purge_middleware(request, _next)
-    assert captured_purges == [("s3.hippius.com", "mybucket/k")]
+    """A staging gateway sets ATS_PURGE_HOST to its own public host so it purges
+    the staging pool, not prod (the cache boxes serve both)."""
+    monkeypatch.setenv("ATS_PURGE_HOST", "s3-staging.hippius.com")
+    gateway_config._config = None
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://anything") as client:
+        r = await client.put("/mybucket/k", content=b"x")
+    assert r.status_code == 200
+    assert captured_purges == [("s3-staging.hippius.com", "mybucket/k")]
 
 
 @pytest.mark.asyncio

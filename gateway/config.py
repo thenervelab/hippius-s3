@@ -144,6 +144,15 @@ class GatewayConfig:
         default_factory=lambda: _parse_csv(os.getenv("ATS_CACHE_ENDPOINT", ""))
     )
 
+    # Host sent on PURGE requests. ATS keys its cache on the remapped upstream
+    # (cachekey.so), so the key is identical for every public alias — any host
+    # ATS can remap to this gateway's pool works. Must match the pool: the
+    # cache boxes also serve staging on a different upstream, so a staging
+    # gateway sets this to its own public host. NOT derived from the request:
+    # internal callers (JuiceFS service DNS, NodePort writers) carry an
+    # unmappable Host that ATS rejects as ERR_INVALID_URL.
+    ats_purge_host: str = dataclasses.field(default_factory=lambda: os.getenv("ATS_PURGE_HOST", "s3.hippius.com"))
+
     # Shared secret stamped on the X-Hippius-Auth-Probe header by an ATS header_rewrite
     # rule on the auth-host remap. The gateway short-circuits with 200 OK when the
     # header value matches (constant-time compare). Empty value disables the feature

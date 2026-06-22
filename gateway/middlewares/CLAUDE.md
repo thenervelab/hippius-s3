@@ -134,4 +134,10 @@ See [todo.md](../../todo.md) P2 for re-enablement discussion.
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
 | #8878 | 11:38 AM | 🔵 | Upload Acceleration Research Completed: No Off-the-Shelf Solution Fits All Requirements | ~1246 |
+
+### Jun 22, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #9231 | 11:28 AM | 🔴 | Fixed ATS Cache Purge Host Configuration | ~325 |
 </claude-mem-context>
