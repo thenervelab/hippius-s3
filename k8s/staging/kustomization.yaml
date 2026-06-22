@@ -17,6 +17,9 @@ resources:
   # and the per-ingest-node drain agent DaemonSet. Both use the `drain` image.
   - drain-allocator-deployment.yaml
   - drain-agent-daemonset.yaml
+  # Drain-gated upload promoter (s3-2.1 PR-7). Deploys OFF (idle) until
+  # HIPPIUS_DRAIN_GATED_UPLOAD_ENABLED is flipped on it + api-local.
+  - upload-promoter-deployment.yaml
 
 patches:
   - path: namespace-patch.yaml

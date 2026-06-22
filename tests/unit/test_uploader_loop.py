@@ -12,6 +12,7 @@ the downloader loop. These tests verify:
 from __future__ import annotations
 
 import asyncio
+import time
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -29,6 +30,8 @@ def _make_config(*, max_inflight: int) -> MagicMock:
     cfg.uploader_max_attempts = 5
     cfg.uploader_backoff_base_ms = 1
     cfg.uploader_backoff_max_ms = 10
+    cfg.uploader_not_ready_delay_seconds = 5.0
+    cfg.uploader_not_ready_max_wait_seconds = 1800.0
     cfg.redis_url = "redis://localhost:6379"
     cfg.redis_queues_url = "redis://localhost:6382"
     cfg.database_url = "postgresql://localhost/test"
@@ -43,6 +46,7 @@ def _req(name: str) -> MagicMock:
     r.chunks = []
     r.attempts = 0
     r.address = "5Addr"
+    r.first_enqueued_at = time.time()
     return r
 
 
@@ -68,6 +72,9 @@ class _Harness:
     def _make_uploader(self, *args, **kwargs):
         u = MagicMock()
         u.db = MagicMock()
+        # Default: parts already on ceph, so the drain-gate is a no-op and the loop
+        # behaves as before. The not-ready path is covered by the _handle_upload tests.
+        u.all_parts_on_pool = AsyncMock(return_value=True)
 
         async def _process(req):
             self.process_calls.append(req)
@@ -190,6 +197,7 @@ async def test_handle_upload_requeues_transient_failure():
     from unittest.mock import patch
 
     uploader = MagicMock()
+    uploader.all_parts_on_pool = AsyncMock(return_value=True)
     uploader.process_upload = AsyncMock(side_effect=ValueError("arion blip"))
     uploader._push_to_dlq = AsyncMock()
     req = _req("obj-transient")
@@ -214,6 +222,7 @@ async def test_handle_upload_dlqs_permanent_failure_and_marks_failed():
     from unittest.mock import patch
 
     uploader = MagicMock()
+    uploader.all_parts_on_pool = AsyncMock(return_value=True)
     uploader.process_upload = AsyncMock(side_effect=ValueError("malformed object"))
     uploader._push_to_dlq = AsyncMock()
     conn = AsyncMock()
@@ -234,3 +243,59 @@ async def test_handle_upload_dlqs_permanent_failure_and_marks_failed():
     enqueue.assert_not_called()
     assert conn.execute.await_count == 1
     assert "status = 'failed'" in conn.execute.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_handle_upload_defers_when_not_yet_on_ceph():
+    """An upload dequeued before the drain copied its parts to ceph is re-scheduled
+    (defer_upload_request) WITHOUT touching the retry/DLQ paths or process_upload."""
+    uploader = MagicMock()
+    uploader.all_parts_on_pool = AsyncMock(return_value=False)
+    uploader.process_upload = AsyncMock()
+    uploader._push_to_dlq = AsyncMock()
+    req = _req("obj-not-ready")
+    req.first_enqueued_at = time.time()  # just enqueued → well within the wall-clock cap
+
+    with (
+        patch.object(up, "config", _make_config(max_inflight=4)),
+        patch.object(up, "defer_upload_request", new=AsyncMock()) as defer,
+        patch.object(up, "enqueue_retry_request", new=AsyncMock()) as enqueue,
+        patch.object(up, "get_logger_with_ray_id", return_value=MagicMock()),
+    ):
+        await up._handle_upload(uploader, MagicMock(), req)
+
+    defer.assert_awaited_once()
+    assert defer.await_args.kwargs["backend_name"] == "arion"
+    uploader.process_upload.assert_not_called()
+    enqueue.assert_not_called()
+    uploader._push_to_dlq.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_upload_stops_deferring_past_max_wait():
+    """A part still absent from ceph past the wall-clock ceiling stops deferring and
+    falls through to process_upload (which routes the genuine fault to the DLQ)."""
+    uploader = MagicMock()
+    uploader.all_parts_on_pool = AsyncMock(return_value=False)
+    uploader.process_upload = AsyncMock(side_effect=RuntimeError("Missing meta"))
+    uploader._push_to_dlq = AsyncMock()
+    conn = AsyncMock()
+    db_pool = MagicMock()
+    db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=conn), __aexit__=AsyncMock()))
+    req = _req("obj-stuck")
+    req.first_enqueued_at = time.time() - 4000.0  # older than the 1800s ceiling
+
+    with (
+        patch.object(up, "config", _make_config(max_inflight=4)),
+        patch.object(up, "defer_upload_request", new=AsyncMock()) as defer,
+        patch.object(up, "classify_error", return_value="permanent"),
+        patch.object(up, "extract_http_status_code", return_value=""),
+        patch.object(up, "enqueue_retry_request", new=AsyncMock()),
+        patch.object(up, "get_metrics_collector", return_value=MagicMock()),
+        patch.object(up, "get_logger_with_ray_id", return_value=MagicMock()),
+    ):
+        await up._handle_upload(uploader, db_pool, req)
+
+    defer.assert_not_called()
+    uploader.process_upload.assert_awaited_once()
+    uploader._push_to_dlq.assert_awaited_once()

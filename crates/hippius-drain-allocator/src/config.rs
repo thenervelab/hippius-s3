@@ -15,7 +15,13 @@ use thiserror::Error;
 /// long so a brief stall does not lose leadership, short enough to fail over.
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
 /// Allocation tick period when `CEPHOR_ALLOCATOR_TICK_SECS` is unset.
-const DEFAULT_TICK: Duration = Duration::from_secs(2);
+///
+/// Each tick renews the leader lease and rewrites allocations — two hot-row writes,
+/// each a slow WAL fsync on the ceph-backed Postgres (where they were measured at
+/// 2–5 s). 5 s (was 2 s) cuts that write churn ~2.5× while still giving the 30 s lease
+/// six renewals of headroom; rate allocation does not need sub-5 s updates. Tune via
+/// `CEPHOR_ALLOCATOR_TICK_SECS` per deployment.
+const DEFAULT_TICK: Duration = Duration::from_secs(5);
 /// Heartbeats older than this are ignored when loading the fleet
 /// (`CEPHOR_FLEET_STALE_SECS`). Several agent heartbeat periods (~10s) wide.
 const DEFAULT_FLEET_STALE: Duration = Duration::from_secs(30);

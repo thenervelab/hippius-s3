@@ -7,6 +7,8 @@
 //! [`crate::runtime`]); here each call is a single, independently-testable step.
 
 use crate::localfs::{LocalFs, LocalSsd};
+use futures::stream::FuturesUnordered;
+use futures::stream::StreamExt;
 use hippius_drain_core::{DrainDecision, DrainOutcome, Enforcer, PartDrainError, PartKey, PartSource, SnapshotCell, Store, StoreError, drain_part};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -182,22 +184,32 @@ pub async fn drain_next(
     result.map(Some).map_err(DrainCycleError::from)
 }
 
-/// Drains pending parts until the backlog is empty, the enforcer throttles, or
-/// `token` is cancelled, returning how many were drained.
+/// Drains pending parts — up to `concurrency` at once — until the backlog is empty,
+/// the enforcer throttles, or `token` is cancelled, returning how many were drained.
 ///
-/// Repeats [`drain_next`] until it reports nothing more to do (an empty backlog or a
-/// throttle), so one wake handles a burst rather than a single part. A drain failure
-/// stops the run and propagates (every failed part's SSD copy is intact, so the next
-/// call resumes the backlog).
+/// Runs up to `concurrency` [`drain_next`] calls concurrently rather than one at a
+/// time. `claim_part` uses `FOR UPDATE SKIP LOCKED`, so concurrent claims take distinct
+/// parts; running them together overlaps the per-part commit `fsync`s, which on the
+/// ceph-backed Postgres are the dominant cost (each commit is a slow WAL flush), so a
+/// serial loop left the configured concurrency (the `Enforcer`'s `ConcurrencyLimiter`)
+/// unused and the backlog draining one slow commit at a time. The admission
+/// `Enforcer` still bounds the real rate/concurrency; this just stops the *driver*
+/// from being the bottleneck.
 ///
-/// Cancellation is observed at each part boundary: on shutdown a large backlog winds
-/// down within the supervisor's grace instead of running to completion and being
-/// force-aborted mid-drain — a forced abort would strand the in-flight part in
-/// `draining` until the claim lease expires (axiom `rust_quality_129_async_graceful_shutdown`).
+/// A `drain_next` returning `None` (empty backlog or a throttle/denial) stops claiming
+/// new work, but in-flight drains are awaited to completion — never abandoned
+/// mid-flight, since dropping one at its await would strand its part in `draining`
+/// until the claim lease expires. A drain *failure* likewise stops new claims and is
+/// surfaced (the first one) only after the in-flight set drains; each failed
+/// `drain_next` has already released its own part.
+///
+/// Cancellation is observed before claiming each new part: on shutdown the burst stops
+/// taking work immediately and only the already-started drains finish, so the worker
+/// exits well within the supervisor's grace (axiom `rust_quality_129_async_graceful_shutdown`).
 ///
 /// # Errors
 ///
-/// The first [`DrainCycleError`] a cycle hits.
+/// The first [`DrainCycleError`] a cycle hits (after the in-flight set has drained).
 pub async fn drain_until_empty(
     ceph: &LocalFs,
     ssd: &LocalSsd,
@@ -205,19 +217,51 @@ pub async fn drain_until_empty(
     enforcer: Option<&Arc<Mutex<Enforcer>>>,
     snapshot: Option<&SnapshotCell>,
     token: &CancellationToken,
+    concurrency: usize,
 ) -> Result<u64, DrainCycleError> {
-    let mut drained = 0;
-    // Check cancellation at the top of each cycle (the part boundary): a started drain
-    // always runs to its own completion — verify-before-unlink makes that the safe
-    // point — but the burst stops claiming new work the moment shutdown is signalled,
-    // so the worker exits well within the grace window.
-    while !token.is_cancelled() {
-        if drain_next(ceph, ssd, store, enforcer, snapshot).await?.is_none() {
+    let concurrency = concurrency.max(1);
+    let mut drained = 0u64;
+    let mut first_err: Option<DrainCycleError> = None;
+    // Cleared by an empty backlog, a throttle, a failure, or cancellation — once we
+    // stop refilling we only wind down the in-flight set.
+    let mut refill = true;
+    let mut inflight = FuturesUnordered::new();
+
+    // Prime the in-flight set (stopping early on cancellation).
+    for _ in 0..concurrency {
+        if token.is_cancelled() {
+            refill = false;
             break;
         }
-        drained += 1;
+        inflight.push(drain_next(ceph, ssd, store, enforcer, snapshot));
     }
-    Ok(drained)
+
+    // Pushing into a FuturesUnordered while iterating it is supported; the `.next()`
+    // borrow ends before the body runs, so the refill push is safe.
+    while let Some(outcome) = inflight.next().await {
+        match outcome {
+            Ok(Some(_)) => {
+                drained += 1;
+                if refill && !token.is_cancelled() {
+                    inflight.push(drain_next(ceph, ssd, store, enforcer, snapshot));
+                } else {
+                    refill = false;
+                }
+            }
+            Ok(None) => refill = false,
+            Err(err) => {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+                refill = false;
+            }
+        }
+    }
+
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(drained),
+    }
 }
 
 #[cfg(test)]
@@ -485,8 +529,11 @@ mod tests {
         store.record_landed_part(&part_at(5, 2)).await.unwrap();
 
         // The burst drains the good part then fails on the bad one. The #10 fix:
-        // the part drained before the failure is NOT discarded.
-        drain_until_empty(&ceph, &ssd, &store, None, Some(&snapshot), &token).await.unwrap_err();
+        // the part drained before the failure is NOT discarded. concurrency=1 keeps the
+        // strict landed_at order this test asserts on.
+        drain_until_empty(&ceph, &ssd, &store, None, Some(&snapshot), &token, 1)
+            .await
+            .unwrap_err();
         let counts = snapshot.load();
         assert_eq!(counts.drained, 1, "the part drained before the failure is kept");
         assert_eq!(counts.failed, 1, "the failed part is counted once");
@@ -508,10 +555,30 @@ mod tests {
         }
 
         let token = CancellationToken::new();
-        let drained = drain_until_empty(&ceph, &ssd, &store, None, None, &token).await.unwrap();
+        let drained = drain_until_empty(&ceph, &ssd, &store, None, None, &token, 4).await.unwrap();
         assert_eq!(drained, 3, "every pending part was drained in one run");
         // The backlog is now empty.
-        assert_eq!(drain_until_empty(&ceph, &ssd, &store, None, None, &token).await.unwrap(), 0);
+        assert_eq!(drain_until_empty(&ceph, &ssd, &store, None, None, &token, 4).await.unwrap(), 0);
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn drain_until_empty_refills_beyond_the_initial_concurrency_wave(pool: PgPool) {
+        // F14: a backlog larger than the concurrency must still drain fully — the
+        // in-flight set is refilled as each drain completes, not capped at one wave.
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let pool_dir = tempfile::tempdir().unwrap();
+        let ssd = LocalSsd::new(ssd_dir.path());
+        let ceph = LocalFs::new(pool_dir.path());
+        let store = Store::from_pool(pool);
+
+        for number in 1..=8_u32 {
+            seed_part(ssd_dir.path(), &store, &part_at(5, number), &[b"backlog part"]).await;
+        }
+
+        let token = CancellationToken::new();
+        let drained = drain_until_empty(&ceph, &ssd, &store, None, None, &token, 3).await.unwrap();
+        assert_eq!(drained, 8, "all 8 parts drained with concurrency 3 (refill works)");
+        assert_eq!(drain_until_empty(&ceph, &ssd, &store, None, None, &token, 3).await.unwrap(), 0);
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
@@ -532,7 +599,7 @@ mod tests {
         // honors the supervisor's grace instead of being force-aborted mid-backlog.
         let token = CancellationToken::new();
         token.cancel();
-        let drained = drain_until_empty(&ceph, &ssd, &store, None, None, &token).await.unwrap();
+        let drained = drain_until_empty(&ceph, &ssd, &store, None, None, &token, 4).await.unwrap();
         assert_eq!(drained, 0, "a cancelled drain stops before touching the backlog");
     }
 }

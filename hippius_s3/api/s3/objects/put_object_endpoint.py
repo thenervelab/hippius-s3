@@ -20,6 +20,7 @@ from hippius_s3.config import get_config
 from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.utils import get_query
+from hippius_s3.writer.db import set_object_version_address
 from hippius_s3.writer.object_writer import ObjectWriter
 from hippius_s3.writer.queue import enqueue_upload as writer_enqueue_upload
 
@@ -200,16 +201,27 @@ async def handle_put_object(
             "put_object.enqueue_upload",
             attributes={"upload_id": str(put_res.upload_id), "has_upload_id": True},
         ):
-            await writer_enqueue_upload(
-                address=request.state.account.main_account,
-                bucket_name=bucket_name,
-                object_key=object_key,
-                object_id=str(put_res.object_id),
-                object_version=int(put_res.object_version),
-                upload_id=str(put_res.upload_id),
-                chunk_ids=[1],
-                ray_id=getattr(request.state, "ray_id", "no-ray-id"),
-            )
+            if config.drain_gated_upload_enabled:
+                # Drain-gated path (s3-2.1 PR-7): do NOT enqueue the backend upload here —
+                # the part isn't on ceph yet. Persist the address so the upload-promoter
+                # can rebuild the request and enqueue once the drain replicates the part.
+                await set_object_version_address(
+                    request.app.state.postgres_pool,
+                    object_id=str(put_res.object_id),
+                    object_version=int(put_res.object_version),
+                    address=request.state.account.main_account,
+                )
+            else:
+                await writer_enqueue_upload(
+                    address=request.state.account.main_account,
+                    bucket_name=bucket_name,
+                    object_key=object_key,
+                    object_id=str(put_res.object_id),
+                    object_version=int(put_res.object_version),
+                    upload_id=str(put_res.upload_id),
+                    chunk_ids=[1],
+                    ray_id=getattr(request.state, "ray_id", "no-ray-id"),
+                )
 
         # Mark upload completed only AFTER a successful enqueue. If enqueue fails above, this is
         # skipped so the row stays is_completed=FALSE and remains eligible for the DELETE cascade

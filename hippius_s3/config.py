@@ -78,6 +78,18 @@ class Config:
     enable_bypass_credit_check: bool = env("HIPPIUS_BYPASS_CREDIT_CHECK:false", convert=lambda x: x.lower() == "true")
     read_only_mode: bool = env("HIPPIUS_READ_ONLY_MODE:false", convert=lambda x: x.lower() == "true")
 
+    # s3-2.1 PR-7: drain-gated upload. When true, the api persists object_versions.address
+    # and does NOT enqueue the backend upload at PUT/MPU-complete; the upload-promoter
+    # enqueues it once the part replicates to ceph (LISTEN cephor_replicated + a periodic
+    # sweep backstop). When false (default), the api enqueues at PUT time as today.
+    drain_gated_upload_enabled: bool = env(
+        "HIPPIUS_DRAIN_GATED_UPLOAD_ENABLED:false", convert=lambda x: x.lower() == "true"
+    )
+    # How often the upload-promoter sweeps for replicated-but-unpromoted parts (the
+    # backstop for a missed NOTIFY), and the max parts promoted per sweep.
+    promoter_sweep_interval_seconds: float = env("HIPPIUS_PROMOTER_SWEEP_INTERVAL_SECONDS:30", convert=float)
+    promoter_sweep_batch: int = env("HIPPIUS_PROMOTER_SWEEP_BATCH:512", convert=int)
+
     # S3 Validation Limits
     min_bucket_name_length: int = env("MIN_BUCKET_NAME_LENGTH", convert=int)
     max_bucket_name_length: int = env("MAX_BUCKET_NAME_LENGTH", convert=int)
@@ -172,6 +184,18 @@ class Config:
     # poll. After the window = genuine fault → raise (classifier routes
     # to DLQ as permanent).
     fs_meta_wait_seconds: float = env("HIPPIUS_FS_META_WAIT_SECONDS:30", convert=float)
+    # Drain-gating (s3-2.1 PR-7a interim). The api enqueues the backend upload at
+    # PUT/MPU-complete, before the drain has copied the parts to the shared ceph pool.
+    # An upload dequeued that early is "too early", not failed: the loop re-schedules
+    # it after this delay WITHOUT consuming the retry budget (see defer_upload_request),
+    # so it neither blocks an inflight slot polling for meta nor DLQs prematurely. The
+    # drain-gated promoter (PR-7) makes this unnecessary; until then it stops the
+    # head-of-line block + DLQ churn for large objects whose drain outlasts the wait.
+    uploader_not_ready_delay_seconds: float = env("HIPPIUS_UPLOADER_NOT_READY_DELAY_SECONDS:5", convert=float)
+    # Wall-clock ceiling (measured from first_enqueued_at) on the not-ready deferral.
+    # Past this, a part still absent from ceph is treated as a genuine fault and routed
+    # to the DLQ. Generous enough to cover normal drain lag for large MPU objects.
+    uploader_not_ready_max_wait_seconds: float = env("HIPPIUS_UPLOADER_NOT_READY_MAX_WAIT_SECONDS:1800", convert=float)
 
     # Unpinner configuration
     # How many unpin requests one unpinner pod processes concurrently (outer bounded-dispatch,

@@ -65,19 +65,31 @@ pub enum DrainOutcome {
 #[derive(Debug)]
 pub struct ClaimedPart {
     part: PartKey,
+    claim_seq: i64,
 }
 
 impl ClaimedPart {
-    /// Binds a claim to its part.
+    /// Binds a claim to its part and the fencing token the store stamped on it.
+    ///
+    /// `claim_seq` is an opaque, per-claim monotonic token the store returns from
+    /// `claim_part`; the commit (`mark_replicated`) is guarded by it so a claim
+    /// re-won after lease expiry fences the stale original claimer. Off-store callers
+    /// (unit tests of the drain pipeline that never touch Postgres) pass any value.
     #[must_use]
-    pub fn new(part: PartKey) -> Self {
-        Self { part }
+    pub fn new(part: PartKey, claim_seq: i64) -> Self {
+        Self { part, claim_seq }
     }
 
     /// The claimed part.
     #[must_use]
     pub fn part(&self) -> &PartKey {
         &self.part
+    }
+
+    /// The store fencing token stamped when this part was claimed.
+    #[must_use]
+    pub fn claim_seq(&self) -> i64 {
+        self.claim_seq
     }
 }
 
@@ -534,7 +546,8 @@ mod tests {
     }
 
     fn claim(part: &PartKey) -> ClaimedPart {
-        ClaimedPart::new(part.clone())
+        // The in-memory store below ignores the fencing token, so any value works here.
+        ClaimedPart::new(part.clone(), 0)
     }
 
     #[tokio::test]

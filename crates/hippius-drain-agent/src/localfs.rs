@@ -704,7 +704,7 @@ mod part_tests {
         let ceph = LocalFs::new(pool_dir.path());
         let store = MemPartStore::default();
         store.set(&part, ReplicationState::Pending);
-        let claim = ClaimedPart::new(part.clone());
+        let claim = ClaimedPart::new(part.clone(), 0);
 
         let outcome = drain_part(&ceph, &ssd, &store, &claim).await.unwrap();
 

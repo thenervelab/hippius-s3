@@ -25,7 +25,11 @@ pub struct ReconcileReport {
     pub scanned: u64,
     /// Had no row and were recorded as pending (a recovered missing trigger).
     pub recovered: u64,
-    /// Already pending — a worker will claim them.
+    /// Were a legacy NULL-node `pending` row this node adopted (stamped its `node_id`)
+    /// so node-scoped `claim_part` can drain them (G2). Distinct from `recovered`
+    /// (which had no row at all) and `already_pending` (already node-owned).
+    pub adopted: u64,
+    /// Already pending and node-owned — a worker will claim them.
     pub already_pending: u64,
     /// Already draining: a live claim in flight, or a stale orphan that
     /// `claim_part` re-claims once its claim outlives the lease (the H1 path).
@@ -40,7 +44,7 @@ pub struct ReconcileReport {
 }
 
 impl ReconcileReport {
-    /// The sum of the five per-status categories.
+    /// The sum of the per-status categories.
     ///
     /// Every scanned part falls into exactly one category, so this must equal
     /// [`scanned`](Self::scanned) — the report's invariant, which [`reconcile_parts`]
@@ -49,6 +53,7 @@ impl ReconcileReport {
     #[must_use]
     pub fn categorized(&self) -> u64 {
         self.recovered
+            .saturating_add(self.adopted)
             .saturating_add(self.already_pending)
             .saturating_add(self.in_flight)
             .saturating_add(self.replicated_orphan)
@@ -98,6 +103,21 @@ pub trait PartScan: Send + Sync {
     fn scan_parts(&self) -> impl Future<Output = std::io::Result<Vec<DiscoveredPart>>> + Send;
 }
 
+/// A part's stored status as the reconciler sees it: its replication state plus
+/// whether the row is an adoptable legacy row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartStatus {
+    /// The part's replication state.
+    pub state: ReplicationState,
+    /// True when the row is `pending` with no owning `node_id` — a legacy row
+    /// predating node-scoping. Such a row is invisible to the node-scoped
+    /// [`claim_part`](crate::Store::claim_part) and so never drains; the node that
+    /// still holds the part on SSD (the one scanning it now) must adopt it (stamp its
+    /// `node_id`) to make it claimable (G2). Adopting only these — never the common
+    /// node-owned `pending` row — avoids a per-cycle write on the slow store.
+    pub adoptable: bool,
+}
+
 /// The store seam the part reconciler needs: read a part's status, and record a
 /// freshly-landed part as pending. The part analogue of [`LandingLog`], implemented
 /// by [`crate::Store`] (under `pg`).
@@ -105,11 +125,12 @@ pub trait PartLandingLog: Send + Sync {
     /// Store-specific failure, boxed into [`ReconcileError::Log`].
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// The part's replication state, or `None` when the store has no row.
-    fn status(&self, part: &PartKey) -> impl Future<Output = Result<Option<ReplicationState>, Self::Error>> + Send;
+    /// The part's status (state + adoptability), or `None` when the store has no row.
+    fn status(&self, part: &PartKey) -> impl Future<Output = Result<Option<PartStatus>, Self::Error>> + Send;
 
     /// Record a part as landed (`pending`). Idempotent: a part that already has a row
-    /// is left untouched, so a re-scan or a trigger race cannot duplicate it.
+    /// is left untouched UNLESS it is a NULL-node row, which it adopts to this node —
+    /// so the reconciler can both recover a dropped trigger and adopt a legacy row.
     fn record_landed(&self, part: &PartKey) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
@@ -139,10 +160,20 @@ where
                 log.record_landed(&discovered.part).await.map_err(ReconcileError::log)?;
                 report.recovered += 1;
             }
-            Some(ReplicationState::Pending) => report.already_pending += 1,
-            Some(ReplicationState::Draining) => report.in_flight += 1,
-            Some(ReplicationState::Replicated) => report.replicated_orphan += 1,
-            Some(ReplicationState::Failed) => report.failed += 1,
+            // A legacy NULL-node `pending` row: adopt it to this node (which holds the
+            // part on SSD — we just scanned it) via the idempotent record_landed UPSERT,
+            // so node-scoped claim_part can finally drain it (G2). Checked before the
+            // state match so an adoptable row is never miscounted as already_pending.
+            Some(status) if status.adoptable => {
+                log.record_landed(&discovered.part).await.map_err(ReconcileError::log)?;
+                report.adopted += 1;
+            }
+            Some(status) => match status.state {
+                ReplicationState::Pending => report.already_pending += 1,
+                ReplicationState::Draining => report.in_flight += 1,
+                ReplicationState::Replicated => report.replicated_orphan += 1,
+                ReplicationState::Failed => report.failed += 1,
+            },
         }
     }
     debug_assert_eq!(report.scanned, report.categorized(), "every scanned part lands in exactly one category");
@@ -152,7 +183,7 @@ where
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod part_tests {
-    use super::{DiscoveredPart, PartLandingLog, PartScan, ReconcileError, ReconcileReport, reconcile_parts};
+    use super::{DiscoveredPart, PartLandingLog, PartScan, PartStatus, ReconcileError, ReconcileReport, reconcile_parts};
     use crate::apipart::{ObjectId, PartKey, PartNumber, Version};
     use crate::state::ReplicationState;
     use core::future::Future;
@@ -195,7 +226,7 @@ mod part_tests {
     /// plus a record of every recorded part.
     #[derive(Default)]
     struct FakePartLog {
-        statuses: Mutex<HashMap<String, ReplicationState>>,
+        statuses: Mutex<HashMap<String, PartStatus>>,
         recorded: Mutex<Vec<String>>,
         fail_status: bool,
     }
@@ -208,8 +239,27 @@ mod part_tests {
         fn with(statuses: &[(&PartKey, ReplicationState)]) -> Self {
             let log = FakePartLog::default();
             for (part, state) in statuses {
-                log.statuses.lock().unwrap().insert(part_key_string(part), *state);
+                log.statuses.lock().unwrap().insert(
+                    part_key_string(part),
+                    PartStatus {
+                        state: *state,
+                        adoptable: false,
+                    },
+                );
             }
+            log
+        }
+
+        /// A log holding one legacy NULL-node `pending` row (G2): `pending` + adoptable.
+        fn with_adoptable(part: &PartKey) -> Self {
+            let log = FakePartLog::default();
+            log.statuses.lock().unwrap().insert(
+                part_key_string(part),
+                PartStatus {
+                    state: ReplicationState::Pending,
+                    adoptable: true,
+                },
+            );
             log
         }
 
@@ -221,7 +271,7 @@ mod part_tests {
     impl PartLandingLog for FakePartLog {
         type Error = io::Error;
 
-        fn status(&self, part: &PartKey) -> impl Future<Output = Result<Option<ReplicationState>, io::Error>> + Send {
+        fn status(&self, part: &PartKey) -> impl Future<Output = Result<Option<PartStatus>, io::Error>> + Send {
             let outcome = if self.fail_status {
                 Err(io::Error::other("status failed"))
             } else {
@@ -309,6 +359,7 @@ mod part_tests {
             ReconcileReport {
                 scanned: 5,
                 recovered: 1,
+                adopted: 0,
                 already_pending: 1,
                 in_flight: 1,
                 replicated_orphan: 1,
@@ -317,6 +368,29 @@ mod part_tests {
         );
         assert_eq!(report.scanned, report.categorized(), "every scanned part lands in exactly one category");
         assert_eq!(log.recorded_parts(), vec![part_key_string(&part_at(UUID_A, 1, 1))]);
+    }
+
+    #[tokio::test]
+    async fn a_legacy_nodeless_pending_part_is_adopted() {
+        // G2: a `pending` row with no owning node (a row predating node-scoping) is
+        // invisible to the node-scoped claim_part. The reconciler on the node that
+        // holds the part re-records it (adopting it to this node) rather than leaving
+        // it stuck — and does NOT count it as an ordinary already_pending row.
+        let part = part_at(UUID_A, 5, 1);
+        let scan = FakePartScan {
+            parts: vec![discovered(UUID_A, 5, 1)],
+            fail: false,
+        };
+        let log = FakePartLog::with_adoptable(&part);
+        let report = reconcile_parts(&scan, &log).await.unwrap();
+        assert_eq!(report.adopted, 1, "the legacy nodeless pending row was adopted");
+        assert_eq!(report.already_pending, 0, "an adoptable row is not an ordinary already_pending");
+        assert_eq!(report.scanned, report.categorized());
+        assert_eq!(
+            log.recorded_parts(),
+            vec![part_key_string(&part)],
+            "adoption re-records the part (the idempotent UPSERT stamps this node)",
+        );
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@ description = "cephor per-node drain daemon (runs as a DaemonSet on each ingest 
 [dependencies]
 hippius-drain-core = { workspace = true, features = ["pg"] }
 tokio = { workspace = true }
+futures = { workspace = true }
 tokio-util = { workspace = true }
 sha2 = { workspace = true }
 nix = { workspace = true }

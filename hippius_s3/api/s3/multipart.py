@@ -34,6 +34,7 @@ from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
+from hippius_s3.writer.db import set_object_version_address
 from hippius_s3.writer.object_writer import ObjectWriter
 from hippius_s3.xml_helpers import add_subelement
 from hippius_s3.xml_helpers import create_element
@@ -1035,30 +1036,42 @@ async def complete_multipart_upload(
         )
 
         # After commit, enqueue background publish
-        parts = await db.fetch(
-            get_query("list_parts_for_version"),
-            object_id,
-            object_version,
-        )
-        ray_id = getattr(request.state, "ray_id", None)
-        await enqueue_upload_request(
-            UploadChainRequest(
-                address=request.state.account.id,
-                bucket_name=bucket_name,
-                object_key=object_key,
+        if config.drain_gated_upload_enabled:
+            # Drain-gated path (s3-2.1 PR-7): persist the address instead of enqueuing —
+            # the upload-promoter enqueues each part's backend upload once the drain
+            # replicates it to ceph. Uses main_account (the upload identity, as the put
+            # path + mpu_complete do), not the subaccount id.
+            await set_object_version_address(
+                request.app.state.postgres_pool,
                 object_id=str(object_id),
                 object_version=int(object_version),
-                chunks=[
-                    Chunk(
-                        id=part["part_number"],
-                    )
-                    for part in parts
-                ],
-                upload_id=upload_id,
-                ray_id=ray_id,
-                upload_backends=get_config().upload_backends,
-            ),
-        )
+                address=request.state.account.main_account,
+            )
+        else:
+            parts = await db.fetch(
+                get_query("list_parts_for_version"),
+                object_id,
+                object_version,
+            )
+            ray_id = getattr(request.state, "ray_id", None)
+            await enqueue_upload_request(
+                UploadChainRequest(
+                    address=request.state.account.id,
+                    bucket_name=bucket_name,
+                    object_key=object_key,
+                    object_id=str(object_id),
+                    object_version=int(object_version),
+                    chunks=[
+                        Chunk(
+                            id=part["part_number"],
+                        )
+                        for part in parts
+                    ],
+                    upload_id=upload_id,
+                    ray_id=ray_id,
+                    upload_backends=get_config().upload_backends,
+                ),
+            )
 
         # Create XML response
         xml_bytes = f"""<?xml version="1.0" encoding="UTF-8"?>

@@ -17,9 +17,11 @@
 # never collide).
 #
 # Scheduling: pinned to nodes labeled `s3-staging-local-ingest=true` (the ONE list
-# lives in ingest-node-labels-staging.yaml). The cache-replicator DaemonSet selects
+# lives in ingest-node-labels-staging.yaml). The drain-agent DaemonSet selects
 # the SAME label, so they stay in lockstep. Preferred pod anti-affinity spreads the
-# 2 replicas across the labeled nodes.
+# 2 replicas across the labeled nodes. A required nodeAffinity hostname allow-list
+# (node2/node3) is belt-and-suspenders WITH the label: a stray/mislabeled node alone
+# can't place ingest on a psql/cache node — the hostname must ALSO be on the list.
 #
 # Routing: the existing `api` Service (the gateway's GATEWAY_BACKEND_URL=
 # http://api:8000 upstream) is patched to select `app: api-local`
@@ -47,6 +49,18 @@ spec:
       nodeSelector:
         s3-staging-local-ingest: "true"
       affinity:
+        # Belt-and-suspenders with the nodeSelector label: even a mislabeled node
+        # can't host ingest unless its hostname is ALSO on this allow-list. Keep in
+        # sync with ingest-node-labels-staging.yaml (the label list).
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - k8s-v3-node2
+                      - k8s-v3-node3
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
             - weight: 100
