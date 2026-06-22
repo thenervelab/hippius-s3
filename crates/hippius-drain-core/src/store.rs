@@ -688,18 +688,30 @@ impl PartReplicationStore for Store {
         // false Ok. The claim_seq is what distinguishes "I still hold it" from "someone
         // re-won it and it's draining again under them" (F4).
         let part = claim.part();
-        let affected = sqlx::query(
-            "UPDATE cephor_replication_status SET status = 'replicated', updated_at = now() \
-             WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining' AND claim_seq = $4",
+        // One statement commits the part Replicated AND emits the `cephor_replicated`
+        // notification atomically (PR-7): the pg_notify runs only for the row the
+        // fenced UPDATE matched, so a lost claim emits nothing, and the payload is bound
+        // to the same commit. The notification (`object_id:version:part`) wakes the
+        // upload-promoter to enqueue the backend upload now that the data is on ceph;
+        // the promoter ALSO sweeps replicated-but-unpromoted parts as a backstop, so a
+        // missed LISTEN (no listener at commit) costs latency, not correctness.
+        let committed = sqlx::query(
+            "WITH updated AS ( \
+                UPDATE cephor_replication_status SET status = 'replicated', updated_at = now() \
+                WHERE object_id = $1 AND version = $2 AND part_number = $3 \
+                  AND status = 'draining' AND claim_seq = $4 \
+                RETURNING object_id, version, part_number \
+             ) \
+             SELECT pg_notify('cephor_replicated', object_id || ':' || version || ':' || part_number) \
+             FROM updated",
         )
         .bind(part.object().as_str())
         .bind(i64::from(part.version().get()))
         .bind(i64::from(part.part().get()))
         .bind(claim.claim_seq())
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        if affected == 0 {
+        .fetch_optional(&self.pool)
+        .await?;
+        if committed.is_none() {
             return Err(StoreError::PartClaimLost {
                 part: part.relative_dir().to_string_lossy().into_owned().into(),
             });
@@ -1270,6 +1282,30 @@ mod part_tests {
         let claimed = store.claim_part().await.unwrap().unwrap();
         store.mark_replicated(&claimed, &PartVerified::for_test()).await.unwrap();
         assert_eq!(store.status(&p).await.unwrap(), Some(ReplicationState::Replicated));
+    }
+
+    #[sqlx::test]
+    async fn mark_replicated_emits_a_cephor_replicated_notification(pool: PgPool) {
+        // PR-7: committing a part Replicated emits `cephor_replicated` = object:version:part
+        // so the upload-promoter can enqueue the backend upload now the data is on ceph.
+        use sqlx::postgres::PgListener;
+
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        let claimed = store.claim_part().await.unwrap().unwrap();
+
+        // LISTEN before the commit, or the fire-and-forget notification is missed.
+        let mut listener = PgListener::connect_with(&pool).await.unwrap();
+        listener.listen("cephor_replicated").await.unwrap();
+
+        store.mark_replicated(&claimed, &PartVerified::for_test()).await.unwrap();
+
+        let notification = tokio::time::timeout(std::time::Duration::from_secs(5), listener.recv())
+            .await
+            .expect("a cephor_replicated notification within 5s")
+            .unwrap();
+        assert_eq!(notification.payload(), format!("{UUID_A}:5:1"));
     }
 
     #[sqlx::test]

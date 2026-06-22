@@ -9,6 +9,27 @@ from typing import Any
 from hippius_s3.utils import get_query
 
 
+async def set_object_version_address(
+    db: Any,
+    *,
+    object_id: str,
+    object_version: int,
+    address: str,
+) -> None:
+    """Persist the main-account address on an object version (s3-2.1 PR-7).
+
+    Written by the api on the drain-gated promoter path in place of the PUT-time
+    enqueue, so the upload-promoter can rebuild the UploadChainRequest by object_id
+    once the part replicates to ceph.
+    """
+    await db.execute(
+        get_query("set_object_version_address"),
+        object_id,
+        int(object_version),
+        address,
+    )
+
+
 async def upsert_object_basic(
     db: Any,
     *,
