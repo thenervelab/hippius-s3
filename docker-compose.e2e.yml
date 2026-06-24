@@ -289,9 +289,11 @@ services:
       - CEPHOR_POOL_ROOT=/var/lib/hippius/object_cache
       - REDIS_QUEUES_URL=redis://redis-queues:6379
       - HIPPIUS_UPLOAD_BACKENDS=arion
-      # Tight polls so a freshly-landed part drains within the e2e wait windows.
+      # Tight polls + short deferral backoff so a freshly-landed (and a just-completed
+      # MPU's) part drains within the e2e wait windows.
       - CEPHOR_RECONCILE_POLL_SECS=2
       - CEPHOR_DRAIN_POLL_SECS=1
+      - CEPHOR_DEFER_BACKOFF_SECS=2
       - RUST_LOG=info
     volumes:
       - /var/lib/hippius/local_object_cache:/var/lib/hippius/local_object_cache

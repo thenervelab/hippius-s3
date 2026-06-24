@@ -226,6 +226,13 @@ pub struct Lease {
 /// [`Store::with_claim_lease`].
 const DEFAULT_CLAIM_LEASE: Duration = Duration::from_mins(5);
 
+/// The default deferral backoff: how long a part that deferred (enqueue not ready —
+/// `object_versions.address` not finalized yet) is parked before `claim_part` will
+/// re-claim it. Short enough that a just-completed MPU's parts upload promptly, long
+/// enough that the drain does not spin on not-ready parts every poll. Override via
+/// [`Store::with_defer_backoff`].
+const DEFAULT_DEFER_BACKOFF: Duration = Duration::from_secs(5);
+
 /// Handle to the Postgres central state. Cheap to clone (shares the pool).
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -233,6 +240,10 @@ pub struct Store {
     /// How long a `draining` claim is honored before [`Store::claim_chunk`]
     /// treats it as abandoned and re-claims it (the H1 crash-recovery TTL).
     claim_lease: Duration,
+    /// How long a deferred part is backed off before it is re-claimable, so the
+    /// drain does not re-claim a not-ready part on every poll (which would starve
+    /// the ready ones). Applied by [`Store::defer_part`], honored by `claim_part`.
+    defer_backoff: Duration,
     /// The agent's node id. Parts live on node-local SSD, so a part may only be
     /// drained by the node that holds it: `record_landed_part` stamps this and
     /// `claim_part` scopes to it. `None` for the allocator, which records/claims
@@ -251,6 +262,7 @@ impl Store {
         Ok(Self {
             pool,
             claim_lease: DEFAULT_CLAIM_LEASE,
+            defer_backoff: DEFAULT_DEFER_BACKOFF,
             node_id: None,
         })
     }
@@ -264,6 +276,7 @@ impl Store {
         Self {
             pool,
             claim_lease: DEFAULT_CLAIM_LEASE,
+            defer_backoff: DEFAULT_DEFER_BACKOFF,
             node_id: Some("test-node".to_owned()),
         }
     }
@@ -273,6 +286,14 @@ impl Store {
     #[must_use]
     pub fn with_claim_lease(mut self, lease: Duration) -> Self {
         self.claim_lease = lease;
+        self
+    }
+
+    /// Sets the deferral backoff (the daemon wires this from `CEPHOR_DEFER_BACKOFF_SECS`).
+    /// A part that defers is not re-claimable until `backoff` has elapsed.
+    #[must_use]
+    pub fn with_defer_backoff(mut self, backoff: Duration) -> Self {
+        self.defer_backoff = backoff;
         self
     }
 
@@ -606,7 +627,7 @@ impl Store {
              WHERE (object_id, version, part_number) IN ( \
                 SELECT object_id, version, part_number FROM cephor_replication_status \
                 WHERE node_id = $2 \
-                  AND ( status = 'pending' \
+                  AND ( (status = 'pending' AND (deferred_until IS NULL OR deferred_until <= now())) \
                         OR (status = 'draining' AND claimed_at < now() - $1 * interval '1 second') ) \
                 ORDER BY landed_at \
                 FOR UPDATE SKIP LOCKED LIMIT 1 \
@@ -628,13 +649,43 @@ impl Store {
     ///
     /// [`StoreError::Database`] on failure.
     pub async fn release_part(&self, part: &PartKey) -> Result<()> {
+        // Clear deferred_until too: a release is the Ceph-failure retry path, which
+        // should be re-claimable immediately — it must not inherit a stale backoff a
+        // prior deferral parked on the row.
         sqlx::query(
-            "UPDATE cephor_replication_status SET status = 'pending', updated_at = now(), claimed_at = NULL \
+            "UPDATE cephor_replication_status SET status = 'pending', updated_at = now(), claimed_at = NULL, deferred_until = NULL \
              WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining'",
         )
         .bind(part.object().as_str())
         .bind(i64::from(part.version().get()))
         .bind(i64::from(part.part().get()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Returns a claimed (`draining`) part to `pending` but backed off for
+    /// [`defer_backoff`](Store::with_defer_backoff) — the path for a part whose drain
+    /// deferred because its upload enqueue was not ready yet (the object's address is
+    /// not finalized). `claim_part` skips a `pending` row whose `deferred_until` is
+    /// still in the future, so the drain stops re-claiming the same not-ready part on
+    /// every poll (which would spin on it and starve the parts that are ready). Guarded
+    /// on `draining` like [`release_part`](Store::release_part), so a late defer cannot
+    /// resurrect a finished part.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on failure.
+    pub async fn defer_part(&self, part: &PartKey) -> Result<()> {
+        sqlx::query(
+            "UPDATE cephor_replication_status \
+             SET status = 'pending', updated_at = now(), claimed_at = NULL, deferred_until = now() + $4 * interval '1 second' \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining'",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .bind(self.defer_backoff.as_secs_f64())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1669,5 +1720,61 @@ mod part_tests {
 
         let v2 = store.load_upload_context(&part(UUID_A, 2, 1)).await.unwrap().expect("v2 context");
         assert_eq!(v2.upload_id, None, "the simple-PUT version must not inherit the prior MPU's upload_id");
+    }
+
+    // --- deferral backoff (a NotReady part must not be re-claimed every poll) ---
+
+    #[sqlx::test]
+    async fn a_deferred_part_is_not_reclaimable_until_its_backoff_elapses(pool: PgPool) {
+        // An enqueue deferral (object address not finalized yet) backs the part off so
+        // the drain stops re-claiming it on every poll — which would otherwise spin on
+        // not-ready parts and starve the parts that ARE ready to upload. It becomes
+        // claimable again only once deferred_until elapses.
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        assert_eq!(store.claim_part().await.unwrap().as_ref().map(ClaimedPart::part), Some(&p));
+
+        store.defer_part(&p).await.unwrap();
+        assert!(
+            store.claim_part().await.unwrap().is_none(),
+            "a freshly deferred part is backed off, not immediately re-claimable",
+        );
+
+        // Backdating deferred_until is the only deterministic way to fast-forward the
+        // backoff clock (it is the server clock, like the claim lease).
+        sqlx::query("UPDATE cephor_replication_status SET deferred_until = now() - interval '1 second' WHERE object_id = $1")
+            .bind(p.object().as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            store.claim_part().await.unwrap().is_some(),
+            "once the backoff elapses the deferred part is claimable again",
+        );
+    }
+
+    #[sqlx::test]
+    async fn release_part_clears_a_prior_deferral_backoff(pool: PgPool) {
+        // A Ceph-write failure (release_part) must retry promptly, so it clears any
+        // backoff a prior deferral set rather than leaving the part parked.
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        store.claim_part().await.unwrap().unwrap();
+        store.defer_part(&p).await.unwrap();
+        assert!(store.claim_part().await.unwrap().is_none(), "deferred -> backed off");
+
+        sqlx::query("UPDATE cephor_replication_status SET deferred_until = now() - interval '1 second' WHERE object_id = $1")
+            .bind(p.object().as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+        store.claim_part().await.unwrap().expect("claimable after the backoff elapsed");
+        store.release_part(&p).await.unwrap();
+        assert!(
+            store.claim_part().await.unwrap().is_some(),
+            "release clears the backoff, so a Ceph-failed part retries immediately",
+        );
     }
 }

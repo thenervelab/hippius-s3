@@ -41,6 +41,7 @@ async fn main() -> Result<(), StartupError> {
         Store::connect(&config.database_url)
             .await?
             .with_claim_lease(config.claim_lease)
+            .with_defer_backoff(config.defer_backoff)
             .with_node_id(config.node_id.as_str()),
     );
 

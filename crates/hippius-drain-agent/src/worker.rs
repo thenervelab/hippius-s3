@@ -185,16 +185,25 @@ pub async fn drain_next<E: UploadEnqueuer>(
     if result.is_err() {
         // A non-terminal drain failure leaves the part claimed (`draining`) with its
         // SSD copy intact. Return it to `pending` now so a live agent retries on the
-        // next wake instead of waiting out the claim lease (the H1 fix). The
-        // `draining` guard in `release_part` makes this a no-op for a part a terminal
-        // step already advanced (e.g. a byte mismatch moved it to `failed`).
-        // Best-effort: if the release itself fails — likely the same store outage that
-        // failed the drain — the lease-TTL re-claim is the backstop, so we keep
+        // next wake instead of waiting out the claim lease (the H1 fix). The `draining`
+        // guard in both store calls makes this a no-op for a part a terminal step
+        // already advanced (e.g. a byte mismatch moved it to `failed`).
+        //
+        // A DEFERRAL (enqueue not ready — the object's address is not finalized yet)
+        // is backed off via `defer_part`, not released immediately: otherwise the drain
+        // re-claims the same not-ready part on every poll and spins on it, starving the
+        // parts that ARE ready to upload. A genuine Ceph-write failure releases promptly.
+        // Best-effort: if the release/defer itself fails — likely the same store outage
+        // that failed the drain — the lease-TTL re-claim is the backstop, so we keep
         // surfacing the original drain error.
-        if let Err(release_err) = store.release_part(claim.part()).await {
+        let returned = match signal {
+            BreakerSignal::Deferred => store.defer_part(claim.part()).await,
+            _ => store.release_part(claim.part()).await,
+        };
+        if let Err(release_err) = returned {
             tracing::warn!(
                 ?release_err,
-                "failed to release claim after a drain error; the claim lease will recover it"
+                "failed to return the claim after a drain error; the claim lease will recover it"
             );
         }
     }

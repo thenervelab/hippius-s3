@@ -35,6 +35,11 @@ const DEFAULT_ALLOCATION_POLL: Duration = Duration::from_secs(2);
 /// Mirrors the store-side default; long enough not to reclaim a live slow drain,
 /// short enough to recover a crashed claim promptly.
 const DEFAULT_CLAIM_LEASE: Duration = Duration::from_mins(5);
+/// Deferral backoff when `CEPHOR_DEFER_BACKOFF_SECS` is unset: how long a part whose
+/// drain deferred (enqueue not ready — the object's address is not finalized yet) is
+/// parked before it is re-claimable, so the drain does not spin on not-ready parts every
+/// poll. Mirrors the store-side default.
+const DEFAULT_DEFER_BACKOFF: Duration = Duration::from_secs(5);
 /// Allocation staleness window when `CEPHOR_ALLOCATION_STALE_SECS` is unset: past
 /// it the allocator is treated as silent on this node and the rate decays toward
 /// the floor (a few allocator ticks — the allocator tick is ~2s).
@@ -70,6 +75,9 @@ pub struct Config {
     /// How long a `draining` claim is honored before another agent re-claims it
     /// (the H1 crash-recovery TTL; wired into the store via `with_claim_lease`).
     pub claim_lease: Duration,
+    /// How long a deferred (enqueue-not-ready) part is backed off before re-claim,
+    /// wired into the store via `with_defer_backoff`.
+    pub defer_backoff: Duration,
     /// How long a stored allocation stays authoritative before the agent treats
     /// the allocator as silent and decays toward the floor (M1 conservation).
     pub allocation_stale: Duration,
@@ -167,6 +175,7 @@ impl Config {
             decay_half_life: duration_secs(&get, "CEPHOR_DECAY_HALF_LIFE_SECS", DEFAULT_DECAY_HALF_LIFE)?,
             allocation_poll: duration_secs(&get, "CEPHOR_ALLOCATION_POLL_SECS", DEFAULT_ALLOCATION_POLL)?,
             claim_lease: duration_secs(&get, "CEPHOR_CLAIM_LEASE_TTL_SECS", DEFAULT_CLAIM_LEASE)?,
+            defer_backoff: duration_secs(&get, "CEPHOR_DEFER_BACKOFF_SECS", DEFAULT_DEFER_BACKOFF)?,
             allocation_stale: duration_secs(&get, "CEPHOR_ALLOCATION_STALE_SECS", DEFAULT_ALLOCATION_STALE)?,
             redis_queues_url: required(&get, "REDIS_QUEUES_URL")?,
             upload_backends: parse_backends(&get, "HIPPIUS_UPLOAD_BACKENDS"),
