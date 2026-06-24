@@ -82,7 +82,11 @@ def test_dlq_requeue_multipart_upload(
         # DLQ is stored in redis-queues (port 6382), not main redis
         r_queues = _redis.Redis.from_url("redis://localhost:6382/0")
         found = False
-        for _ in range(130):
+        # Drain-direct adds a pipeline stage before the upload is even attempted: the
+        # drain must reconcile the completed MPU's parts, copy them to the pool, and
+        # enqueue the UploadChainRequest before the uploader fails against the downed
+        # Arion and DLQs. Widen the window from the old immediate-enqueue model.
+        for _ in range(300):
             entries = list(r_queues.lrange("arion_upload_requests:dlq", 0, -1))  # type: ignore[arg-type]
             for entry_json in entries:
                 import json as _json
