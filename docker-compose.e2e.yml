@@ -294,6 +294,11 @@ services:
       - CEPHOR_RECONCILE_POLL_SECS=2
       - CEPHOR_DRAIN_POLL_SECS=1
       - CEPHOR_DEFER_BACKOFF_SECS=2
+      # e2e does not exercise rate limiting; give the drain effectively-unlimited
+      # bandwidth so the token bucket never depletes across the suite and parts
+      # replicate within the tests' backend-ready wait windows.
+      - CEPHOR_FLOOR_RATE_BPS=10000000000
+      - CEPHOR_MAX_DRAIN_RATE_BPS=10000000000
       - RUST_LOG=hippius_drain_agent=debug,info
     volumes:
       - /var/lib/hippius/local_object_cache:/var/lib/hippius/local_object_cache
