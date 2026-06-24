@@ -273,6 +273,37 @@ pub enum DrainDecision {
     Denied(DenyReason),
 }
 
+/// How a completed drain attempt should inform the Ceph circuit breaker.
+///
+/// The breaker is a signal of *Ceph* health, so only the copy/verify/commit phase
+/// feeds it. The post-write enqueue (turning a replicated part into a backend upload
+/// request) runs AFTER Ceph has already accepted the write, so its failures say
+/// nothing about Ceph and must not trip the breaker — hence the third, neutral
+/// variant. Replaces the prior `success: bool` parameter, which could not express
+/// "release the permit but leave the breaker alone" (axioms
+/// `rust_quality_10_enums_not_booleans`, `rust_quality_90_enum_dispatch`).
+///
+/// Deliberately NOT `#[non_exhaustive]`: this is a small, frozen classification the
+/// agent worker matches exhaustively, so adding a variant SHOULD break that match at
+/// compile time and force the new outcome to be handled, rather than silently falling
+/// into a wildcard (the `kind()`-classification case of axiom
+/// `rust_quality_151_error_representation_small_opaque`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakerSignal {
+    /// The part's copy + verify + commit to Ceph succeeded; the breaker closes and
+    /// the consecutive-failure run resets.
+    CephSuccess,
+    /// A Ceph-write step (persist / hash / cleanup / commit) failed; counts toward
+    /// tripping the breaker.
+    CephFailure,
+    /// The drain did not complete for a reason unrelated to Ceph's health — the
+    /// post-write upload enqueue deferred (the object's address is not finalized
+    /// yet, or Redis is unreachable). The permit is released so the slot is reusable,
+    /// but the breaker is left untouched: a backlog of not-yet-finalized parts (an
+    /// in-progress MPU) must not wedge the node-global Ceph breaker.
+    Deferred,
+}
+
 /// The agent's combined admission valve.
 #[derive(Debug, Clone, Copy)]
 pub struct Enforcer {
@@ -335,11 +366,17 @@ impl Enforcer {
     }
 
     /// Records a completed drain's outcome and releases its concurrency permit.
-    pub fn record_outcome(&mut self, success: bool, now: Instant) {
-        if success {
-            self.breaker.record_success();
-        } else {
-            self.breaker.record_failure(now);
+    ///
+    /// Every signal releases the permit (so the in-flight slot is always reclaimed,
+    /// matching the `PermitGuard` dismissal contract in the agent worker). Only
+    /// [`BreakerSignal::CephSuccess`]/[`CephFailure`](BreakerSignal::CephFailure)
+    /// move the breaker; [`BreakerSignal::Deferred`] is neutral — it neither trips nor
+    /// resets it, because a post-write enqueue deferral is not evidence about Ceph.
+    pub fn record_outcome(&mut self, signal: BreakerSignal, now: Instant) {
+        match signal {
+            BreakerSignal::CephSuccess => self.breaker.record_success(),
+            BreakerSignal::CephFailure => self.breaker.record_failure(now),
+            BreakerSignal::Deferred => {}
         }
         self.concurrency.release();
     }
@@ -355,7 +392,9 @@ impl Enforcer {
 
 #[cfg(test)]
 mod tests {
-    use super::{BreakerConfig, BreakerState, CircuitBreaker, ConcurrencyLimiter, DenyReason, DrainDecision, Enforcer, TokenBucket, decay_rate};
+    use super::{
+        BreakerConfig, BreakerSignal, BreakerState, CircuitBreaker, ConcurrencyLimiter, DenyReason, DrainDecision, Enforcer, TokenBucket, decay_rate,
+    };
     use crate::units::{ByteRate, Bytes};
     use proptest::prelude::*;
     use std::time::{Duration, Instant};
@@ -583,7 +622,7 @@ mod tests {
         let now = t0();
         let mut e = enforcer(now);
         assert_eq!(e.try_drain(100, now), DrainDecision::Allowed); // permit taken
-        e.record_outcome(false, now); // one failure trips threshold=1, releases permit
+        e.record_outcome(BreakerSignal::CephFailure, now); // one failure trips threshold=1, releases permit
         assert_eq!(e.try_drain(100, now), DrainDecision::Denied(DenyReason::BreakerOpen));
     }
 
@@ -592,7 +631,7 @@ mod tests {
         let now = t0();
         let mut e = enforcer(now);
         assert_eq!(e.try_drain(1_000, now), DrainDecision::Allowed);
-        e.record_outcome(true, now); // release permit so concurrency is not the blocker
+        e.record_outcome(BreakerSignal::CephSuccess, now); // release permit so concurrency is not the blocker
         assert_eq!(e.try_drain(1, now), DrainDecision::Denied(DenyReason::RateLimited));
     }
 
@@ -605,7 +644,7 @@ mod tests {
         assert_eq!(e.try_drain(100, now), DrainDecision::Denied(DenyReason::AtConcurrencyLimit));
         // The refund means the bandwidth budget was not consumed by the denied drain:
         // after releasing the permit, a 900-byte drain still fits the original 1000 burst.
-        e.record_outcome(true, now);
+        e.record_outcome(BreakerSignal::CephSuccess, now);
         assert_eq!(e.try_drain(900, now), DrainDecision::Allowed);
     }
 
@@ -623,7 +662,7 @@ mod tests {
         );
         // It paid at most one burst: the bucket is now empty, so the next drain is rate
         // limited (and the oversize part did NOT overdraw into a negative balance).
-        e.record_outcome(true, now);
+        e.record_outcome(BreakerSignal::CephSuccess, now);
         assert_eq!(e.try_drain(1, now), DrainDecision::Denied(DenyReason::RateLimited));
     }
 
@@ -649,13 +688,36 @@ mod tests {
         let now = t0();
         let mut e = enforcer(now);
         assert_eq!(e.try_drain(1_000, now), DrainDecision::Allowed);
-        e.record_outcome(true, now);
+        e.record_outcome(BreakerSignal::CephSuccess, now);
         e.set_rate(ByteRate::new(2_000)); // a larger allocation refills faster
         let later = now + Duration::from_secs(1);
         assert_eq!(
             e.try_drain(1_000, later),
             DrainDecision::Allowed,
             "refilled to the burst cap at the new rate"
+        );
+    }
+
+    #[test]
+    fn a_deferred_outcome_releases_the_permit_without_tripping_the_breaker() {
+        // P1a: a drain that copied + verified to Ceph but then deferred at the
+        // post-write enqueue (the object's address is not finalized yet, or Redis is
+        // unreachable) is NOT a Ceph-write failure — the Ceph write already succeeded.
+        // Deferring must release the concurrency permit (so the slot is reusable) yet
+        // leave the breaker untouched, so a backlog of not-yet-finalized parts (e.g. an
+        // in-progress large MPU) cannot wedge the node-global Ceph breaker. At
+        // threshold = 1 a single CephFailure would open the breaker, so surviving
+        // repeated deferrals is the proof the breaker was never signalled.
+        let now = t0();
+        let mut e = enforcer(now); // failure_threshold = 1, concurrency = 1
+        for _ in 0..5 {
+            assert_eq!(e.try_drain(100, now), DrainDecision::Allowed, "the released permit is free each round");
+            e.record_outcome(BreakerSignal::Deferred, now);
+        }
+        assert_eq!(
+            e.try_drain(100, now),
+            DrainDecision::Allowed,
+            "five deferrals neither tripped the breaker nor leaked the permit",
         );
     }
 

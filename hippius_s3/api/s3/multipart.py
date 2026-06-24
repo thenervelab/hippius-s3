@@ -29,9 +29,7 @@ from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.monitoring import get_metrics_collector
-from hippius_s3.queue import Chunk
-from hippius_s3.queue import UploadChainRequest
-from hippius_s3.queue import enqueue_upload_request
+from hippius_s3.services.mpu_cleanup import fail_version_replication
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import set_object_version_address
@@ -769,6 +767,20 @@ async def abort_multipart_upload(
                 get_query("abort_multipart_upload"),
                 upload_id,
             )
+
+        # The aborted upload's version address will never be written, so its parts and
+        # the drain's cephor_replication_status rows would otherwise leak: the reconciler
+        # keeps re-recording them and the drain keeps re-claiming + re-copying +
+        # re-deferring the enqueue forever, on every node. Mark the version's replication
+        # rows terminal so the drain stops touching them fleet-wide, and best-effort
+        # delete the parts on THIS node's local cache (other nodes' copies are left to the
+        # orphan GC; the central mark already stopped their drain churn). Best-effort: a
+        # failure here is logged, not surfaced — the abandoned-upload reaper is the backstop.
+        with contextlib.suppress(Exception):
+            await fail_version_replication(db, object_id=object_id, object_version=object_version)
+        with contextlib.suppress(Exception):
+            await request.app.state.fs_store.delete_object(str(object_id), int(object_version))
+
         # Mark aborted in Redis so listings immediately hide this upload (defensive against read lag)
         with contextlib.suppress(Exception):
             await request.app.state.redis_client.setex(f"aborted_mpu:{upload_id}", 300, "1")
@@ -1035,43 +1047,16 @@ async def complete_multipart_upload(
             seed_phrase=request.state.seed_phrase,
         )
 
-        # After commit, enqueue background publish
-        if config.drain_gated_upload_enabled:
-            # Drain-gated path (s3-2.1 PR-7): persist the address instead of enqueuing —
-            # the upload-promoter enqueues each part's backend upload once the drain
-            # replicates it to ceph. Uses main_account (the upload identity, as the put
-            # path + mpu_complete do), not the subaccount id.
-            await set_object_version_address(
-                request.app.state.postgres_pool,
-                object_id=str(object_id),
-                object_version=int(object_version),
-                address=request.state.account.main_account,
-            )
-        else:
-            parts = await db.fetch(
-                get_query("list_parts_for_version"),
-                object_id,
-                object_version,
-            )
-            ray_id = getattr(request.state, "ray_id", None)
-            await enqueue_upload_request(
-                UploadChainRequest(
-                    address=request.state.account.id,
-                    bucket_name=bucket_name,
-                    object_key=object_key,
-                    object_id=str(object_id),
-                    object_version=int(object_version),
-                    chunks=[
-                        Chunk(
-                            id=part["part_number"],
-                        )
-                        for part in parts
-                    ],
-                    upload_id=upload_id,
-                    ray_id=ray_id,
-                    upload_backends=get_config().upload_backends,
-                ),
-            )
+        # Drain-direct (s3-2.1 PR-11): the api does NOT enqueue the backend upload. It
+        # persists the main-account address (the upload identity); the Rust drain reads
+        # it and LPUSHes each part's UploadChainRequest itself, per part, as the part
+        # replicates to ceph. The drain is the sole upload producer.
+        await set_object_version_address(
+            request.app.state.postgres_pool,
+            object_id=str(object_id),
+            object_version=int(object_version),
+            address=request.state.account.main_account,
+        )
 
         # Create XML response
         xml_bytes = f"""<?xml version="1.0" encoding="UTF-8"?>

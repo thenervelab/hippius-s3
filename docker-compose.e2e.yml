@@ -26,6 +26,11 @@ services:
       - HIPPIUS_UPLOAD_BACKENDS=arion
       - HIPPIUS_DOWNLOAD_BACKENDS=arion
       - HIPPIUS_DELETE_BACKENDS=arion
+      # Drain-direct topology: the api writes parts to the node-local SSD cache; the
+      # drain copies them to the shared pool (object_cache) that the uploader reads,
+      # then unlinks the SSD copy. Reads fall back to the pool for drained parts.
+      - HIPPIUS_OBJECT_CACHE_DIR=/var/lib/hippius/local_object_cache
+      - HIPPIUS_OBJECT_CACHE_FALLBACK_DIR=/var/lib/hippius/object_cache
     depends_on:
       db:
         condition: service_healthy
@@ -45,6 +50,7 @@ services:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
       - ./.e2e/dlq_archive:/tmp/hippius_dlq_archive
+      - /var/lib/hippius/local_object_cache:/var/lib/hippius/local_object_cache
       - kms_certs:/kms_certs:ro
     networks:
       - hippius_net
@@ -247,6 +253,66 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
+    networks:
+      - hippius_net
+
+  # The hippius-drain stack — the sole producer of backend upload requests after this
+  # change. Without it the e2e api (which no longer enqueues at PUT) would never have its
+  # parts uploaded. The allocator owns + migrates the cephor_* schema and hands the agent
+  # a write budget; the agent reconciles the SSD cache, copies each complete part to the
+  # shared pool, and LPUSHes its UploadChainRequest to the upload queue.
+  drain-allocator:
+    build:
+      context: .
+      dockerfile: Dockerfile.drain
+    command: ["/usr/local/bin/hippius-drain-allocator"]
+    environment:
+      - CEPHOR_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
+      - CEPHOR_ALLOCATOR_INSTANCE_ID=e2e-allocator
+      - RUST_LOG=info
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - hippius_net
+
+  drain-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.drain
+    command: ["/usr/local/bin/hippius-drain-agent"]
+    environment:
+      - CEPHOR_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
+      - CEPHOR_NODE_ID=e2e-node
+      - CEPHOR_SSD_ROOT=/var/lib/hippius/local_object_cache
+      - CEPHOR_POOL_ROOT=/var/lib/hippius/object_cache
+      - REDIS_QUEUES_URL=redis://redis-queues:6379
+      - HIPPIUS_UPLOAD_BACKENDS=arion
+      # Tight polls + short deferral backoff so a freshly-landed (and a just-completed
+      # MPU's) part drains within the e2e wait windows.
+      - CEPHOR_RECONCILE_POLL_SECS=2
+      - CEPHOR_DRAIN_POLL_SECS=1
+      - CEPHOR_DEFER_BACKOFF_SECS=2
+      # e2e does not exercise rate limiting; give the drain effectively-unlimited
+      # bandwidth so the token bucket never depletes across the suite and parts
+      # replicate within the tests' backend-ready wait windows.
+      - CEPHOR_FLOOR_RATE_BPS=10000000000
+      - CEPHOR_MAX_DRAIN_RATE_BPS=10000000000
+      - RUST_LOG=hippius_drain_agent=debug,info
+    volumes:
+      - /var/lib/hippius/local_object_cache:/var/lib/hippius/local_object_cache
+      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
+    depends_on:
+      db:
+        condition: service_healthy
+      redis-queues:
+        condition: service_healthy
+      drain-allocator:
+        condition: service_started
+    # The allocator migrates the cephor_* schema on startup; if the agent races ahead of
+    # that its first query errors and it exits — restart retries until the tables exist.
+    restart: unless-stopped
     networks:
       - hippius_net
 

@@ -7,6 +7,7 @@
 //! separate deploy step, so the daemon needs no DDL rights.
 
 use hippius_drain_agent::config::{Config, ConfigError};
+use hippius_drain_agent::enqueue::RedisEnqueuer;
 use hippius_drain_agent::localfs::{LocalFs, LocalSsd};
 use hippius_drain_agent::runtime::{AgentRuntime, RateControl, default_enforcer};
 use hippius_drain_core::{Bytes, Store, StoreError};
@@ -14,13 +15,15 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 /// A failure bringing the daemon up. Each variant maps to a distinct operator
-/// fix: a bad environment versus an unreachable store.
+/// fix: a bad environment versus an unreachable store or Redis.
 #[derive(Debug, Error)]
 enum StartupError {
     #[error("invalid configuration")]
     Config(#[from] ConfigError),
     #[error("cannot connect to the state store")]
     Store(#[from] StoreError),
+    #[error("cannot connect to the upload-queue Redis")]
+    Redis(#[from] redis::RedisError),
 }
 
 #[tokio::main]
@@ -34,10 +37,19 @@ async fn main() -> Result<(), StartupError> {
     // Scope claims/records to this node: parts live on node-local SSD, so this agent
     // may only drain parts it holds (otherwise it claims a peer's part and fails on
     // the missing local source). See migration 0006 + Store::with_node_id.
-    let store = Store::connect(&config.database_url)
-        .await?
-        .with_claim_lease(config.claim_lease)
-        .with_node_id(config.node_id.as_str());
+    let store = Arc::new(
+        Store::connect(&config.database_url)
+            .await?
+            .with_claim_lease(config.claim_lease)
+            .with_defer_backoff(config.defer_backoff)
+            .with_node_id(config.node_id.as_str()),
+    );
+
+    // Drain-direct: the drain LPUSHes each replicated part's UploadChainRequest to the
+    // upload-queue Redis (the api no longer enqueues at PUT). A multiplexed, auto-
+    // reconnecting manager shared across the concurrent drains.
+    let redis = redis::aio::ConnectionManager::new(redis::Client::open(config.redis_queues_url.as_str())?).await?;
+    let enqueuer = Arc::new(RedisEnqueuer::new(Arc::clone(&store), redis, config.upload_backends.clone()));
 
     // The enforcer starts at the floor (conservative) with a one-second burst of
     // the node's capability; the allocation-pull worker raises it to the leader's
@@ -55,7 +67,8 @@ async fn main() -> Result<(), StartupError> {
     let runtime = AgentRuntime::new(
         Arc::new(LocalFs::new(&config.pool_root)),
         Arc::new(LocalSsd::new(&config.ssd_root)),
-        Arc::new(store),
+        store,
+        enqueuer,
         config.runtime_config(),
     )
     .with_heartbeat(config.heartbeat_config())

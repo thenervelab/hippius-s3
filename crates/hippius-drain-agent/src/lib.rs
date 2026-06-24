@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod disk;
+pub mod enqueue;
 pub mod localfs;
 pub mod runtime;
 pub mod supervisor;

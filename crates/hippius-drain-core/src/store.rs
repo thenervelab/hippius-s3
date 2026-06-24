@@ -226,6 +226,13 @@ pub struct Lease {
 /// [`Store::with_claim_lease`].
 const DEFAULT_CLAIM_LEASE: Duration = Duration::from_mins(5);
 
+/// The default deferral backoff: how long a part that deferred (enqueue not ready —
+/// `object_versions.address` not finalized yet) is parked before `claim_part` will
+/// re-claim it. Short enough that a just-completed MPU's parts upload promptly, long
+/// enough that the drain does not spin on not-ready parts every poll. Override via
+/// [`Store::with_defer_backoff`].
+const DEFAULT_DEFER_BACKOFF: Duration = Duration::from_secs(5);
+
 /// Handle to the Postgres central state. Cheap to clone (shares the pool).
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -233,6 +240,10 @@ pub struct Store {
     /// How long a `draining` claim is honored before [`Store::claim_chunk`]
     /// treats it as abandoned and re-claims it (the H1 crash-recovery TTL).
     claim_lease: Duration,
+    /// How long a deferred part is backed off before it is re-claimable, so the
+    /// drain does not re-claim a not-ready part on every poll (which would starve
+    /// the ready ones). Applied by [`Store::defer_part`], honored by `claim_part`.
+    defer_backoff: Duration,
     /// The agent's node id. Parts live on node-local SSD, so a part may only be
     /// drained by the node that holds it: `record_landed_part` stamps this and
     /// `claim_part` scopes to it. `None` for the allocator, which records/claims
@@ -251,6 +262,7 @@ impl Store {
         Ok(Self {
             pool,
             claim_lease: DEFAULT_CLAIM_LEASE,
+            defer_backoff: DEFAULT_DEFER_BACKOFF,
             node_id: None,
         })
     }
@@ -264,6 +276,7 @@ impl Store {
         Self {
             pool,
             claim_lease: DEFAULT_CLAIM_LEASE,
+            defer_backoff: DEFAULT_DEFER_BACKOFF,
             node_id: Some("test-node".to_owned()),
         }
     }
@@ -273,6 +286,14 @@ impl Store {
     #[must_use]
     pub fn with_claim_lease(mut self, lease: Duration) -> Self {
         self.claim_lease = lease;
+        self
+    }
+
+    /// Sets the deferral backoff (the daemon wires this from `CEPHOR_DEFER_BACKOFF_SECS`).
+    /// A part that defers is not re-claimable until `backoff` has elapsed.
+    #[must_use]
+    pub fn with_defer_backoff(mut self, backoff: Duration) -> Self {
+        self.defer_backoff = backoff;
         self
     }
 
@@ -606,7 +627,7 @@ impl Store {
              WHERE (object_id, version, part_number) IN ( \
                 SELECT object_id, version, part_number FROM cephor_replication_status \
                 WHERE node_id = $2 \
-                  AND ( status = 'pending' \
+                  AND ( (status = 'pending' AND (deferred_until IS NULL OR deferred_until <= now())) \
                         OR (status = 'draining' AND claimed_at < now() - $1 * interval '1 second') ) \
                 ORDER BY landed_at \
                 FOR UPDATE SKIP LOCKED LIMIT 1 \
@@ -628,13 +649,43 @@ impl Store {
     ///
     /// [`StoreError::Database`] on failure.
     pub async fn release_part(&self, part: &PartKey) -> Result<()> {
+        // Clear deferred_until too: a release is the Ceph-failure retry path, which
+        // should be re-claimable immediately — it must not inherit a stale backoff a
+        // prior deferral parked on the row.
         sqlx::query(
-            "UPDATE cephor_replication_status SET status = 'pending', updated_at = now(), claimed_at = NULL \
+            "UPDATE cephor_replication_status SET status = 'pending', updated_at = now(), claimed_at = NULL, deferred_until = NULL \
              WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining'",
         )
         .bind(part.object().as_str())
         .bind(i64::from(part.version().get()))
         .bind(i64::from(part.part().get()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Returns a claimed (`draining`) part to `pending` but backed off for
+    /// [`defer_backoff`](Store::with_defer_backoff) — the path for a part whose drain
+    /// deferred because its upload enqueue was not ready yet (the object's address is
+    /// not finalized). `claim_part` skips a `pending` row whose `deferred_until` is
+    /// still in the future, so the drain stops re-claiming the same not-ready part on
+    /// every poll (which would spin on it and starve the parts that are ready). Guarded
+    /// on `draining` like [`release_part`](Store::release_part), so a late defer cannot
+    /// resurrect a finished part.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on failure.
+    pub async fn defer_part(&self, part: &PartKey) -> Result<()> {
+        sqlx::query(
+            "UPDATE cephor_replication_status \
+             SET status = 'pending', updated_at = now(), claimed_at = NULL, deferred_until = now() + $4 * interval '1 second' \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining'",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .bind(self.defer_backoff.as_secs_f64())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -656,6 +707,83 @@ impl Store {
         .await?;
         rows.into_iter().map(PartRow::into_pending).collect()
     }
+
+    /// Loads the non-derivable fields the agent needs to build a part's backend
+    /// `UploadChainRequest` (s3-2.1 PR-11, drain-direct enqueue): `bucket_name`,
+    /// `object_key`, the main-account `address`, and the latest `upload_id` (MPU only).
+    /// Everything else the uploader re-derives by `object_id`.
+    ///
+    /// Returns `None` when the version row is absent OR its `address` is still NULL —
+    /// the api writes `address` at PUT/MPU-complete, so a NULL means the part landed on
+    /// SSD before the api finished (a rare race). The caller treats `None` as not-ready
+    /// and retries on a later wake rather than enqueuing an incomplete request.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on query failure.
+    pub async fn load_upload_context(&self, part: &PartKey) -> Result<Option<UploadContext>> {
+        let row = sqlx::query_as::<_, UploadContextRow>(
+            // The upload_id subquery is scoped to the PART's own version via `parts`
+            // (not object_id alone): an object first uploaded via MPU and later
+            // overwritten by a simple PUT keeps a `multipart_uploads` row, so an
+            // object_id-only lookup would stamp that stale upload_id onto the
+            // simple-PUT part and flip the uploader's request name from `simple::` to
+            // `multipart::`. Keying on `parts.object_version = $2` ties the upload
+            // identity to the version actually being drained.
+            "SELECT b.bucket_name, o.object_key, ov.address, \
+                    ( SELECT mu.upload_id::text FROM parts p \
+                      JOIN multipart_uploads mu ON mu.upload_id = p.upload_id \
+                      WHERE p.object_id = o.object_id AND p.object_version = $2 \
+                      ORDER BY mu.initiated_at DESC LIMIT 1 ) AS upload_id \
+             FROM objects o \
+             JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = $2 \
+             JOIN buckets b ON b.bucket_id = o.bucket_id \
+             WHERE o.object_id = $1::uuid",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| {
+            r.address.map(|address| UploadContext {
+                object_id: part.object().as_str().to_owned(),
+                object_version: part.version().get(),
+                part_number: part.part().get(),
+                bucket_name: r.bucket_name,
+                object_key: r.object_key,
+                address,
+                upload_id: r.upload_id,
+            })
+        }))
+    }
+}
+
+/// The non-derivable fields for a part's backend upload request, read from the app
+/// tables by [`Store::load_upload_context`]. Consumed by the agent's upload enqueuer.
+#[derive(Debug, Clone)]
+pub struct UploadContext {
+    /// The object UUID (as text, the wire form).
+    pub object_id: String,
+    /// The object version.
+    pub object_version: u32,
+    /// The part number being enqueued.
+    pub part_number: u32,
+    /// The bucket the object lives in.
+    pub bucket_name: String,
+    /// The object key.
+    pub object_key: String,
+    /// The main-account address (the backend upload identity).
+    pub address: String,
+    /// The MPU upload id, if this object was a multipart upload.
+    pub upload_id: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct UploadContextRow {
+    bucket_name: String,
+    object_key: String,
+    address: Option<String>,
+    upload_id: Option<String>,
 }
 
 /// Postgres-backed part replication state for the drain orchestrator.
@@ -688,30 +816,18 @@ impl PartReplicationStore for Store {
         // false Ok. The claim_seq is what distinguishes "I still hold it" from "someone
         // re-won it and it's draining again under them" (F4).
         let part = claim.part();
-        // One statement commits the part Replicated AND emits the `cephor_replicated`
-        // notification atomically (PR-7): the pg_notify runs only for the row the
-        // fenced UPDATE matched, so a lost claim emits nothing, and the payload is bound
-        // to the same commit. The notification (`object_id:version:part`) wakes the
-        // upload-promoter to enqueue the backend upload now that the data is on ceph;
-        // the promoter ALSO sweeps replicated-but-unpromoted parts as a backstop, so a
-        // missed LISTEN (no listener at commit) costs latency, not correctness.
-        let committed = sqlx::query(
-            "WITH updated AS ( \
-                UPDATE cephor_replication_status SET status = 'replicated', updated_at = now() \
-                WHERE object_id = $1 AND version = $2 AND part_number = $3 \
-                  AND status = 'draining' AND claim_seq = $4 \
-                RETURNING object_id, version, part_number \
-             ) \
-             SELECT pg_notify('cephor_replicated', object_id || ':' || version || ':' || part_number) \
-             FROM updated",
+        let affected = sqlx::query(
+            "UPDATE cephor_replication_status SET status = 'replicated', updated_at = now() \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining' AND claim_seq = $4",
         )
         .bind(part.object().as_str())
         .bind(i64::from(part.version().get()))
         .bind(i64::from(part.part().get()))
         .bind(claim.claim_seq())
-        .fetch_optional(&self.pool)
-        .await?;
-        if committed.is_none() {
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if affected == 0 {
             return Err(StoreError::PartClaimLost {
                 part: part.relative_dir().to_string_lossy().into_owned().into(),
             });
@@ -1285,30 +1401,6 @@ mod part_tests {
     }
 
     #[sqlx::test]
-    async fn mark_replicated_emits_a_cephor_replicated_notification(pool: PgPool) {
-        // PR-7: committing a part Replicated emits `cephor_replicated` = object:version:part
-        // so the upload-promoter can enqueue the backend upload now the data is on ceph.
-        use sqlx::postgres::PgListener;
-
-        let store = Store::from_pool(pool.clone());
-        let p = part(UUID_A, 5, 1);
-        store.record_landed_part(&p).await.unwrap();
-        let claimed = store.claim_part().await.unwrap().unwrap();
-
-        // LISTEN before the commit, or the fire-and-forget notification is missed.
-        let mut listener = PgListener::connect_with(&pool).await.unwrap();
-        listener.listen("cephor_replicated").await.unwrap();
-
-        store.mark_replicated(&claimed, &PartVerified::for_test()).await.unwrap();
-
-        let notification = tokio::time::timeout(std::time::Duration::from_secs(5), listener.recv())
-            .await
-            .expect("a cephor_replicated notification within 5s")
-            .unwrap();
-        assert_eq!(notification.payload(), format!("{UUID_A}:5:1"));
-    }
-
-    #[sqlx::test]
     async fn mark_replicated_without_a_draining_claim_is_part_claim_lost(pool: PgPool) {
         let store = Store::from_pool(pool);
         let p = part(UUID_A, 5, 1);
@@ -1497,5 +1589,192 @@ mod part_tests {
 
         let claimed = node_b.claim_part().await.unwrap().expect("the adopted part is now claimable by node-b");
         assert_eq!(claimed.part(), &p);
+    }
+
+    // --- load_upload_context (the drain-direct enqueue's read of the app tables) ---
+
+    const MPU_UPLOAD_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// Creates the minimal slice of the api schema `load_upload_context` reads
+    /// (`buckets`, `objects`, `object_versions`, `multipart_uploads`, `parts`) — only
+    /// the columns the query touches. The drain-core migrations are cephor-only, so a
+    /// contract test for the cross-table query has to stand the app tables up itself.
+    /// Executed statement-by-statement because sqlx prepares each query (the extended
+    /// protocol rejects multiple statements in one prepare).
+    async fn create_app_schema(pool: &PgPool) {
+        for ddl in [
+            "CREATE TABLE buckets (bucket_id uuid PRIMARY KEY, bucket_name text NOT NULL)",
+            "CREATE TABLE objects (object_id uuid PRIMARY KEY, bucket_id uuid NOT NULL, object_key text NOT NULL)",
+            "CREATE TABLE object_versions (object_id uuid NOT NULL, object_version bigint NOT NULL, address text, \
+             PRIMARY KEY (object_id, object_version))",
+            "CREATE TABLE multipart_uploads (upload_id uuid PRIMARY KEY, object_id uuid, initiated_at timestamptz NOT NULL)",
+            "CREATE TABLE parts (object_id uuid NOT NULL, object_version bigint NOT NULL, part_number bigint NOT NULL, upload_id uuid)",
+        ] {
+            sqlx::query(ddl).execute(pool).await.unwrap();
+        }
+    }
+
+    /// Seeds one bucket + object and one of its versions (with `address`, possibly NULL).
+    async fn seed_object_version(pool: &PgPool, object: &str, version: i64, address: Option<&str>) {
+        sqlx::query("INSERT INTO buckets (bucket_id, bucket_name) VALUES ($1::uuid, 'b') ON CONFLICT DO NOTHING")
+            .bind(UUID_B)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO objects (object_id, bucket_id, object_key) VALUES ($1::uuid, $2::uuid, 'k') ON CONFLICT DO NOTHING")
+            .bind(object)
+            .bind(UUID_B)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO object_versions (object_id, object_version, address) VALUES ($1::uuid, $2, $3)")
+            .bind(object)
+            .bind(version)
+            .bind(address)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// Records a part row at `(object, version, number)` linked to `upload_id` (NULL for
+    /// a simple-PUT part). Mirrors how the api populates `parts` per object version.
+    async fn seed_part_row(pool: &PgPool, object: &str, version: i64, number: i64, upload_id: Option<&str>) {
+        sqlx::query("INSERT INTO parts (object_id, object_version, part_number, upload_id) VALUES ($1::uuid, $2, $3, $4::uuid)")
+            .bind(object)
+            .bind(version)
+            .bind(number)
+            .bind(upload_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// Records a multipart upload header (its `initiated_at` is the latest-wins tiebreak).
+    async fn seed_multipart_upload(pool: &PgPool, upload_id: &str, object: &str) {
+        sqlx::query("INSERT INTO multipart_uploads (upload_id, object_id, initiated_at) VALUES ($1::uuid, $2::uuid, now())")
+            .bind(upload_id)
+            .bind(object)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn load_upload_context_returns_the_context_when_the_address_is_set(pool: PgPool) {
+        create_app_schema(&pool).await;
+        seed_object_version(&pool, UUID_A, 5, Some("hippius-addr")).await;
+        let store = Store::from_pool(pool);
+
+        let ctx = store
+            .load_upload_context(&part(UUID_A, 5, 1))
+            .await
+            .unwrap()
+            .expect("a version with an address yields a context");
+        assert_eq!(ctx.address, "hippius-addr");
+        assert_eq!(ctx.bucket_name, "b");
+        assert_eq!(ctx.object_key, "k");
+        assert_eq!(ctx.object_version, 5);
+        assert_eq!(ctx.part_number, 1);
+        assert_eq!(ctx.upload_id, None, "a part with no multipart row is a simple upload");
+    }
+
+    #[sqlx::test]
+    async fn load_upload_context_is_none_when_the_address_is_null(pool: PgPool) {
+        // The api writes `address` at PUT/MPU-complete; until then the part is on SSD
+        // but not enqueueable, so the drain must treat it as not-ready (None), not 500.
+        create_app_schema(&pool).await;
+        seed_object_version(&pool, UUID_A, 5, None).await;
+        let store = Store::from_pool(pool);
+        assert_eq!(store.load_upload_context(&part(UUID_A, 5, 1)).await.unwrap().map(|c| c.address), None);
+    }
+
+    #[sqlx::test]
+    async fn load_upload_context_is_none_for_a_missing_version_row(pool: PgPool) {
+        create_app_schema(&pool).await;
+        seed_object_version(&pool, UUID_A, 5, Some("addr")).await;
+        let store = Store::from_pool(pool);
+        // Version 9 was never written, so the inner join drops the row entirely.
+        assert!(store.load_upload_context(&part(UUID_A, 9, 1)).await.unwrap().is_none());
+    }
+
+    #[sqlx::test]
+    async fn load_upload_context_scopes_the_upload_id_to_the_part_version(pool: PgPool) {
+        // The regression the version scope fixes: an object first uploaded via MPU
+        // (version 1) and later overwritten by a simple PUT (version 2, same object_id)
+        // must NOT stamp the stale MPU `upload_id` onto the simple-PUT part — that would
+        // flip the uploader's request name from `simple::` to `multipart::`. Keying the
+        // subquery on the part's own version (via `parts`) instead of object_id alone
+        // is what keeps each version's upload identity correct.
+        create_app_schema(&pool).await;
+        seed_multipart_upload(&pool, MPU_UPLOAD_ID, UUID_A).await;
+        // Version 1: a multipart upload — its part links to the MPU header.
+        seed_object_version(&pool, UUID_A, 1, Some("addr-v1")).await;
+        seed_part_row(&pool, UUID_A, 1, 1, Some(MPU_UPLOAD_ID)).await;
+        // Version 2: a simple PUT overwrite — its part has no upload linkage.
+        seed_object_version(&pool, UUID_A, 2, Some("addr-v2")).await;
+        seed_part_row(&pool, UUID_A, 2, 1, None).await;
+        let store = Store::from_pool(pool);
+
+        let v1 = store.load_upload_context(&part(UUID_A, 1, 1)).await.unwrap().expect("v1 context");
+        assert_eq!(v1.upload_id.as_deref(), Some(MPU_UPLOAD_ID), "the MPU version keeps its upload_id");
+
+        let v2 = store.load_upload_context(&part(UUID_A, 2, 1)).await.unwrap().expect("v2 context");
+        assert_eq!(v2.upload_id, None, "the simple-PUT version must not inherit the prior MPU's upload_id");
+    }
+
+    // --- deferral backoff (a NotReady part must not be re-claimed every poll) ---
+
+    #[sqlx::test]
+    async fn a_deferred_part_is_not_reclaimable_until_its_backoff_elapses(pool: PgPool) {
+        // An enqueue deferral (object address not finalized yet) backs the part off so
+        // the drain stops re-claiming it on every poll — which would otherwise spin on
+        // not-ready parts and starve the parts that ARE ready to upload. It becomes
+        // claimable again only once deferred_until elapses.
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        assert_eq!(store.claim_part().await.unwrap().as_ref().map(ClaimedPart::part), Some(&p));
+
+        store.defer_part(&p).await.unwrap();
+        assert!(
+            store.claim_part().await.unwrap().is_none(),
+            "a freshly deferred part is backed off, not immediately re-claimable",
+        );
+
+        // Backdating deferred_until is the only deterministic way to fast-forward the
+        // backoff clock (it is the server clock, like the claim lease).
+        sqlx::query("UPDATE cephor_replication_status SET deferred_until = now() - interval '1 second' WHERE object_id = $1")
+            .bind(p.object().as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            store.claim_part().await.unwrap().is_some(),
+            "once the backoff elapses the deferred part is claimable again",
+        );
+    }
+
+    #[sqlx::test]
+    async fn release_part_clears_a_prior_deferral_backoff(pool: PgPool) {
+        // A Ceph-write failure (release_part) must retry promptly, so it clears any
+        // backoff a prior deferral set rather than leaving the part parked.
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        store.claim_part().await.unwrap().unwrap();
+        store.defer_part(&p).await.unwrap();
+        assert!(store.claim_part().await.unwrap().is_none(), "deferred -> backed off");
+
+        sqlx::query("UPDATE cephor_replication_status SET deferred_until = now() - interval '1 second' WHERE object_id = $1")
+            .bind(p.object().as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+        store.claim_part().await.unwrap().expect("claimable after the backoff elapsed");
+        store.release_part(&p).await.unwrap();
+        assert!(
+            store.claim_part().await.unwrap().is_some(),
+            "release clears the backoff, so a Ceph-failed part retries immediately",
+        );
     }
 }

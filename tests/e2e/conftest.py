@@ -247,8 +247,19 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
             ps_out = compose_cmd(["ps"]).stdout
             (artifacts_dir / "ps.txt").write_bytes(ps_out or b"")
 
-            # service logs (best-effort)
-            for svc in ["api", "gateway", "downloader", "uploader", "unpinner"]:
+            # service logs (best-effort). Use the real compose service names — the
+            # workers are arion-* (the prior "uploader"/"downloader"/"unpinner" names
+            # matched no service, so those logs were always empty). Include the drain
+            # stack so the drain-direct upload path is diagnosable.
+            for svc in [
+                "api",
+                "gateway",
+                "arion-downloader",
+                "arion-uploader",
+                "arion-unpinner",
+                "drain-agent",
+                "drain-allocator",
+            ]:
                 log_result = compose_cmd(["logs", svc])
                 (artifacts_dir / f"{svc}.log").write_bytes(log_result.stdout or b"")
     except Exception as e:  # noqa: PERF203

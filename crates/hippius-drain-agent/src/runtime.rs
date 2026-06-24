@@ -20,7 +20,7 @@ use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
     BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, Enforcer, NodeId, NodeObservation, SnapshotCell, Store, SystemClock,
-    TokenBucket, decay_rate, reconcile_parts,
+    TokenBucket, UploadEnqueuer, decay_rate, reconcile_parts,
 };
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -114,13 +114,15 @@ pub struct RateControl {
 
 /// The drain worker's shared dependencies, bundled so the worker fn stays within
 /// the argument limit. `enforcer` is `None` for an ungated (unlimited) drain.
-#[derive(Debug)]
-struct DrainDeps {
+struct DrainDeps<E: UploadEnqueuer> {
     ceph: Arc<LocalFs>,
     ssd: Arc<LocalSsd>,
     store: Arc<Store>,
     snapshot: Arc<SnapshotCell>,
     enforcer: Option<Arc<Mutex<Enforcer>>>,
+    /// Publishes each part's backend upload request once it's durably on the pool
+    /// (drain-direct; the drain is the sole upload producer).
+    enqueuer: Arc<E>,
 }
 
 /// Drains the part backlog on each `period` poll, until `token` is cancelled.
@@ -130,7 +132,7 @@ struct DrainDeps {
 /// poll is already mid-burst). The backlog drain runs to completion before
 /// cancellation is checked, so an in-flight drain is never abandoned mid-flight
 /// (axiom `rust_quality_129_async_graceful_shutdown`).
-async fn run_drain(token: CancellationToken, period: Duration, deps: DrainDeps) {
+async fn run_drain<E: UploadEnqueuer>(token: CancellationToken, period: Duration, deps: DrainDeps<E>) {
     loop {
         // A drain failure leaves the SSD copy intact (verify-before-unlink), so it is
         // recorded and retried on the next poll; the backlog is never lost. Per-part
@@ -140,6 +142,7 @@ async fn run_drain(token: CancellationToken, period: Duration, deps: DrainDeps) 
             &deps.ceph,
             &deps.ssd,
             &deps.store,
+            deps.enqueuer.as_ref(),
             deps.enforcer.as_ref(),
             Some(&deps.snapshot),
             &token,
@@ -242,11 +245,16 @@ async fn run_alloc(token: CancellationToken, store: Arc<Store>, rate_control: Ra
 }
 
 /// The supervised agent runtime over one node's pool, cache, and store.
+///
+/// Generic over the [`UploadEnqueuer`] the drain uses to publish each replicated
+/// part's backend upload request (drain-direct). Production wires the agent's Redis
+/// enqueuer; tests inject a no-op.
 #[derive(Debug)]
-pub struct AgentRuntime {
+pub struct AgentRuntime<E: UploadEnqueuer> {
     ceph: Arc<LocalFs>,
     ssd: Arc<LocalSsd>,
     store: Arc<Store>,
+    enqueuer: Arc<E>,
     config: RuntimeConfig,
     /// Running drain counters the workers publish into; the observability layer
     /// (M9) reads them. Shared with each worker via `Arc`.
@@ -263,15 +271,16 @@ pub struct AgentRuntime {
     clock: Arc<dyn Clock>,
 }
 
-impl AgentRuntime {
+impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
     /// Builds a runtime over the given handles. The `Arc`s are cloned into each
-    /// worker, so the runtime's workers share one pool/cache/store.
+    /// worker, so the runtime's workers share one pool/cache/store/enqueuer.
     #[must_use]
-    pub fn new(ceph: Arc<LocalFs>, ssd: Arc<LocalSsd>, store: Arc<Store>, config: RuntimeConfig) -> Self {
+    pub fn new(ceph: Arc<LocalFs>, ssd: Arc<LocalSsd>, store: Arc<Store>, enqueuer: Arc<E>, config: RuntimeConfig) -> Self {
         Self {
             ceph,
             ssd,
             store,
+            enqueuer,
             config,
             snapshot: Arc::new(SnapshotCell::new()),
             heartbeat: None,
@@ -328,6 +337,7 @@ impl AgentRuntime {
             snapshot: Arc::clone(&self.snapshot),
             // The drain worker and the allocation worker share one enforcer.
             enforcer: self.rate_control.as_ref().map(|rc| Arc::clone(&rc.enforcer)),
+            enqueuer: Arc::clone(&self.enqueuer),
         };
         supervisor.spawn(WorkerName::new("drain"), move |token| run_drain(token, drain_poll, deps));
 
@@ -382,8 +392,19 @@ mod tests {
     use crate::supervisor::ShutdownTrigger;
     use core::str::FromStr;
     use hippius_drain_core::{
-        Allocation, ByteRate, Bytes, Clock, NodeId, ObjectId, PartKey, PartNumber, PartReplicationStore, ReplicationState, Store, TestClock, Version,
+        Allocation, ByteRate, Bytes, Clock, NodeId, ObjectId, PartKey, PartNumber, PartReplicationStore, ReplicationState, Store, TestClock,
+        UploadEnqueuer, Version,
     };
+
+    /// A no-op upload enqueuer for the runtime tests (drain-direct's Redis fan-out is
+    /// covered by the core partdrain tests + the agent enqueue module).
+    struct NoopEnqueuer;
+    impl UploadEnqueuer for NoopEnqueuer {
+        type Error = std::io::Error;
+        async fn enqueue(&self, _part: &PartKey) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+    }
     use sqlx::postgres::PgPool;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -450,6 +471,7 @@ mod tests {
             Arc::new(LocalFs::new(pool_dir.path())),
             Arc::new(LocalSsd::new(ssd_dir.path())),
             Arc::clone(&store),
+            Arc::new(NoopEnqueuer),
             RuntimeConfig {
                 drain_poll: Duration::from_mins(1),
                 reconcile_poll: Duration::from_mins(1),
@@ -510,6 +532,7 @@ mod tests {
             Arc::new(LocalFs::new(pool_dir.path())),
             Arc::new(LocalSsd::new(ssd_dir.path())),
             Arc::clone(&store),
+            Arc::new(NoopEnqueuer),
             RuntimeConfig {
                 drain_poll: Duration::from_mins(1),
                 reconcile_poll: Duration::from_mins(1),
@@ -589,6 +612,7 @@ mod tests {
             Arc::new(LocalFs::new(pool_dir.path())),
             Arc::new(LocalSsd::new(ssd_dir.path())),
             Arc::clone(&store),
+            Arc::new(NoopEnqueuer),
             RuntimeConfig {
                 // Park drain/reconcile; this test exercises only the heartbeat.
                 drain_poll: Duration::from_mins(1),
@@ -647,6 +671,7 @@ mod tests {
             Arc::new(LocalFs::new(pool_dir.path())),
             Arc::new(LocalSsd::new(ssd_dir.path())),
             Arc::clone(&store),
+            Arc::new(NoopEnqueuer),
             RuntimeConfig {
                 drain_poll: Duration::from_millis(20),
                 reconcile_poll: Duration::from_millis(20),
@@ -688,6 +713,7 @@ mod tests {
             Arc::new(LocalFs::new(pool_dir.path())),
             Arc::new(LocalSsd::new(ssd_dir.path())),
             Arc::clone(&store),
+            Arc::new(NoopEnqueuer),
             RuntimeConfig {
                 drain_poll: Duration::from_millis(20),
                 reconcile_poll: Duration::from_millis(50),

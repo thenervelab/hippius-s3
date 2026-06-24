@@ -205,32 +205,6 @@ async def enqueue_retry_request(
     )
 
 
-async def defer_upload_request(
-    payload: UploadChainRequest,
-    *,
-    backend_name: str,
-    delay_seconds: float,
-) -> None:
-    """Re-schedule an upload that isn't yet replicated to ceph.
-
-    Unlike ``enqueue_retry_request`` this does NOT increment ``attempts`` — a part that
-    has not drained to the shared pool yet is "too early", not a failure, so it must not
-    burn the retry budget (which would DLQ a large object before its drain finishes).
-    Reuses the same retry ZSET, so the existing ``move_due_upload_retries`` mover picks
-    it up. ``first_enqueued_at`` is preserved so the caller's wall-clock ceiling still
-    bounds how long an upload may stay un-replicated before it is treated as a fault.
-    """
-    client = get_queue_client()
-    if payload.request_id is None:
-        payload.request_id = uuid.uuid4().hex
-    if payload.first_enqueued_at is None:
-        payload.first_enqueued_at = time.time()
-    next_ts = time.time() + max(0.0, float(delay_seconds))
-    member = payload.model_dump_json()
-    zset_key = _upload_retry_zset(backend_name)
-    await client.zadd(zset_key, {member: next_ts})
-
-
 async def move_due_upload_retries(
     *,
     backend_name: str,

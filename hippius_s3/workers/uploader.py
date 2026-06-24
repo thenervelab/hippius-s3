@@ -117,20 +117,6 @@ class Uploader:
             return acquire()
         return Uploader._ConnCtx(self.db)
 
-    async def all_parts_on_pool(self, payload: UploadChainRequest) -> bool:
-        """True once every part of this request has a meta.json on the shared pool.
-
-        The drain writes meta last, so meta presence == "the part is on ceph". The loop
-        uses this to defer an upload dequeued before the drain finished copying, instead
-        of blocking an inflight slot in get_meta_with_wait or DLQ-ing prematurely.
-        Short-circuits on the first missing part.
-        """
-        object_version = int(payload.object_version or 1)
-        for chunk in payload.chunks:
-            if await self.fs_store.get_meta(payload.object_id, object_version, int(chunk.id)) is None:
-                return False
-        return True
-
     async def process_upload(self, payload: UploadChainRequest) -> List[str]:
         with tracer.start_as_current_span(
             "uploader.process_upload",

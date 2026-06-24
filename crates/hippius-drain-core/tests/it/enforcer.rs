@@ -5,7 +5,9 @@
 //! one scenario walks a single enforcer through a stream of attempts crafted to
 //! trip each gate in turn, tabulating the decision and the reason at every step.
 
-use hippius_drain_core::{BreakerConfig, ByteRate, Bytes, CircuitBreaker, ConcurrencyLimiter, DenyReason, DrainDecision, Enforcer, TokenBucket};
+use hippius_drain_core::{
+    BreakerConfig, BreakerSignal, ByteRate, Bytes, CircuitBreaker, ConcurrencyLimiter, DenyReason, DrainDecision, Enforcer, TokenBucket,
+};
 use std::time::{Duration, Instant};
 
 use crate::table::Table;
@@ -64,7 +66,7 @@ fn admission_valve_decision_stream() {
 
     // 4) Drain (1) completes successfully: it releases its permit and the success
     //    resets the breaker's failure run.
-    enforcer.record_outcome(true, t1);
+    enforcer.record_outcome(BreakerSignal::CephSuccess, t1);
 
     // 5) +1s still: the permit is free and the refund in (3) left the budget
     //    intact, so the attempt is admitted — proof the denied drain burnt nothing.
@@ -74,8 +76,8 @@ fn admission_valve_decision_stream() {
 
     // 6) Two consecutive failed Ceph writes trip the breaker (threshold = 2);
     //    once open it sheds drains fast, ahead of the bucket and the permit.
-    enforcer.record_outcome(false, t1); // failure 1 (also releases drain (5)'s permit)
-    enforcer.record_outcome(false, t1); // failure 2 -> breaker opens
+    enforcer.record_outcome(BreakerSignal::CephFailure, t1); // failure 1 (also releases drain (5)'s permit)
+    enforcer.record_outcome(BreakerSignal::CephFailure, t1); // failure 2 -> breaker opens
     let t2 = t0 + Duration::from_secs(2);
     let d6 = enforcer.try_drain(1_000, t2);
     record(&mut table, "+2s", "drain 1000 B", d6, "breaker open after 2 failures (cooldown 5s)");

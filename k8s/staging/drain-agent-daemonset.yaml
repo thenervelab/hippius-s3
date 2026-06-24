@@ -88,6 +88,16 @@ spec:
               value: /var/lib/hippius/local_object_cache
             - name: CEPHOR_POOL_ROOT
               value: /var/lib/hippius/object_cache
+            # The drain is the sole upload producer (s3-2.1 drain-direct): once a part is
+            # replicated to ceph it pushes an UploadChainRequest to {backend}_upload_requests
+            # for each configured backend. Reuse the api's queue-Redis + upload-backend list.
+            - name: REDIS_QUEUES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_QUEUES_URL
+            - name: HIPPIUS_UPLOAD_BACKENDS
+              value: "arion"
             - name: RUST_LOG
               value: "info"
           volumeMounts:

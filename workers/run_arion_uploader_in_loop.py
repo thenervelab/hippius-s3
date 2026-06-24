@@ -20,7 +20,6 @@ from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.monitoring import initialize_metrics_collector
-from hippius_s3.queue import defer_upload_request
 from hippius_s3.queue import dequeue_upload_request
 from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.queue import move_due_upload_retries
@@ -53,29 +52,8 @@ async def _handle_upload(uploader, db_pool, upload_request) -> None:
     ray_id_context.set(ray_id)
     worker_logger = get_logger_with_ray_id(__name__, ray_id)
 
-    # Drain-gating (s3-2.1 PR-7a interim): the api enqueues this upload at PUT/MPU-complete,
-    # before the drain has copied the parts to the shared ceph pool — and the workers read
-    # ceph. An upload dequeued that early can't be served, so rather than block an inflight
-    # slot polling for meta (then DLQ as "permanent"), re-schedule it after a short delay
-    # WITHOUT burning the retry budget. A generous wall-clock ceiling still routes a
-    # genuinely-stuck part to the DLQ via the normal process_upload path below.
-    if not await uploader.all_parts_on_pool(upload_request):
-        waited = time.time() - (upload_request.first_enqueued_at or time.time())
-        if waited < config.uploader_not_ready_max_wait_seconds:
-            await defer_upload_request(
-                upload_request, backend_name="arion", delay_seconds=config.uploader_not_ready_delay_seconds
-            )
-            worker_logger.info(
-                f"Deferring upload; parts not yet on ceph object_id={upload_request.object_id} "
-                f"waited={waited:.0f}s delay={config.uploader_not_ready_delay_seconds}s"
-            )
-            return
-        worker_logger.warning(
-            f"Upload parts still absent from ceph after {waited:.0f}s "
-            f"(> {config.uploader_not_ready_max_wait_seconds}s); routing to DLQ "
-            f"object_id={upload_request.object_id}"
-        )
-
+    # Drain-direct (s3-2.1 PR-11): the drain only enqueues a part AFTER it's replicated to
+    # ceph, so a dequeued request is always ceph-ready — no defer-gate needed.
     worker_logger.info(
         f"Processing Arion upload request object_id={upload_request.object_id} "
         f"chunks={len(upload_request.chunks)} attempts={upload_request.attempts or 0}"
