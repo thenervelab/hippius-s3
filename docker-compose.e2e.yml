@@ -294,7 +294,7 @@ services:
       - CEPHOR_RECONCILE_POLL_SECS=2
       - CEPHOR_DRAIN_POLL_SECS=1
       - CEPHOR_DEFER_BACKOFF_SECS=2
-      - RUST_LOG=info
+      - RUST_LOG=hippius_drain_agent=debug,info
     volumes:
       - /var/lib/hippius/local_object_cache:/var/lib/hippius/local_object_cache
       - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache

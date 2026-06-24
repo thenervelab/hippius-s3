@@ -106,6 +106,15 @@ impl UploadEnqueuer for RedisEnqueuer {
 
     async fn enqueue(&self, part: &PartKey) -> Result<(), EnqueueError> {
         let Some(ctx) = self.store.load_upload_context(part).await.map_err(EnqueueError::Store)? else {
+            // Diagnostic: name the part so a stuck/abandoned not-ready loop is traceable
+            // (the upload context is missing because object_versions.address is NULL or
+            // the version row is absent for this exact object_id/version).
+            tracing::warn!(
+                object_id = %part.object().as_str(),
+                version = part.version().get(),
+                part = part.part().get(),
+                "upload context not ready (address NULL or version row absent)",
+            );
             return Err(EnqueueError::NotReady);
         };
         let first_enqueued_at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
