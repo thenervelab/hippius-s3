@@ -155,7 +155,10 @@ mod tests {
     // (`hippius_s3.queue.UploadChainRequest.model_validate`) accepts the same bytes. If
     // either struct drifts, one of the two tests fails — the coupling the `KEEP IN SYNC`
     // comment on `UploadChainRequest` could previously only assert by inspection.
-    const GOLDEN: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/upload_chain_request.golden.json"));
+    const GOLDEN: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/upload_chain_request.golden.json"
+    ));
 
     #[test]
     fn upload_chain_request_serializes_to_the_golden_wire_shape() {

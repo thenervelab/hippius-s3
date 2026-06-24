@@ -585,7 +585,10 @@ mod tests {
         let err = drain_next(&ceph, &ssd, &store, &DeferringEnqueuer, Some(&enforcer), Some(&snapshot))
             .await
             .unwrap_err();
-        assert!(matches!(err, super::DrainCycleError::Drain(_)), "the deferral surfaces as a drain error, got {err:?}");
+        assert!(
+            matches!(err, super::DrainCycleError::Drain(_)),
+            "the deferral surfaces as a drain error, got {err:?}"
+        );
 
         let counts = snapshot.load();
         assert_eq!(counts.deferred, 1, "the enqueue deferral was counted as deferred");

@@ -392,7 +392,9 @@ impl Enforcer {
 
 #[cfg(test)]
 mod tests {
-    use super::{BreakerConfig, BreakerSignal, BreakerState, CircuitBreaker, ConcurrencyLimiter, DenyReason, DrainDecision, Enforcer, TokenBucket, decay_rate};
+    use super::{
+        BreakerConfig, BreakerSignal, BreakerState, CircuitBreaker, ConcurrencyLimiter, DenyReason, DrainDecision, Enforcer, TokenBucket, decay_rate,
+    };
     use crate::units::{ByteRate, Bytes};
     use proptest::prelude::*;
     use std::time::{Duration, Instant};
