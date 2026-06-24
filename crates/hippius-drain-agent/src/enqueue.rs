@@ -142,3 +142,41 @@ impl UploadEnqueuer for RedisEnqueuer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
+mod tests {
+    use super::Chunk;
+    use super::UploadChainRequest;
+
+    // The cross-language wire contract is pinned by a single golden fixture that BOTH
+    // sides assert against: this test checks the Rust producer serializes to it, and
+    // tests/unit/test_upload_chain_request_wire.py checks the Python consumer
+    // (`hippius_s3.queue.UploadChainRequest.model_validate`) accepts the same bytes. If
+    // either struct drifts, one of the two tests fails — the coupling the `KEEP IN SYNC`
+    // comment on `UploadChainRequest` could previously only assert by inspection.
+    const GOLDEN: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/upload_chain_request.golden.json"));
+
+    #[test]
+    fn upload_chain_request_serializes_to_the_golden_wire_shape() {
+        // Fixed field values (not SystemTime::now()) so the wire shape is deterministic.
+        let request = UploadChainRequest {
+            address: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY".to_owned(),
+            bucket_name: "my-bucket".to_owned(),
+            object_key: "path/to/key.bin".to_owned(),
+            object_id: "466916c0-d61b-4518-b81b-9576b574270a".to_owned(),
+            object_version: 5,
+            chunks: vec![Chunk { id: 1 }],
+            upload_id: Some("11111111-1111-4111-8111-111111111111".to_owned()),
+            upload_backends: vec!["arion".to_owned()],
+            request_id: None,
+            attempts: 0,
+            first_enqueued_at: 0.0,
+            bypass_billing: false,
+        };
+        // Compare as parsed JSON values so key order / whitespace are irrelevant.
+        let produced: serde_json::Value = serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        let golden: serde_json::Value = serde_json::from_str(GOLDEN).unwrap();
+        assert_eq!(produced, golden, "the Rust UploadChainRequest wire shape drifted from the golden fixture");
+    }
+}

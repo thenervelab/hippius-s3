@@ -1,0 +1,20 @@
+{
+  "address": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+  "bucket_name": "my-bucket",
+  "object_key": "path/to/key.bin",
+  "object_id": "466916c0-d61b-4518-b81b-9576b574270a",
+  "object_version": 5,
+  "chunks": [
+    {
+      "id": 1
+    }
+  ],
+  "upload_id": "11111111-1111-4111-8111-111111111111",
+  "upload_backends": [
+    "arion"
+  ],
+  "request_id": null,
+  "attempts": 0,
+  "first_enqueued_at": 0.0,
+  "bypass_billing": false
+}
