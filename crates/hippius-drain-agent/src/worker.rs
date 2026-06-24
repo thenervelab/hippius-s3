@@ -710,8 +710,16 @@ mod tests {
             .unwrap();
         assert_eq!(drained, 2, "the two ready parts drained despite part 1 deferring");
 
-        assert_eq!(status_of(&store, &part_at(5, 2)).await, Some(ReplicationState::Replicated), "ready part 2 drained");
-        assert_eq!(status_of(&store, &part_at(5, 3)).await, Some(ReplicationState::Replicated), "ready part 3 drained");
+        assert_eq!(
+            status_of(&store, &part_at(5, 2)).await,
+            Some(ReplicationState::Replicated),
+            "ready part 2 drained"
+        );
+        assert_eq!(
+            status_of(&store, &part_at(5, 3)).await,
+            Some(ReplicationState::Replicated),
+            "ready part 3 drained"
+        );
         assert_eq!(
             status_of(&store, &part_at(5, 1)).await,
             Some(ReplicationState::Pending),
