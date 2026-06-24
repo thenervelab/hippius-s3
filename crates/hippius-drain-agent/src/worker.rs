@@ -10,7 +10,8 @@ use crate::localfs::{LocalFs, LocalSsd};
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
 use hippius_drain_core::{
-    DrainDecision, DrainOutcome, Enforcer, PartDrainError, PartKey, PartSource, SnapshotCell, Store, StoreError, UploadEnqueuer, drain_part,
+    BreakerSignal, DrainDecision, DrainOutcome, Enforcer, PartDrainError, PartKey, PartSource, SnapshotCell, Store, StoreError, UploadEnqueuer,
+    drain_part,
 };
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -142,14 +143,25 @@ pub async fn drain_next<E: UploadEnqueuer>(
     let started = Instant::now();
     let result = drain_part(ceph, ssd, store, enqueuer, &claim).await;
     let elapsed = started.elapsed();
+    // Classify the drain outcome once, for both the breaker and the metrics. The
+    // upload enqueue runs only AFTER Ceph has accepted and verified the copy
+    // (partdrain.rs), so a `PartDrainError::Enqueue` (the object's address is not
+    // finalized yet — e.g. an in-progress MPU — or Redis is unreachable) is NOT
+    // evidence of Ceph unhealth: classify it as a benign deferral that releases the
+    // permit but neither trips the node-global Ceph breaker nor counts as a failure
+    // (P1a). Only a copy/verify/commit error is a Ceph-write failure. A deferred part
+    // is still returned to `pending` below, so a later re-drain retries it.
+    let signal = match &result {
+        Ok(_) => BreakerSignal::CephSuccess,
+        Err(PartDrainError::Enqueue(_)) => BreakerSignal::Deferred,
+        Err(_) => BreakerSignal::CephFailure,
+    };
     if let Some(enforcer) = enforcer {
-        // Any Ok is a Ceph-write success for the breaker; an Err is a failure.
         // record_outcome releases the permit, so the guard is dismissed afterwards.
-        let success = result.is_ok();
         enforcer
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .record_outcome(success, Instant::now());
+            .record_outcome(signal, Instant::now());
     }
     if let Some(permit) = permit {
         permit.dismiss();
@@ -158,14 +170,16 @@ pub async fn drain_next<E: UploadEnqueuer>(
     // part-drain attempts, so `error_bps` divides like units, and a burst that fails
     // midway keeps the parts it already drained (audit #10 / H2). Latency is sampled
     // only on success — a failed drain's time is not a representative Ceph-write
-    // latency for the p99 saturation signal.
+    // latency for the p99 saturation signal. A deferral is neither drained nor failed:
+    // it has its own counter so it stays out of `error_bps` (P1a).
     if let Some(snapshot) = snapshot {
-        match &result {
-            Ok(_) => {
+        match signal {
+            BreakerSignal::CephSuccess => {
                 snapshot.record_drained(1);
                 snapshot.record_latency(elapsed);
             }
-            Err(_) => snapshot.record_failed(1),
+            BreakerSignal::Deferred => snapshot.record_deferred(1),
+            BreakerSignal::CephFailure => snapshot.record_failed(1),
         }
     }
     if result.is_err() {
@@ -280,8 +294,8 @@ mod tests {
     use crate::localfs::{LocalFs, LocalSsd};
     use core::str::FromStr;
     use hippius_drain_core::{
-        BreakerConfig, ByteRate, Bytes, CircuitBreaker, ConcurrencyLimiter, DrainDecision, DrainOutcome, Enforcer, ObjectId, PartKey, PartNumber,
-        PartReplicationStore, ReplicationState, SnapshotCell, Store, TokenBucket, UploadEnqueuer, Version,
+        BreakerConfig, BreakerSignal, ByteRate, Bytes, CircuitBreaker, ConcurrencyLimiter, DrainDecision, DrainOutcome, Enforcer, ObjectId, PartKey,
+        PartNumber, PartReplicationStore, ReplicationState, SnapshotCell, Store, TokenBucket, UploadEnqueuer, Version,
     };
     use sqlx::postgres::PgPool;
     use std::path::Path;
@@ -318,6 +332,16 @@ mod tests {
         type Error = std::io::Error;
         async fn enqueue(&self, _part: &PartKey) -> Result<(), std::io::Error> {
             Ok(())
+        }
+    }
+
+    /// An enqueuer that always defers — to exercise the post-write deferral path
+    /// (`PartDrainError::Enqueue`): the Ceph copy succeeds, then the enqueue fails.
+    struct DeferringEnqueuer;
+    impl UploadEnqueuer for DeferringEnqueuer {
+        type Error = std::io::Error;
+        async fn enqueue(&self, _part: &PartKey) -> Result<(), std::io::Error> {
+            Err(std::io::Error::other("upload context not ready; will retry"))
         }
     }
 
@@ -376,7 +400,7 @@ mod tests {
             let mut guard = enforcer.lock().unwrap();
             assert_eq!(guard.try_drain(1, now), DrainDecision::Allowed);
         }
-        enforcer.lock().unwrap().record_outcome(true, now); // releases the permit
+        enforcer.lock().unwrap().record_outcome(BreakerSignal::CephSuccess, now); // releases the permit
         PermitGuard::new(&enforcer).dismiss(); // must NOT release a second time
         let mut guard = enforcer.lock().unwrap();
         assert_eq!(guard.try_drain(1, now), DrainDecision::Allowed, "the single permit is available");
@@ -529,6 +553,59 @@ mod tests {
         let counts = snapshot.load();
         assert_eq!(counts.failed, 1, "the failed part attempt was counted");
         assert_eq!(counts.drained, 0, "a failure records no drain");
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn an_enqueue_deferral_counts_as_deferred_not_failed_and_spares_the_breaker(pool: PgPool) {
+        // P1a end-to-end through drain_next: a part whose Ceph copy + verify succeed
+        // but whose post-write enqueue defers (address not finalized / Redis down)
+        // must (1) count as `deferred`, not `failed`, so error_bps stays a clean
+        // Ceph-write signal; (2) be returned to `pending` for a later re-drain; and
+        // (3) NOT signal the breaker. The enforcer's breaker trips on a single Ceph
+        // failure, so a subsequently-admitted drain is the proof the deferral never
+        // reached it — which is what kept an in-progress large MPU from wedging the
+        // whole node's drain.
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let pool_dir = tempfile::tempdir().unwrap();
+        let ssd = LocalSsd::new(ssd_dir.path());
+        let ceph = LocalFs::new(pool_dir.path());
+        let store = Store::from_pool(pool);
+        let snapshot = SnapshotCell::new();
+        let enforcer = Arc::new(Mutex::new(Enforcer::new(
+            CircuitBreaker::new(BreakerConfig {
+                failure_threshold: 1,
+                cooldown: Duration::from_secs(5),
+            }),
+            TokenBucket::new(ByteRate::new(1_000_000), Bytes::new(1_000_000), Instant::now()),
+            ConcurrencyLimiter::new(4),
+        )));
+        let part = part_at(5, 1);
+        seed_part(ssd_dir.path(), &store, &part, &[b"deferred part bytes"]).await;
+
+        let err = drain_next(&ceph, &ssd, &store, &DeferringEnqueuer, Some(&enforcer), Some(&snapshot))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, super::DrainCycleError::Drain(_)), "the deferral surfaces as a drain error, got {err:?}");
+
+        let counts = snapshot.load();
+        assert_eq!(counts.deferred, 1, "the enqueue deferral was counted as deferred");
+        assert_eq!(counts.failed, 0, "a deferral is not a Ceph-write failure");
+        assert_eq!(counts.drained, 0, "the part was not committed, so it is not drained");
+        assert_eq!(counts.error_bps(), 0, "deferrals stay out of the Ceph failure rate");
+
+        assert_eq!(
+            status_of(&store, &part).await,
+            Some(ReplicationState::Pending),
+            "a deferred part is returned to pending for a later re-drain",
+        );
+
+        // The breaker (threshold 1) never saw a failure, so a fresh drain is still
+        // admitted; the released permit means concurrency is not the blocker.
+        assert_eq!(
+            enforcer.lock().unwrap().try_drain(1, Instant::now()),
+            DrainDecision::Allowed,
+            "the deferral neither tripped the breaker nor leaked the permit",
+        );
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]

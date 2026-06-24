@@ -26,7 +26,9 @@ mod units;
 pub use alloc::{AllocConfig, Allocation, AllocationPlan, BudgetController, FleetView, NodeObservation, allocate};
 pub use apipart::{ChunkIndex, META_FILE_NAME, ObjectId, PartKey, PartNumber, PartPathError, Version, chunk_file_name, parse_part_dir};
 pub use clock::{Clock, SystemClock};
-pub use enforce::{BreakerConfig, BreakerState, CircuitBreaker, ConcurrencyLimiter, DenyReason, DrainDecision, Enforcer, TokenBucket, decay_rate};
+pub use enforce::{
+    BreakerConfig, BreakerSignal, BreakerState, CircuitBreaker, ConcurrencyLimiter, DenyReason, DrainDecision, Enforcer, TokenBucket, decay_rate,
+};
 pub use error::{Error, Result};
 pub use gc::{CephFs, GcClaim, GcError, GcOutcome, GcTarget, SsdCache, gc_object};
 pub use ids::{FileId, NodeId};

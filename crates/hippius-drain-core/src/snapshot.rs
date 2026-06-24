@@ -76,10 +76,17 @@ impl LatencyWindow {
 pub struct AgentSnapshot {
     /// Chunks drained to the pool and committed `Replicated`.
     pub drained: u64,
-    /// Failed chunk-drain attempts — one per chunk whose drain errored. Counted
-    /// per chunk (in `drain_next`), so this shares a unit with `drained` and the
-    /// two form a meaningful failure rate (see [`error_bps`](Self::error_bps)).
+    /// Failed chunk-drain attempts — one per chunk whose Ceph copy/verify/commit
+    /// errored. Counted per chunk (in `drain_next`), so this shares a unit with
+    /// `drained` and the two form a meaningful failure rate (see
+    /// [`error_bps`](Self::error_bps)). A post-write enqueue deferral is NOT a
+    /// failure — it goes to [`deferred`](Self::deferred) instead.
     pub failed: u64,
+    /// Parts whose Ceph write succeeded but whose post-write upload enqueue deferred
+    /// (the object's address is not finalized yet, or Redis is unreachable). Counted
+    /// separately from `failed` and deliberately kept OUT of `error_bps`, so the
+    /// Ceph-write failure rate is not polluted by non-Ceph deferrals.
+    pub deferred: u64,
     /// Chunks the reconciler recovered after a dropped `chunk_landed` trigger.
     pub reconciler_recovered: u64,
 }
@@ -113,6 +120,7 @@ impl AgentSnapshot {
 pub struct SnapshotCell {
     drained: AtomicU64,
     failed: AtomicU64,
+    deferred: AtomicU64,
     reconciler_recovered: AtomicU64,
     /// Recent drain latencies, behind a `Mutex` because a percentile needs the
     /// whole window (no single atomic suffices). Off the wait-free `load` path.
@@ -134,6 +142,12 @@ impl SnapshotCell {
     /// Records `n` failed chunk-drain attempts.
     pub fn record_failed(&self, n: u64) {
         self.failed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Records `n` parts whose drain deferred at the post-write enqueue (not a
+    /// Ceph-write failure — see [`AgentSnapshot::deferred`]).
+    pub fn record_deferred(&self, n: u64) {
+        self.deferred.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Adds `n` to the reconciler-recovered total.
@@ -163,6 +177,7 @@ impl SnapshotCell {
         AgentSnapshot {
             drained: self.drained.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
+            deferred: self.deferred.load(Ordering::Relaxed),
             reconciler_recovered: self.reconciler_recovered.load(Ordering::Relaxed),
         }
     }
@@ -207,9 +222,24 @@ mod tests {
             AgentSnapshot {
                 drained: 5,
                 failed: 1,
+                deferred: 0,
                 reconciler_recovered: 4,
             },
         );
+    }
+
+    #[test]
+    fn deferred_records_accumulate_without_polluting_error_bps() {
+        // P1a: a benign deferral (enqueue not-ready / Redis down) is counted for
+        // visibility but is NOT a Ceph-write failure, so it must stay out of error_bps
+        // — otherwise the p99/error saturation signal is polluted by non-Ceph events.
+        let cell = SnapshotCell::new();
+        cell.record_drained(7);
+        cell.record_failed(3);
+        cell.record_deferred(50);
+        let snap = cell.load();
+        assert_eq!(snap.deferred, 50, "deferrals are counted for visibility");
+        assert_eq!(snap.error_bps(), 3000, "deferred attempts stay out of the Ceph failure rate");
     }
 
     #[test]
@@ -225,6 +255,7 @@ mod tests {
         let snapshot = AgentSnapshot {
             drained: 0,
             failed: u64::MAX,
+            deferred: 0,
             reconciler_recovered: 0,
         };
         assert_eq!(snapshot.error_bps(), 10_000);
@@ -235,6 +266,7 @@ mod tests {
         let snapshot = AgentSnapshot {
             drained: 7,
             failed: 3,
+            deferred: 0,
             reconciler_recovered: 0,
         };
         // 3 failed attempts of 10 total attempts = 30%, i.e. 3000 basis points.
