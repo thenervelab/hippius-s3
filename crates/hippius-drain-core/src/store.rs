@@ -672,9 +672,18 @@ impl Store {
     /// [`StoreError::Database`] on query failure.
     pub async fn load_upload_context(&self, part: &PartKey) -> Result<Option<UploadContext>> {
         let row = sqlx::query_as::<_, UploadContextRow>(
+            // The upload_id subquery is scoped to the PART's own version via `parts`
+            // (not object_id alone): an object first uploaded via MPU and later
+            // overwritten by a simple PUT keeps a `multipart_uploads` row, so an
+            // object_id-only lookup would stamp that stale upload_id onto the
+            // simple-PUT part and flip the uploader's request name from `simple::` to
+            // `multipart::`. Keying on `parts.object_version = $2` ties the upload
+            // identity to the version actually being drained.
             "SELECT b.bucket_name, o.object_key, ov.address, \
-                    ( SELECT mu.upload_id::text FROM multipart_uploads mu \
-                      WHERE mu.object_id = o.object_id ORDER BY mu.initiated_at DESC LIMIT 1 ) AS upload_id \
+                    ( SELECT mu.upload_id::text FROM parts p \
+                      JOIN multipart_uploads mu ON mu.upload_id = p.upload_id \
+                      WHERE p.object_id = o.object_id AND p.object_version = $2 \
+                      ORDER BY mu.initiated_at DESC LIMIT 1 ) AS upload_id \
              FROM objects o \
              JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = $2 \
              JOIN buckets b ON b.bucket_id = o.bucket_id \
@@ -1529,5 +1538,136 @@ mod part_tests {
 
         let claimed = node_b.claim_part().await.unwrap().expect("the adopted part is now claimable by node-b");
         assert_eq!(claimed.part(), &p);
+    }
+
+    // --- load_upload_context (the drain-direct enqueue's read of the app tables) ---
+
+    const MPU_UPLOAD_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// Creates the minimal slice of the api schema `load_upload_context` reads
+    /// (`buckets`, `objects`, `object_versions`, `multipart_uploads`, `parts`) — only
+    /// the columns the query touches. The drain-core migrations are cephor-only, so a
+    /// contract test for the cross-table query has to stand the app tables up itself.
+    /// Executed statement-by-statement because sqlx prepares each query (the extended
+    /// protocol rejects multiple statements in one prepare).
+    async fn create_app_schema(pool: &PgPool) {
+        for ddl in [
+            "CREATE TABLE buckets (bucket_id uuid PRIMARY KEY, bucket_name text NOT NULL)",
+            "CREATE TABLE objects (object_id uuid PRIMARY KEY, bucket_id uuid NOT NULL, object_key text NOT NULL)",
+            "CREATE TABLE object_versions (object_id uuid NOT NULL, object_version bigint NOT NULL, address text, \
+             PRIMARY KEY (object_id, object_version))",
+            "CREATE TABLE multipart_uploads (upload_id uuid PRIMARY KEY, object_id uuid, initiated_at timestamptz NOT NULL)",
+            "CREATE TABLE parts (object_id uuid NOT NULL, object_version bigint NOT NULL, part_number bigint NOT NULL, upload_id uuid)",
+        ] {
+            sqlx::query(ddl).execute(pool).await.unwrap();
+        }
+    }
+
+    /// Seeds one bucket + object and one of its versions (with `address`, possibly NULL).
+    async fn seed_object_version(pool: &PgPool, object: &str, version: i64, address: Option<&str>) {
+        sqlx::query("INSERT INTO buckets (bucket_id, bucket_name) VALUES ($1::uuid, 'b') ON CONFLICT DO NOTHING")
+            .bind(UUID_B)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO objects (object_id, bucket_id, object_key) VALUES ($1::uuid, $2::uuid, 'k') ON CONFLICT DO NOTHING")
+            .bind(object)
+            .bind(UUID_B)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO object_versions (object_id, object_version, address) VALUES ($1::uuid, $2, $3)")
+            .bind(object)
+            .bind(version)
+            .bind(address)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// Records a part row at `(object, version, number)` linked to `upload_id` (NULL for
+    /// a simple-PUT part). Mirrors how the api populates `parts` per object version.
+    async fn seed_part_row(pool: &PgPool, object: &str, version: i64, number: i64, upload_id: Option<&str>) {
+        sqlx::query("INSERT INTO parts (object_id, object_version, part_number, upload_id) VALUES ($1::uuid, $2, $3, $4::uuid)")
+            .bind(object)
+            .bind(version)
+            .bind(number)
+            .bind(upload_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// Records a multipart upload header (its `initiated_at` is the latest-wins tiebreak).
+    async fn seed_multipart_upload(pool: &PgPool, upload_id: &str, object: &str) {
+        sqlx::query("INSERT INTO multipart_uploads (upload_id, object_id, initiated_at) VALUES ($1::uuid, $2::uuid, now())")
+            .bind(upload_id)
+            .bind(object)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn load_upload_context_returns_the_context_when_the_address_is_set(pool: PgPool) {
+        create_app_schema(&pool).await;
+        seed_object_version(&pool, UUID_A, 5, Some("hippius-addr")).await;
+        let store = Store::from_pool(pool);
+
+        let ctx = store
+            .load_upload_context(&part(UUID_A, 5, 1))
+            .await
+            .unwrap()
+            .expect("a version with an address yields a context");
+        assert_eq!(ctx.address, "hippius-addr");
+        assert_eq!(ctx.bucket_name, "b");
+        assert_eq!(ctx.object_key, "k");
+        assert_eq!(ctx.object_version, 5);
+        assert_eq!(ctx.part_number, 1);
+        assert_eq!(ctx.upload_id, None, "a part with no multipart row is a simple upload");
+    }
+
+    #[sqlx::test]
+    async fn load_upload_context_is_none_when_the_address_is_null(pool: PgPool) {
+        // The api writes `address` at PUT/MPU-complete; until then the part is on SSD
+        // but not enqueueable, so the drain must treat it as not-ready (None), not 500.
+        create_app_schema(&pool).await;
+        seed_object_version(&pool, UUID_A, 5, None).await;
+        let store = Store::from_pool(pool);
+        assert_eq!(store.load_upload_context(&part(UUID_A, 5, 1)).await.unwrap().map(|c| c.address), None);
+    }
+
+    #[sqlx::test]
+    async fn load_upload_context_is_none_for_a_missing_version_row(pool: PgPool) {
+        create_app_schema(&pool).await;
+        seed_object_version(&pool, UUID_A, 5, Some("addr")).await;
+        let store = Store::from_pool(pool);
+        // Version 9 was never written, so the inner join drops the row entirely.
+        assert!(store.load_upload_context(&part(UUID_A, 9, 1)).await.unwrap().is_none());
+    }
+
+    #[sqlx::test]
+    async fn load_upload_context_scopes_the_upload_id_to_the_part_version(pool: PgPool) {
+        // The regression the version scope fixes: an object first uploaded via MPU
+        // (version 1) and later overwritten by a simple PUT (version 2, same object_id)
+        // must NOT stamp the stale MPU `upload_id` onto the simple-PUT part — that would
+        // flip the uploader's request name from `simple::` to `multipart::`. Keying the
+        // subquery on the part's own version (via `parts`) instead of object_id alone
+        // is what keeps each version's upload identity correct.
+        create_app_schema(&pool).await;
+        seed_multipart_upload(&pool, MPU_UPLOAD_ID, UUID_A).await;
+        // Version 1: a multipart upload — its part links to the MPU header.
+        seed_object_version(&pool, UUID_A, 1, Some("addr-v1")).await;
+        seed_part_row(&pool, UUID_A, 1, 1, Some(MPU_UPLOAD_ID)).await;
+        // Version 2: a simple PUT overwrite — its part has no upload linkage.
+        seed_object_version(&pool, UUID_A, 2, Some("addr-v2")).await;
+        seed_part_row(&pool, UUID_A, 2, 1, None).await;
+        let store = Store::from_pool(pool);
+
+        let v1 = store.load_upload_context(&part(UUID_A, 1, 1)).await.unwrap().expect("v1 context");
+        assert_eq!(v1.upload_id.as_deref(), Some(MPU_UPLOAD_ID), "the MPU version keeps its upload_id");
+
+        let v2 = store.load_upload_context(&part(UUID_A, 2, 1)).await.unwrap().expect("v2 context");
+        assert_eq!(v2.upload_id, None, "the simple-PUT version must not inherit the prior MPU's upload_id");
     }
 }
