@@ -34,6 +34,17 @@ pub enum DrainCycleError {
     Drain(#[from] PartDrainError),
 }
 
+impl DrainCycleError {
+    /// Whether this is a benign deferral — the part's upload context was not ready yet
+    /// (`object_versions.address` NULL), so the part backed off rather than failed. A
+    /// deferral must not stop a [`drain_until_empty`] burst: the parts behind a not-ready
+    /// one are often ready, and starving them is what wedged the drain on in-progress or
+    /// abandoned MPUs.
+    fn is_deferral(&self) -> bool {
+        matches!(self, Self::Drain(PartDrainError::Enqueue(_)))
+    }
+}
+
 /// RAII guard that returns a taken concurrency permit if the drain unwinds or is
 /// cancelled before [`Enforcer::record_outcome`] runs.
 ///
@@ -280,6 +291,19 @@ pub async fn drain_until_empty<E: UploadEnqueuer>(
                 }
             }
             Ok(None) => refill = false,
+            Err(err) if err.is_deferral() => {
+                // A deferral is not a cycle failure: the part backed off, so keep
+                // draining the rest of the backlog instead of stopping the burst —
+                // otherwise a not-ready part (an in-progress/abandoned MPU) starves the
+                // ready parts behind it. The backoff keeps the deferred part out of the
+                // claim set, so the burst still terminates when only backed-off parts
+                // remain (claim_part then returns None).
+                if refill && !token.is_cancelled() {
+                    inflight.push(drain_next(ceph, ssd, store, enqueuer, enforcer, snapshot));
+                } else {
+                    refill = false;
+                }
+            }
             Err(err) => {
                 if first_err.is_none() {
                     first_err = Some(err);
@@ -351,6 +375,20 @@ mod tests {
         type Error = std::io::Error;
         async fn enqueue(&self, _part: &PartKey) -> Result<(), std::io::Error> {
             Err(std::io::Error::other("upload context not ready; will retry"))
+        }
+    }
+
+    /// Defers part number 1 (not ready) but enqueues every other part — to exercise that
+    /// a not-ready part does not stop the burst and starve the ready parts behind it.
+    struct DeferPartOneEnqueuer;
+    impl UploadEnqueuer for DeferPartOneEnqueuer {
+        type Error = std::io::Error;
+        async fn enqueue(&self, part: &PartKey) -> Result<(), std::io::Error> {
+            if part.part().get() == 1 {
+                Err(std::io::Error::other("upload context not ready; will retry"))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -646,6 +684,39 @@ mod tests {
         assert_eq!(counts.failed, 1, "the failed part is counted once");
         // error_bps is dimensionally clean: 1 failed of 2 attempts = 5000 bps.
         assert_eq!(counts.error_bps(), 5000, "failed attempts over total attempts");
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn a_deferred_part_does_not_starve_the_ready_parts_in_a_burst(pool: PgPool) {
+        // A not-ready part must not stop the burst: part 1 defers (backs off) but parts
+        // 2 and 3 are ready and must still replicate in the same run. concurrency=1
+        // forces serial claims so part 1 (the oldest) is reached first — without the
+        // skip-and-continue, its deferral would stop the burst before 2 and 3 drain.
+        // This is the starvation the e2e DLQ MPU hit: ready parts crowded out by
+        // not-ready ones (in-progress / abandoned MPUs).
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let pool_dir = tempfile::tempdir().unwrap();
+        let ssd = LocalSsd::new(ssd_dir.path());
+        let ceph = LocalFs::new(pool_dir.path());
+        let store = Store::from_pool(pool);
+        for number in 1..=3_u32 {
+            seed_part(ssd_dir.path(), &store, &part_at(5, number), &[b"backlog part"]).await;
+        }
+
+        let token = CancellationToken::new();
+        // A burst of only deferrals + successes is not a cycle error, so this is Ok.
+        let drained = drain_until_empty(&ceph, &ssd, &store, &DeferPartOneEnqueuer, None, None, &token, 1)
+            .await
+            .unwrap();
+        assert_eq!(drained, 2, "the two ready parts drained despite part 1 deferring");
+
+        assert_eq!(status_of(&store, &part_at(5, 2)).await, Some(ReplicationState::Replicated), "ready part 2 drained");
+        assert_eq!(status_of(&store, &part_at(5, 3)).await, Some(ReplicationState::Replicated), "ready part 3 drained");
+        assert_eq!(
+            status_of(&store, &part_at(5, 1)).await,
+            Some(ReplicationState::Pending),
+            "the deferred part is backed off (pending), not replicated and not starving the rest",
+        );
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]

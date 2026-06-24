@@ -82,7 +82,11 @@ def test_dlq_requeue_multipart_upload(
         # DLQ is stored in redis-queues (port 6382), not main redis
         r_queues = _redis.Redis.from_url("redis://localhost:6382/0")
         found = False
-        for _ in range(130):
+        # Drain-aware: under drain-direct the upload is attempted asynchronously by the
+        # drain (reconcile poll -> copy to pool -> enqueue) and only then by the uploader
+        # against the downed Arion, so the DLQ entry appears later than the old
+        # enqueue-at-complete model. Poll generously for that pipeline to run.
+        for _ in range(250):
             entries = list(r_queues.lrange("arion_upload_requests:dlq", 0, -1))  # type: ignore[arg-type]
             for entry_json in entries:
                 import json as _json
