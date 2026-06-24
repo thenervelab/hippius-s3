@@ -136,8 +136,10 @@ def test_dlq_requeue_multipart_upload(
         assert code == 0, f"Requeue command failed: {err}\n{out}"
         assert f"Successfully requeued object_id: {object_id}" in out
 
-        # Verify the object was successfully processed
-        assert wait_for_parts_cids(bucket, key, min_count=2), "Requeued parts not processed"
+        # Verify the object was successfully processed. Drain-aware: the requeued parts
+        # upload asynchronously (uploader retry backlog + the freshly-requeued request)
+        # once Arion heals, so allow generous time for both parts' chunk_backend rows.
+        assert wait_for_parts_cids(bucket, key, min_count=2, timeout_seconds=60.0), "Requeued parts not processed"
 
         # Verify the object can be retrieved
         resp = boto3_client.get_object(Bucket=bucket, Key=key)
