@@ -18,8 +18,8 @@ from datetime import datetime
 from datetime import timezone
 
 import boto3
-import pytest
 import httpx
+import pytest
 from botocore.config import Config
 
 

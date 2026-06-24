@@ -73,6 +73,12 @@ pub struct Config {
     /// How long a stored allocation stays authoritative before the agent treats
     /// the allocator as silent and decays toward the floor (M1 conservation).
     pub allocation_stale: Duration,
+    /// Redis URL for the upload queues — the drain pushes each replicated part's
+    /// `UploadChainRequest` here (drain-direct; the drain is the sole upload producer).
+    pub redis_queues_url: String,
+    /// Backends to enqueue each part's upload to (`{backend}_upload_requests`), from
+    /// `HIPPIUS_UPLOAD_BACKENDS` (comma-list). Defaults to `["arion"]`.
+    pub upload_backends: Vec<String>,
 }
 
 /// A failure parsing the daemon configuration from the environment.
@@ -162,8 +168,24 @@ impl Config {
             allocation_poll: duration_secs(&get, "CEPHOR_ALLOCATION_POLL_SECS", DEFAULT_ALLOCATION_POLL)?,
             claim_lease: duration_secs(&get, "CEPHOR_CLAIM_LEASE_TTL_SECS", DEFAULT_CLAIM_LEASE)?,
             allocation_stale: duration_secs(&get, "CEPHOR_ALLOCATION_STALE_SECS", DEFAULT_ALLOCATION_STALE)?,
+            redis_queues_url: required(&get, "REDIS_QUEUES_URL")?,
+            upload_backends: parse_backends(&get, "HIPPIUS_UPLOAD_BACKENDS"),
         })
     }
+}
+
+/// Parses a comma-separated backend list (`HIPPIUS_UPLOAD_BACKENDS`), trimming and
+/// dropping empties. Defaults to `["arion"]` when unset or empty (mirrors the Python
+/// `config.upload_backends` default).
+fn parse_backends(get: &impl Fn(&str) -> Option<String>, var: &'static str) -> Vec<String> {
+    let parsed: Vec<String> = get(var)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if parsed.is_empty() { vec!["arion".to_owned()] } else { parsed }
 }
 
 /// Resolves a required identifier variable into a validated [`NodeId`].
@@ -240,6 +262,7 @@ mod tests {
             ("CEPHOR_POOL_ROOT", "/mnt/pool"),
             ("CEPHOR_SSD_ROOT", "/mnt/ssd"),
             ("CEPHOR_NODE_ID", "node-7"),
+            ("REDIS_QUEUES_URL", "redis://localhost:6382/0"),
         ]
     }
 
@@ -429,5 +452,32 @@ mod tests {
         pairs.push(("CEPHOR_RECONCILE_POLL_SECS", "120"));
         let config = Config::from_lookup(lookup(&pairs)).unwrap();
         assert_eq!(config.reconcile_poll, Duration::from_mins(2));
+    }
+
+    #[test]
+    fn reads_the_redis_url_and_defaults_upload_backends_to_arion() {
+        let config = Config::from_lookup(lookup(&required_only())).unwrap();
+        assert_eq!(config.redis_queues_url, "redis://localhost:6382/0");
+        assert_eq!(config.upload_backends, vec!["arion".to_owned()]);
+    }
+
+    #[test]
+    fn a_missing_redis_url_is_reported() {
+        let pairs = vec![
+            ("CEPHOR_DATABASE_URL", "postgres://localhost/cephor"),
+            ("CEPHOR_POOL_ROOT", "/mnt/pool"),
+            ("CEPHOR_SSD_ROOT", "/mnt/ssd"),
+            ("CEPHOR_NODE_ID", "node-7"),
+        ];
+        let err = Config::from_lookup(lookup(&pairs)).unwrap_err();
+        assert!(matches!(err, ConfigError::Missing("REDIS_QUEUES_URL")));
+    }
+
+    #[test]
+    fn upload_backends_parses_a_trimmed_comma_list() {
+        let mut pairs = required_only();
+        pairs.push(("HIPPIUS_UPLOAD_BACKENDS", " arion , ovh "));
+        let config = Config::from_lookup(lookup(&pairs)).unwrap();
+        assert_eq!(config.upload_backends, vec!["arion".to_owned(), "ovh".to_owned()]);
     }
 }

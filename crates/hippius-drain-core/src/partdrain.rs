@@ -183,6 +183,26 @@ pub trait PartReplicationStore: Send + Sync {
     fn mark_failed(&self, part: &ClaimedPart, reason: &str) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
+/// Publishes the per-part backend upload request once the part is durably on the pool.
+///
+/// Called by [`drain_part`] **after** the verified copy + meta are persisted but
+/// **before** `mark_replicated` commits — so a crash between the enqueue and the commit
+/// leaves the part `draining`, which a later re-drain re-enqueues (a harmless duplicate;
+/// the backend uploader is idempotent). This is the at-least-once seam that lets the
+/// drain be the sole upload producer without a separate notify/sweep.
+///
+/// The trait is storage-generic (takes only a [`PartKey`]); the concrete impl lives in
+/// the agent, which loads the request fields from the store and pushes to Redis — so
+/// `hippius-drain-core` stays free of Redis and the app schema.
+pub trait UploadEnqueuer: Send + Sync {
+    /// Impl-specific failure, boxed into [`PartDrainError::Enqueue`].
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Enqueue the part's backend upload request(s). Idempotent at the consumer, so a
+    /// retry after a transient failure (or a re-drain) is safe.
+    fn enqueue(&self, part: &PartKey) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
 /// A part-drain failure. Every variant leaves the SSD copy intact, so a failed
 /// drain is always safe to retry.
 #[derive(Debug, Error)]
@@ -212,12 +232,22 @@ pub enum PartDrainError {
     /// The replication store rejected a state transition; nothing was unlinked.
     #[error("replication store rejected the drain")]
     Store(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// Enqueuing the backend upload request failed (e.g. Redis unavailable, or the
+    /// upload context isn't ready yet). The part is NOT committed, so it stays
+    /// `draining` and a later re-drain re-enqueues it — no upload is lost.
+    #[error("enqueuing the backend upload failed")]
+    Enqueue(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl PartDrainError {
     /// Box a store-specific error into [`PartDrainError::Store`].
     fn store<E: std::error::Error + Send + Sync + 'static>(err: E) -> Self {
         Self::Store(Box::new(err))
+    }
+
+    /// Box an enqueuer error into [`PartDrainError::Enqueue`].
+    fn enqueue<E: std::error::Error + Send + Sync + 'static>(err: E) -> Self {
+        Self::Enqueue(Box::new(err))
     }
 
     /// Tag an I/O error with the step at which it struck.
@@ -238,11 +268,12 @@ impl PartDrainError {
 /// - [`PartDrainError::ChunkMismatch`] if a pooled chunk does not match its source
 ///   (the part is marked `Failed` first).
 /// - [`PartDrainError::Store`] if a store transition fails.
-pub async fn drain_part<F, S, R>(ceph: &F, ssd: &S, store: &R, claim: &ClaimedPart) -> Result<DrainOutcome, PartDrainError>
+pub async fn drain_part<F, S, R, E>(ceph: &F, ssd: &S, store: &R, enqueuer: &E, claim: &ClaimedPart) -> Result<DrainOutcome, PartDrainError>
 where
     F: PartPool,
     S: PartSource,
     R: PartReplicationStore,
+    E: UploadEnqueuer,
 {
     let part = claim.part();
 
@@ -287,8 +318,15 @@ where
         .map_err(PartDrainError::io(DrainStep::Persist))?;
     let verified = PartVerified(());
 
+    // Enqueue the backend upload BEFORE committing (at-least-once): the part is now
+    // durably on the pool and readable, so the uploader can serve it. If this fails the
+    // part stays `draining` and a re-drain re-enqueues — no upload is lost, and the dup
+    // is harmless (idempotent uploader). The drain is thus the sole upload producer with
+    // no separate notify/sweep.
+    enqueuer.enqueue(part).await.map_err(PartDrainError::enqueue)?;
+
     // Commit Replicated. Only past this point — a durable, verified, committed copy
-    // exists — is removing the SSD part safe.
+    // exists AND its upload is enqueued — is removing the SSD part safe.
     store.mark_replicated(claim, &verified).await.map_err(PartDrainError::store)?;
 
     ssd.remove_part(part).await.map_err(PartDrainError::io(DrainStep::Unlink))?;
@@ -298,7 +336,9 @@ where
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
-    use super::{ClaimedPart, DrainOutcome, DrainStep, PartDrainError, PartPool, PartReplicationStore, PartSource, PartVerified, drain_part};
+    use super::{
+        ClaimedPart, DrainOutcome, DrainStep, PartDrainError, PartPool, PartReplicationStore, PartSource, PartVerified, UploadEnqueuer, drain_part,
+    };
     use crate::apipart::{ChunkIndex, ObjectId, PartKey, PartNumber, Version};
     use crate::state::ReplicationState;
     use core::future::Future;
@@ -342,6 +382,10 @@ mod tests {
         status: HashMap<String, ReplicationState>,
         fault: Fault,
         corrupt_persist: bool,
+        /// When set, the upload enqueue fails (to test the at-least-once seam).
+        enqueue_fault: bool,
+        /// Parts the enqueuer was asked to enqueue, in order.
+        enqueued: Vec<String>,
     }
 
     /// One struct implementing all three part contracts.
@@ -382,6 +426,15 @@ mod tests {
         fn corrupt_persist(self) -> Self {
             self.world.lock().unwrap().corrupt_persist = true;
             self
+        }
+
+        fn enqueue_fault(self) -> Self {
+            self.world.lock().unwrap().enqueue_fault = true;
+            self
+        }
+
+        fn enqueued(&self) -> Vec<String> {
+            self.world.lock().unwrap().enqueued.clone()
         }
 
         fn clear_faults(&self) {
@@ -545,6 +598,22 @@ mod tests {
         }
     }
 
+    impl UploadEnqueuer for Fakes {
+        type Error = io::Error;
+
+        fn enqueue(&self, part: &PartKey) -> impl Future<Output = Result<(), io::Error>> + Send {
+            let key = key_of(part);
+            async move {
+                let mut world = self.world.lock().unwrap();
+                if world.enqueue_fault {
+                    return Err(io::Error::other("enqueue failed"));
+                }
+                world.enqueued.push(key);
+                Ok(())
+            }
+        }
+    }
+
     fn claim(part: &PartKey) -> ClaimedPart {
         // The in-memory store below ignores the fencing token, so any value works here.
         ClaimedPart::new(part.clone(), 0)
@@ -555,7 +624,7 @@ mod tests {
         let part = part();
         let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]);
 
-        let outcome = drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+        let outcome = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
 
         assert_eq!(outcome, DrainOutcome::Replicated);
         assert_eq!(fakes.status_of(&part), Some(ReplicationState::Replicated));
@@ -564,6 +633,21 @@ mod tests {
         assert_eq!(pooled.chunks.get(&1).map(String::as_str), Some("h1"));
         assert!(pooled.has_meta, "meta.json written");
         assert!(!fakes.ssd_has(&part), "SSD part unlinked only after commit");
+        assert_eq!(fakes.enqueued(), vec![key_of(&part)], "the backend upload was enqueued");
+    }
+
+    #[tokio::test]
+    async fn an_enqueue_failure_never_commits_and_preserves_the_ssd_copy() {
+        // At-least-once: if enqueuing the upload fails, the part is NOT committed and the
+        // SSD copy is kept, so a re-drain re-enqueues — no upload is lost.
+        let part = part();
+        let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]).enqueue_fault();
+
+        let err = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
+
+        assert!(matches!(err, PartDrainError::Enqueue(_)), "got: {err:?}");
+        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Pending), "must NOT commit Replicated");
+        assert!(fakes.ssd_has(&part), "SSD copy kept for the re-drain");
     }
 
     #[tokio::test]
@@ -572,7 +656,7 @@ mod tests {
         let fakes = Fakes::seeded(&part, &[(0, "h0")]);
         fakes.world.lock().unwrap().status.insert(key_of(&part), ReplicationState::Replicated);
 
-        let outcome = drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+        let outcome = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
 
         assert_eq!(outcome, DrainOutcome::AlreadyReplicated);
         assert!(!fakes.ssd_has(&part), "lingering SSD copy reclaimed");
@@ -584,7 +668,7 @@ mod tests {
         let part = part();
         let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]).corrupt_persist();
 
-        let err = drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
+        let err = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
 
         assert!(matches!(err, PartDrainError::ChunkMismatch { index, .. } if index == ChunkIndex::new(0)));
         assert_eq!(fakes.status_of(&part), Some(ReplicationState::Failed));
@@ -599,7 +683,7 @@ mod tests {
         let part = part();
         let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]).fault(Fault::PersistChunk);
 
-        let err = drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
+        let err = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
 
         assert!(matches!(
             err,
@@ -616,7 +700,7 @@ mod tests {
         let part = part();
         let fakes = Fakes::seeded(&part, &[(0, "h0")]).fault(Fault::Commit);
 
-        let err = drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
+        let err = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
 
         assert!(matches!(err, PartDrainError::Store(_)));
         assert_eq!(fakes.status_of(&part), Some(ReplicationState::Pending), "commit did not take");
@@ -627,11 +711,11 @@ mod tests {
     async fn crash_before_commit_then_redrive_completes_the_drain() {
         let part = part();
         let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]).fault(Fault::Commit);
-        assert!(drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.is_err());
+        assert!(drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.is_err());
         assert!(fakes.ssd_has(&part), "interrupted drain kept the SSD copy");
 
         fakes.clear_faults();
-        let outcome = drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+        let outcome = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
 
         assert_eq!(outcome, DrainOutcome::Replicated);
         assert!(!fakes.ssd_has(&part));
@@ -643,8 +727,8 @@ mod tests {
         let part = part();
         let fakes = Fakes::seeded(&part, &[(0, "h0")]);
 
-        let first = drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
-        let second = drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+        let first = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+        let second = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
 
         assert_eq!(first, DrainOutcome::Replicated);
         assert_eq!(second, DrainOutcome::AlreadyReplicated);

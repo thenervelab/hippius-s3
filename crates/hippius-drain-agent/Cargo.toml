@@ -13,6 +13,9 @@ hippius-drain-core = { workspace = true, features = ["pg"] }
 tokio = { workspace = true }
 futures = { workspace = true }
 tokio-util = { workspace = true }
+redis = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 nix = { workspace = true }
 thiserror = { workspace = true }

@@ -2,6 +2,8 @@ import asyncio
 import uuid
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
+from unittest.mock import MagicMock
 
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -22,7 +24,11 @@ def _fake_request(headers: dict[str, str] | None = None) -> Any:
         headers=Headers(headers or {}),
         # ObjectWriter is constructed with request.app.state.fs_store; put_simple_stream_full is
         # patched in these tests so the store is never exercised — a sentinel avoids create_fs_store.
-        app=SimpleNamespace(state=SimpleNamespace(fs_store=SimpleNamespace())),
+        # postgres_pool backs set_object_version_address (drain-direct address write); its execute is
+        # a no-op AsyncMock so the address persist neither hits a real DB nor perturbs `pool` acquires.
+        app=SimpleNamespace(
+            state=SimpleNamespace(fs_store=SimpleNamespace(), postgres_pool=MagicMock(execute=AsyncMock()))
+        ),
     )
 
 
@@ -69,11 +75,11 @@ def _patch_writer(monkeypatch: Any, captured: dict[str, Any]) -> None:
             object_version=1,
         )
 
-    async def fake_enqueue(**_kw: Any) -> None:
+    async def fake_persist_address(*_a: Any, **_kw: Any) -> None:
         return None
 
     monkeypatch.setattr(put_object_endpoint.ObjectWriter, "put_simple_stream_full", fake_put)
-    monkeypatch.setattr(put_object_endpoint, "writer_enqueue_upload", fake_enqueue)
+    monkeypatch.setattr(put_object_endpoint, "set_object_version_address", fake_persist_address)
 
 
 @pytest.mark.asyncio
@@ -109,11 +115,11 @@ async def test_head_lookups_single_acquire(monkeypatch: Any) -> None:
             object_version=1,
         )
 
-    async def fake_enqueue(**_kw: Any) -> None:
+    async def fake_persist_address(*_a: Any, **_kw: Any) -> None:
         return None
 
     monkeypatch.setattr(put_object_endpoint.ObjectWriter, "put_simple_stream_full", fake_put)
-    monkeypatch.setattr(put_object_endpoint, "writer_enqueue_upload", fake_enqueue)
+    monkeypatch.setattr(put_object_endpoint, "set_object_version_address", fake_persist_address)
 
     resp = await handle_put_object(
         bucket_name="bkt",

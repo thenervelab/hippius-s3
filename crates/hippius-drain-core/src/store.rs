@@ -656,6 +656,74 @@ impl Store {
         .await?;
         rows.into_iter().map(PartRow::into_pending).collect()
     }
+
+    /// Loads the non-derivable fields the agent needs to build a part's backend
+    /// `UploadChainRequest` (s3-2.1 PR-11, drain-direct enqueue): `bucket_name`,
+    /// `object_key`, the main-account `address`, and the latest `upload_id` (MPU only).
+    /// Everything else the uploader re-derives by `object_id`.
+    ///
+    /// Returns `None` when the version row is absent OR its `address` is still NULL —
+    /// the api writes `address` at PUT/MPU-complete, so a NULL means the part landed on
+    /// SSD before the api finished (a rare race). The caller treats `None` as not-ready
+    /// and retries on a later wake rather than enqueuing an incomplete request.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on query failure.
+    pub async fn load_upload_context(&self, part: &PartKey) -> Result<Option<UploadContext>> {
+        let row = sqlx::query_as::<_, UploadContextRow>(
+            "SELECT b.bucket_name, o.object_key, ov.address, \
+                    ( SELECT mu.upload_id::text FROM multipart_uploads mu \
+                      WHERE mu.object_id = o.object_id ORDER BY mu.initiated_at DESC LIMIT 1 ) AS upload_id \
+             FROM objects o \
+             JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = $2 \
+             JOIN buckets b ON b.bucket_id = o.bucket_id \
+             WHERE o.object_id = $1::uuid",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| {
+            r.address.map(|address| UploadContext {
+                object_id: part.object().as_str().to_owned(),
+                object_version: part.version().get(),
+                part_number: part.part().get(),
+                bucket_name: r.bucket_name,
+                object_key: r.object_key,
+                address,
+                upload_id: r.upload_id,
+            })
+        }))
+    }
+}
+
+/// The non-derivable fields for a part's backend upload request, read from the app
+/// tables by [`Store::load_upload_context`]. Consumed by the agent's upload enqueuer.
+#[derive(Debug, Clone)]
+pub struct UploadContext {
+    /// The object UUID (as text, the wire form).
+    pub object_id: String,
+    /// The object version.
+    pub object_version: u32,
+    /// The part number being enqueued.
+    pub part_number: u32,
+    /// The bucket the object lives in.
+    pub bucket_name: String,
+    /// The object key.
+    pub object_key: String,
+    /// The main-account address (the backend upload identity).
+    pub address: String,
+    /// The MPU upload id, if this object was a multipart upload.
+    pub upload_id: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct UploadContextRow {
+    bucket_name: String,
+    object_key: String,
+    address: Option<String>,
+    upload_id: Option<String>,
 }
 
 /// Postgres-backed part replication state for the drain orchestrator.
@@ -688,30 +756,18 @@ impl PartReplicationStore for Store {
         // false Ok. The claim_seq is what distinguishes "I still hold it" from "someone
         // re-won it and it's draining again under them" (F4).
         let part = claim.part();
-        // One statement commits the part Replicated AND emits the `cephor_replicated`
-        // notification atomically (PR-7): the pg_notify runs only for the row the
-        // fenced UPDATE matched, so a lost claim emits nothing, and the payload is bound
-        // to the same commit. The notification (`object_id:version:part`) wakes the
-        // upload-promoter to enqueue the backend upload now that the data is on ceph;
-        // the promoter ALSO sweeps replicated-but-unpromoted parts as a backstop, so a
-        // missed LISTEN (no listener at commit) costs latency, not correctness.
-        let committed = sqlx::query(
-            "WITH updated AS ( \
-                UPDATE cephor_replication_status SET status = 'replicated', updated_at = now() \
-                WHERE object_id = $1 AND version = $2 AND part_number = $3 \
-                  AND status = 'draining' AND claim_seq = $4 \
-                RETURNING object_id, version, part_number \
-             ) \
-             SELECT pg_notify('cephor_replicated', object_id || ':' || version || ':' || part_number) \
-             FROM updated",
+        let affected = sqlx::query(
+            "UPDATE cephor_replication_status SET status = 'replicated', updated_at = now() \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining' AND claim_seq = $4",
         )
         .bind(part.object().as_str())
         .bind(i64::from(part.version().get()))
         .bind(i64::from(part.part().get()))
         .bind(claim.claim_seq())
-        .fetch_optional(&self.pool)
-        .await?;
-        if committed.is_none() {
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if affected == 0 {
             return Err(StoreError::PartClaimLost {
                 part: part.relative_dir().to_string_lossy().into_owned().into(),
             });
@@ -1282,30 +1338,6 @@ mod part_tests {
         let claimed = store.claim_part().await.unwrap().unwrap();
         store.mark_replicated(&claimed, &PartVerified::for_test()).await.unwrap();
         assert_eq!(store.status(&p).await.unwrap(), Some(ReplicationState::Replicated));
-    }
-
-    #[sqlx::test]
-    async fn mark_replicated_emits_a_cephor_replicated_notification(pool: PgPool) {
-        // PR-7: committing a part Replicated emits `cephor_replicated` = object:version:part
-        // so the upload-promoter can enqueue the backend upload now the data is on ceph.
-        use sqlx::postgres::PgListener;
-
-        let store = Store::from_pool(pool.clone());
-        let p = part(UUID_A, 5, 1);
-        store.record_landed_part(&p).await.unwrap();
-        let claimed = store.claim_part().await.unwrap().unwrap();
-
-        // LISTEN before the commit, or the fire-and-forget notification is missed.
-        let mut listener = PgListener::connect_with(&pool).await.unwrap();
-        listener.listen("cephor_replicated").await.unwrap();
-
-        store.mark_replicated(&claimed, &PartVerified::for_test()).await.unwrap();
-
-        let notification = tokio::time::timeout(std::time::Duration::from_secs(5), listener.recv())
-            .await
-            .expect("a cephor_replicated notification within 5s")
-            .unwrap();
-        assert_eq!(notification.payload(), format!("{UUID_A}:5:1"));
     }
 
     #[sqlx::test]

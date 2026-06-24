@@ -16,11 +16,10 @@ async def set_object_version_address(
     object_version: int,
     address: str,
 ) -> None:
-    """Persist the main-account address on an object version (s3-2.1 PR-7).
+    """Persist the main-account address on an object version (s3-2.1).
 
-    Written by the api on the drain-gated promoter path in place of the PUT-time
-    enqueue, so the upload-promoter can rebuild the UploadChainRequest by object_id
-    once the part replicates to ceph.
+    Written by the api in place of the PUT-time enqueue, so the Rust drain can rebuild
+    the UploadChainRequest by object_id and enqueue it once the part replicates to ceph.
     """
     await db.execute(
         get_query("set_object_version_address"),

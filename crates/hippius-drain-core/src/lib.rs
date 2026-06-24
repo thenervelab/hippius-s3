@@ -31,7 +31,9 @@ pub use error::{Error, Result};
 pub use gc::{CephFs, GcClaim, GcError, GcOutcome, GcTarget, SsdCache, gc_object};
 pub use ids::{FileId, NodeId};
 pub use mgr::{CephReport, CephThresholds, ProbeParseError, classify, decay, parse_prometheus_metrics};
-pub use partdrain::{ClaimedPart, DrainOutcome, DrainStep, PartDrainError, PartPool, PartReplicationStore, PartSource, PartVerified, drain_part};
+pub use partdrain::{
+    ClaimedPart, DrainOutcome, DrainStep, PartDrainError, PartPool, PartReplicationStore, PartSource, PartVerified, UploadEnqueuer, drain_part,
+};
 pub use reconcile::{DiscoveredPart, PartLandingLog, PartScan, ReconcileError, ReconcileReport, reconcile_parts};
 pub use snapshot::{AgentSnapshot, SnapshotCell};
 pub use state::{CephCeiling, PressureZone, ReplicationState};
@@ -41,6 +43,6 @@ pub use units::{ByteRate, Bytes, DiskPressure};
 pub use clock::TestClock;
 
 #[cfg(feature = "pg")]
-pub use store::{Lease, PendingPart, Store, StoreError, StoredAllocation};
+pub use store::{Lease, PendingPart, Store, StoreError, StoredAllocation, UploadContext};
 #[cfg(feature = "pg")]
 pub use tick::{CephCeilingSource, StaticCeiling, TickConfig, TickOutcome, run_tick};

@@ -9,7 +9,9 @@
 use crate::localfs::{LocalFs, LocalSsd};
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
-use hippius_drain_core::{DrainDecision, DrainOutcome, Enforcer, PartDrainError, PartKey, PartSource, SnapshotCell, Store, StoreError, drain_part};
+use hippius_drain_core::{
+    DrainDecision, DrainOutcome, Enforcer, PartDrainError, PartKey, PartSource, SnapshotCell, Store, StoreError, UploadEnqueuer, drain_part,
+};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 use thiserror::Error;
@@ -94,10 +96,11 @@ async fn part_size(ssd: &LocalSsd, part: &PartKey) -> Option<u64> {
 ///
 /// [`DrainCycleError::Claim`] if the claim/release query fails;
 /// [`DrainCycleError::Drain`] if the copy/verify/commit/unlink sequence fails.
-pub async fn drain_next(
+pub async fn drain_next<E: UploadEnqueuer>(
     ceph: &LocalFs,
     ssd: &LocalSsd,
     store: &Store,
+    enqueuer: &E,
     enforcer: Option<&Arc<Mutex<Enforcer>>>,
     snapshot: Option<&SnapshotCell>,
 ) -> Result<Option<DrainOutcome>, DrainCycleError> {
@@ -137,7 +140,7 @@ pub async fn drain_next(
     // below releases via `record_outcome` and then dismisses the guard.
     let permit = enforcer.map(PermitGuard::new);
     let started = Instant::now();
-    let result = drain_part(ceph, ssd, store, &claim).await;
+    let result = drain_part(ceph, ssd, store, enqueuer, &claim).await;
     let elapsed = started.elapsed();
     if let Some(enforcer) = enforcer {
         // Any Ok is a Ceph-write success for the breaker; an Err is a failure.
@@ -210,10 +213,15 @@ pub async fn drain_next(
 /// # Errors
 ///
 /// The first [`DrainCycleError`] a cycle hits (after the in-flight set has drained).
-pub async fn drain_until_empty(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the drain seams (pool/ssd/store/enqueuer/enforcer/snapshot) + token + concurrency are each distinct injected collaborators; bundling them would just hide the wiring"
+)]
+pub async fn drain_until_empty<E: UploadEnqueuer>(
     ceph: &LocalFs,
     ssd: &LocalSsd,
     store: &Store,
+    enqueuer: &E,
     enforcer: Option<&Arc<Mutex<Enforcer>>>,
     snapshot: Option<&SnapshotCell>,
     token: &CancellationToken,
@@ -233,7 +241,7 @@ pub async fn drain_until_empty(
             refill = false;
             break;
         }
-        inflight.push(drain_next(ceph, ssd, store, enforcer, snapshot));
+        inflight.push(drain_next(ceph, ssd, store, enqueuer, enforcer, snapshot));
     }
 
     // Pushing into a FuturesUnordered while iterating it is supported; the `.next()`
@@ -243,7 +251,7 @@ pub async fn drain_until_empty(
             Ok(Some(_)) => {
                 drained += 1;
                 if refill && !token.is_cancelled() {
-                    inflight.push(drain_next(ceph, ssd, store, enforcer, snapshot));
+                    inflight.push(drain_next(ceph, ssd, store, enqueuer, enforcer, snapshot));
                 } else {
                     refill = false;
                 }
@@ -273,7 +281,7 @@ mod tests {
     use core::str::FromStr;
     use hippius_drain_core::{
         BreakerConfig, ByteRate, Bytes, CircuitBreaker, ConcurrencyLimiter, DrainDecision, DrainOutcome, Enforcer, ObjectId, PartKey, PartNumber,
-        PartReplicationStore, ReplicationState, SnapshotCell, Store, TokenBucket, Version,
+        PartReplicationStore, ReplicationState, SnapshotCell, Store, TokenBucket, UploadEnqueuer, Version,
     };
     use sqlx::postgres::PgPool;
     use std::path::Path;
@@ -301,6 +309,16 @@ mod tests {
         }
         std::fs::write(dir.join("meta.json"), br#"{"chunk_size":16,"num_chunks":1,"size_bytes":16}"#).unwrap();
         store.record_landed_part(part).await.unwrap();
+    }
+
+    /// A no-op upload enqueuer — the drain tests assert claim/copy/commit, not the
+    /// Redis fan-out (that's covered by the core partdrain tests + the enqueue module).
+    struct NoopEnqueuer;
+    impl UploadEnqueuer for NoopEnqueuer {
+        type Error = std::io::Error;
+        async fn enqueue(&self, _part: &PartKey) -> Result<(), std::io::Error> {
+            Ok(())
+        }
     }
 
     /// An enforcer whose token bucket holds `rate` bytes/sec and the same burst.
@@ -379,7 +397,7 @@ mod tests {
         seed_part(ssd_dir.path(), &store, &part, &[b"hello cephor part", b"second chunk"]).await;
 
         // One ungated cycle claims it and drains it end-to-end.
-        let outcome = drain_next(&ceph, &ssd, &store, None, None).await.unwrap();
+        let outcome = drain_next(&ceph, &ssd, &store, &NoopEnqueuer, None, None).await.unwrap();
         assert_eq!(outcome, Some(DrainOutcome::Replicated));
 
         // The SSD part is freed only after the verified, committed pool copy exists.
@@ -394,7 +412,7 @@ mod tests {
         assert!(pool_part.join("meta.json").exists(), "the meta marker landed last");
 
         // Nothing else is pending: the next cycle is a no-op.
-        assert_eq!(drain_next(&ceph, &ssd, &store, None, None).await.unwrap(), None);
+        assert_eq!(drain_next(&ceph, &ssd, &store, &NoopEnqueuer, None, None).await.unwrap(), None);
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
@@ -410,7 +428,7 @@ mod tests {
 
         // A zero-budget enforcer: the rate gate denies any non-zero drain.
         let empty = enforcer_with(0);
-        assert_eq!(drain_next(&ceph, &ssd, &store, Some(&empty), None).await.unwrap(), None);
+        assert_eq!(drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&empty), None).await.unwrap(), None);
         assert!(ssd_part.exists(), "a throttled drain leaves the SSD part untouched");
         assert_eq!(
             status_of(&store, &part).await,
@@ -421,7 +439,7 @@ mod tests {
         // With an ample budget, the same part drains.
         let ample = enforcer_with(1_000_000);
         assert_eq!(
-            drain_next(&ceph, &ssd, &store, Some(&ample), None).await.unwrap(),
+            drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&ample), None).await.unwrap(),
             Some(DrainOutcome::Replicated)
         );
         assert!(!ssd_part.exists(), "the admitted drain frees the SSD part");
@@ -440,7 +458,7 @@ mod tests {
 
         // A successful drain feeds its latency into the window, so p99 leaves zero.
         assert_eq!(
-            drain_next(&ceph, &ssd, &store, None, Some(&snapshot)).await.unwrap(),
+            drain_next(&ceph, &ssd, &store, &NoopEnqueuer, None, Some(&snapshot)).await.unwrap(),
             Some(DrainOutcome::Replicated)
         );
         assert!(snapshot.p99() > Duration::ZERO, "the drain's latency was recorded in the snapshot");
@@ -462,7 +480,7 @@ mod tests {
         let part = part_at(5, 1);
         store.record_landed_part(&part).await.unwrap();
 
-        let err = drain_next(&ceph, &ssd, &store, None, None).await.unwrap_err();
+        let err = drain_next(&ceph, &ssd, &store, &NoopEnqueuer, None, None).await.unwrap_err();
         assert!(
             matches!(err, super::DrainCycleError::Drain(_)),
             "a missing SSD part is a drain failure, got {err:?}"
@@ -488,7 +506,7 @@ mod tests {
 
         // Counting lives per part in drain_next, so a single drained part is one
         // drained attempt and zero failed attempts (the units error_bps divides).
-        drain_next(&ceph, &ssd, &store, None, Some(&snapshot)).await.unwrap();
+        drain_next(&ceph, &ssd, &store, &NoopEnqueuer, None, Some(&snapshot)).await.unwrap();
         let counts = snapshot.load();
         assert_eq!(counts.drained, 1, "the drained part was counted");
         assert_eq!(counts.failed, 0, "a success records no failure");
@@ -507,7 +525,7 @@ mod tests {
         let part = part_at(5, 1);
         store.record_landed_part(&part).await.unwrap();
 
-        drain_next(&ceph, &ssd, &store, None, Some(&snapshot)).await.unwrap_err();
+        drain_next(&ceph, &ssd, &store, &NoopEnqueuer, None, Some(&snapshot)).await.unwrap_err();
         let counts = snapshot.load();
         assert_eq!(counts.failed, 1, "the failed part attempt was counted");
         assert_eq!(counts.drained, 0, "a failure records no drain");
@@ -531,7 +549,7 @@ mod tests {
         // The burst drains the good part then fails on the bad one. The #10 fix:
         // the part drained before the failure is NOT discarded. concurrency=1 keeps the
         // strict landed_at order this test asserts on.
-        drain_until_empty(&ceph, &ssd, &store, None, Some(&snapshot), &token, 1)
+        drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, None, Some(&snapshot), &token, 1)
             .await
             .unwrap_err();
         let counts = snapshot.load();
@@ -555,10 +573,17 @@ mod tests {
         }
 
         let token = CancellationToken::new();
-        let drained = drain_until_empty(&ceph, &ssd, &store, None, None, &token, 4).await.unwrap();
+        let drained = drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, None, None, &token, 4)
+            .await
+            .unwrap();
         assert_eq!(drained, 3, "every pending part was drained in one run");
         // The backlog is now empty.
-        assert_eq!(drain_until_empty(&ceph, &ssd, &store, None, None, &token, 4).await.unwrap(), 0);
+        assert_eq!(
+            drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, None, None, &token, 4)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
@@ -576,9 +601,16 @@ mod tests {
         }
 
         let token = CancellationToken::new();
-        let drained = drain_until_empty(&ceph, &ssd, &store, None, None, &token, 3).await.unwrap();
+        let drained = drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, None, None, &token, 3)
+            .await
+            .unwrap();
         assert_eq!(drained, 8, "all 8 parts drained with concurrency 3 (refill works)");
-        assert_eq!(drain_until_empty(&ceph, &ssd, &store, None, None, &token, 3).await.unwrap(), 0);
+        assert_eq!(
+            drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, None, None, &token, 3)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
@@ -599,7 +631,9 @@ mod tests {
         // honors the supervisor's grace instead of being force-aborted mid-backlog.
         let token = CancellationToken::new();
         token.cancel();
-        let drained = drain_until_empty(&ceph, &ssd, &store, None, None, &token, 4).await.unwrap();
+        let drained = drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, None, None, &token, 4)
+            .await
+            .unwrap();
         assert_eq!(drained, 0, "a cancelled drain stops before touching the backlog");
     }
 }

@@ -481,13 +481,22 @@ mod part_tests {
     use core::str::FromStr;
     use hippius_drain_core::{
         ChunkIndex, ClaimedPart, DrainOutcome, ObjectId, PartKey, PartNumber, PartPool, PartReplicationStore, PartScan, PartSource, PartVerified,
-        ReplicationState, Version, drain_part,
+        ReplicationState, UploadEnqueuer, Version, drain_part,
     };
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::io;
     use std::sync::Mutex;
     use tempfile::TempDir;
+
+    /// A no-op upload enqueuer for the localfs drain test.
+    struct NoopEnqueuer;
+    impl UploadEnqueuer for NoopEnqueuer {
+        type Error = io::Error;
+        async fn enqueue(&self, _part: &PartKey) -> Result<(), io::Error> {
+            Ok(())
+        }
+    }
 
     const UUID: &str = "466916c0-d61b-4518-b81b-9576b574270a";
 
@@ -706,7 +715,7 @@ mod part_tests {
         store.set(&part, ReplicationState::Pending);
         let claim = ClaimedPart::new(part.clone(), 0);
 
-        let outcome = drain_part(&ceph, &ssd, &store, &claim).await.unwrap();
+        let outcome = drain_part(&ceph, &ssd, &store, &NoopEnqueuer, &claim).await.unwrap();
 
         let pool_part = pool_dir.path().join(part.relative_dir());
         let ssd_part = ssd_dir.path().join(part.relative_dir());
