@@ -29,6 +29,7 @@ from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.monitoring import get_metrics_collector
+from hippius_s3.services.mpu_cleanup import fail_version_replication
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import set_object_version_address
@@ -766,6 +767,20 @@ async def abort_multipart_upload(
                 get_query("abort_multipart_upload"),
                 upload_id,
             )
+
+        # The aborted upload's version address will never be written, so its parts and
+        # the drain's cephor_replication_status rows would otherwise leak: the reconciler
+        # keeps re-recording them and the drain keeps re-claiming + re-copying +
+        # re-deferring the enqueue forever, on every node. Mark the version's replication
+        # rows terminal so the drain stops touching them fleet-wide, and best-effort
+        # delete the parts on THIS node's local cache (other nodes' copies are left to the
+        # orphan GC; the central mark already stopped their drain churn). Best-effort: a
+        # failure here is logged, not surfaced — the abandoned-upload reaper is the backstop.
+        with contextlib.suppress(Exception):
+            await fail_version_replication(db, object_id=object_id, object_version=object_version)
+        with contextlib.suppress(Exception):
+            await request.app.state.fs_store.delete_object(str(object_id), int(object_version))
+
         # Mark aborted in Redis so listings immediately hide this upload (defensive against read lag)
         with contextlib.suppress(Exception):
             await request.app.state.redis_client.setex(f"aborted_mpu:{upload_id}", 300, "1")

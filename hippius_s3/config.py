@@ -275,6 +275,10 @@ class Config:
     object_cache_fallback_dir: str = env("HIPPIUS_OBJECT_CACHE_FALLBACK_DIR:", convert=str)
     fs_cache_gc_max_age_seconds: int = env("HIPPIUS_FS_CACHE_GC_MAX_AGE_SECONDS:604800", convert=int)  # 7 days
     mpu_stale_seconds: int = env("HIPPIUS_MPU_STALE_SECONDS:86400", convert=int)  # 1 day
+    # How often the abandoned-multipart-upload reaper sweeps. The reaper auto-aborts
+    # never-finalized uploads older than mpu_stale_seconds (address never written),
+    # purging their SSD parts + drain replication rows so the drain stops re-deferring.
+    mpu_reaper_interval_seconds: int = env("HIPPIUS_MPU_REAPER_INTERVAL_SECONDS:3600", convert=int)  # hourly
     # Bounded concurrency for the janitor's per-part DB checks + deletes. The
     # cleanup loops are DB-roundtrip bound; this is how many parts are processed
     # in parallel (each over its own pooled connection).
