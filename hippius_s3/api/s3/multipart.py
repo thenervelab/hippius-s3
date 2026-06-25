@@ -743,8 +743,17 @@ async def abort_multipart_upload(
         # Get object_id from multipart upload
         object_id = multipart_upload["object_id"]
 
+        # Resolve THIS upload's version from its own parts, not objects.current_object_version
+        # (which a concurrent same-key MPU advances) — otherwise the destructive cleanup below
+        # (fail_version_replication + delete_object) would hit a different, possibly in-flight version.
+        version_row = await db.fetchrow(get_query("get_multipart_version_by_upload"), upload_id)
+        object_version = (
+            int(version_row["object_version"])
+            if version_row
+            else int(multipart_upload.get("current_object_version") or 1)
+        )
+
         # Clean up Redis keys for cached parts (meta + chunks)
-        object_version = int(multipart_upload.get("current_object_version") or 1)
         parts = await db.fetch(
             get_query("list_parts_for_version"),
             object_id,
@@ -1005,8 +1014,15 @@ async def complete_multipart_upload(
             )
         part_info.sort(key=lambda x: x[0])
 
-        # Get the parts from the database for the version captured on MPU initiation
-        object_version = int(multipart_upload.get("current_object_version") or 1)
+        # Resolve THIS upload's version from its own parts (keyed by upload_id), not
+        # objects.current_object_version — a concurrent same-key MPU advances that pointer, which
+        # would complete + write the address against a different upload's version.
+        version_row = await db.fetchrow(get_query("get_multipart_version_by_upload"), upload_id)
+        object_version = (
+            int(version_row["object_version"])
+            if version_row
+            else int(multipart_upload.get("current_object_version") or 1)
+        )
         db_parts = await db.fetch(
             get_query("list_parts_for_version"),
             object_id,
