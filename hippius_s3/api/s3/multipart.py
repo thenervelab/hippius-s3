@@ -743,32 +743,31 @@ async def abort_multipart_upload(
         # Get object_id from multipart upload
         object_id = multipart_upload["object_id"]
 
-        # Resolve THIS upload's version from its own parts, not objects.current_object_version
-        # (which a concurrent same-key MPU advances) — otherwise the destructive cleanup below
-        # (fail_version_replication + delete_object) would hit a different, possibly in-flight version.
+        # Resolve THIS upload's version from its own parts, not objects.current_object_version.
+        # A simple PUT or another MPU on the same key advances that pointer, so acting on it would
+        # fail-replicate + delete an innocent NEWER version's data. No parts for this upload_id =>
+        # nothing of ours to clean: skip the version-scoped cleanup entirely (do NOT fall back to
+        # the pointer), and just remove the upload row + aborted marker below.
         version_row = await db.fetchrow(get_query("get_multipart_version_by_upload"), upload_id)
-        object_version = (
-            int(version_row["object_version"])
-            if version_row
-            else int(multipart_upload.get("current_object_version") or 1)
-        )
+        object_version = int(version_row["object_version"]) if version_row else None
 
-        # Clean up Redis keys for cached parts (meta + chunks)
-        parts = await db.fetch(
-            get_query("list_parts_for_version"),
-            object_id,
-            object_version,
-        )
-        if parts:
-            redis_client = request.app.state.redis_client
-            delegate = RedisObjectPartsCache(redis_client)
-            for part in parts:
-                part_num = int(part["part_number"])
-                meta_key = delegate.build_meta_key(str(object_id), object_version, part_num)
-                await redis_client.delete(meta_key)
-                base_key = delegate.build_key(str(object_id), object_version, part_num)
-                async for key in redis_client.scan_iter(f"{base_key}:chunk:*"):
-                    await redis_client.delete(key)
+        # Clean up Redis keys for cached parts (meta + chunks) — only for our own version.
+        if object_version is not None:
+            parts = await db.fetch(
+                get_query("list_parts_for_version"),
+                object_id,
+                object_version,
+            )
+            if parts:
+                redis_client = request.app.state.redis_client
+                delegate = RedisObjectPartsCache(redis_client)
+                for part in parts:
+                    part_num = int(part["part_number"])
+                    meta_key = delegate.build_meta_key(str(object_id), object_version, part_num)
+                    await redis_client.delete(meta_key)
+                    base_key = delegate.build_key(str(object_id), object_version, part_num)
+                    async for key in redis_client.scan_iter(f"{base_key}:chunk:*"):
+                        await redis_client.delete(key)
 
         # Fully remove the multipart upload (and cascade parts) so it disappears from listings immediately
         async with db.transaction():
@@ -785,10 +784,12 @@ async def abort_multipart_upload(
         # delete the parts on THIS node's local cache (other nodes' copies are left to the
         # orphan GC; the central mark already stopped their drain churn). Best-effort: a
         # failure here is logged, not surfaced — the abandoned-upload reaper is the backstop.
-        with contextlib.suppress(Exception):
-            await fail_version_replication(db, object_id=object_id, object_version=object_version)
-        with contextlib.suppress(Exception):
-            await request.app.state.fs_store.delete_object(str(object_id), int(object_version))
+        # Skipped when the upload had no parts of its own (object_version is None).
+        if object_version is not None:
+            with contextlib.suppress(Exception):
+                await fail_version_replication(db, object_id=object_id, object_version=object_version)
+            with contextlib.suppress(Exception):
+                await request.app.state.fs_store.delete_object(str(object_id), int(object_version))
 
         # Mark aborted in Redis so listings immediately hide this upload (defensive against read lag)
         with contextlib.suppress(Exception):
@@ -1015,14 +1016,19 @@ async def complete_multipart_upload(
         part_info.sort(key=lambda x: x[0])
 
         # Resolve THIS upload's version from its own parts (keyed by upload_id), not
-        # objects.current_object_version — a concurrent same-key MPU advances that pointer, which
-        # would complete + write the address against a different upload's version.
+        # objects.current_object_version — a simple PUT or another MPU on the same key advances that
+        # pointer, and completing/writing the address against it would target a different upload's
+        # version (and, with no parts of our own, would pull THAT version's parts). No parts for this
+        # upload_id => genuinely nothing to complete; do not fall back to the pointer.
         version_row = await db.fetchrow(get_query("get_multipart_version_by_upload"), upload_id)
-        object_version = (
-            int(version_row["object_version"])
-            if version_row
-            else int(multipart_upload.get("current_object_version") or 1)
-        )
+        if not version_row:
+            logger.error(f"No parts found for multipart upload {upload_id}")
+            return s3_error_response(
+                "InvalidRequest",
+                "No parts found for this multipart upload",
+                status_code=400,
+            )
+        object_version = int(version_row["object_version"])
         db_parts = await db.fetch(
             get_query("list_parts_for_version"),
             object_id,
