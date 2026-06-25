@@ -108,4 +108,10 @@ Config:
 |----|------|---|-------|------|
 | #7721 | 11:50 AM | 🔵 | Complete Sentry integration pattern documented for hippius-s3 | ~629 |
 | #7720 | 11:49 AM | 🔵 | Sentry configuration pattern in hippius-s3 repository | ~506 |
+
+### Jun 25, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #9377 | 9:07 PM | 🔵 | Application Pool Configuration Exceeds Database max_connections by 96 Connections | ~723 |
 </claude-mem-context>
