@@ -70,6 +70,9 @@ spec:
     size: 800Gi
     storageClass: local-postgresql
   switchoverDelay: 3600
+  # Dampen premature failover on a transient operator->instance status-poll
+  # timeout (default 0 = instant failover). See 2026-06-25 nvme flap incident.
+  failoverDelay: 15
   plugins:
   - name: barman-cloud.cloudnative-pg.io
     isWALArchiver: true
