@@ -81,3 +81,6 @@ tests/e2e/certs/*.srl
 node_modules/
 package-lock.json
 CLAUDE.md
+
+# Rust (workspace at repo root; Cargo.lock is committed for the binary crates)
+/target/

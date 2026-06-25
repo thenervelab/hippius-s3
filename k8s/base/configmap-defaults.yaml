@@ -47,6 +47,10 @@ data:
   API_DB_POOL_MAX_QUERIES: "50000"
   API_DB_POOL_MAX_INACTIVE_LIFETIME: "300"
   API_DB_POOL_COMMAND_TIMEOUT: "30"
+  # Per-uploader-pod DB pool cap. Multiplied by the uploader replica count against
+  # Postgres max_connections (40 pods x 8 = 320). Capped to keep total backends well
+  # under max_connections=1000 and limit per-backend page-table memory. See cnpg.md.
+  HIPPIUS_UPLOADER_DB_POOL_MAX: "8"
   CACHET_API_URL: "http://cachet.monitoring.svc.cluster.local"
   BACKUP_INTERVAL_HOURS: "24"
   BACKUP_RETENTION_COUNT: "30"

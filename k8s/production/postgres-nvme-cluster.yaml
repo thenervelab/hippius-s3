@@ -34,6 +34,7 @@ spec:
       default_statistics_target: '500'
       effective_cache_size: 48GB
       effective_io_concurrency: '200'
+      hash_mem_multiplier: '1.0'
       maintenance_work_mem: 2GB
       max_connections: '1000'
       max_parallel_maintenance_workers: '4'
@@ -44,10 +45,10 @@ spec:
       max_worker_processes: '48'
       min_wal_size: 1GB
       random_page_cost: '1.1'
-      shared_buffers: 16GB
+      shared_buffers: 12GB
       wal_buffers: 64MB
       wal_level: replica
-      work_mem: 48MB
+      work_mem: 24MB
   primaryUpdateStrategy: unsupervised
   replicationSlots:
     highAvailability:
@@ -57,12 +58,16 @@ spec:
       enabled: true
     updateInterval: 30
   resources:
+    # No memory limit on purpose: nodes are dedicated to postgres (taint
+    # hippius.io/postgresql), and a hard cgroup memory.max counts page cache, so
+    # buffered reads were OOM-killing the whole pod (~every 4h). Without a limit,
+    # page cache is reclaimable node RAM. Safe because anon is bounded (work_mem +
+    # capped DB pools). QoS is Burstable. See 2026-06-25 OOM analysis / cnpg.md.
     limits:
       cpu: '10'
-      memory: 48Gi
     requests:
       cpu: '2'
-      memory: 48Gi
+      memory: 40Gi
   smartShutdownTimeout: 180
   startDelay: 3600
   stopDelay: 1800
