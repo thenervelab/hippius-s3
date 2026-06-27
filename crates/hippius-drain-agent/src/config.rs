@@ -44,6 +44,20 @@ const DEFAULT_DEFER_BACKOFF: Duration = Duration::from_secs(5);
 /// it the allocator is treated as silent on this node and the rate decays toward
 /// the floor (a few allocator ticks — the allocator tick is ~2s).
 const DEFAULT_ALLOCATION_STALE: Duration = Duration::from_secs(10);
+/// Reclaim scan period when `CEPHOR_RECLAIM_POLL_SECS` is unset: the SSD-ingest GC
+/// runs less often than the drain — eviction is a backstop, not a hot path.
+const DEFAULT_RECLAIM_POLL: Duration = Duration::from_mins(5);
+/// Reclaim grace when `CEPHOR_RECLAIM_GRACE_SECS` is unset: how long a terminal part
+/// is kept on SSD before eviction under normal pressure (a generous diagnosis /
+/// drain-race window; also the orphan-temp sweep's max age).
+const DEFAULT_RECLAIM_GRACE: Duration = Duration::from_hours(1);
+/// Reclaim grace under disk pressure when `CEPHOR_RECLAIM_PRESSURE_GRACE_SECS` is
+/// unset: evict terminal parts sooner to relieve a filling SSD.
+const DEFAULT_RECLAIM_PRESSURE_GRACE: Duration = Duration::from_mins(1);
+/// SSD fullness (basis points) at/above which reclaim uses the pressure grace, when
+/// `CEPHOR_RECLAIM_PRESSURE_BPS` is unset — 90%, just under the `fs_cache_pressure`
+/// 503 cliff, so eviction accelerates before the api starts rejecting PUTs.
+const DEFAULT_RECLAIM_PRESSURE_BPS: u16 = 9000;
 
 /// The daemon's startup configuration.
 #[derive(Debug, Clone)]
@@ -87,6 +101,15 @@ pub struct Config {
     /// Backends to enqueue each part's upload to (`{backend}_upload_requests`), from
     /// `HIPPIUS_UPLOAD_BACKENDS` (comma-list). Defaults to `["arion"]`.
     pub upload_backends: Vec<String>,
+    /// How often the SSD-reclaim worker scans for terminal aged parts to evict.
+    pub reclaim_poll: Duration,
+    /// How long a terminal (replicated/failed) part is kept on SSD before eviction
+    /// under normal pressure.
+    pub reclaim_grace: Duration,
+    /// The shorter grace used when the SSD is under pressure.
+    pub reclaim_pressure_grace: Duration,
+    /// SSD fullness (basis points) at/above which reclaim uses the pressure grace.
+    pub reclaim_pressure_bps: u16,
 }
 
 /// A failure parsing the daemon configuration from the environment.
@@ -143,6 +166,10 @@ impl Config {
         RuntimeConfig {
             drain_poll: self.drain_poll,
             reconcile_poll: self.reconcile_poll,
+            reclaim_poll: self.reclaim_poll,
+            reclaim_grace: self.reclaim_grace,
+            reclaim_pressure_grace: self.reclaim_pressure_grace,
+            reclaim_pressure_bps: self.reclaim_pressure_bps,
             grace: self.grace,
         }
     }
@@ -179,6 +206,10 @@ impl Config {
             allocation_stale: duration_secs(&get, "CEPHOR_ALLOCATION_STALE_SECS", DEFAULT_ALLOCATION_STALE)?,
             redis_queues_url: required(&get, "REDIS_QUEUES_URL")?,
             upload_backends: parse_backends(&get, "HIPPIUS_UPLOAD_BACKENDS"),
+            reclaim_poll: duration_secs(&get, "CEPHOR_RECLAIM_POLL_SECS", DEFAULT_RECLAIM_POLL)?,
+            reclaim_grace: duration_secs(&get, "CEPHOR_RECLAIM_GRACE_SECS", DEFAULT_RECLAIM_GRACE)?,
+            reclaim_pressure_grace: duration_secs(&get, "CEPHOR_RECLAIM_PRESSURE_GRACE_SECS", DEFAULT_RECLAIM_PRESSURE_GRACE)?,
+            reclaim_pressure_bps: bps_or(&get, "CEPHOR_RECLAIM_PRESSURE_BPS", DEFAULT_RECLAIM_PRESSURE_BPS)?,
         })
     }
 }
@@ -222,6 +253,15 @@ fn positive_u64_or(get: &impl Fn(&str) -> Option<String>, var: &'static str, def
     }
 }
 
+/// Resolves an optional basis-points (`0..=10000`) variable. Builds on [`u64_or`]
+/// (so a present-but-unparsable value still errors), then clamps a value above 10000
+/// down to 10000 — a "never enter pressure mode" config that is pointless but safe,
+/// not a startup failure.
+fn bps_or(get: &impl Fn(&str) -> Option<String>, var: &'static str, default: u16) -> Result<u16, ConfigError> {
+    let raw = u64_or(get, var, u64::from(default))?;
+    Ok(u16::try_from(raw.min(10_000)).unwrap_or(default))
+}
+
 /// Resolves a required filesystem path, rejecting unset, empty, or whitespace-only
 /// values as [`Missing`](ConfigError::Missing). A blank path is the dangerous case
 /// `required` alone misses: it is non-empty, so it would pass into a `PathBuf` and
@@ -252,7 +292,8 @@ fn duration_secs(get: &impl Fn(&str) -> Option<String>, var: &'static str, defau
 mod tests {
     use super::{
         Config, ConfigError, DEFAULT_ALLOCATION_POLL, DEFAULT_ALLOCATION_STALE, DEFAULT_CLAIM_LEASE, DEFAULT_DECAY_HALF_LIFE, DEFAULT_DRAIN_POLL,
-        DEFAULT_FLOOR_RATE_BPS, DEFAULT_HEARTBEAT_POLL, DEFAULT_MAX_DRAIN_RATE_BPS,
+        DEFAULT_FLOOR_RATE_BPS, DEFAULT_HEARTBEAT_POLL, DEFAULT_MAX_DRAIN_RATE_BPS, DEFAULT_RECLAIM_GRACE, DEFAULT_RECLAIM_POLL,
+        DEFAULT_RECLAIM_PRESSURE_BPS, DEFAULT_RECLAIM_PRESSURE_GRACE,
     };
     use core::str::FromStr;
     use hippius_drain_core::{ByteRate, NodeId};
@@ -358,6 +399,39 @@ mod tests {
         pairs.push(("CEPHOR_ALLOCATION_STALE_SECS", "30"));
         let config = Config::from_lookup(lookup(&pairs)).unwrap();
         assert_eq!(config.allocation_stale, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn defaults_the_reclaim_knobs() {
+        let config = Config::from_lookup(lookup(&required_only())).unwrap();
+        assert_eq!(config.reclaim_poll, DEFAULT_RECLAIM_POLL);
+        assert_eq!(config.reclaim_grace, DEFAULT_RECLAIM_GRACE);
+        assert_eq!(config.reclaim_pressure_grace, DEFAULT_RECLAIM_PRESSURE_GRACE);
+        assert_eq!(config.reclaim_pressure_bps, DEFAULT_RECLAIM_PRESSURE_BPS);
+    }
+
+    #[test]
+    fn numeric_reclaim_knobs_override_the_defaults() {
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_RECLAIM_POLL_SECS", "120"));
+        pairs.push(("CEPHOR_RECLAIM_GRACE_SECS", "600"));
+        pairs.push(("CEPHOR_RECLAIM_PRESSURE_GRACE_SECS", "30"));
+        pairs.push(("CEPHOR_RECLAIM_PRESSURE_BPS", "8500"));
+        let config = Config::from_lookup(lookup(&pairs)).unwrap();
+        assert_eq!(config.reclaim_poll, Duration::from_mins(2));
+        assert_eq!(config.reclaim_grace, Duration::from_mins(10));
+        assert_eq!(config.reclaim_pressure_grace, Duration::from_secs(30));
+        assert_eq!(config.reclaim_pressure_bps, 8500);
+    }
+
+    #[test]
+    fn an_out_of_range_reclaim_pressure_bps_is_clamped_not_rejected() {
+        // Above 10000 just means "never enter pressure mode" — a pointless but safe
+        // config, clamped rather than failing startup.
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_RECLAIM_PRESSURE_BPS", "99999"));
+        let config = Config::from_lookup(lookup(&pairs)).unwrap();
+        assert_eq!(config.reclaim_pressure_bps, 10_000);
     }
 
     #[test]

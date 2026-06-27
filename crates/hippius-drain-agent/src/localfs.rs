@@ -12,12 +12,14 @@
 //! `<object_id>` folder).
 
 use hippius_drain_core::{
-    CephFs, ChunkIndex, DiscoveredPart, FileId, META_FILE_NAME, PartKey, PartPool, PartScan, PartSource, SsdCache, chunk_file_name, parse_part_dir,
+    CephFs, ChunkIndex, DiscoveredPart, FileId, META_FILE_NAME, PartKey, PartPool, PartRemover, PartScan, PartSource, SsdCache, chunk_file_name,
+    parse_part_dir,
 };
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 
@@ -148,6 +150,51 @@ impl LocalSsd {
     pub fn root(&self) -> &Path {
         self.root.as_path()
     }
+
+    /// Removes orphaned write-temp files left on the SSD by a crashed mid-write PUT
+    /// (the api's `<name>.tmp.<uuid>`) or a cancelled persist (the agent's
+    /// `.tmp-<name>`), once older than `max_age`.
+    ///
+    /// Walks the `<object>/v<version>/part_<n>/` layout and only ever unlinks a temp
+    /// FILE — never a real `chunk_*.bin`/`meta.json`, never a directory — so it cannot
+    /// touch a complete or in-flight part; the age gate keeps a temp an active writer
+    /// is still using. Returns how many temps it removed; a missing root is an empty
+    /// cache, not an error. The companion to whole-part reclaim (`reclaim_ssd`), which
+    /// already clears temps inside a reclaimed part dir.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if walking the cache or unlinking a temp fails for a reason other
+    /// than a concurrently-removed entry (which is tolerated).
+    pub async fn sweep_orphan_tmp(&self, max_age: Duration) -> io::Result<u64> {
+        let mut removed = 0;
+        let Some(mut objects) = open_dir(&self.root).await? else {
+            return Ok(0);
+        };
+        while let Some(object) = objects.next_entry().await? {
+            if !object.file_type().await?.is_dir() {
+                continue;
+            }
+            let Some(mut versions) = open_dir(&object.path()).await? else {
+                continue;
+            };
+            while let Some(version) = versions.next_entry().await? {
+                if !version.file_type().await?.is_dir() {
+                    continue;
+                }
+                let Some(mut parts) = open_dir(&version.path()).await? else {
+                    continue;
+                };
+                while let Some(part) = parts.next_entry().await? {
+                    if !part.file_type().await?.is_dir() {
+                        continue;
+                    }
+                    removed += sweep_part_tmp(&part.path(), max_age).await?;
+                }
+            }
+        }
+        Ok(removed)
+    }
 }
 
 impl SsdCache for LocalSsd {
@@ -215,6 +262,61 @@ async fn remove_part_dir(root: &Path, part: &PartKey) -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+/// Opens `dir` for reading, mapping a vanished dir (a concurrent reclaim removed it)
+/// to `None` rather than an error, so a sweep walking a live tree never aborts.
+async fn open_dir(dir: &Path) -> io::Result<Option<fs::ReadDir>> {
+    match fs::read_dir(dir).await {
+        Ok(read) => Ok(Some(read)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Whether a directory-entry name is a write temp — the agent's `.tmp-<name>` or the
+/// api's `<name>.tmp.<uuid>`. A real `chunk_<i>.bin`/`meta.json` matches neither.
+fn is_temp_name(name: &str) -> bool {
+    name.starts_with(".tmp-") || name.contains(".tmp.")
+}
+
+/// How long ago `meta` was last modified, or [`Duration::ZERO`] if its mtime is
+/// unavailable or in the future (clock skew) — the fail-safe direction (reads young,
+/// so the temp is kept rather than removed).
+fn file_age(meta: &std::fs::Metadata) -> Duration {
+    meta.modified()
+        .ok()
+        .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+        .unwrap_or(Duration::ZERO)
+}
+
+/// Unlinks aged orphan write-temps directly inside one part dir. Only temp FILES older
+/// than `max_age` are removed; real chunk/meta files, fresh temps, and any subdirectory
+/// are left untouched. A temp another writer renamed away mid-sweep is already gone.
+async fn sweep_part_tmp(part_path: &Path, max_age: Duration) -> io::Result<u64> {
+    let mut removed = 0;
+    let Some(mut entries) = open_dir(part_path).await? else {
+        return Ok(0);
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let raw = entry.file_name();
+        let Some(name) = raw.to_str() else {
+            continue;
+        };
+        if !is_temp_name(name) {
+            continue;
+        }
+        let meta = entry.metadata().await?;
+        if !meta.is_file() || file_age(&meta) < max_age {
+            continue;
+        }
+        match fs::remove_file(entry.path()).await {
+            Ok(()) => removed += 1,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(removed)
 }
 
 /// Parse a `chunk_<index>.bin` file name into its [`ChunkIndex`], or `None` for any
@@ -380,6 +482,15 @@ impl PartScan for LocalSsd {
     }
 }
 
+impl PartRemover for LocalSsd {
+    async fn unlink_part(&self, part: &PartKey) -> io::Result<()> {
+        // The reclaim worker's removal seam — the same idempotent whole-part unlink the
+        // drain's success path (`PartSource::remove_part`) uses, so a reclaim racing
+        // that unlink is harmless.
+        remove_part_dir(&self.root, part).await
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
@@ -480,13 +591,14 @@ mod part_tests {
     use core::future::Future;
     use core::str::FromStr;
     use hippius_drain_core::{
-        ChunkIndex, ClaimedPart, DrainOutcome, ObjectId, PartKey, PartNumber, PartPool, PartReplicationStore, PartScan, PartSource, PartVerified,
-        ReplicationState, UploadEnqueuer, Version, drain_part,
+        ChunkIndex, ClaimedPart, DrainOutcome, ObjectId, PartKey, PartNumber, PartPool, PartRemover, PartReplicationStore, PartScan, PartSource,
+        PartVerified, ReplicationState, UploadEnqueuer, Version, drain_part,
     };
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::io;
     use std::sync::Mutex;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     /// A no-op upload enqueuer for the localfs drain test.
@@ -729,5 +841,52 @@ mod part_tests {
         assert!(pool_part.join("meta.json").exists(), "meta marker copied last");
         assert!(!ssd_part.exists(), "SSD part unlinked only after a verified, committed copy exists");
         assert_eq!(store.status_of(&part), Some(ReplicationState::Replicated));
+    }
+
+    #[tokio::test]
+    async fn part_remover_unlinks_the_part_dir_idempotently() {
+        let dir = TempDir::new().unwrap();
+        let part = part_key(5, 1);
+        seed_ssd_part(dir.path(), &part, &[(0, b"x")]);
+        let ssd = LocalSsd::new(dir.path());
+
+        ssd.unlink_part(&part).await.unwrap();
+        assert!(!dir.path().join(part.relative_dir()).exists(), "the reclaimed part dir is gone");
+        // A second reclaim of an already-absent part is Ok (mirrors the drain's unlink).
+        ssd.unlink_part(&part).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sweep_orphan_tmp_removes_aged_temps_and_keeps_real_and_fresh_files() {
+        let dir = TempDir::new().unwrap();
+        let part = part_key(5, 1);
+        let part_dir = dir.path().join(part.relative_dir());
+        std::fs::create_dir_all(&part_dir).unwrap();
+        // Real files alongside both temp flavors: the api's `<name>.tmp.<uuid>` and the
+        // agent's `.tmp-<name>`.
+        std::fs::write(part_dir.join("chunk_0.bin"), b"real").unwrap();
+        std::fs::write(part_dir.join("meta.json"), b"{}").unwrap();
+        let api_tmp = part_dir.join("chunk_0.bin.tmp.deadbeefdeadbeef");
+        let agent_tmp = part_dir.join(".tmp-chunk_0.bin");
+        std::fs::write(&api_tmp, b"partial").unwrap();
+        std::fs::write(&agent_tmp, b"partial").unwrap();
+
+        let ssd = LocalSsd::new(dir.path());
+
+        // A long window keeps the just-written temps (younger than max_age).
+        assert_eq!(ssd.sweep_orphan_tmp(Duration::from_hours(1)).await.unwrap(), 0);
+        assert!(api_tmp.exists() && agent_tmp.exists(), "fresh temps within the window are kept");
+
+        // A zero window ages every temp, so both flavors are removed; real files stay.
+        assert_eq!(ssd.sweep_orphan_tmp(Duration::ZERO).await.unwrap(), 2, "both temp flavors removed");
+        assert!(!api_tmp.exists() && !agent_tmp.exists(), "aged temps unlinked");
+        assert!(part_dir.join("chunk_0.bin").exists(), "the real chunk is untouched");
+        assert!(part_dir.join("meta.json").exists(), "the meta marker is untouched");
+    }
+
+    #[tokio::test]
+    async fn sweep_orphan_tmp_of_a_missing_root_is_zero() {
+        let ssd = LocalSsd::new("/no/such/cephor/cache/dir");
+        assert_eq!(ssd.sweep_orphan_tmp(Duration::ZERO).await.unwrap(), 0);
     }
 }

@@ -98,6 +98,19 @@ spec:
                   key: REDIS_QUEUES_URL
             - name: HIPPIUS_UPLOAD_BACKENDS
               value: "arion"
+            # SSD-ingest reclaim worker: evict terminal (replicated/failed) parts the
+            # drain is done with, plus orphan write-temps, once aged — so a stuck drain's
+            # backlog cannot fill the SSD and 503 every PUT on the node. All four have
+            # safe code defaults (300s poll / 1h grace / 60s under pressure / 90% band);
+            # set here for visibility + per-node tuning.
+            - name: CEPHOR_RECLAIM_POLL_SECS
+              value: "300"
+            - name: CEPHOR_RECLAIM_GRACE_SECS
+              value: "3600"
+            - name: CEPHOR_RECLAIM_PRESSURE_GRACE_SECS
+              value: "60"
+            - name: CEPHOR_RECLAIM_PRESSURE_BPS
+              value: "9000"
             - name: RUST_LOG
               value: "info"
           volumeMounts:
