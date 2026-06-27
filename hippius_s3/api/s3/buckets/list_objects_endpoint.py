@@ -40,10 +40,15 @@ def _content_resume(key: str) -> str:
 
 
 def _prefix_resume(p: str) -> str:
-    # Lexicographic successor that skips every key starting with p, under C/byte collation.
-    # p ends in the delimiter; bumping its last code point jumps past the whole collapsed group.
-    # Exact for any single-byte (ASCII) delimiter — i.e. '/', the only delimiter clients use.
-    return p[:-1] + chr(ord(p[-1]) + 1)
+    # Lexicographic successor that skips every key starting with p, under C/byte collation
+    # (UTF-8 byte order == code-point order, so a code-point bump is a valid byte-wise successor).
+    # Bump the last code point that can be bumped, dropping the tail; jumps past the collapsed
+    # group in one index seek. The loop only guards the pathological U+10FFFF tail (a crafted
+    # delimiter) from raising in chr(); for the real delimiter ('/') it bumps the last char.
+    for i in range(len(p) - 1, -1, -1):
+        if ord(p[i]) < 0x10FFFF:
+            return p[:i] + chr(ord(p[i]) + 1)
+    return p
 
 
 def _encode_continuation_token(resume_inclusive: str) -> str:
@@ -118,6 +123,10 @@ async def handle_list_objects(
     bucket_id = bucket["bucket_id"]
     bucket_owner = bucket["main_account_id"] or ctx.main_account_id
 
+    # A common prefix is emitted only if it sorts strictly after StartAfter (AWS rule); the
+    # cursor jump already keeps it from recurring across continuation pages, so the floor is
+    # only meaningful for an explicit start-after (ignored when a continuation token resumes).
+    cp_floor = None if continuation_token else start_after
     items, is_truncated, next_cursor = await _collect_page(
         pool,
         bucket_id,
@@ -125,6 +134,7 @@ async def handle_list_objects(
         delimiter=delimiter,
         cursor=cursor,
         target=effective_max_keys,
+        cp_floor=cp_floor,
     )
     contents = [row for kind, row in items if kind == "content"]
     common_prefixes = [payload for kind, payload in items if kind == "prefix"]
@@ -180,12 +190,16 @@ async def _collect_page(
     delimiter: str | None,
     cursor: str | None,
     target: int,
+    cp_floor: str | None,
 ) -> tuple[list[tuple[str, Any]], bool, str | None]:
     """Skip-scan the keyset query, rolling delimiter groups into CommonPrefixes.
 
     Returns the ordered page items (``("content", row)`` | ``("prefix", str)``), whether more
     results exist, and the inclusive boundary to resume from. Each common prefix counts as one
-    item toward ``target`` and its whole collapsed key range is skipped via a single index seek.
+    item toward ``target``; once a group is seen its whole collapsed key range is skipped by
+    advancing the cursor to ``_prefix_resume`` so the next fetch seeks past it in one index
+    descent (a folder of N objects costs at most one extra round trip, not N rows of output).
+    ``cp_floor`` (StartAfter) suppresses any common prefix not lexicographically greater than it.
     """
     if target == 0:
         # AWS returns an empty, non-truncated page for max-keys=0 (degenerate probe).
@@ -204,24 +218,25 @@ async def _collect_page(
         if not batch:
             return items, False, None
 
-        advanced = False
-        for i, row in enumerate(batch):
+        for row in batch:
             key = row["object_key"]
             if cursor is not None and key < cursor:
-                # Row sorts before a jump boundary we set mid-batch — already accounted for.
+                # Row sorts before a collapsed-group boundary we already jumped — skip cheaply.
                 continue
 
             di = key.find(delimiter, plen) if delimiter else -1
-            common_prefix = ""
             if di == -1:
                 items.append(("content", row))
                 cursor = _content_resume(key)
             else:
                 common_prefix = key[: di + dlen]
-                if common_prefix not in seen_prefixes:
-                    seen_prefixes.add(common_prefix)
-                    items.append(("prefix", common_prefix))
                 cursor = _prefix_resume(common_prefix)
+                if common_prefix in seen_prefixes:
+                    continue
+                seen_prefixes.add(common_prefix)
+                if cp_floor is not None and common_prefix <= cp_floor:
+                    continue
+                items.append(("prefix", common_prefix))
 
             if len(items) > target:
                 # The (target+1)th item proves truncation; resume just past the last KEPT item.
@@ -229,10 +244,5 @@ async def _collect_page(
                 next_cursor = _prefix_resume(payload) if kind == "prefix" else _content_resume(payload["object_key"])
                 return items[:target], True, next_cursor
 
-            # Jump past the collapsed group instead of scanning its interior row-by-row.
-            if di != -1 and i + 1 < len(batch) and batch[i + 1]["object_key"].startswith(common_prefix):
-                advanced = True
-                break
-
-        if not advanced and len(batch) < batch_limit:
+        if len(batch) < batch_limit:
             return items, False, None

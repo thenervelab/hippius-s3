@@ -100,6 +100,23 @@ def test_url_encode_only_when_requested() -> None:
     assert _maybe_url_encode("é", "URL") == "%C3%A9"
 
 
+def test_prefix_resume_is_a_tight_successor() -> None:
+    # Successor must exceed every key under the prefix but nothing else.
+    assert list_objects_endpoint._prefix_resume("photos/") == "photos0"
+    assert "photos/zzz" < list_objects_endpoint._prefix_resume("photos/") <= "photos0"
+    # Multi-char delimiter: bump the last char of the group.
+    assert list_objects_endpoint._prefix_resume("a::") == "a:;"
+
+
+def test_prefix_resume_does_not_crash_on_max_codepoint() -> None:
+    # A crafted delimiter ending at U+10FFFF must not raise from chr(); fall back to bumping
+    # an earlier code point and dropping the tail.
+    p = "a" + chr(0x10FFFF)
+    out = list_objects_endpoint._prefix_resume(p)
+    assert out == "b"
+    assert p < out
+
+
 # ---- endpoint behaviour -------------------------------------------------------
 
 
@@ -600,6 +617,53 @@ async def test_start_after_filters_common_prefix_not_greater() -> None:
     assert pool.fetch.call_args.args[3] == "docs/zzz\x01"
     root = _parse(resp.body)
     assert _cps(root) == ["img/"]
+
+
+@pytest.mark.asyncio
+async def test_start_after_equal_to_common_prefix_suppresses_it() -> None:
+    # AWS: a common prefix is filtered out if it is NOT lexicographically greater than
+    # StartAfter. With start-after="abc/", the abc/* keys form "abc/" which equals (not >)
+    # StartAfter and must be dropped; only def/ (which is > "abc/") survives.
+    rows = [_row("abc/file1"), _row("abc/file2"), _row("def/1")]
+    pool = _make_pool(bucket_row=_bucket(), list_rows=rows)
+    resp = await handle_list_objects(
+        "b",
+        _ctx(),
+        pool,
+        prefix=None,
+        start_after="abc/",
+        continuation_token=None,
+        max_keys=None,
+        encoding_type=None,
+        delimiter="/",
+    )
+    root = _parse(resp.body)
+    assert _keys(root) == []
+    assert _cps(root) == ["def/"]
+    assert _text(root, "KeyCount") == "1"
+
+
+@pytest.mark.asyncio
+async def test_multiple_folders_collapse_in_a_single_fetch() -> None:
+    # Regression guard: distinct sibling folders must roll up within ONE fetch (the cursor
+    # jump skips each group's interior in-batch) rather than one DB round trip per folder.
+    rows = [_row("d1/a"), _row("d1/b"), _row("d2/a"), _row("d2/b"), _row("e1/a")]
+    pool = _make_pool(bucket_row=_bucket(), list_rows=rows)
+    resp = await handle_list_objects(
+        "b",
+        _ctx(),
+        pool,
+        prefix=None,
+        start_after=None,
+        continuation_token=None,
+        max_keys=None,
+        encoding_type=None,
+        delimiter="/",
+    )
+    root = _parse(resp.body)
+    assert _cps(root) == ["d1/", "d2/", "e1/"]
+    assert _keys(root) == []
+    pool.fetch.assert_awaited_once()
 
 
 @pytest.mark.asyncio
