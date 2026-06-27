@@ -223,6 +223,20 @@ struct ReclaimParams {
     pressure_bps: u16,
 }
 
+impl ReclaimParams {
+    /// The grace to apply at `pressure_bps` SSD fullness: the shorter `pressure_grace`
+    /// at or above the threshold (evict sooner to relieve a filling disk), the normal
+    /// `grace` below it. A pure decision, extracted so the mode selection is unit-tested
+    /// without needing to drive real disk fullness.
+    fn grace_for(self, pressure_bps: u16) -> Duration {
+        if pressure_bps >= self.pressure_bps {
+            self.pressure_grace
+        } else {
+            self.grace
+        }
+    }
+}
+
 /// One reclaim pass: probe SSD pressure (off the async runtime — statvfs blocks) to
 /// pick the grace, then evict terminal aged parts and sweep orphan write-temps.
 ///
@@ -232,8 +246,7 @@ struct ReclaimParams {
 async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, params: ReclaimParams) {
     let root = ssd.root().to_path_buf();
     let grace = match tokio::task::spawn_blocking(move || disk_usage(&root)).await {
-        Ok(Ok(usage)) if usage.pressure.bps() >= params.pressure_bps => params.pressure_grace,
-        Ok(Ok(_)) => params.grace,
+        Ok(Ok(usage)) => params.grace_for(usage.pressure.bps()),
         Ok(Err(err)) => {
             tracing::warn!(error = %err, "reclaim disk probe failed; using the normal grace");
             params.grace
@@ -476,13 +489,13 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::{AgentRuntime, HeartbeatConfig, RateControl, RuntimeConfig, default_enforcer};
+    use super::{AgentRuntime, HeartbeatConfig, RateControl, ReclaimParams, RuntimeConfig, default_enforcer};
     use crate::localfs::{LocalFs, LocalSsd};
     use crate::supervisor::ShutdownTrigger;
     use core::str::FromStr;
     use hippius_drain_core::{
-        Allocation, ByteRate, Bytes, Clock, NodeId, ObjectId, PartKey, PartNumber, PartReplicationStore, ReplicationState, Store, TestClock,
-        UploadEnqueuer, Version,
+        Allocation, ByteRate, Bytes, Clock, NodeId, ObjectId, PartKey, PartNumber, PartReplicationStore, ReplicationState, SnapshotCell, Store,
+        TestClock, UploadEnqueuer, Version,
     };
 
     /// A no-op upload enqueuer for the runtime tests (drain-direct's Redis fan-out is
@@ -504,6 +517,21 @@ mod tests {
 
     fn part_at(version: u32, number: u32) -> PartKey {
         PartKey::new(ObjectId::from_str(UUID).unwrap(), Version::new(version), PartNumber::new(number))
+    }
+
+    #[test]
+    fn reclaim_grace_switches_to_the_pressure_grace_at_the_threshold() {
+        let params = ReclaimParams {
+            grace: Duration::from_hours(1),
+            pressure_grace: Duration::from_mins(1),
+            pressure_bps: 9000,
+        };
+        // Below the threshold -> the normal (longer) grace.
+        assert_eq!(params.grace_for(0), Duration::from_hours(1));
+        assert_eq!(params.grace_for(8999), Duration::from_hours(1));
+        // At or above the threshold -> the shorter pressure grace (evict sooner).
+        assert_eq!(params.grace_for(9000), Duration::from_mins(1));
+        assert_eq!(params.grace_for(10_000), Duration::from_mins(1));
     }
 
     /// Lays a complete SSD part (chunk files + meta.json) and records it pending.
@@ -859,13 +887,15 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
-    async fn the_reclaim_worker_evicts_a_terminal_aged_part_and_keeps_a_live_one(pool: PgPool) {
-        // The SSD-ingest GC: a `replicated` part still on SSD (a crash-orphaned copy) is
-        // unlinked once aged, while a `pending` part the drain still owns is never touched
-        // — the absolute safety invariant, exercised end-to-end against real Postgres.
+    async fn reclaim_once_evicts_a_terminal_aged_part_and_keeps_a_live_one(pool: PgPool) {
+        // The SSD-ingest GC, exercised against real Postgres + a real LocalSsd + disk
+        // probe: a `replicated` part still on SSD (a crash-orphaned copy) is unlinked once
+        // aged, while a `pending` part the drain still owns is never touched (the absolute
+        // safety invariant). Driving reclaim_once directly keeps it deterministic — the
+        // periodic spawn machinery is the same run_periodic the sibling worker tests cover.
         let ssd_dir = tempfile::tempdir().unwrap();
-        let pool_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::from_pool(pool.clone()));
+        let store = Store::from_pool(pool.clone());
+        let snapshot = SnapshotCell::new();
 
         // A replicated part still on SSD, forced 2h old -> reclaimable.
         let replicated = part_at(5, 1);
@@ -887,55 +917,31 @@ mod tests {
         seed_ssd_dir(ssd_dir.path(), &pending);
         store.record_landed_part(&pending).await.unwrap();
 
-        let runtime = AgentRuntime::new(
-            Arc::new(LocalFs::new(pool_dir.path())),
-            Arc::new(LocalSsd::new(ssd_dir.path())),
-            Arc::clone(&store),
-            Arc::new(NoopEnqueuer),
-            RuntimeConfig {
-                // Park drain + reconcile so ONLY the reclaim worker acts on the SSD (a
-                // live drain would replicate + unlink the pending part, masking the test).
-                drain_poll: Duration::from_mins(1),
-                reconcile_poll: Duration::from_mins(1),
-                reclaim_poll: Duration::from_millis(20),
-                // Both graces tiny so the 2h-old part is reclaimed whatever the host
-                // disk's pressure band — the test is deterministic regardless of mode.
-                reclaim_grace: Duration::from_secs(1),
-                reclaim_pressure_grace: Duration::from_secs(1),
-                reclaim_pressure_bps: 9000,
-                grace: Duration::from_secs(5),
-            },
+        let ssd = LocalSsd::new(ssd_dir.path());
+        // Tiny graces so the 2h-old part is reclaimed whatever the host disk's pressure
+        // band reads — the assertion is deterministic regardless of which grace is picked.
+        let params = ReclaimParams {
+            grace: Duration::from_secs(1),
+            pressure_grace: Duration::from_secs(1),
+            pressure_bps: 9000,
+        };
+
+        super::reclaim_once(&ssd, &store, &snapshot, params).await;
+
+        assert!(
+            !ssd_dir.path().join(replicated.relative_dir()).exists(),
+            "the terminal aged part was evicted from the SSD",
         );
-
-        let snapshot = runtime.snapshot();
-        let shutdown = CancellationToken::new();
-        let signal = shutdown.clone();
-        let handle = tokio::spawn(async move { runtime.run(signal.cancelled_owned()).await });
-
-        let replicated_dir = ssd_dir.path().join(replicated.relative_dir());
-        let pending_dir = ssd_dir.path().join(pending.relative_dir());
-        // Generous window (~5s): the reclaim tick spawn_blocks a statvfs probe, which can
-        // queue behind sibling sqlx tests' blocking work under a full parallel run.
-        let mut evicted = false;
-        for _ in 0..500 {
-            if !replicated_dir.exists() {
-                evicted = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(evicted, "the reclaim worker evicted the terminal aged part from the SSD");
-        assert!(pending_dir.exists(), "a live (pending) part is never reclaimed");
-        assert!(snapshot.load().reclaimed >= 1, "the reclaim was counted");
+        assert!(
+            ssd_dir.path().join(pending.relative_dir()).exists(),
+            "a live (pending) part is never reclaimed"
+        );
+        assert_eq!(snapshot.load().reclaimed, 1, "the reclaim was counted");
         // Reclaim only unlinks the SSD copy; the DB row is left intact.
         assert_eq!(
             <Store as PartReplicationStore>::status(&store, &replicated).await.unwrap(),
             Some(ReplicationState::Replicated),
             "reclaim does not touch the replication row",
         );
-
-        shutdown.cancel();
-        let report = handle.await.unwrap();
-        assert!(report.clean, "every worker wound down within grace");
     }
 }
