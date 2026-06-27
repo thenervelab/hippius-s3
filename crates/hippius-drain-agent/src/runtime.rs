@@ -58,18 +58,11 @@ pub struct RuntimeConfig {
     pub drain_poll: Duration,
     /// How often the reconciler scans the SSD cache for parts missing a landed row.
     pub reconcile_poll: Duration,
-    /// How often the reclaim worker scans the SSD for terminal aged parts to evict.
+    /// How often the reclaim worker scans the SSD for `failed` (abandoned-upload) parts.
     pub reclaim_poll: Duration,
-    /// How long a terminal (replicated/failed) part is kept before the reclaim worker
-    /// unlinks it under normal pressure (its diagnosis / drain-race window). Also the
-    /// orphan-temp sweep's max age.
+    /// How long a `failed` part (and an orphan write-temp) is kept before the reclaim
+    /// worker unlinks it — a diagnosis / abort-settle window.
     pub reclaim_grace: Duration,
-    /// The shorter grace the reclaim worker uses when the SSD is under pressure, to
-    /// relieve a filling disk sooner. Never relaxes the terminal-state gate.
-    pub reclaim_pressure_grace: Duration,
-    /// SSD fullness (basis points, `0..=10000`) at or above which the reclaim worker
-    /// switches from `reclaim_grace` to `reclaim_pressure_grace`.
-    pub reclaim_pressure_bps: u16,
     /// How long workers get to finish an in-flight tick after cancellation
     /// before the supervisor force-aborts them.
     pub grace: Duration,
@@ -214,71 +207,25 @@ async fn heartbeat_once(ssd: &LocalSsd, store: &Store, node: &NodeId, max_drain_
     }
 }
 
-/// The reclaim worker's grace policy: the normal grace, the shorter grace used when
-/// the SSD is under pressure, and the pressure threshold (basis points) that selects it.
-#[derive(Debug, Clone, Copy)]
-struct ReclaimParams {
-    grace: Duration,
-    pressure_grace: Duration,
-    pressure_bps: u16,
-}
-
-impl ReclaimParams {
-    /// The grace to apply at `pressure_bps` SSD fullness: the shorter `pressure_grace`
-    /// at or above the threshold (evict sooner to relieve a filling disk), the normal
-    /// `grace` below it. A pure decision, extracted so the mode selection is unit-tested
-    /// without needing to drive real disk fullness.
-    fn grace_for(self, pressure_bps: u16) -> Duration {
-        if pressure_bps >= self.pressure_bps {
-            self.pressure_grace
-        } else {
-            self.grace
-        }
-    }
-}
-
-/// One reclaim pass: probe SSD pressure (off the async runtime — statvfs blocks) to
-/// pick the grace, then evict terminal aged parts and sweep orphan write-temps.
+/// One reclaim pass: evict `failed` (broken/abandoned-upload) SSD parts older than
+/// `grace`, then sweep orphan write-temps older than `grace`.
 ///
-/// A probe failure falls back to the relaxed normal grace — never escalating
-/// aggression on a bad reading. Reclaim and sweep errors are logged and skipped; the
-/// next tick retries, and no part is ever removed without a successful status read.
-async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, params: ReclaimParams) {
-    let root = ssd.root().to_path_buf();
-    let grace = match tokio::task::spawn_blocking(move || disk_usage(&root)).await {
-        Ok(Ok(usage)) => params.grace_for(usage.pressure.bps()),
-        Ok(Err(err)) => {
-            tracing::warn!(error = %err, "reclaim disk probe failed; using the normal grace");
-            params.grace
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "reclaim disk probe task panicked; using the normal grace");
-            params.grace
-        }
-    };
-
+/// Reclaim and sweep errors are logged and skipped; the next tick retries, and no part
+/// is ever removed without a successful status read (fail-safe).
+async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, grace: Duration) {
     match reclaim_ssd(ssd, ssd, store, grace).await {
         Ok(report) => {
-            snapshot.record_reclaimed(report.total_reclaimed());
-            if report.total_reclaimed() > 0 {
+            snapshot.record_reclaimed(report.reclaimed);
+            if report.reclaimed > 0 {
                 // Aggregate, not per-part: an abandoned MPU reclaims many parts at once,
-                // so a per-part line would spam — the counts give the diagnosis signal.
-                tracing::info!(
-                    replicated = report.reclaimed_replicated,
-                    failed = report.reclaimed_failed,
-                    grace_secs = grace.as_secs(),
-                    "reclaimed terminal SSD parts"
-                );
+                // so a per-part line would spam.
+                tracing::info!(reclaimed = report.reclaimed, "reclaimed broken/abandoned-upload SSD parts");
             }
         }
         Err(err) => tracing::warn!(error = ?err, "ssd reclaim cycle failed; will retry next poll"),
     }
 
-    // Always use the NORMAL grace for temps, never the pressure-shortened one: a temp
-    // is tiny (sweeping it frees no meaningful space, so there is nothing to gain by
-    // being aggressive under pressure) and a recent temp may belong to a slow in-flight
-    // PUT — unlinking it would break that upload's atomic rename.
-    match ssd.sweep_orphan_tmp(params.grace).await {
+    match ssd.sweep_orphan_tmp(grace).await {
         Ok(0) => {}
         Ok(removed) => tracing::info!(removed, "swept orphan SSD write-temps"),
         Err(err) => tracing::warn!(error = %err, "orphan-temp sweep failed; will retry next poll"),
@@ -440,21 +387,17 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
             })
         });
 
-        // SSD reclaim worker: evict terminal (replicated/failed) parts the drain is
-        // done with, plus orphan write-temps, once aged — the SSD-ingest tier's GC, so
-        // a stuck drain's backlog does not fill the disk and 503 every PUT on the node.
+        // SSD reclaim worker: clean up broken/abandoned uploads (`failed` parts) the
+        // drain skips forever, plus orphan write-temps — the SSD-ingest tier's GC so
+        // abandoned-upload junk does not accumulate on the node-local disk.
         let (ssd, store, snapshot) = (Arc::clone(&self.ssd), Arc::clone(&self.store), Arc::clone(&self.snapshot));
         let reclaim_poll = self.config.reclaim_poll;
-        let params = ReclaimParams {
-            grace: self.config.reclaim_grace,
-            pressure_grace: self.config.reclaim_pressure_grace,
-            pressure_bps: self.config.reclaim_pressure_bps,
-        };
+        let reclaim_grace = self.config.reclaim_grace;
         supervisor.spawn(WorkerName::new("ssd_reclaim"), move |token| {
             run_periodic(token, reclaim_poll, move || {
                 let (ssd, store, snapshot) = (Arc::clone(&ssd), Arc::clone(&store), Arc::clone(&snapshot));
                 async move {
-                    reclaim_once(&ssd, &store, &snapshot, params).await;
+                    reclaim_once(&ssd, &store, &snapshot, reclaim_grace).await;
                 }
             })
         });
@@ -489,7 +432,7 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::{AgentRuntime, HeartbeatConfig, RateControl, ReclaimParams, RuntimeConfig, default_enforcer};
+    use super::{AgentRuntime, HeartbeatConfig, RateControl, RuntimeConfig, default_enforcer};
     use crate::localfs::{LocalFs, LocalSsd};
     use crate::supervisor::ShutdownTrigger;
     use core::str::FromStr;
@@ -517,21 +460,6 @@ mod tests {
 
     fn part_at(version: u32, number: u32) -> PartKey {
         PartKey::new(ObjectId::from_str(UUID).unwrap(), Version::new(version), PartNumber::new(number))
-    }
-
-    #[test]
-    fn reclaim_grace_switches_to_the_pressure_grace_at_the_threshold() {
-        let params = ReclaimParams {
-            grace: Duration::from_hours(1),
-            pressure_grace: Duration::from_mins(1),
-            pressure_bps: 9000,
-        };
-        // Below the threshold -> the normal (longer) grace.
-        assert_eq!(params.grace_for(0), Duration::from_hours(1));
-        assert_eq!(params.grace_for(8999), Duration::from_hours(1));
-        // At or above the threshold -> the shorter pressure grace (evict sooner).
-        assert_eq!(params.grace_for(9000), Duration::from_mins(1));
-        assert_eq!(params.grace_for(10_000), Duration::from_mins(1));
     }
 
     /// Lays a complete SSD part (chunk files + meta.json) and records it pending.
@@ -600,8 +528,6 @@ mod tests {
                 reconcile_poll: Duration::from_mins(1),
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
-                reclaim_pressure_grace: Duration::from_mins(1),
-                reclaim_pressure_bps: 9000,
                 grace: Duration::from_secs(5),
             },
         )
@@ -665,8 +591,6 @@ mod tests {
                 reconcile_poll: Duration::from_mins(1),
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
-                reclaim_pressure_grace: Duration::from_mins(1),
-                reclaim_pressure_bps: 9000,
                 grace: Duration::from_secs(5),
             },
         )
@@ -750,8 +674,6 @@ mod tests {
                 reconcile_poll: Duration::from_mins(1),
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
-                reclaim_pressure_grace: Duration::from_mins(1),
-                reclaim_pressure_bps: 9000,
                 grace: Duration::from_secs(5),
             },
         )
@@ -812,8 +734,6 @@ mod tests {
                 reconcile_poll: Duration::from_millis(20),
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
-                reclaim_pressure_grace: Duration::from_mins(1),
-                reclaim_pressure_bps: 9000,
                 grace: Duration::from_secs(5),
             },
         );
@@ -858,8 +778,6 @@ mod tests {
                 reconcile_poll: Duration::from_millis(50),
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
-                reclaim_pressure_grace: Duration::from_mins(1),
-                reclaim_pressure_bps: 9000,
                 grace: Duration::from_secs(5),
             },
         );
@@ -887,61 +805,61 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
-    async fn reclaim_once_evicts_a_terminal_aged_part_and_keeps_a_live_one(pool: PgPool) {
-        // The SSD-ingest GC, exercised against real Postgres + a real LocalSsd + disk
-        // probe: a `replicated` part still on SSD (a crash-orphaned copy) is unlinked once
-        // aged, while a `pending` part the drain still owns is never touched (the absolute
-        // safety invariant). Driving reclaim_once directly keeps it deterministic — the
-        // periodic spawn machinery is the same run_periodic the sibling worker tests cover.
+    async fn reclaim_once_evicts_a_failed_aged_part_and_keeps_a_replicated_one(pool: PgPool) {
+        // The SSD-ingest GC, against real Postgres + a real LocalSsd: a `failed` part (a
+        // broken/abandoned upload) is unlinked once aged, while a `replicated` part (the
+        // drain's own to clean) and the DB rows are left untouched. Driving reclaim_once
+        // directly keeps it deterministic — the periodic spawn machinery is the same
+        // run_periodic the sibling worker tests cover.
         let ssd_dir = tempfile::tempdir().unwrap();
         let store = Store::from_pool(pool.clone());
         let snapshot = SnapshotCell::new();
 
-        // A replicated part still on SSD, forced 2h old -> reclaimable.
-        let replicated = part_at(5, 1);
+        // A failed part (abandoned upload), forced 2h old -> reclaimable.
+        let failed = part_at(5, 1);
+        seed_ssd_dir(ssd_dir.path(), &failed);
+        store.record_landed_part(&failed).await.unwrap();
+        force_terminal_2h(&pool, &failed, "failed").await;
+
+        // A replicated part -> the drain's own to clean up; the reclaimer leaves it.
+        let replicated = part_at(5, 2);
         seed_ssd_dir(ssd_dir.path(), &replicated);
         store.record_landed_part(&replicated).await.unwrap();
-        sqlx::query(
-            "UPDATE cephor_replication_status SET status = 'replicated', updated_at = now() - interval '2 hours' \
-             WHERE object_id = $1 AND version = $2 AND part_number = $3",
-        )
-        .bind(replicated.object().as_str())
-        .bind(i64::from(replicated.version().get()))
-        .bind(i64::from(replicated.part().get()))
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // A pending part the drain still owns -> must survive regardless of age.
-        let pending = part_at(5, 2);
-        seed_ssd_dir(ssd_dir.path(), &pending);
-        store.record_landed_part(&pending).await.unwrap();
+        force_terminal_2h(&pool, &replicated, "replicated").await;
 
         let ssd = LocalSsd::new(ssd_dir.path());
-        // Tiny graces so the 2h-old part is reclaimed whatever the host disk's pressure
-        // band reads — the assertion is deterministic regardless of which grace is picked.
-        let params = ReclaimParams {
-            grace: Duration::from_secs(1),
-            pressure_grace: Duration::from_secs(1),
-            pressure_bps: 9000,
-        };
-
-        super::reclaim_once(&ssd, &store, &snapshot, params).await;
+        super::reclaim_once(&ssd, &store, &snapshot, Duration::from_secs(1)).await;
 
         assert!(
-            !ssd_dir.path().join(replicated.relative_dir()).exists(),
-            "the terminal aged part was evicted from the SSD",
+            !ssd_dir.path().join(failed.relative_dir()).exists(),
+            "the aged failed (abandoned-upload) part was evicted from the SSD",
         );
         assert!(
-            ssd_dir.path().join(pending.relative_dir()).exists(),
-            "a live (pending) part is never reclaimed"
+            ssd_dir.path().join(replicated.relative_dir()).exists(),
+            "a replicated part is left for the drain, never reclaimed here",
         );
-        assert_eq!(snapshot.load().reclaimed, 1, "the reclaim was counted");
+        assert_eq!(snapshot.load().reclaimed, 1, "exactly the failed part was counted");
         // Reclaim only unlinks the SSD copy; the DB row is left intact.
         assert_eq!(
-            <Store as PartReplicationStore>::status(&store, &replicated).await.unwrap(),
-            Some(ReplicationState::Replicated),
+            <Store as PartReplicationStore>::status(&store, &failed).await.unwrap(),
+            Some(ReplicationState::Failed),
             "reclaim does not touch the replication row",
         );
+    }
+
+    /// Forces a part's row to `status` with `updated_at` backdated 2h, so the reclaim
+    /// age reads deterministically older than any test grace.
+    async fn force_terminal_2h(pool: &PgPool, part: &PartKey, status: &str) {
+        sqlx::query(
+            "UPDATE cephor_replication_status SET status = $4, updated_at = now() - interval '2 hours' \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 }

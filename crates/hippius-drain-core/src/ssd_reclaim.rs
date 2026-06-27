@@ -1,24 +1,24 @@
-//! The SSD-ingest reclaim backstop: delete node-local SSD parts the drain is done
-//! with, once they have aged past a grace.
+//! The SSD-ingest reclaim backstop: clean up **broken / abandoned uploads** left on
+//! the node-local SSD.
 //!
-//! The drain's success path already unlinks a part right after `mark_replicated`,
-//! so in steady state the SSD self-clears. This worker reclaims the leftovers that
-//! path misses, both terminal in the replication log:
-//! - a [`Replicated`](ReplicationState::Replicated) part orphaned by a crash between
-//!   the commit and the unlink (the at-least-once gap), and
-//! - a [`Failed`](ReplicationState::Failed) part — an aborted/abandoned upload that
-//!   `claim_part` skips forever, so the drain never unlinks it.
+//! Scope is deliberately narrow — only [`Failed`](ReplicationState::Failed) parts: an
+//! aborted or abandoned upload (an MPU abort, an abandoned MPU the reaper marked
+//! terminal, or a failed single-part PUT). `claim_part` skips a `failed` row forever,
+//! so the drain never unlinks it and its SSD bytes leak with nothing else to reclaim
+//! them. This worker is that missing owner.
 //!
-//! It NEVER touches a `pending`/`draining` part (owned by the drain pipeline) or a
-//! part with no row (pre-reconcile / mid-upload). The gate is absolute and mirrors
-//! the CephFS-pool janitor's replication gate: `replicated`/`failed` are terminal
-//! sinks (nothing returns a row to `pending` except `release_part`/`defer_part`,
-//! each guarded on `status='draining'`), so a terminal read cannot race back to a
-//! live part, and removal is idempotent, so racing the drain's own unlink is safe.
+//! It does NOT touch anything else, and in particular **not** `replicated` parts: the
+//! drain unlinks its own SSD copy the instant it commits a replication, and the SSD
+//! copy is never read (downloads stream from the `CephFS` pool, not the ingest SSD),
+//! so a successfully-replicated part is the drain's to clean up, not the reclaimer's.
+//! `pending`/`draining` parts are live (owned by the drain pipeline) and a part with
+//! no row may still be mid-upload — both are left strictly alone.
 //!
-//! A `failed` part is kept for the grace window too (a byte-mismatch copy is worth a
-//! brief diagnosis window), then reclaimed — the abandoned-upload leak is the same
-//! `failed` state and must not be kept forever.
+//! Safety: `failed` is a terminal sink (nothing returns a row to `pending` except
+//! `release_part`/`defer_part`, each guarded on `status='draining'`), so the read can
+//! never race back to a live part; removal is idempotent; a brief `grace` keeps a
+//! just-failed part (a diagnosis window, and headroom so an in-flight abort txn is not
+//! raced). Age uses the store's clock, so the grace has no agent-clock dependence.
 //!
 //! Like [`crate::reconcile_parts`] the orchestrator is I/O-free: it is generic over
 //! the [`PartScan`] discovery seam, a [`PartRemover`] removal seam, and a
@@ -81,35 +81,31 @@ pub trait ReclaimLog: Send + Sync {
 pub struct ReclaimReport {
     /// Parts seen on SSD.
     pub scanned: u64,
-    /// `replicated` parts (durable on `CephFS`) reclaimed — crash-orphaned SSD copies.
-    pub reclaimed_replicated: u64,
     /// `failed` parts (aborted/abandoned uploads) reclaimed.
-    pub reclaimed_failed: u64,
+    pub reclaimed: u64,
     /// Left alone because still `pending`/`draining` — owned by the drain pipeline.
     pub skipped_live: u64,
+    /// Left alone because already `replicated`: the drain owns cleanup of its own
+    /// successful replications (it unlinks on commit). A replicated copy still on SSD
+    /// is a rare drain crash-orphan; counted only for visibility, never reclaimed here.
+    pub skipped_replicated: u64,
     /// Left alone because the store has no row yet — pre-reconcile or mid-upload.
     pub skipped_absent: u64,
-    /// Terminal but within the grace window (diagnosis / drain-race headroom).
+    /// `failed` but within the grace window (diagnosis / abort-race headroom).
     pub skipped_young: u64,
 }
 
 impl ReclaimReport {
-    /// Total parts reclaimed this pass (`replicated` + `failed`).
-    #[must_use]
-    pub fn total_reclaimed(&self) -> u64 {
-        self.reclaimed_replicated.saturating_add(self.reclaimed_failed)
-    }
-
     /// The sum of the per-disposition categories.
     ///
     /// Every scanned part falls into exactly one, so this must equal
     /// [`scanned`](Self::scanned) — the report's invariant, which [`reclaim_ssd`]
-    /// `debug_assert`s before returning.
+    /// `debug_asserts` before returning.
     #[must_use]
     pub fn categorized(&self) -> u64 {
-        self.reclaimed_replicated
-            .saturating_add(self.reclaimed_failed)
+        self.reclaimed
             .saturating_add(self.skipped_live)
+            .saturating_add(self.skipped_replicated)
             .saturating_add(self.skipped_absent)
             .saturating_add(self.skipped_young)
     }
@@ -138,21 +134,12 @@ impl ReclaimError {
     }
 }
 
-/// The two terminal states a reclaim may act on. Carrying the kind from the age gate
-/// to the tally keeps the per-state count exhaustive with no impossible match arm.
-#[derive(Debug, Clone, Copy)]
-enum Terminal {
-    Replicated,
-    Failed,
-}
-
-/// Reclaims terminal, aged parts from the SSD cache.
+/// Reclaims `failed` (broken/abandoned-upload) parts from the SSD cache, once aged.
 ///
-/// Scans every complete part on SSD, reads all their states in one batch, and for
-/// each one that is terminal (`replicated`/`failed`) AND older than `grace`, unlinks
-/// its directory. `pending`/`draining` parts and parts with no row are left untouched
-/// — the absolute safety gate (never delete a part the drain still owns or has not
-/// recorded). The caller resolves `grace` from the disk-pressure mode.
+/// Scans every complete part on SSD, reads all their states in one batch, and unlinks
+/// each one that is `failed` AND older than `grace`. Everything else is left untouched:
+/// `pending`/`draining` are live (drain-owned), `replicated` is the drain's own to
+/// clean up, and a part with no row may still be mid-upload — the absolute safety gate.
 ///
 /// # Errors
 ///
@@ -187,25 +174,22 @@ where
             continue;
         };
 
-        // pending/draining are owned by the drain pipeline; the age gate keeps a
-        // just-terminal part for the grace window. Everything else is reclaimable.
-        let terminal = match status.state {
-            ReplicationState::Pending | ReplicationState::Draining => {
-                report.skipped_live += 1;
-                continue;
+        match status.state {
+            // Live: owned by the drain pipeline.
+            ReplicationState::Pending | ReplicationState::Draining => report.skipped_live += 1,
+            // Replicated: the drain unlinks its own SSD copy on commit; a lingering one
+            // is a rare crash-orphan that is the drain's to clean up, not ours.
+            ReplicationState::Replicated => report.skipped_replicated += 1,
+            // Failed = a broken/abandoned upload (MPU abort, abandoned MPU, or a failed
+            // single-part PUT). The only thing we reclaim — once past the grace window.
+            ReplicationState::Failed => {
+                if status.age < grace {
+                    report.skipped_young += 1;
+                } else {
+                    remover.unlink_part(part).await.map_err(ReclaimError::Remove)?;
+                    report.reclaimed += 1;
+                }
             }
-            ReplicationState::Replicated => Terminal::Replicated,
-            ReplicationState::Failed => Terminal::Failed,
-        };
-        if status.age < grace {
-            report.skipped_young += 1;
-            continue;
-        }
-
-        remover.unlink_part(part).await.map_err(ReclaimError::Remove)?;
-        match terminal {
-            Terminal::Replicated => report.reclaimed_replicated += 1,
-            Terminal::Failed => report.reclaimed_failed += 1,
         }
     }
 
@@ -346,18 +330,6 @@ mod tests {
     const GRACE: Duration = Duration::from_mins(30);
 
     #[tokio::test]
-    async fn an_aged_replicated_part_is_reclaimed() {
-        let part = part_at(UUID_A, 5, 1);
-        let scan = FakeScan::of(std::slice::from_ref(&part));
-        let remover = FakeRemover::default();
-        let log = FakeLog::with(&[(&part, ReplicationState::Replicated, HOUR)]);
-
-        let report = reclaim_ssd(&scan, &remover, &log, GRACE).await.unwrap();
-        assert_eq!(report.reclaimed_replicated, 1);
-        assert_eq!(remover.removed(), vec![key(&part)], "the aged replicated part was unlinked");
-    }
-
-    #[tokio::test]
     async fn an_aged_failed_part_is_reclaimed() {
         let part = part_at(UUID_A, 5, 1);
         let scan = FakeScan::of(std::slice::from_ref(&part));
@@ -365,48 +337,63 @@ mod tests {
         let log = FakeLog::with(&[(&part, ReplicationState::Failed, HOUR)]);
 
         let report = reclaim_ssd(&scan, &remover, &log, GRACE).await.unwrap();
-        assert_eq!(report.reclaimed_failed, 1);
+        assert_eq!(report.reclaimed, 1);
         assert_eq!(remover.removed(), vec![key(&part)], "the aged failed (abandoned) part was unlinked");
     }
 
     #[tokio::test]
-    async fn pending_draining_and_no_row_parts_are_never_reclaimed() {
-        // The absolute safety invariant: a part the drain still owns (pending/draining)
-        // or has no row for must NEVER be unlinked, regardless of age.
+    async fn a_replicated_part_is_left_for_the_drain() {
+        // A replicated copy still on SSD is the drain's own to clean up (it unlinks on
+        // commit; this is a rare crash-orphan). The reclaimer never touches it.
+        let part = part_at(UUID_A, 5, 1);
+        let scan = FakeScan::of(std::slice::from_ref(&part));
+        let remover = FakeRemover::default();
+        let log = FakeLog::with(&[(&part, ReplicationState::Replicated, HOUR)]);
+
+        let report = reclaim_ssd(&scan, &remover, &log, GRACE).await.unwrap();
+        assert_eq!(report.skipped_replicated, 1);
+        assert_eq!(report.reclaimed, 0);
+        assert!(remover.removed().is_empty(), "a replicated part is never reclaimed here");
+    }
+
+    #[tokio::test]
+    async fn pending_draining_replicated_and_no_row_parts_are_never_reclaimed() {
+        // The absolute safety invariant: a part the drain still owns (pending/draining),
+        // one it already replicated, or one with no row must NEVER be unlinked here,
+        // regardless of age.
         let pending = part_at(UUID_A, 1, 1);
         let draining = part_at(UUID_A, 1, 2);
+        let replicated = part_at(UUID_A, 1, 3);
         let absent = part_at(UUID_B, 7, 1);
-        let scan = FakeScan::of(&[pending.clone(), draining.clone(), absent.clone()]);
+        let scan = FakeScan::of(&[pending.clone(), draining.clone(), replicated.clone(), absent.clone()]);
         let remover = FakeRemover::default();
         let log = FakeLog::with(&[
             (&pending, ReplicationState::Pending, HOUR),
             (&draining, ReplicationState::Draining, HOUR),
+            (&replicated, ReplicationState::Replicated, HOUR),
             // `absent` has no row in the log at all.
         ]);
 
         let report = reclaim_ssd(&scan, &remover, &log, GRACE).await.unwrap();
-        assert_eq!(
-            report.reclaimed_replicated + report.reclaimed_failed,
-            0,
-            "nothing live or unrecorded is reclaimed"
-        );
+        assert_eq!(report.reclaimed, 0, "nothing but a failed part is ever reclaimed");
         assert_eq!(report.skipped_live, 2);
+        assert_eq!(report.skipped_replicated, 1);
         assert_eq!(report.skipped_absent, 1);
         assert!(remover.removed().is_empty(), "no part was unlinked");
     }
 
     #[tokio::test]
-    async fn a_young_terminal_part_is_kept_within_the_grace_window() {
+    async fn a_young_failed_part_is_kept_within_the_grace_window() {
         let part = part_at(UUID_A, 5, 1);
         let scan = FakeScan::of(std::slice::from_ref(&part));
         let remover = FakeRemover::default();
-        // Terminal but only just replicated — within grace (drain may be racing the
-        // unlink, or a failed copy is in its diagnosis window).
-        let log = FakeLog::with(&[(&part, ReplicationState::Replicated, Duration::from_mins(1))]);
+        // Failed but only just now — within grace (an abort txn may still be settling,
+        // and a corruption sample is worth a brief diagnosis window).
+        let log = FakeLog::with(&[(&part, ReplicationState::Failed, Duration::from_mins(1))]);
 
         let report = reclaim_ssd(&scan, &remover, &log, GRACE).await.unwrap();
         assert_eq!(report.skipped_young, 1);
-        assert!(remover.removed().is_empty(), "a young terminal part is kept");
+        assert!(remover.removed().is_empty(), "a young failed part is kept");
     }
 
     #[tokio::test]
@@ -414,27 +401,27 @@ mod tests {
         let parts: Vec<PartKey> = (1..=5).map(|n| part_at(UUID_A, 5, n)).collect();
         let scan = FakeScan::of(&parts);
         let remover = FakeRemover::default();
-        let log = FakeLog::with(&parts.iter().map(|p| (p, ReplicationState::Replicated, HOUR)).collect::<Vec<_>>());
+        let log = FakeLog::with(&parts.iter().map(|p| (p, ReplicationState::Failed, HOUR)).collect::<Vec<_>>());
 
         let report = reclaim_ssd(&scan, &remover, &log, GRACE).await.unwrap();
-        assert_eq!(report.reclaimed_replicated, 5);
+        assert_eq!(report.reclaimed, 5);
         assert_eq!(log.calls(), 1, "all five parts' statuses were read in one batched call");
     }
 
     #[tokio::test]
     async fn a_mixed_cache_tallies_each_disposition_and_sums_to_scanned() {
-        let repl = part_at(UUID_A, 1, 1); // aged replicated -> reclaimed
-        let fail = part_at(UUID_A, 1, 2); // aged failed -> reclaimed
+        let fail = part_at(UUID_A, 1, 1); // aged failed -> reclaimed
+        let repl = part_at(UUID_A, 1, 2); // replicated -> left for the drain
         let live = part_at(UUID_A, 1, 3); // draining -> live
-        let young = part_at(UUID_A, 1, 4); // young replicated -> kept
+        let young = part_at(UUID_A, 1, 4); // young failed -> kept
         let absent = part_at(UUID_B, 7, 1); // no row -> absent
-        let scan = FakeScan::of(&[repl.clone(), fail.clone(), live.clone(), young.clone(), absent.clone()]);
+        let scan = FakeScan::of(&[fail.clone(), repl.clone(), live.clone(), young.clone(), absent.clone()]);
         let remover = FakeRemover::default();
         let log = FakeLog::with(&[
-            (&repl, ReplicationState::Replicated, HOUR),
             (&fail, ReplicationState::Failed, HOUR),
+            (&repl, ReplicationState::Replicated, HOUR),
             (&live, ReplicationState::Draining, HOUR),
-            (&young, ReplicationState::Replicated, Duration::from_secs(1)),
+            (&young, ReplicationState::Failed, Duration::from_secs(1)),
         ]);
 
         let report = reclaim_ssd(&scan, &remover, &log, GRACE).await.unwrap();
@@ -442,9 +429,9 @@ mod tests {
             report,
             ReclaimReport {
                 scanned: 5,
-                reclaimed_replicated: 1,
-                reclaimed_failed: 1,
+                reclaimed: 1,
                 skipped_live: 1,
+                skipped_replicated: 1,
                 skipped_absent: 1,
                 skipped_young: 1,
             }
@@ -454,9 +441,7 @@ mod tests {
             report.categorized(),
             "every scanned part lands in exactly one disposition"
         );
-        assert_eq!(report.total_reclaimed(), 2);
-        // removed() is sorted ascending: repl is part_1, fail is part_2.
-        assert_eq!(remover.removed(), vec![key(&repl), key(&fail)], "exactly the two aged terminal parts");
+        assert_eq!(remover.removed(), vec![key(&fail)], "exactly the one aged failed part");
     }
 
     #[tokio::test]
@@ -491,7 +476,7 @@ mod tests {
             fail: true,
             ..FakeRemover::default()
         };
-        let log = FakeLog::with(&[(&part, ReplicationState::Replicated, HOUR)]);
+        let log = FakeLog::with(&[(&part, ReplicationState::Failed, HOUR)]);
         let err = reclaim_ssd(&scan, &remover, &log, GRACE).await.unwrap_err();
         assert!(matches!(err, ReclaimError::Remove(_)), "got: {err:?}");
     }
