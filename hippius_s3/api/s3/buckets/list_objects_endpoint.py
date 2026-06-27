@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
+from typing import Any
 from urllib.parse import quote as urlquote
 
 import asyncpg
@@ -23,20 +24,40 @@ MAX_KEYS_LIMIT = 1000
 DEFAULT_MAX_KEYS = 1000
 # Cap continuation token length to avoid an attacker forcing a giant DB cursor bind.
 MAX_CONTINUATION_TOKEN_LEN = 4096
+# Marks tokens whose payload is an inclusive resume boundary (delimiter-aware).
+# Legacy tokens (delimiter never worked) carried a bare content key used with a ">" cursor.
+TOKEN_V2 = b"\x02"
 
 
 def _invalid_arg(message: str) -> Response:
     return errors.s3_error_response(code="InvalidArgument", message=message, status_code=400)
 
 
-def _encode_continuation_token(last_key: str) -> str:
-    return base64.urlsafe_b64encode(last_key.encode("utf-8")).decode("ascii")
+def _content_resume(key: str) -> str:
+    # Smallest representable text strictly greater than key (TEXT cannot hold U+0000),
+    # so the inclusive ">= cursor" scan resumes just past this key.
+    return key + "\x01"
+
+
+def _prefix_resume(p: str) -> str:
+    # Lexicographic successor that skips every key starting with p, under C/byte collation.
+    # p ends in the delimiter; bumping its last code point jumps past the whole collapsed group.
+    # Exact for any single-byte (ASCII) delimiter — i.e. '/', the only delimiter clients use.
+    return p[:-1] + chr(ord(p[-1]) + 1)
+
+
+def _encode_continuation_token(resume_inclusive: str) -> str:
+    return base64.urlsafe_b64encode(TOKEN_V2 + resume_inclusive.encode("utf-8")).decode("ascii")
 
 
 def _decode_continuation_token(token: str) -> str | None:
     if not token:
         return None
-    return base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
+    raw = base64.urlsafe_b64decode(token.encode("ascii"))
+    if raw[:1] == TOKEN_V2:
+        return raw[1:].decode("utf-8")
+    # Legacy bare-key token: reproduce the old "> key" semantics via an inclusive boundary.
+    return raw.decode("utf-8") + "\x01"
 
 
 def _maybe_url_encode(value: str, encoding_type: str | None) -> str:
@@ -57,12 +78,10 @@ async def handle_list_objects(
     encoding_type: str | None,
     delimiter: str | None,
 ) -> Response:
-    if delimiter:
-        logger.info("ListObjectsV2 delimiter=%r ignored (CommonPrefixes not implemented yet)", delimiter)
-
-    # FastAPI hands "?prefix=" / "?start-after=" through as "" — treat as absent.
+    # FastAPI hands "?prefix=" / "?start-after=" / "?delimiter=" through as "" — treat as absent.
     prefix = prefix or None
     start_after = start_after or None
+    delimiter = delimiter or None
 
     if max_keys is None or max_keys == "":
         effective_max_keys = DEFAULT_MAX_KEYS
@@ -75,7 +94,10 @@ async def handle_list_objects(
             return _invalid_arg("max-keys must be non-negative")
         effective_max_keys = min(effective_max_keys, MAX_KEYS_LIMIT)
 
-    cursor: str | None = start_after
+    # The SQL cursor ($3) is an inclusive ">= boundary": a content key resumes at key+'\x01'
+    # (== old "> key"), start-after at start_after+'\x01', and a common prefix jumps past its
+    # whole collapsed group via _prefix_resume.
+    cursor: str | None = _content_resume(start_after) if start_after else None
     if continuation_token:
         if len(continuation_token) > MAX_CONTINUATION_TOKEN_LEN:
             return _invalid_arg("The continuation token provided is incorrect")
@@ -96,16 +118,20 @@ async def handle_list_objects(
     bucket_id = bucket["bucket_id"]
     bucket_owner = bucket["main_account_id"] or ctx.main_account_id
 
-    # Fetch one extra row so we can detect truncation without a separate count query.
-    fetch_limit = effective_max_keys + 1 if effective_max_keys > 0 else 0
-    rows = await pool.fetch(get_query("list_objects"), bucket_id, prefix, cursor, fetch_limit)
-
-    is_truncated = len(rows) > effective_max_keys
-    if is_truncated:
-        rows = rows[:effective_max_keys]
+    items, is_truncated, next_cursor = await _collect_page(
+        pool,
+        bucket_id,
+        prefix=prefix,
+        delimiter=delimiter,
+        cursor=cursor,
+        target=effective_max_keys,
+    )
+    contents = [row for kind, row in items if kind == "content"]
+    common_prefixes = [payload for kind, payload in items if kind == "prefix"]
 
     # Element order follows the AWS ListObjectsV2 response schema so strict XML
-    # validators (some Java SDKs, S3-spec test suites) accept it.
+    # validators (some Java SDKs, S3-spec test suites) accept it. CommonPrefixes come
+    # after Contents, matching the AWS sample response.
     root = create_element("ListBucketResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
     add_subelement(root, "Name", bucket_name)
     add_subelement(root, "Prefix", _maybe_url_encode(prefix or "", encoding_type))
@@ -119,11 +145,11 @@ async def handle_list_objects(
     add_subelement(root, "IsTruncated", "true" if is_truncated else "false")
     if encoding_type:
         add_subelement(root, "EncodingType", encoding_type)
-    add_subelement(root, "KeyCount", str(len(rows)))
-    if is_truncated and rows:
-        add_subelement(root, "NextContinuationToken", _encode_continuation_token(rows[-1]["object_key"]))
+    add_subelement(root, "KeyCount", str(len(items)))
+    if is_truncated and next_cursor is not None:
+        add_subelement(root, "NextContinuationToken", _encode_continuation_token(next_cursor))
 
-    for obj in rows:
+    for obj in contents:
         content = add_subelement(root, "Contents")
         add_subelement(content, "Key", _maybe_url_encode(obj["object_key"], encoding_type))
         add_subelement(content, "LastModified", format_s3_timestamp(obj["created_at"]))
@@ -135,8 +161,78 @@ async def handle_list_objects(
         add_subelement(owner, "ID", bucket_owner)
         add_subelement(owner, "DisplayName", bucket_owner)
 
+    for common_prefix in common_prefixes:
+        cp = add_subelement(root, "CommonPrefixes")
+        add_subelement(cp, "Prefix", _maybe_url_encode(common_prefix, encoding_type))
+
     return Response(
         content=to_xml_bytes(root, pretty_print=False),
         media_type="application/xml",
         status_code=200,
     )
+
+
+async def _collect_page(
+    pool: asyncpg.Pool,
+    bucket_id: Any,
+    *,
+    prefix: str | None,
+    delimiter: str | None,
+    cursor: str | None,
+    target: int,
+) -> tuple[list[tuple[str, Any]], bool, str | None]:
+    """Skip-scan the keyset query, rolling delimiter groups into CommonPrefixes.
+
+    Returns the ordered page items (``("content", row)`` | ``("prefix", str)``), whether more
+    results exist, and the inclusive boundary to resume from. Each common prefix counts as one
+    item toward ``target`` and its whole collapsed key range is skipped via a single index seek.
+    """
+    if target == 0:
+        # AWS returns an empty, non-truncated page for max-keys=0 (degenerate probe).
+        return [], False, None
+
+    plen = len(prefix or "")
+    dlen = len(delimiter or "")
+    # One extra item past the target proves more exist (truncation) without a count query.
+    batch_limit = target + 1
+    items: list[tuple[str, Any]] = []
+    seen_prefixes: set[str] = set()
+    query = get_query("list_objects")
+
+    while True:
+        batch = await pool.fetch(query, bucket_id, prefix, cursor, batch_limit)
+        if not batch:
+            return items, False, None
+
+        advanced = False
+        for i, row in enumerate(batch):
+            key = row["object_key"]
+            if cursor is not None and key < cursor:
+                # Row sorts before a jump boundary we set mid-batch — already accounted for.
+                continue
+
+            di = key.find(delimiter, plen) if delimiter else -1
+            common_prefix = ""
+            if di == -1:
+                items.append(("content", row))
+                cursor = _content_resume(key)
+            else:
+                common_prefix = key[: di + dlen]
+                if common_prefix not in seen_prefixes:
+                    seen_prefixes.add(common_prefix)
+                    items.append(("prefix", common_prefix))
+                cursor = _prefix_resume(common_prefix)
+
+            if len(items) > target:
+                # The (target+1)th item proves truncation; resume just past the last KEPT item.
+                kind, payload = items[target - 1]
+                next_cursor = _prefix_resume(payload) if kind == "prefix" else _content_resume(payload["object_key"])
+                return items[:target], True, next_cursor
+
+            # Jump past the collapsed group instead of scanning its interior row-by-row.
+            if di != -1 and i + 1 < len(batch) and batch[i + 1]["object_key"].startswith(common_prefix):
+                advanced = True
+                break
+
+        if not advanced and len(batch) < batch_limit:
+            return items, False, None
