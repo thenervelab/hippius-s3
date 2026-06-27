@@ -7,10 +7,15 @@
 //! so the drain never unlinks it and its SSD bytes leak with nothing else to reclaim
 //! them. This worker is that missing owner.
 //!
-//! It does NOT touch anything else, and in particular **not** `replicated` parts: the
-//! drain unlinks its own SSD copy the instant it commits a replication, and the SSD
-//! copy is never read (downloads stream from the `CephFS` pool, not the ingest SSD),
-//! so a successfully-replicated part is the drain's to clean up, not the reclaimer's.
+//! It does NOT touch anything else, and in particular **not** `replicated` parts: on
+//! the happy path the drain unlinks its own SSD copy the instant it commits a
+//! replication, and the SSD copy is never read (downloads stream from the `CephFS`
+//! pool, not the ingest SSD), so a replicated part is normally the drain's to clean up.
+//! A replicated copy that lingers is only a rare **drain crash-orphan** (a crash
+//! between the `mark_replicated` commit and the unlink); `claim_part` never re-selects
+//! a `replicated` row, so nothing currently re-drives that unlink — it is a known
+//! residual leak, left out of scope here on purpose (counted `skipped_replicated` for
+//! visibility) to be handled by a drain-side re-drive if it ever proves to matter.
 //! `pending`/`draining` parts are live (owned by the drain pipeline) and a part with
 //! no row may still be mid-upload — both are left strictly alone.
 //!
@@ -85,9 +90,10 @@ pub struct ReclaimReport {
     pub reclaimed: u64,
     /// Left alone because still `pending`/`draining` — owned by the drain pipeline.
     pub skipped_live: u64,
-    /// Left alone because already `replicated`: the drain owns cleanup of its own
-    /// successful replications (it unlinks on commit). A replicated copy still on SSD
-    /// is a rare drain crash-orphan; counted only for visibility, never reclaimed here.
+    /// Left alone because already `replicated`. On the happy path the drain unlinks its
+    /// own copy on commit; a lingering one is a rare drain crash-orphan that NOTHING
+    /// currently re-drives (a known residual leak — see the module doc). Counted here so
+    /// a non-zero value surfaces that the orphan case is actually happening.
     pub skipped_replicated: u64,
     /// Left alone because the store has no row yet — pre-reconcile or mid-upload.
     pub skipped_absent: u64,
@@ -177,8 +183,9 @@ where
         match status.state {
             // Live: owned by the drain pipeline.
             ReplicationState::Pending | ReplicationState::Draining => report.skipped_live += 1,
-            // Replicated: the drain unlinks its own SSD copy on commit; a lingering one
-            // is a rare crash-orphan that is the drain's to clean up, not ours.
+            // Replicated: the drain unlinks its own SSD copy on commit. A lingering one
+            // is a rare crash-orphan nothing currently re-drives (known residual leak —
+            // see the module doc); left alone here, counted for visibility.
             ReplicationState::Replicated => report.skipped_replicated += 1,
             // Failed = a broken/abandoned upload (MPU abort, abandoned MPU, or a failed
             // single-part PUT). The only thing we reclaim — once past the grace window.

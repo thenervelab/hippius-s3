@@ -5,8 +5,10 @@
 //! [`Supervisor`](crate::supervisor): a drain worker that empties the pending
 //! part backlog on each poll, a reconciler worker that backfills parts whose
 //! landed row is missing (the reconciler is the sole trigger — there is no api
-//! NOTIFY in the part model), and an opt-in heartbeat worker that reports this
-//! node's disk pressure to the allocator. With rate control on, the drain worker
+//! NOTIFY in the part model), an `ssd_reclaim` worker that GCs `failed`
+//! (broken/abandoned-upload) parts + orphan write-temps off the local SSD, and an
+//! opt-in heartbeat worker that reports this node's disk pressure to the allocator.
+//! With rate control on, the drain worker
 //! gates through a shared
 //! [`Enforcer`] and an allocation-pull worker keeps that enforcer synced to the
 //! leader's write-budget. Each worker is a [`run_periodic`] loop that observes
@@ -220,6 +222,14 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
                 // Aggregate, not per-part: an abandoned MPU reclaims many parts at once,
                 // so a per-part line would spam.
                 tracing::info!(reclaimed = report.reclaimed, "reclaimed broken/abandoned-upload SSD parts");
+            }
+            // The one signal that the (deliberately un-handled) replicated crash-orphan
+            // leak is actually occurring — otherwise invisible. Warn so it surfaces.
+            if report.skipped_replicated > 0 {
+                tracing::warn!(
+                    skipped_replicated = report.skipped_replicated,
+                    "replicated parts still on SSD — drain crash-orphans nothing currently reclaims"
+                );
             }
         }
         Err(err) => tracing::warn!(error = ?err, "ssd reclaim cycle failed; will retry next poll"),

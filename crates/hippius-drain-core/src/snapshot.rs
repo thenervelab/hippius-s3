@@ -89,7 +89,7 @@ pub struct AgentSnapshot {
     pub deferred: u64,
     /// Chunks the reconciler recovered after a dropped `chunk_landed` trigger.
     pub reconciler_recovered: u64,
-    /// Terminal (replicated/failed) SSD parts the reclaim worker unlinked — the
+    /// `failed` (broken/abandoned-upload) SSD parts the reclaim worker unlinked — the
     /// SSD-ingest tier's eviction throughput, distinct from the drain's `CephFS` work.
     pub reclaimed: u64,
 }
