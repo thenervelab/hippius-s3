@@ -644,6 +644,29 @@ async def test_start_after_equal_to_common_prefix_suppresses_it() -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_after_inside_group_suppresses_prefix_even_with_later_member() -> None:
+    # Verified against live AWS: start-after="abc/file1" suppresses "abc/" even though a
+    # later member "abc/file2" still exists, because "abc/" is not lexicographically > the
+    # StartAfter value. Only def/ (> "abc/file1") survives.
+    rows = [_row("abc/file2"), _row("def/1")]
+    pool = _make_pool(bucket_row=_bucket(), list_rows=rows)
+    resp = await handle_list_objects(
+        "b",
+        _ctx(),
+        pool,
+        prefix=None,
+        start_after="abc/file1",
+        continuation_token=None,
+        max_keys=None,
+        encoding_type=None,
+        delimiter="/",
+    )
+    root = _parse(resp.body)
+    assert _keys(root) == []
+    assert _cps(root) == ["def/"]
+
+
+@pytest.mark.asyncio
 async def test_multiple_folders_collapse_in_a_single_fetch() -> None:
     # Regression guard: distinct sibling folders must roll up within ONE fetch (the cursor
     # jump skips each group's interior in-batch) rather than one DB round trip per folder.
