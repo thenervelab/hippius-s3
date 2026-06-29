@@ -82,6 +82,9 @@ dev = [
     "psycopg[binary]>=3.1",
     "fakeredis>=2.23.0",
     "respx>=0.21.0",
+    # Transitive via pip-audit -> cachecontrol[filecache]; floor to clear
+    # GHSA-6v7p-g79w-8964 (msgpack <1.2.1). Not used by the app at runtime.
+    "msgpack>=1.2.1",
 ]
 
 [tool.hatch.build.targets.wheel]
