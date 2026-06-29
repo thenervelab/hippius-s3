@@ -857,6 +857,29 @@ mod tests {
         );
     }
 
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn reclaim_once_also_runs_the_orphan_temp_sweep(pool: PgPool) {
+        // reclaim_once must do BOTH the failed-part reclaim AND the orphan-temp sweep.
+        // An orphan temp in an incomplete (no-meta) part dir is invisible to the part
+        // scan, so if it gets removed it can only be the sweep — proving the wiring.
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let store = Store::from_pool(pool);
+        let snapshot = SnapshotCell::new();
+
+        let part = part_at(9, 1);
+        let part_dir = ssd_dir.path().join(part.relative_dir());
+        std::fs::create_dir_all(&part_dir).unwrap();
+        let orphan = part_dir.join("chunk_0.bin.tmp.0badf00d0badf00d");
+        std::fs::write(&orphan, b"half-written").unwrap();
+
+        let ssd = LocalSsd::new(ssd_dir.path());
+        // Zero grace so the just-written temp is past the (no-)window.
+        super::reclaim_once(&ssd, &store, &snapshot, Duration::ZERO).await;
+
+        assert!(!orphan.exists(), "reclaim_once swept the orphan temp");
+        assert_eq!(snapshot.load().reclaimed, 0, "no failed part -> nothing reclaimed, only the temp swept");
+    }
+
     /// Forces a part's row to `status` with `updated_at` backdated 2h, so the reclaim
     /// age reads deterministically older than any test grace.
     async fn force_terminal_2h(pool: &PgPool, part: &PartKey, status: &str) {

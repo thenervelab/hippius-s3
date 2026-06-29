@@ -404,6 +404,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_part_exactly_at_the_grace_boundary_is_reclaimed() {
+        // The gate is `age < grace -> keep`, so age == grace falls through to reclaim.
+        // Pins the boundary so a future `<` vs `<=` slip is caught.
+        let part = part_at(UUID_A, 5, 1);
+        let scan = FakeScan::of(std::slice::from_ref(&part));
+        let remover = FakeRemover::default();
+        let log = FakeLog::with(&[(&part, ReplicationState::Failed, GRACE)]);
+
+        let report = reclaim_ssd(&scan, &remover, &log, GRACE).await.unwrap();
+        assert_eq!(report.reclaimed, 1, "age == grace reclaims");
+        assert_eq!(report.skipped_young, 0);
+    }
+
+    #[tokio::test]
     async fn the_status_read_is_batched_into_one_call() {
         let parts: Vec<PartKey> = (1..=5).map(|n| part_at(UUID_A, 5, n)).collect();
         let scan = FakeScan::of(&parts);

@@ -889,4 +889,49 @@ mod part_tests {
         let ssd = LocalSsd::new("/no/such/cephor/cache/dir");
         assert_eq!(ssd.sweep_orphan_tmp(Duration::ZERO).await.unwrap(), 0);
     }
+
+    #[tokio::test]
+    async fn sweep_orphan_tmp_reaches_a_temp_in_an_incomplete_no_meta_part_dir() {
+        // The real orphan case: a PUT crashed mid-write, leaving a temp in a part dir with
+        // NO meta.json (and no completed chunk). scan_parts skips such dirs, so only the
+        // sweep can reclaim it — it must walk no-meta dirs, not just complete ones.
+        let dir = TempDir::new().unwrap();
+        let part = part_key(7, 3);
+        let part_dir = dir.path().join(part.relative_dir());
+        std::fs::create_dir_all(&part_dir).unwrap();
+        let orphan = part_dir.join("chunk_0.bin.tmp.cafebabecafebabe");
+        std::fs::write(&orphan, b"half-written").unwrap();
+
+        let ssd = LocalSsd::new(dir.path());
+        assert_eq!(
+            ssd.sweep_orphan_tmp(Duration::ZERO).await.unwrap(),
+            1,
+            "the temp in a no-meta dir is swept"
+        );
+        assert!(!orphan.exists());
+    }
+
+    #[tokio::test]
+    async fn sweep_orphan_tmp_tolerates_non_dir_entries_at_every_level() {
+        // The walk must skip non-directory junk at the object/version/part levels rather
+        // than abort, and still find the real temp.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let part = part_key(1, 1); // root/<uuid>/v1/part_1
+        let part_dir = root.join(part.relative_dir());
+        std::fs::create_dir_all(&part_dir).unwrap();
+        // Stray files where dirs would be, at each level.
+        std::fs::write(root.join("stray-at-root"), b"x").unwrap();
+        std::fs::write(root.join(part.object().as_str()).join("stray-at-object"), b"x").unwrap();
+        std::fs::write(part_dir.parent().unwrap().join("stray-at-version"), b"x").unwrap();
+        // A real aged temp in the proper part dir -> still swept.
+        std::fs::write(part_dir.join("meta.json.tmp.feedfacefeedface"), b"partial").unwrap();
+
+        let ssd = LocalSsd::new(root);
+        assert_eq!(
+            ssd.sweep_orphan_tmp(Duration::ZERO).await.unwrap(),
+            1,
+            "non-dir junk is skipped and the real temp is swept",
+        );
+    }
 }
