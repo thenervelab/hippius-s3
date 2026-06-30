@@ -8,6 +8,8 @@
 mod alloc;
 mod apipart;
 mod clock;
+#[cfg(feature = "coord")]
+mod coordination;
 mod enforce;
 mod error;
 mod gc;
@@ -20,7 +22,7 @@ mod ssd_reclaim;
 mod state;
 #[cfg(feature = "pg")]
 mod store;
-#[cfg(feature = "pg")]
+#[cfg(feature = "coord")]
 mod tick;
 mod units;
 
@@ -46,7 +48,9 @@ pub use units::{ByteRate, Bytes, DiskPressure};
 #[cfg(any(test, feature = "test-util"))]
 pub use clock::TestClock;
 
+#[cfg(feature = "coord")]
+pub use coordination::{CoordError, Coordinator, Lease, StoredAllocation};
 #[cfg(feature = "pg")]
-pub use store::{Lease, PendingPart, Store, StoreError, StoredAllocation, UploadContext};
-#[cfg(feature = "pg")]
+pub use store::{PendingPart, Store, StoreError, UploadContext};
+#[cfg(feature = "coord")]
 pub use tick::{CephCeilingSource, StaticCeiling, TickConfig, TickOutcome, run_tick};

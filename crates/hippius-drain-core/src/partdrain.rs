@@ -150,13 +150,25 @@ pub trait PartSource: Send + Sync {
 /// must be crash-atomic: once either returns `Ok`, a power loss leaves the complete
 /// file, never a torn one.
 pub trait PartPool: Send + Sync {
-    /// Durably copy `source` into the pool at the part's `chunk_<index>.bin`.
-    fn persist_chunk(&self, source: &Path, part: &PartKey, index: ChunkIndex) -> impl Future<Output = std::io::Result<()>> + Send;
+    /// Durably copy `source` into the pool at the part's `chunk_<index>.bin`,
+    /// returning the lowercase-hex SHA-256 of the bytes streamed during the copy.
+    /// The copy fsyncs the chunk file (`fdatasync`) but NOT the parent dir — the
+    /// single per-part dir-fsync is deferred to [`finalize_part`](PartPool::finalize_part),
+    /// so a 64-chunk part costs one dir-fsync, not 64.
+    fn persist_chunk(&self, source: &Path, part: &PartKey, index: ChunkIndex) -> impl Future<Output = std::io::Result<String>> + Send;
 
     /// Durably copy `source` into the pool at the part's `meta.json`. Called LAST,
     /// after every chunk is verified, so a reader's meta gate flips only when the
-    /// whole part is durably present.
+    /// whole part is durably present. Like [`persist_chunk`](PartPool::persist_chunk)
+    /// it does not fsync the dir — [`finalize_part`](PartPool::finalize_part) does.
     fn persist_meta(&self, source: &Path, part: &PartKey) -> impl Future<Output = std::io::Result<()>> + Send;
+
+    /// Fsync the part's directory once, after every chunk + meta has been renamed
+    /// into place, so all those directory entries become durable together. Meta is
+    /// renamed before this call, so chunks+meta flush atomically when the dir entry
+    /// flushes — a crash before this leaves the part `draining` (re-drained), losing
+    /// no durability since `mark_replicated` only commits after it succeeds.
+    fn finalize_part(&self, part: &PartKey) -> impl Future<Output = std::io::Result<()>> + Send;
 
     /// The lowercase-hex content hash of one pooled chunk (to verify the copy).
     fn chunk_hash(&self, part: &PartKey, index: ChunkIndex) -> impl Future<Output = std::io::Result<String>> + Send;
@@ -285,37 +297,50 @@ where
         return Ok(DrainOutcome::AlreadyReplicated);
     }
 
-    // Copy + byte-verify every chunk. A pooled chunk whose hash differs from its SSD
-    // source is a corrupt copy: mark the part Failed, drop the partial pool copy, and
-    // leave the SSD source intact — never commit it.
+    // Copy every chunk, hashing it ONCE during the copy stream (no SSD re-read). The
+    // copy-time hash is the source bytes as written, so a torn pool write is caught by
+    // re-reading the pool copy and comparing — but only for a SAMPLE (the first and last
+    // chunk), not every chunk: the per-chunk pool readback was a full second read of the
+    // slowest tier. Content-addressed naming makes writes idempotent + self-naming and the
+    // drain re-drives on any failure, so the interior chunks trust the copy; the sampled
+    // endpoints still catch a systematic copy/IO fault. A mismatch marks the part Failed,
+    // drops the partial pool copy, and leaves the SSD source intact — never commit it.
     let chunks = ssd.list_chunks(part).await.map_err(PartDrainError::io(DrainStep::Persist))?;
-    for index in chunks {
+    let (first, last) = (chunks.first().copied(), chunks.last().copied());
+    for index in &chunks {
+        let index = *index;
         let source = ssd.chunk_source(part, index).map_err(PartDrainError::io(DrainStep::Persist))?;
-        ceph.persist_chunk(&source, part, index)
+        let copy_hash = ceph
+            .persist_chunk(&source, part, index)
             .await
             .map_err(PartDrainError::io(DrainStep::Persist))?;
-        let source_hash = ssd.chunk_hash(part, index).await.map_err(PartDrainError::io(DrainStep::Hash))?;
-        let pool_hash = ceph.chunk_hash(part, index).await.map_err(PartDrainError::io(DrainStep::Hash))?;
-        if source_hash != pool_hash {
-            store
-                .mark_failed(claim, "chunk copy byte mismatch")
-                .await
-                .map_err(PartDrainError::store)?;
-            ceph.remove_part(part).await.map_err(PartDrainError::io(DrainStep::Cleanup))?;
-            return Err(PartDrainError::ChunkMismatch {
-                index,
-                source_hash: source_hash.into_boxed_str(),
-                pool_hash: pool_hash.into_boxed_str(),
-            });
+        if Some(index) == first || Some(index) == last {
+            let pool_hash = ceph.chunk_hash(part, index).await.map_err(PartDrainError::io(DrainStep::Hash))?;
+            if pool_hash != copy_hash {
+                store
+                    .mark_failed(claim, "chunk copy byte mismatch")
+                    .await
+                    .map_err(PartDrainError::store)?;
+                ceph.remove_part(part).await.map_err(PartDrainError::io(DrainStep::Cleanup))?;
+                return Err(PartDrainError::ChunkMismatch {
+                    index,
+                    source_hash: copy_hash.into_boxed_str(),
+                    pool_hash: pool_hash.into_boxed_str(),
+                });
+            }
         }
     }
 
-    // Persist meta LAST — only now, with every chunk durable and verified, may the
-    // reader's `meta.json` gate flip on the pool copy.
+    // Persist meta LAST — only now, with every chunk durably copied (and the sampled
+    // endpoints byte-verified), may the reader's `meta.json` gate flip on the pool copy.
     let meta_source = ssd.meta_source(part).map_err(PartDrainError::io(DrainStep::Persist))?;
     ceph.persist_meta(&meta_source, part)
         .await
         .map_err(PartDrainError::io(DrainStep::Persist))?;
+    // ONE dir-fsync for the whole part, now that every chunk + meta is renamed into place
+    // (Task 1: batch the fsync). Precedes commit/enqueue so the pool copy is durable before
+    // the SSD source can be removed.
+    ceph.finalize_part(part).await.map_err(PartDrainError::io(DrainStep::Persist))?;
     let verified = PartVerified(());
 
     // Enqueue the backend upload BEFORE committing (at-least-once): the part is now
@@ -382,6 +407,9 @@ mod tests {
         status: HashMap<String, ReplicationState>,
         fault: Fault,
         corrupt_persist: bool,
+        /// Specific chunk indices a persist corrupts (in addition to `corrupt_persist`),
+        /// so a test can corrupt only an interior chunk vs. a sampled endpoint.
+        corrupt_chunks: std::collections::HashSet<u32>,
         /// When set, the upload enqueue fails (to test the at-least-once seam).
         enqueue_fault: bool,
         /// Parts the enqueuer was asked to enqueue, in order.
@@ -428,6 +456,12 @@ mod tests {
             self
         }
 
+        /// Corrupt the persisted copy of one specific chunk index only.
+        fn corrupt_chunk(self, index: u32) -> Self {
+            self.world.lock().unwrap().corrupt_chunks.insert(index);
+            self
+        }
+
         fn enqueue_fault(self) -> Self {
             self.world.lock().unwrap().enqueue_fault = true;
             self
@@ -441,6 +475,7 @@ mod tests {
             let mut world = self.world.lock().unwrap();
             world.fault = Fault::None;
             world.corrupt_persist = false;
+            world.corrupt_chunks.clear();
         }
 
         fn status_of(&self, part: &PartKey) -> Option<ReplicationState> {
@@ -509,23 +544,30 @@ mod tests {
     }
 
     impl PartPool for Fakes {
-        fn persist_chunk(&self, _source: &Path, part: &PartKey, index: ChunkIndex) -> impl Future<Output = io::Result<()>> + Send {
+        fn persist_chunk(&self, _source: &Path, part: &PartKey, index: ChunkIndex) -> impl Future<Output = io::Result<String>> + Send {
             let part = part.clone();
             async move {
                 let mut world = self.world.lock().unwrap();
                 if world.fault == Fault::PersistChunk {
                     return Err(io::Error::other("persist chunk failed"));
                 }
-                let corrupt = world.corrupt_persist;
+                let corrupt = world.corrupt_persist || world.corrupt_chunks.contains(&index.get());
                 let source_hash = world
                     .ssd
                     .get(&key_of(&part))
                     .and_then(|s| s.chunks.get(&index.get()).cloned())
                     .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no ssd source"))?;
-                // A corrupt persist writes different bytes (hash) than the source.
-                let written = if corrupt { format!("corrupt-{}", index.get()) } else { source_hash };
+                // A corrupt persist writes different bytes (hash) than the source. The
+                // returned hash is the copy-time (source) hash either way — mirrors the
+                // real localfs, where the copy streams + hashes the source while a torn
+                // write only diverges on the pool re-read.
+                let written = if corrupt {
+                    format!("corrupt-{}", index.get())
+                } else {
+                    source_hash.clone()
+                };
                 world.pool.entry(key_of(&part)).or_default().chunks.insert(index.get(), written);
-                Ok(())
+                Ok(source_hash)
             }
         }
 
@@ -539,6 +581,12 @@ mod tests {
                 world.pool.entry(key_of(&part)).or_default().has_meta = true;
                 Ok(())
             }
+        }
+
+        async fn finalize_part(&self, _part: &PartKey) -> io::Result<()> {
+            // The in-memory pool needs no fsync; the real localfs dir-fsync is exercised
+            // by the e2e + localfs tests.
+            Ok(())
         }
 
         fn chunk_hash(&self, part: &PartKey, index: ChunkIndex) -> impl Future<Output = io::Result<String>> + Send {
@@ -674,6 +722,43 @@ mod tests {
         assert_eq!(fakes.status_of(&part), Some(ReplicationState::Failed));
         assert!(fakes.ssd_has(&part), "corrupt drain must NOT delete the SSD copy");
         assert!(fakes.pool_part(&part).is_none(), "the corrupt, never-committed pool copy is removed");
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_last_chunk_is_caught_by_the_sampled_readback() {
+        // The sampled verify re-reads the first and last chunk. A torn LAST chunk must
+        // still trip ChunkMismatch even though the interior chunks are now trusted.
+        let part = part();
+        let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1"), (2, "h2")]).corrupt_chunk(2);
+
+        let err = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
+
+        assert!(matches!(err, PartDrainError::ChunkMismatch { index, .. } if index == ChunkIndex::new(2)));
+        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Failed));
+        assert!(fakes.ssd_has(&part), "corrupt drain must NOT delete the SSD copy");
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_interior_chunk_is_not_caught_by_the_sampled_readback() {
+        // Pins the sampling trade-off: only the first + last chunk are re-read, so a torn
+        // INTERIOR chunk is trusted (content-addressed naming + re-drive cover it elsewhere).
+        // The drain therefore commits — the test documents what sampling deliberately skips.
+        let part = part();
+        let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1"), (2, "h2")]).corrupt_chunk(1);
+
+        let outcome = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            DrainOutcome::Replicated,
+            "an interior torn copy is not sampled, so the drain commits"
+        );
+        let pooled = fakes.pool_part(&part).expect("part landed on CephFS");
+        assert_eq!(
+            pooled.chunks.get(&1).map(String::as_str),
+            Some("corrupt-1"),
+            "the interior corruption went undetected"
+        );
     }
 
     #[tokio::test]

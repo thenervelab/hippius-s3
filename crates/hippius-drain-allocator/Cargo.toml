@@ -13,10 +13,10 @@ description = "cephor singleton allocator (leader-elected; allocates the global 
 default = ["http"]
 http = ["dep:reqwest"]
 
-# The allocator contends for the leader lease and reads/writes the central state,
-# so it enables hippius-drain-core's `pg` feature.
+# The allocator owns schema provisioning (`pg`) and contends for the leader lease /
+# reads the fleet / writes budgets via the Redis-backed coordinator (`coord`).
 [dependencies]
-hippius-drain-core = { workspace = true, features = ["pg"] }
+hippius-drain-core = { workspace = true, features = ["pg", "coord"] }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -25,8 +25,6 @@ tracing-subscriber = { workspace = true }
 reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
-# For `#[sqlx::test]` against a real Postgres (migrations come from hippius-drain-core).
-sqlx = { workspace = true }
 # CancellationToken drives the shutdown signal in the run-loop tests.
 tokio-util = { workspace = true }
 # Mock HTTP server for the probe's status/timeout/parse edge tests.

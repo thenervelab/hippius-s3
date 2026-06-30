@@ -23,7 +23,7 @@ futures = "=0.3.32"
 # Async Redis client for the drain-direct upload enqueue (the drain LPUSHes the per-part
 # UploadChainRequest to the backend queues). connection-manager = auto-reconnecting
 # multiplexed handle for the long-lived daemon; tokio-comp for the tokio runtime.
-redis = { version = "=0.27.6", default-features = false, features = ["tokio-comp", "connection-manager"] }
+redis = { version = "=0.27.6", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
 # CancellationToken (hierarchical child tokens) for the agent task supervisor;
 # it lives in the always-on `sync` module, so no extra feature is needed.
 tokio-util = "=0.7.18"

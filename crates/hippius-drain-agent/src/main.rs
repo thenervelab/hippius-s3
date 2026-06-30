@@ -10,9 +10,14 @@ use hippius_drain_agent::config::{Config, ConfigError};
 use hippius_drain_agent::enqueue::RedisEnqueuer;
 use hippius_drain_agent::localfs::{LocalFs, LocalSsd};
 use hippius_drain_agent::runtime::{AgentRuntime, RateControl, default_enforcer};
-use hippius_drain_core::{Bytes, Store, StoreError};
+use hippius_drain_core::{Bytes, Coordinator, Store, StoreError};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use thiserror::Error;
+
+/// The agent never writes allocation keys (the allocator owns that key's TTL), so the
+/// alloc TTL on its shared coordinator is never read — a placeholder for the constructor.
+const AGENT_ALLOC_TTL_UNUSED: Duration = Duration::from_secs(15);
 
 /// A failure bringing the daemon up. Each variant maps to a distinct operator
 /// fix: a bad environment versus an unreachable store or Redis.
@@ -47,21 +52,26 @@ async fn main() -> Result<(), StartupError> {
 
     // Drain-direct: the drain LPUSHes each replicated part's UploadChainRequest to the
     // upload-queue Redis (the api no longer enqueues at PUT). A multiplexed, auto-
-    // reconnecting manager shared across the concurrent drains.
+    // reconnecting manager shared across the concurrent drains AND the coordinator below
+    // (same redis-queues instance — one connection, cloned).
     let redis = redis::aio::ConnectionManager::new(redis::Client::open(config.redis_queues_url.as_str())?).await?;
-    let enqueuer = Arc::new(RedisEnqueuer::new(Arc::clone(&store), redis, config.upload_backends.clone()));
+    let enqueuer = Arc::new(RedisEnqueuer::new(Arc::clone(&store), redis.clone(), config.upload_backends.clone()));
+
+    // The Redis-backed coordinator: the heartbeat worker upserts this node's state under
+    // `heartbeat_ttl`, and the allocation-pull worker reads its budget. The agent never
+    // writes allocations, so its alloc TTL is unused (the allocator owns that key's TTL).
+    let coordinator = Arc::new(Coordinator::new(redis, config.heartbeat_ttl, AGENT_ALLOC_TTL_UNUSED));
 
     // The enforcer starts at the floor (conservative) with a one-second burst of
     // the node's capability; the allocation-pull worker raises it to the leader's
     // budget on its first tick.
-    let enforcer = default_enforcer(config.floor_rate, Bytes::new(config.max_drain_rate.get()));
+    let enforcer = default_enforcer(config.floor_rate, Bytes::new(config.max_drain_rate.get()), config.drain_concurrency);
     let rate_control = RateControl {
         enforcer: Arc::new(Mutex::new(enforcer)),
         node: config.node_id.clone(),
         floor: config.floor_rate,
         half_life: config.decay_half_life,
         poll: config.allocation_poll,
-        stale_after: config.allocation_stale,
     };
 
     let runtime = AgentRuntime::new(
@@ -71,6 +81,7 @@ async fn main() -> Result<(), StartupError> {
         enqueuer,
         config.runtime_config(),
     )
+    .with_coordinator(coordinator)
     .with_heartbeat(config.heartbeat_config())
     .with_rate_control(rate_control);
 

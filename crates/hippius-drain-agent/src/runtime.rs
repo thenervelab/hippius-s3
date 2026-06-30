@@ -21,8 +21,8 @@ use crate::localfs::{LocalFs, LocalSsd};
 use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
-    BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, Enforcer, NodeId, NodeObservation, SnapshotCell, Store, SystemClock,
-    TokenBucket, UploadEnqueuer, decay_rate, reclaim_ssd, reconcile_parts,
+    BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, Coordinator, Enforcer, NodeId, NodeObservation, SnapshotCell, Store,
+    SystemClock, TokenBucket, UploadEnqueuer, decay_rate, reclaim_ssd, reconcile_parts,
 };
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -33,23 +33,22 @@ use tokio_util::sync::CancellationToken;
 const BREAKER_FAILURES: u32 = 5;
 /// How long the breaker stays open before probing Ceph again.
 const BREAKER_COOLDOWN: Duration = Duration::from_secs(10);
-/// Maximum drains in flight at once (the concurrency gate).
-const DRAIN_CONCURRENCY: u32 = 4;
 
-/// Builds the agent's admission enforcer at `rate` with burst `burst`, using
-/// fixed breaker/concurrency policy. The breaker opens after [`BREAKER_FAILURES`]
-/// consecutive Ceph failures for [`BREAKER_COOLDOWN`]; up to [`DRAIN_CONCURRENCY`]
-/// drains run concurrently. The allocation-pull worker then keeps `rate` synced
-/// to the leader's budget.
+/// Builds the agent's admission enforcer at `rate` with burst `burst`, gating up to
+/// `concurrency` drains at once. The breaker opens after [`BREAKER_FAILURES`]
+/// consecutive Ceph failures for [`BREAKER_COOLDOWN`]; the allocation-pull worker
+/// then keeps `rate` synced to the leader's budget. `concurrency` comes from
+/// `CEPHOR_DRAIN_CONCURRENCY` so a node can hide fsync latency behind more in-flight
+/// parts (the AIMD allocator only tunes bytes/sec).
 #[must_use]
-pub fn default_enforcer(rate: ByteRate, burst: Bytes) -> Enforcer {
+pub fn default_enforcer(rate: ByteRate, burst: Bytes, concurrency: u32) -> Enforcer {
     Enforcer::new(
         CircuitBreaker::new(BreakerConfig {
             failure_threshold: BREAKER_FAILURES,
             cooldown: BREAKER_COOLDOWN,
         }),
         TokenBucket::new(rate, burst, Instant::now()),
-        ConcurrencyLimiter::new(DRAIN_CONCURRENCY),
+        ConcurrencyLimiter::new(concurrency),
     )
 }
 
@@ -68,6 +67,9 @@ pub struct RuntimeConfig {
     /// How long workers get to finish an in-flight tick after cancellation
     /// before the supervisor force-aborts them.
     pub grace: Duration,
+    /// Maximum parts the drain worker processes concurrently (the in-flight gate
+    /// that overlaps fsync latency across parts).
+    pub drain_concurrency: u32,
 }
 
 /// Runs `tick` immediately and then once per `period`, until `token` is
@@ -114,9 +116,6 @@ pub struct RateControl {
     pub half_life: Duration,
     /// How often to re-pull the allocation.
     pub poll: Duration,
-    /// How long a stored allocation stays authoritative; past it the allocator is
-    /// treated as silent on this node and the rate decays toward `floor`.
-    pub stale_after: Duration,
 }
 
 /// The drain worker's shared dependencies, bundled so the worker fn stays within
@@ -130,6 +129,8 @@ struct DrainDeps<E: UploadEnqueuer> {
     /// Publishes each part's backend upload request once it's durably on the pool
     /// (drain-direct; the drain is the sole upload producer).
     enqueuer: Arc<E>,
+    /// Maximum parts processed concurrently per drain cycle (`CEPHOR_DRAIN_CONCURRENCY`).
+    concurrency: u32,
 }
 
 /// Drains the part backlog on each `period` poll, until `token` is cancelled.
@@ -153,7 +154,7 @@ async fn run_drain<E: UploadEnqueuer>(token: CancellationToken, period: Duration
             deps.enforcer.as_ref(),
             Some(&deps.snapshot),
             &token,
-            DRAIN_CONCURRENCY as usize,
+            deps.concurrency as usize,
         )
         .await
         {
@@ -174,7 +175,7 @@ async fn run_drain<E: UploadEnqueuer>(token: CancellationToken, period: Duration
 /// Probes SSD disk pressure off the async runtime (statvfs blocks) and upserts
 /// this node's heartbeat. Probe or upsert failures are logged and skipped — the
 /// next tick retries; a missed heartbeat only ages the node out of the fleet.
-async fn heartbeat_once(ssd: &LocalSsd, store: &Store, node: &NodeId, max_drain_rate: ByteRate, snapshot: &SnapshotCell) {
+async fn heartbeat_once(ssd: &LocalSsd, coord: &Coordinator, node: &NodeId, max_drain_rate: ByteRate, snapshot: &SnapshotCell) {
     let root = ssd.root().to_path_buf();
     // statvfs is a blocking syscall — never run it on an executor thread (axiom
     // r4r_ch10_01); spawn_blocking moves it to the blocking pool.
@@ -204,7 +205,7 @@ async fn heartbeat_once(ssd: &LocalSsd, store: &Store, node: &NodeId, max_drain_
         observed_p99: snapshot.p99(),
         error_bps: snapshot.load().error_bps(),
     };
-    if let Err(err) = store.upsert_node_state(node, &observation).await {
+    if let Err(err) = coord.upsert_node_state(node, &observation).await {
         tracing::warn!(error = %err, "heartbeat upsert failed");
     }
 }
@@ -253,22 +254,23 @@ fn apply_rate(enforcer: &Arc<Mutex<Enforcer>>, rate: ByteRate) {
 /// `poll`, decaying toward `floor` when the allocator goes silent so a stale
 /// allocation cannot keep the node hammering Ceph. The async `load_allocation`
 /// runs *unlocked*; only the synchronous `set_rate` takes the lock.
-async fn run_alloc(token: CancellationToken, store: Arc<Store>, rate_control: RateControl, clock: Arc<dyn Clock>) {
+async fn run_alloc(token: CancellationToken, coord: Arc<Coordinator>, rate_control: RateControl, clock: Arc<dyn Clock>) {
     let RateControl {
         enforcer,
         node,
         floor,
         half_life,
         poll,
-        stale_after,
     } = rate_control;
     // Decay state: the last allocated rate and when it landed. A fresh
     // allocation resets both; silence decays `base` toward `floor` by age. The
     // age is measured against the injected `clock`, so decay timing is testable.
+    // The allocation key's Redis TTL is the staleness signal: once it expires,
+    // load_allocation returns None and the decay path engages.
     let mut base = floor;
     let mut allocated_at = clock.now();
     loop {
-        match store.load_allocation(&node, stale_after).await {
+        match coord.load_allocation(&node).await {
             Ok(Some(allocation)) => {
                 base = allocation.budget;
                 allocated_at = clock.now();
@@ -306,6 +308,10 @@ pub struct AgentRuntime<E: UploadEnqueuer> {
     /// (which gates through it) and the allocation-pull worker (which tunes it);
     /// `None` drains ungated.
     rate_control: Option<RateControl>,
+    /// The Redis-backed coordinator the heartbeat + allocation-pull workers use.
+    /// Required for those two workers to run; `None` (tests / drain-only e2e) skips
+    /// them even if heartbeat / rate control are configured.
+    coord: Option<Arc<Coordinator>>,
     /// The time source the allocation-pull worker reads for its decay timing.
     /// Defaults to [`SystemClock`]; tests inject a [`hippius_drain_core::TestClock`].
     clock: Arc<dyn Clock>,
@@ -325,6 +331,7 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
             snapshot: Arc::new(SnapshotCell::new()),
             heartbeat: None,
             rate_control: None,
+            coord: None,
             clock: Arc::new(SystemClock),
         }
     }
@@ -335,6 +342,15 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Wires the Redis coordinator the heartbeat + allocation-pull workers need.
+    /// Without it those two workers do not run (the drain/reconcile/reclaim workers,
+    /// which use only the Postgres store, are unaffected).
+    #[must_use]
+    pub fn with_coordinator(mut self, coord: Arc<Coordinator>) -> Self {
+        self.coord = Some(coord);
         self
     }
 
@@ -378,6 +394,7 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
             // The drain worker and the allocation worker share one enforcer.
             enforcer: self.rate_control.as_ref().map(|rc| Arc::clone(&rc.enforcer)),
             enqueuer: Arc::clone(&self.enqueuer),
+            concurrency: self.config.drain_concurrency,
         };
         supervisor.spawn(WorkerName::new("drain"), move |token| run_drain(token, drain_poll, deps));
 
@@ -413,15 +430,16 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
         });
 
         // Heartbeat worker (opt-in): report this node's disk pressure + capability
-        // so the allocator can weight it. Without it the node is never in the fleet.
-        if let Some(heartbeat) = self.heartbeat {
-            let (ssd, store, snapshot) = (Arc::clone(&self.ssd), Arc::clone(&self.store), Arc::clone(&self.snapshot));
+        // so the allocator can weight it. Needs the coordinator; without it the node
+        // is never in the fleet.
+        if let (Some(heartbeat), Some(coord)) = (self.heartbeat, self.coord.as_ref()) {
+            let (ssd, coord, snapshot) = (Arc::clone(&self.ssd), Arc::clone(coord), Arc::clone(&self.snapshot));
             let HeartbeatConfig { node, max_drain_rate, poll } = heartbeat;
             supervisor.spawn(WorkerName::new("heartbeat"), move |token| {
                 run_periodic(token, poll, move || {
-                    let (ssd, store, node, snapshot) = (Arc::clone(&ssd), Arc::clone(&store), node.clone(), Arc::clone(&snapshot));
+                    let (ssd, coord, node, snapshot) = (Arc::clone(&ssd), Arc::clone(&coord), node.clone(), Arc::clone(&snapshot));
                     async move {
-                        heartbeat_once(&ssd, &store, &node, max_drain_rate, &snapshot).await;
+                        heartbeat_once(&ssd, &coord, &node, max_drain_rate, &snapshot).await;
                     }
                 })
             });
@@ -429,10 +447,11 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
 
         // Allocation-pull worker (opt-in): apply the leader's write-budget to the
         // shared enforcer, decaying toward the floor when the allocator is silent.
-        if let Some(rate_control) = self.rate_control {
-            let store = Arc::clone(&self.store);
+        // Needs the coordinator; without it the drain stays ungated at its floor.
+        if let (Some(rate_control), Some(coord)) = (self.rate_control, self.coord.as_ref()) {
+            let coord = Arc::clone(coord);
             let clock = Arc::clone(&self.clock);
-            supervisor.spawn(WorkerName::new("allocation"), move |token| run_alloc(token, store, rate_control, clock));
+            supervisor.spawn(WorkerName::new("allocation"), move |token| run_alloc(token, coord, rate_control, clock));
         }
 
         supervisor.run(shutdown).await
@@ -440,16 +459,31 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "tests")]
+#[expect(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr, reason = "tests")]
 mod tests {
     use super::{AgentRuntime, HeartbeatConfig, RateControl, RuntimeConfig, default_enforcer};
     use crate::localfs::{LocalFs, LocalSsd};
     use crate::supervisor::ShutdownTrigger;
     use core::str::FromStr;
     use hippius_drain_core::{
-        Allocation, ByteRate, Bytes, Clock, NodeId, ObjectId, PartKey, PartNumber, PartReplicationStore, ReplicationState, SnapshotCell, Store,
-        TestClock, UploadEnqueuer, Version,
+        Allocation, ByteRate, Bytes, Clock, Coordinator, NodeId, ObjectId, PartKey, PartNumber, PartReplicationStore, ReplicationState, SnapshotCell,
+        Store, TestClock, UploadEnqueuer, Version,
     };
+
+    /// A coordinator on the test Redis under a per-test prefix, or `None` to skip the
+    /// redis-dependent runtime tests (Rust has no fakeredis; set
+    /// `CEPHOR_TEST_REDIS_URL=redis://localhost:6382/0`). `alloc_ttl` lets the decay test
+    /// expire a budget deterministically.
+    async fn test_coord(prefix: &str, node_ttl: Duration, alloc_ttl: Duration) -> Option<Coordinator> {
+        let url = std::env::var("CEPHOR_TEST_REDIS_URL").ok().filter(|value| !value.is_empty())?;
+        // Prefix with the process id so a re-run never collides with the prior run's
+        // still-TTL'd keys on a shared test Redis.
+        let coordinator = Coordinator::connect(&url, node_ttl, alloc_ttl)
+            .await
+            .expect("connect to the test redis")
+            .with_prefix(&format!("{}:{prefix}", std::process::id()));
+        Some(coordinator)
+    }
 
     /// A no-op upload enqueuer for the runtime tests (drain-direct's Redis fan-out is
     /// covered by the core partdrain tests + the agent enqueue module).
@@ -509,13 +543,18 @@ mod tests {
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
     async fn the_allocation_worker_applies_the_leaders_budget(pool: PgPool) {
+        let Some(coord) = test_coord("cephor-test:rt-applies:", Duration::from_secs(30), Duration::from_secs(30)).await else {
+            eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");
+            return;
+        };
+        let coord = Arc::new(coord);
         let ssd_dir = tempfile::tempdir().unwrap();
         let pool_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::from_pool(pool));
         let node = NodeId::from_str("node-alloc").unwrap();
 
         // The leader has already written this node a budget.
-        store
+        coord
             .write_allocations(
                 1,
                 &[Allocation {
@@ -527,7 +566,7 @@ mod tests {
             .unwrap();
 
         // The enforcer starts at zero, so any non-zero rate is the worker's doing.
-        let enforcer = Arc::new(Mutex::new(default_enforcer(ByteRate::new(0), Bytes::new(1 << 20))));
+        let enforcer = Arc::new(Mutex::new(default_enforcer(ByteRate::new(0), Bytes::new(1 << 20), 4)));
         let runtime = AgentRuntime::new(
             Arc::new(LocalFs::new(pool_dir.path())),
             Arc::new(LocalSsd::new(ssd_dir.path())),
@@ -539,15 +578,16 @@ mod tests {
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
+                drain_concurrency: 4,
             },
         )
+        .with_coordinator(Arc::clone(&coord))
         .with_rate_control(RateControl {
             enforcer: Arc::clone(&enforcer),
             node,
             floor: ByteRate::new(1_000),
             half_life: Duration::from_secs(30),
             poll: Duration::from_millis(20),
-            stale_after: Duration::from_secs(10),
         });
 
         let shutdown = CancellationToken::new();
@@ -571,22 +611,28 @@ mod tests {
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
     async fn the_allocation_worker_decays_on_an_injected_clock(pool: PgPool) {
-        // #33: run_alloc reads the injected Clock for its decay timing. Load a
-        // budget (base jumps above the floor, allocated_at = clock.now()), then
-        // delete the row so the allocator reads "silent" and advance the TestClock
-        // past several half-lives. The enforcer rate must decay below the budget
-        // toward the floor — proving the *injected* clock drives decay, since no
-        // real time passes between the load and the assertion.
+        // #33: run_alloc reads the injected Clock for its decay timing. Load a budget
+        // (base jumps above the floor, allocated_at = clock.now()), then let the
+        // allocation key's short Redis TTL expire so the allocator reads "silent", and
+        // advance the TestClock past several half-lives. The enforcer rate must decay
+        // toward the floor — proving the *injected* clock drives decay, since no real
+        // time passes (on the test clock) between the load and the assertion.
+        let Some(coord) = test_coord("cephor-test:rt-decay:", Duration::from_secs(30), Duration::from_secs(1)).await else {
+            eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");
+            return;
+        };
+        let coord = Arc::new(coord);
         let ssd_dir = tempfile::tempdir().unwrap();
         let pool_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::from_pool(pool.clone()));
+        let store = Arc::new(Store::from_pool(pool));
         let node = NodeId::from_str("node-decay").unwrap();
         let budget = ByteRate::new(800_000);
         let floor = ByteRate::new(1_000);
 
-        store.write_allocations(1, &[Allocation { node: node.clone(), budget }]).await.unwrap();
+        // alloc_ttl is 1s (above), so this budget key expires ~1s after the write.
+        coord.write_allocations(1, &[Allocation { node: node.clone(), budget }]).await.unwrap();
 
-        let enforcer = Arc::new(Mutex::new(default_enforcer(ByteRate::new(0), Bytes::new(1 << 20))));
+        let enforcer = Arc::new(Mutex::new(default_enforcer(ByteRate::new(0), Bytes::new(1 << 20), 4)));
         // Keep the concrete handle (for `advance`) and a trait-object clone (for the
         // runtime); the `let` binding is the unsizing coercion site.
         let clock = Arc::new(TestClock::new());
@@ -602,17 +648,16 @@ mod tests {
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
+                drain_concurrency: 4,
             },
         )
+        .with_coordinator(Arc::clone(&coord))
         .with_rate_control(RateControl {
             enforcer: Arc::clone(&enforcer),
             node: node.clone(),
             floor,
             half_life: Duration::from_secs(1),
             poll: Duration::from_millis(10),
-            // SQL staleness off (1h): the DELETE below, not row aging, drives the
-            // load to None, so the test controls exactly when decay begins.
-            stale_after: Duration::from_hours(1),
         })
         .with_clock(clock_source);
 
@@ -622,7 +667,7 @@ mod tests {
 
         // The worker first pulls the budget into the enforcer. Generous window (~5s):
         // the allocation-pull worker shares a single-threaded runtime with the other
-        // workers and can be starved under a full parallel sqlx-test run.
+        // workers and can be starved under a full parallel test run.
         let mut loaded = false;
         for _ in 0..500 {
             if enforcer.lock().unwrap().rate() == budget {
@@ -633,18 +678,15 @@ mod tests {
         }
         assert!(loaded, "the worker loaded the budget before decay");
 
-        // The allocator goes silent (row removed), and the injected clock jumps
-        // well past the 1s half-life, so decay should drive the rate to the floor.
-        sqlx::query("DELETE FROM cephor_allocation WHERE node_id = $1")
-            .bind(node.as_str())
-            .execute(&pool)
-            .await
-            .unwrap();
-        // Ten half-lives on the injected clock -> the rate collapses to ~floor.
-        // This deep decay is reachable ONLY by the injected jump: the sub-second of
-        // real time the test spends polling, against the 1s half-life, could only
-        // shave the rate slightly. So a near-floor rate proves run_alloc read the
-        // injected clock, not the wall clock.
+        // Wait out the 1s alloc-key TTL so load_allocation reads None ("silent"). The
+        // injected clock has NOT advanced yet, so allocated_at freezes at the last load
+        // and elapsed stays 0 (no decay) until we jump the clock below.
+        tokio::time::sleep(Duration::from_millis(1_300)).await;
+
+        // Ten half-lives on the injected clock -> the rate collapses to ~floor. This
+        // deep decay is reachable ONLY by the injected jump (the test clock advances
+        // 10s while no real test-clock time passed), so a near-floor rate proves
+        // run_alloc reads the injected clock, not the wall clock.
         clock.advance(Duration::from_secs(10));
         let near_floor = floor.get().saturating_mul(2);
 
@@ -670,6 +712,11 @@ mod tests {
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
     async fn the_heartbeat_worker_upserts_this_node_into_the_fleet(pool: PgPool) {
+        let Some(coord) = test_coord("cephor-test:rt-hb:", Duration::from_secs(30), Duration::from_secs(30)).await else {
+            eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");
+            return;
+        };
+        let coord = Arc::new(coord);
         let ssd_dir = tempfile::tempdir().unwrap();
         let pool_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::from_pool(pool));
@@ -689,8 +736,10 @@ mod tests {
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
+                drain_concurrency: 4,
             },
         )
+        .with_coordinator(Arc::clone(&coord))
         .with_heartbeat(HeartbeatConfig {
             node: node.clone(),
             max_drain_rate: rate,
@@ -705,7 +754,7 @@ mod tests {
         // (matched by its distinctive capability) appears.
         let mut seen = false;
         for _ in 0..100 {
-            let fleet = store.load_fleet(Duration::from_hours(1)).await.unwrap();
+            let fleet = coord.load_fleet().await.unwrap();
             if fleet
                 .iter()
                 .any(|(id, observation)| id == &node && observation.max_drain_rate == rate && observation.backlog.get() > 0)
@@ -749,6 +798,7 @@ mod tests {
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
+                drain_concurrency: 4,
             },
         );
 
@@ -793,6 +843,7 @@ mod tests {
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
+                drain_concurrency: 4,
             },
         );
 

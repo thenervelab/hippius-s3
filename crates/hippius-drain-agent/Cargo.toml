@@ -6,10 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "cephor per-node drain daemon (runs as a DaemonSet on each ingest SSD node)"
 
-# The daemon talks to Postgres (claim/commit, heartbeat, allocation), so it
-# enables hippius-drain-core's `pg` feature.
+# The daemon talks to Postgres for the durable drain state (`pg`) and to the
+# Redis-backed coordinator for heartbeats + allocation pulls (`coord`).
 [dependencies]
-hippius-drain-core = { workspace = true, features = ["pg"] }
+hippius-drain-core = { workspace = true, features = ["pg", "coord"] }
 tokio = { workspace = true }
 futures = { workspace = true }
 tokio-util = { workspace = true }
@@ -25,7 +25,7 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 # `test-util` brings in hippius-drain-core's TestClock for the clock-injection tests
 # (Cargo unifies this with the normal `pg` dependency above).
-hippius-drain-core = { workspace = true, features = ["pg", "test-util"] }
+hippius-drain-core = { workspace = true, features = ["pg", "coord", "test-util"] }
 tempfile = { workspace = true }
 proptest = { workspace = true }
 # For `#[sqlx::test]` against a real Postgres (migrations come from hippius-drain-core).

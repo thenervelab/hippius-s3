@@ -9,17 +9,26 @@
 
 use hippius_drain_allocator::config::{AllocatorConfig, ConfigError};
 use hippius_drain_allocator::run::run_allocator;
-use hippius_drain_core::{CephCeilingSource, Store, StoreError};
+use hippius_drain_core::{CephCeilingSource, CoordError, Coordinator, Store, StoreError};
+use std::time::Duration;
 use thiserror::Error;
 
+/// The agents own the heartbeat TTL (`CEPHOR_HEARTBEAT_TTL_SECS`), so the allocator's
+/// coordinator never writes node keys; this value is unused on its side, present only to
+/// satisfy the shared [`Coordinator`] constructor.
+const ALLOCATOR_NODE_TTL: Duration = Duration::from_secs(30);
+
 /// A failure bringing the allocator up. Each variant maps to a distinct operator
-/// fix: a bad environment, an unreachable store, or an unbuildable probe client.
+/// fix: a bad environment, an unreachable store / coordination redis, or an
+/// unbuildable probe client.
 #[derive(Debug, Error)]
 enum StartupError {
     #[error("invalid configuration")]
     Config(#[from] ConfigError),
     #[error("cannot connect to the state store")]
     Store(#[from] StoreError),
+    #[error("cannot connect to the coordination redis")]
+    Coord(#[from] CoordError),
     #[cfg(feature = "http")]
     #[error("cannot build the ceph mgr probe")]
     Probe(#[from] hippius_drain_allocator::probe::ProbeError),
@@ -39,19 +48,23 @@ async fn main() -> Result<(), StartupError> {
     // brief multi-replica overlap during rollout re-runs nothing.
     store.migrate().await?;
 
+    // Leadership, the fleet view, and the budgets live in Redis (TTL-keyed, epoch-fenced)
+    // — not Postgres — so the ~2s leader tick never touches the WAL.
+    let coordinator = Coordinator::connect(&config.redis_queues_url, ALLOCATOR_NODE_TTL, config.alloc_ttl).await?;
+
     tracing::info!(
         instance = %config.instance_id,
         tick_secs = config.tick_interval.as_secs(),
         "hippius-drain-allocator started"
     );
-    run_with_ceiling_source(&store, &config).await?;
+    run_with_ceiling_source(&coordinator, &config).await?;
     tracing::info!("hippius-drain-allocator stopped");
     Ok(())
 }
 
 /// Selects the ceiling source — the live mgr probe when a URL is configured (and the
 /// `http` feature is built), else the static ceiling — and runs the allocator on it.
-async fn run_with_ceiling_source(store: &Store, config: &AllocatorConfig) -> Result<(), StartupError> {
+async fn run_with_ceiling_source(coord: &Coordinator, config: &AllocatorConfig) -> Result<(), StartupError> {
     #[cfg(feature = "http")]
     if let Some(url) = config.ceph_mgr_metrics_url.clone() {
         // The decay floor is the AIMD floor: while the probe is blind, the fleet
@@ -64,19 +77,19 @@ async fn run_with_ceiling_source(store: &Store, config: &AllocatorConfig) -> Res
             config.ceph_probe_timeout,
         )?;
         tracing::info!(mgr_url = %url, "driving the budget from the live ceph-mgr ceiling probe");
-        drive(store, &probe, config).await;
+        drive(coord, &probe, config).await;
         return Ok(());
     }
     tracing::info!("no ceph mgr url configured; using the static ceiling");
-    drive(store, &config.ceiling(), config).await;
+    drive(coord, &config.ceiling(), config).await;
     Ok(())
 }
 
 /// Runs the allocator loop on `ceiling`, logging (not failing on) a shutdown
 /// relinquish error — the lease TTL recovers it, so the process still exits cleanly.
-async fn drive<C: CephCeilingSource>(store: &Store, ceiling: &C, config: &AllocatorConfig) {
+async fn drive<C: CephCeilingSource>(coord: &Coordinator, ceiling: &C, config: &AllocatorConfig) {
     if let Err(err) = run_allocator(
-        store,
+        coord,
         ceiling,
         &config.tick_config(),
         config.initial_total,
