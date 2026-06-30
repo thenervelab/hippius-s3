@@ -279,6 +279,10 @@ class Config:
     # cleanup loops are DB-roundtrip bound; this is how many parts are processed
     # in parallel (each over its own pooled connection).
     janitor_concurrency: int = env("HIPPIUS_JANITOR_CONCURRENCY:16", convert=int)
+    # Max soft-deleted objects hard-deleted per janitor cycle. The find query is
+    # an index-probe over this many candidates; keep it bounded so a large
+    # backlog drains gradually instead of in one DELETE-cascade burst.
+    janitor_hard_delete_batch: int = env("HIPPIUS_JANITOR_HARD_DELETE_BATCH:5000", convert=int)
 
     # Filesystem cache disk-pressure backoff (ingress control).
     # Threshold can be expressed as either absolute bytes or ratio; we trigger if ANY threshold is hit.
