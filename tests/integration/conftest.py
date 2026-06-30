@@ -201,7 +201,6 @@ async def gateway_redis_clients() -> AsyncGenerator[dict[str, Any], None]:
     yield {
         "redis": create_mock_redis(),
         "redis_accounts": create_mock_redis(),
-        "redis_chain": create_mock_redis(),
         "redis_rate_limiting": create_mock_redis(),
     }
 
@@ -221,7 +220,6 @@ async def gateway_app(
     app.state.postgres_pool = gateway_db_pool
     app.state.redis_client = gateway_redis_clients["redis"]
     app.state.redis_accounts = gateway_redis_clients["redis_accounts"]
-    app.state.redis_chain = gateway_redis_clients["redis_chain"]
     app.state.redis_rate_limiting = gateway_redis_clients["redis_rate_limiting"]
 
     from gateway.config import get_config
@@ -281,7 +279,6 @@ async def gateway_app_no_auth(
     app.state.postgres_pool = gateway_db_pool
     app.state.redis_client = gateway_redis_clients["redis"]
     app.state.redis_accounts = gateway_redis_clients["redis_accounts"]
-    app.state.redis_chain = gateway_redis_clients["redis_chain"]
     app.state.redis_rate_limiting = gateway_redis_clients["redis_rate_limiting"]
 
     from gateway.config import get_config

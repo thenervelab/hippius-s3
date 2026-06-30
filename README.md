@@ -67,12 +67,11 @@ Create a `.env` file. Base defaults are in `.env.defaults`.
 | `DATABASE_URL` | PostgreSQL connection string |
 | `HIPPIUS_KEYSTORE_DATABASE_URL` | PostgreSQL for encryption keys (falls back to `DATABASE_URL`) |
 
-**Redis (6 separate instances)**
+**Redis (5 separate instances)**
 | Variable | Port | Purpose | Persistence |
 |----------|------|---------|-------------|
 | `REDIS_URL` | 6379 | General cache / temp data | Ephemeral |
 | `REDIS_ACCOUNTS_URL` | 6380 | Account credit cache | Persistent (AOF) |
-| `REDIS_CHAIN_URL` | 6381 | Blockchain operation cache | Persistent (AOF) |
 | `REDIS_QUEUES_URL` | 6382 | Work queues for async workers | Persistent, 2GB, LRU |
 | `REDIS_RATE_LIMITING_URL` | 6383 | Rate limit counters | Ephemeral, 1GB |
 | `REDIS_ACL_URL` | 6384 | ACL / permission cache | Ephemeral, 2GB, LRU |
@@ -251,7 +250,6 @@ Secrets required for CI/CD deployment (configured in `.github/workflows/producti
 | **Database** | `DATABASE_PASSWORD` | PostgreSQL password |
 | **Redis** | `REDIS_URL` | Main Redis cluster |
 | | `REDIS_ACCOUNTS_URL` | Account cache Redis |
-| | `REDIS_CHAIN_URL` | Blockchain cache Redis |
 | | `REDIS_QUEUES_URL` | Work queue Redis |
 | | `REDIS_RATE_LIMITING_URL` | Rate limit Redis |
 | | `REDIS_ACL_URL` | ACL cache Redis |
