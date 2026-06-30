@@ -20,20 +20,24 @@ loki:
     ingestion_burst_size_mb: 16
     retention_period: 168h
     max_query_length: 168h
-    max_query_parallelism: 32
+    # Single-binary on a few cores: high fan-out turns one Explore load into a
+    # CPU-starving storm of split subqueries. Keep parallelism bounded.
+    max_query_parallelism: 8
 
 singleBinary:
   replicas: 1
   persistence:
     enabled: true
-    size: 200Gi
+    # Matches the live PVC (resized to 350Gi in prod). The volumeClaimTemplate is
+    # immutable — this MUST equal the bound PVC or helm upgrade is rejected.
+    size: 350Gi
   resources:
     requests:
-      cpu: 100m
-      memory: 512Mi
-    limits:
       cpu: 500m
       memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 8Gi
 
 gateway:
   enabled: false
@@ -48,7 +52,9 @@ backend:
   replicas: 0
 
 chunksCache:
-  enabled: false
+  enabled: true
+  allocatedMemory: 1024
 
 resultsCache:
-  enabled: false
+  enabled: true
+  allocatedMemory: 512
