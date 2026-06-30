@@ -29,8 +29,6 @@ services:
         condition: service_healthy
       redis-accounts:
         condition: service_healthy
-      redis-chain:
-        condition: service_healthy
       redis-rate-limiting:
         condition: service_healthy
       redis-acl:
@@ -65,8 +63,6 @@ services:
       redis:
         condition: service_healthy
       redis-accounts:
-        condition: service_healthy
-      redis-chain:
         condition: service_healthy
       redis-rate-limiting:
         condition: service_healthy
@@ -142,38 +138,6 @@ services:
       - "127.0.0.1:6380:6379"
     volumes:
       - redis_accounts_data:/data
-      - ./redis.conf:/usr/local/etc/redis/redis.conf
-    command:
-      [
-        "redis-server",
-        "/usr/local/etc/redis/redis.conf",
-        "--save",
-        "60 1",
-        "--save",
-        "300 10",
-        "--save",
-        "900 100",
-        "--appendonly",
-        "yes",
-        "--appendfsync",
-        "everysec",
-      ]
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
-      interval: 5s
-      timeout: 3s
-      retries: 50
-      start_period: 30s
-    networks:
-      - hippius_net
-
-  redis-chain:
-    image: redis:7-alpine
-    ports:
-      - "127.0.0.1:6381:6379"
-    volumes:
-      - redis_chain_data:/data
       - ./redis.conf:/usr/local/etc/redis/redis.conf
     command:
       [
@@ -422,7 +386,6 @@ volumes:
   postgres_data:
   redis_data:
   redis_accounts_data:
-  redis_chain_data:
   redis_rate_limiting_data:
   redis_queues_data:
   redis_acl_data:

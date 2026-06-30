@@ -33,8 +33,6 @@ services:
         condition: service_healthy
       redis-accounts:
         condition: service_healthy
-      redis-chain:
-        condition: service_healthy
       redis-rate-limiting:
         condition: service_healthy
       redis-queues:
@@ -198,17 +196,6 @@ services:
     image: redis:7-alpine
     ports:
       - "127.0.0.1:6380:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-    networks:
-      - hippius_net
-
-  redis-chain:
-    image: redis:7-alpine
-    ports:
-      - "127.0.0.1:6381:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

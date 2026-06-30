@@ -140,7 +140,6 @@ jobs:
             --from-literal=HIPPIUS_KEYSTORE_DATABASE_URL="${DATABASE_URL}" \
             --from-literal=REDIS_URL='redis://redis-cluster.hippius-s3-staging.svc.cluster.local:6379?cluster=true' \
             --from-literal=REDIS_ACCOUNTS_URL='redis://redis-accounts:6379' \
-            --from-literal=REDIS_CHAIN_URL='redis://redis-chain:6379' \
             --from-literal=REDIS_QUEUES_URL='redis://redis-queues:6379' \
             --from-literal=REDIS_RATE_LIMITING_URL='redis://redis-rate-limiting:6379' \
             --from-literal=REDIS_ACL_URL='redis://redis-acl:6379' \

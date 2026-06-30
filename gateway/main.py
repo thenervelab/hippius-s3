@@ -74,9 +74,6 @@ def factory() -> FastAPI:
         app.state.redis_accounts = Redis.from_url(config.redis_accounts_url, decode_responses=False)
         logger.info("Connected to Redis (accounts)")
 
-        app.state.redis_chain = Redis.from_url(config.redis_chain_url, decode_responses=False)
-        logger.info("Connected to Redis (chain)")
-
         app.state.redis_rate_limiting = Redis.from_url(config.redis_rate_limiting_url, decode_responses=False)
         logger.info("Connected to Redis (rate limiting)")
 
@@ -157,10 +154,6 @@ def factory() -> FastAPI:
         if hasattr(app.state, "redis_accounts"):
             await app.state.redis_accounts.close()
             logger.info("Redis accounts client closed")
-
-        if hasattr(app.state, "redis_chain"):
-            await app.state.redis_chain.close()
-            logger.info("Redis chain client closed")
 
         if hasattr(app.state, "redis_rate_limiting"):
             await app.state.redis_rate_limiting.close()

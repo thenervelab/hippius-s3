@@ -108,9 +108,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.redis_accounts_client = async_redis.from_url(config.redis_accounts_url)
         logger.info("Redis accounts client initialized")
 
-        app.state.redis_chain_client = async_redis.from_url(config.redis_chain_url)
-        logger.info("Redis chain client initialized")
-
         app.state.redis_rate_limiting_client = async_redis.from_url(config.redis_rate_limiting_url)
         logger.info("Redis rate limiting client initialized")
 
@@ -119,13 +116,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
         from hippius_s3.queue import initialize_queue_client
         from hippius_s3.redis_cache import initialize_cache_client
-        from hippius_s3.redis_chain import initialize_chain_client
 
         initialize_queue_client(app.state.redis_queues_client)
         logger.info("Queue client initialized")
-
-        initialize_chain_client(app.state.redis_chain_client)
-        logger.info("Chain Redis client initialized")
 
         initialize_cache_client(app.state.redis_client)
         logger.info("Cache Redis client initialized")
@@ -160,7 +153,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             app.state.metrics_collector,
             app.state.redis_client,
             app.state.redis_accounts_client,
-            app.state.redis_chain_client,
             app.state.redis_rate_limiting_client,
             app.state.redis_queues_client,
         )
@@ -205,12 +197,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.info("Redis accounts client closed")
         except Exception:
             logger.exception("Error shutting down Redis accounts client")
-
-        try:
-            await app.state.redis_chain_client.close()
-            logger.info("Redis chain client closed")
-        except Exception:
-            logger.exception("Error shutting down Redis chain client")
 
         try:
             await app.state.redis_rate_limiting_client.close()
