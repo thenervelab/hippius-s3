@@ -51,7 +51,6 @@ async def test_forward_post_request_with_body(gateway_client_no_auth: AsyncClien
 
     async def inject_state_middleware(request: Any, call_next: Any) -> Any:
         request.state.account_id = "test-account"
-        request.state.seed_phrase = "test seed"
         request.state.account = HippiusAccount(
             id="test-account",
             main_account="test-account",
@@ -97,8 +96,6 @@ async def test_header_injection_for_auth(gateway_client_no_auth: AsyncClient, ga
     def check_headers(request: httpx.Request) -> httpx.Response:
         assert "X-Hippius-Request-User" in request.headers
         assert request.headers["X-Hippius-Request-User"] == "test-account-123"
-        assert "X-Hippius-Seed" in request.headers
-        assert request.headers["X-Hippius-Seed"] == "test seed phrase"
         assert "X-Hippius-Bucket-Owner" in request.headers
         assert "X-Hippius-Has-Credits" in request.headers
         assert request.headers["X-Hippius-Has-Credits"] == "True"
@@ -108,7 +105,6 @@ async def test_header_injection_for_auth(gateway_client_no_auth: AsyncClient, ga
 
     async def inject_state_middleware(request: Any, call_next: Any) -> Any:
         request.state.account_id = "test-account-123"
-        request.state.seed_phrase = "test seed phrase"
         request.state.account = HippiusAccount(
             id="test-account-123",
             main_account="main-account-456",

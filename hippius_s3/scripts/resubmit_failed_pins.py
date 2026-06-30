@@ -44,12 +44,6 @@ async def fetch_failed_simple_objects(db: Any, hours: int, include_pinning: bool
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Resubmit failed simple uploads by re-enqueuing pin requests")
     parser.add_argument("--hours", type=int, default=72, help="Look back window in hours (default: 72)")
-    parser.add_argument(
-        "--seed",
-        type=str,
-        default=os.getenv("SEED_PHRASE") or "",
-        help="Seed phrase to use for encryption/pin (required for private buckets)",
-    )
     parser.add_argument("--dry-run", action="store_true", help="Print planned actions without enqueueing")
     parser.add_argument("--include-pinning", action="store_true", help="Include items currently in 'pinning' status")
     args = parser.parse_args()
@@ -74,7 +68,6 @@ async def main() -> None:
 
         enqueued = 0
         skipped_no_cache = 0
-        skipped_private_no_seed = 0
 
         for row in candidates:
             object_id = str(row["object_id"]) if row.get("object_id") is not None else ""
@@ -89,12 +82,6 @@ async def main() -> None:
             # Ensure part 0 is still in cache (assume current version = 1 for legacy script)
             if not await obj_cache.exists(object_id, 1, 1):
                 skipped_no_cache += 1
-                continue
-
-            should_encrypt = not is_public
-            seed_phrase = args.seed if should_encrypt else ""
-            if should_encrypt and not seed_phrase:
-                skipped_private_no_seed += 1
                 continue
 
             payload = UploadChainRequest(

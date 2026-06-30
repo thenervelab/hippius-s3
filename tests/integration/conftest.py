@@ -38,14 +38,9 @@ def test_run_id() -> str:
 
 
 @pytest.fixture
-def test_seed_phrase() -> str:
-    """Seed phrase used for local integration tests (mirrors e2e fixture semantics)."""
-    return "about acid actor absent action able actual abandon abstract above ability achieve"
-
-
-@pytest.fixture
 def boto3_client(
-    test_seed_phrase: str,
+    test_access_key: str,
+    test_access_key_secret: str,
 ) -> Any:
     """Create a boto3 S3 client configured for integration testing."""
     if is_real_aws():
@@ -57,14 +52,11 @@ def boto3_client(
             ),
         )
 
-    access_key = base64.b64encode(test_seed_phrase.encode()).decode()
-    secret_key = test_seed_phrase
-
     return boto3.client(
         "s3",
         endpoint_url="http://localhost:8000",
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
+        aws_access_key_id=test_access_key,
+        aws_secret_access_key=test_access_key_secret,
         region_name="us-east-1",
         config=Config(
             s3={"addressing_style": "path"},

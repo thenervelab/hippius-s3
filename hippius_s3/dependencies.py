@@ -86,14 +86,12 @@ def get_redis_accounts(request: Request) -> Union[Redis, RedisCluster]:
 @dataclass
 class RequestContext:
     main_account_id: str
-    seed_phrase: str
 
 
 def get_request_context(request: Request) -> RequestContext:
     """Lightweight context extracted from request.state for passing to services."""
     main_account_id = getattr(request.state.account, "main_account", "") or ""
-    seed_phrase = getattr(request.state, "seed_phrase", "")
-    return RequestContext(main_account_id=main_account_id, seed_phrase=seed_phrase)
+    return RequestContext(main_account_id=main_account_id)
 
 
 def get_user_repo(db: DBConnection) -> UserRepository:
@@ -106,24 +104,3 @@ def get_bucket_repo(db: DBConnection) -> BucketRepository:
 
 def get_object_repo(db: DBConnection) -> ObjectRepository:
     return ObjectRepository(db)
-
-
-async def extract_seed_phrase(request: Request) -> str:
-    """
-    FastAPI dependency that extracts the seed phrase from request.state.
-    The HMAC middleware should have already extracted and stored the seed phrase.
-
-    Returns:
-        str: The extracted seed phrase
-
-    Raises:
-        HTTPException: If the seed phrase is not found in request.state
-    """
-    if hasattr(request.state, "seed_phrase"):
-        seed_phrase: str = request.state.seed_phrase
-        return seed_phrase
-
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Seed phrase not found in request state - HMAC middleware may not be configured",
-    )

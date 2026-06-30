@@ -47,7 +47,7 @@ async def get_object(
     if "tagging" in request.query_params:
         async with pool.acquire() as conn:
             return await tags_get_object_tags(
-                bucket_name, object_key, conn, request.state.seed_phrase, request.state.account.main_account
+                bucket_name, object_key, conn, request.state.account.main_account
             )
     if "uploadId" in request.query_params:
         async with pool.acquire() as conn:
@@ -71,7 +71,7 @@ async def put_object(
     if "tagging" in request.query_params:
         async with pool.acquire() as conn:
             return await tags_set_object_tags(
-                bucket_name, object_key, request, conn, request.state.seed_phrase, request.state.account.main_account
+                bucket_name, object_key, request, conn, request.state.account.main_account
             )
     if request.headers.get("x-amz-copy-source"):
         return await handle_copy_object(bucket_name, object_key, request, pool, redis_client)
@@ -92,7 +92,7 @@ async def delete_object(
     if "tagging" in request.query_params:
         async with pool.acquire() as conn:
             return await tags_delete_object_tags(
-                bucket_name, object_key, conn, request.state.seed_phrase, request.state.account.main_account
+                bucket_name, object_key, conn, request.state.account.main_account
             )
     async with pool.acquire() as conn:
         return await handle_delete_object(bucket_name, object_key, request, conn, redis_client)

@@ -60,7 +60,6 @@ async def test_mpu_upload_part_stream_cleans_up_on_oversize(tmp_path, monkeypatc
                 object_version=1,
                 bucket_name="bucket",
                 account_address="acct",
-                seed_phrase="seed",
                 part_number=1,
                 body_iter=body_iter(),
             )

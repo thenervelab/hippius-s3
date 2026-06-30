@@ -31,11 +31,6 @@ def auth_router_app() -> Any:
                 "account_address": request.state.account_address,
                 "token_type": request.state.token_type,
             }
-        elif auth_method == "seed_phrase":
-            return {
-                "auth_method": auth_method,
-                "seed_phrase": request.state.seed_phrase,
-            }
         else:
             return {"auth_method": auth_method}
 

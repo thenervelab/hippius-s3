@@ -154,7 +154,6 @@ async def build_stream_context(
                 bucket_name=info.get("bucket_name", ""),
                 address=address,
                 subaccount=address,
-                subaccount_seed_phrase="",
                 substrate_url=cfg.substrate_url,
                 size=int(info.get("size_bytes") or 0),
                 multipart=bool(info.get("multipart")),

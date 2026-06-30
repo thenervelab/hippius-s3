@@ -14,7 +14,6 @@ class PutContext:
     redis: Any
     ipfs_service: Any
     account_address: str
-    seed_phrase: str
     bucket_id: str
     bucket_name: str
     object_id: str

@@ -111,11 +111,6 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: DISCORD_WEBHOOK_URL
-            - name: RESUBMISSION_SEED_PHRASE
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: RESUBMISSION_SEED_PHRASE
             - name: HIPPIUS_OVH_KMS_ENDPOINT
               valueFrom:
                 secretKeyRef:
