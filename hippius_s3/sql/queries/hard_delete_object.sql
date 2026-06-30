@@ -13,6 +13,10 @@
 -- delete only fires if the object STILL qualifies at delete time; a revived (or
 -- otherwise no-longer-ready) object matches nothing and is left untouched.
 -- Returns "DELETE 1" when removed, "DELETE 0" when skipped.
+--
+-- The deleted_at/grace/NOT-EXISTS conditions mirror find_objects_ready_for_hard_delete.sql
+-- (the finder also has an EXISTS(>=1 chunk_backend) guard, not re-checked here because
+-- chunk_backend rows never disappear between find and delete). Keep the two in sync.
 DELETE FROM objects o
 WHERE o.object_id = $1
   AND o.deleted_at IS NOT NULL

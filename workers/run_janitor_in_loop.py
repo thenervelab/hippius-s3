@@ -804,7 +804,7 @@ async def gc_soft_deleted_objects(pool: asyncpg.Pool) -> int:
                 # (re-PUT clears deleted_at + adds live chunks) between the find and
                 # here is left untouched. "DELETE 0" => skipped, not deleted.
                 tag = await db.execute(get_query("hard_delete_object"), row["object_id"])
-                if str(tag).split()[-1] == "0":
+                if tag == "DELETE 0":
                     skipped += 1
                     continue
                 deleted += 1

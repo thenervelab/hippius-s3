@@ -332,3 +332,30 @@ async def gateway_client_no_auth(gateway_app_no_auth: Any) -> AsyncGenerator[Asy
     transport = ASGITransport(app=gateway_app_no_auth)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
+
+
+@pytest_asyncio.fixture
+async def pg_conn() -> AsyncGenerator[asyncpg.Connection, None]:
+    """A live Postgres connection on DATABASE_URL; skips the test if none is reachable."""
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        pytest.skip("DATABASE_URL not set; skipping live-schema check")
+    try:
+        conn = await asyncpg.connect(dsn=dsn)
+    except (OSError, asyncpg.PostgresError) as exc:
+        pytest.skip(f"Postgres unreachable on DATABASE_URL: {exc}")
+    try:
+        yield conn
+    finally:
+        await conn.close()
+
+
+@pytest_asyncio.fixture
+async def pg_tx(pg_conn: asyncpg.Connection) -> AsyncGenerator[asyncpg.Connection, None]:
+    """A pg_conn wrapped in a transaction that is always rolled back, so seeded rows never persist."""
+    tr = pg_conn.transaction()
+    await tr.start()
+    try:
+        yield pg_conn
+    finally:
+        await tr.rollback()
