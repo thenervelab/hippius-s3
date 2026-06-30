@@ -89,6 +89,9 @@ pub struct AgentSnapshot {
     pub deferred: u64,
     /// Chunks the reconciler recovered after a dropped `chunk_landed` trigger.
     pub reconciler_recovered: u64,
+    /// `failed` (broken/abandoned-upload) SSD parts the reclaim worker unlinked — the
+    /// SSD-ingest tier's eviction throughput, distinct from the drain's `CephFS` work.
+    pub reclaimed: u64,
 }
 
 impl AgentSnapshot {
@@ -122,6 +125,7 @@ pub struct SnapshotCell {
     failed: AtomicU64,
     deferred: AtomicU64,
     reconciler_recovered: AtomicU64,
+    reclaimed: AtomicU64,
     /// Recent drain latencies, behind a `Mutex` because a percentile needs the
     /// whole window (no single atomic suffices). Off the wait-free `load` path.
     latency: Mutex<LatencyWindow>,
@@ -155,6 +159,11 @@ impl SnapshotCell {
         self.reconciler_recovered.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Adds `n` to the SSD-reclaim total (terminal parts the reclaim worker unlinked).
+    pub fn record_reclaimed(&self, n: u64) {
+        self.reclaimed.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Records a completed drain's latency for the windowed p99 estimate.
     ///
     /// The lock is held only for an O(1) ring push and is never carried across an
@@ -179,6 +188,7 @@ impl SnapshotCell {
             failed: self.failed.load(Ordering::Relaxed),
             deferred: self.deferred.load(Ordering::Relaxed),
             reconciler_recovered: self.reconciler_recovered.load(Ordering::Relaxed),
+            reclaimed: self.reclaimed.load(Ordering::Relaxed),
         }
     }
 }
@@ -217,6 +227,7 @@ mod tests {
         cell.record_drained(2);
         cell.record_failed(1);
         cell.record_reconciled(4);
+        cell.record_reclaimed(6);
         assert_eq!(
             cell.load(),
             AgentSnapshot {
@@ -224,6 +235,7 @@ mod tests {
                 failed: 1,
                 deferred: 0,
                 reconciler_recovered: 4,
+                reclaimed: 6,
             },
         );
     }
@@ -257,6 +269,7 @@ mod tests {
             failed: u64::MAX,
             deferred: 0,
             reconciler_recovered: 0,
+            reclaimed: 0,
         };
         assert_eq!(snapshot.error_bps(), 10_000);
     }
@@ -268,6 +281,7 @@ mod tests {
             failed: 3,
             deferred: 0,
             reconciler_recovered: 0,
+            reclaimed: 0,
         };
         // 3 failed attempts of 10 total attempts = 30%, i.e. 3000 basis points.
         assert_eq!(snapshot.error_bps(), 3000);

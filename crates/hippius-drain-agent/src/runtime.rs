@@ -5,8 +5,10 @@
 //! [`Supervisor`](crate::supervisor): a drain worker that empties the pending
 //! part backlog on each poll, a reconciler worker that backfills parts whose
 //! landed row is missing (the reconciler is the sole trigger — there is no api
-//! NOTIFY in the part model), and an opt-in heartbeat worker that reports this
-//! node's disk pressure to the allocator. With rate control on, the drain worker
+//! NOTIFY in the part model), an `ssd_reclaim` worker that GCs `failed`
+//! (broken/abandoned-upload) parts + orphan write-temps off the local SSD, and an
+//! opt-in heartbeat worker that reports this node's disk pressure to the allocator.
+//! With rate control on, the drain worker
 //! gates through a shared
 //! [`Enforcer`] and an allocation-pull worker keeps that enforcer synced to the
 //! leader's write-budget. Each worker is a [`run_periodic`] loop that observes
@@ -20,7 +22,7 @@ use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
     BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, Enforcer, NodeId, NodeObservation, SnapshotCell, Store, SystemClock,
-    TokenBucket, UploadEnqueuer, decay_rate, reconcile_parts,
+    TokenBucket, UploadEnqueuer, decay_rate, reclaim_ssd, reconcile_parts,
 };
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -58,6 +60,11 @@ pub struct RuntimeConfig {
     pub drain_poll: Duration,
     /// How often the reconciler scans the SSD cache for parts missing a landed row.
     pub reconcile_poll: Duration,
+    /// How often the reclaim worker scans the SSD for `failed` (abandoned-upload) parts.
+    pub reclaim_poll: Duration,
+    /// How long a `failed` part (and an orphan write-temp) is kept before the reclaim
+    /// worker unlinks it — a diagnosis / abort-settle window.
+    pub reclaim_grace: Duration,
     /// How long workers get to finish an in-flight tick after cancellation
     /// before the supervisor force-aborts them.
     pub grace: Duration,
@@ -199,6 +206,39 @@ async fn heartbeat_once(ssd: &LocalSsd, store: &Store, node: &NodeId, max_drain_
     };
     if let Err(err) = store.upsert_node_state(node, &observation).await {
         tracing::warn!(error = %err, "heartbeat upsert failed");
+    }
+}
+
+/// One reclaim pass: evict `failed` (broken/abandoned-upload) SSD parts older than
+/// `grace`, then sweep orphan write-temps older than `grace`.
+///
+/// Reclaim and sweep errors are logged and skipped; the next tick retries, and no part
+/// is ever removed without a successful status read (fail-safe).
+async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, grace: Duration) {
+    match reclaim_ssd(ssd, ssd, store, grace).await {
+        Ok(report) => {
+            snapshot.record_reclaimed(report.reclaimed);
+            if report.reclaimed > 0 {
+                // Aggregate, not per-part: an abandoned MPU reclaims many parts at once,
+                // so a per-part line would spam.
+                tracing::info!(reclaimed = report.reclaimed, "reclaimed broken/abandoned-upload SSD parts");
+            }
+            // The one signal that the (deliberately un-handled) replicated crash-orphan
+            // leak is actually occurring — otherwise invisible. Warn so it surfaces.
+            if report.skipped_replicated > 0 {
+                tracing::warn!(
+                    skipped_replicated = report.skipped_replicated,
+                    "replicated parts still on SSD — drain crash-orphans nothing currently reclaims"
+                );
+            }
+        }
+        Err(err) => tracing::warn!(error = ?err, "ssd reclaim cycle failed; will retry next poll"),
+    }
+
+    match ssd.sweep_orphan_tmp(grace).await {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(removed, "swept orphan SSD write-temps"),
+        Err(err) => tracing::warn!(error = %err, "orphan-temp sweep failed; will retry next poll"),
     }
 }
 
@@ -357,6 +397,21 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
             })
         });
 
+        // SSD reclaim worker: clean up broken/abandoned uploads (`failed` parts) the
+        // drain skips forever, plus orphan write-temps — the SSD-ingest tier's GC so
+        // abandoned-upload junk does not accumulate on the node-local disk.
+        let (ssd, store, snapshot) = (Arc::clone(&self.ssd), Arc::clone(&self.store), Arc::clone(&self.snapshot));
+        let reclaim_poll = self.config.reclaim_poll;
+        let reclaim_grace = self.config.reclaim_grace;
+        supervisor.spawn(WorkerName::new("ssd_reclaim"), move |token| {
+            run_periodic(token, reclaim_poll, move || {
+                let (ssd, store, snapshot) = (Arc::clone(&ssd), Arc::clone(&store), Arc::clone(&snapshot));
+                async move {
+                    reclaim_once(&ssd, &store, &snapshot, reclaim_grace).await;
+                }
+            })
+        });
+
         // Heartbeat worker (opt-in): report this node's disk pressure + capability
         // so the allocator can weight it. Without it the node is never in the fleet.
         if let Some(heartbeat) = self.heartbeat {
@@ -392,8 +447,8 @@ mod tests {
     use crate::supervisor::ShutdownTrigger;
     use core::str::FromStr;
     use hippius_drain_core::{
-        Allocation, ByteRate, Bytes, Clock, NodeId, ObjectId, PartKey, PartNumber, PartReplicationStore, ReplicationState, Store, TestClock,
-        UploadEnqueuer, Version,
+        Allocation, ByteRate, Bytes, Clock, NodeId, ObjectId, PartKey, PartNumber, PartReplicationStore, ReplicationState, SnapshotCell, Store,
+        TestClock, UploadEnqueuer, Version,
     };
 
     /// A no-op upload enqueuer for the runtime tests (drain-direct's Redis fan-out is
@@ -419,11 +474,17 @@ mod tests {
 
     /// Lays a complete SSD part (chunk files + meta.json) and records it pending.
     async fn seed_part(ssd_root: &Path, store: &Store, part: &PartKey) {
+        seed_ssd_dir(ssd_root, part);
+        store.record_landed_part(part).await.unwrap();
+    }
+
+    /// Lays a complete SSD part dir (chunk + meta) WITHOUT a DB row — for the reclaim
+    /// test, which sets the row's status/age itself.
+    fn seed_ssd_dir(ssd_root: &Path, part: &PartKey) {
         let dir = ssd_root.join(part.relative_dir());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("chunk_0.bin"), b"runtime backlog part").unwrap();
         std::fs::write(dir.join("meta.json"), br#"{"chunk_size":20,"num_chunks":1,"size_bytes":20}"#).unwrap();
-        store.record_landed_part(part).await.unwrap();
     }
 
     async fn all_replicated(store: &Store, parts: &[PartKey]) -> bool {
@@ -475,6 +536,8 @@ mod tests {
             RuntimeConfig {
                 drain_poll: Duration::from_mins(1),
                 reconcile_poll: Duration::from_mins(1),
+                reclaim_poll: Duration::from_mins(1),
+                reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
             },
         )
@@ -536,6 +599,8 @@ mod tests {
             RuntimeConfig {
                 drain_poll: Duration::from_mins(1),
                 reconcile_poll: Duration::from_mins(1),
+                reclaim_poll: Duration::from_mins(1),
+                reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
             },
         )
@@ -617,6 +682,8 @@ mod tests {
                 // Park drain/reconcile; this test exercises only the heartbeat.
                 drain_poll: Duration::from_mins(1),
                 reconcile_poll: Duration::from_mins(1),
+                reclaim_poll: Duration::from_mins(1),
+                reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
             },
         )
@@ -675,6 +742,8 @@ mod tests {
             RuntimeConfig {
                 drain_poll: Duration::from_millis(20),
                 reconcile_poll: Duration::from_millis(20),
+                reclaim_poll: Duration::from_mins(1),
+                reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
             },
         );
@@ -717,6 +786,8 @@ mod tests {
             RuntimeConfig {
                 drain_poll: Duration::from_millis(20),
                 reconcile_poll: Duration::from_millis(50),
+                reclaim_poll: Duration::from_mins(1),
+                reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
             },
         );
@@ -741,5 +812,87 @@ mod tests {
         let snap = snapshot.load();
         assert_eq!(snap.drained, 3, "every drained part was counted once");
         assert_eq!(snap.failed, 0, "the happy path records no failures");
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn reclaim_once_evicts_a_failed_aged_part_and_keeps_a_replicated_one(pool: PgPool) {
+        // The SSD-ingest GC, against real Postgres + a real LocalSsd: a `failed` part (a
+        // broken/abandoned upload) is unlinked once aged, while a `replicated` part (the
+        // drain's own to clean) and the DB rows are left untouched. Driving reclaim_once
+        // directly keeps it deterministic — the periodic spawn machinery is the same
+        // run_periodic the sibling worker tests cover.
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let store = Store::from_pool(pool.clone());
+        let snapshot = SnapshotCell::new();
+
+        // A failed part (abandoned upload), forced 2h old -> reclaimable.
+        let failed = part_at(5, 1);
+        seed_ssd_dir(ssd_dir.path(), &failed);
+        store.record_landed_part(&failed).await.unwrap();
+        force_terminal_2h(&pool, &failed, "failed").await;
+
+        // A replicated part -> the drain's own to clean up; the reclaimer leaves it.
+        let replicated = part_at(5, 2);
+        seed_ssd_dir(ssd_dir.path(), &replicated);
+        store.record_landed_part(&replicated).await.unwrap();
+        force_terminal_2h(&pool, &replicated, "replicated").await;
+
+        let ssd = LocalSsd::new(ssd_dir.path());
+        super::reclaim_once(&ssd, &store, &snapshot, Duration::from_secs(1)).await;
+
+        assert!(
+            !ssd_dir.path().join(failed.relative_dir()).exists(),
+            "the aged failed (abandoned-upload) part was evicted from the SSD",
+        );
+        assert!(
+            ssd_dir.path().join(replicated.relative_dir()).exists(),
+            "a replicated part is left for the drain, never reclaimed here",
+        );
+        assert_eq!(snapshot.load().reclaimed, 1, "exactly the failed part was counted");
+        // Reclaim only unlinks the SSD copy; the DB row is left intact.
+        assert_eq!(
+            <Store as PartReplicationStore>::status(&store, &failed).await.unwrap(),
+            Some(ReplicationState::Failed),
+            "reclaim does not touch the replication row",
+        );
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn reclaim_once_also_runs_the_orphan_temp_sweep(pool: PgPool) {
+        // reclaim_once must do BOTH the failed-part reclaim AND the orphan-temp sweep.
+        // An orphan temp in an incomplete (no-meta) part dir is invisible to the part
+        // scan, so if it gets removed it can only be the sweep — proving the wiring.
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let store = Store::from_pool(pool);
+        let snapshot = SnapshotCell::new();
+
+        let part = part_at(9, 1);
+        let part_dir = ssd_dir.path().join(part.relative_dir());
+        std::fs::create_dir_all(&part_dir).unwrap();
+        let orphan = part_dir.join("chunk_0.bin.tmp.0badf00d0badf00d");
+        std::fs::write(&orphan, b"half-written").unwrap();
+
+        let ssd = LocalSsd::new(ssd_dir.path());
+        // Zero grace so the just-written temp is past the (no-)window.
+        super::reclaim_once(&ssd, &store, &snapshot, Duration::ZERO).await;
+
+        assert!(!orphan.exists(), "reclaim_once swept the orphan temp");
+        assert_eq!(snapshot.load().reclaimed, 0, "no failed part -> nothing reclaimed, only the temp swept");
+    }
+
+    /// Forces a part's row to `status` with `updated_at` backdated 2h, so the reclaim
+    /// age reads deterministically older than any test grace.
+    async fn force_terminal_2h(pool: &PgPool, part: &PartKey, status: &str) {
+        sqlx::query(
+            "UPDATE cephor_replication_status SET status = $4, updated_at = now() - interval '2 hours' \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 }

@@ -15,9 +15,11 @@ use crate::ids::{FileId, NodeId};
 use crate::partdrain::{ClaimedPart, PartReplicationStore, PartVerified};
 use crate::reconcile::PartLandingLog;
 use crate::reconcile::PartStatus;
+use crate::ssd_reclaim::{PartStatusAge, ReclaimLog};
 use crate::state::ReplicationState;
 use crate::units::{ByteRate, Bytes, DiskPressure};
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use std::collections::HashMap;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -95,6 +97,20 @@ fn state_from_db(raw: &str) -> Result<ReplicationState> {
         "failed" => Ok(ReplicationState::Failed),
         other => Err(StoreError::UnknownState { value: other.into() }),
     }
+}
+
+/// How many parts one [`ReclaimLog::part_states`] query covers. A whole-SSD scan is
+/// chunked into batches of this many tuples so a pathological backlog cannot build
+/// one giant `IN (...)` list; the worker still reads every part, just over a few
+/// queries instead of one unbounded one.
+const RECLAIM_STATUS_BATCH: usize = 500;
+
+/// Converts an `EXTRACT(EPOCH FROM (now() - updated_at))` age in seconds into a
+/// [`Duration`], clamping a negative (clock skew) or non-finite value to zero. A
+/// clamped-to-zero age reads as "just updated", so the reclaim age gate keeps the
+/// part — the fail-safe direction.
+fn age_from_secs(secs: f64) -> Duration {
+    Duration::try_from_secs_f64(secs.max(0.0)).unwrap_or(Duration::ZERO)
 }
 
 #[derive(sqlx::FromRow)]
@@ -890,6 +906,61 @@ impl PartLandingLog for Store {
     }
 }
 
+/// The reclaim worker's batched view of the store: read the replication state + age
+/// of many parts in ONE round-trip, so the per-cycle SSD scan never fans out into a
+/// per-part SELECT (the reconciler's O(backlog) cost the worker must not repeat).
+impl ReclaimLog for Store {
+    type Error = StoreError;
+
+    async fn part_states(&self, parts: &[PartKey]) -> Result<HashMap<PartKey, PartStatusAge>> {
+        let mut out = HashMap::with_capacity(parts.len());
+        // Chunk the IN-list so a pathological backlog never builds one giant query.
+        for batch in parts.chunks(RECLAIM_STATUS_BATCH) {
+            let mut object_ids: Vec<&str> = Vec::with_capacity(batch.len());
+            let mut versions: Vec<i64> = Vec::with_capacity(batch.len());
+            let mut part_numbers: Vec<i64> = Vec::with_capacity(batch.len());
+            for part in batch {
+                object_ids.push(part.object().as_str());
+                versions.push(i64::from(part.version().get()));
+                part_numbers.push(i64::from(part.part().get()));
+            }
+            // Match the batch by its PK tuple via UNNEST'd parallel arrays — one query,
+            // a PK lookup per element (no new index needed). A part with no row simply
+            // does not come back, so the caller treats it as absent.
+            let rows = sqlx::query_as::<_, (String, i64, i64, String, f64)>(
+                // EXTRACT(EPOCH ...) is `numeric` on PG 14+, which does not decode into
+                // f64 — cast to float8 so sqlx reads the age as a plain double.
+                "SELECT object_id, version, part_number, status, \
+                        EXTRACT(EPOCH FROM (now() - updated_at))::float8 \
+                 FROM cephor_replication_status \
+                 WHERE (object_id, version, part_number) IN \
+                       (SELECT * FROM UNNEST($1::text[], $2::bigint[], $3::bigint[]))",
+            )
+            .bind(&object_ids)
+            .bind(&versions)
+            .bind(&part_numbers)
+            .fetch_all(&self.pool)
+            .await?;
+            for (object_id, version, part_number, status, age_secs) in rows {
+                let part = PartRow {
+                    object_id,
+                    version,
+                    part_number,
+                }
+                .into_part()?;
+                out.insert(
+                    part,
+                    PartStatusAge {
+                        state: state_from_db(&status)?,
+                        age: age_from_secs(age_secs),
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 #[cfg(feature = "pg")]
 #[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
@@ -1285,15 +1356,72 @@ mod part_tests {
     use super::{Store, StoreError};
     use crate::apipart::{ObjectId, PartKey, PartNumber, Version};
     use crate::partdrain::{ClaimedPart, PartReplicationStore, PartVerified};
+    use crate::ssd_reclaim::ReclaimLog;
     use crate::state::ReplicationState;
     use core::str::FromStr;
     use sqlx::postgres::PgPool;
+    use std::time::Duration;
 
     const UUID_A: &str = "466916c0-d61b-4518-b81b-9576b574270a";
     const UUID_B: &str = "00000000-0000-4000-8000-000000000000";
 
     fn part(uuid: &str, version: u32, number: u32) -> PartKey {
         PartKey::new(ObjectId::from_str(uuid).unwrap(), Version::new(version), PartNumber::new(number))
+    }
+
+    /// Forces a part's row to a terminal status with a backdated `updated_at`, so the
+    /// reclaim age reads deterministically older than any plausible grace.
+    async fn force_terminal(pool: &PgPool, part: &PartKey, status: &str) {
+        sqlx::query(
+            "UPDATE cephor_replication_status SET status = $4, updated_at = now() - interval '2 hours' \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn part_states_returns_state_and_age_for_known_parts_only(pool: PgPool) {
+        let store = Store::from_pool(pool.clone());
+        let pending = part(UUID_A, 5, 1);
+        let replicated = part(UUID_A, 5, 2);
+        let failed = part(UUID_A, 5, 3);
+        let absent = part(UUID_B, 7, 1);
+
+        store.record_landed_part(&pending).await.unwrap();
+        store.record_landed_part(&replicated).await.unwrap();
+        force_terminal(&pool, &replicated, "replicated").await;
+        store.record_landed_part(&failed).await.unwrap();
+        force_terminal(&pool, &failed, "failed").await;
+
+        let states = <Store as ReclaimLog>::part_states(&store, &[pending.clone(), replicated.clone(), failed.clone(), absent.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(states.len(), 3, "the part with no row is omitted (treated as absent)");
+        assert!(!states.contains_key(&absent), "an unknown part has no entry");
+
+        let pending_status = states.get(&pending).expect("pending part present");
+        assert_eq!(pending_status.state, ReplicationState::Pending);
+        assert!(pending_status.age < Duration::from_hours(1), "a freshly landed row reads young");
+
+        let replicated_status = states.get(&replicated).expect("replicated part present");
+        assert_eq!(replicated_status.state, ReplicationState::Replicated);
+        assert!(replicated_status.age >= Duration::from_hours(1), "the backdated row reads ~2h old");
+
+        assert_eq!(states.get(&failed).expect("failed part present").state, ReplicationState::Failed);
+    }
+
+    #[sqlx::test]
+    async fn part_states_of_an_empty_request_is_empty(pool: PgPool) {
+        let store = Store::from_pool(pool);
+        let states = <Store as ReclaimLog>::part_states(&store, &[]).await.unwrap();
+        assert!(states.is_empty(), "no parts requested -> no query, empty map");
     }
 
     #[sqlx::test]

@@ -98,6 +98,14 @@ spec:
                   key: REDIS_QUEUES_URL
             - name: HIPPIUS_UPLOAD_BACKENDS
               value: "arion"
+            # SSD-ingest reclaim worker: clean up broken/abandoned uploads (failed parts
+            # the drain skips forever) + orphan write-temps, once aged, so abandoned-upload
+            # junk does not accumulate on the node-local disk. Both have safe code defaults
+            # (300s poll / 1h grace); set here for visibility + per-node tuning.
+            - name: CEPHOR_RECLAIM_POLL_SECS
+              value: "300"
+            - name: CEPHOR_RECLAIM_GRACE_SECS
+              value: "3600"
             - name: RUST_LOG
               value: "info"
           volumeMounts:
