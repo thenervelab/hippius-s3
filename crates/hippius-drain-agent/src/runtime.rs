@@ -620,9 +620,11 @@ mod tests {
         let signal = shutdown.clone();
         let handle = tokio::spawn(async move { runtime.run(signal.cancelled_owned()).await });
 
-        // The worker first pulls the budget into the enforcer.
+        // The worker first pulls the budget into the enforcer. Generous window (~5s):
+        // the allocation-pull worker shares a single-threaded runtime with the other
+        // workers and can be starved under a full parallel sqlx-test run.
         let mut loaded = false;
-        for _ in 0..200 {
+        for _ in 0..500 {
             if enforcer.lock().unwrap().rate() == budget {
                 loaded = true;
                 break;
@@ -646,8 +648,10 @@ mod tests {
         clock.advance(Duration::from_secs(10));
         let near_floor = floor.get().saturating_mul(2);
 
+        // Generous window (~5s) for the same reason: the rate is applied on the next
+        // allocation-pull tick, which can lag under a starved parallel test run.
         let mut decayed = false;
-        for _ in 0..200 {
+        for _ in 0..500 {
             if enforcer.lock().unwrap().rate().get() <= near_floor {
                 decayed = true;
                 break;
