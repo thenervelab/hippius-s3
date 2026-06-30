@@ -795,15 +795,24 @@ async def cleanup_old_parts_by_mtime(
 async def gc_soft_deleted_objects(pool: asyncpg.Pool) -> int:
     """Hard-delete objects where all backends have confirmed unpin."""
     async with pool.acquire() as db:
-        rows = await db.fetch(get_query("find_objects_ready_for_hard_delete"))
+        rows = await db.fetch(get_query("find_objects_ready_for_hard_delete"), config.janitor_hard_delete_batch)
         deleted = 0
+        skipped = 0
         for row in rows:
             try:
-                await db.execute("DELETE FROM objects WHERE object_id = $1", row["object_id"])
+                # Guarded delete: re-verifies readiness atomically so a row revived
+                # (re-PUT clears deleted_at + adds live chunks) between the find and
+                # here is left untouched. "DELETE 0" => skipped, not deleted.
+                tag = await db.execute(get_query("hard_delete_object"), row["object_id"])
+                if tag == "DELETE 0":
+                    skipped += 1
+                    continue
                 deleted += 1
                 logger.info(f"Hard-deleted soft-deleted object: object_id={row['object_id']}")
             except Exception as e:
                 logger.warning(f"Failed to hard-delete object {row['object_id']}: {e}")
+        if skipped:
+            logger.info(f"Hard-delete skipped {skipped} object(s) no longer ready (revived/in-flight)")
     return deleted
 
 
