@@ -89,6 +89,7 @@ _fs_age_buckets: dict[str, int] = dict.fromkeys(AGE_BUCKET_NAMES, 0)
 
 _janitor_deleted_counter = None  # set by _setup_janitor_metrics
 _janitor_tmp_deleted_counter = None
+_janitor_abandoned_deleted_counter = None
 
 
 def _obs_parts_on_disk(_: object) -> list[otel_metrics.Observation]:
@@ -242,7 +243,7 @@ async def _run_worker_pool(
 
 
 def _setup_janitor_metrics() -> None:
-    global _janitor_deleted_counter, _janitor_tmp_deleted_counter
+    global _janitor_deleted_counter, _janitor_tmp_deleted_counter, _janitor_abandoned_deleted_counter
 
     if os.getenv("ENABLE_MONITORING", "false").lower() not in ("true", "1", "yes"):
         logger.info("Monitoring disabled for janitor")
@@ -308,6 +309,11 @@ def _setup_janitor_metrics() -> None:
     _janitor_tmp_deleted_counter = meter.create_counter(
         name="fs_janitor_tmp_deleted_total",
         description="Total number of orphan .tmp files deleted by the janitor",
+        unit="1",
+    )
+    _janitor_abandoned_deleted_counter = meter.create_counter(
+        name="fs_janitor_abandoned_reclaimed_total",
+        description="CephFS-pool parts reclaimed as terminally-abandoned uploads (failed + unservable)",
         unit="1",
     )
 
@@ -435,10 +441,12 @@ async def cleanup_stale_parts(
         #   row["recent"] false→ row exists but is old → only reap once every chunk
         #                        is replicated to every required backend. A
         #                        not-yet-replicated part is a pending or aborted
-        #                        upload and must be protected (no data loss).
+        #                        upload and must be protected (no data loss) — with
+        #                        ONE exception, the terminally-abandoned upload below.
         # Distinguishing "no DB row" (orphan, reap) from "DB row but not replicated"
         # (pending, protect) is what keeps deleted-object cache cleanup working
         # without ever deleting data that hasn't been backed up.
+        abandoned = False
         try:
             row = await conn.fetchrow(
                 """
@@ -457,14 +465,30 @@ async def cleanup_stale_parts(
                 if row["recent"]:
                     return False
                 if not await is_replicated_on_all_backends(conn, object_id, object_version, part_number):
-                    return False
+                    # Not replicated → normally protect (pending / in-flight / aborted).
+                    # The ONE exception: a terminally-abandoned upload — the reaper or an
+                    # abort marked the part 'failed' AND its version is unservable. The
+                    # drain never re-claims a 'failed' part, so its pool bytes leak
+                    # forever otherwise; an unservable version can never be served by a
+                    # GET, so reclaiming is safe (see is_terminally_abandoned).
+                    if not await is_terminally_abandoned(conn, object_id, object_version, part_number):
+                        return False
+                    abandoned = True
         except Exception:
             # If any DB check fails, be extra conservative: skip deletion
             return False
 
         try:
             await fs_store.delete_part(object_id, object_version, part_number)
-            logger.info(f"Cleaned stale part by mtime: object_id={object_id} v={object_version} part={part_number}")
+            if abandoned:
+                logger.info(
+                    "Reclaimed terminally-abandoned part (failed+unservable): "
+                    f"object_id={object_id} v={object_version} part={part_number}"
+                )
+                if _janitor_abandoned_deleted_counter is not None:
+                    _janitor_abandoned_deleted_counter.add(1)
+            else:
+                logger.info(f"Cleaned stale part by mtime: object_id={object_id} v={object_version} part={part_number}")
             return True
         except Exception as e:
             logger.warning(f"Failed to clean part: object_id={object_id} v={object_version} part={part_number}: {e}")
@@ -533,6 +557,37 @@ async def is_replicated_on_all_backends(
     if result["total_chunks"] < expected_count:
         return False
     return result["total_chunks"] == result["replicated_chunks"]
+
+
+async def is_terminally_abandoned(
+    db: asyncpg.Connection,
+    object_id: str,
+    object_version: int,
+    part_number: int,
+) -> bool:
+    """True iff this part is a terminally-abandoned upload that is SAFE to reclaim.
+
+    Safety-critical. Returns True only when BOTH hold (see
+    `janitor_part_terminally_abandoned.sql`):
+      (a) `cephor_replication_status.status = 'failed'` — the MPU reaper or an abort
+          marked the part terminal. The drain never re-claims a 'failed' row, so its
+          CephFS-pool copy is dead weight that leaks forever otherwise.
+      (b) the object version is UNSERVABLE — `address` was never written AND the GET
+          download filter (`size_bytes > 0 OR md5_hash <> ''`) cannot be satisfied.
+
+    Why both: 'failed' alone is NOT sufficient, because the drain's corruption-path
+    `mark_failed` has no servability guard and can mark a part of a *servable*
+    simple-PUT version 'failed'. Requiring (b) — the reaper's own `address IS NULL`
+    predicate plus the literal download-servability filter — guarantees the janitor
+    never deletes bytes a live GET could serve.
+    """
+    row = await db.fetchrow(
+        get_query("janitor_part_terminally_abandoned"),
+        object_id,
+        object_version,
+        part_number,
+    )
+    return bool(row and row["abandoned"])
 
 
 async def cleanup_orphan_tmp_files(fs_store: FileSystemPartsStore) -> int:
