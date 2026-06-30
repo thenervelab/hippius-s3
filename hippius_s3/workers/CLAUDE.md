@@ -105,4 +105,10 @@ All worker operations emit OTel spans with `hippius.ray_id`, `hippius.account.ma
 |----|------|---|-------|------|
 | #2798 | 2:42 AM | 🔵 | Unpinner worker handles deletion from distributed storage with retry logic and soft-delete database tracking | ~584 |
 | #2785 | 2:41 AM | 🔵 | Downloader worker architecture reveals queue processing with concurrency limits and retry logic | ~639 |
+
+### Jun 25, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #9377 | 9:07 PM | 🔵 | Application Pool Configuration Exceeds Database max_connections by 96 Connections | ~723 |
 </claude-mem-context>
