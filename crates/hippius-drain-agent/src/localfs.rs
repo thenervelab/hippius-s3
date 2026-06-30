@@ -6,8 +6,9 @@
 //! implements [`PartSource`]/[`PartScan`] (list, locate, hash, scan, unlink a
 //! part) and [`LocalFs`] implements [`PartPool`] (persist chunk/meta, hash,
 //! remove). The crash-safety guarantee the drain depends on lives in
-//! [`persist_into`]: it copies, fsyncs, atomically renames within the part folder,
-//! and fsyncs the folder so a power loss never leaves a torn file. Both also
+//! [`copy_into`]: it streams+hashes the bytes, `fdatasync`s the temp, atomically
+//! renames within the part folder, and (once per part, via `finalize_part`) fsyncs
+//! the folder so a power loss never leaves a torn file. Both also
 //! implement the GC-only [`CephFs`]/[`SsdCache`] `remove_object` reclaim (by
 //! `<object_id>` folder).
 
@@ -22,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 
 /// Streaming hash read buffer. Bounds memory so multi-gigabyte chunks are never
 /// read whole into memory just to hash them.
@@ -233,24 +235,51 @@ async fn hash_file(path: &Path) -> io::Result<String> {
     Ok(hex_lower(hasher.finalize().as_slice()))
 }
 
-/// Atomically place `source`'s bytes into `dir` as `name`: copy into a temp inside
-/// `dir`, fsync it, rename into place, then fsync `dir`. A crash leaves either no file
-/// or the complete one. The single-writer-per-part claim makes the `.tmp-<name>`
-/// temp collision-free (mirrors the chunk persist's within-folder atomic rename).
-async fn persist_into(dir: &Path, name: &str, source: &Path) -> io::Result<()> {
+/// Streams `source` into `dest`, computing the SHA-256 of the bytes in the same pass so the
+/// copy needs no second read to verify (the audit's hash-once win), and `fdatasync`s `dest`
+/// — [`File::sync_data`] skips the atime/mtime metadata flush a `sync_all` would force.
+/// Bounded by [`HASH_BUF_BYTES`] so a multi-gigabyte chunk is never read whole into memory.
+async fn stream_copy_hash(source: &Path, dest: &Path) -> io::Result<String> {
+    let mut reader = fs::File::open(source).await?;
+    let mut writer = fs::File::create(dest).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0_u8; HASH_BUF_BYTES];
+    loop {
+        let read = reader.read(&mut buf).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+        writer.write_all(&buf[..read]).await?;
+    }
+    writer.flush().await?;
+    writer.sync_data().await?;
+    Ok(hex_lower(hasher.finalize().as_slice()))
+}
+
+/// Atomically place `source`'s bytes into `dir` as `name`, returning the lowercase-hex
+/// SHA-256 of the bytes streamed during the copy: stream into a temp inside `dir`
+/// (`fdatasync`'d), rename into place, then — only when `sync_dir` is set — fsync `dir`.
+/// A crash leaves either no file or the complete one. The single-writer-per-part claim
+/// makes the `.tmp-<name>` temp collision-free (mirrors the within-folder atomic rename).
+///
+/// The directory fsync is deferred (`sync_dir = false` for chunks + meta) so the whole
+/// part costs ONE dir-fsync via [`sync_parent_dir`], not one per file — the caller drives
+/// it through `PartPool::finalize_part` after every rename lands.
+async fn copy_into(dir: &Path, name: &str, source: &Path, sync_dir: bool) -> io::Result<String> {
     let dest = dir.join(name);
     let tmp = dir.join(format!(".tmp-{name}"));
     fs::create_dir_all(dir).await?;
     // Arm temp cleanup before the copy: any failure or cancellation before the rename
     // must not leave a `.tmp-*` orphan in the pool (the drop-guard idiom, RfR ch.1).
     let guard = TmpGuard::arm(tmp.clone());
-    fs::copy(source, &tmp).await?;
-    let written = fs::File::open(&tmp).await?;
-    written.sync_all().await?;
-    drop(written);
+    let hash = stream_copy_hash(source, &tmp).await?;
     fs::rename(&tmp, &dest).await?;
     guard.dismiss();
-    sync_parent_dir(dir).await
+    if sync_dir {
+        sync_parent_dir(dir).await?;
+    }
+    Ok(hash)
 }
 
 /// Remove a part's whole directory; an already-absent dir is `Ok` (idempotent, so a
@@ -392,12 +421,20 @@ impl PartSource for LocalSsd {
 }
 
 impl PartPool for LocalFs {
-    async fn persist_chunk(&self, source: &Path, part: &PartKey, index: ChunkIndex) -> io::Result<()> {
-        persist_into(&part_dir(&self.root, part), &chunk_file_name(index), source).await
+    async fn persist_chunk(&self, source: &Path, part: &PartKey, index: ChunkIndex) -> io::Result<String> {
+        // sync_dir=false: the per-part dir fsync is batched into finalize_part below.
+        copy_into(&part_dir(&self.root, part), &chunk_file_name(index), source, false).await
     }
 
     async fn persist_meta(&self, source: &Path, part: &PartKey) -> io::Result<()> {
-        persist_into(&part_dir(&self.root, part), META_FILE_NAME, source).await
+        // sync_dir=false: meta's dir entry flushes with the chunks' in the single finalize.
+        copy_into(&part_dir(&self.root, part), META_FILE_NAME, source, false).await.map(|_| ())
+    }
+
+    async fn finalize_part(&self, part: &PartKey) -> io::Result<()> {
+        // One fsync of the part dir, after every chunk + meta rename has landed, so all
+        // those directory entries become durable together (Task 1: batch the fsync).
+        sync_parent_dir(&part_dir(&self.root, part)).await
     }
 
     async fn chunk_hash(&self, part: &PartKey, index: ChunkIndex) -> io::Result<String> {
@@ -744,15 +781,24 @@ mod part_tests {
         let ssd = LocalSsd::new(ssd_dir.path());
         let ceph = LocalFs::new(pool_dir.path());
         let source = ssd.chunk_source(&part, ChunkIndex::new(0)).unwrap();
-        ceph.persist_chunk(&source, &part, ChunkIndex::new(0)).await.unwrap();
+        let copy_hash = ceph.persist_chunk(&source, &part, ChunkIndex::new(0)).await.unwrap();
+        // The hash-once win: persist_chunk returns the SHA computed during the copy stream,
+        // so the drain needs no separate readback of the source to verify.
+        assert_eq!(copy_hash, sha256_hex(content), "persist_chunk returns the copy-time hash");
 
         let pooled = pool_dir.path().join(part.relative_dir()).join("chunk_0.bin");
         assert_eq!(std::fs::read(&pooled).unwrap(), content, "the pooled bytes match the source");
-        assert_eq!(ceph.chunk_hash(&part, ChunkIndex::new(0)).await.unwrap(), sha256_hex(content));
 
         let meta = ssd.meta_source(&part).unwrap();
         ceph.persist_meta(&meta, &part).await.unwrap();
+        // One dir-fsync for the whole part: after it, every chunk + meta is durably present.
+        ceph.finalize_part(&part).await.unwrap();
         assert!(pool_dir.path().join(part.relative_dir()).join("meta.json").exists(), "meta marker landed");
+        assert_eq!(
+            ceph.chunk_hash(&part, ChunkIndex::new(0)).await.unwrap(),
+            sha256_hex(content),
+            "the pooled chunk is durable + verifiable after finalize",
+        );
     }
 
     #[tokio::test]

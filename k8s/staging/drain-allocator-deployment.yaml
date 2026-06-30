@@ -1,11 +1,13 @@
 # The hippius-drain allocator: the singleton, leader-elected budget allocator.
 #
 # One replica. The allocator does NOT need the SSD/CephFS mounts — it only reads the
-# fleet's heartbeats and writes per-node write-budgets in Postgres. It is also the
-# schema owner: on startup it applies the hippius-drain-core migrations (the cephor_*
-# tables) before contending for leadership, so the agents come up against a ready
-# schema (allocator-first deploy). A DB leader-lease fences any accidental second
-# instance, so even a brief rollout overlap allocates from exactly one leader.
+# fleet's heartbeats and writes per-node write-budgets. Leadership, heartbeats, and
+# budgets are TTL-keyed in redis-queues (epoch-fenced via Lua), NOT Postgres, so the
+# ~2s leader tick never touches the WAL. It is still the schema owner: on startup it
+# applies the hippius-drain-core migrations (the durable cephor_* tables) before
+# contending for leadership, so the agents come up against a ready schema
+# (allocator-first deploy). A Redis leader-lease (monotonic epoch) fences any accidental
+# second instance, so even a brief rollout overlap allocates from exactly one leader.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -45,6 +47,14 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: DATABASE_URL
+            # Coordination state (leader lease / fleet heartbeats / per-node budgets) lives
+            # here, TTL-keyed — the same redis-queues instance the agents use. Reuse the
+            # api's secret.
+            - name: REDIS_QUEUES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_QUEUES_URL
             - name: RUST_LOG
               value: "info"
             # Live ceph-mgr ceiling probe. Left unset for first bring-up so the

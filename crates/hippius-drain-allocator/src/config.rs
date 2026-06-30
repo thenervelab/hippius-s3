@@ -22,9 +22,11 @@ const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
 /// six renewals of headroom; rate allocation does not need sub-5 s updates. Tune via
 /// `CEPHOR_ALLOCATOR_TICK_SECS` per deployment.
 const DEFAULT_TICK: Duration = Duration::from_secs(5);
-/// Heartbeats older than this are ignored when loading the fleet
-/// (`CEPHOR_FLEET_STALE_SECS`). Several agent heartbeat periods (~10s) wide.
-const DEFAULT_FLEET_STALE: Duration = Duration::from_secs(30);
+/// TTL on each per-node allocation key when `CEPHOR_ALLOCATION_TTL_SECS` is unset.
+/// Past it the agent reads no budget and decays toward its floor, so it must be a few
+/// allocator ticks wide — long enough to survive a missed tick, short enough that a
+/// departed node's budget conserves promptly. Replaces the old PG node-absence zeroing.
+const DEFAULT_ALLOCATION_TTL: Duration = Duration::from_secs(15);
 /// Static Ceph write-ceiling (bytes/sec) when `CEPHOR_CEPH_CEILING_BPS` is unset.
 /// The operational default until the live Ceph-mgr probe lands; assumes Ceph is
 /// open at this rate, so the real cap is `max_total` and per-node demand.
@@ -66,8 +68,11 @@ pub struct AllocatorConfig {
     pub lease_ttl: Duration,
     /// How often to run an allocation tick.
     pub tick_interval: Duration,
-    /// Heartbeats older than this are ignored when reading the fleet.
-    pub fleet_stale: Duration,
+    /// Redis URL for the coordination state (leader lease / heartbeats / allocations) —
+    /// the redis-queues instance the agents also use.
+    pub redis_queues_url: String,
+    /// TTL stamped on each per-node allocation key the allocator writes.
+    pub alloc_ttl: Duration,
     /// The static Ceph write-ceiling (the open-rate the live probe hands out when
     /// Ceph is healthy, and the whole ceiling when no probe URL is configured).
     pub ceph_ceiling: ByteRate,
@@ -139,7 +144,6 @@ impl AllocatorConfig {
         TickConfig {
             instance_id: self.instance_id.clone(),
             lease_ttl: self.lease_ttl,
-            stale_after: self.fleet_stale,
             alloc: self.alloc,
         }
     }
@@ -178,7 +182,8 @@ impl AllocatorConfig {
             instance_id: required(&get, "CEPHOR_ALLOCATOR_INSTANCE_ID")?,
             lease_ttl: duration_secs(&get, "CEPHOR_LEADER_LEASE_TTL_SECS", DEFAULT_LEASE_TTL)?,
             tick_interval: duration_secs(&get, "CEPHOR_ALLOCATOR_TICK_SECS", DEFAULT_TICK)?,
-            fleet_stale: duration_secs(&get, "CEPHOR_FLEET_STALE_SECS", DEFAULT_FLEET_STALE)?,
+            redis_queues_url: required(&get, "REDIS_QUEUES_URL")?,
+            alloc_ttl: duration_secs(&get, "CEPHOR_ALLOCATION_TTL_SECS", DEFAULT_ALLOCATION_TTL)?,
             ceph_ceiling: ByteRate::new(positive_u64(&get, "CEPHOR_CEPH_CEILING_BPS", DEFAULT_CEPH_CEILING_BPS)?),
             // The first tick starts from the AIMD floor unless overridden, so a
             // fresh leader ramps up from a safe rate rather than a guess.
@@ -282,8 +287,8 @@ fn duration_millis(get: &impl Fn(&str) -> Option<String>, var: &'static str, def
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::{
-        AllocatorConfig, ConfigError, DEFAULT_CRITICAL_PRESSURE_BPS, DEFAULT_DECREASE_PERMILLE, DEFAULT_MAX_TOTAL_BPS, DEFAULT_MIN_TOTAL_BPS,
-        DEFAULT_TICK,
+        AllocatorConfig, ConfigError, DEFAULT_ALLOCATION_TTL, DEFAULT_CRITICAL_PRESSURE_BPS, DEFAULT_DECREASE_PERMILLE, DEFAULT_MAX_TOTAL_BPS,
+        DEFAULT_MIN_TOTAL_BPS, DEFAULT_TICK,
     };
     use hippius_drain_core::{ByteRate, CephCeiling, DiskPressure};
 
@@ -297,6 +302,7 @@ mod tests {
         vec![
             ("CEPHOR_DATABASE_URL", "postgres://localhost/cephor"),
             ("CEPHOR_ALLOCATOR_INSTANCE_ID", "alloc-1"),
+            ("REDIS_QUEUES_URL", "redis://localhost:6382/0"),
         ]
     }
 
@@ -333,6 +339,31 @@ mod tests {
         let pairs = vec![("CEPHOR_ALLOCATOR_INSTANCE_ID", "alloc-1")];
         let err = AllocatorConfig::from_lookup(lookup(&pairs)).unwrap_err();
         assert!(matches!(err, ConfigError::Missing("CEPHOR_DATABASE_URL")));
+    }
+
+    #[test]
+    fn reads_the_redis_url_and_defaults_the_allocation_ttl() {
+        let config = AllocatorConfig::from_lookup(lookup(&required_only())).unwrap();
+        assert_eq!(config.redis_queues_url, "redis://localhost:6382/0");
+        assert_eq!(config.alloc_ttl, DEFAULT_ALLOCATION_TTL);
+    }
+
+    #[test]
+    fn a_numeric_allocation_ttl_overrides_the_default() {
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_ALLOCATION_TTL_SECS", "20"));
+        let config = AllocatorConfig::from_lookup(lookup(&pairs)).unwrap();
+        assert_eq!(config.alloc_ttl, std::time::Duration::from_secs(20));
+    }
+
+    #[test]
+    fn a_missing_redis_url_is_reported() {
+        let pairs = vec![
+            ("CEPHOR_DATABASE_URL", "postgres://localhost/cephor"),
+            ("CEPHOR_ALLOCATOR_INSTANCE_ID", "alloc-1"),
+        ];
+        let err = AllocatorConfig::from_lookup(lookup(&pairs)).unwrap_err();
+        assert!(matches!(err, ConfigError::Missing("REDIS_QUEUES_URL")));
     }
 
     #[test]

@@ -13,8 +13,11 @@ default = []
 serde = ["dep:serde"]
 # Exposes deterministic test helpers (e.g. TestClock) to downstream test code.
 test-util = []
-# Postgres-backed central state store (heartbeats, allocations, GC claims).
+# Postgres-backed central state store (replication/claim/GC durable state).
 pg = ["dep:sqlx", "dep:tokio"]
+# Redis-backed ephemeral coordination (leader lease, heartbeats, allocations) +
+# the allocator tick that drives it. Loss-tolerant, TTL-expiring state kept off PG.
+coord = ["dep:redis", "dep:tokio", "dep:serde", "dep:serde_json"]
 # Enables GC of the shared CephFS pool folder. Off by default until the api
 # write-fence is confirmed (an owned task); SSD-local GC ships without it.
 gc-cephfs = []
@@ -22,8 +25,10 @@ gc-cephfs = []
 [dependencies]
 thiserror = { workspace = true }
 serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
+redis = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

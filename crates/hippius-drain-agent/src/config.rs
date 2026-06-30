@@ -30,6 +30,10 @@ const DEFAULT_FLOOR_RATE_BPS: u64 = 1_000_000;
 const DEFAULT_DECAY_HALF_LIFE: Duration = Duration::from_secs(30);
 /// Allocation re-pull period when `CEPHOR_ALLOCATION_POLL_SECS` is unset.
 const DEFAULT_ALLOCATION_POLL: Duration = Duration::from_secs(2);
+/// Maximum parts drained concurrently when `CEPHOR_DRAIN_CONCURRENCY` is unset.
+/// Tuning this lets the node hide fsync latency behind more in-flight parts (the
+/// AIMD allocator only tunes bytes/sec, never the concurrency).
+const DEFAULT_DRAIN_CONCURRENCY: u32 = 4;
 /// Claim lease TTL when `CEPHOR_CLAIM_LEASE_TTL_SECS` is unset: a `draining`
 /// claim older than this is treated as abandoned (the H1 crash-recovery TTL).
 /// Mirrors the store-side default; long enough not to reclaim a live slow drain,
@@ -40,10 +44,11 @@ const DEFAULT_CLAIM_LEASE: Duration = Duration::from_mins(5);
 /// parked before it is re-claimable, so the drain does not spin on not-ready parts every
 /// poll. Mirrors the store-side default.
 const DEFAULT_DEFER_BACKOFF: Duration = Duration::from_secs(5);
-/// Allocation staleness window when `CEPHOR_ALLOCATION_STALE_SECS` is unset: past
-/// it the allocator is treated as silent on this node and the rate decays toward
-/// the floor (a few allocator ticks — the allocator tick is ~2s).
-const DEFAULT_ALLOCATION_STALE: Duration = Duration::from_secs(10);
+/// Heartbeat key TTL when `CEPHOR_HEARTBEAT_TTL_SECS` is unset: how long this node's
+/// heartbeat stays live in the fleet before it must be refreshed. This IS the
+/// fleet-staleness window (the allocator drops a node whose key has expired), so it must
+/// be a few heartbeat periods (~10s) wide — long enough to survive a missed beat.
+const DEFAULT_HEARTBEAT_TTL: Duration = Duration::from_secs(30);
 /// Reclaim scan period when `CEPHOR_RECLAIM_POLL_SECS` is unset: the SSD-ingest GC
 /// runs less often than the drain — eviction is a backstop, not a hot path.
 const DEFAULT_RECLAIM_POLL: Duration = Duration::from_mins(5);
@@ -85,9 +90,9 @@ pub struct Config {
     /// How long a deferred (enqueue-not-ready) part is backed off before re-claim,
     /// wired into the store via `with_defer_backoff`.
     pub defer_backoff: Duration,
-    /// How long a stored allocation stays authoritative before the agent treats
-    /// the allocator as silent and decays toward the floor (M1 conservation).
-    pub allocation_stale: Duration,
+    /// TTL stamped on this node's heartbeat key — the fleet-staleness window the
+    /// allocator sees (a node whose key expires drops out of the fleet).
+    pub heartbeat_ttl: Duration,
     /// Redis URL for the upload queues — the drain pushes each replicated part's
     /// `UploadChainRequest` here (drain-direct; the drain is the sole upload producer).
     pub redis_queues_url: String,
@@ -99,6 +104,9 @@ pub struct Config {
     /// How long a `failed` part (and an orphan write-temp) is kept on SSD before
     /// eviction (a diagnosis / abort-settle window).
     pub reclaim_grace: Duration,
+    /// Maximum parts the drain worker processes concurrently — the in-flight gate
+    /// that lets the node overlap fsync latency across parts.
+    pub drain_concurrency: u32,
 }
 
 /// A failure parsing the daemon configuration from the environment.
@@ -135,6 +143,17 @@ pub enum ConfigError {
         /// The offending variable.
         var: &'static str,
     },
+    /// A count variable exceeded its representable maximum (e.g. a drain
+    /// concurrency past `u32::MAX`). A misconfiguration must fail fast.
+    #[error("environment variable `{var}` value {value} exceeds the maximum {limit}")]
+    OutOfRange {
+        /// The offending variable.
+        var: &'static str,
+        /// The value supplied.
+        value: u64,
+        /// The maximum it may take.
+        limit: u64,
+    },
 }
 
 impl Config {
@@ -158,6 +177,7 @@ impl Config {
             reclaim_poll: self.reclaim_poll,
             reclaim_grace: self.reclaim_grace,
             grace: self.grace,
+            drain_concurrency: self.drain_concurrency,
         }
     }
 
@@ -190,11 +210,12 @@ impl Config {
             allocation_poll: duration_secs(&get, "CEPHOR_ALLOCATION_POLL_SECS", DEFAULT_ALLOCATION_POLL)?,
             claim_lease: duration_secs(&get, "CEPHOR_CLAIM_LEASE_TTL_SECS", DEFAULT_CLAIM_LEASE)?,
             defer_backoff: duration_secs(&get, "CEPHOR_DEFER_BACKOFF_SECS", DEFAULT_DEFER_BACKOFF)?,
-            allocation_stale: duration_secs(&get, "CEPHOR_ALLOCATION_STALE_SECS", DEFAULT_ALLOCATION_STALE)?,
+            heartbeat_ttl: duration_secs(&get, "CEPHOR_HEARTBEAT_TTL_SECS", DEFAULT_HEARTBEAT_TTL)?,
             redis_queues_url: required(&get, "REDIS_QUEUES_URL")?,
             upload_backends: parse_backends(&get, "HIPPIUS_UPLOAD_BACKENDS"),
             reclaim_poll: duration_secs(&get, "CEPHOR_RECLAIM_POLL_SECS", DEFAULT_RECLAIM_POLL)?,
             reclaim_grace: duration_secs(&get, "CEPHOR_RECLAIM_GRACE_SECS", DEFAULT_RECLAIM_GRACE)?,
+            drain_concurrency: positive_u32_or(&get, "CEPHOR_DRAIN_CONCURRENCY", DEFAULT_DRAIN_CONCURRENCY)?,
         })
     }
 }
@@ -238,6 +259,22 @@ fn positive_u64_or(get: &impl Fn(&str) -> Option<String>, var: &'static str, def
     }
 }
 
+/// Resolves an optional positive count variable as a `u32`. Builds on [`u64_or`]
+/// but rejects an explicit zero (a zero drain concurrency would stall the worker)
+/// and a value past `u32::MAX`, mirroring [`positive_u64_or`]'s fail-fast contract.
+fn positive_u32_or(get: &impl Fn(&str) -> Option<String>, var: &'static str, default: u32) -> Result<u32, ConfigError> {
+    let value = u64_or(get, var, u64::from(default))?;
+    match u32::try_from(value) {
+        Ok(0) => Err(ConfigError::NonPositive { var }),
+        Ok(value) => Ok(value),
+        Err(_) => Err(ConfigError::OutOfRange {
+            var,
+            value,
+            limit: u64::from(u32::MAX),
+        }),
+    }
+}
+
 /// Resolves a required filesystem path, rejecting unset, empty, or whitespace-only
 /// values as [`Missing`](ConfigError::Missing). A blank path is the dangerous case
 /// `required` alone misses: it is non-empty, so it would pass into a `PathBuf` and
@@ -267,8 +304,9 @@ fn duration_secs(get: &impl Fn(&str) -> Option<String>, var: &'static str, defau
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::{
-        Config, ConfigError, DEFAULT_ALLOCATION_POLL, DEFAULT_ALLOCATION_STALE, DEFAULT_CLAIM_LEASE, DEFAULT_DECAY_HALF_LIFE, DEFAULT_DRAIN_POLL,
-        DEFAULT_FLOOR_RATE_BPS, DEFAULT_HEARTBEAT_POLL, DEFAULT_MAX_DRAIN_RATE_BPS, DEFAULT_RECLAIM_GRACE, DEFAULT_RECLAIM_POLL,
+        Config, ConfigError, DEFAULT_ALLOCATION_POLL, DEFAULT_CLAIM_LEASE, DEFAULT_DECAY_HALF_LIFE, DEFAULT_DRAIN_CONCURRENCY, DEFAULT_DRAIN_POLL,
+        DEFAULT_FLOOR_RATE_BPS, DEFAULT_HEARTBEAT_POLL, DEFAULT_HEARTBEAT_TTL, DEFAULT_MAX_DRAIN_RATE_BPS, DEFAULT_RECLAIM_GRACE,
+        DEFAULT_RECLAIM_POLL,
     };
     use core::str::FromStr;
     use hippius_drain_core::{ByteRate, NodeId};
@@ -363,17 +401,17 @@ mod tests {
     }
 
     #[test]
-    fn defaults_the_allocation_stale_window() {
+    fn defaults_the_heartbeat_ttl() {
         let config = Config::from_lookup(lookup(&required_only())).unwrap();
-        assert_eq!(config.allocation_stale, DEFAULT_ALLOCATION_STALE);
+        assert_eq!(config.heartbeat_ttl, DEFAULT_HEARTBEAT_TTL);
     }
 
     #[test]
-    fn a_numeric_allocation_stale_overrides_the_default() {
+    fn a_numeric_heartbeat_ttl_overrides_the_default() {
         let mut pairs = required_only();
-        pairs.push(("CEPHOR_ALLOCATION_STALE_SECS", "30"));
+        pairs.push(("CEPHOR_HEARTBEAT_TTL_SECS", "45"));
         let config = Config::from_lookup(lookup(&pairs)).unwrap();
-        assert_eq!(config.allocation_stale, Duration::from_secs(30));
+        assert_eq!(config.heartbeat_ttl, Duration::from_secs(45));
     }
 
     #[test]
@@ -513,6 +551,48 @@ mod tests {
         ];
         let err = Config::from_lookup(lookup(&pairs)).unwrap_err();
         assert!(matches!(err, ConfigError::Missing("REDIS_QUEUES_URL")));
+    }
+
+    #[test]
+    fn defaults_the_drain_concurrency() {
+        let config = Config::from_lookup(lookup(&required_only())).unwrap();
+        assert_eq!(config.drain_concurrency, DEFAULT_DRAIN_CONCURRENCY);
+    }
+
+    #[test]
+    fn a_numeric_drain_concurrency_overrides_the_default() {
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_DRAIN_CONCURRENCY", "12"));
+        let config = Config::from_lookup(lookup(&pairs)).unwrap();
+        assert_eq!(config.drain_concurrency, 12);
+    }
+
+    #[test]
+    fn a_zero_drain_concurrency_is_rejected() {
+        // A zero concurrency would stall the drain worker entirely — fail fast.
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_DRAIN_CONCURRENCY", "0"));
+        let err = Config::from_lookup(lookup(&pairs)).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::NonPositive {
+                var: "CEPHOR_DRAIN_CONCURRENCY"
+            }
+        ));
+    }
+
+    #[test]
+    fn a_drain_concurrency_past_u32_is_out_of_range() {
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_DRAIN_CONCURRENCY", "4294967296"));
+        let err = Config::from_lookup(lookup(&pairs)).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::OutOfRange {
+                var: "CEPHOR_DRAIN_CONCURRENCY",
+                ..
+            }
+        ));
     }
 
     #[test]
