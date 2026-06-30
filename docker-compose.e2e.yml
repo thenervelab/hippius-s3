@@ -269,10 +269,13 @@ services:
     environment:
       - CEPHOR_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - CEPHOR_ALLOCATOR_INSTANCE_ID=e2e-allocator
+      - REDIS_QUEUES_URL=redis://redis-queues:6379
       - RUST_LOG=info
     depends_on:
       db:
         condition: service_healthy
+      redis-queues:
+        condition: service_started
     restart: unless-stopped
     networks:
       - hippius_net
