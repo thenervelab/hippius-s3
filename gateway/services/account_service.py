@@ -2,7 +2,6 @@
 
 import json
 import logging
-
 import redis.asyncio as async_redis
 from hippius_s3.models.account import HippiusAccount
 
