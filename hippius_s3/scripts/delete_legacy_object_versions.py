@@ -7,8 +7,12 @@ from contextlib import suppress
 from dataclasses import dataclass
 
 import asyncpg
+import redis.asyncio as async_redis
 
 from hippius_s3.config import get_config
+from hippius_s3.queue import UnpinChainRequest
+from hippius_s3.queue import enqueue_unpin_request
+from hippius_s3.queue import initialize_queue_client
 
 
 @dataclass(frozen=True)
@@ -19,11 +23,17 @@ class DeleteCandidate:
     object_key: str
     storage_version: int
     is_current: bool
+    main_account_id: str
 
 
 async def main_async(args: argparse.Namespace) -> int:
     cfg = get_config()
     db = await asyncpg.connect(cfg.database_url)
+    unpin = not args.no_unpin
+    redis_q = None
+    if unpin and not args.dry_run:
+        redis_q = async_redis.from_url(cfg.redis_queues_url)
+        initialize_queue_client(redis_q)
     try:
         max_sv = int(args.max_storage_version)
         include_current = bool(args.include_current)
@@ -82,6 +92,7 @@ async def main_async(args: argparse.Namespace) -> int:
               ov.object_version,
               ov.storage_version,
               (ov.object_version = o.current_object_version) AS is_current,
+              b.main_account_id,
               f.has_v4
             FROM object_versions ov
             JOIN objects o ON o.object_id = ov.object_id
@@ -108,6 +119,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 object_key=str(r["object_key"]),
                 storage_version=int(r["storage_version"]),
                 is_current=bool(r["is_current"]),
+                main_account_id=str(r["main_account_id"]),
             )
             for r in rows
         ]
@@ -153,28 +165,43 @@ async def main_async(args: argparse.Namespace) -> int:
         # 1) If requested, delete legacy-only objects entirely (cascades to versions/parts).
         # This is the only reliable way to delete an object whose current version is legacy.
         if include_objects_without_v4:
-            r0 = await db.execute(
+            # Enqueue unpins BEFORE the delete — the cascade removes chunk_backend, after which
+            # the unpin workers couldn't find anything to delete from the backends.
+            legacy_only = await db.fetch(
                 """
-                DELETE FROM objects o
-                USING buckets b
-                WHERE b.bucket_id = o.bucket_id
-                  AND ($2::text IS NULL OR b.bucket_name = $2)
+                SELECT o.object_id, o.current_object_version, b.main_account_id
+                FROM objects o
+                JOIN buckets b ON b.bucket_id = o.bucket_id
+                WHERE ($2::text IS NULL OR b.bucket_name = $2)
                   AND EXISTS (
                     SELECT 1 FROM object_versions ov
-                    WHERE ov.object_id = o.object_id
-                      AND ov.storage_version <= $1
+                    WHERE ov.object_id = o.object_id AND ov.storage_version <= $1
                   )
                   AND NOT EXISTS (
                     SELECT 1 FROM object_versions ov
-                    WHERE ov.object_id = o.object_id
-                      AND ov.storage_version >= 4
+                    WHERE ov.object_id = o.object_id AND ov.storage_version >= 4
                   )
                 """,
                 max_sv,
                 bucket,
             )
-            with suppress(Exception):
-                deleted_objects += int(str(r0).split()[-1])
+            if unpin:
+                for lr in legacy_only:
+                    with suppress(Exception):
+                        await enqueue_unpin_request(
+                            payload=UnpinChainRequest(
+                                address=str(lr["main_account_id"]),
+                                object_id=str(lr["object_id"]),
+                                object_version=int(lr["current_object_version"]),
+                            )
+                        )
+            if legacy_only:
+                r0 = await db.execute(
+                    "DELETE FROM objects WHERE object_id = ANY($1::uuid[])",
+                    [lr["object_id"] for lr in legacy_only],
+                )
+                with suppress(Exception):
+                    deleted_objects += int(str(r0).split()[-1])
 
         # Deleting object_versions will cascade-delete parts and part_chunks due to FKs:
         # - parts_object_version_fk ON DELETE CASCADE
@@ -187,6 +214,16 @@ async def main_async(args: argparse.Namespace) -> int:
                 # Defensive: avoid surprising failures unless user explicitly asked.
                 continue
 
+            if unpin:
+                # Enqueue before the cascade removes chunk_backend (see note above).
+                with suppress(Exception):
+                    await enqueue_unpin_request(
+                        payload=UnpinChainRequest(
+                            address=c.main_account_id,
+                            object_id=c.object_id,
+                            object_version=int(c.object_version),
+                        )
+                    )
             await db.execute(
                 """
                 DELETE FROM object_versions
@@ -226,6 +263,8 @@ async def main_async(args: argparse.Namespace) -> int:
         return 0
     finally:
         await db.close()
+        if redis_q is not None:
+            await redis_q.aclose()
 
 
 def main() -> None:
@@ -255,6 +294,11 @@ def main() -> None:
     )
     ap.add_argument("--dry-run", action="store_true", help="Print counts/examples; do not delete")
     ap.add_argument("--yes", action="store_true", help="Required to actually delete")
+    ap.add_argument(
+        "--no-unpin",
+        action="store_true",
+        help="Skip enqueuing unpins before delete (DANGEROUS: leaks backend chunks, no soft-delete record left)",
+    )
     args = ap.parse_args()
     rc = asyncio.run(main_async(args))
     raise SystemExit(rc)
