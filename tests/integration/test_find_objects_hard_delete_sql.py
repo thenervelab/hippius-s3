@@ -162,3 +162,72 @@ async def test_find_objects_ready_for_hard_delete_plan_is_index_driven() -> None
         assert "Seq Scan on part_chunks" not in plan
     finally:
         await conn.close()
+
+
+async def _seed_one(conn: asyncpg.Connection, chunk_backends: list[bool]) -> uuid.UUID:
+    acct = f"5HDTEST{uuid.uuid4().hex[:12]}"
+    await conn.execute("INSERT INTO users(main_account_id) VALUES($1) ON CONFLICT DO NOTHING", acct)
+    bucket_id = uuid.uuid4()
+    await conn.execute(
+        "INSERT INTO buckets(bucket_id, bucket_name, created_at, main_account_id) VALUES($1, $2, now(), $3)",
+        bucket_id,
+        f"hd-test-{bucket_id}",
+        acct,
+    )
+    return await _seed_object(conn, bucket_id, _T_A, chunk_backends)
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_object_deletes_ready_object() -> None:
+    conn = await _connect_or_skip()
+    tr = conn.transaction()
+    await tr.start()
+    try:
+        oid = await _seed_one(conn, [True, True])  # ready: all chunks deleted
+        tag = await conn.execute(get_query("hard_delete_object"), oid)
+        assert tag == "DELETE 1"
+        assert await conn.fetchval("SELECT count(*) FROM objects WHERE object_id=$1", oid) == 0
+    finally:
+        await tr.rollback()
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_object_skips_revived_object() -> None:
+    """Race guard: an object revived (deleted_at cleared) after the find query must
+    NOT be hard-deleted even if its object_id was already selected."""
+    conn = await _connect_or_skip()
+    tr = conn.transaction()
+    await tr.start()
+    try:
+        oid = await _seed_one(conn, [True, True])  # was ready...
+        await conn.execute("UPDATE objects SET deleted_at = NULL WHERE object_id=$1", oid)  # ...then re-PUT revives it
+        tag = await conn.execute(get_query("hard_delete_object"), oid)
+        assert tag == "DELETE 0"  # guard skipped it
+        assert await conn.fetchval("SELECT count(*) FROM objects WHERE object_id=$1", oid) == 1  # still alive
+    finally:
+        await tr.rollback()
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_object_skips_object_with_live_chunk() -> None:
+    """Race guard: if a live (non-deleted) chunk_backend row appears after the find
+    query (e.g. a fresh upload), the delete must skip — never orphan a live chunk."""
+    conn = await _connect_or_skip()
+    tr = conn.transaction()
+    await tr.start()
+    try:
+        oid = await _seed_one(conn, [True])  # was ready...
+        # ...then a live chunk_backend row appears (re-upload).
+        await conn.execute(
+            "UPDATE chunk_backend SET deleted = false WHERE chunk_id IN"
+            " (SELECT pc.id FROM parts p JOIN part_chunks pc ON pc.part_id = p.part_id WHERE p.object_id = $1)",
+            oid,
+        )
+        tag = await conn.execute(get_query("hard_delete_object"), oid)
+        assert tag == "DELETE 0"
+        assert await conn.fetchval("SELECT count(*) FROM objects WHERE object_id=$1", oid) == 1
+    finally:
+        await tr.rollback()
+        await conn.close()
