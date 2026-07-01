@@ -180,7 +180,7 @@ Six separate services for blast-radius isolation:
 | `redis` | 6379 | General cache / short-lived state | Ephemeral |
 | `redis-accounts` | 6380 | Account credit cache | Persistent (AOF) |
 | `redis-chain` | 6381 | Blockchain operation cache | Persistent (AOF) |
-| `redis-queues` | 6382 | Work queues + chunk pub/sub notifications | Persistent, 2GB, LRU |
+| `redis-queues` | 6382 | Work queues + chunk pub/sub notifications + drain coordination (`cephor:*`) | Persistent, 2GB, **noeviction** (holds queue + coordination data — must not evict; a full instance fails writes loudly) |
 | `redis-rate-limiting` | 6383 | Rate limit counters | Ephemeral, 1GB |
 | `redis-acl` | 6384 | ACL cache | Ephemeral, 2GB, LRU |
 
