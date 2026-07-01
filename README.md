@@ -180,15 +180,11 @@ COMPOSE_PROJECT_NAME=hippius-e2e docker compose -f docker-compose.yml -f docker-
 
 ```python
 from minio import Minio
-import base64
-
-seed_phrase = "your twelve word seed phrase here"
-encoded_key = base64.b64encode(seed_phrase.encode('utf-8')).decode('utf-8')
 
 client = Minio(
     "s3.hippius.com",
-    access_key=encoded_key,
-    secret_key=seed_phrase,
+    access_key="your-access-key",
+    secret_key="your-secret-key",
     secure=True,
     region="decentralized"
 )
@@ -200,15 +196,12 @@ client.put_object("my-bucket", "file.txt", data, length)
 
 ```python
 import boto3
-import base64
-
-seed_phrase = "your twelve word seed phrase here"
 
 client = boto3.client(
     "s3",
     endpoint_url="https://s3.hippius.com",
-    aws_access_key_id=base64.b64encode(seed_phrase.encode()).decode(),
-    aws_secret_access_key=seed_phrase,
+    aws_access_key_id="your-access-key",
+    aws_secret_access_key="your-secret-key",
     region_name="decentralized",
 )
 
@@ -218,8 +211,8 @@ client.put_object(Bucket="my-bucket", Key="file.txt", Body=b"hello")
 ### AWS CLI
 
 ```bash
-aws configure set aws_access_key_id "base64-encoded-seed-phrase"
-aws configure set aws_secret_access_key "your-seed-phrase"
+aws configure set aws_access_key_id "your-access-key"
+aws configure set aws_secret_access_key "your-secret-key"
 aws configure set default.region "decentralized"
 aws configure set default.s3.signature_version "s3v4"
 
@@ -275,7 +268,6 @@ Secrets required for CI/CD deployment (configured in `.github/workflows/producti
 | | `CACHET_API_KEY` | Status page API key |
 | | `CACHET_COMPONENT_ID` | Status page component ID |
 | | `DISCORD_WEBHOOK_URL` | Discord notifications |
-| **Other** | `RESUBMISSION_SEED_PHRASE` | Retry failed operations |
 
 ## Project Structure
 

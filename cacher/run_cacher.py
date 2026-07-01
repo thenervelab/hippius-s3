@@ -10,7 +10,7 @@ import redis.asyncio as async_redis
 from dotenv import load_dotenv
 
 from hippius_s3.config import get_config
-from hippius_s3.substrate_client import SubstrateClient
+from substrateinterface import SubstrateInterface
 
 
 logging.basicConfig(level=logging.INFO)
@@ -26,7 +26,7 @@ class SubstrateCacher:
         self.substrate_url = substrate_url
         self.redis_url = redis_url
         self.redis_client: Optional[async_redis.Redis] = None
-        self.substrate_client: Optional[SubstrateClient] = None
+        self.substrate: Optional[SubstrateInterface] = None
 
     async def connect(self) -> None:
         """Connect to Redis and Substrate."""
@@ -34,12 +34,11 @@ class SubstrateCacher:
         await self.redis_client.ping()
         logger.debug("Connected to Redis")
 
-        self.substrate_client = SubstrateClient(
+        self.substrate = SubstrateInterface(
             url=self.substrate_url,
-            password="",
-            account_name=None,
+            ss58_format=42,
+            type_registry_preset="substrate-node-template",
         )
-        self.substrate_client.connect()
         logger.debug("Connected to Substrate")
 
     async def disconnect(self) -> None:
@@ -47,9 +46,9 @@ class SubstrateCacher:
         if self.redis_client:
             await self.redis_client.aclose()
 
-        if self.substrate_client:
-            # SubstrateClient doesn't have disconnect method
-            self.substrate_client = None
+        if self.substrate:
+            # SubstrateInterface doesn't have an async disconnect method
+            self.substrate = None
 
     async def fetch_free_credits(self) -> Dict[str, int]:
         """Fetch all free credits from substrate storage."""
@@ -68,7 +67,7 @@ class SubstrateCacher:
         for pallet in pallet_names:
             for storage in storage_names:
                 try:
-                    storage_map = self.substrate_client._substrate.query_map(
+                    storage_map = self.substrate.query_map(
                         module=pallet,
                         storage_function=storage,
                     )
@@ -111,7 +110,7 @@ class SubstrateCacher:
         for pallet in pallet_names:
             for storage in storage_names:
                 try:
-                    storage_map = self.substrate_client._substrate.query_map(
+                    storage_map = self.substrate.query_map(
                         module=pallet,
                         storage_function=storage,
                     )
@@ -152,7 +151,7 @@ class SubstrateCacher:
         for pallet in pallet_names:
             for storage in storage_names:
                 try:
-                    storage_map = self.substrate_client._substrate.query_map(
+                    storage_map = self.substrate.query_map(
                         module=pallet,
                         storage_function=storage,
                     )

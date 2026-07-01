@@ -9,7 +9,6 @@ async def stream_encrypt_to_chunks(
     plaintext_stream: AsyncIterator[bytes],
     object_id: str,
     part_number: int,
-    seed_phrase: str,
     chunk_size: int,
     key_bytes: bytes,
     crypto_service: Any,

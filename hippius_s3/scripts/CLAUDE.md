@@ -24,7 +24,7 @@ Operational and migration scripts. Most are invoked manually by an operator duri
 |---|---|
 | [dlq_requeue.py](dlq_requeue.py) | CLI to requeue DLQ entries — per-identifier or bulk. Supports `--force` (requeue permanent-classified failures) and `--bypass-billing`. |
 | [dlq_seed.py](dlq_seed.py) | Test helper: push a fake entry to a DLQ for development/debugging. |
-| [resubmit_failed_pins.py](resubmit_failed_pins.py) | Retry failed Hippius pin requests via the chain API. Uses `RESUBMISSION_SEED_PHRASE` env. |
+| [resubmit_failed_pins.py](resubmit_failed_pins.py) | Retry failed simple uploads by re-enqueuing pin requests. Access-key auth only (seed-phrase support removed). |
 | [recover_missing_backend.py](recover_missing_backend.py) | Restore accidentally-deleted `chunk_backend` rows from Arion by matching identifiers. |
 
 ### Destructive ops (use with care)
