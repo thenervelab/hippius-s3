@@ -8,6 +8,8 @@
 //! and the loop are unit-/integration-testable without the process entry point.
 
 pub mod config;
+#[cfg(feature = "otel")]
+pub mod metrics;
 #[cfg(feature = "http")]
 pub mod probe;
 pub mod run;

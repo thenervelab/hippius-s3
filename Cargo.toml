@@ -43,6 +43,13 @@ nix = { version = "=0.31.3", default-features = false, features = ["fs"] }
 reqwest = { version = "=0.13.4", default-features = false }
 # Mock HTTP server for the probe's edge tests (dev-only).
 wiremock = "=0.6.5"
+# OTLP metrics export for the drain binaries (mirrors hippius_s3/otel_setup.py: gRPC OTLP
+# to the otel-collector on :4317, 10s PeriodicReader). Behind each binary's `otel` feature.
+# grpc-tonic (not http-proto) matches the collector's gRPC receiver; default-features=false
+# keeps the reqwest/HTTP exporter + TLS backends out (the in-cluster link is plaintext).
+opentelemetry = { version = "=0.31.0", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "=0.31.0", default-features = false, features = ["metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "=0.31.0", default-features = false, features = ["grpc-tonic", "metrics"] }
 
 # Strict crate-level lints, shared across every member via `[lints] workspace = true`.
 # These crates perform no unsafe operations, so unsafe_code is forbidden workspace-wide;

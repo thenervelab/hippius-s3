@@ -21,13 +21,22 @@ use crate::localfs::{LocalFs, LocalSsd};
 use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
-    BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, Coordinator, Enforcer, NodeId, NodeObservation, SnapshotCell, Store,
-    SystemClock, TokenBucket, UploadEnqueuer, decay_rate, reclaim_ssd, reconcile_parts,
+    BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, NodeId, NodeObservation,
+    SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate, reclaim_ssd, reconcile_parts,
 };
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+/// Best-effort liveness touch: rewriting the file bumps its mtime, which the k8s exec
+/// probe checks for freshness. Errors are ignored — a transient FS blip must not kill an
+/// otherwise-healthy process; a persistent failure ages the mtime out and the probe fails,
+/// which is the correct outcome (restart a wedged pod).
+fn touch_liveness(path: &Path) {
+    let _ = std::fs::write(path, b"ok");
+}
 
 /// Consecutive Ceph-write failures before the circuit breaker opens.
 const BREAKER_FAILURES: u32 = 5;
@@ -198,6 +207,10 @@ async fn heartbeat_once(ssd: &LocalSsd, coord: &Coordinator, node: &NodeId, max_
     // Pressure (allocator weight), backlog (SSD used bytes — the undrained work),
     // and error rate (from the drain counters) are real. p99 latency stays neutral
     // until per-drain timing is wired (the saturation signal, not a demand signal).
+    // Publish the backlog to the metrics gauge here, where the (blocking) disk probe has
+    // already produced used_bytes — the metrics layer reads it wait-free off the exporter
+    // thread, so it must never run statvfs itself.
+    snapshot.record_backlog(usage.used_bytes);
     let observation = NodeObservation {
         pressure: usage.pressure,
         backlog: Bytes::new(usage.used_bytes),
@@ -250,10 +263,33 @@ fn apply_rate(enforcer: &Arc<Mutex<Enforcer>>, rate: ByteRate) {
     enforcer.lock().unwrap_or_else(PoisonError::into_inner).set_rate(rate);
 }
 
+/// The enforcer action for one allocation-pull outcome, separated from the async
+/// loop so the "a failed pull decays like silence" policy is unit-testable without
+/// a live Redis. `Decay` deliberately covers BOTH a TTL-expired allocation
+/// (`Ok(None)`) and a failed pull (`Err`): a sustained pull failure must not hold
+/// the last budget and keep the node draining full-rate into a possibly-degraded
+/// Ceph — the exact incident the rate control exists to dampen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PullAction {
+    /// A fresh budget landed: adopt it as the new decay base.
+    Adopt(ByteRate),
+    /// No budget (TTL-expired) or the pull failed: decay the current base toward floor.
+    Decay,
+}
+
+/// Maps an allocation-pull result to its enforcer action. A fresh budget is
+/// adopted; silence (`Ok(None)`) and any failure (`Err`) both decay.
+fn pull_action(pull: &Result<Option<StoredAllocation>, CoordError>) -> PullAction {
+    match pull {
+        Ok(Some(allocation)) => PullAction::Adopt(allocation.budget),
+        Ok(None) | Err(_) => PullAction::Decay,
+    }
+}
+
 /// Pulls this node's leader-assigned budget into the shared enforcer each
-/// `poll`, decaying toward `floor` when the allocator goes silent so a stale
-/// allocation cannot keep the node hammering Ceph. The async `load_allocation`
-/// runs *unlocked*; only the synchronous `set_rate` takes the lock.
+/// `poll`, decaying toward `floor` when the allocator goes silent OR the pull
+/// fails, so a stale allocation cannot keep the node hammering Ceph. The async
+/// `load_allocation` runs *unlocked*; only the synchronous `set_rate` takes the lock.
 async fn run_alloc(token: CancellationToken, coord: Arc<Coordinator>, rate_control: RateControl, clock: Arc<dyn Clock>) {
     let RateControl {
         enforcer,
@@ -270,14 +306,17 @@ async fn run_alloc(token: CancellationToken, coord: Arc<Coordinator>, rate_contr
     let mut base = floor;
     let mut allocated_at = clock.now();
     loop {
-        match coord.load_allocation(&node).await {
-            Ok(Some(allocation)) => {
-                base = allocation.budget;
+        let pull = coord.load_allocation(&node).await;
+        if let Err(err) = &pull {
+            tracing::warn!(error = %err, "allocation pull failed; decaying toward the floor");
+        }
+        match pull_action(&pull) {
+            PullAction::Adopt(budget) => {
+                base = budget;
                 allocated_at = clock.now();
                 apply_rate(&enforcer, base);
             }
-            Ok(None) => apply_rate(&enforcer, decay_rate(base, floor, clock.now().duration_since(allocated_at), half_life)),
-            Err(err) => tracing::warn!(error = %err, "allocation pull failed; keeping the current budget"),
+            PullAction::Decay => apply_rate(&enforcer, decay_rate(base, floor, clock.now().duration_since(allocated_at), half_life)),
         }
         tokio::select! {
             () = token.cancelled() => return,
@@ -315,6 +354,9 @@ pub struct AgentRuntime<E: UploadEnqueuer> {
     /// The time source the allocation-pull worker reads for its decay timing.
     /// Defaults to [`SystemClock`]; tests inject a [`hippius_drain_core::TestClock`].
     clock: Arc<dyn Clock>,
+    /// Opt-in liveness file the heartbeat worker touches each tick, for the k8s probe.
+    /// `None` (tests / drain-only e2e) writes no file.
+    liveness_path: Option<Arc<PathBuf>>,
 }
 
 impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
@@ -333,6 +375,7 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
             rate_control: None,
             coord: None,
             clock: Arc::new(SystemClock),
+            liveness_path: None,
         }
     }
 
@@ -369,6 +412,15 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
     #[must_use]
     pub fn with_heartbeat(mut self, heartbeat: HeartbeatConfig) -> Self {
         self.heartbeat = Some(heartbeat);
+        self
+    }
+
+    /// Sets the liveness file the heartbeat worker touches each tick, so a k8s
+    /// `livenessProbe` can restart a wedged (not crashed) pod. Without it (tests /
+    /// drain-only e2e) no file is written.
+    #[must_use]
+    pub fn with_liveness(mut self, path: PathBuf) -> Self {
+        self.liveness_path = Some(Arc::new(path));
         self
     }
 
@@ -434,11 +486,27 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
         // is never in the fleet.
         if let (Some(heartbeat), Some(coord)) = (self.heartbeat, self.coord.as_ref()) {
             let (ssd, coord, snapshot) = (Arc::clone(&self.ssd), Arc::clone(coord), Arc::clone(&self.snapshot));
+            let liveness = self.liveness_path.clone();
             let HeartbeatConfig { node, max_drain_rate, poll } = heartbeat;
             supervisor.spawn(WorkerName::new("heartbeat"), move |token| {
                 run_periodic(token, poll, move || {
-                    let (ssd, coord, node, snapshot) = (Arc::clone(&ssd), Arc::clone(&coord), node.clone(), Arc::clone(&snapshot));
+                    let (ssd, coord, node, snapshot, liveness) = (
+                        Arc::clone(&ssd),
+                        Arc::clone(&coord),
+                        node.clone(),
+                        Arc::clone(&snapshot),
+                        liveness.clone(),
+                    );
                     async move {
+                        // Touch liveness FIRST, before the (blocking, possibly early-returning)
+                        // disk probe, so a healthy runtime keeps the k8s probe fresh even when a
+                        // statvfs blip short-circuits heartbeat_once. The heartbeat cadence is a
+                        // bounded, quick tick independent of drain-backlog duration, so it is a
+                        // truer runtime-liveness signal than the drain loop (which can legitimately
+                        // run long under a large backlog).
+                        if let Some(path) = liveness.as_deref() {
+                            touch_liveness(path);
+                        }
                         heartbeat_once(&ssd, &coord, &node, max_drain_rate, &snapshot).await;
                     }
                 })
@@ -461,13 +529,13 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr, reason = "tests")]
 mod tests {
-    use super::{AgentRuntime, HeartbeatConfig, RateControl, RuntimeConfig, default_enforcer};
+    use super::{AgentRuntime, HeartbeatConfig, PullAction, RateControl, RuntimeConfig, default_enforcer, pull_action};
     use crate::localfs::{LocalFs, LocalSsd};
     use crate::supervisor::ShutdownTrigger;
     use core::str::FromStr;
     use hippius_drain_core::{
-        Allocation, ByteRate, Bytes, Clock, Coordinator, NodeId, ObjectId, PartKey, PartNumber, PartReplicationStore, ReplicationState, SnapshotCell,
-        Store, TestClock, UploadEnqueuer, Version,
+        Allocation, ByteRate, Bytes, Clock, CoordError, Coordinator, NodeId, ObjectId, PartKey, PartNumber, PartReplicationStore, ReplicationState,
+        SnapshotCell, Store, StoredAllocation, TestClock, UploadEnqueuer, Version,
     };
 
     /// A coordinator on the test Redis under a per-test prefix, or `None` to skip the
@@ -501,6 +569,27 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     const UUID: &str = "466916c0-d61b-4518-b81b-9576b574270a";
+
+    #[test]
+    fn pull_action_adopts_a_fresh_budget() {
+        let allocation = StoredAllocation {
+            budget: ByteRate::new(500_000),
+            epoch: 7,
+        };
+        assert_eq!(pull_action(&Ok(Some(allocation))), PullAction::Adopt(ByteRate::new(500_000)));
+    }
+
+    #[test]
+    fn pull_action_decays_on_a_ttl_expired_allocation() {
+        assert_eq!(pull_action(&Ok(None)), PullAction::Decay);
+    }
+
+    #[test]
+    fn pull_action_decays_on_a_failed_pull() {
+        // WI-6: an Err (e.g. a sustained redis-queues outage) must decay toward the floor
+        // like silence, NOT hold the last budget and keep hammering a degraded Ceph.
+        assert_eq!(pull_action(&Err(CoordError::Invalid { field: "test" })), PullAction::Decay);
+    }
 
     fn part_at(version: u32, number: u32) -> PartKey {
         PartKey::new(ObjectId::from_str(UUID).unwrap(), Version::new(version), PartNumber::new(number))
@@ -542,6 +631,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn the_allocation_worker_applies_the_leaders_budget(pool: PgPool) {
         let Some(coord) = test_coord("cephor-test:rt-applies:", Duration::from_secs(30), Duration::from_secs(30)).await else {
             eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");
@@ -610,6 +700,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn the_allocation_worker_decays_on_an_injected_clock(pool: PgPool) {
         // #33: run_alloc reads the injected Clock for its decay timing. Load a budget
         // (base jumps above the floor, allocated_at = clock.now()), then let the
@@ -711,6 +802,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn the_heartbeat_worker_upserts_this_node_into_the_fleet(pool: PgPool) {
         let Some(coord) = test_coord("cephor-test:rt-hb:", Duration::from_secs(30), Duration::from_secs(30)).await else {
             eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");

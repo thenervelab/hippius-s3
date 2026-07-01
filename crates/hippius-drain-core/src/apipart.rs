@@ -124,6 +124,22 @@ numeric_newtype!(
 /// so a reader's `meta.json` gate flips only once the whole part is on `CephFS`.
 pub const META_FILE_NAME: &str = "meta.json";
 
+/// The api's `meta.json` part manifest (`chunk_size`/`num_chunks`/`size_bytes`),
+/// written last by the ingest path. The drain reads `num_chunks` to assert the copied
+/// chunk set is complete before it commits + unlinks the SSD copy — meta being present
+/// is not by itself proof every `chunk_<i>.bin` is still on disk (a chunk could be
+/// removed after meta landed). `chunk_size`/`size_bytes` are carried for a future size
+/// assertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartMeta {
+    /// Declared chunk size in bytes.
+    pub chunk_size: u64,
+    /// Declared number of `chunk_<0..num_chunks>.bin` files.
+    pub num_chunks: u32,
+    /// Declared total plaintext size in bytes.
+    pub size_bytes: u64,
+}
+
 /// The drain unit: one part of one object version.
 ///
 /// Names the `<object_id>/v<version>/part_<n>/` directory the api writes and the

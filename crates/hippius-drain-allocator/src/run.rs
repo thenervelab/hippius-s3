@@ -2,7 +2,37 @@
 
 use hippius_drain_core::{BudgetController, ByteRate, CephCeilingSource, CoordError, Coordinator, TickConfig, TickOutcome, run_tick};
 use std::future::Future;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+/// Best-effort liveness touch (see the agent runtime for the rationale): rewriting the
+/// file bumps its mtime, which the k8s exec probe checks for freshness. Errors are
+/// ignored — a persistent failure ages the mtime out and the probe restarts the pod.
+fn touch_liveness(path: &Path) {
+    let _ = std::fs::write(path, b"ok");
+}
+
+/// The allocator's plain-atomic gauges, always compiled (no `otel` dep). The tick loop
+/// writes them; the OTLP gauge callbacks (feature `otel`) read them, so the metrics layer
+/// never has to reach into the loop's state.
+#[derive(Debug, Default)]
+pub struct AllocatorMetrics {
+    /// 1 while this instance led the last tick, else 0 (`drain_leader`).
+    pub leader: AtomicU64,
+    /// The fleet write-budget estimate in bytes/s from the last led tick (`drain_fleet_estimate_bps`).
+    pub fleet_estimate_bps: AtomicU64,
+}
+
+/// Loop-level observability inputs, bundled so `run_allocator` stays under the argument
+/// count lint: the liveness file to touch each tick and the gauges to update.
+#[derive(Debug)]
+pub struct Observability<'a> {
+    /// Liveness file touched each tick (`None` in tests).
+    pub liveness: Option<&'a Path>,
+    /// Gauges the loop updates (leadership + fleet estimate).
+    pub metrics: &'a AllocatorMetrics,
+}
 
 /// Runs the allocator's tick loop until `shutdown` resolves.
 ///
@@ -30,27 +60,42 @@ pub async fn run_allocator<C: CephCeilingSource>(
     config: &TickConfig,
     initial: ByteRate,
     tick: Duration,
+    obs: &Observability<'_>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), CoordError> {
     let mut controller = BudgetController::new(initial);
     tokio::pin!(shutdown);
     loop {
+        // Touch liveness each tick (the tick is bounded and quick) so a k8s probe
+        // restarts a wedged — not crashed — loop, e.g. one blocked on a hung Redis.
+        if let Some(path) = obs.liveness {
+            touch_liveness(path);
+        }
         match run_tick(coord, ceiling, config, controller).await {
             Ok(TickOutcome::Led(plan)) => {
+                let estimate = plan.controller.total().get();
                 tracing::debug!(
-                    fleet_estimate = plan.controller.total().get(),
+                    fleet_estimate = estimate,
                     feasible = plan.feasible,
                     nodes = plan.allocations.len(),
                     "led allocation tick"
                 );
+                obs.metrics.leader.store(1, Ordering::Relaxed);
+                obs.metrics.fleet_estimate_bps.store(estimate, Ordering::Relaxed);
                 // Carry the evolved AIMD state into the next tick.
                 controller = plan.controller;
             }
-            Ok(TickOutcome::NotLeader) => tracing::debug!("another instance holds leadership this tick"),
+            Ok(TickOutcome::NotLeader) => {
+                tracing::debug!("another instance holds leadership this tick");
+                obs.metrics.leader.store(0, Ordering::Relaxed);
+            }
             // The coordinator fenced this instance's stale-epoch write: a higher-epoch
             // leader exists, so this instance is deposed. Expected handoff, not an
             // alert. Keep the carried controller so a re-win resumes from a sane rate.
-            Err(CoordError::Fenced { epoch }) => tracing::info!(epoch, "allocation fenced; leadership has moved on"),
+            Err(CoordError::Fenced { epoch }) => {
+                tracing::info!(epoch, "allocation fenced; leadership has moved on");
+                obs.metrics.leader.store(0, Ordering::Relaxed);
+            }
             Err(err) => tracing::warn!(error = %err, "allocation tick failed; retrying next tick"),
         }
         tokio::select! {
@@ -66,7 +111,7 @@ pub async fn run_allocator<C: CephCeilingSource>(
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr, reason = "tests")]
 mod tests {
-    use super::run_allocator;
+    use super::{AllocatorMetrics, Observability, run_allocator};
     use core::str::FromStr;
     use hippius_drain_core::{
         AllocConfig, Allocation, ByteRate, Bytes, CephCeiling, Coordinator, DiskPressure, NodeId, NodeObservation, StaticCeiling, TickConfig,
@@ -123,6 +168,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn run_allocator_leads_writes_a_budget_then_relinquishes() {
         let Some(c) = coord("cephor-test:run-leads:").await else {
             eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");
@@ -134,6 +180,11 @@ mod tests {
         let config = tick_config("alloc-1");
         let ceiling = open_ceiling();
         let shutdown = CancellationToken::new();
+        let metrics = AllocatorMetrics::default();
+        let obs = Observability {
+            liveness: None,
+            metrics: &metrics,
+        };
 
         // Run the loop concurrently with a driver that waits for a budget to land,
         // then signals shutdown — joined (not spawned) so `&c` is shared by ref.
@@ -143,6 +194,7 @@ mod tests {
             &config,
             ByteRate::new(190_000),
             Duration::from_millis(10),
+            &obs,
             shutdown.cancelled(),
         );
         let driver = async {
@@ -174,6 +226,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn run_allocator_survives_a_fenced_tick() {
         let Some(c) = coord("cephor-test:run-fenced:").await else {
             eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");
@@ -196,6 +249,11 @@ mod tests {
         let config = tick_config("late");
         let ceiling = open_ceiling();
         let shutdown = CancellationToken::new();
+        let metrics = AllocatorMetrics::default();
+        let obs = Observability {
+            liveness: None,
+            metrics: &metrics,
+        };
 
         // The loop must survive the fenced ticks (logged, not fatal) and shut down
         // cleanly — run a few ticks, then cancel.
@@ -205,6 +263,7 @@ mod tests {
             &config,
             ByteRate::new(190_000),
             Duration::from_millis(10),
+            &obs,
             shutdown.cancelled(),
         );
         let driver = async {

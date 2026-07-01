@@ -64,6 +64,27 @@ spec:
           volumeMounts:
             - name: local-ingest
               mountPath: /var/lib/hippius/local_object_cache
+        # Block until the allocator has provisioned the cephor_* schema (it owns the
+        # migrations). Without this gate a fresh-namespace `apply` lets the agent start
+        # against missing tables and CrashLoop until the allocator catches up. Strengthens
+        # mpu-reaper's port-check to an actual schema check (to_regclass is NULL, not an
+        # error, for an absent table).
+        - name: wait-for-cephor-schema
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h postgres-rw -p 5432; do echo "waiting for postgres"; sleep 3; done
+              until [ "$(psql "$CEPHOR_DATABASE_URL" -tAc "SELECT to_regclass('public.cephor_replication_status') IS NOT NULL")" = "t" ]; do
+                echo "waiting for the cephor schema (allocator migration)"; sleep 3
+              done
+          env:
+            - name: CEPHOR_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
       containers:
         - name: agent
           image: ghcr.io/thenervelab/hippius-s3/drain:latest
@@ -96,8 +117,16 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: REDIS_QUEUES_URL
+            # Sourced from the shared secret (like every Python worker), NOT a literal:
+            # the drain is the sole upload producer, so if a backup backend is added to the
+            # secret the drain must fan out to it too — a hardcoded "arion" would silently
+            # under-replicate (never enqueue the new backend, so the janitor replication gate
+            # never clears -> unbounded cache growth).
             - name: HIPPIUS_UPLOAD_BACKENDS
-              value: "arion"
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_UPLOAD_BACKENDS
             # SSD-ingest reclaim worker: clean up broken/abandoned uploads (failed parts
             # the drain skips forever) + orphan write-temps, once aged, so abandoned-upload
             # junk does not accumulate on the node-local disk. Both have safe code defaults
@@ -113,6 +142,26 @@ spec:
               value: "4"
             - name: RUST_LOG
               value: "info"
+            # OTLP metrics -> otel-collector -> Prometheus -> Grafana (feature `otel`, on by
+            # default). The collector turns these resource attrs into Prometheus labels; the
+            # dashboard's var-namespace filters on service_namespace, so drain_* series land
+            # under the staging namespace. Mirrors the janitor deployment's env.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ENVIRONMENT
+              value: "staging"
+            - name: ENABLE_MONITORING
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector:4317"
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
           volumeMounts:
             - name: local-ingest
               mountPath: /var/lib/hippius/local_object_cache
@@ -125,6 +174,20 @@ spec:
             limits:
               cpu: 1000m
               memory: 1Gi
+          # The agent touches this file each heartbeat tick (~10s); a stale file means a
+          # wedged (not crashed) runtime — e.g. a broken redis ConnectionManager — so k8s
+          # restarts the pod. The agent is the sole upload producer, so a silent hang would
+          # otherwise stop this node's uploads with no recovery.
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'f=/tmp/hippius-drain-agent.alive; test -f "$f" && [ $(( $(date +%s) - $(stat -c %Y "$f") )) -lt 40 ]'
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
       volumes:
         - name: local-ingest
           hostPath:

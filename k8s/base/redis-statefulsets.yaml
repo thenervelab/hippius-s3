@@ -224,8 +224,14 @@ spec:
             - redis-server
             - --maxmemory
             - 2gb
+            # noeviction (NOT allkeys-lru): redis-queues holds the drain's coordination
+            # keys (the cephor:* leader lease + epoch fence) AND the upload work queues.
+            # Evicting either is data loss — a reset epoch deadlocks the allocator (drain
+            # audit F3), and a dropped UploadChainRequest is a lost upload (the drain is the
+            # sole producer). A genuinely-full queue must fail writes LOUDLY (OOM) so it is
+            # alerted on, not silently drop data. Alert on redis-queues memory usage.
             - --maxmemory-policy
-            - allkeys-lru
+            - noeviction
             - --appendonly
             - "yes"
             - --appendfsync

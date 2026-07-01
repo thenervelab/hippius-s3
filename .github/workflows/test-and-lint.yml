@@ -241,10 +241,22 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U postgres" --health-interval 5s
           --health-timeout 5s --health-retries 12
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 5s --health-retries 12
     env:
       # The drain's #[sqlx::test] cases auto-create per-test DBs against this and apply
       # the cephor_* migrations, so schema + queries (incl node-scoped claim) are exercised.
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The coordination/tick/allocator/runtime tests need a real Redis (no fakeredis in
+      # Rust) and are #[ignore]d so a redis-less local run shows them as ignored, not
+      # passed. One shared instance + DB 0 is enough: each test prefixes its keys with the
+      # process id + a per-test prefix, so parallel cases never collide.
+      CEPHOR_TEST_REDIS_URL: redis://localhost:6379/0
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust 1.95.0 (pinned to the builder toolchain)
@@ -257,8 +269,11 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Tests (pure + Postgres-backed sqlx tiers)
-        run: cargo test --workspace --all-features --locked
+      - name: Tests (pure + Postgres + Redis-gated coordination tiers)
+        # --include-ignored runs the #[ignore]d redis-gated coordination tests (fencing,
+        # leader election, lease/heartbeat expiry, budget apply/decay) now that a Redis
+        # service is present; without it CI covered none of them while showing green.
+        run: cargo test --workspace --all-features --locked -- --include-ignored
 
   rust-deny:
     name: Rust (cargo-deny supply chain)

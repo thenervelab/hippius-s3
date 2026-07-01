@@ -6,10 +6,19 @@ rust-version.workspace = true
 license.workspace = true
 description = "cephor per-node drain daemon (runs as a DaemonSet on each ingest SSD node)"
 
+# `otel` (on by default) exports drain metrics via OTLP; `--no-default-features` yields a
+# dependency-light build with no exporter.
+[features]
+default = ["otel"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+
 # The daemon talks to Postgres for the durable drain state (`pg`) and to the
 # Redis-backed coordinator for heartbeats + allocation pulls (`coord`).
 [dependencies]
 hippius-drain-core = { workspace = true, features = ["pg", "coord"] }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 tokio-util = { workspace = true }

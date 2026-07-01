@@ -145,6 +145,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn leader_allocates_and_writes_budgets() {
         let Some(c) = coord("cephor-test:tick-leads:").await else {
             eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");
@@ -163,6 +164,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn a_deposed_leader_tick_surfaces_the_fence_not_a_false_led() {
         // M4: a leader deposed between acquiring its lease and writing (a higher epoch
         // already wrote this node's allocation) must NOT report Led for a tick whose
@@ -194,6 +196,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn a_second_instance_does_not_lead_or_allocate() {
         let Some(c) = coord("cephor-test:tick-second:").await else {
             eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");

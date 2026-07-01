@@ -33,6 +33,13 @@ use thiserror::Error;
 /// instance. Override per test via [`Coordinator::with_prefix`] for isolation.
 const DEFAULT_PREFIX: &str = "cephor:";
 
+/// Per-command response timeout (and per-attempt connection timeout) for the coordinator's
+/// Redis manager. Bounds every command so a reachable-but-blocked redis-queues (an fsync
+/// stall, a BGSAVE, a half-open TCP after a blip) surfaces as a retryable error instead of
+/// hanging the allocator tick / agent heartbeat / allocation-pull loop indefinitely — the
+/// error-retry paths only fire on an `Err`, never on a silent hang.
+pub const DEFAULT_REDIS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Acquire-or-renew the singleton lease. `KEYS[1]`=lease, `KEYS[2]`=epoch counter;
 /// `ARGV[1]`=instance id, `ARGV[2]`=ttl secs. Returns the held epoch, or nil if another
 /// instance holds an unexpired lease. An absent (expired/fresh) lease bumps the epoch via
@@ -217,7 +224,14 @@ impl Coordinator {
     ///
     /// [`CoordError::Redis`] if the client cannot be opened or the connection established.
     pub async fn connect(url: &str, node_ttl: Duration, alloc_ttl: Duration) -> Result<Self> {
-        let conn = ConnectionManager::new(redis::Client::open(url)?).await?;
+        // Bound every command with a response timeout ([`DEFAULT_REDIS_TIMEOUT`]) so a
+        // reachable-but-blocked redis-queues surfaces as a retryable error rather than
+        // hanging a coordination loop; the connection timeout bounds the manager's
+        // (re)connect after a blip.
+        let config = redis::aio::ConnectionManagerConfig::new()
+            .set_response_timeout(DEFAULT_REDIS_TIMEOUT)
+            .set_connection_timeout(DEFAULT_REDIS_TIMEOUT);
+        let conn = ConnectionManager::new_with_config(redis::Client::open(url)?, config).await?;
         Ok(Self::new(conn, node_ttl, alloc_ttl))
     }
 
@@ -458,6 +472,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn lease_acquires_renews_keeping_the_epoch_and_blocks_a_second_holder() {
         let Some(c) = coord("cephor-test:lease-renew:", Duration::from_secs(5), Duration::from_secs(5)).await else {
             eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");
@@ -484,6 +499,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn an_expired_lease_is_taken_over_with_a_bumped_epoch() {
         // A 1s lease that we let lapse: the next acquirer is a NEW era (epoch + 1), which
         // fences any stale in-flight write from the previous era.
@@ -512,6 +528,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn a_heartbeat_expires_out_of_the_fleet() {
         // A 1s node TTL: present right after the upsert, gone after it lapses.
         let Some(c) = coord("cephor-test:fleet-ttl:", Duration::from_secs(1), Duration::from_secs(5)).await else {
@@ -526,6 +543,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn an_allocation_round_trips_and_a_stale_epoch_write_is_fenced() {
         let Some(c) = coord("cephor-test:alloc-fence:", Duration::from_secs(5), Duration::from_secs(30)).await else {
             eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");
@@ -555,5 +573,62 @@ mod tests {
         // A higher epoch (a new leader) may overwrite.
         c.write_allocations(6, std::slice::from_ref(&alloc(2_000))).await.unwrap();
         assert_eq!(c.load_allocation(&node).await.unwrap().unwrap().budget, ByteRate::new(2_000));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
+    async fn a_fresh_lease_after_a_lost_leadership_key_fences_the_deposed_leaders_late_write() {
+        // Models redis losing/evicting the lease key under memory pressure: the deposed
+        // leader keeps its stale epoch, a successor takes over with a strictly higher
+        // epoch, and the deposed leader's late allocation write must still be fenced. The
+        // fence anchor is the epoch COUNTER, not the lease key, so a lost lease alone must
+        // never let a zombie leader corrupt allocations (F3, lease-key-loss variant).
+        let Some(c) = coord("cephor-test:lost-lease-fence:", Duration::from_secs(30), Duration::from_secs(30)).await else {
+            eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");
+            return;
+        };
+        let node = NodeId::from_str("n1").unwrap();
+        let alloc = |budget| Allocation {
+            node: node.clone(),
+            budget: ByteRate::new(budget),
+        };
+
+        // A leads (epoch e) and writes a budget.
+        let a = c
+            .acquire_or_renew_leadership("a", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .expect("a leads");
+        c.write_allocations(a.epoch, std::slice::from_ref(&alloc(1_000))).await.unwrap();
+
+        // Redis loses the lease key (eviction / flush) — but the epoch counter survives.
+        let mut conn = c.conn.clone();
+        let _: i64 = redis::cmd("DEL").arg(c.leader_key()).query_async(&mut conn).await.unwrap();
+
+        // B sees no lease and takes over with a strictly higher epoch (the counter persisted).
+        let b = c
+            .acquire_or_renew_leadership("b", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .expect("b takes over the lost lease");
+        assert!(
+            b.epoch > a.epoch,
+            "takeover after a lost lease still bumps the epoch ({} > {})",
+            b.epoch,
+            a.epoch
+        );
+        c.write_allocations(b.epoch, std::slice::from_ref(&alloc(2_000))).await.unwrap();
+
+        // The deposed leader A (still holding its stale epoch) tries to write: fenced.
+        let err = c.write_allocations(a.epoch, std::slice::from_ref(&alloc(9_999))).await.unwrap_err();
+        assert!(
+            matches!(err, super::CoordError::Fenced { epoch } if epoch == a.epoch),
+            "deposed leader fenced, got {err:?}"
+        );
+        assert_eq!(
+            c.load_allocation(&node).await.unwrap().unwrap().budget,
+            ByteRate::new(2_000),
+            "only the new leader's budget stands after a lost-lease takeover",
+        );
     }
 }
