@@ -458,6 +458,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn lease_acquires_renews_keeping_the_epoch_and_blocks_a_second_holder() {
         let Some(c) = coord("cephor-test:lease-renew:", Duration::from_secs(5), Duration::from_secs(5)).await else {
             eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");
@@ -484,6 +485,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn an_expired_lease_is_taken_over_with_a_bumped_epoch() {
         // A 1s lease that we let lapse: the next acquirer is a NEW era (epoch + 1), which
         // fences any stale in-flight write from the previous era.
@@ -512,6 +514,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn a_heartbeat_expires_out_of_the_fleet() {
         // A 1s node TTL: present right after the upsert, gone after it lapses.
         let Some(c) = coord("cephor-test:fleet-ttl:", Duration::from_secs(1), Duration::from_secs(5)).await else {
@@ -526,6 +529,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn an_allocation_round_trips_and_a_stale_epoch_write_is_fenced() {
         let Some(c) = coord("cephor-test:alloc-fence:", Duration::from_secs(5), Duration::from_secs(30)).await else {
             eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");

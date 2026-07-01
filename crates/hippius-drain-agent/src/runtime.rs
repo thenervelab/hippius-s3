@@ -589,6 +589,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn the_allocation_worker_applies_the_leaders_budget(pool: PgPool) {
         let Some(coord) = test_coord("cephor-test:rt-applies:", Duration::from_secs(30), Duration::from_secs(30)).await else {
             eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");
@@ -657,6 +658,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn the_allocation_worker_decays_on_an_injected_clock(pool: PgPool) {
         // #33: run_alloc reads the injected Clock for its decay timing. Load a budget
         // (base jumps above the floor, allocated_at = clock.now()), then let the
@@ -758,6 +760,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn the_heartbeat_worker_upserts_this_node_into_the_fleet(pool: PgPool) {
         let Some(coord) = test_coord("cephor-test:rt-hb:", Duration::from_secs(30), Duration::from_secs(30)).await else {
             eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");

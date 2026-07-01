@@ -123,6 +123,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn run_allocator_leads_writes_a_budget_then_relinquishes() {
         let Some(c) = coord("cephor-test:run-leads:").await else {
             eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");
@@ -174,6 +175,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
     async fn run_allocator_survives_a_fenced_tick() {
         let Some(c) = coord("cephor-test:run-fenced:").await else {
             eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");
