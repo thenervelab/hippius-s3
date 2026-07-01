@@ -306,9 +306,7 @@ def configured_probe_secret(monkeypatch: pytest.MonkeyPatch) -> str:
 
 
 @pytest.mark.asyncio
-async def test_purge_with_valid_probe_secret_bypasses_auth(
-    auth_router_app: Any, configured_probe_secret: str
-) -> None:
+async def test_purge_with_valid_probe_secret_bypasses_auth(auth_router_app: Any, configured_probe_secret: str) -> None:
     """PURGE with the matching probe secret skips auth_router validation
     (no Authorization header needed)."""
     async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
@@ -322,9 +320,7 @@ async def test_purge_with_valid_probe_secret_bypasses_auth(
 
 
 @pytest.mark.asyncio
-async def test_purge_without_probe_header_returns_403(
-    auth_router_app: Any, configured_probe_secret: str
-) -> None:
+async def test_purge_without_probe_header_returns_403(auth_router_app: Any, configured_probe_secret: str) -> None:
     """PURGE without the probe header still gets the existing 403 — only the
     ATS authproxy bounce-back can bypass."""
     async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
@@ -334,9 +330,7 @@ async def test_purge_without_probe_header_returns_403(
 
 
 @pytest.mark.asyncio
-async def test_purge_with_wrong_probe_value_returns_403(
-    auth_router_app: Any, configured_probe_secret: str
-) -> None:
+async def test_purge_with_wrong_probe_value_returns_403(auth_router_app: Any, configured_probe_secret: str) -> None:
     """Constant-time compare protects against guessed probe values."""
     for bad in ("", "1", "wrong-secret", PURGE_PROBE_SECRET[:-1], PURGE_PROBE_SECRET + "x"):
         async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:

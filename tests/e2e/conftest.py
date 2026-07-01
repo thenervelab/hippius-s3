@@ -8,7 +8,6 @@ Environment configuration:
 - See .env.defaults, .env.test-local, and .env.test-docker for configuration
 """
 
-import base64
 import os
 import secrets
 import subprocess
@@ -75,6 +74,7 @@ def assert_hippius_source(headers: dict[str, str] | dict[str, object], allowed: 
 def test_run_id() -> str:
     """Generate a unique ID for this test run to ensure isolation."""
     return str(uuid.uuid4())[:8]
+
 
 @pytest.fixture(scope="session")
 def test_access_key() -> str:
