@@ -18,6 +18,7 @@
 //! path. [`PartVerified`] makes "commit before verify" a compile error.
 
 use crate::apipart::{ChunkIndex, PartKey, PartMeta};
+use crate::enforce::BreakerSignal;
 use crate::state::ReplicationState;
 use core::future::Future;
 use std::path::{Path, PathBuf};
@@ -320,9 +321,40 @@ impl PartDrainError {
         }
     }
 
+    /// Whether this failure is genuine evidence of `CephFS`-write unhealth — the only
+    /// class that should trip the node-global Ceph breaker. True for a real pool I/O error
+    /// (non-ENOENT `Io`) and a chunk byte-mismatch (a torn/corrupt pool write). A
+    /// `Store`/claim-coordination error is a Postgres-domain fault, NOT Ceph unhealth, so
+    /// it is excluded — it must not halt draining of a healthy pool; and `Enqueue` /
+    /// `IncompleteSource` are benign deferrals (see [`is_benign_deferral`](Self::is_benign_deferral)).
+    #[must_use]
+    pub fn is_ceph_write_failure(&self) -> bool {
+        match self {
+            Self::Io { source, .. } => source.kind() != std::io::ErrorKind::NotFound,
+            Self::ChunkMismatch { .. } => true,
+            Self::Store(_) | Self::Enqueue(_) | Self::IncompleteSource { .. } => false,
+        }
+    }
+
     /// Tag an I/O error with the step at which it struck.
     fn io(step: DrainStep) -> impl FnOnce(std::io::Error) -> Self {
         move |source| Self::Io { step, source }
+    }
+}
+
+/// The circuit-breaker signal for a completed drain outcome — the one place that decides
+/// which failures count as `CephFS` unhealth. `Ok` succeeds; a benign deferral (enqueue
+/// not ready / vanished source / incomplete part) AND a store/claim-coordination error
+/// both leave the breaker untouched ([`BreakerSignal::Deferred`]); only a genuine
+/// Ceph-write failure trips it. Lives with the error type (not the agent) so the policy is
+/// unit-testable and the agent worker is a thin caller.
+#[must_use]
+pub fn breaker_signal_for(result: &Result<DrainOutcome, PartDrainError>) -> BreakerSignal {
+    match result {
+        Ok(_) => BreakerSignal::CephSuccess,
+        Err(err) if err.is_benign_deferral() => BreakerSignal::Deferred,
+        Err(err) if err.is_ceph_write_failure() => BreakerSignal::CephFailure,
+        Err(_) => BreakerSignal::Deferred,
     }
 }
 
@@ -442,9 +474,11 @@ where
 #[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
     use super::{
-        ClaimedPart, DrainOutcome, DrainStep, PartDrainError, PartPool, PartReplicationStore, PartSource, PartVerified, UploadEnqueuer, drain_part,
+        ClaimedPart, DrainOutcome, DrainStep, PartDrainError, PartPool, PartReplicationStore, PartSource, PartVerified, UploadEnqueuer,
+        breaker_signal_for, drain_part,
     };
     use crate::apipart::{ChunkIndex, ObjectId, PartKey, PartMeta, PartNumber, Version};
+    use crate::enforce::BreakerSignal;
     use crate::state::ReplicationState;
     use core::future::Future;
     use core::str::FromStr;
@@ -500,6 +534,70 @@ mod tests {
         assert!(!mismatch.is_benign_deferral(), "a chunk byte-mismatch is not a benign deferral");
         let store_err = PartDrainError::store(io::Error::from(io::ErrorKind::Other));
         assert!(!store_err.is_benign_deferral(), "a store rejection is not a benign deferral");
+    }
+
+    #[test]
+    fn is_ceph_write_failure_only_for_real_pool_io_and_mismatch() {
+        // WI-10: only genuine Ceph-write faults trip the node-global breaker. A real pool
+        // I/O error and a byte-mismatch do; a store/claim error, an enqueue deferral, an
+        // ENOENT vanished source, and an incomplete SSD part do NOT (they are not evidence
+        // the pool is unhealthy).
+        let real_io = PartDrainError::Io {
+            step: DrainStep::Persist,
+            source: io::Error::from(io::ErrorKind::Other),
+        };
+        assert!(real_io.is_ceph_write_failure(), "a real pool I/O error is a Ceph-write failure");
+        let mismatch = PartDrainError::ChunkMismatch {
+            index: ChunkIndex::new(0),
+            source_hash: "aaa".into(),
+            pool_hash: "bbb".into(),
+        };
+        assert!(mismatch.is_ceph_write_failure(), "a torn-copy byte mismatch is a Ceph-write failure");
+
+        let vanished = PartDrainError::Io {
+            step: DrainStep::Persist,
+            source: io::Error::from(io::ErrorKind::NotFound),
+        };
+        assert!(!vanished.is_ceph_write_failure(), "an ENOENT vanished source is not a Ceph failure");
+        let store_err = PartDrainError::store(io::Error::from(io::ErrorKind::Other));
+        assert!(
+            !store_err.is_ceph_write_failure(),
+            "a store/claim error is a Postgres-domain fault, not Ceph"
+        );
+        let enqueue = PartDrainError::enqueue(io::Error::from(io::ErrorKind::ConnectionRefused));
+        assert!(!enqueue.is_ceph_write_failure(), "an enqueue deferral is not a Ceph failure");
+        let incomplete = PartDrainError::IncompleteSource { declared: 3, present: 2 };
+        assert!(!incomplete.is_ceph_write_failure(), "an incomplete SSD part is not a Ceph failure");
+    }
+
+    #[test]
+    fn breaker_signal_classifies_the_three_domains() {
+        // WI-10: Ok -> success; benign deferrals AND store/claim errors -> Deferred
+        // (breaker untouched); only a genuine Ceph-write failure -> CephFailure.
+        assert_eq!(breaker_signal_for(&Ok(DrainOutcome::Replicated)), BreakerSignal::CephSuccess);
+        assert_eq!(
+            breaker_signal_for(&Err(PartDrainError::enqueue(io::Error::from(io::ErrorKind::ConnectionRefused)))),
+            BreakerSignal::Deferred,
+            "an enqueue deferral does not trip the breaker",
+        );
+        assert_eq!(
+            breaker_signal_for(&Err(PartDrainError::IncompleteSource { declared: 3, present: 2 })),
+            BreakerSignal::Deferred,
+            "an incomplete part does not trip the breaker",
+        );
+        assert_eq!(
+            breaker_signal_for(&Err(PartDrainError::store(io::Error::from(io::ErrorKind::Other)))),
+            BreakerSignal::Deferred,
+            "a store/claim error (PG blip) must NOT trip the Ceph breaker",
+        );
+        assert_eq!(
+            breaker_signal_for(&Err(PartDrainError::Io {
+                step: DrainStep::Persist,
+                source: io::Error::from(io::ErrorKind::Other),
+            })),
+            BreakerSignal::CephFailure,
+            "a real pool I/O error trips the breaker",
+        );
     }
 
     /// The step (if any) at which the fakes inject an I/O failure.

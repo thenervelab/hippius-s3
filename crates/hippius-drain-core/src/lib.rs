@@ -37,7 +37,8 @@ pub use gc::{CephFs, GcClaim, GcError, GcOutcome, GcTarget, SsdCache, gc_object}
 pub use ids::{FileId, NodeId};
 pub use mgr::{CephReport, CephThresholds, ProbeParseError, classify, decay, parse_prometheus_metrics};
 pub use partdrain::{
-    ClaimedPart, DrainOutcome, DrainStep, PartDrainError, PartPool, PartReplicationStore, PartSource, PartVerified, UploadEnqueuer, drain_part,
+    ClaimedPart, DrainOutcome, DrainStep, PartDrainError, PartPool, PartReplicationStore, PartSource, PartVerified, UploadEnqueuer,
+    breaker_signal_for, drain_part,
 };
 pub use reconcile::{DiscoveredPart, PartLandingLog, PartScan, ReconcileError, ReconcileReport, reconcile_parts};
 pub use snapshot::{AgentSnapshot, SnapshotCell};

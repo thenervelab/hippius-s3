@@ -11,7 +11,7 @@ use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
 use hippius_drain_core::{
     BreakerSignal, DrainDecision, DrainOutcome, Enforcer, PartDrainError, PartKey, PartSource, SnapshotCell, Store, StoreError, UploadEnqueuer,
-    drain_part,
+    breaker_signal_for, drain_part,
 };
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -165,11 +165,14 @@ pub async fn drain_next<E: UploadEnqueuer>(
     // healthy pool and halt ALL draining on the node (stalling unrelated parts). Only a
     // genuine copy/verify/commit I/O error is a Ceph-write failure. A deferred part is
     // returned to `pending` (backed off) below, so a later re-drain retries it.
-    let signal = match &result {
-        Ok(_) => BreakerSignal::CephSuccess,
-        Err(err) if err.is_benign_deferral() => BreakerSignal::Deferred,
-        Err(_) => BreakerSignal::CephFailure,
-    };
+    // A benign deferral (enqueue not ready / vanished source / incomplete part) AND a
+    // store/claim-coordination error (a Postgres blip on commit, or PartClaimLost from a
+    // lease-expiry re-claim) both leave the breaker untouched; only a genuine Ceph-write
+    // failure trips it. The policy lives in core (breaker_signal_for) so it stays with the
+    // error type and is unit-tested there. A store error maps to Deferred for the breaker
+    // but is RELEASED (not defer-backed-off) below, since only a genuine not-ready deferral
+    // should back off.
+    let signal = breaker_signal_for(&result);
     if let Some(enforcer) = enforcer {
         // record_outcome releases the permit, so the guard is dismissed afterwards.
         enforcer
@@ -210,8 +213,11 @@ pub async fn drain_next<E: UploadEnqueuer>(
         // Best-effort: if the release/defer itself fails — likely the same store outage
         // that failed the drain — the lease-TTL re-claim is the backstop, so we keep
         // surfacing the original drain error.
-        let returned = match signal {
-            BreakerSignal::Deferred => store.defer_part(claim.part()).await,
+        // Back off (defer_part) ONLY a genuine not-ready deferral, so the drain doesn't
+        // spin re-claiming the same not-ready part; a store/claim error (which also maps
+        // to the Deferred breaker signal) or a Ceph-write failure releases promptly.
+        let returned = match &result {
+            Err(err) if err.is_benign_deferral() => store.defer_part(claim.part()).await,
             _ => store.release_part(claim.part()).await,
         };
         if let Err(release_err) = returned {
