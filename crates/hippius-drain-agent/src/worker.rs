@@ -35,13 +35,13 @@ pub enum DrainCycleError {
 }
 
 impl DrainCycleError {
-    /// Whether this is a benign deferral — the part's upload context was not ready yet
-    /// (`object_versions.address` NULL), so the part backed off rather than failed. A
-    /// deferral must not stop a [`drain_until_empty`] burst: the parts behind a not-ready
-    /// one are often ready, and starving them is what wedged the drain on in-progress or
-    /// abandoned MPUs.
+    /// Whether this is a benign deferral rather than a real cycle failure — the part
+    /// backed off for a reason that is NOT Ceph unhealth (upload context not ready, or a
+    /// vanished SSD source; see [`PartDrainError::is_benign_deferral`]). A deferral must
+    /// not stop a [`drain_until_empty`] burst: the parts behind the deferred one are often
+    /// ready, and starving them is what wedged the drain on in-progress/abandoned MPUs.
     fn is_deferral(&self) -> bool {
-        matches!(self, Self::Drain(PartDrainError::Enqueue(_)))
+        matches!(self, Self::Drain(err) if err.is_benign_deferral())
     }
 }
 
@@ -154,17 +154,20 @@ pub async fn drain_next<E: UploadEnqueuer>(
     let started = Instant::now();
     let result = drain_part(ceph, ssd, store, enqueuer, &claim).await;
     let elapsed = started.elapsed();
-    // Classify the drain outcome once, for both the breaker and the metrics. The
-    // upload enqueue runs only AFTER Ceph has accepted and verified the copy
-    // (partdrain.rs), so a `PartDrainError::Enqueue` (the object's address is not
-    // finalized yet — e.g. an in-progress MPU — or Redis is unreachable) is NOT
-    // evidence of Ceph unhealth: classify it as a benign deferral that releases the
-    // permit but neither trips the node-global Ceph breaker nor counts as a failure
-    // (P1a). Only a copy/verify/commit error is a Ceph-write failure. A deferred part
-    // is still returned to `pending` below, so a later re-drain retries it.
+    // Classify the drain outcome once, for both the breaker and the metrics. A benign
+    // deferral (`PartDrainError::is_benign_deferral`) is NOT evidence of Ceph unhealth,
+    // so it must neither trip the node-global Ceph breaker nor count as a failure (P1a):
+    //   - `Enqueue`: the upload context isn't finalized yet (in-progress MPU / Redis blip);
+    //   - `Io` ENOENT: the SSD source/part vanished mid-drain (overwrite, concurrent
+    //     clean, or a part another cycle already drained) — the pool is fine, there is
+    //     just nothing to copy.
+    // Misclassifying the ENOENT case as a Ceph failure would open the breaker on a
+    // healthy pool and halt ALL draining on the node (stalling unrelated parts). Only a
+    // genuine copy/verify/commit I/O error is a Ceph-write failure. A deferred part is
+    // returned to `pending` (backed off) below, so a later re-drain retries it.
     let signal = match &result {
         Ok(_) => BreakerSignal::CephSuccess,
-        Err(PartDrainError::Enqueue(_)) => BreakerSignal::Deferred,
+        Err(err) if err.is_benign_deferral() => BreakerSignal::Deferred,
         Err(_) => BreakerSignal::CephFailure,
     };
     if let Some(enforcer) = enforcer {

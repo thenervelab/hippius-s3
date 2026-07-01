@@ -262,6 +262,28 @@ impl PartDrainError {
         Self::Enqueue(Box::new(err))
     }
 
+    /// Whether this failure is a benign deferral rather than a Ceph-write failure — the
+    /// part could not be drained *right now* for a reason that is NOT evidence of `CephFS`
+    /// unhealth, so the caller must neither trip the node-global Ceph breaker nor count
+    /// it as a failure; the part is backed off and a later re-drain retries it.
+    ///
+    /// Two cases:
+    /// - [`Enqueue`](Self::Enqueue): the upload context isn't ready (an in-progress MPU
+    ///   whose `object_versions.address` is still NULL, or Redis briefly unreachable).
+    /// - [`Io`](Self::Io) with [`ErrorKind::NotFound`](std::io::ErrorKind::NotFound): the
+    ///   SSD source/part vanished mid-drain — an overwrite, a concurrent clean, or a part
+    ///   another cycle already drained and unlinked. The pool is healthy; there is simply
+    ///   nothing to copy. Any OTHER `Io` error (`EIO`, `ENOTCONN`, permission, no-space…)
+    ///   is a genuine write failure and still trips the breaker.
+    #[must_use]
+    pub fn is_benign_deferral(&self) -> bool {
+        match self {
+            Self::Enqueue(_) => true,
+            Self::Io { source, .. } => source.kind() == std::io::ErrorKind::NotFound,
+            _ => false,
+        }
+    }
+
     /// Tag an I/O error with the step at which it struck.
     fn io(step: DrainStep) -> impl FnOnce(std::io::Error) -> Self {
         move |source| Self::Io { step, source }
@@ -375,6 +397,47 @@ mod tests {
     use std::sync::Mutex;
 
     const UUID: &str = "466916c0-d61b-4518-b81b-9576b574270a";
+
+    #[test]
+    fn is_benign_deferral_spares_the_breaker_only_for_enqueue_and_vanished_source() {
+        // ENOENT reading the SSD source (overwrite / concurrent clean / already drained)
+        // is benign — the pool is healthy, there is just nothing to copy. It must NOT trip
+        // the node-global Ceph breaker.
+        let vanished = PartDrainError::Io {
+            step: DrainStep::Persist,
+            source: io::Error::from(io::ErrorKind::NotFound),
+        };
+        assert!(vanished.is_benign_deferral(), "a vanished SSD source (ENOENT) is a benign deferral");
+
+        // Not-ready upload context is likewise benign (in-progress MPU / Redis blip).
+        let not_ready = PartDrainError::enqueue(io::Error::from(io::ErrorKind::ConnectionRefused));
+        assert!(not_ready.is_benign_deferral(), "an enqueue failure is a benign deferral");
+
+        // Every OTHER I/O error is a genuine Ceph-write failure and MUST still trip the
+        // breaker — the whole point of the breaker is to react to a degrading pool.
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::Other, // e.g. a raw EIO / ENOTCONN from a sick CephFS mount
+        ] {
+            let real = PartDrainError::Io {
+                step: DrainStep::Persist,
+                source: io::Error::from(kind),
+            };
+            assert!(!real.is_benign_deferral(), "a real I/O error ({kind:?}) must still trip the breaker");
+        }
+
+        // A byte-mismatch corruption and a store rejection are not deferrals either.
+        let mismatch = PartDrainError::ChunkMismatch {
+            index: ChunkIndex::new(0),
+            source_hash: "aaa".into(),
+            pool_hash: "bbb".into(),
+        };
+        assert!(!mismatch.is_benign_deferral(), "a chunk byte-mismatch is not a benign deferral");
+        let store_err = PartDrainError::store(io::Error::from(io::ErrorKind::Other));
+        assert!(!store_err.is_benign_deferral(), "a store rejection is not a benign deferral");
+    }
 
     /// The step (if any) at which the fakes inject an I/O failure.
     #[derive(Default, Clone, Copy, PartialEq, Eq)]
