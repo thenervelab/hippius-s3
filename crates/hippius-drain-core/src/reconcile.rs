@@ -15,6 +15,7 @@
 use crate::apipart::PartKey;
 use crate::state::ReplicationState;
 use core::future::Future;
+use std::collections::HashMap;
 use thiserror::Error;
 
 /// What one reconcile pass found, tallied by the part's prior status. `scanned`
@@ -128,6 +129,23 @@ pub trait PartLandingLog: Send + Sync {
     /// The part's status (state + adoptability), or `None` when the store has no row.
     fn status(&self, part: &PartKey) -> impl Future<Output = Result<Option<PartStatus>, Self::Error>> + Send;
 
+    /// The status of many parts in as few round-trips as the store allows — the batched
+    /// counterpart to [`status`](Self::status), so the reconciler (the sole drain trigger)
+    /// issues O(batches) queries per scan instead of one per part. A part with no row is
+    /// simply absent from the map. The default loops `status` (for the in-memory fakes);
+    /// the Postgres [`Store`](crate::Store) overrides it with a chunked `UNNEST` query.
+    fn statuses(&self, parts: &[PartKey]) -> impl Future<Output = Result<HashMap<PartKey, PartStatus>, Self::Error>> + Send {
+        async move {
+            let mut out = HashMap::with_capacity(parts.len());
+            for part in parts {
+                if let Some(status) = self.status(part).await? {
+                    out.insert(part.clone(), status);
+                }
+            }
+            Ok(out)
+        }
+    }
+
     /// Record a part as landed (`pending`). Idempotent: a part that already has a row
     /// is left untouched UNLESS it is a NULL-node row, which it adopts to this node —
     /// so the reconciler can both recover a dropped trigger and adopt a legacy row.
@@ -152,10 +170,16 @@ where
     L: PartLandingLog,
 {
     let parts = scanner.scan_parts().await.map_err(ReconcileError::Scan)?;
+    // One batched status read per scan instead of one query per part — the reconciler is
+    // the sole drain trigger, so on a large backlog the per-part read was O(N) round-trips
+    // against the ceph-backed Postgres every cycle. record_landed stays per-part: it is
+    // only hit on the None / adoptable arms (the minority), not the common already-known row.
+    let keys: Vec<PartKey> = parts.iter().map(|discovered| discovered.part.clone()).collect();
+    let statuses = log.statuses(&keys).await.map_err(ReconcileError::log)?;
     let mut report = ReconcileReport::default();
-    for discovered in parts {
+    for discovered in &parts {
         report.scanned += 1;
-        match log.status(&discovered.part).await.map_err(ReconcileError::log)? {
+        match statuses.get(&discovered.part) {
             None => {
                 log.record_landed(&discovered.part).await.map_err(ReconcileError::log)?;
                 report.recovered += 1;

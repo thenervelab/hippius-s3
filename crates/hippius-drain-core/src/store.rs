@@ -633,6 +633,51 @@ impl PartLandingLog for Store {
         }
     }
 
+    async fn statuses(&self, parts: &[PartKey]) -> Result<HashMap<PartKey, PartStatus>> {
+        // The batched status read: one query per ~500 parts (chunked so a pathological
+        // backlog never builds one giant IN-list), matching by PK tuple via UNNEST'd
+        // parallel arrays. Selects the same (status, adoptability) as `status`. A part with
+        // no row simply does not come back, so the caller treats it as absent.
+        let mut out = HashMap::with_capacity(parts.len());
+        for batch in parts.chunks(RECLAIM_STATUS_BATCH) {
+            let mut object_ids: Vec<&str> = Vec::with_capacity(batch.len());
+            let mut versions: Vec<i64> = Vec::with_capacity(batch.len());
+            let mut part_numbers: Vec<i64> = Vec::with_capacity(batch.len());
+            for part in batch {
+                object_ids.push(part.object().as_str());
+                versions.push(i64::from(part.version().get()));
+                part_numbers.push(i64::from(part.part().get()));
+            }
+            let rows = sqlx::query_as::<_, (String, i64, i64, String, bool)>(
+                "SELECT object_id, version, part_number, status, (status = 'pending' AND node_id IS NULL) \
+                 FROM cephor_replication_status \
+                 WHERE (object_id, version, part_number) IN \
+                       (SELECT * FROM UNNEST($1::text[], $2::bigint[], $3::bigint[]))",
+            )
+            .bind(&object_ids)
+            .bind(&versions)
+            .bind(&part_numbers)
+            .fetch_all(&self.pool)
+            .await?;
+            for (object_id, version, part_number, status, adoptable) in rows {
+                let part = PartRow {
+                    object_id,
+                    version,
+                    part_number,
+                }
+                .into_part()?;
+                out.insert(
+                    part,
+                    PartStatus {
+                        state: state_from_db(&status)?,
+                        adoptable,
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+
     async fn record_landed(&self, part: &PartKey) -> Result<()> {
         Store::record_landed_part(self, part).await
     }
@@ -887,6 +932,39 @@ mod part_tests {
         assert!(replicated_status.age >= Duration::from_hours(1), "the backdated row reads ~2h old");
 
         assert_eq!(states.get(&failed).expect("failed part present").state, ReplicationState::Failed);
+    }
+
+    #[sqlx::test]
+    async fn statuses_batches_state_and_adoptability_matching_per_part_status(pool: PgPool) {
+        // WI-13: the batched reconciler read returns the same (state, adoptability) as the
+        // per-part status() for known parts, and omits a part with no row.
+        let store = Store::from_pool(pool.clone());
+        let pending = part(UUID_A, 5, 1);
+        let replicated = part(UUID_A, 5, 2);
+        let absent = part(UUID_B, 7, 1);
+
+        store.record_landed_part(&pending).await.unwrap();
+        store.record_landed_part(&replicated).await.unwrap();
+        force_terminal(&pool, &replicated, "replicated").await;
+
+        let batched = <Store as crate::reconcile::PartLandingLog>::statuses(&store, &[pending.clone(), replicated.clone(), absent.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(batched.len(), 2, "the part with no row is omitted (treated as absent)");
+        assert!(!batched.contains_key(&absent));
+        assert_eq!(batched.get(&pending).expect("pending present").state, ReplicationState::Pending);
+        assert_eq!(batched.get(&replicated).expect("replicated present").state, ReplicationState::Replicated);
+        // The batched result agrees with the single-part path it replaces.
+        let single = <Store as crate::reconcile::PartLandingLog>::status(&store, &pending)
+            .await
+            .unwrap()
+            .expect("pending present");
+        assert_eq!(
+            batched.get(&pending).unwrap().adoptable,
+            single.adoptable,
+            "batched adoptability matches per-part status()",
+        );
     }
 
     #[sqlx::test]

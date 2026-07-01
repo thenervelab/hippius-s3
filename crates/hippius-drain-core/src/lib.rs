@@ -40,7 +40,7 @@ pub use partdrain::{
     ClaimedPart, DrainOutcome, DrainStep, PartDrainError, PartPool, PartReplicationStore, PartSource, PartVerified, UploadEnqueuer,
     breaker_signal_for, drain_part,
 };
-pub use reconcile::{DiscoveredPart, PartLandingLog, PartScan, ReconcileError, ReconcileReport, reconcile_parts};
+pub use reconcile::{DiscoveredPart, PartLandingLog, PartScan, PartStatus, ReconcileError, ReconcileReport, reconcile_parts};
 pub use snapshot::{AgentSnapshot, SnapshotCell};
 pub use ssd_reclaim::{PartRemover, PartStatusAge, ReclaimError, ReclaimLog, ReclaimReport, reclaim_ssd};
 pub use state::{CephCeiling, PressureZone, ReplicationState};
