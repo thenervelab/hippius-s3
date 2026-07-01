@@ -76,11 +76,16 @@ def test_run_id() -> str:
     """Generate a unique ID for this test run to ensure isolation."""
     return str(uuid.uuid4())[:8]
 
-
 @pytest.fixture(scope="session")
 def test_access_key() -> str:
-    """Return a hip_ access key for e2e tests."""
-    return os.getenv("HIPPIUS_KEY", "hip_e2e_test_master")
+    """Return a hip_ access key for e2e tests.
+
+    Intentionally NOT reading from HIPPIUS_KEY — the CI secret predates the
+    hip_* access-key model and is not guaranteed to be a hip_* value, which
+    causes auth_orchestrator to reject it before the mock API is even
+    consulted. See test_master_access_key for the same reasoning.
+    """
+    return "hip_e2e_test_master"
 
 
 @pytest.fixture(scope="session")
