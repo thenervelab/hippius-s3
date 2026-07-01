@@ -1,49 +1,27 @@
 from __future__ import annotations
 
-
-
 import argparse
-
 import asyncio
-
 import contextlib
-
 import logging
-
 from typing import Any
 
-
-
 import asyncpg
-
 import redis.asyncio as async_redis
 
-
-
 from hippius_s3.cache import RedisObjectPartsCache
-
 from hippius_s3.config import get_config
-
 from hippius_s3.queue import Chunk
-
 from hippius_s3.queue import UploadChainRequest
-
 from hippius_s3.queue import enqueue_upload_request
-
-
-
 
 
 logger = logging.getLogger(__name__)
 
 
-
-
-
 async def fetch_failed_simple_objects(db: Any, hours: int, include_pinning: bool = False) -> list[dict]:
 
     rows = await db.fetch(
-
         """
 
         SELECT o.object_id,
@@ -69,17 +47,11 @@ async def fetch_failed_simple_objects(db: Any, hours: int, include_pinning: bool
         ORDER BY o.created_at DESC
 
         """,
-
         hours,
-
         include_pinning,
-
     )
 
     return [dict(r) for r in rows]
-
-
-
 
 
 async def main() -> None:
@@ -94,8 +66,6 @@ async def main() -> None:
 
     args = parser.parse_args()
 
-
-
     config = get_config()
 
     db = await asyncpg.connect(config.database_url)
@@ -104,42 +74,27 @@ async def main() -> None:
 
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
 
-
-
     from hippius_s3.queue import initialize_queue_client
-
-
 
     initialize_queue_client(redis_queues_client)
 
     obj_cache = RedisObjectPartsCache(redis_client)
 
-
-
     try:
-
         candidates = await fetch_failed_simple_objects(db, args.hours, include_pinning=args.include_pinning)
 
         if not candidates:
-
             logger.info("No failed simple uploads found in the specified window.")
 
             return
 
-
-
         logger.info(f"Found {len(candidates)} failed simple uploads in last {args.hours}h")
-
-
 
         enqueued = 0
 
         skipped_no_cache = 0
 
-
-
         for row in candidates:
-
             object_id = str(row["object_id"]) if row.get("object_id") is not None else ""
 
             object_key = str(row.get("object_key") or "")
@@ -148,50 +103,30 @@ async def main() -> None:
 
             address = str(row.get("main_account_id") or "")
 
-
-
             if not object_id or not object_key or not bucket_name or not address:
-
                 continue
-
-
 
             # Ensure part 0 is still in cache (assume current version = 1 for legacy script)
 
             if not await obj_cache.exists(object_id, 1, 1):
-
                 skipped_no_cache += 1
 
                 continue
 
-
-
             payload = UploadChainRequest(
-
                 address=address,
-
                 bucket_name=bucket_name,
-
                 object_key=object_key,
-
                 object_id=object_id,
-
                 object_version=1,
-
                 chunks=[Chunk(id=1)],
-
                 upload_id=None,
-
             )
 
-
-
             if args.dry_run:
-
                 logger.info(f"DRY_RUN would enqueue: {address} {bucket_name}/{object_key}")
 
             else:
-
                 # Mark as pinning and enqueue
 
                 await db.execute("UPDATE objects SET status = 'pinning' WHERE object_id = $1", object_id)
@@ -200,30 +135,18 @@ async def main() -> None:
 
                 enqueued += 1
 
-
-
         logger.info(f"Done. enqueued={enqueued} skipped_no_cache={skipped_no_cache}")
 
-
-
     finally:
-
         with contextlib.suppress(Exception):
-
             await redis_client.close()
 
         with contextlib.suppress(Exception):
-
             await redis_queues_client.close()
 
         with contextlib.suppress(Exception):
-
             await db.close()
 
 
-
-
-
 if __name__ == "__main__":
-
     asyncio.run(main())

@@ -1,6 +1,5 @@
 """User API endpoints for frontend JSON responses."""
 
-import base64
 import ipaddress
 import json
 import logging

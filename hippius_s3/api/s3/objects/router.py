@@ -46,9 +46,7 @@ async def get_object(
     # Handle query variants by delegation
     if "tagging" in request.query_params:
         async with pool.acquire() as conn:
-            return await tags_get_object_tags(
-                bucket_name, object_key, conn, request.state.account.main_account
-            )
+            return await tags_get_object_tags(bucket_name, object_key, conn, request.state.account.main_account)
     if "uploadId" in request.query_params:
         async with pool.acquire() as conn:
             return await list_parts_internal(bucket_name, object_key, request, conn)
@@ -91,8 +89,6 @@ async def delete_object(
             return await abort_multipart_upload(bucket_name, object_key, request, conn)
     if "tagging" in request.query_params:
         async with pool.acquire() as conn:
-            return await tags_delete_object_tags(
-                bucket_name, object_key, conn, request.state.account.main_account
-            )
+            return await tags_delete_object_tags(bucket_name, object_key, conn, request.state.account.main_account)
     async with pool.acquire() as conn:
         return await handle_delete_object(bucket_name, object_key, request, conn, redis_client)

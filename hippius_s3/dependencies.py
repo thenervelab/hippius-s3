@@ -6,11 +6,9 @@ from typing import AsyncGenerator
 from typing import Union
 
 import asyncpg
-from fastapi import HTTPException
 from fastapi import Request
 from redis.asyncio import Redis
 from redis.asyncio.cluster import RedisCluster
-from starlette import status
 
 from hippius_s3.config import Config
 from hippius_s3.repositories import BucketRepository
