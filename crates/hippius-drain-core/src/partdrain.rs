@@ -275,6 +275,14 @@ impl PartDrainError {
     ///   another cycle already drained and unlinked. The pool is healthy; there is simply
     ///   nothing to copy. Any OTHER `Io` error (`EIO`, `ENOTCONN`, permission, no-space…)
     ///   is a genuine write failure and still trips the breaker.
+    ///
+    /// Scoped by `ErrorKind`, not by which side raised it: in principle a pool-side
+    /// `ENOENT` (the pool dir removed between `create_dir_all` and the file write) would
+    /// also read as benign, but nothing removes an actively-draining part's pool dir, and
+    /// a real degrading `CephFS` mount surfaces as `ENOTCONN`/`EIO` (kind `Other`), not
+    /// `NotFound` — so a genuine pool failure still trips the breaker. Distinguishing the
+    /// source-open `ENOENT` from a pool-write `ENOENT` at the type level is a tracked
+    /// follow-up (would need a dedicated `DrainStep`/source-open error tag).
     #[must_use]
     pub fn is_benign_deferral(&self) -> bool {
         match self {

@@ -17,6 +17,13 @@
 -- (address IS NULL) plus the literal download-servability filter — guarantees this can
 -- never delete bytes a live GET could serve.
 --
+-- The size_bytes/md5_hash clauses are NON-redundant with `address IS NULL` — do NOT
+-- "simplify" this to match the reaper's `address IS NULL`-only predicate. `address` is
+-- written AFTER size_bytes/md5_hash and NOT in the same transaction (put_object_endpoint
+-- / multipart complete → set_object_version_address), so there is a real window where a
+-- fully-servable version (size>0, md5 set) still has address=NULL. The size/md5 filter is
+-- what keeps that mid-finalize version safe if its parts were ever marked 'failed'.
+--
 -- Params: $1 object_id (text; cast to uuid for object_versions), $2 object_version
 -- (bigint), $3 part_number (bigint).
 SELECT

@@ -195,6 +195,33 @@ async def test_non_failed_status_is_never_abandoned(conn, status):
     assert await janitor.is_terminally_abandoned(conn, oid, 1, 1) is False
 
 
+# ===================================================== FALSE: the mid-finalize window
+# The single most important "must-not-delete" real-world state: `address` is written
+# AFTER size_bytes/md5_hash and in a separate step, so a fully-servable version briefly
+# has address=NULL. If its parts were marked 'failed' (drain corruption) in that window,
+# the size/md5 guard — not address — is what protects it.
+
+
+async def test_failed_but_servable_mid_finalize_is_protected(conn):
+    """address=NULL BUT size>0 AND md5 set (a version between the size/md5 UPDATE and the
+    set_object_version_address call) is GET-servable → must never be reclaimed."""
+    oid = _oid()
+    await _seed_version(conn, oid, 1, address=None, size_bytes=4096, md5_hash="9a0364b9e99bb480dd25e1f0284c8555")
+    await _seed_status(conn, oid, 1, 1, status="failed")
+    assert await janitor.is_terminally_abandoned(conn, oid, 1, 1) is False
+
+
+async def test_servable_version_with_one_failed_part_is_protected(conn):
+    """A completed, servable multi-part version (address + size + md5 all set) where ONE
+    part is 'failed' (e.g. drain corruption mark_failed) → that part must be protected;
+    the version is servable, so its bytes could still be read."""
+    oid = _oid()
+    await _seed_version(conn, oid, 1, address="5Fowner", size_bytes=8_388_608, md5_hash="abc-2")
+    await _seed_status(conn, oid, 1, 1, status="replicated")
+    await _seed_status(conn, oid, 1, 2, status="failed")
+    assert await janitor.is_terminally_abandoned(conn, oid, 1, 2) is False, "a failed part of a servable version is protected"
+
+
 # ===================================================== FALSE: missing rows
 
 
