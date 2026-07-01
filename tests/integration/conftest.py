@@ -38,9 +38,85 @@ def test_run_id() -> str:
 
 
 @pytest.fixture
+def test_access_key() -> str:
+    """Return a hip_ access key for local integration tests."""
+    return "hip_integration_test_master"
+
+
+@pytest.fixture
+def test_access_key_secret() -> str:
+    """Return the plaintext secret paired with test_access_key."""
+    return "integration_test_secret_for_hip_keys"
+
+
+@pytest.fixture
+def _mock_backend_forwarding() -> Generator[None, None, None]:
+    """Stub out the real backend so forwarded requests don't hit a real network address.
+
+    boto3_client-driven tests exercise auth + middleware end-to-end via the
+    in-process ASGI app; once auth succeeds, GET/HEAD object requests are
+    proxied to config.backend_url (no real backend exists in this test job).
+    Respond 404 NoSuchKey for anything forwarded, which is within the
+    response range these tests already accept.
+    """
+    import httpx
+    import respx
+
+    with respx.mock(assert_all_called=False) as respx_router:
+        respx_router.route(host__regex=".*").mock(
+            return_value=httpx.Response(
+                404,
+                content=b'<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code></Error>',
+            )
+        )
+        yield
+
+
+@pytest.fixture
+def _mock_access_key_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    test_access_key: str,
+    test_access_key_secret: str,
+    _mock_backend_forwarding: None,
+) -> None:
+    """Make test_access_key verify successfully without calling the real Hippius API.
+
+    Access-key signature verification needs a valid TokenAuthResponse (with a
+    decryptable secret) to compute the expected SigV4 signature. Unlike the
+    old seed-phrase flow, which verified entirely locally, access-key auth
+    always calls out to the Hippius API — so for fully offline/in-process
+    integration tests we fake that response here using the same encryption
+    key the gateway expects (HIPPIUS_AUTH_ENCRYPTION_KEY).
+    """
+    from nacl.secret import SecretBox
+
+    from gateway.config import get_config
+    from hippius_s3.services.hippius_api_service import TokenAuthResponse
+
+    key_hex = get_config().hippius_secret_decryption_material
+    box = SecretBox(bytes.fromhex(key_hex))
+    encrypted_secret = base64.b64encode(box.encrypt(test_access_key_secret.encode())).decode()
+
+    async def _fake_cached_auth(access_key: str, redis_client: Any) -> TokenAuthResponse:
+        if access_key != test_access_key:
+            return TokenAuthResponse(valid=False, status="invalid")
+        return TokenAuthResponse(
+            valid=True,
+            status="active",
+            account_address="5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+            token_type="master",
+            encrypted_secret=encrypted_secret,
+            nonce=base64.b64encode(b"\x00" * 24).decode(),
+        )
+
+    monkeypatch.setattr("gateway.middlewares.access_key_auth.cached_auth", _fake_cached_auth)
+
+
+@pytest.fixture
 def boto3_client(
     test_access_key: str,
     test_access_key_secret: str,
+    _mock_access_key_auth: None,
 ) -> Any:
     """Create a boto3 S3 client configured for integration testing."""
     if is_real_aws():
@@ -54,7 +130,7 @@ def boto3_client(
 
     return boto3.client(
         "s3",
-        endpoint_url="http://localhost:8000",
+        endpoint_url="http://test",
         aws_access_key_id=test_access_key,
         aws_secret_access_key=test_access_key_secret,
         region_name="us-east-1",
