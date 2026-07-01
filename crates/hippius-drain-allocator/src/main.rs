@@ -18,6 +18,10 @@ use thiserror::Error;
 /// satisfy the shared [`Coordinator`] constructor.
 const ALLOCATOR_NODE_TTL: Duration = Duration::from_secs(30);
 
+/// How often the terminal-row GC sweep runs (coarse — the table grows slowly and each
+/// sweep is one bounded DELETE).
+const STATUS_GC_INTERVAL: Duration = Duration::from_hours(1);
+
 /// A failure bringing the allocator up. Each variant maps to a distinct operator
 /// fix: a bad environment, an unreachable store / coordination redis, or an
 /// unbuildable probe client.
@@ -47,6 +51,23 @@ async fn main() -> Result<(), StartupError> {
     // — sqlx records applied migrations under an advisory lock, so a restart or a
     // brief multi-replica overlap during rollout re-runs nothing.
     store.migrate().await?;
+
+    // Terminal-row GC: a best-effort background sweep pruning aged replicated/failed rows
+    // so cephor_replication_status does not grow unbounded and bloat the hot claim/reconcile
+    // scans. The DELETE is idempotent, so a mid-cycle abort on shutdown just re-runs next
+    // startup; the allocator is a singleton (replicas:1, Recreate), so a single sweeper runs.
+    // `store` is moved here — it is only needed for the migrate above and this sweep.
+    let gc_retention = config.status_retention;
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(STATUS_GC_INTERVAL).await;
+            match store.gc_terminal_status_rows(gc_retention).await {
+                Ok(0) => {}
+                Ok(pruned) => tracing::info!(pruned, "gc'd terminal replication rows"),
+                Err(err) => tracing::warn!(error = %err, "terminal-row gc failed; retrying next cycle"),
+            }
+        }
+    });
 
     // Leadership, the fleet view, and the budgets live in Redis (TTL-keyed, epoch-fenced)
     // — not Postgres — so the ~2s leader tick never touches the WAL.

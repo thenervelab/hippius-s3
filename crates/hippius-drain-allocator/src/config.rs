@@ -62,6 +62,12 @@ const DEFAULT_CEPH_FULL_BPS: u16 = 9_500;
 /// is unset — short relative to the tick so a hung mgr decays rather than stalls.
 const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a terminal (`replicated`/`failed`) replication row is kept before the periodic
+/// GC prunes it, when `CEPHOR_STATUS_RETENTION_SECS` is unset. A week comfortably exceeds
+/// the janitor cycle + any abort-settle window, so a `failed` row is never pruned before
+/// the reclaim path has had a chance to act on it.
+const DEFAULT_STATUS_RETENTION: Duration = Duration::from_hours(7 * 24);
+
 /// The allocator's startup configuration.
 #[derive(Debug, Clone)]
 pub struct AllocatorConfig {
@@ -95,6 +101,9 @@ pub struct AllocatorConfig {
     /// Path of the liveness file the tick loop touches each iteration; a k8s
     /// `livenessProbe` checks its freshness to restart a wedged (not crashed) allocator.
     pub liveness_file: PathBuf,
+    /// How long a terminal (`replicated`/`failed`) replication row is kept before the
+    /// periodic GC sweep prunes it (`CEPHOR_STATUS_RETENTION_SECS`).
+    pub status_retention: Duration,
 }
 
 /// A failure parsing the allocator configuration from the environment.
@@ -201,6 +210,7 @@ impl AllocatorConfig {
             ceph_thresholds: ceph_thresholds(&get)?,
             ceph_probe_timeout: duration_secs(&get, "CEPHOR_CEPH_PROBE_TIMEOUT_SECS", DEFAULT_PROBE_TIMEOUT)?,
             liveness_file: path_or(&get, "CEPHOR_LIVENESS_FILE", DEFAULT_LIVENESS_FILE),
+            status_retention: duration_secs(&get, "CEPHOR_STATUS_RETENTION_SECS", DEFAULT_STATUS_RETENTION)?,
         })
     }
 }
@@ -305,7 +315,7 @@ fn duration_millis(get: &impl Fn(&str) -> Option<String>, var: &'static str, def
 mod tests {
     use super::{
         AllocatorConfig, ConfigError, DEFAULT_ALLOCATION_TTL, DEFAULT_CRITICAL_PRESSURE_BPS, DEFAULT_DECREASE_PERMILLE, DEFAULT_MAX_TOTAL_BPS,
-        DEFAULT_MIN_TOTAL_BPS, DEFAULT_TICK,
+        DEFAULT_MIN_TOTAL_BPS, DEFAULT_STATUS_RETENTION, DEFAULT_TICK,
     };
     use hippius_drain_core::{ByteRate, CephCeiling, DiskPressure};
 
@@ -338,6 +348,16 @@ mod tests {
         );
         // The first-tick estimate defaults to the AIMD floor.
         assert_eq!(config.initial_total, ByteRate::new(DEFAULT_MIN_TOTAL_BPS));
+    }
+
+    #[test]
+    fn status_retention_defaults_to_a_week_and_is_overridable() {
+        let config = AllocatorConfig::from_lookup(lookup(&required_only())).unwrap();
+        assert_eq!(config.status_retention, DEFAULT_STATUS_RETENTION);
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_STATUS_RETENTION_SECS", "3600"));
+        let overridden = AllocatorConfig::from_lookup(lookup(&pairs)).unwrap();
+        assert_eq!(overridden.status_retention, std::time::Duration::from_hours(1));
     }
 
     #[test]

@@ -263,6 +263,28 @@ impl Store {
         Ok(())
     }
 
+    /// Deletes terminal (`replicated`/`failed`) replication rows older than `retention`,
+    /// returning how many were removed. Terminal rows are inert — nothing returns one to a
+    /// live state (`release_part`/`defer_part` are guarded on `status='draining'`) — so
+    /// aged ones are pure debris that bloat the hot `claim_part` / reconcile scans. NEVER
+    /// touches `pending`/`draining` (live) rows. Idempotent and safe to run concurrently:
+    /// a row deleted by one sweep simply is not matched by another.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the delete fails.
+    pub async fn gc_terminal_status_rows(&self, retention: Duration) -> Result<u64> {
+        let affected = sqlx::query(
+            "DELETE FROM cephor_replication_status \
+             WHERE status IN ('replicated', 'failed') AND updated_at < now() - (interval '1 second' * $1)",
+        )
+        .bind(retention.as_secs_f64())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected)
+    }
+
     /// Claims a file for GC. Returns `Some(GcClaim)` if this caller won the claim,
     /// `None` if another agent already holds a live, incomplete claim — so the
     /// reclaim runs once. The returned [`GcClaim`] is the capability
@@ -888,6 +910,46 @@ mod part_tests {
 
     /// Forces a part's row to a terminal status with a backdated `updated_at`, so the
     /// reclaim age reads deterministically older than any plausible grace.
+    #[sqlx::test]
+    async fn gc_terminal_status_rows_prunes_only_aged_terminal_rows(pool: PgPool) {
+        // WI-17: prune aged replicated/failed rows; keep a FRESH terminal row and any
+        // pending/draining (live) row regardless of age.
+        let store = Store::from_pool(pool.clone());
+        let fresh = part(UUID_A, 5, 1);
+        let old_replicated = part(UUID_A, 5, 2);
+        let old_failed = part(UUID_A, 5, 3);
+        let pending = part(UUID_A, 5, 4);
+        for p in [&fresh, &old_replicated, &old_failed, &pending] {
+            store.record_landed_part(p).await.unwrap();
+        }
+        // Fresh: replicated but updated_at ~now, so it is younger than the retention.
+        sqlx::query("UPDATE cephor_replication_status SET status = 'replicated' WHERE object_id = $1 AND version = $2 AND part_number = $3")
+            .bind(fresh.object().as_str())
+            .bind(i64::from(fresh.version().get()))
+            .bind(i64::from(fresh.part().get()))
+            .execute(&pool)
+            .await
+            .unwrap();
+        force_terminal(&pool, &old_replicated, "replicated").await; // backdated 2h
+        force_terminal(&pool, &old_failed, "failed").await; // backdated 2h
+
+        let pruned = store.gc_terminal_status_rows(Duration::from_hours(1)).await.unwrap();
+
+        assert_eq!(pruned, 2, "only the two aged terminal rows are pruned");
+        assert_eq!(
+            store.status(&fresh).await.unwrap(),
+            Some(ReplicationState::Replicated),
+            "a fresh terminal row is kept"
+        );
+        assert_eq!(store.status(&old_replicated).await.unwrap(), None, "the aged replicated row was pruned");
+        assert_eq!(store.status(&old_failed).await.unwrap(), None, "the aged failed row was pruned");
+        assert_eq!(
+            store.status(&pending).await.unwrap(),
+            Some(ReplicationState::Pending),
+            "a live pending row is never pruned"
+        );
+    }
+
     async fn force_terminal(pool: &PgPool, part: &PartKey, status: &str) {
         sqlx::query(
             "UPDATE cephor_replication_status SET status = $4, updated_at = now() - interval '2 hours' \
