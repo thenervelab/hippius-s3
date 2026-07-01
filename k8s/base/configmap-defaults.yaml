@@ -65,7 +65,11 @@ data:
   HIPPIUS_OVH_KMS_CERT_PATH: "/kms_certs/client.crt"
   HIPPIUS_OVH_KMS_KEY_PATH: "/kms_certs/client.key"
   UVICORN_WORKERS: "4"
-  UVICORN_MAX_REQUESTS: "10000"
+  # In-process worker recycling disabled (0): --limit-max-requests churns a worker while
+  # the pod stays Ready, so the ATS edge routes into the restart window and gets a 502
+  # "Next Hop Connection Failed". Prod memory is flat at ~10-15% of the pod limit with
+  # zero OOMs, so it bought nothing. Re-enable (>0) only if a real leak appears.
+  UVICORN_MAX_REQUESTS: "0"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
   OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: "cumulative"
   HIPPIUS_OBJECT_CACHE_FALLBACK_DIR: ""
