@@ -23,8 +23,8 @@ from fastapi import Response
 from hippius_s3.api.s3 import errors
 from hippius_s3.config import get_config
 from hippius_s3.utils import get_query
+from hippius_s3.writer.db import set_object_version_address
 from hippius_s3.writer.object_writer import ObjectWriter
-from hippius_s3.writer.queue import enqueue_upload as writer_enqueue_upload
 from hippius_s3.writer.types import AppendPreconditionFailed
 from hippius_s3.writer.types import EmptyAppendError
 from hippius_s3.writer.types import ObjectNotFound
@@ -142,24 +142,23 @@ async def handle_append(
     object_version = int(result.get("object_version", 1))
     new_append_version = int(result.get("new_append_version", 0))
 
-    # Enqueue background publish of this part via the pinner worker (writer helper)
-    try:
-        await writer_enqueue_upload(
-            address=request.state.account.main_account,
-            bucket_name=bucket_name,
-            object_key=object_key,
-            object_id=object_id,
-            object_version=int(object_version),
-            upload_id=str(result["upload_id"]),
-            chunk_ids=[int(next_part)],
-            ray_id=getattr(request.state, "ray_id", "no-ray-id"),
+    # Drain-direct (s3-2.1 PR-11): the api does NOT enqueue the backend upload. It
+    # persists the main-account address on this version; the Rust drain reads it and
+    # LPUSHes the appended part's UploadChainRequest itself once the part replicates to
+    # ceph, so the drain is the sole upload producer. The version already carries an
+    # address from the object's original create, so this is normally idempotent — but it
+    # also corrects a legacy pre-cutover version whose address is NULL, which the drain
+    # would otherwise defer forever (leaving the appended part un-backed).
+    await set_object_version_address(
+        request.app.state.postgres_pool,
+        object_id=str(object_id),
+        object_version=int(object_version),
+        address=request.state.account.main_account,
+    )
+    with contextlib.suppress(Exception):
+        logger.info(
+            f"APPEND persisted upload address object_id={object_id} v={int(object_version)} part={int(next_part)}"
         )
-        with contextlib.suppress(Exception):
-            logger.info(
-                f"APPEND enqueued background publish object_id={object_id} part={int(next_part)} upload_id={str(result.get('upload_id', ''))}"
-            )
-    except Exception:
-        logger.exception("Failed to enqueue append publish request")
 
     # Successful append: return the new append version so clients can avoid a HEAD
     resp = Response(
