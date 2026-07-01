@@ -37,8 +37,14 @@ pub enum BreakerState {
     /// The single trial is in flight: it was admitted but its outcome is not yet
     /// recorded, so further requests are denied until `record_success` (closes) or
     /// `record_failure` (reopens) resolves it — this is what bounds the half-open
-    /// phase to exactly one probe rather than a stampede.
-    Probing,
+    /// phase to exactly one probe rather than a stampede. Carries `until`: a deadline
+    /// (the cooldown) after which a probe whose outcome was never recorded — a
+    /// cancelled/unwound drain that skipped `record_outcome` — auto-reopens, so the
+    /// breaker can never wedge in `Probing` and deny all drains on the node forever.
+    Probing {
+        /// The instant after which an unresolved probe auto-reopens the breaker.
+        until: Instant,
+    },
 }
 
 /// A circuit breaker over the agent's observed Ceph write outcomes.
@@ -63,10 +69,17 @@ impl CircuitBreaker {
     /// The current phase (after applying any time-based transition from `now`).
     #[must_use]
     pub fn state(&mut self, now: Instant) -> BreakerState {
-        if let BreakerState::Open { until } = self.state
-            && now >= until
-        {
-            self.state = BreakerState::HalfOpen;
+        match self.state {
+            BreakerState::Open { until } if now >= until => self.state = BreakerState::HalfOpen,
+            // A probe whose outcome was never recorded (a cancelled/unwound drain skipped
+            // record_outcome) auto-reopens once its deadline passes, so the breaker cannot
+            // wedge in Probing and deny every drain on the node forever.
+            BreakerState::Probing { until } if now >= until => {
+                self.state = BreakerState::Open {
+                    until: now.checked_add(self.config.cooldown).unwrap_or(now),
+                };
+            }
+            _ => {}
         }
         self.state
     }
@@ -77,12 +90,16 @@ impl CircuitBreaker {
     #[must_use]
     pub fn allows(&mut self, now: Instant) -> bool {
         match self.state(now) {
-            BreakerState::Open { .. } | BreakerState::Probing => false,
+            BreakerState::Open { .. } | BreakerState::Probing { .. } => false,
             BreakerState::Closed => true,
             BreakerState::HalfOpen => {
                 // Consume the single trial: admit this one and move to Probing, so a
                 // concurrent second request is denied until record_outcome resolves it.
-                self.state = BreakerState::Probing;
+                // Stamp a deadline (reusing the cooldown) so an unresolved probe reopens
+                // via state() rather than wedging the breaker.
+                self.state = BreakerState::Probing {
+                    until: now.checked_add(self.config.cooldown).unwrap_or(now),
+                };
                 true
             }
         }
@@ -100,7 +117,7 @@ impl CircuitBreaker {
     /// `Closed`, the breaker opens once consecutive failures reach the threshold.
     pub fn record_failure(&mut self, now: Instant) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        let trip = matches!(self.state, BreakerState::HalfOpen | BreakerState::Probing)
+        let trip = matches!(self.state, BreakerState::HalfOpen | BreakerState::Probing { .. })
             || (matches!(self.state, BreakerState::Closed) && self.consecutive_failures >= self.config.failure_threshold);
         if trip {
             // `now + cooldown` would panic on `Instant` overflow — invisible to the
@@ -523,7 +540,7 @@ mod tests {
         // consumes it into Probing (in flight); a success closes the breaker.
         assert_eq!(b.state(after), BreakerState::HalfOpen);
         assert!(b.allows(after), "the trial request is admitted");
-        assert_eq!(b.state(after), BreakerState::Probing, "the trial is now in flight");
+        assert!(matches!(b.state(after), BreakerState::Probing { .. }), "the trial is now in flight");
         b.record_success();
         assert_eq!(b.state(after), BreakerState::Closed);
         assert!(b.allows(after));
@@ -540,6 +557,28 @@ mod tests {
         assert!(b.allows(after)); // half-open trial
         b.record_failure(after); // trial fails
         assert!(!b.allows(after), "a failed trial reopens the breaker");
+    }
+
+    #[test]
+    fn a_probe_whose_outcome_is_never_recorded_auto_reopens_after_the_deadline() {
+        // WI-9: a cancelled/unwound drain can admit the half-open trial (-> Probing) but
+        // never record its outcome. Without a deadline the breaker would deny ALL drains on
+        // the node forever. Past the probe deadline (the cooldown) it must reopen, then
+        // become probe-able again — never wedge.
+        let now = t0();
+        let mut b = breaker();
+        for _ in 0..3 {
+            b.record_failure(now);
+        }
+        let after = now + Duration::from_secs(5);
+        assert!(b.allows(after), "the trial is admitted (-> Probing)");
+        assert!(matches!(b.state(after), BreakerState::Probing { .. }));
+        // Outcome never recorded. Past the probe deadline the breaker must NOT stay Probing.
+        let stale = after + Duration::from_secs(5);
+        assert!(matches!(b.state(stale), BreakerState::Open { .. }), "a stale probe reopened");
+        // And after another cooldown it half-opens again — fully recovered, never wedged.
+        let recovered = stale + Duration::from_secs(5);
+        assert!(b.allows(recovered), "the breaker becomes probe-able again");
     }
 
     #[test]
