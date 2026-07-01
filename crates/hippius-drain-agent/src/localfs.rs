@@ -456,9 +456,20 @@ impl PartPool for LocalFs {
     }
 
     async fn finalize_part(&self, part: &PartKey) -> io::Result<()> {
-        // One fsync of the part dir, after every chunk + meta rename has landed, so all
-        // those directory entries become durable together (Task 1: batch the fsync).
-        sync_parent_dir(&part_dir(&self.root, part)).await
+        // Fsync the part dir first (all chunk + meta renames become durable together —
+        // Task 1's batched fsync), THEN each ancestor up to the pool root. A part-dir fsync
+        // alone leaves the part reachable only via parent dir entries a crash could still
+        // lose (the new version/object dirs this drain just created), so the ancestor walk
+        // is what makes "committed => durably reachable on CephFS" hold — not merely
+        // "chunks fsynced". Fsyncing an already-durable dir is a near-noop, so the extra
+        // two/three syncs are negligible next to the per-chunk data fsyncs.
+        let part_path = part_dir(&self.root, part);
+        let version_path = part_path.parent().unwrap_or(self.root.as_path());
+        let object_path = version_path.parent().unwrap_or(self.root.as_path());
+        sync_parent_dir(&part_path).await?;
+        sync_parent_dir(version_path).await?;
+        sync_parent_dir(object_path).await?;
+        sync_parent_dir(self.root.as_path()).await
     }
 
     async fn chunk_hash(&self, part: &PartKey, index: ChunkIndex) -> io::Result<String> {
@@ -946,6 +957,28 @@ mod part_tests {
         assert!(ssd_dir.path().join(part.relative_dir()).exists(), "SSD copy kept");
         assert!(!pool_dir.path().join(part.relative_dir()).exists(), "nothing committed to the pool");
         assert_eq!(store.status_of(&part), Some(ReplicationState::Pending));
+    }
+
+    #[tokio::test]
+    async fn finalize_part_fsyncs_the_new_part_version_and_object_dirs() {
+        // WI-15: finalize walks the fresh object/version/part dir chain (created by the
+        // first drain of a new object). It must succeed against a freshly-created deep tree
+        // and be a cheap no-op on a second call over the now-durable tree.
+        let ssd_dir = TempDir::new().unwrap();
+        let pool_dir = TempDir::new().unwrap();
+        let part = part_key(5, 1);
+        seed_ssd_part(ssd_dir.path(), &part, &[(0, b"bytes")]);
+        let ssd = LocalSsd::new(ssd_dir.path());
+        let ceph = LocalFs::new(pool_dir.path());
+        let source = ssd.chunk_source(&part, ChunkIndex::new(0)).unwrap();
+        ceph.persist_chunk(&source, &part, ChunkIndex::new(0)).await.unwrap();
+        ceph.persist_meta(&ssd.meta_source(&part).unwrap(), &part).await.unwrap();
+
+        ceph.finalize_part(&part).await.unwrap();
+        let part_path = pool_dir.path().join(part.relative_dir());
+        assert!(part_path.join("chunk_0.bin").exists() && part_path.join("meta.json").exists());
+        // A second finalize over an already-durable tree is a cheap no-op, not an error.
+        ceph.finalize_part(&part).await.unwrap();
     }
 
     #[tokio::test]
