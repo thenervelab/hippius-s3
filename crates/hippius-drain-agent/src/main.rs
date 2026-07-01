@@ -106,6 +106,7 @@ async fn main() -> Result<ExitCode, StartupError> {
     tracing::info!(
         pool_root = %config.pool_root.display(),
         ssd_root = %config.ssd_root.display(),
+        upload_backends = ?config.upload_backends,
         "hippius-drain-agent started"
     );
     let report = runtime.run(shutdown_signal()).await;

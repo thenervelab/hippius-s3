@@ -64,6 +64,27 @@ spec:
           volumeMounts:
             - name: local-ingest
               mountPath: /var/lib/hippius/local_object_cache
+        # Block until the allocator has provisioned the cephor_* schema (it owns the
+        # migrations). Without this gate a fresh-namespace `apply` lets the agent start
+        # against missing tables and CrashLoop until the allocator catches up. Strengthens
+        # mpu-reaper's port-check to an actual schema check (to_regclass is NULL, not an
+        # error, for an absent table).
+        - name: wait-for-cephor-schema
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h postgres-rw -p 5432; do echo "waiting for postgres"; sleep 3; done
+              until [ "$(psql "$CEPHOR_DATABASE_URL" -tAc "SELECT to_regclass('public.cephor_replication_status') IS NOT NULL")" = "t" ]; do
+                echo "waiting for the cephor schema (allocator migration)"; sleep 3
+              done
+          env:
+            - name: CEPHOR_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
       containers:
         - name: agent
           image: ghcr.io/thenervelab/hippius-s3/drain:latest
@@ -96,8 +117,16 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: REDIS_QUEUES_URL
+            # Sourced from the shared secret (like every Python worker), NOT a literal:
+            # the drain is the sole upload producer, so if a backup backend is added to the
+            # secret the drain must fan out to it too — a hardcoded "arion" would silently
+            # under-replicate (never enqueue the new backend, so the janitor replication gate
+            # never clears -> unbounded cache growth).
             - name: HIPPIUS_UPLOAD_BACKENDS
-              value: "arion"
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_UPLOAD_BACKENDS
             # SSD-ingest reclaim worker: clean up broken/abandoned uploads (failed parts
             # the drain skips forever) + orphan write-temps, once aged, so abandoned-upload
             # junk does not accumulate on the node-local disk. Both have safe code defaults
