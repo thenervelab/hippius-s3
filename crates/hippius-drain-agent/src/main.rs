@@ -10,7 +10,9 @@ use hippius_drain_agent::config::{Config, ConfigError};
 use hippius_drain_agent::enqueue::RedisEnqueuer;
 use hippius_drain_agent::localfs::{LocalFs, LocalSsd};
 use hippius_drain_agent::runtime::{AgentRuntime, RateControl, default_enforcer};
+use hippius_drain_agent::supervisor::{RunReport, ShutdownTrigger};
 use hippius_drain_core::{Bytes, Coordinator, Store, StoreError};
+use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -31,8 +33,17 @@ enum StartupError {
     Redis(#[from] redis::RedisError),
 }
 
+/// Whether a supervised run ended in a fault — a worker exited during normal
+/// operation (panic / early return), or a straggler had to be force-aborted. A
+/// clean `Signal`/`NoWorkers` shutdown is not a fault. The process maps this to a
+/// non-zero exit so Kubernetes restarts the pod and the crash is alertable,
+/// rather than an exit-0 that reads as a clean SIGTERM.
+fn faulted(report: &RunReport) -> bool {
+    matches!(report.trigger, ShutdownTrigger::WorkerExited(_)) || !report.clean
+}
+
 #[tokio::main]
-async fn main() -> Result<(), StartupError> {
+async fn main() -> Result<ExitCode, StartupError> {
     init_tracing();
 
     let config = Config::from_env()?;
@@ -92,7 +103,10 @@ async fn main() -> Result<(), StartupError> {
     );
     let report = runtime.run(shutdown_signal()).await;
     tracing::info!(trigger = ?report.trigger, clean = report.clean, "hippius-drain-agent stopped");
-    Ok(())
+    // A worker fault exits non-zero so k8s restarts the pod and the fault is alertable;
+    // a clean shutdown exits zero. (`exit = deny` lints out std::process::exit, so main
+    // returns the ExitCode.)
+    Ok(if faulted(&report) { ExitCode::FAILURE } else { ExitCode::SUCCESS })
 }
 
 /// Installs the global tracing subscriber, honoring `RUST_LOG` (default `info`).
@@ -128,5 +142,53 @@ async fn shutdown_signal() {
     tokio::select! {
         () = interrupt => {}
         () = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::faulted;
+    use hippius_drain_agent::supervisor::{RunReport, ShutdownTrigger, WorkerName};
+
+    #[test]
+    fn a_clean_signal_shutdown_is_not_a_fault() {
+        let report = RunReport {
+            trigger: ShutdownTrigger::Signal,
+            exits: vec![],
+            clean: true,
+        };
+        assert!(!faulted(&report), "a clean SIGTERM shutdown exits zero");
+    }
+
+    #[test]
+    fn no_workers_is_not_a_fault() {
+        let report = RunReport {
+            trigger: ShutdownTrigger::NoWorkers,
+            exits: vec![],
+            clean: true,
+        };
+        assert!(!faulted(&report));
+    }
+
+    #[test]
+    fn a_worker_exit_is_a_fault_even_if_the_winddown_was_clean() {
+        // WI-7: a panicked/early-exited worker escalates to shutdown; even a clean
+        // wind-down of the peers must exit non-zero so k8s restarts the pod.
+        let report = RunReport {
+            trigger: ShutdownTrigger::WorkerExited(WorkerName::new("drain")),
+            exits: vec![],
+            clean: true,
+        };
+        assert!(faulted(&report));
+    }
+
+    #[test]
+    fn an_unclean_winddown_is_a_fault() {
+        let report = RunReport {
+            trigger: ShutdownTrigger::Signal,
+            exits: vec![],
+            clean: false,
+        };
+        assert!(faulted(&report), "a force-aborted straggler is a fault");
     }
 }
