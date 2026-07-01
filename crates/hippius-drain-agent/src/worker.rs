@@ -35,13 +35,13 @@ pub enum DrainCycleError {
 }
 
 impl DrainCycleError {
-    /// Whether this is a benign deferral — the part's upload context was not ready yet
-    /// (`object_versions.address` NULL), so the part backed off rather than failed. A
-    /// deferral must not stop a [`drain_until_empty`] burst: the parts behind a not-ready
-    /// one are often ready, and starving them is what wedged the drain on in-progress or
-    /// abandoned MPUs.
+    /// Whether this is a benign deferral rather than a real cycle failure — the part
+    /// backed off for a reason that is NOT Ceph unhealth (upload context not ready, or a
+    /// vanished SSD source; see [`PartDrainError::is_benign_deferral`]). A deferral must
+    /// not stop a [`drain_until_empty`] burst: the parts behind the deferred one are often
+    /// ready, and starving them is what wedged the drain on in-progress/abandoned MPUs.
     fn is_deferral(&self) -> bool {
-        matches!(self, Self::Drain(PartDrainError::Enqueue(_)))
+        matches!(self, Self::Drain(err) if err.is_benign_deferral())
     }
 }
 
@@ -154,17 +154,20 @@ pub async fn drain_next<E: UploadEnqueuer>(
     let started = Instant::now();
     let result = drain_part(ceph, ssd, store, enqueuer, &claim).await;
     let elapsed = started.elapsed();
-    // Classify the drain outcome once, for both the breaker and the metrics. The
-    // upload enqueue runs only AFTER Ceph has accepted and verified the copy
-    // (partdrain.rs), so a `PartDrainError::Enqueue` (the object's address is not
-    // finalized yet — e.g. an in-progress MPU — or Redis is unreachable) is NOT
-    // evidence of Ceph unhealth: classify it as a benign deferral that releases the
-    // permit but neither trips the node-global Ceph breaker nor counts as a failure
-    // (P1a). Only a copy/verify/commit error is a Ceph-write failure. A deferred part
-    // is still returned to `pending` below, so a later re-drain retries it.
+    // Classify the drain outcome once, for both the breaker and the metrics. A benign
+    // deferral (`PartDrainError::is_benign_deferral`) is NOT evidence of Ceph unhealth,
+    // so it must neither trip the node-global Ceph breaker nor count as a failure (P1a):
+    //   - `Enqueue`: the upload context isn't finalized yet (in-progress MPU / Redis blip);
+    //   - `Io` ENOENT: the SSD source/part vanished mid-drain (overwrite, concurrent
+    //     clean, or a part another cycle already drained) — the pool is fine, there is
+    //     just nothing to copy.
+    // Misclassifying the ENOENT case as a Ceph failure would open the breaker on a
+    // healthy pool and halt ALL draining on the node (stalling unrelated parts). Only a
+    // genuine copy/verify/commit I/O error is a Ceph-write failure. A deferred part is
+    // returned to `pending` (backed off) below, so a later re-drain retries it.
     let signal = match &result {
         Ok(_) => BreakerSignal::CephSuccess,
-        Err(PartDrainError::Enqueue(_)) => BreakerSignal::Deferred,
+        Err(err) if err.is_benign_deferral() => BreakerSignal::Deferred,
         Err(_) => BreakerSignal::CephFailure,
     };
     if let Some(enforcer) = enforcer {
@@ -584,22 +587,54 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
-    async fn a_failed_drain_increments_the_failed_counter(pool: PgPool) {
+    async fn a_vanished_source_counts_as_deferred_not_failed_and_spares_the_breaker(pool: PgPool) {
+        // A part recorded landed but with NO SSD files models the SSD source vanishing
+        // out from under the drain: the MPU-abort / DeleteObject / overwrite paths (and,
+        // in e2e, the `clear_object_cache` helper) delete the ingest copy while the drain
+        // may be mid-copy, so `persist` hits ENOENT. That is NOT Ceph unhealth — there is
+        // simply nothing left to copy — so it must count as a DEFERRAL (not a failure),
+        // stay out of `error_bps`, be returned to `pending`, and — the load-bearing part —
+        // NOT trip the node-global Ceph breaker (which would halt draining of every other,
+        // healthy part on the node).
         let ssd_dir = tempfile::tempdir().unwrap();
         let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
         let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
         let snapshot = SnapshotCell::new();
+        // Breaker threshold 1: a single Ceph failure would open it, so a subsequently
+        // admitted drain is the proof the vanished source never signalled it.
+        let enforcer = Arc::new(Mutex::new(Enforcer::new(
+            CircuitBreaker::new(BreakerConfig {
+                failure_threshold: 1,
+                cooldown: Duration::from_secs(5),
+            }),
+            TokenBucket::new(ByteRate::new(1_000_000), Bytes::new(1_000_000), Instant::now()),
+            ConcurrencyLimiter::new(4),
+        )));
 
-        // Recorded landed but no SSD files -> the drain copy fails (one failed attempt).
         let part = part_at(5, 1);
         store.record_landed_part(&part).await.unwrap();
 
-        drain_next(&ceph, &ssd, &store, &NoopEnqueuer, None, Some(&snapshot)).await.unwrap_err();
+        drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot))
+            .await
+            .unwrap_err();
+
         let counts = snapshot.load();
-        assert_eq!(counts.failed, 1, "the failed part attempt was counted");
-        assert_eq!(counts.drained, 0, "a failure records no drain");
+        assert_eq!(counts.deferred, 1, "a vanished source is counted as a deferral");
+        assert_eq!(counts.failed, 0, "a vanished source is not a Ceph-write failure");
+        assert_eq!(counts.drained, 0, "nothing was committed");
+        assert_eq!(counts.error_bps(), 0, "vanished sources stay out of the Ceph failure rate");
+        assert_eq!(
+            status_of(&store, &part).await,
+            Some(ReplicationState::Pending),
+            "a deferred part is returned to pending for a later re-drain",
+        );
+        assert_eq!(
+            enforcer.lock().unwrap().try_drain(1, Instant::now()),
+            DrainDecision::Allowed,
+            "a vanished source must not trip the Ceph breaker",
+        );
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
@@ -668,10 +703,19 @@ mod tests {
         let snapshot = SnapshotCell::new();
         let token = CancellationToken::new();
 
-        // One good part (drains), then one with no SSD files (fails) — claimed in
-        // landed_at order, so the good one drains before the burst errors.
+        // One good part (drains), then one whose POOL destination is blocked so its copy
+        // fails with a GENUINE (non-ENOENT) Ceph-write error — a stand-in for a sick/full
+        // pool, which unlike a vanished SSD source (ENOENT, a benign deferral) MUST count
+        // as a failure. Both seeded on SSD so the bad one reaches the pool write; claimed
+        // in landed_at order, so the good one drains first.
         seed_part(ssd_dir.path(), &store, &part_at(5, 1), &[b"good part bytes"]).await;
-        store.record_landed_part(&part_at(5, 2)).await.unwrap();
+        seed_part(ssd_dir.path(), &store, &part_at(5, 2), &[b"bad part bytes"]).await;
+        // A regular file where part 2's pool directory must go makes the copy's
+        // `create_dir_all` fail with AlreadyExists (deterministic and root-safe, unlike a
+        // chmod-based denial that root would bypass in CI).
+        let blocked = pool_dir.path().join(part_at(5, 2).relative_dir());
+        std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        std::fs::write(&blocked, b"not a directory").unwrap();
 
         // The burst drains the good part then fails on the bad one. The #10 fix:
         // the part drained before the failure is NOT discarded. concurrency=1 keeps the
