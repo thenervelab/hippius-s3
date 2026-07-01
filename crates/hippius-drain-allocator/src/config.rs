@@ -8,8 +8,13 @@
 
 use hippius_drain_core::{AllocConfig, ByteRate, CephCeiling, CephThresholds, DiskPressure, StaticCeiling, TickConfig};
 use std::num::ParseIntError;
+use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
+
+/// Default path of the liveness file the tick loop touches each iteration; the k8s
+/// `livenessProbe` checks its freshness. Container-local `/tmp` is always writable.
+const DEFAULT_LIVENESS_FILE: &str = "/tmp/hippius-drain-allocator.alive";
 
 /// Leader-lease TTL when `CEPHOR_LEADER_LEASE_TTL_SECS` is unset. Several ticks
 /// long so a brief stall does not lose leadership, short enough to fail over.
@@ -87,6 +92,9 @@ pub struct AllocatorConfig {
     pub ceph_thresholds: CephThresholds,
     /// Per-scrape timeout for the live probe.
     pub ceph_probe_timeout: Duration,
+    /// Path of the liveness file the tick loop touches each iteration; a k8s
+    /// `livenessProbe` checks its freshness to restart a wedged (not crashed) allocator.
+    pub liveness_file: PathBuf,
 }
 
 /// A failure parsing the allocator configuration from the environment.
@@ -192,6 +200,7 @@ impl AllocatorConfig {
             ceph_mgr_metrics_url: optional(&get, "CEPHOR_CEPH_MGR_METRICS_URL"),
             ceph_thresholds: ceph_thresholds(&get)?,
             ceph_probe_timeout: duration_secs(&get, "CEPHOR_CEPH_PROBE_TIMEOUT_SECS", DEFAULT_PROBE_TIMEOUT)?,
+            liveness_file: path_or(&get, "CEPHOR_LIVENESS_FILE", DEFAULT_LIVENESS_FILE),
         })
     }
 }
@@ -221,6 +230,14 @@ fn required(get: &impl Fn(&str) -> Option<String>, var: &'static str) -> Result<
 /// absent — a blank mgr URL must not select the probe with an unusable endpoint.
 fn optional(get: &impl Fn(&str) -> Option<String>, var: &'static str) -> Option<String> {
     get(var).filter(|value| !value.trim().is_empty())
+}
+
+/// Resolves an optional path variable, falling back to `default` when unset or blank.
+fn path_or(get: &impl Fn(&str) -> Option<String>, var: &'static str, default: &str) -> PathBuf {
+    match get(var) {
+        Some(value) if !value.trim().is_empty() => PathBuf::from(value),
+        _ => PathBuf::from(default),
+    }
 }
 
 /// Resolves an optional integer variable, falling back to `default` when unset.
@@ -321,6 +338,16 @@ mod tests {
         );
         // The first-tick estimate defaults to the AIMD floor.
         assert_eq!(config.initial_total, ByteRate::new(DEFAULT_MIN_TOTAL_BPS));
+    }
+
+    #[test]
+    fn liveness_file_defaults_and_is_overridable() {
+        let config = AllocatorConfig::from_lookup(lookup(&required_only())).unwrap();
+        assert_eq!(config.liveness_file, std::path::PathBuf::from("/tmp/hippius-drain-allocator.alive"));
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_LIVENESS_FILE", "/var/run/allocator.alive"));
+        let overridden = AllocatorConfig::from_lookup(lookup(&pairs)).unwrap();
+        assert_eq!(overridden.liveness_file, std::path::PathBuf::from("/var/run/allocator.alive"));
     }
 
     #[test]

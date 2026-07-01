@@ -57,6 +57,10 @@ const DEFAULT_RECLAIM_POLL: Duration = Duration::from_mins(5);
 /// eviction (a diagnosis / abort-settle window).
 const DEFAULT_RECLAIM_GRACE: Duration = Duration::from_hours(1);
 
+/// Default path of the liveness file the runtime touches each heartbeat tick; the
+/// k8s `livenessProbe` checks its freshness. Container-local `/tmp` is always writable.
+const DEFAULT_LIVENESS_FILE: &str = "/tmp/hippius-drain-agent.alive";
+
 /// The daemon's startup configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -107,6 +111,9 @@ pub struct Config {
     /// Maximum parts the drain worker processes concurrently — the in-flight gate
     /// that lets the node overlap fsync latency across parts.
     pub drain_concurrency: u32,
+    /// Path of the liveness file the runtime touches each heartbeat tick; a k8s
+    /// `livenessProbe` checks its freshness to restart a wedged (not crashed) pod.
+    pub liveness_file: PathBuf,
 }
 
 /// A failure parsing the daemon configuration from the environment.
@@ -216,6 +223,7 @@ impl Config {
             reclaim_poll: duration_secs(&get, "CEPHOR_RECLAIM_POLL_SECS", DEFAULT_RECLAIM_POLL)?,
             reclaim_grace: duration_secs(&get, "CEPHOR_RECLAIM_GRACE_SECS", DEFAULT_RECLAIM_GRACE)?,
             drain_concurrency: positive_u32_or(&get, "CEPHOR_DRAIN_CONCURRENCY", DEFAULT_DRAIN_CONCURRENCY)?,
+            liveness_file: path_or(&get, "CEPHOR_LIVENESS_FILE", DEFAULT_LIVENESS_FILE),
         })
     }
 }
@@ -287,6 +295,14 @@ fn required_path(get: &impl Fn(&str) -> Option<String>, var: &'static str) -> Re
     }
 }
 
+/// Resolves an optional path variable, falling back to `default` when unset or blank.
+fn path_or(get: &impl Fn(&str) -> Option<String>, var: &'static str, default: &str) -> PathBuf {
+    match get(var) {
+        Some(value) if !value.trim().is_empty() => PathBuf::from(value),
+        _ => PathBuf::from(default),
+    }
+}
+
 /// Resolves a required variable, treating unset and empty as the same failure
 /// (an empty `DATABASE_URL` is as unusable as a missing one).
 fn required(get: &impl Fn(&str) -> Option<String>, var: &'static str) -> Result<String, ConfigError> {
@@ -336,6 +352,16 @@ mod tests {
         assert_eq!(config.pool_root, PathBuf::from("/mnt/pool"));
         assert_eq!(config.ssd_root, PathBuf::from("/mnt/ssd"));
         assert_eq!(config.drain_poll, DEFAULT_DRAIN_POLL);
+    }
+
+    #[test]
+    fn liveness_file_defaults_and_is_overridable() {
+        let config = Config::from_lookup(lookup(&required_only())).unwrap();
+        assert_eq!(config.liveness_file, PathBuf::from("/tmp/hippius-drain-agent.alive"));
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_LIVENESS_FILE", "/var/run/agent.alive"));
+        let overridden = Config::from_lookup(lookup(&pairs)).unwrap();
+        assert_eq!(overridden.liveness_file, PathBuf::from("/var/run/agent.alive"));
     }
 
     #[test]

@@ -125,6 +125,20 @@ spec:
             limits:
               cpu: 1000m
               memory: 1Gi
+          # The agent touches this file each heartbeat tick (~10s); a stale file means a
+          # wedged (not crashed) runtime — e.g. a broken redis ConnectionManager — so k8s
+          # restarts the pod. The agent is the sole upload producer, so a silent hang would
+          # otherwise stop this node's uploads with no recovery.
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'f=/tmp/hippius-drain-agent.alive; test -f "$f" && [ $(( $(date +%s) - $(stat -c %Y "$f") )) -lt 40 ]'
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
       volumes:
         - name: local-ingest
           hostPath:

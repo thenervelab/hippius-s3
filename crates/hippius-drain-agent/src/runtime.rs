@@ -25,9 +25,18 @@ use hippius_drain_core::{
     SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate, reclaim_ssd, reconcile_parts,
 };
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+/// Best-effort liveness touch: rewriting the file bumps its mtime, which the k8s exec
+/// probe checks for freshness. Errors are ignored — a transient FS blip must not kill an
+/// otherwise-healthy process; a persistent failure ages the mtime out and the probe fails,
+/// which is the correct outcome (restart a wedged pod).
+fn touch_liveness(path: &Path) {
+    let _ = std::fs::write(path, b"ok");
+}
 
 /// Consecutive Ceph-write failures before the circuit breaker opens.
 const BREAKER_FAILURES: u32 = 5;
@@ -341,6 +350,9 @@ pub struct AgentRuntime<E: UploadEnqueuer> {
     /// The time source the allocation-pull worker reads for its decay timing.
     /// Defaults to [`SystemClock`]; tests inject a [`hippius_drain_core::TestClock`].
     clock: Arc<dyn Clock>,
+    /// Opt-in liveness file the heartbeat worker touches each tick, for the k8s probe.
+    /// `None` (tests / drain-only e2e) writes no file.
+    liveness_path: Option<Arc<PathBuf>>,
 }
 
 impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
@@ -359,6 +371,7 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
             rate_control: None,
             coord: None,
             clock: Arc::new(SystemClock),
+            liveness_path: None,
         }
     }
 
@@ -395,6 +408,15 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
     #[must_use]
     pub fn with_heartbeat(mut self, heartbeat: HeartbeatConfig) -> Self {
         self.heartbeat = Some(heartbeat);
+        self
+    }
+
+    /// Sets the liveness file the heartbeat worker touches each tick, so a k8s
+    /// `livenessProbe` can restart a wedged (not crashed) pod. Without it (tests /
+    /// drain-only e2e) no file is written.
+    #[must_use]
+    pub fn with_liveness(mut self, path: PathBuf) -> Self {
+        self.liveness_path = Some(Arc::new(path));
         self
     }
 
@@ -460,11 +482,27 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
         // is never in the fleet.
         if let (Some(heartbeat), Some(coord)) = (self.heartbeat, self.coord.as_ref()) {
             let (ssd, coord, snapshot) = (Arc::clone(&self.ssd), Arc::clone(coord), Arc::clone(&self.snapshot));
+            let liveness = self.liveness_path.clone();
             let HeartbeatConfig { node, max_drain_rate, poll } = heartbeat;
             supervisor.spawn(WorkerName::new("heartbeat"), move |token| {
                 run_periodic(token, poll, move || {
-                    let (ssd, coord, node, snapshot) = (Arc::clone(&ssd), Arc::clone(&coord), node.clone(), Arc::clone(&snapshot));
+                    let (ssd, coord, node, snapshot, liveness) = (
+                        Arc::clone(&ssd),
+                        Arc::clone(&coord),
+                        node.clone(),
+                        Arc::clone(&snapshot),
+                        liveness.clone(),
+                    );
                     async move {
+                        // Touch liveness FIRST, before the (blocking, possibly early-returning)
+                        // disk probe, so a healthy runtime keeps the k8s probe fresh even when a
+                        // statvfs blip short-circuits heartbeat_once. The heartbeat cadence is a
+                        // bounded, quick tick independent of drain-backlog duration, so it is a
+                        // truer runtime-liveness signal than the drain loop (which can legitimately
+                        // run long under a large backlog).
+                        if let Some(path) = liveness.as_deref() {
+                            touch_liveness(path);
+                        }
                         heartbeat_once(&ssd, &coord, &node, max_drain_rate, &snapshot).await;
                     }
                 })

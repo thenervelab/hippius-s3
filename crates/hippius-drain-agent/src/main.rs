@@ -94,7 +94,8 @@ async fn main() -> Result<ExitCode, StartupError> {
     )
     .with_coordinator(coordinator)
     .with_heartbeat(config.heartbeat_config())
-    .with_rate_control(rate_control);
+    .with_rate_control(rate_control)
+    .with_liveness(config.liveness_file.clone());
 
     tracing::info!(
         pool_root = %config.pool_root.display(),

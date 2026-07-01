@@ -94,6 +94,7 @@ async fn drive<C: CephCeilingSource>(coord: &Coordinator, ceiling: &C, config: &
         &config.tick_config(),
         config.initial_total,
         config.tick_interval,
+        Some(config.liveness_file.as_path()),
         shutdown_signal(),
     )
     .await

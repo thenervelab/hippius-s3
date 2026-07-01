@@ -69,3 +69,17 @@ spec:
             limits:
               cpu: 250m
               memory: 256Mi
+          # The allocator touches this file each tick (~2s); a stale file means a wedged
+          # (not crashed) tick loop — e.g. blocked on a hung Redis — so k8s restarts it. A
+          # hung leader stops refreshing per-node budgets and the whole fleet decays to
+          # floor, so a silent hang must not persist. initialDelay covers startup migrations.
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'f=/tmp/hippius-drain-allocator.alive; test -f "$f" && [ $(( $(date +%s) - $(stat -c %Y "$f") )) -lt 30 ]'
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3

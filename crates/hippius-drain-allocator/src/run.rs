@@ -2,7 +2,15 @@
 
 use hippius_drain_core::{BudgetController, ByteRate, CephCeilingSource, CoordError, Coordinator, TickConfig, TickOutcome, run_tick};
 use std::future::Future;
+use std::path::Path;
 use std::time::Duration;
+
+/// Best-effort liveness touch (see the agent runtime for the rationale): rewriting the
+/// file bumps its mtime, which the k8s exec probe checks for freshness. Errors are
+/// ignored — a persistent failure ages the mtime out and the probe restarts the pod.
+fn touch_liveness(path: &Path) {
+    let _ = std::fs::write(path, b"ok");
+}
 
 /// Runs the allocator's tick loop until `shutdown` resolves.
 ///
@@ -30,11 +38,17 @@ pub async fn run_allocator<C: CephCeilingSource>(
     config: &TickConfig,
     initial: ByteRate,
     tick: Duration,
+    liveness: Option<&Path>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), CoordError> {
     let mut controller = BudgetController::new(initial);
     tokio::pin!(shutdown);
     loop {
+        // Touch liveness each tick (the tick is bounded and quick) so a k8s probe
+        // restarts a wedged — not crashed — loop, e.g. one blocked on a hung Redis.
+        if let Some(path) = liveness {
+            touch_liveness(path);
+        }
         match run_tick(coord, ceiling, config, controller).await {
             Ok(TickOutcome::Led(plan)) => {
                 tracing::debug!(
@@ -144,6 +158,7 @@ mod tests {
             &config,
             ByteRate::new(190_000),
             Duration::from_millis(10),
+            None,
             shutdown.cancelled(),
         );
         let driver = async {
@@ -207,6 +222,7 @@ mod tests {
             &config,
             ByteRate::new(190_000),
             Duration::from_millis(10),
+            None,
             shutdown.cancelled(),
         );
         let driver = async {
