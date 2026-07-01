@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 
 
 async def fetch_failed_simple_objects(db: Any, hours: int, include_pinning: bool = False) -> list[dict]:
-
     rows = await db.fetch(
         """
 
@@ -55,7 +54,6 @@ async def fetch_failed_simple_objects(db: Any, hours: int, include_pinning: bool
 
 
 async def main() -> None:
-
     parser = argparse.ArgumentParser(description="Resubmit failed simple uploads by re-enqueuing pin requests")
 
     parser.add_argument("--hours", type=int, default=72, help="Look back window in hours (default: 72)")
