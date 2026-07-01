@@ -560,4 +560,61 @@ mod tests {
         c.write_allocations(6, std::slice::from_ref(&alloc(2_000))).await.unwrap();
         assert_eq!(c.load_allocation(&node).await.unwrap().unwrap().budget, ByteRate::new(2_000));
     }
+
+    #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
+    async fn a_fresh_lease_after_a_lost_leadership_key_fences_the_deposed_leaders_late_write() {
+        // Models redis losing/evicting the lease key under memory pressure: the deposed
+        // leader keeps its stale epoch, a successor takes over with a strictly higher
+        // epoch, and the deposed leader's late allocation write must still be fenced. The
+        // fence anchor is the epoch COUNTER, not the lease key, so a lost lease alone must
+        // never let a zombie leader corrupt allocations (F3, lease-key-loss variant).
+        let Some(c) = coord("cephor-test:lost-lease-fence:", Duration::from_secs(30), Duration::from_secs(30)).await else {
+            eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");
+            return;
+        };
+        let node = NodeId::from_str("n1").unwrap();
+        let alloc = |budget| Allocation {
+            node: node.clone(),
+            budget: ByteRate::new(budget),
+        };
+
+        // A leads (epoch e) and writes a budget.
+        let a = c
+            .acquire_or_renew_leadership("a", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .expect("a leads");
+        c.write_allocations(a.epoch, std::slice::from_ref(&alloc(1_000))).await.unwrap();
+
+        // Redis loses the lease key (eviction / flush) — but the epoch counter survives.
+        let mut conn = c.conn.clone();
+        let _: i64 = redis::cmd("DEL").arg(c.leader_key()).query_async(&mut conn).await.unwrap();
+
+        // B sees no lease and takes over with a strictly higher epoch (the counter persisted).
+        let b = c
+            .acquire_or_renew_leadership("b", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .expect("b takes over the lost lease");
+        assert!(
+            b.epoch > a.epoch,
+            "takeover after a lost lease still bumps the epoch ({} > {})",
+            b.epoch,
+            a.epoch
+        );
+        c.write_allocations(b.epoch, std::slice::from_ref(&alloc(2_000))).await.unwrap();
+
+        // The deposed leader A (still holding its stale epoch) tries to write: fenced.
+        let err = c.write_allocations(a.epoch, std::slice::from_ref(&alloc(9_999))).await.unwrap_err();
+        assert!(
+            matches!(err, super::CoordError::Fenced { epoch } if epoch == a.epoch),
+            "deposed leader fenced, got {err:?}"
+        );
+        assert_eq!(
+            c.load_allocation(&node).await.unwrap().unwrap().budget,
+            ByteRate::new(2_000),
+            "only the new leader's budget stands after a lost-lease takeover",
+        );
+    }
 }
