@@ -21,8 +21,8 @@ use crate::localfs::{LocalFs, LocalSsd};
 use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
-    BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, Coordinator, Enforcer, NodeId, NodeObservation, SnapshotCell, Store,
-    SystemClock, TokenBucket, UploadEnqueuer, decay_rate, reclaim_ssd, reconcile_parts,
+    BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, NodeId, NodeObservation,
+    SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate, reclaim_ssd, reconcile_parts,
 };
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -250,10 +250,33 @@ fn apply_rate(enforcer: &Arc<Mutex<Enforcer>>, rate: ByteRate) {
     enforcer.lock().unwrap_or_else(PoisonError::into_inner).set_rate(rate);
 }
 
+/// The enforcer action for one allocation-pull outcome, separated from the async
+/// loop so the "a failed pull decays like silence" policy is unit-testable without
+/// a live Redis. `Decay` deliberately covers BOTH a TTL-expired allocation
+/// (`Ok(None)`) and a failed pull (`Err`): a sustained pull failure must not hold
+/// the last budget and keep the node draining full-rate into a possibly-degraded
+/// Ceph — the exact incident the rate control exists to dampen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PullAction {
+    /// A fresh budget landed: adopt it as the new decay base.
+    Adopt(ByteRate),
+    /// No budget (TTL-expired) or the pull failed: decay the current base toward floor.
+    Decay,
+}
+
+/// Maps an allocation-pull result to its enforcer action. A fresh budget is
+/// adopted; silence (`Ok(None)`) and any failure (`Err`) both decay.
+fn pull_action(pull: &Result<Option<StoredAllocation>, CoordError>) -> PullAction {
+    match pull {
+        Ok(Some(allocation)) => PullAction::Adopt(allocation.budget),
+        Ok(None) | Err(_) => PullAction::Decay,
+    }
+}
+
 /// Pulls this node's leader-assigned budget into the shared enforcer each
-/// `poll`, decaying toward `floor` when the allocator goes silent so a stale
-/// allocation cannot keep the node hammering Ceph. The async `load_allocation`
-/// runs *unlocked*; only the synchronous `set_rate` takes the lock.
+/// `poll`, decaying toward `floor` when the allocator goes silent OR the pull
+/// fails, so a stale allocation cannot keep the node hammering Ceph. The async
+/// `load_allocation` runs *unlocked*; only the synchronous `set_rate` takes the lock.
 async fn run_alloc(token: CancellationToken, coord: Arc<Coordinator>, rate_control: RateControl, clock: Arc<dyn Clock>) {
     let RateControl {
         enforcer,
@@ -270,14 +293,17 @@ async fn run_alloc(token: CancellationToken, coord: Arc<Coordinator>, rate_contr
     let mut base = floor;
     let mut allocated_at = clock.now();
     loop {
-        match coord.load_allocation(&node).await {
-            Ok(Some(allocation)) => {
-                base = allocation.budget;
+        let pull = coord.load_allocation(&node).await;
+        if let Err(err) = &pull {
+            tracing::warn!(error = %err, "allocation pull failed; decaying toward the floor");
+        }
+        match pull_action(&pull) {
+            PullAction::Adopt(budget) => {
+                base = budget;
                 allocated_at = clock.now();
                 apply_rate(&enforcer, base);
             }
-            Ok(None) => apply_rate(&enforcer, decay_rate(base, floor, clock.now().duration_since(allocated_at), half_life)),
-            Err(err) => tracing::warn!(error = %err, "allocation pull failed; keeping the current budget"),
+            PullAction::Decay => apply_rate(&enforcer, decay_rate(base, floor, clock.now().duration_since(allocated_at), half_life)),
         }
         tokio::select! {
             () = token.cancelled() => return,
@@ -461,13 +487,13 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr, reason = "tests")]
 mod tests {
-    use super::{AgentRuntime, HeartbeatConfig, RateControl, RuntimeConfig, default_enforcer};
+    use super::{AgentRuntime, HeartbeatConfig, PullAction, RateControl, RuntimeConfig, default_enforcer, pull_action};
     use crate::localfs::{LocalFs, LocalSsd};
     use crate::supervisor::ShutdownTrigger;
     use core::str::FromStr;
     use hippius_drain_core::{
-        Allocation, ByteRate, Bytes, Clock, Coordinator, NodeId, ObjectId, PartKey, PartNumber, PartReplicationStore, ReplicationState, SnapshotCell,
-        Store, TestClock, UploadEnqueuer, Version,
+        Allocation, ByteRate, Bytes, Clock, CoordError, Coordinator, NodeId, ObjectId, PartKey, PartNumber, PartReplicationStore, ReplicationState,
+        SnapshotCell, Store, StoredAllocation, TestClock, UploadEnqueuer, Version,
     };
 
     /// A coordinator on the test Redis under a per-test prefix, or `None` to skip the
@@ -501,6 +527,27 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     const UUID: &str = "466916c0-d61b-4518-b81b-9576b574270a";
+
+    #[test]
+    fn pull_action_adopts_a_fresh_budget() {
+        let allocation = StoredAllocation {
+            budget: ByteRate::new(500_000),
+            epoch: 7,
+        };
+        assert_eq!(pull_action(&Ok(Some(allocation))), PullAction::Adopt(ByteRate::new(500_000)));
+    }
+
+    #[test]
+    fn pull_action_decays_on_a_ttl_expired_allocation() {
+        assert_eq!(pull_action(&Ok(None)), PullAction::Decay);
+    }
+
+    #[test]
+    fn pull_action_decays_on_a_failed_pull() {
+        // WI-6: an Err (e.g. a sustained redis-queues outage) must decay toward the floor
+        // like silence, NOT hold the last budget and keep hammering a degraded Ceph.
+        assert_eq!(pull_action(&Err(CoordError::Invalid { field: "test" })), PullAction::Decay);
+    }
 
     fn part_at(version: u32, number: u32) -> PartKey {
         PartKey::new(ObjectId::from_str(UUID).unwrap(), Version::new(version), PartNumber::new(number))
