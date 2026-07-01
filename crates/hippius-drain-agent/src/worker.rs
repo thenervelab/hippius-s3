@@ -357,7 +357,9 @@ mod tests {
         for (index, bytes) in chunks.iter().enumerate() {
             std::fs::write(dir.join(format!("chunk_{index}.bin")), bytes).unwrap();
         }
-        std::fs::write(dir.join("meta.json"), br#"{"chunk_size":16,"num_chunks":1,"size_bytes":16}"#).unwrap();
+        // num_chunks must match the seeded set, or the drain's completeness gate rejects it.
+        let meta = format!(r#"{{"chunk_size":16,"num_chunks":{},"size_bytes":16}}"#, chunks.len());
+        std::fs::write(dir.join("meta.json"), meta).unwrap();
         store.record_landed_part(part).await.unwrap();
     }
 

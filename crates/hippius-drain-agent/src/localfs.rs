@@ -13,8 +13,8 @@
 //! `<object_id>` folder).
 
 use hippius_drain_core::{
-    CephFs, ChunkIndex, DiscoveredPart, FileId, META_FILE_NAME, PartKey, PartPool, PartRemover, PartScan, PartSource, SsdCache, chunk_file_name,
-    parse_part_dir,
+    CephFs, ChunkIndex, DiscoveredPart, FileId, META_FILE_NAME, PartKey, PartMeta, PartPool, PartRemover, PartScan, PartSource, SsdCache,
+    chunk_file_name, parse_part_dir,
 };
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
@@ -398,6 +398,16 @@ async fn part_has_meta(part_path: &Path) -> io::Result<bool> {
     }
 }
 
+/// The subset of the api's `meta.json` the drain reads. Only `num_chunks` gates the
+/// completeness check today; `chunk_size`/`size_bytes` are carried for a future size
+/// assertion and to fail-closed (via `InvalidData`) if the schema drifts.
+#[derive(serde::Deserialize)]
+struct MetaJson {
+    chunk_size: u64,
+    num_chunks: u32,
+    size_bytes: u64,
+}
+
 impl PartSource for LocalSsd {
     async fn list_chunks(&self, part: &PartKey) -> io::Result<Vec<ChunkIndex>> {
         list_chunk_indices(&part_dir(&self.root, part)).await
@@ -409,6 +419,20 @@ impl PartSource for LocalSsd {
 
     fn meta_source(&self, part: &PartKey) -> io::Result<PathBuf> {
         Ok(part_dir(&self.root, part).join(META_FILE_NAME))
+    }
+
+    async fn part_meta(&self, part: &PartKey) -> io::Result<PartMeta> {
+        let bytes = fs::read(part_dir(&self.root, part).join(META_FILE_NAME)).await?;
+        // A malformed manifest is corruption, not a not-ready shortfall, so it maps to
+        // InvalidData (non-benign) — the completeness `IncompleteSource` is only for a
+        // well-formed meta whose declared chunk count exceeds what is on disk.
+        let parsed: MetaJson =
+            serde_json::from_slice(&bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("malformed meta.json: {err}")))?;
+        Ok(PartMeta {
+            chunk_size: parsed.chunk_size,
+            num_chunks: parsed.num_chunks,
+            size_bytes: parsed.size_bytes,
+        })
     }
 
     async fn chunk_hash(&self, part: &PartKey, index: ChunkIndex) -> io::Result<String> {
@@ -628,8 +652,8 @@ mod part_tests {
     use core::future::Future;
     use core::str::FromStr;
     use hippius_drain_core::{
-        ChunkIndex, ClaimedPart, DrainOutcome, ObjectId, PartKey, PartNumber, PartPool, PartRemover, PartReplicationStore, PartScan, PartSource,
-        PartVerified, ReplicationState, UploadEnqueuer, Version, drain_part,
+        ChunkIndex, ClaimedPart, DrainOutcome, ObjectId, PartDrainError, PartKey, PartNumber, PartPool, PartRemover, PartReplicationStore, PartScan,
+        PartSource, PartVerified, ReplicationState, UploadEnqueuer, Version, drain_part,
     };
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -666,7 +690,9 @@ mod part_tests {
         for &(index, bytes) in chunks {
             std::fs::write(dir.join(format!("chunk_{index}.bin")), bytes).unwrap();
         }
-        std::fs::write(dir.join("meta.json"), br#"{"chunk_size":4,"num_chunks":1,"size_bytes":4}"#).unwrap();
+        // num_chunks must match the seeded set, or the drain's completeness gate rejects it.
+        let meta = format!(r#"{{"chunk_size":4,"num_chunks":{},"size_bytes":4}}"#, chunks.len());
+        std::fs::write(dir.join("meta.json"), meta).unwrap();
     }
 
     /// Minimal in-memory part replication store for the end-to-end drain tests; it
@@ -887,6 +913,39 @@ mod part_tests {
         assert!(pool_part.join("meta.json").exists(), "meta marker copied last");
         assert!(!ssd_part.exists(), "SSD part unlinked only after a verified, committed copy exists");
         assert_eq!(store.status_of(&part), Some(ReplicationState::Replicated));
+    }
+
+    #[tokio::test]
+    async fn end_to_end_drain_of_a_part_whose_meta_overdeclares_defers_and_keeps_the_ssd_copy() {
+        // WI-1 against the real FS: meta claims 2 chunks but only chunk 0 is on disk (a
+        // chunk removed after meta landed). The drain must defer with the SSD copy intact
+        // and nothing committed to the pool.
+        let ssd_dir = TempDir::new().unwrap();
+        let pool_dir = TempDir::new().unwrap();
+        let part = part_key(5, 1);
+        seed_ssd_part(ssd_dir.path(), &part, &[(0, b"only chunk")]);
+        // Overwrite the (matching) meta with one that over-declares num_chunks.
+        std::fs::write(
+            ssd_dir.path().join(part.relative_dir()).join("meta.json"),
+            br#"{"chunk_size":4,"num_chunks":2,"size_bytes":8}"#,
+        )
+        .unwrap();
+
+        let ssd = LocalSsd::new(ssd_dir.path());
+        let ceph = LocalFs::new(pool_dir.path());
+        let store = MemPartStore::default();
+        store.set(&part, ReplicationState::Pending);
+        let claim = ClaimedPart::new(part.clone(), 0);
+
+        let err = drain_part(&ceph, &ssd, &store, &NoopEnqueuer, &claim).await.unwrap_err();
+
+        assert!(
+            matches!(err, PartDrainError::IncompleteSource { declared: 2, present: 1 }),
+            "got: {err:?}"
+        );
+        assert!(ssd_dir.path().join(part.relative_dir()).exists(), "SSD copy kept");
+        assert!(!pool_dir.path().join(part.relative_dir()).exists(), "nothing committed to the pool");
+        assert_eq!(store.status_of(&part), Some(ReplicationState::Pending));
     }
 
     #[tokio::test]

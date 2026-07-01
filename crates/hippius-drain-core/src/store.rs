@@ -579,18 +579,23 @@ impl PartReplicationStore for Store {
     }
 
     async fn mark_failed(&self, claim: &ClaimedPart, _reason: &str) -> Result<()> {
-        // Terminal sink: a corrupt part is marked Failed regardless of its prior
-        // state, and an already-absent row is a harmless no-op (idempotent). Clear
-        // claimed_at for consistency with release_part — a failed part holds no live
-        // claim, so its claim timestamp must not linger (F18).
+        // Guarded on `draining` AND this claim's fencing token, mirroring mark_replicated:
+        // only the agent that still holds THIS claim may terminally fail the part. A fenced
+        // stale claimant (its claim re-won after the lease) matches zero rows and MUST NOT
+        // flip the live re-claimed part to `failed`. Zero rows is a harmless no-op here
+        // (unlike mark_replicated) because mark_failed authorizes no SSD unlink — so it is
+        // NOT surfaced as PartClaimLost, which also keeps it idempotent (a second call
+        // finds status='failed', not 'draining'). Clear claimed_at, like release_part, so a
+        // failed part holds no lingering live-claim timestamp (F18).
         let part = claim.part();
         sqlx::query(
             "UPDATE cephor_replication_status SET status = 'failed', updated_at = now(), claimed_at = NULL \
-             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+             WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining' AND claim_seq = $4",
         )
         .bind(part.object().as_str())
         .bind(i64::from(part.version().get()))
         .bind(i64::from(part.part().get()))
+        .bind(claim.claim_seq())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1085,6 +1090,38 @@ mod part_tests {
         );
         store.mark_replicated(&second, &PartVerified::for_test()).await.unwrap();
         assert_eq!(store.status(&p).await.unwrap(), Some(ReplicationState::Replicated));
+    }
+
+    #[sqlx::test]
+    async fn mark_failed_by_a_fenced_stale_claimant_does_not_fail_the_live_part(pool: PgPool) {
+        // WI-3: the mark_failed counterpart of the mark_replicated fence. A stale claimant
+        // whose claim was re-won after the lease must NOT flip the live re-claimed part to
+        // `failed` — its guarded UPDATE matches zero rows (a harmless no-op, not an error,
+        // since mark_failed authorizes no SSD unlink).
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        let first = store.claim_part().await.unwrap().expect("the pending part is claimable");
+
+        sqlx::query("UPDATE cephor_replication_status SET claimed_at = now() - interval '1 hour' WHERE object_id = $1")
+            .bind(p.object().as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let second = store.claim_part().await.unwrap().expect("the stale claim is re-won past the lease");
+        assert_ne!(first.claim_seq(), second.claim_seq(), "the re-claim gets a fresh fencing token");
+
+        // The fenced (stale) claimant tries to fail the part — a no-op, not an error.
+        store.mark_failed(&first, "chunk copy byte mismatch").await.unwrap();
+        assert_eq!(
+            store.status(&p).await.unwrap(),
+            Some(ReplicationState::Draining),
+            "the live re-claimed part is untouched by the fenced claimant's mark_failed",
+        );
+
+        // The live claimant can still fail it.
+        store.mark_failed(&second, "chunk copy byte mismatch").await.unwrap();
+        assert_eq!(store.status(&p).await.unwrap(), Some(ReplicationState::Failed));
     }
 
     #[sqlx::test]

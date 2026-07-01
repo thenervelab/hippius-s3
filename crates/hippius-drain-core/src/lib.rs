@@ -27,7 +27,7 @@ mod tick;
 mod units;
 
 pub use alloc::{AllocConfig, Allocation, AllocationPlan, BudgetController, FleetView, NodeObservation, allocate};
-pub use apipart::{ChunkIndex, META_FILE_NAME, ObjectId, PartKey, PartNumber, PartPathError, Version, chunk_file_name, parse_part_dir};
+pub use apipart::{ChunkIndex, META_FILE_NAME, ObjectId, PartKey, PartMeta, PartNumber, PartPathError, Version, chunk_file_name, parse_part_dir};
 pub use clock::{Clock, SystemClock};
 pub use enforce::{
     BreakerConfig, BreakerSignal, BreakerState, CircuitBreaker, ConcurrencyLimiter, DenyReason, DrainDecision, Enforcer, TokenBucket, decay_rate,
