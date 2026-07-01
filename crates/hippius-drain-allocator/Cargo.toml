@@ -10,8 +10,10 @@ description = "cephor singleton allocator (leader-elected; allocates the global 
 # real near-full; `--no-default-features` drops `reqwest` and falls back to the
 # static ceiling, keeping a dependency-light build provable.
 [features]
-default = ["http"]
+default = ["http", "otel"]
 http = ["dep:reqwest"]
+# OTLP metrics export; `--no-default-features` drops it for a dependency-light build.
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 
 # The allocator owns schema provisioning (`pg`) and contends for the leader lease /
 # reads the fleet / writes budgets via the Redis-backed coordinator (`coord`).
@@ -23,6 +25,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # The probe's HTTP client; gated behind `http` so a no-default-features build omits it.
 reqwest = { workspace = true, optional = true }
+# OTLP metrics export, gated behind `otel`.
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
 
 [dev-dependencies]
 # CancellationToken drives the shutdown signal in the run-loop tests.

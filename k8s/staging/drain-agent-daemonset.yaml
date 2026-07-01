@@ -142,6 +142,26 @@ spec:
               value: "4"
             - name: RUST_LOG
               value: "info"
+            # OTLP metrics -> otel-collector -> Prometheus -> Grafana (feature `otel`, on by
+            # default). The collector turns these resource attrs into Prometheus labels; the
+            # dashboard's var-namespace filters on service_namespace, so drain_* series land
+            # under the staging namespace. Mirrors the janitor deployment's env.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ENVIRONMENT
+              value: "staging"
+            - name: ENABLE_MONITORING
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector:4317"
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
           volumeMounts:
             - name: local-ingest
               mountPath: /var/lib/hippius/local_object_cache

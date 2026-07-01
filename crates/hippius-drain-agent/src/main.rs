@@ -82,9 +82,13 @@ async fn main() -> Result<ExitCode, StartupError> {
     // The enforcer starts at the floor (conservative) with a one-second burst of
     // the node's capability; the allocation-pull worker raises it to the leader's
     // budget on its first tick.
-    let enforcer = default_enforcer(config.floor_rate, Bytes::new(config.max_drain_rate.get()), config.drain_concurrency);
+    let enforcer = Arc::new(Mutex::new(default_enforcer(
+        config.floor_rate,
+        Bytes::new(config.max_drain_rate.get()),
+        config.drain_concurrency,
+    )));
     let rate_control = RateControl {
-        enforcer: Arc::new(Mutex::new(enforcer)),
+        enforcer: Arc::clone(&enforcer),
         node: config.node_id.clone(),
         floor: config.floor_rate,
         half_life: config.decay_half_life,
@@ -103,6 +107,11 @@ async fn main() -> Result<ExitCode, StartupError> {
     .with_rate_control(rate_control)
     .with_liveness(config.liveness_file.clone());
 
+    // OTLP metrics read the runtime's live snapshot + the shared enforcer (for the breaker
+    // gauge); grabbed before `run` consumes the runtime. Held until after shutdown to flush.
+    #[cfg(feature = "otel")]
+    let metrics = hippius_drain_agent::metrics::init("hippius-drain-agent", &runtime.snapshot(), Some(&enforcer));
+
     tracing::info!(
         pool_root = %config.pool_root.display(),
         ssd_root = %config.ssd_root.display(),
@@ -111,6 +120,10 @@ async fn main() -> Result<ExitCode, StartupError> {
     );
     let report = runtime.run(shutdown_signal()).await;
     tracing::info!(trigger = ?report.trigger, clean = report.clean, "hippius-drain-agent stopped");
+    #[cfg(feature = "otel")]
+    if let Some(metrics) = metrics {
+        metrics.shutdown();
+    }
     // A worker fault exits non-zero so k8s restarts the pod and the fault is alertable;
     // a clean shutdown exits zero. (`exit = deny` lints out std::process::exit, so main
     // returns the ExitCode.)

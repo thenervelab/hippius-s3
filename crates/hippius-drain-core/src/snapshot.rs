@@ -126,6 +126,11 @@ pub struct SnapshotCell {
     deferred: AtomicU64,
     reconciler_recovered: AtomicU64,
     reclaimed: AtomicU64,
+    /// Current SSD backlog (undrained bytes) — a LEVEL, not a monotonic counter, so it
+    /// has its own atomic (set, not accumulated) rather than living in [`AgentSnapshot`].
+    /// The heartbeat worker writes it (`usage.used_bytes`) each tick; the metrics layer
+    /// reads it as a gauge. Kept off the wait-free `load` path so a scrape never blocks.
+    backlog_bytes: AtomicU64,
     /// Recent drain latencies, behind a `Mutex` because a percentile needs the
     /// whole window (no single atomic suffices). Off the wait-free `load` path.
     latency: Mutex<LatencyWindow>,
@@ -162,6 +167,17 @@ impl SnapshotCell {
     /// Adds `n` to the SSD-reclaim total (terminal parts the reclaim worker unlinked).
     pub fn record_reclaimed(&self, n: u64) {
         self.reclaimed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Records the current SSD backlog (undrained bytes). A gauge: `store`, not add.
+    pub fn record_backlog(&self, bytes: u64) {
+        self.backlog_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The last-recorded SSD backlog in bytes (the metrics `drain_ssd_backlog_bytes` gauge).
+    #[must_use]
+    pub fn backlog(&self) -> u64 {
+        self.backlog_bytes.load(Ordering::Relaxed)
     }
 
     /// Records a completed drain's latency for the windowed p99 estimate.
@@ -218,6 +234,16 @@ mod tests {
         }
         // 100 samples (1..=100ms): nearest-rank p99 is the 99th value = 99ms.
         assert_eq!(cell.p99(), Duration::from_millis(99));
+    }
+
+    #[test]
+    fn backlog_is_a_settable_gauge_not_a_counter() {
+        let cell = SnapshotCell::new();
+        assert_eq!(cell.backlog(), 0, "a fresh cell reports no backlog");
+        cell.record_backlog(4096);
+        assert_eq!(cell.backlog(), 4096);
+        cell.record_backlog(100);
+        assert_eq!(cell.backlog(), 100, "backlog is a level: a later record replaces, not accumulates");
     }
 
     #[test]

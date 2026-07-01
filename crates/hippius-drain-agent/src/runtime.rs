@@ -207,6 +207,10 @@ async fn heartbeat_once(ssd: &LocalSsd, coord: &Coordinator, node: &NodeId, max_
     // Pressure (allocator weight), backlog (SSD used bytes — the undrained work),
     // and error rate (from the drain counters) are real. p99 latency stays neutral
     // until per-drain timing is wired (the saturation signal, not a demand signal).
+    // Publish the backlog to the metrics gauge here, where the (blocking) disk probe has
+    // already produced used_bytes — the metrics layer reads it wait-free off the exporter
+    // thread, so it must never run statvfs itself.
+    snapshot.record_backlog(usage.used_bytes);
     let observation = NodeObservation {
         pressure: usage.pressure,
         backlog: Bytes::new(usage.used_bytes),

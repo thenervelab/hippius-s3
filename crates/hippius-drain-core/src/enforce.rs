@@ -351,6 +351,15 @@ impl Enforcer {
         self.bucket.rate()
     }
 
+    /// Whether the Ceph breaker is currently open (the `drain_breaker_open` metric read).
+    /// Takes `&mut` because reading the breaker applies its time-based `Open→HalfOpen`
+    /// transition at `now`, exactly like an admission check; the metrics layer calls this
+    /// under the shared enforcer lock.
+    #[must_use]
+    pub fn breaker_open(&mut self, now: Instant) -> bool {
+        matches!(self.breaker.state(now), BreakerState::Open { .. })
+    }
+
     /// Admits a drain of `bytes` at `now` through all three gates in order:
     /// breaker → bandwidth → concurrency. Tokens spent at the bandwidth gate are
     /// refunded if the concurrency gate then denies, so a rejected drain costs
@@ -557,6 +566,22 @@ mod tests {
         assert!(b.allows(after)); // half-open trial
         b.record_failure(after); // trial fails
         assert!(!b.allows(after), "a failed trial reopens the breaker");
+    }
+
+    #[test]
+    fn breaker_open_reflects_the_breaker_state() {
+        // The drain_breaker_open metric read: false while closed, true once tripped.
+        let now = t0();
+        let mut e = Enforcer::new(
+            breaker(),
+            TokenBucket::new(ByteRate::new(1_000_000), Bytes::new(1_000_000), now),
+            ConcurrencyLimiter::new(4),
+        );
+        assert!(!e.breaker_open(now), "a closed breaker reads not-open");
+        for _ in 0..3 {
+            e.record_outcome(BreakerSignal::CephFailure, now);
+        }
+        assert!(e.breaker_open(now), "the breaker reads open after the failure threshold");
     }
 
     #[test]

@@ -8,8 +8,9 @@
 //! [`StaticCeiling`](hippius_drain_core::StaticCeiling) from config is the fallback.
 
 use hippius_drain_allocator::config::{AllocatorConfig, ConfigError};
-use hippius_drain_allocator::run::run_allocator;
+use hippius_drain_allocator::run::{AllocatorMetrics, Observability, run_allocator};
 use hippius_drain_core::{CephCeilingSource, CoordError, Coordinator, Store, StoreError};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -73,19 +74,29 @@ async fn main() -> Result<(), StartupError> {
     // — not Postgres — so the ~2s leader tick never touches the WAL.
     let coordinator = Coordinator::connect(&config.redis_queues_url, ALLOCATOR_NODE_TTL, config.alloc_ttl).await?;
 
+    // Plain-atomic gauges the tick loop updates; the OTLP exporter (feature `otel`) reads
+    // them. Always created (cheap) so the loop's signature is uniform with or without otel.
+    let alloc_metrics = Arc::new(AllocatorMetrics::default());
+    #[cfg(feature = "otel")]
+    let metrics = hippius_drain_allocator::metrics::init("hippius-drain-allocator", &alloc_metrics);
+
     tracing::info!(
         instance = %config.instance_id,
         tick_secs = config.tick_interval.as_secs(),
         "hippius-drain-allocator started"
     );
-    run_with_ceiling_source(&coordinator, &config).await?;
+    run_with_ceiling_source(&coordinator, &config, alloc_metrics.as_ref()).await?;
     tracing::info!("hippius-drain-allocator stopped");
+    #[cfg(feature = "otel")]
+    if let Some(metrics) = metrics {
+        metrics.shutdown();
+    }
     Ok(())
 }
 
 /// Selects the ceiling source — the live mgr probe when a URL is configured (and the
 /// `http` feature is built), else the static ceiling — and runs the allocator on it.
-async fn run_with_ceiling_source(coord: &Coordinator, config: &AllocatorConfig) -> Result<(), StartupError> {
+async fn run_with_ceiling_source(coord: &Coordinator, config: &AllocatorConfig, metrics: &AllocatorMetrics) -> Result<(), StartupError> {
     #[cfg(feature = "http")]
     if let Some(url) = config.ceph_mgr_metrics_url.clone() {
         // The decay floor is the AIMD floor: while the probe is blind, the fleet
@@ -98,24 +109,28 @@ async fn run_with_ceiling_source(coord: &Coordinator, config: &AllocatorConfig) 
             config.ceph_probe_timeout,
         )?;
         tracing::info!(mgr_url = %url, "driving the budget from the live ceph-mgr ceiling probe");
-        drive(coord, &probe, config).await;
+        drive(coord, &probe, config, metrics).await;
         return Ok(());
     }
     tracing::info!("no ceph mgr url configured; using the static ceiling");
-    drive(coord, &config.ceiling(), config).await;
+    drive(coord, &config.ceiling(), config, metrics).await;
     Ok(())
 }
 
 /// Runs the allocator loop on `ceiling`, logging (not failing on) a shutdown
 /// relinquish error — the lease TTL recovers it, so the process still exits cleanly.
-async fn drive<C: CephCeilingSource>(coord: &Coordinator, ceiling: &C, config: &AllocatorConfig) {
+async fn drive<C: CephCeilingSource>(coord: &Coordinator, ceiling: &C, config: &AllocatorConfig, metrics: &AllocatorMetrics) {
+    let obs = Observability {
+        liveness: Some(config.liveness_file.as_path()),
+        metrics,
+    };
     if let Err(err) = run_allocator(
         coord,
         ceiling,
         &config.tick_config(),
         config.initial_total,
         config.tick_interval,
-        Some(config.liveness_file.as_path()),
+        &obs,
         shutdown_signal(),
     )
     .await

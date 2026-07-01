@@ -8,6 +8,8 @@ pub mod config;
 pub mod disk;
 pub mod enqueue;
 pub mod localfs;
+#[cfg(feature = "otel")]
+pub mod metrics;
 pub mod runtime;
 pub mod supervisor;
 pub mod worker;
