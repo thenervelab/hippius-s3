@@ -33,6 +33,13 @@ use thiserror::Error;
 /// instance. Override per test via [`Coordinator::with_prefix`] for isolation.
 const DEFAULT_PREFIX: &str = "cephor:";
 
+/// Per-command response timeout (and per-attempt connection timeout) for the coordinator's
+/// Redis manager. Bounds every command so a reachable-but-blocked redis-queues (an fsync
+/// stall, a BGSAVE, a half-open TCP after a blip) surfaces as a retryable error instead of
+/// hanging the allocator tick / agent heartbeat / allocation-pull loop indefinitely — the
+/// error-retry paths only fire on an `Err`, never on a silent hang.
+pub const DEFAULT_REDIS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Acquire-or-renew the singleton lease. `KEYS[1]`=lease, `KEYS[2]`=epoch counter;
 /// `ARGV[1]`=instance id, `ARGV[2]`=ttl secs. Returns the held epoch, or nil if another
 /// instance holds an unexpired lease. An absent (expired/fresh) lease bumps the epoch via
@@ -217,7 +224,14 @@ impl Coordinator {
     ///
     /// [`CoordError::Redis`] if the client cannot be opened or the connection established.
     pub async fn connect(url: &str, node_ttl: Duration, alloc_ttl: Duration) -> Result<Self> {
-        let conn = ConnectionManager::new(redis::Client::open(url)?).await?;
+        // Bound every command with a response timeout ([`DEFAULT_REDIS_TIMEOUT`]) so a
+        // reachable-but-blocked redis-queues surfaces as a retryable error rather than
+        // hanging a coordination loop; the connection timeout bounds the manager's
+        // (re)connect after a blip.
+        let config = redis::aio::ConnectionManagerConfig::new()
+            .set_response_timeout(DEFAULT_REDIS_TIMEOUT)
+            .set_connection_timeout(DEFAULT_REDIS_TIMEOUT);
+        let conn = ConnectionManager::new_with_config(redis::Client::open(url)?, config).await?;
         Ok(Self::new(conn, node_ttl, alloc_ttl))
     }
 

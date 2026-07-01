@@ -11,7 +11,7 @@ use hippius_drain_agent::enqueue::RedisEnqueuer;
 use hippius_drain_agent::localfs::{LocalFs, LocalSsd};
 use hippius_drain_agent::runtime::{AgentRuntime, RateControl, default_enforcer};
 use hippius_drain_agent::supervisor::{RunReport, ShutdownTrigger};
-use hippius_drain_core::{Bytes, Coordinator, Store, StoreError};
+use hippius_drain_core::{Bytes, Coordinator, DEFAULT_REDIS_TIMEOUT, Store, StoreError};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -65,7 +65,13 @@ async fn main() -> Result<ExitCode, StartupError> {
     // upload-queue Redis (the api no longer enqueues at PUT). A multiplexed, auto-
     // reconnecting manager shared across the concurrent drains AND the coordinator below
     // (same redis-queues instance — one connection, cloned).
-    let redis = redis::aio::ConnectionManager::new(redis::Client::open(config.redis_queues_url.as_str())?).await?;
+    // Bound every command on the shared manager (coordinator + enqueuer) with a response
+    // timeout so a hung redis-queues surfaces as a retryable error rather than wedging a
+    // worker loop; the connection timeout bounds the manager's reconnect after a blip.
+    let redis_config = redis::aio::ConnectionManagerConfig::new()
+        .set_response_timeout(DEFAULT_REDIS_TIMEOUT)
+        .set_connection_timeout(DEFAULT_REDIS_TIMEOUT);
+    let redis = redis::aio::ConnectionManager::new_with_config(redis::Client::open(config.redis_queues_url.as_str())?, redis_config).await?;
     let enqueuer = Arc::new(RedisEnqueuer::new(Arc::clone(&store), redis.clone(), config.upload_backends.clone()));
 
     // The Redis-backed coordinator: the heartbeat worker upserts this node's state under
