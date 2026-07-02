@@ -92,12 +92,14 @@ async def authenticate_request(request: Request) -> AuthResult:
     if credential.startswith("hip_"):
         return await _authenticate_access_key_header(request, credential, logger)
 
-    # Seed phrase authentication is no longer supported
-    logger.warning(f"Invalid credential format (not hip_ access key): {credential[:8]}***")
+    # A well-formed SigV4 header with a non-hip_ credential is the shape the removed
+    # seed-phrase auth used — surface a deprecation pointer to tokens rather than a bare
+    # "invalid key" so migrating users know what changed and where to go.
+    logger.warning(f"Seed-phrase / non-hip_ credential rejected: {credential[:8]}***")
     return AuthResult(
         error_response=s3_error_response(
             code="InvalidAccessKeyId",
-            message='Please provide a valid "hip_*" access key. See https://docs.hippius.com/storage/s3/integration#authentication for more information.',  # noqa: Q003
+            message="Seed phrase authentication is deprecated. Use https://docs.hippius.com/storage/s3/integration to get started using tokens.",
             status_code=status.HTTP_403_FORBIDDEN,
         )
     )
