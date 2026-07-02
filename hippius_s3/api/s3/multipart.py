@@ -1011,7 +1011,18 @@ async def complete_multipart_upload(
                     tag.replace('"', "").strip(),
                 ),
             )
-        part_info.sort(key=lambda x: x[0])
+        # S3 requires the parts to be listed in strictly ascending part-number order.
+        # We used to silently sort here, which masked a malformed part list; reject it
+        # (InvalidPartOrder) instead so a client cannot depend on undefined assembly order.
+        last_seen_pn = 0
+        for pn, _ in part_info:
+            if pn <= last_seen_pn:
+                return s3_error_response(
+                    "InvalidPartOrder",
+                    "The list of parts was not in ascending order. Parts must be ordered by part number.",
+                    status_code=400,
+                )
+            last_seen_pn = pn
 
         # Resolve THIS upload's version from its own parts (keyed by upload_id), not
         # objects.current_object_version — a simple PUT or another MPU on the same key advances that
@@ -1043,12 +1054,32 @@ async def complete_multipart_upload(
                 status_code=400,
             )
 
-        # Check that all parts exist
-        missing_parts = [pn for pn, _ in part_info if pn not in db_parts_dict]
+        # Validate each part exists AND the client-asserted ETag matches the stored part.
+        # A CompleteMultipartUpload names, per part, the ETag the client believes it
+        # uploaded; S3 rejects the completion (InvalidPart) if the part is missing OR the
+        # ETag does not match. Without the ETag check a client could assemble the object
+        # from the wrong part bytes and still receive a 200 — a silent data-integrity hole.
+        missing_parts = []
+        mismatched_parts = []
+        for pn, client_etag in part_info:
+            db_part = db_parts_dict.get(pn)
+            if db_part is None:
+                missing_parts.append(pn)
+                continue
+            stored_etag = str(db_part["etag"]).replace('"', "").strip()
+            if client_etag and client_etag.lower() != stored_etag.lower():
+                mismatched_parts.append(pn)
         if missing_parts:
             return s3_error_response(
                 "InvalidPart",
                 f"One or more parts could not be found: {', '.join(map(str, missing_parts))}",
+                status_code=400,
+            )
+        if mismatched_parts:
+            return s3_error_response(
+                "InvalidPart",
+                "The ETag supplied for one or more parts did not match the uploaded part: "
+                f"{', '.join(map(str, mismatched_parts))}",
                 status_code=400,
             )
 
