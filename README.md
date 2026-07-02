@@ -358,6 +358,38 @@ Pre-built Grafana dashboards: Hippius S3 Overview (API performance, request rate
 
 Performance benchmarks live in the separate [`hippius-benchmarks`](https://github.com/thenervelab/hippius-benchmarks) repo. The public S3 dashboard is at <https://s3.hippius.com/veggies/s3/benchmark.html>.
 
+## Operations
+
+### Upgrading PostgreSQL (`postgres-nvme`)
+
+The production `postgres-nvme` CNPG cluster ([k8s/production/postgres-nvme-cluster.yaml](k8s/production/postgres-nvme-cluster.yaml)) is configured for **manual-only** image upgrades — nothing rolls automatically:
+
+- `spec.imageName` is pinned to an **immutable digest** (`…@sha256:…`), so upstream rebuilds of the `18.1-system-trixie` tag can never trigger a surprise roll.
+- `primaryUpdateStrategy: supervised`, so any roll updates the replicas but **stops before the primary** — the write-serving primary only switches over when a human promotes a replica.
+
+**To do a deliberate minor upgrade, in a planned maintenance window:**
+
+1. Find the digest of the target image (e.g. after bumping the base tag):
+   ```bash
+   docker manifest inspect ghcr.io/cloudnative-pg/postgresql:<tag> -v \
+     | grep -m1 digest
+   ```
+2. Update `spec.imageName` in `k8s/production/postgres-nvme-cluster.yaml` to `…:<tag>@sha256:<digest>` and merge/apply.
+3. CNPG rolls the **replicas** automatically, then pauses (cluster reports "waiting for the user to request a switchover"). No primary disruption yet.
+4. Complete the roll by promoting a replica — this performs the (brief) primary switchover:
+   ```bash
+   kubectl -n hippius-s3-prod cnpg promote postgres-nvme <replica-pod>
+   ```
+5. Verify every instance is on the new digest:
+   ```bash
+   kubectl -n hippius-s3-prod get pods -l cnpg.io/cluster=postgres-nvme \
+     -o custom-columns='NAME:.metadata.name,ROLE:.metadata.labels.cnpg\.io/instanceRole,DIGEST:.status.containerStatuses[0].imageID'
+   ```
+
+> **Important:** because of `supervised`, step 4 is not optional. If you skip it, the replicas run the new image while the primary stays on the old one (version skew) until you promote.
+
+For major version upgrades (`pg_upgrade`, offline) see the [CloudNativePG docs](https://cloudnative-pg.io/docs/current/postgres_upgrades/) — those are out of scope for the routine minor bump above.
+
 ## License
 
 See [LICENSE](LICENSE) file.
