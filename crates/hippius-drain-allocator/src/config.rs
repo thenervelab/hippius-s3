@@ -44,8 +44,20 @@ const DEFAULT_MAX_TOTAL_BPS: u64 = 1_000_000_000;
 const DEFAULT_ADDITIVE_INCREASE_BPS: u64 = 10_000_000;
 /// Multiplicative-decrease parts-per-thousand kept on back-off (800 => keep 80%).
 const DEFAULT_DECREASE_PERMILLE: u16 = 800;
-/// p99 latency (ms) above which the fleet is considered saturated.
-const DEFAULT_TARGET_P99_MS: u64 = 50;
+/// p99 *per-part* drain latency (ms) above which the fleet is considered saturated and the AIMD
+/// estimate backs off toward `min_total`.
+///
+/// This is the p99 of `drain_part` — a whole part's SSD→CephFS copy + fsync + readback-verify —
+/// NOT a small point op. Measured healthy p99 on staging is ~330–410 ms (breaker closed,
+/// `error_bps=0`). The former default of **50 ms** was physically unreachable for a multi-MB part
+/// copy, so `observed_p99 > target_p99` fired on EVERY tick → the fleet write-budget was pinned
+/// at the `min_total` 1 MB/s floor permanently, throttling the whole drain to ~1 MB/s regardless
+/// of Ceph health (measured live: `drain_fleet_estimate_bps = 1_000_000`). 2000 ms gives ~5×
+/// headroom over the healthy baseline: the AIMD ramps up while Ceph keeps p99 well under 2 s, and
+/// only a genuine multi-second slowdown throttles it. Tune per-cluster via
+/// `CEPHOR_ALLOC_TARGET_P99_MS`. (Future: compare against a rolling baseline rather than an
+/// absolute target; an absolute target must be set above the real per-part copy time.)
+const DEFAULT_TARGET_P99_MS: u64 = 2_000;
 /// Error rate (basis points) above which the fleet is considered saturated.
 const DEFAULT_MAX_ERROR_BPS: u16 = 100;
 /// Pressure (basis points) at/above which a node earns a reservation floor.
