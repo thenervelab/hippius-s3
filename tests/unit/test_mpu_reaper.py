@@ -72,6 +72,29 @@ async def test_fail_version_replication_marks_the_rows_failed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fail_version_replication_passes_null_version_through() -> None:
+    # Legacy parts can carry a NULL object_version; the helper must bind NULL (not crash
+    # on int(None)) so the query fails every version of the abandoned object.
+    db = FakeDb()
+    await mpu_cleanup.fail_version_replication(db, object_id="obj-1", object_version=None)
+    assert len(db.executed) == 1
+    _, args = db.executed[0]
+    assert args == ("obj-1", None), "a NULL version is bound through, not int()-cast"
+
+
+@pytest.mark.asyncio
+async def test_reaper_handles_abandoned_row_with_null_object_version() -> None:
+    # The regression that wedged the staging reaper: an abandoned row whose object_version
+    # is NULL must still be reaped, not raise TypeError on int(None).
+    rows = [{"upload_id": "u1", "object_id": "obj-1", "object_version": None, "age_seconds": 90000.0}]
+    db = FakeDb(rows)
+    result = await mpu_cleanup.reap_abandoned_uploads(db, stale_seconds=86400, dlq_object_ids=set())
+    assert result.count == 1
+    fail_args = [args for query, args in db.executed if "'failed'" in query]
+    assert fail_args == [("obj-1", None)], "the NULL-version row is marked terminal without crashing"
+
+
+@pytest.mark.asyncio
 async def test_reaper_marks_each_abandoned_version_and_deletes_its_mpu_row() -> None:
     rows = [
         {"upload_id": "u1", "object_id": "obj-1", "object_version": 1, "age_seconds": 90000.0},

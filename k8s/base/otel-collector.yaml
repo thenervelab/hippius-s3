@@ -15,9 +15,12 @@ data:
     processors:
       resource:
         attributes:
+          # insert (not upsert) so a producer's own service.name (api/gateway via
+          # configure_otel, workers via OTEL_SERVICE_NAME, the Rust drain) survives;
+          # this only labels telemetry that arrives without a service.name.
           - key: service.name
             value: "hippius-s3"
-            action: upsert
+            action: insert
       batch:
         timeout: 1s
         send_batch_size: 1024
