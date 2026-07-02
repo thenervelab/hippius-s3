@@ -172,6 +172,25 @@ async def test_invalid_credential_format_returns_403(auth_router_app: Any) -> No
 
 
 @pytest.mark.asyncio
+async def test_seed_phrase_credential_returns_deprecation_message(auth_router_app: Any) -> None:
+    """A well-formed SigV4 header with a non-hip_ credential (the removed seed-phrase shape)
+    is rejected with a deprecation pointer to token docs, not a bare invalid-key error."""
+    # base64-ish non-hip_ credential — the shape seed-phrase auth used as the access key id
+    auth_header = (
+        "AWS4-HMAC-SHA256 Credential=d29yZCB3b3JkIHdvcmQ/20250101/us-east-1/s3/aws4_request, "
+        "SignedHeaders=host;x-amz-date, Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
+        response = await client.put("/test", headers={"Authorization": auth_header}, content=b"test data")
+
+    assert response.status_code == 403
+    assert b"InvalidAccessKeyId" in response.content
+    assert b"Seed phrase authentication is deprecated" in response.content
+    assert b"docs.hippius.com/storage/s3/integration" in response.content
+
+
+@pytest.mark.asyncio
 async def test_access_key_with_invalid_signature_returns_403(auth_router_app: Any) -> None:
     """Test that access key with invalid signature returns 403"""
     test_access_key = "hip_test_key_12345"
