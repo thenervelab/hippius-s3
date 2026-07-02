@@ -16,6 +16,8 @@ from typing import TypeVar
 import redis.asyncio as async_redis
 from pydantic import BaseModel
 
+from hippius_s3.monitoring import get_metrics_collector
+
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,7 @@ class BaseDLQManager(Generic[T]):
         dlq_entry = self._create_entry(payload, last_error, etype)
 
         await self.redis_client.lpush(self.dlq_key, json.dumps(dlq_entry))  # ty: ignore[invalid-await]
+        get_metrics_collector().record_dlq_push(self.dlq_key, etype)
         identifier = self._get_identifier(payload)
         logger.warning(
             f"Pushed to DLQ ({self.dlq_key}): identifier={identifier}, error_type={etype}, error={last_error}"
@@ -144,6 +147,7 @@ class BaseDLQManager(Generic[T]):
                 payload.bypass_billing = True  # ty: ignore[invalid-assignment]
 
             await self.enqueue_func(payload)
+            get_metrics_collector().record_dlq_requeue(self.dlq_key, 1)
             logger.info(f"Successfully requeued identifier: {identifier}")
             return True
 
@@ -194,6 +198,7 @@ class BaseDLQManager(Generic[T]):
             # Bulk enqueue via pipeline
             if payloads:
                 await self._bulk_enqueue(payloads)
+                get_metrics_collector().record_dlq_requeue(self.dlq_key, len(payloads))
                 total_requeued += len(payloads)
 
             logger.info(f"Requeued batch: {len(payloads)} entries (total: {total_requeued}, skipped: {total_skipped})")

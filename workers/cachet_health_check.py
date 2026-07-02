@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
+from hippius_s3.monitoring import get_metrics_collector
+from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.sentry import init_sentry
 
 
@@ -19,6 +21,39 @@ config = get_config()
 setup_loki_logging(config, "cachet-health-checker")
 logger = logging.getLogger(__name__)
 init_sentry("cachet-health-checker", is_worker=True)
+
+
+# Cachet component status → metric label. 1=operational, 3=partial outage, 4=major outage.
+_STATUS_LABELS = {1: "operational", 3: "degraded", 4: "outage"}
+
+
+async def _cachet_once(
+    client: httpx.AsyncClient,
+    health_url: str,
+    cachet_update_url: str,
+    headers: dict[str, str],
+) -> None:
+    """One health-check + Cachet update, recording the outcome as a metric."""
+    try:
+        response = await client.get(health_url)
+        status = 1 if response.status_code == 200 else 3
+        logger.info(f"Health check result: {response.status_code}, setting status to {status}")
+    except Exception as e:
+        status = 4
+        logger.error(f"Health check failed with error: {e}, setting status to {status}")
+
+    update_success = False
+    try:
+        update_response = await client.put(cachet_update_url, headers=headers, json={"status": status})
+        update_success = update_response.status_code == 200
+        if update_success:
+            logger.info(f"Successfully updated Cachet component to status {status}")
+        else:
+            logger.error(f"Failed to update Cachet: {update_response.status_code} - {update_response.text}")
+    except Exception as e:
+        logger.error(f"Failed to update Cachet with error: {e}")
+
+    get_metrics_collector().record_cachet_check(_STATUS_LABELS.get(status, "unknown"), update_success)
 
 
 async def check_health_and_update_cachet():
@@ -34,29 +69,14 @@ async def check_health_and_update_cachet():
         logger.error("Cachet configuration incomplete, skipping health checks")
         return
 
+    initialize_metrics_collector()
     health_url = "http://gateway:8080/health"
     cachet_update_url = f"{config.cachet_api_url}/api/components/{config.cachet_component_id}"
     headers = {"Authorization": f"Bearer {config.cachet_api_key}"}
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         while True:
-            try:
-                response = await client.get(health_url)
-                status = 1 if response.status_code == 200 else 3
-                logger.info(f"Health check result: {response.status_code}, setting status to {status}")
-            except Exception as e:
-                status = 4
-                logger.error(f"Health check failed with error: {e}, setting status to {status}")
-
-            try:
-                update_response = await client.put(cachet_update_url, headers=headers, json={"status": status})
-                if update_response.status_code == 200:
-                    logger.info(f"Successfully updated Cachet component to status {status}")
-                else:
-                    logger.error(f"Failed to update Cachet: {update_response.status_code} - {update_response.text}")
-            except Exception as e:
-                logger.error(f"Failed to update Cachet with error: {e}")
-
+            await _cachet_once(client, health_url, cachet_update_url, headers)
             await asyncio.sleep(60)
 
 

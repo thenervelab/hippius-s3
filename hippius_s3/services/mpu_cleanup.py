@@ -23,13 +23,25 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+from dataclasses import dataclass
 from typing import Any
 from typing import Iterable
 
+from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ReapResult:
+    """Outcome of one reaper pass: how many uploads were reaped and how far behind we
+    were (the age of the oldest one we reaped, or None when nothing was reaped)."""
+
+    count: int
+    oldest_reaped_age_seconds: float | None
 
 
 async def fail_version_replication(db: Any, *, object_id: Any, object_version: int) -> None:
@@ -46,16 +58,18 @@ async def fail_version_replication(db: Any, *, object_id: Any, object_version: i
     )
 
 
-async def reap_abandoned_uploads(db: Any, *, stale_seconds: int, dlq_object_ids: set[str]) -> int:
+async def reap_abandoned_uploads(db: Any, *, stale_seconds: int, dlq_object_ids: set[str]) -> ReapResult:
     """Auto-abort never-finalized multipart uploads older than ``stale_seconds``.
 
     For each abandoned ``(upload_id, object_id, object_version)`` (address never written),
     mark its replication rows terminal and delete the multipart_uploads row (the cascade
     drops its ``parts`` rows). DLQ-protected objects are skipped, mirroring the janitor's
-    gate — their data may still be needed. Returns the number of uploads reaped.
+    gate — their data may still be needed. Returns the count reaped + the age of the
+    oldest reaped upload (the reaper's lag).
     """
     rows = await db.fetch(get_query("list_abandoned_versions"), int(stale_seconds))
     reaped = 0
+    oldest_age: float | None = None
     for row in rows:
         object_id = row["object_id"]
         if str(object_id) in dlq_object_ids:
@@ -64,7 +78,10 @@ async def reap_abandoned_uploads(db: Any, *, stale_seconds: int, dlq_object_ids:
         await fail_version_replication(db, object_id=object_id, object_version=row["object_version"])
         await db.execute(get_query("abort_multipart_upload"), row["upload_id"])
         reaped += 1
-    return reaped
+        age = row.get("age_seconds")
+        if age is not None:
+            oldest_age = age if oldest_age is None else max(oldest_age, age)
+    return ReapResult(count=reaped, oldest_reaped_age_seconds=oldest_age)
 
 
 async def gather_dlq_object_ids(redis_client: Any, upload_backends: Iterable[str]) -> set[str]:
@@ -93,6 +110,34 @@ async def gather_dlq_object_ids(redis_client: Any, upload_backends: Iterable[str
     return object_ids
 
 
+async def run_reaper_cycle(
+    db_pool: Any,
+    redis_client: Any,
+    *,
+    stale_seconds: int,
+    upload_backends: Iterable[str],
+) -> None:
+    """Run one reaper pass, time it, and record its metrics. Never raises — a failed
+    cycle is logged and recorded as ``success=false`` so the loop keeps going."""
+    collector = get_metrics_collector()
+    started = time.monotonic()
+    try:
+        dlq_object_ids = await gather_dlq_object_ids(redis_client, upload_backends)
+        async with db_pool.acquire() as db:
+            result = await reap_abandoned_uploads(db, stale_seconds=stale_seconds, dlq_object_ids=dlq_object_ids)
+        if result.count:
+            logger.info("mpu-reaper: reaped %d abandoned multipart upload(s)", result.count)
+        collector.record_mpu_reaper_cycle(
+            success=True,
+            reaped=result.count,
+            duration=time.monotonic() - started,
+            oldest_reaped_age=result.oldest_reaped_age_seconds,
+        )
+    except Exception:
+        logger.exception("mpu-reaper cycle failed; will retry next interval")
+        collector.record_mpu_reaper_cycle(success=False, reaped=0, duration=time.monotonic() - started)
+
+
 async def run_mpu_reaper_loop() -> None:
     """Periodically reap abandoned multipart uploads until the process is stopped.
 
@@ -103,12 +148,14 @@ async def run_mpu_reaper_loop() -> None:
     import redis.asyncio as async_redis
 
     from hippius_s3.config import get_config
+    from hippius_s3.monitoring import initialize_metrics_collector
 
     config = get_config()
     db_pool = await asyncpg.create_pool(config.database_url, min_size=1, max_size=5)
     # The upload/unpin DLQs live on redis-queues (not the main cache), matching the
     # janitor's DLQ scan — read protection ids from the same instance.
     redis_client = async_redis.from_url(config.redis_queues_url)
+    initialize_metrics_collector(redis_client)
     logger.info(
         "mpu-reaper: started (stale_seconds=%s interval=%ss)",
         config.mpu_stale_seconds,
@@ -116,18 +163,12 @@ async def run_mpu_reaper_loop() -> None:
     )
     try:
         while True:
-            try:
-                dlq_object_ids = await gather_dlq_object_ids(redis_client, config.upload_backends)
-                async with db_pool.acquire() as db:
-                    reaped = await reap_abandoned_uploads(
-                        db,
-                        stale_seconds=config.mpu_stale_seconds,
-                        dlq_object_ids=dlq_object_ids,
-                    )
-                if reaped:
-                    logger.info("mpu-reaper: reaped %d abandoned multipart upload(s)", reaped)
-            except Exception:
-                logger.exception("mpu-reaper cycle failed; will retry next interval")
+            await run_reaper_cycle(
+                db_pool,
+                redis_client,
+                stale_seconds=config.mpu_stale_seconds,
+                upload_backends=config.upload_backends,
+            )
             await asyncio.sleep(config.mpu_reaper_interval_seconds)
     finally:
         await db_pool.close()
