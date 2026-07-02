@@ -3,6 +3,11 @@ kind: Cluster
 metadata:
   name: postgres-nvme
 spec:
+  # Pinned to the resolved digest of the (mutable) 18.1-system-trixie tag. CNPG re-resolves the tag
+  # and a digest drift auto-rolled the cluster overnight 2026-06-11 under primaryUpdateStrategy:
+  # unsupervised (graceful but unattended primary switchover). Pin = no surprise rolls; bump this
+  # digest deliberately to upgrade. This is the currently-running digest, so applying it is a no-op.
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.1-system-trixie@sha256:51bc94428be3df3e234447278e33803544a93d27a57a4b6af737f218d6472d12
   affinity:
     enablePodAntiAffinity: true
     nodeSelector:
