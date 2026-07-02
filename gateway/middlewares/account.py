@@ -1,5 +1,6 @@
 """Account verification and credit checking middleware for the gateway."""
 
+import asyncio
 import logging
 import re
 from typing import Callable
@@ -17,6 +18,26 @@ from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 
 
 config = get_config()
+
+# Substrings that mark a can_upload denial as a TRANSIENT billing-service failure (the upstream
+# balance lookup could not complete) rather than a genuine "account is out of credit" denial. The
+# former is retryable and must never surface as a hard 402 — a client reads that as "insufficient
+# funds" and gives up, when in reality the billing backend just blipped.
+_TRANSIENT_BILLING_ERROR_MARKERS = (
+    "failed to fetch billing balance",
+    "billing balance",
+    "billing service",
+    "timeout",
+    "timed out",
+    "temporarily unavailable",
+)
+
+
+def _is_transient_billing_error(error: str | None) -> bool:
+    if not error:
+        return False
+    lowered = error.lower()
+    return any(marker in lowered for marker in _TRANSIENT_BILLING_ERROR_MARKERS)
 
 
 async def _check_can_upload(
@@ -52,7 +73,31 @@ async def _check_can_upload(
     logger.info(
         f"can_upload billing check for {main_account}: size_bytes={content_length}, result={response.result}, error={response.error}"
     )
+
+    # A transient billing-service failure is not a real denial — retry a few times before giving up.
+    attempts = 0
+    while (
+        not response.result
+        and _is_transient_billing_error(response.error)
+        and attempts < config.can_upload_transient_retries
+    ):
+        attempts += 1
+        logger.warning(
+            f"can_upload transient billing failure for {main_account} (attempt {attempts}/{config.can_upload_transient_retries}): {response.error}"
+        )
+        await asyncio.sleep(config.can_upload_transient_retry_delay_seconds)
+        response = await arion_client.can_upload(main_account, content_length)
+
     if not response.result:
+        # Still failing on a transient billing error after retries: surface a retryable 503
+        # SlowDown, NOT a hard 402 — the account may well have credit; the billing lookup is down.
+        if _is_transient_billing_error(response.error):
+            logger.warning(f"can_upload billing service unavailable for {main_account}: {response.error}")
+            return s3_error_response(
+                code="SlowDown",
+                message="Billing service is temporarily unavailable. Please retry.",
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         error_message = response.error or "Upload not permitted by billing service"
         logger.warning(f"can_upload denied for {main_account}: {error_message}")
         return s3_error_response(
