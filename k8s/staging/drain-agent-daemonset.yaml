@@ -140,6 +140,21 @@ spec:
             # Safe code default (4); set here for per-node tuning.
             - name: CEPHOR_DRAIN_CONCURRENCY
               value: "4"
+            # Replication-lag tuning (measured 2026-07-02: p50 4.6s / p99 5.9s, clustered at
+            # ~5s). The lag was NOT the drain budget (unpinned to ~1 GB/s by the target_p99 fix)
+            # — it was these two 5s timers:
+            #   - CEPHOR_DEFER_BACKOFF_SECS: an MPU part lands BEFORE its Complete writes
+            #     object_versions.address, so the drain's first claim defers ("upload context
+            #     not ready") and re-parks the part for this long. 5s -> 1s cuts the dominant
+            #     component of the observed lag.
+            #   - CEPHOR_DRAIN_POLL_SECS: the backstop poll floor (the chunk_landed trigger wakes
+            #     the worker sooner; this only bounds a missed-event/idle wake). Cheap to lower:
+            #     the claim query is a partial-index (node_id, landed_at) WHERE status='pending'
+            #     lookup, so 1s polling scans only the small active-pending set, not the parts table.
+            - name: CEPHOR_DEFER_BACKOFF_SECS
+              value: "1"
+            - name: CEPHOR_DRAIN_POLL_SECS
+              value: "1"
             - name: RUST_LOG
               value: "info"
             # OTLP metrics -> otel-collector -> Prometheus -> Grafana (feature `otel`, on by
