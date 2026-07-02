@@ -34,9 +34,7 @@ QUEUE_NAME = "arion_download_requests"
 async def arion_fetch(identifier: str, account_address: str) -> bytes:
     """Download ciphertext from Arion by backend identifier."""
     async with ArionClient() as client:
-        chunks: list[bytes] = []
-        async for chunk in client.download_file(identifier, account_address):
-            chunks.append(chunk)
+        chunks = [chunk async for chunk in client.download_file(identifier, account_address)]
     return b"".join(chunks)
 
 

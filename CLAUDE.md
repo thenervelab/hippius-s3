@@ -52,7 +52,7 @@ The pipeline is deliberately split so the user-facing path (gateway + API) is fa
 ├── scripts/                 # Top-level ops scripts (dumps, smoke tests, MPU retry)
 ├── tests/                   # unit/, integration/, e2e/, smoke/
 ├── docs/                    # Architecture and spec docs (s4.md, s3-compatibility.md)
-├── k8s/                     # Kustomize manifests: base/, staging/, production/, cache/, otel/
+├── k8s/                     # Kustomize manifests: base/, staging/, production/, otel/
 ├── monitoring/              # Grafana dashboards, observability config
 └── examples/                # Python and JavaScript client examples
 ```
@@ -391,7 +391,6 @@ Kustomize-based. Namespaces: `hippius-s3-staging` and `hippius-s3-prod`.
 
 - [k8s/base/](k8s/base/) — shared resources.
 - [k8s/staging/](k8s/staging/), [k8s/production/](k8s/production/) — per-env patches.
-- [k8s/cache/](k8s/cache/) — regional cache stack (gateway + api + downloader + Redis per region).
 - [k8s/otel/](k8s/otel/) — LGTM observability stack (Alloy, Loki, Prometheus, Tempo, Grafana).
 
 ### 10.1 CI/CD
@@ -399,7 +398,7 @@ Kustomize-based. Namespaces: `hippius-s3-staging` and `hippius-s3-prod`.
 Two deploy workflows, one per environment:
 
 - [.github/workflows/staging-deploy.yaml](.github/workflows/staging-deploy.yaml) — triggers on pushes to the `staging` branch. Job: `deploy-staging`.
-- [.github/workflows/production-deploy.yaml](.github/workflows/production-deploy.yaml) — triggers on pushes to the `k8s-production` branch. Jobs: `deploy-production`, `deploy-cache-production` (**currently DISABLED** via `if: false` — regional cache rollout for `us-0` / `eu-0`, to be re-enabled once the FS cache NVMe PVC story is finalized per region).
+- [.github/workflows/production-deploy.yaml](.github/workflows/production-deploy.yaml) — triggers on pushes to the `k8s-production` branch. Job: `deploy-production`.
 
 Both share the same `build-base` and `build-images` jobs (duplicated, since GitHub Actions can't share jobs across workflows without `workflow_call`).
 

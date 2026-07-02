@@ -60,9 +60,6 @@ async def auth_router_middleware(
         request.state.account_id = auth_result.account_id
         if auth_result.access_key:
             logger.debug(f"Authenticated with Bearer access key: {auth_result.access_key[:8]}***")
-    elif auth_result.auth_method == "seed_phrase":
-        request.state.seed_phrase = auth_result.seed_phrase
-        logger.debug("Authenticated with seed phrase")
     elif auth_result.auth_method == "anonymous":
         logger.debug("Anonymous request")
 

@@ -850,7 +850,7 @@ async def cleanup_old_parts_by_mtime(
 async def gc_soft_deleted_objects(pool: asyncpg.Pool) -> int:
     """Hard-delete objects where all backends have confirmed unpin."""
     async with pool.acquire() as db:
-        rows = await db.fetch(get_query("find_objects_ready_for_hard_delete"))
+        rows = await db.fetch(get_query("find_objects_ready_for_hard_delete"), config.janitor_hard_delete_batch)
         deleted = 0
         for row in rows:
             try:

@@ -14,7 +14,6 @@ RUN pip install --no-cache-dir \
     asyncpg \
     redis \
     python-dotenv \
-    mnemonic \
     pydantic \
     substrate-interface==1.7.11 \
     opentelemetry-api>=1.37.0 \

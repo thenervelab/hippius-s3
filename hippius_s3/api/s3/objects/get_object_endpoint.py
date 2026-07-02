@@ -52,7 +52,6 @@ async def handle_get_object(
                     bucket_name,
                     object_key,
                     conn,
-                    getattr(request.state, "seed_phrase", ""),
                     account.main_account if account else "",
                 )
 

@@ -313,7 +313,6 @@ async def migrate_one(
                 object_version=int(new_version),
                 bucket_name=bucket_name,
                 account_address=address,
-                seed_phrase="",
                 part_number=int(part_number),
                 body_bytes=bytes(buf),
             )
@@ -353,7 +352,6 @@ async def migrate_one(
         upload_id=str(upload_id),
         object_version=int(new_version),
         address=address,
-        seed_phrase="",
     )
     # Enqueue background publish for the migrated version
     try:

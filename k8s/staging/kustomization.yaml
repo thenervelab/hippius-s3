@@ -6,6 +6,8 @@ namespace: hippius-s3-staging
 resources:
   - ../base
   - gateway-nodeport.yaml
+  - postgres-cluster.yaml
+  - postgres-scheduledbackup.yaml
   - postgres-objectstore.yaml
   # s3-2.0 trial: node-local-SSD ingest tier (see README-local-ingest-trial.md).
   # Uses a hostPath (DirectoryOrCreate) volume — no PV/PVC, no manual node prep.

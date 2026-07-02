@@ -47,6 +47,10 @@ data:
   API_DB_POOL_MAX_QUERIES: "50000"
   API_DB_POOL_MAX_INACTIVE_LIFETIME: "300"
   API_DB_POOL_COMMAND_TIMEOUT: "30"
+  # Per-uploader-pod DB pool cap. Multiplied by the uploader replica count against
+  # Postgres max_connections (40 pods x 8 = 320). Capped to keep total backends well
+  # under max_connections=1000 and limit per-backend page-table memory. See cnpg.md.
+  HIPPIUS_UPLOADER_DB_POOL_MAX: "8"
   CACHET_API_URL: "http://cachet.monitoring.svc.cluster.local"
   BACKUP_INTERVAL_HOURS: "24"
   BACKUP_RETENTION_COUNT: "30"
@@ -61,7 +65,11 @@ data:
   HIPPIUS_OVH_KMS_CERT_PATH: "/kms_certs/client.crt"
   HIPPIUS_OVH_KMS_KEY_PATH: "/kms_certs/client.key"
   UVICORN_WORKERS: "4"
-  UVICORN_MAX_REQUESTS: "10000"
+  # In-process worker recycling disabled (0): --limit-max-requests churns a worker while
+  # the pod stays Ready, so the ATS edge routes into the restart window and gets a 502
+  # "Next Hop Connection Failed". Prod memory is flat at ~10-15% of the pod limit with
+  # zero OOMs, so it bought nothing. Re-enable (>0) only if a real leak appears.
+  UVICORN_MAX_REQUESTS: "0"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
   OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: "cumulative"
   HIPPIUS_OBJECT_CACHE_FALLBACK_DIR: ""

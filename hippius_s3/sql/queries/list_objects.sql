@@ -1,5 +1,8 @@
 -- List objects in a bucket with optional prefix and keyset pagination.
--- Parameters: $1: bucket_id, $2: prefix (optional), $3: cursor / start-after key (optional), $4: limit
+-- Parameters: $1: bucket_id, $2: prefix (optional), $3: inclusive cursor / boundary key (optional), $4: limit
+-- $3 is an INCLUSIVE lower bound: the endpoint computes the boundary (content key + '\x01', or the
+-- lexicographic successor of a delimiter common-prefix) so a single >= predicate expresses both
+-- "resume after a content key" and "skip the whole collapsed directory group".
 -- LATERAL is required so the planner uses idx_objects_bucket_prefix as an ordered range scan
 -- and stops after LIMIT rows. The previous correlated-subquery JOIN forced a full hash join over
 -- objects + object_versions on large buckets (~5+ min on hyperliquid → asyncpg 30s timeout).
@@ -29,7 +32,7 @@ FROM objects o,
      ) ov
 WHERE o.bucket_id = $1
   AND ($2::text IS NULL OR o.object_key LIKE $2::text || '%')
-  AND ($3::text IS NULL OR o.object_key > $3::text)
+  AND ($3::text IS NULL OR o.object_key >= $3::text)
   AND o.deleted_at IS NULL
 -- DB is C-collation; an explicit COLLATE here would defeat the (bucket_id, object_key) index ordered scan.
 ORDER BY o.object_key

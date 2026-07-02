@@ -89,18 +89,15 @@ jobs:
           path: reports/
           retention-days: 90
 
-      - name: Check test status
-        if: failure()
-        run: |
-          echo "Smoke tests failed - check artifacts"
-          echo "Run ID: ${{ github.run_id }}"
-
       - name: Notify Mattermost on failure
         if: failure()
         env:
           WEBHOOK_URL: ${{ secrets.MATTERMOST_WEBHOOK_URL }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          curl -fsS -X POST -H 'Content-Type: application/json' \
-            -d "{\"text\": \":rotating_light: **s3.hippius.com smoke tests failed**\n[View run #${{ github.run_id }}]($RUN_URL)\n![smoke tests failed](https://media3.giphy.com/media/v1.Y2lkPTc5MGI3NjExcmg4NDIyMnNtMHk0cHpvc2JpcHEwczY4cXR3eDkwdDE4Y3M3bGQ5MiZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/HUkOv6BNWc1HO/giphy.gif)\"}" \
-            "$WEBHOOK_URL"
+          python scripts/extract_failure_details.py \
+            reports/smoke-production.json \
+            reports/smoke-regional.json \
+            reports/smoke-subtoken-scope.json \
+            --webhook "$WEBHOOK_URL" \
+            --run-url "$RUN_URL"
