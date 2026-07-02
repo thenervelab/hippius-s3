@@ -46,9 +46,10 @@ async def conn() -> AsyncGenerator[asyncpg.Connection, None]:
         ) ON COMMIT PRESERVE ROWS;
 
         CREATE TEMP TABLE parts (
-            upload_id      uuid   NOT NULL,
-            object_id      uuid   NOT NULL,
-            object_version bigint NOT NULL
+            upload_id      uuid        NOT NULL,
+            object_id      uuid        NOT NULL,
+            object_version bigint      NOT NULL,
+            uploaded_at    timestamptz
         ) ON COMMIT PRESERVE ROWS;
 
         CREATE TEMP TABLE object_versions (
@@ -74,12 +75,18 @@ async def _mpu(conn: asyncpg.Connection, upload_id: str, *, completed: bool | No
     )
 
 
-async def _part(conn: asyncpg.Connection, upload_id: str, object_id: str, version: int) -> None:
+async def _part(
+    conn: asyncpg.Connection, upload_id: str, object_id: str, version: int, *, uploaded_age_seconds: int = 7200
+) -> None:
+    # uploaded_age_seconds defaults to 2h ago (stale, since the tests use _STALE=3600) so
+    # existing cases reap as before; pass a small value to model a still-active upload.
     await conn.execute(
-        "INSERT INTO parts (upload_id, object_id, object_version) VALUES ($1::uuid, $2::uuid, $3)",
+        "INSERT INTO parts (upload_id, object_id, object_version, uploaded_at) "
+        "VALUES ($1::uuid, $2::uuid, $3, now() - make_interval(secs => $4))",
         upload_id,
         object_id,
         version,
+        uploaded_age_seconds,
     )
 
 
@@ -135,6 +142,25 @@ async def test_fresh_upload_is_not_listed(conn):
     await _part(conn, u, o, 1)
     await _ov(conn, o, 1, address=None)
     assert await _abandoned(conn) == set()
+
+
+async def test_old_upload_with_recent_part_activity_is_not_listed(conn):
+    # The resume-after-a-pause safety case: initiated long ago, but a part was uploaded
+    # within the stale window → still active → must NOT be reaped.
+    u, o = str(uuid.uuid4()), str(uuid.uuid4())
+    await _mpu(conn, u, completed=False, age_seconds=7200)
+    await _part(conn, u, o, 1, uploaded_age_seconds=60)  # part uploaded a minute ago
+    await _ov(conn, o, 1, address=None)
+    assert await _abandoned(conn) == set()
+
+
+async def test_old_upload_with_only_stale_parts_is_listed(conn):
+    # Initiated long ago AND no part touched within the stale window → genuinely abandoned.
+    u, o = str(uuid.uuid4()), str(uuid.uuid4())
+    await _mpu(conn, u, completed=False, age_seconds=7200)
+    await _part(conn, u, o, 1, uploaded_age_seconds=7200)
+    await _ov(conn, o, 1, address=None)
+    assert (u, o, 1) in await _abandoned(conn)
 
 
 async def test_multipart_upload_dedups_to_one_row_per_version(conn):
