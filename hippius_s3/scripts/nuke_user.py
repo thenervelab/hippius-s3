@@ -248,7 +248,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
     db = await asyncpg.connect(config.database_url)
 
-    if args.unpin and not args.dry_run:
+    if not args.no_unpin and not args.dry_run:
         redis_queues_client = async_redis.from_url(config.redis_queues_url)
         from hippius_s3.queue import initialize_queue_client
 
@@ -352,8 +352,8 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.from_json:
-        if args.address or args.dry_run or args.unpin:
-            ap.error("--from-json must be used alone (without --address, --dry-run, or --unpin)")
+        if args.address or args.dry_run or args.no_unpin:
+            ap.error("--from-json must be used alone (without --address, --dry-run, or --no-unpin)")
     elif not args.address:
         ap.error("--address is required when not using --from-json")
 
