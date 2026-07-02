@@ -44,6 +44,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
+            - name: OTEL_SERVICE_NAME
+              value: "hippius-s3-uploader"
             - name: WORKER_SCRIPT
               value: "workers/run_arion_uploader_in_loop.py"
             - name: DATABASE_URL
@@ -221,6 +223,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
+            - name: OTEL_SERVICE_NAME
+              value: "hippius-s3-downloader"
             - name: WORKER_SCRIPT
               value: "workers/run_arion_downloader_in_loop.py"
             - name: DATABASE_URL
@@ -391,6 +395,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
+            - name: OTEL_SERVICE_NAME
+              value: "hippius-s3-unpinner"
             - name: WORKER_SCRIPT
               value: "workers/run_arion_unpinner_in_loop.py"
             - name: HIPPIUS_UNPINNER_MAX_INFLIGHT
@@ -523,6 +529,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
+            - name: OTEL_SERVICE_NAME
+              value: "hippius-s3-janitor"
             - name: WORKER_SCRIPT
               value: "workers/run_janitor_in_loop.py"
             - name: DATABASE_URL
@@ -662,6 +670,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
+            - name: OTEL_SERVICE_NAME
+              value: "hippius-s3-account-cacher"
             - name: WORKER_SCRIPT
               value: "workers/run_account_cacher_in_loop.py"
             - name: DATABASE_URL
@@ -785,6 +795,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
+            - name: OTEL_SERVICE_NAME
+              value: "hippius-s3-cachet"
             - name: WORKER_SCRIPT
               value: "workers/cachet_health_check.py"
             - name: DATABASE_URL
