@@ -21,7 +21,10 @@ tracer = trace.get_tracer(__name__)
 
 
 class MetricsCollector:
-    def __init__(self, redis_client: Union[Redis, RedisCluster]):
+    def __init__(self, redis_client: Union[Redis, RedisCluster, None] = None):
+        # Optional: redis-less workers (e.g. the cachet health checker) still want the
+        # counter/histogram surface. The observable gauges read cached ints, not the
+        # client, so None is safe.
         self.redis_client = redis_client
         self.meter = metrics.get_meter(__name__)
         self._queue_lengths: dict[str, int] = {}
@@ -260,6 +263,64 @@ class MetricsCollector:
             name="gateway_bytes_sent_total",
             description="Total bytes sent to clients through the gateway",
             unit="bytes",
+        )
+
+        # --- Background worker loops (previously un-metered) ---
+
+        self.mpu_reaper_cycles_total = self.meter.create_counter(
+            name="mpu_reaper_cycles_total", description="Total MPU reaper cycles run", unit="1"
+        )
+        self.mpu_reaper_versions_reaped_total = self.meter.create_counter(
+            name="mpu_reaper_versions_reaped_total", description="Abandoned MPU versions reaped", unit="1"
+        )
+        self.mpu_reaper_duration_seconds = self.meter.create_histogram(
+            name="mpu_reaper_duration_seconds", description="MPU reaper cycle duration", unit="s"
+        )
+        self.mpu_reaper_oldest_reaped_age_seconds = self.meter.create_histogram(
+            name="mpu_reaper_oldest_reaped_age_seconds",
+            description="Age of the oldest abandoned upload reaped in a cycle (reaper lag)",
+            unit="s",
+        )
+
+        self.orphan_checker_cycles_total = self.meter.create_counter(
+            name="orphan_checker_cycles_total", description="Total orphan-checker cycles run", unit="1"
+        )
+        self.orphan_checker_files_scanned_total = self.meter.create_counter(
+            name="orphan_checker_files_scanned_total",
+            description="On-chain files scanned by the orphan checker",
+            unit="1",
+        )
+        self.orphan_checker_orphans_found_total = self.meter.create_counter(
+            name="orphan_checker_orphans_found_total", description="Orphaned files found + enqueued for unpin", unit="1"
+        )
+        self.orphan_checker_duration_seconds = self.meter.create_histogram(
+            name="orphan_checker_duration_seconds", description="Orphan-checker cycle duration", unit="s"
+        )
+
+        self.account_cacher_cycles_total = self.meter.create_counter(
+            name="account_cacher_cycles_total", description="Total account-cacher cycles run", unit="1"
+        )
+        self.account_cacher_accounts_cached_total = self.meter.create_counter(
+            name="account_cacher_accounts_cached_total",
+            description="Account credit rows cached from Substrate",
+            unit="1",
+        )
+        self.account_cacher_duration_seconds = self.meter.create_histogram(
+            name="account_cacher_duration_seconds", description="Account-cacher cycle duration", unit="s"
+        )
+
+        self.cachet_health_checks_total = self.meter.create_counter(
+            name="cachet_health_checks_total", description="Gateway health checks run by the cachet worker", unit="1"
+        )
+        self.cachet_updates_total = self.meter.create_counter(
+            name="cachet_updates_total", description="Cachet status-page updates pushed", unit="1"
+        )
+
+        self.dlq_pushed_total = self.meter.create_counter(
+            name="dlq_pushed_total", description="Entries pushed to a dead-letter queue", unit="1"
+        )
+        self.dlq_requeued_total = self.meter.create_counter(
+            name="dlq_requeued_total", description="Entries requeued out of a dead-letter queue", unit="1"
         )
 
         logger.info("Metrics setup complete")
@@ -592,6 +653,56 @@ class MetricsCollector:
         attributes = {"database": database_name}
         self.backup_cleanup_deleted_count.add(deleted_count, attributes=attributes)
 
+    def record_mpu_reaper_cycle(
+        self,
+        success: bool,
+        reaped: int,
+        duration: float,
+        oldest_reaped_age: Optional[float] = None,
+    ) -> None:
+        self.mpu_reaper_cycles_total.add(1, attributes={"success": str(success).lower()})
+        self.mpu_reaper_duration_seconds.record(duration)
+        if reaped > 0:
+            self.mpu_reaper_versions_reaped_total.add(reaped)
+        if oldest_reaped_age is not None:
+            self.mpu_reaper_oldest_reaped_age_seconds.record(oldest_reaped_age)
+
+    def record_orphan_checker_cycle(
+        self,
+        success: bool,
+        files_scanned: int,
+        orphans_found: int,
+        duration: float,
+    ) -> None:
+        self.orphan_checker_cycles_total.add(1, attributes={"success": str(success).lower()})
+        self.orphan_checker_duration_seconds.record(duration)
+        if files_scanned > 0:
+            self.orphan_checker_files_scanned_total.add(files_scanned)
+        if orphans_found > 0:
+            self.orphan_checker_orphans_found_total.add(orphans_found)
+
+    def record_account_cacher_cycle(
+        self,
+        success: bool,
+        accounts_cached: int,
+        duration: float,
+    ) -> None:
+        self.account_cacher_cycles_total.add(1, attributes={"success": str(success).lower()})
+        self.account_cacher_duration_seconds.record(duration)
+        if accounts_cached > 0:
+            self.account_cacher_accounts_cached_total.add(accounts_cached)
+
+    def record_cachet_check(self, status: str, update_success: bool) -> None:
+        self.cachet_health_checks_total.add(1, attributes={"status": status})
+        self.cachet_updates_total.add(1, attributes={"success": str(update_success).lower()})
+
+    def record_dlq_push(self, queue: str, error_type: str) -> None:
+        self.dlq_pushed_total.add(1, attributes={"queue": queue, "error_type": error_type})
+
+    def record_dlq_requeue(self, queue: str, count: int = 1) -> None:
+        if count > 0:
+            self.dlq_requeued_total.add(count, attributes={"queue": queue})
+
 
 class NullMetricsCollector:
     def __init__(self) -> None:
@@ -643,6 +754,24 @@ class NullMetricsCollector:
     def record_backup_cleanup(self, *args: object, **kwargs: object) -> None:
         pass
 
+    def record_mpu_reaper_cycle(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_orphan_checker_cycle(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_account_cacher_cycle(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_cachet_check(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_dlq_push(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_dlq_requeue(self, *args: object, **kwargs: object) -> None:
+        pass
+
 
 _metrics_collector: MetricsCollector | NullMetricsCollector = NullMetricsCollector()
 
@@ -656,7 +785,9 @@ def set_metrics_collector(collector: MetricsCollector | NullMetricsCollector) ->
     _metrics_collector = collector
 
 
-def initialize_metrics_collector(redis_client: Union[Redis, RedisCluster]) -> MetricsCollector | NullMetricsCollector:
+def initialize_metrics_collector(
+    redis_client: Union[Redis, RedisCluster, None] = None,
+) -> MetricsCollector | NullMetricsCollector:
     if os.getenv("ENABLE_MONITORING", "false").lower() not in ("true", "1", "yes"):
         logger.info("Monitoring disabled, using NullMetricsCollector")
         null_collector = NullMetricsCollector()

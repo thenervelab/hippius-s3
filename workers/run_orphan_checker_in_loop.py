@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
+from hippius_s3.monitoring import get_metrics_collector
+from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import enqueue_unpin_request
 from hippius_s3.queue import initialize_queue_client
@@ -28,8 +30,11 @@ init_sentry("orphan-checker", is_worker=True)
 
 async def check_for_orphans(
     db: asyncpg.Connection,
-) -> None:
-    """Check for orphaned files on chain that don't exist in local DB."""
+) -> tuple[int, int]:
+    """Check for orphaned files on chain that don't exist in local DB.
+
+    Returns ``(files_scanned, orphans_found)`` for the cycle.
+    """
     logger.info("Starting orphan check cycle...")
 
     accounts = await db.fetch("SELECT DISTINCT main_account_id FROM users WHERE main_account_id IS NOT NULL")
@@ -102,6 +107,26 @@ async def check_for_orphans(
                 page += 1
 
     logger.info(f"Orphan check complete: checked {total_checked} files, found {total_orphans} orphans")
+    return total_checked, total_orphans
+
+
+async def run_orphan_check_cycle(db: asyncpg.Connection) -> bool:
+    """Run one orphan-check pass, time it, and record metrics. Returns success so the
+    loop can pick its sleep (normal interval vs a short error backoff)."""
+    collector = get_metrics_collector()
+    started = time.monotonic()
+    try:
+        scanned, orphans = await check_for_orphans(db)
+        collector.record_orphan_checker_cycle(
+            success=True, files_scanned=scanned, orphans_found=orphans, duration=time.monotonic() - started
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Orphan checker error: {e}", exc_info=True)
+        collector.record_orphan_checker_cycle(
+            success=False, files_scanned=0, orphans_found=0, duration=time.monotonic() - started
+        )
+        return False
 
 
 async def run_orphan_checker_loop() -> None:
@@ -117,6 +142,7 @@ async def run_orphan_checker_loop() -> None:
 
     initialize_queue_client(redis_queues_client)
     initialize_cache_client(redis_client)
+    initialize_metrics_collector(redis_client)
 
     logger.info("Starting orphan checker service...")
     logger.info(f"Check interval: {config.orphan_checker_loop_sleep} seconds")
@@ -127,13 +153,10 @@ async def run_orphan_checker_loop() -> None:
         logger.info("Account whitelist: disabled (processing all accounts)")
 
     while True:
-        try:
-            await check_for_orphans(db)
-            logger.info(f"Sleeping for {config.orphan_checker_loop_sleep} seconds...")
-            await asyncio.sleep(config.orphan_checker_loop_sleep)
-        except Exception as e:
-            logger.error(f"Orphan checker error: {e}", exc_info=True)
-            await asyncio.sleep(60)
+        ok = await run_orphan_check_cycle(db)
+        sleep_for = config.orphan_checker_loop_sleep if ok else 60
+        logger.info(f"Sleeping for {sleep_for} seconds...")
+        await asyncio.sleep(sleep_for)
 
 
 if __name__ == "__main__":

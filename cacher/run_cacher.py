@@ -246,8 +246,9 @@ class SubstrateCacher:
         await pipeline.execute()
         logger.debug(f"Cached {cached_count} main account credits in Redis")
 
-    async def run_cache_update(self) -> None:
-        """Main function to fetch and cache all substrate data."""
+    async def run_cache_update(self) -> int:
+        """Fetch and cache all substrate data. Returns the number of main-account credit
+        rows cached (the primary progress signal for this cycle)."""
         await self.connect()
 
         main_account_credits = await self.fetch_free_credits()
@@ -271,6 +272,7 @@ class SubstrateCacher:
             logger.warning(f"Subaccount caching skipped: {e}")
 
         await self.disconnect()
+        return len(main_account_credits)
 
 
 async def main():

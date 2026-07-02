@@ -5,9 +5,11 @@
 -- age pair is what distinguishes a genuinely abandoned upload (the drain would defer
 -- its enqueue as not-ready forever) from a still-in-flight one. is_completed=false is
 -- a belt-and-suspenders guard so a completed upload can never be selected.
--- Returns one row per (upload_id, object_id, object_version) to reap.
+-- Returns one row per (upload_id, object_id, object_version) to reap, plus age_seconds
+-- (how long ago the upload was initiated) so the reaper can report its lag.
 -- Parameters: $1: stale_seconds (int)
-SELECT DISTINCT mu.upload_id, p.object_id, p.object_version
+SELECT DISTINCT mu.upload_id, p.object_id, p.object_version,
+       EXTRACT(EPOCH FROM (now() - mu.initiated_at))::float8 AS age_seconds
 FROM multipart_uploads mu
 JOIN parts p ON p.upload_id = mu.upload_id
 LEFT JOIN object_versions ov
