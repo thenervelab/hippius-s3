@@ -51,7 +51,11 @@ spec:
       wal_buffers: 64MB
       wal_level: replica
       work_mem: 128MB
-  primaryUpdateStrategy: unsupervised
+  # supervised: on any roll (deliberate digest bump, or an operator upgrade) CNPG updates the
+  # replicas but STOPS before the primary — the write-serving primary is only switched over when a
+  # human runs `kubectl cnpg promote postgres-nvme <replica>`. No unattended primary disruption.
+  # Trade-off: you must manually finish the roll or replicas/primary sit on skewed images.
+  primaryUpdateStrategy: supervised
   replicationSlots:
     highAvailability:
       enabled: true
