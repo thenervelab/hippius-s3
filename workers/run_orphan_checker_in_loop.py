@@ -117,11 +117,15 @@ async def run_orphan_check_cycle(db: asyncpg.Connection) -> bool:
     started = time.monotonic()
     try:
         scanned, orphans = await check_for_orphans(db)
-        collector.record_orphan_checker_cycle(True, scanned, orphans, time.monotonic() - started)
+        collector.record_orphan_checker_cycle(
+            success=True, files_scanned=scanned, orphans_found=orphans, duration=time.monotonic() - started
+        )
         return True
     except Exception as e:
         logger.error(f"Orphan checker error: {e}", exc_info=True)
-        collector.record_orphan_checker_cycle(False, 0, 0, time.monotonic() - started)
+        collector.record_orphan_checker_cycle(
+            success=False, files_scanned=0, orphans_found=0, duration=time.monotonic() - started
+        )
         return False
 
 

@@ -6,6 +6,7 @@ is exercised without a real queue. Patches `get_metrics_collector` (the house pa
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -89,4 +90,37 @@ async def test_requeue_permanent_refusal_records_nothing() -> None:
     with patch("hippius_s3.dlq.base.get_metrics_collector", return_value=collector):
         ok = await dlq.requeue("a")
     assert ok is False
+    collector.record_dlq_requeue.assert_not_called()
+
+
+def _pipeline_returning(entries: list[str]) -> MagicMock:
+    """A fake redis pipeline whose execute() drains `entries` (rpop is a queued no-op)."""
+    pipe = MagicMock()
+    pipe.rpop = MagicMock()
+    pipe.execute = AsyncMock(return_value=entries)
+    return pipe
+
+
+@pytest.mark.asyncio
+async def test_requeue_all_records_the_batch_count() -> None:
+    dlq = _dlq()
+    entry = json.dumps({"payload": {"id": "x", "attempts": 1}, "error_type": "transient"})
+    dlq.redis_client.pipeline = MagicMock(return_value=_pipeline_returning([entry, entry, entry]))
+    collector = MagicMock()
+    with patch("hippius_s3.dlq.base.get_metrics_collector", return_value=collector):
+        total = await dlq.requeue_all()
+    assert total == 3
+    collector.record_dlq_requeue.assert_called_once_with(KEY, 3)
+
+
+@pytest.mark.asyncio
+async def test_requeue_all_permanent_only_records_nothing() -> None:
+    # A batch of only permanent errors is pushed back, not requeued → no metric.
+    dlq = _dlq()
+    entry = json.dumps({"payload": {"id": "x"}, "error_type": "permanent"})
+    dlq.redis_client.pipeline = MagicMock(return_value=_pipeline_returning([entry, entry]))
+    collector = MagicMock()
+    with patch("hippius_s3.dlq.base.get_metrics_collector", return_value=collector):
+        total = await dlq.requeue_all()
+    assert total == 0
     collector.record_dlq_requeue.assert_not_called()

@@ -20,8 +20,8 @@ async def test_cycle_records_accounts_cached() -> None:
     ):
         ok = await ac.run_account_cacher_cycle()
     assert ok is True
-    args, _ = collector.record_account_cacher_cycle.call_args
-    assert args[0] is True and args[1] == 42
+    _, kwargs = collector.record_account_cacher_cycle.call_args
+    assert kwargs["success"] is True and kwargs["accounts_cached"] == 42
 
 
 @pytest.mark.asyncio
@@ -33,5 +33,20 @@ async def test_cycle_records_failure_without_raising() -> None:
     ):
         ok = await ac.run_account_cacher_cycle()
     assert ok is False
-    args, _ = collector.record_account_cacher_cycle.call_args
-    assert args[0] is False and args[1] == 0
+    _, kwargs = collector.record_account_cacher_cycle.call_args
+    assert kwargs["success"] is False and kwargs["accounts_cached"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_cacher_once_returns_the_cached_count_and_closes_redis() -> None:
+    # The count plumbed to the metric comes from run_cache_update; the redis client is
+    # always closed in the finally.
+    cacher = MagicMock()
+    cacher.connect = AsyncMock()
+    cacher.run_cache_update = AsyncMock(return_value=7)
+    cacher.redis_client = MagicMock()
+    cacher.redis_client.aclose = AsyncMock()
+    with patch.object(ac, "SubstrateCacher", return_value=cacher):
+        n = await ac.run_cacher_once()
+    assert n == 7
+    cacher.redis_client.aclose.assert_awaited_once()

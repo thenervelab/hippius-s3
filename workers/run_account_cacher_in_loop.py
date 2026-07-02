@@ -40,16 +40,16 @@ async def run_cacher_once() -> int:
 async def run_account_cacher_cycle() -> bool:
     """Run one cacher pass, time it, and record metrics. Returns success."""
     collector = get_metrics_collector()
-    started = time.time()
+    started = time.monotonic()
     try:
         accounts_cached = await run_cacher_once()
-        duration = time.time() - started
-        collector.record_account_cacher_cycle(True, accounts_cached, duration)
+        duration = time.monotonic() - started
+        collector.record_account_cacher_cycle(success=True, accounts_cached=accounts_cached, duration=duration)
         logger.info(f"Cache update completed in {duration:.2f}s, sleeping for 5 minutes...")
         return True
     except Exception as e:
         logger.error(f"Cache update failed: {e}, will retry in 5 minutes")
-        collector.record_account_cacher_cycle(False, 0, time.time() - started)
+        collector.record_account_cacher_cycle(success=False, accounts_cached=0, duration=time.monotonic() - started)
         return False
 
 
