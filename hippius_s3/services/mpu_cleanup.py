@@ -44,17 +44,18 @@ class ReapResult:
     oldest_reaped_age_seconds: float | None
 
 
-async def fail_version_replication(db: Any, *, object_id: Any, object_version: int) -> None:
+async def fail_version_replication(db: Any, *, object_id: Any, object_version: int | None) -> None:
     """Mark one object version's active replication rows terminal ('failed').
 
     The central, node-agnostic churn-stopper: a 'failed' row is neither re-recorded by
     the reconciler nor re-claimed by the drain, so the per-node re-copy/re-defer loop
     halts on every node. Idempotent — rows already 'failed'/'replicated' are untouched.
+    A NULL ``object_version`` (legacy parts carry one) fails every version of the object.
     """
     await db.execute(
         get_query("fail_replication_status_for_version"),
         str(object_id),
-        int(object_version),
+        None if object_version is None else int(object_version),
     )
 
 
