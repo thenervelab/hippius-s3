@@ -86,9 +86,9 @@ Config:
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #2804 | 2:43 AM | 🔵 | Uploader workers process backend-specific upload queues with retry management | ~525 |
+| #2804 | 12:43 AM | 🔵 | Uploader workers process backend-specific upload queues with retry management | ~525 |
 | #2802 | " | 🔵 | Account cacher worker periodically synchronizes Substrate blockchain account data to Redis | ~533 |
-| #2796 | 2:42 AM | 🔵 | Orphan checker worker periodically scans blockchain files and enqueues cleanup requests | ~559 |
+| #2796 | 12:42 AM | 🔵 | Orphan checker worker periodically scans blockchain files and enqueues cleanup requests | ~559 |
 | #2792 | " | 🔵 | IPFS downloader worker implements minimal backend-specific fetch wrapping shared downloader infrastructure | ~502 |
 | #2791 | " | 🔵 | Unpinner workers handle backend cleanup via dedicated queue processing loops | ~427 |
 | #2787 | " | 🔵 | Arion uploader worker implements retry logic with exponential backoff and DLQ for failed uploads | ~586 |
@@ -98,20 +98,20 @@ Config:
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #6801 | 1:01 PM | 🟣 | Committed comprehensive PR #146 code review fixes addressing critical safety issues | ~1390 |
-| #6779 | 12:48 PM | ✅ | Janitor documentation strengthened to emphasize absolute replication safety | ~726 |
-| #6761 | 12:40 PM | 🔵 | Critical s3-backup PR #7 parity review reveals data loss risk | ~878 |
+| #6801 | 11:01 AM | 🟣 | Committed comprehensive PR #146 code review fixes addressing critical safety issues | ~1390 |
+| #6779 | 10:48 AM | ✅ | Janitor documentation strengthened to emphasize absolute replication safety | ~726 |
+| #6761 | 10:40 AM | 🔵 | Critical s3-backup PR #7 parity review reveals data loss risk | ~878 |
 
 ### May 12, 2026
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #7721 | 11:50 AM | 🔵 | Complete Sentry integration pattern documented for hippius-s3 | ~629 |
-| #7720 | 11:49 AM | 🔵 | Sentry configuration pattern in hippius-s3 repository | ~506 |
+| #7721 | 9:50 AM | 🔵 | Complete Sentry integration pattern documented for hippius-s3 | ~629 |
+| #7720 | 9:49 AM | 🔵 | Sentry configuration pattern in hippius-s3 repository | ~506 |
 
 ### Jun 25, 2026
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #9377 | 9:07 PM | 🔵 | Application Pool Configuration Exceeds Database max_connections by 96 Connections | ~723 |
+| #9377 | 7:07 PM | 🔵 | Application Pool Configuration Exceeds Database max_connections by 96 Connections | ~723 |
 </claude-mem-context>

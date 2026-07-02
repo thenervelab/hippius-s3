@@ -49,6 +49,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
+            - name: OTEL_SERVICE_NAME
+              value: "hippius-s3-mpu-reaper"
             - name: WORKER_SCRIPT
               value: "workers/run_mpu_reaper_in_loop.py"
             - name: DATABASE_URL
