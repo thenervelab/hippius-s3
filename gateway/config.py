@@ -89,6 +89,16 @@ class GatewayConfig:
     can_upload_cache_ttl_seconds: int = dataclasses.field(
         default_factory=lambda: int(os.getenv("CAN_UPLOAD_CACHE_TTL_SECONDS", "10"))
     )
+    # A transient billing-service failure (the upstream balance lookup blipped) comes back as
+    # result=False with a distinct error string, NOT a genuine "out of credit" denial. Retry the
+    # can_upload call this many times before surfacing anything; if it still fails, we return a
+    # retryable 503 SlowDown rather than a hard 402 that clients read as "insufficient funds".
+    can_upload_transient_retries: int = dataclasses.field(
+        default_factory=lambda: int(os.getenv("CAN_UPLOAD_TRANSIENT_RETRIES", "2"))
+    )
+    can_upload_transient_retry_delay_seconds: float = dataclasses.field(
+        default_factory=lambda: float(os.getenv("CAN_UPLOAD_TRANSIENT_RETRY_DELAY_SECONDS", "0.4"))
+    )
     public_bucket_cache_ttl_seconds: int = dataclasses.field(
         default_factory=lambda: int(os.getenv("PUBLIC_BUCKET_CACHE_TTL_SECONDS", "300"))
     )
