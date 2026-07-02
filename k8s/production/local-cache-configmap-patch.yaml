@@ -5,3 +5,5 @@ metadata:
 data:
   HIPPIUS_OBJECT_CACHE_DIR: "/var/lib/hippius/local_object_cache"
   HIPPIUS_OBJECT_CACHE_FALLBACK_DIR: "/var/lib/hippius/object_cache"
+  # Evict cache parts idle for 24h (mtime is bumped on every read, so this is "since last access").
+  HIPPIUS_FS_CACHE_GC_MAX_AGE_SECONDS: "86400"

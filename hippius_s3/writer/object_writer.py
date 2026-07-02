@@ -93,7 +93,6 @@ class ObjectWriter:
         object_key: str,
         object_version: int,
         account_address: str,
-        seed_phrase: str,
         content_type: str,
         metadata: dict[str, Any],
         body_bytes: bytes,
@@ -117,7 +116,6 @@ class ObjectWriter:
             body_bytes,
             object_id=object_id,
             part_number=1,
-            seed_phrase=seed_phrase,
             chunk_size=chunk_size,
             key=key_bytes,
             suite_id=suite_id,
@@ -547,7 +545,6 @@ class ObjectWriter:
         object_version: int,
         bucket_name: str,
         account_address: str,
-        seed_phrase: str,
         part_number: int,
         body_bytes: bytes,
     ) -> PartResult:
@@ -582,7 +579,6 @@ class ObjectWriter:
             body_bytes,
             object_id=str(object_id),
             part_number=int(part_number),
-            seed_phrase=seed_phrase,
             chunk_size=chunk_size,
             key=key_bytes,
             suite_id=suite_id,
@@ -628,7 +624,6 @@ class ObjectWriter:
         object_version: int,
         bucket_name: str,
         account_address: str,
-        seed_phrase: str,
         part_number: int,
         body_iter: AsyncIterator[bytes],
         max_size_bytes: int | None = None,
@@ -860,7 +855,6 @@ class ObjectWriter:
         upload_id: str,
         object_version: int,
         address: str,
-        seed_phrase: str,
     ) -> CompleteResult:
         # Compute combined ETag from part etags for this version
         parts = await self.pool.fetch(
@@ -913,7 +907,6 @@ class ObjectWriter:
         object_key: str,
         expected_version: int,
         account_address: str,
-        seed_phrase: str,
         body_iter: AsyncIterator[bytes],
     ) -> dict:
         """Append bytes with CAS, cache write-through, and enqueue (streaming)."""
@@ -1057,7 +1050,6 @@ class ObjectWriter:
                 object_version=int(cov),
                 bucket_name=str(bucket_name),
                 account_address=account_address,
-                seed_phrase=seed_phrase,
                 part_number=int(next_part),
                 body_iter=body_iter,
                 max_size_bytes=0,
@@ -1190,7 +1182,6 @@ class ObjectWriter:
         object_key: str,
         expected_version: int,
         account_address: str,
-        seed_phrase: str,
         incoming_bytes: bytes,
     ) -> dict:
         async def _iter_once() -> AsyncIterator[bytes]:
@@ -1203,6 +1194,5 @@ class ObjectWriter:
             object_key=object_key,
             expected_version=int(expected_version),
             account_address=account_address,
-            seed_phrase=seed_phrase,
             body_iter=_iter_once(),
         )

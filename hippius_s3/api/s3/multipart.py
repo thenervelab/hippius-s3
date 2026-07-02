@@ -507,7 +507,6 @@ async def upload_part(
                 bucket_name=source_bucket_name,
                 address=request.state.account.main_account,
                 subaccount=request.state.account.main_account,
-                subaccount_seed_phrase=request.state.seed_phrase,
                 substrate_url=config.substrate_url,
                 size=int(source_obj.get("size_bytes") or 0),
                 multipart=bool((json.loads(source_obj.get("metadata") or "{}") or {}).get("multipart", False)),
@@ -607,7 +606,6 @@ async def upload_part(
                 object_version=int(current_object_version),
                 bucket_name=str(dest_bucket_name or ""),
                 account_address=request.state.account.main_account,
-                seed_phrase=request.state.seed_phrase,
                 part_number=int(part_number),
                 body_iter=body_iter,
             )
@@ -1066,7 +1064,6 @@ async def complete_multipart_upload(
             upload_id=str(upload_id),
             object_version=int(object_version),
             address=request.state.account.main_account,
-            seed_phrase=request.state.seed_phrase,
         )
 
         # Drain-direct (s3-2.1 PR-11): the api does NOT enqueue the backend upload. It

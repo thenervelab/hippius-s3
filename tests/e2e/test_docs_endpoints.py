@@ -48,16 +48,6 @@ def test_docs_endpoints_no_auth_required():
 
 
 @pytest.mark.e2e
-def test_bearer_token_auth_with_valid_seed():
-    seed_phrase = "test seed phrase with twelve words to make a valid seed phrase here"
-    token = base64.b64encode(seed_phrase.encode("ascii")).decode("ascii")
-
-    response = requests.get(f"{BASE_URL}/", headers={"Authorization": f"Bearer {token}"})
-
-    assert response.status_code in [200, 403]
-
-
-@pytest.mark.e2e
 def test_bearer_token_auth_with_invalid_token():
     response = requests.get(f"{BASE_URL}/test-bucket", headers={"Authorization": "Bearer invalid_not_base64!@#$"})
 

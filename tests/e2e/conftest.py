@@ -8,7 +8,6 @@ Environment configuration:
 - See .env.defaults, .env.test-local, and .env.test-docker for configuration
 """
 
-import base64
 import os
 import secrets
 import subprocess
@@ -78,16 +77,15 @@ def test_run_id() -> str:
 
 
 @pytest.fixture(scope="session")
-def test_seed_phrase() -> str:
-    """Generate a unique seed phrase for this test run."""
-    # For now, use a fixed test seed. In production, generate or load from secure source.
-    return "about acid actor absent action able actual abandon abstract above ability achieve"
-
-
-@pytest.fixture(scope="session")
 def test_access_key() -> str:
-    """Return a hip_ access key for e2e tests."""
-    return os.getenv("HIPPIUS_KEY", "hip_e2e_test_master")
+    """Return a hip_ access key for e2e tests.
+
+    Intentionally NOT reading from HIPPIUS_KEY — the CI secret predates the
+    hip_* access-key model and is not guaranteed to be a hip_* value, which
+    causes auth_orchestrator to reject it before the mock API is even
+    consulted. See test_master_access_key for the same reasoning.
+    """
+    return "hip_e2e_test_master"
 
 
 @pytest.fixture(scope="session")
@@ -312,7 +310,7 @@ def _init_arion_proxy(docker_services: None) -> Iterator[None]:
 
 
 @pytest.fixture
-def boto3_client(test_seed_phrase: str) -> Any:
+def boto3_client(test_access_key: str, test_access_key_secret: str) -> Any:
     """Create a boto3 S3 client configured for testing.
 
     RUN_REAL_AWS=1 to run against real AWS. Otherwise uses local endpoint.
@@ -326,14 +324,11 @@ def boto3_client(test_seed_phrase: str) -> Any:
             ),  # Credentials resolved via default AWS chain
         )
 
-    access_key = base64.b64encode(test_seed_phrase.encode()).decode()
-    secret_key = test_seed_phrase
-
     return boto3.client(
         "s3",
         endpoint_url="http://localhost:8080",
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
+        aws_access_key_id=test_access_key,
+        aws_secret_access_key=test_access_key_secret,
         region_name="us-east-1",
         config=Config(
             s3={"addressing_style": "path"},

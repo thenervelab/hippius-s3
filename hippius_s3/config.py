@@ -273,7 +273,8 @@ class Config:
     # Object parts filesystem cache configuration
     object_cache_dir: str = env("HIPPIUS_OBJECT_CACHE_DIR:/var/lib/hippius/object_cache")
     object_cache_fallback_dir: str = env("HIPPIUS_OBJECT_CACHE_FALLBACK_DIR:", convert=str)
-    fs_cache_gc_max_age_seconds: int = env("HIPPIUS_FS_CACHE_GC_MAX_AGE_SECONDS:604800", convert=int)  # 7 days
+    # 24h since last access — reads bump mtime (os.utime sets both atime+mtime), so this gates on idle time.
+    fs_cache_gc_max_age_seconds: int = env("HIPPIUS_FS_CACHE_GC_MAX_AGE_SECONDS:86400", convert=int)
     # An MPU is "abandoned" only after this long with NO part activity (not just since
     # initiation) — a user can pause a multipart upload and resume it, so the window must
     # exceed a realistic pause. 2 days gives leeway over a full-day pause + resume.
@@ -286,6 +287,10 @@ class Config:
     # cleanup loops are DB-roundtrip bound; this is how many parts are processed
     # in parallel (each over its own pooled connection).
     janitor_concurrency: int = env("HIPPIUS_JANITOR_CONCURRENCY:16", convert=int)
+    # Max soft-deleted objects hard-deleted per janitor cycle. The find query is
+    # an index-probe over this many candidates; keep it bounded so a large
+    # backlog drains gradually instead of in one DELETE-cascade burst.
+    janitor_hard_delete_batch: int = env("HIPPIUS_JANITOR_HARD_DELETE_BATCH:30000", convert=int)
 
     # Filesystem cache disk-pressure backoff (ingress control).
     # Threshold can be expressed as either absolute bytes or ratio; we trigger if ANY threshold is hit.
