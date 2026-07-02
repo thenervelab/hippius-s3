@@ -364,6 +364,63 @@ mod tests {
         plan.iter().find(|a| a.node == wanted).map_or(0, |a| a.budget.get())
     }
 
+    fn node_p99(id: &str, p99: Duration, backlog: u64) -> (NodeId, NodeObservation) {
+        (
+            NodeId::from_str(id).unwrap(),
+            NodeObservation {
+                pressure: DiskPressure::try_from(3_000).unwrap(),
+                backlog: Bytes::new(backlog),
+                max_drain_rate: ByteRate::new(1_000_000_000),
+                observed_p99: p99,
+                error_bps: 0,
+            },
+        )
+    }
+
+    fn config_target_p99(ms: u64) -> AllocConfig {
+        AllocConfig {
+            target_p99: Duration::from_millis(ms),
+            ..config()
+        }
+    }
+
+    #[test]
+    fn a_healthy_slow_fleet_ramps_the_estimate_up() {
+        // Regression for the drain throttle deadlock: a whole-part SSD->CephFS drain has a p99 of
+        // hundreds of ms even when perfectly healthy (measured ~330-410 ms on staging). With a
+        // realistic target (2 s) a 400 ms p99 is NOT saturation, so the AIMD must ramp the estimate
+        // UP by additive_increase — not back off to min_total. Under the old 50 ms target this
+        // fleet backed off every tick, pinning the whole fleet budget at the 1 MB/s floor.
+        let fleet = fleet_of(&[node_p99("a", Duration::from_millis(400), 10_000_000_000)]);
+        let cfg = config_target_p99(2_000);
+        let plan = allocate(
+            &fleet,
+            CephCeiling::Open(ByteRate::new(1_000_000_000)),
+            BudgetController::new(ByteRate::new(190_000)),
+            &cfg,
+        );
+        assert_eq!(
+            plan.controller.total().get(),
+            190_000 + cfg.additive_increase.get(),
+            "a healthy-but-slow fleet (p99 below the realistic target) ramps up by additive_increase",
+        );
+    }
+
+    #[test]
+    fn a_genuinely_saturated_fleet_still_backs_off() {
+        // The other side of the fix: a p99 ABOVE the (realistic) target IS saturation and must back
+        // off multiplicatively toward min_total — proving raising the target did not disable back-off.
+        let fleet = fleet_of(&[node_p99("a", Duration::from_secs(3), 10_000_000_000)]);
+        let cfg = config_target_p99(2_000);
+        let plan = allocate(
+            &fleet,
+            CephCeiling::Open(ByteRate::new(1_000_000_000)),
+            BudgetController::new(ByteRate::new(190_000)),
+            &cfg,
+        );
+        assert!(plan.controller.total().get() < 190_000, "a p99 above the target backs the estimate off");
+    }
+
     #[test]
     fn empty_fleet_yields_no_allocations() {
         let plan = allocate(
