@@ -138,7 +138,7 @@ mod tests {
             max_total: ByteRate::new(1_000_000_000),
             additive_increase: ByteRate::new(10_000),
             decrease_permille: 800,
-            target_p99: Duration::from_millis(50),
+            target_p99: Duration::from_secs(2),
             max_error_bps: 100,
             critical_pressure: DiskPressure::try_from(9_000).unwrap(),
             reservation_floor: ByteRate::new(50_000),
