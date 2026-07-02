@@ -49,7 +49,7 @@ async def conn() -> AsyncGenerator[asyncpg.Connection, None]:
             upload_id      uuid        NOT NULL,
             object_id      uuid        NOT NULL,
             object_version bigint      NOT NULL,
-            uploaded_at    timestamptz
+            uploaded_at    timestamptz NOT NULL
         ) ON COMMIT PRESERVE ROWS;
 
         CREATE TEMP TABLE object_versions (
@@ -161,6 +161,18 @@ async def test_old_upload_with_only_stale_parts_is_listed(conn):
     await _part(conn, u, o, 1, uploaded_age_seconds=7200)
     await _ov(conn, o, 1, address=None)
     assert (u, o, 1) in await _abandoned(conn)
+
+
+async def test_one_recent_part_protects_an_upload_with_other_stale_parts(conn):
+    # The core of the activity gate: NOT EXISTS is per-upload, so a single recent part
+    # (a resumed upload adding part N) protects the whole upload even though earlier parts
+    # are stale. Without this, a slow/resumed MPU would be reaped mid-flight.
+    u, o = str(uuid.uuid4()), str(uuid.uuid4())
+    await _mpu(conn, u, completed=False, age_seconds=7200)
+    await _part(conn, u, o, 1, uploaded_age_seconds=7200)  # early part, stale
+    await _part(conn, u, o, 1, uploaded_age_seconds=60)  # just-added part, recent
+    await _ov(conn, o, 1, address=None)
+    assert await _abandoned(conn) == set()
 
 
 async def test_multipart_upload_dedups_to_one_row_per_version(conn):
