@@ -1,0 +1,17 @@
+# Evacuate-to-ceph patch for hydrator: unpin from the cache node, drop the node-local NVMe volume,
+# mount the ceph cache read-write. Applied live by hippius-s3's scripts/evacuate_cache.sh.
+spec:
+  template:
+    spec:
+      nodeSelector: null
+      containers:
+        - name: hydrator
+          volumeMounts:
+            - $patch: delete
+              mountPath: /var/lib/hippius/local_object_cache
+            - name: object-cache
+              mountPath: /var/lib/hippius/object_cache
+              readOnly: false
+      volumes:
+        - $patch: delete
+          name: local-cache
