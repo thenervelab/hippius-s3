@@ -296,10 +296,12 @@ async def test_warm_fallback_does_not_enqueue():
 @pytest.mark.asyncio
 async def test_cold_fallback_with_none_redis_does_not_crash():
     """A cold fallback read with redis=None (unit callers) must not crash on redis.set — the
-    helper short-circuits and simply doesn't enqueue (the streamer still waits)."""
+    coalesce lock's try/except fails open (behaves as acquired), so the download is still enqueued.
+    The main read path relies on this same fail-open behavior for redis=None."""
     with _PATCHES[0] as m0, _PATCHES[1] as m1, _PATCHES[2] as m2, _PATCHES[3] as m3, \
          _PATCHES[4] as m4, _PATCHES[5] as m5, _PATCHES[6] as m6, \
-         patch("hippius_s3.services.object_reader.enqueue_download_request", new_callable=AsyncMock) as m_enqueue:
+         patch("hippius_s3.services.object_reader.enqueue_download_request", new_callable=AsyncMock) as m_enqueue, \
+         patch("hippius_s3.services.object_reader.resolve_object_backends", new_callable=AsyncMock, return_value=[]):
         _apply_patches([m0, m1, m2, m3, m4, m5, m6])
         m3.return_value.download_coalesce_lock_ttl_seconds = 120
         m3.return_value.substrate_url = ""
@@ -315,7 +317,9 @@ async def test_cold_fallback_with_none_redis_does_not_crash():
 
         assert ctx.object_version == 4
         assert ctx.source == "pipeline"
-        m_enqueue.assert_not_awaited()
+        # fail-open on the None redis.set: the fallback version is still enqueued (no crash)
+        enqueued_versions = [call.args[0].object_version for call in m_enqueue.await_args_list]
+        assert 4 in enqueued_versions
 
 
 @pytest.mark.asyncio
