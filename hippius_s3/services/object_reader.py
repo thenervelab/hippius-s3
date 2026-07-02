@@ -64,6 +64,10 @@ async def _enqueue_missing_downloads(
     source without enqueuing anything, so a cold read of the fallback version hung on pub/sub until
     the wait timed out.
     """
+    if redis is None:
+        # No coalescing backend available (only unit callers pass None). Match the old fallback
+        # behavior of not enqueuing rather than crashing on redis.set — the streamer still waits.
+        return
     object_id = info["object_id"]
     indices_by_part: dict[int, set[int]] = {}
     for item, cached in zip(plan, exist_results, strict=True):
