@@ -191,3 +191,69 @@ async def test_complete_rejects_out_of_order_parts(monkeypatch: Any) -> None:
     assert resp.status_code == 400
     assert b"InvalidPartOrder" in bytes(resp.body)
     assert called["complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_complete_accepts_matching_etag_case_insensitive(monkeypatch: Any) -> None:
+    """A legitimate client that upper-cases the hex ETag must still succeed — the match is
+    case-insensitive, so real SDK clients are never newly rejected by the ETag check."""
+    _patch_common(monkeypatch)
+    completed = {"ok": False}
+
+    async def _upper_etag_body(_req: Any) -> bytes:
+        return b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>ABC</ETag></Part></CompleteMultipartUpload>"
+
+    monkeypatch.setattr(multipart, "get_request_body", _upper_etag_body)
+
+    class _FakeWriter:
+        def __init__(self, **_: Any) -> None: ...
+
+        async def mpu_complete(self, **_: Any) -> Any:
+            completed["ok"] = True
+            return SimpleNamespace(etag="abc", size_bytes=100)
+
+    async def _addr(*_: Any, **__: Any) -> None:
+        return None
+
+    monkeypatch.setattr(multipart, "ObjectWriter", _FakeWriter)
+    monkeypatch.setattr(multipart, "set_object_version_address", _addr)
+
+    db = _FakeDb(current_version=1, upload_version=1)  # stored part 1 etag == "abc"
+    resp = await multipart.complete_multipart_upload("b", "k", "up-1", _request(), db)
+
+    assert resp.status_code == 200
+    assert completed["ok"] is True, "a case-differing but matching ETag must complete"
+
+
+@pytest.mark.asyncio
+async def test_complete_rejects_duplicate_part_numbers(monkeypatch: Any) -> None:
+    """Duplicate part numbers are not strictly ascending => InvalidPartOrder."""
+    _patch_common(monkeypatch)
+    called = {"complete": False}
+
+    async def _dup_body(_req: Any) -> bytes:
+        return (
+            b"<CompleteMultipartUpload>"
+            b"<Part><PartNumber>1</PartNumber><ETag>x</ETag></Part>"
+            b"<Part><PartNumber>1</PartNumber><ETag>y</ETag></Part>"
+            b"</CompleteMultipartUpload>"
+        )
+
+    monkeypatch.setattr(multipart, "get_request_body", _dup_body)
+
+    class _FakeWriter:
+        def __init__(self, **_: Any) -> None: ...
+
+        async def mpu_complete(self, **_: Any) -> Any:
+            called["complete"] = True
+            return SimpleNamespace(etag="abc", size_bytes=100)
+
+    monkeypatch.setattr(multipart, "ObjectWriter", _FakeWriter)
+    monkeypatch.setattr(multipart, "set_object_version_address", lambda *_, **__: None)
+
+    db = _FakeDb(current_version=1, upload_version=1)
+    resp = await multipart.complete_multipart_upload("b", "k", "up-1", _request(), db)
+
+    assert resp.status_code == 400
+    assert b"InvalidPartOrder" in bytes(resp.body)
+    assert called["complete"] is False
