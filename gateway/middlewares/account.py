@@ -23,13 +23,21 @@ config = get_config()
 # balance lookup could not complete) rather than a genuine "account is out of credit" denial. The
 # former is retryable and must never surface as a hard 402 — a client reads that as "insufficient
 # funds" and gives up, when in reality the billing backend just blipped.
+#
+# These are matched as substrings, so they MUST be phrases that describe an infra/lookup FAILURE and
+# can never appear in a genuine out-of-credit verdict. In particular do NOT add a bare "billing
+# balance" — a real denial like "insufficient billing balance" contains it and would be wrongly
+# retried into a 503. Keep this list anchored to Arion's known fetch-failure wording; the durable
+# fix is a structured `transient` flag on CanUploadResponse instead of string-sniffing another
+# service's free text.
 _TRANSIENT_BILLING_ERROR_MARKERS = (
     "failed to fetch billing balance",
-    "billing balance",
-    "billing service",
+    "could not fetch billing",
+    "error fetching billing",
     "timeout",
     "timed out",
     "temporarily unavailable",
+    "service unavailable",
 )
 
 

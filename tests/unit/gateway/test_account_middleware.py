@@ -251,6 +251,24 @@ async def test_can_upload_transient_billing_returns_503_not_402(mock_config_no_b
 
 
 @pytest.mark.asyncio
+async def test_can_upload_genuine_denial_stays_402_and_is_not_retried(
+    mock_config_no_bypass: Any, monkeypatch: Any
+) -> None:
+    """A genuine out-of-credit denial must return 402 and must NOT be retried — even when the
+    message contains the words 'billing balance' (e.g. 'Insufficient billing balance'). Guards
+    against widening the transient classifier into silently converting real 402s into 503s."""
+    mock_arion = MockArionService(allow_upload=False, upload_error="Insufficient billing balance")
+    app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert response.status_code == 402
+    assert b"UploadNotPermitted" in response.content
+    assert len(mock_arion.can_upload_calls) == 1, "a genuine denial must not be retried"
+
+
+@pytest.mark.asyncio
 async def test_can_upload_skipped_in_bypass_mode(mock_config_bypass: Any, monkeypatch: Any) -> None:
     mock_arion = MockArionService(allow_upload=False, upload_error="should not be called")
 
