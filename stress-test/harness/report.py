@@ -16,6 +16,11 @@ class Result:
     detail: str             # one-line evidence (numbers, counts)
     criteria: str           # the pass condition, in words
     skipped: bool = False
+    # An OBSERVED result reports a measurement that has no ratified pass/fail threshold yet
+    # (e.g. the S4 backlog gauge) or that is verified elsewhere (corpus upload → durability-reverify).
+    # It is NOT a gate: it never flips the GO verdict and is counted apart from real passes, so a
+    # non-failing observer can't inflate the pass count into false confidence.
+    observed: bool = False
     metrics: dict = dataclasses.field(default_factory=dict)
 
 
@@ -27,23 +32,25 @@ class Report:
 
     def add(self, r: Result) -> Result:
         self.results.append(r)
-        tag = "SKIP" if r.skipped else ("PASS" if r.passed else "FAIL")
+        tag = "SKIP" if r.skipped else ("INFO" if r.observed else ("PASS" if r.passed else "FAIL"))
         print(f"  [{tag}] {r.name} — {r.detail}")
         return r
 
     @property
     def failed(self) -> list[Result]:
-        return [r for r in self.results if not r.passed and not r.skipped]
+        # Observers never fail the run — they carry no ratified threshold; only real gates gate.
+        return [r for r in self.results if not r.passed and not r.skipped and not r.observed]
 
     @property
     def go(self) -> bool:
         return len(self.failed) == 0
 
     def summary_line(self) -> str:
-        p = sum(1 for r in self.results if r.passed and not r.skipped)
+        p = sum(1 for r in self.results if r.passed and not r.skipped and not r.observed)
         f = len(self.failed)
         s = sum(1 for r in self.results if r.skipped)
-        return f"{p} pass, {f} fail, {s} skip"
+        o = sum(1 for r in self.results if r.observed and not r.skipped)
+        return f"{p} pass, {f} fail, {s} skip, {o} observed"
 
     def to_markdown(self) -> str:
         lines = [
@@ -56,7 +63,7 @@ class Report:
             "|---|---|---|---|---|",
         ]
         for r in self.results:
-            tag = "⏭️ SKIP" if r.skipped else ("✅ PASS" if r.passed else "❌ FAIL")
+            tag = "⏭️ SKIP" if r.skipped else ("ℹ️ OBSERVED" if r.observed else ("✅ PASS" if r.passed else "❌ FAIL"))
             lines.append(
                 f"| {tag} | {r.name} | {r.invariant} | {r.detail} | {r.criteria} |"
             )

@@ -11,6 +11,8 @@ import contextlib
 import json
 import subprocess
 import time
+import urllib.parse
+import urllib.request
 
 from .config import Config
 
@@ -78,8 +80,6 @@ class ClusterProbe:
         """Instant query; return [(labels, value)]. None on failure."""
         if not self._prom_port:
             return None
-        import urllib.parse
-
         url = f"http://localhost:{self._prom_port}/api/v1/query?query={urllib.parse.quote(promql)}"
         try:
             with urllib.request.urlopen(url, timeout=15) as resp:  # noqa: S310

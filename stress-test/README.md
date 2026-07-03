@@ -26,6 +26,20 @@ python stress-test/run.py
 Exit code is `0` (GO) / `1` (NO-GO). A markdown + JSON report and the durability ledger are written to
 `stress-test/results/`.
 
+## Pre-flight (deterministic, no live S3/cluster) — `inv-det`
+
+Before any live run, prove the invariants that can be checked deterministically (WI-19 GO/NO-GO #2):
+
+```bash
+export CEPHOR_TEST_REDIS_URL=redis://localhost:6379   # required — the split-brain fence tests need a real Redis
+python stress-test/inv/inv_det.py                     # cargo drain-core (--include-ignored) + pytest unit + G4 audit
+python stress-test/inv/inv_det.py --integration       # also tests/integration (needs DB/Redis)
+```
+
+This runs the **8 `#[ignore]`d coordinator epoch/lease tests** (0 executed coverage under a bare `cargo test`), the
+Python unit suite, and a static **sole-producer (G4)** audit asserting the dead `enqueue_upload` producer stays
+callerless. A skipped required check (e.g. no `CEPHOR_TEST_REDIS_URL`) is **NO-GO**, not a pass.
+
 ## What it asserts (scenario → criterion)
 
 | Scenario | Asserts | Pass condition |
@@ -44,13 +58,15 @@ envelope-encrypted and MPU ETags are not content hashes).
 ```
 stress-test/
 ├── plan.md              # full build spec (all tiers)
-├── run.py               # entrypoint
+├── run.py               # entrypoint (live S3 + cluster run)
+├── inv/
+│   └── inv_det.py       # pre-flight: cargo (--include-ignored) + pytest + sole-producer (G4) audit
 ├── harness/
 │   ├── config.py        # endpoint + creds + cluster access
 │   ├── s3util.py        # boto3 client (path-style, SigV4) + ops + md5
 │   ├── ledger.py        # the acked-object durability manifest (oracle)
 │   ├── probes.py        # staging Postgres + Prometheus probes (optional)
 │   ├── scenarios.py     # the scenario suite
-│   └── report.py        # PASS/FAIL report (md + json)
+│   └── report.py        # PASS/FAIL/OBSERVED report (md + json)
 └── results/             # run reports + ledgers (gitignored)
 ```

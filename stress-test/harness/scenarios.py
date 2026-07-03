@@ -15,6 +15,8 @@ Mapping to the WI-19 gate (see ../s3-2.1-todo.md):
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
+import re
 import time
 
 import botocore.exceptions
@@ -70,6 +72,7 @@ def durability_corpus(client, cfg: Config, ledger: Ledger, report: Report, bucke
         name="durability-corpus-upload",
         invariant="S8/G3 setup",
         passed=True,
+        observed=True,  # setup only — the real no-data-loss gate is durability-reverify
         detail=f"uploaded {n} objects ({mpu_n} multipart) in {time.time()-t0:.1f}s to {b}",
         criteria="corpus PUTs succeed (verified for real in durability-reverify)",
     ))
@@ -110,8 +113,13 @@ def functional_adversarial(client, cfg: Config, ledger: Ledger, report: Report, 
                 MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": '"deadbeefdeadbeefdeadbeefdeadbeef"'}]})
         except botocore.exceptions.ClientError:
             rejected = True
-        if not rejected:
-            client.abort_multipart_upload(Bucket=b, Key="mpu-badetag", UploadId=up)
+        finally:
+            # On the CORRECT (rejected) path the upload is still open — abort it so the harness
+            # doesn't strand an in-progress MPU every run (the A21 orphan cephor-pending-row leak).
+            # On the ACCEPTED (bug) path complete already consumed the upload; NoSuchUpload is expected.
+            if rejected:
+                with contextlib.suppress(botocore.exceptions.ClientError):
+                    client.abort_multipart_upload(Bucket=b, Key="mpu-badetag", UploadId=up)
         return rejected, f"wrong-ETag complete was {'rejected' if rejected else 'ACCEPTED (bug)'}"
     _check(report, "func-mpu-wrong-etag", "T1 MPU integrity",
            "CompleteMultipartUpload with a mismatched part ETag is rejected", mpu_bad_etag)
@@ -227,15 +235,43 @@ def concurrency_ramp(client, cfg: Config, ledger: Ledger, report: Report, bucket
 
 
 # ---------------------------------------------------------------- 4. INVARIANTS (cluster) G1/G6/S4
+# cephor_replication_status PK is (object_id, version, part_number); replicated/failed are terminal sinks.
+_TERMINAL = frozenset({"replicated", "failed"})
+_NON_TERMINAL = frozenset({"pending", "draining"})
+_PREFIX_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def _safe_prefix(prefix: str) -> str:
+    """Constrain the bucket prefix before it goes into a SQL LIKE — it's operator-set, but we build
+    raw SQL from it, so reject anything outside the S3 bucket-name charset rather than interpolate it."""
+    if not _PREFIX_RE.match(prefix):
+        raise ValueError(f"unsafe bucket prefix for SQL LIKE: {prefix!r}")
+    return prefix
+
+
 def _our_repl_counts(probe: ClusterProbe, prefix: str) -> dict[str, int] | None:
     rows = probe.pg(
         "select crs.status, count(*) from cephor_replication_status crs "
         "join objects o on o.object_id::text = crs.object_id::text "
         "join buckets b on b.bucket_id = o.bucket_id "
-        f"where b.bucket_name like '{prefix}-%' group by crs.status")
+        f"where b.bucket_name like '{_safe_prefix(prefix)}-%' group by crs.status")
     if rows is None:
         return None
     return {r[0]: int(r[1]) for r in rows}
+
+
+def _our_repl_rows(probe: ClusterProbe, prefix: str) -> dict[tuple[str, str, str], str] | None:
+    """Per-row status of our objects' replication rows, keyed by the PK (object_id, version, part_number).
+    The per-row view is what makes a real G6 monotonicity assertion possible — a count can't tell a
+    terminal row regressing apart from a new non-terminal row arriving."""
+    rows = probe.pg(
+        "select crs.object_id, crs.version, crs.part_number, crs.status from cephor_replication_status crs "
+        "join objects o on o.object_id::text = crs.object_id::text "
+        "join buckets b on b.bucket_id = o.bucket_id "
+        f"where b.bucket_name like '{_safe_prefix(prefix)}-%'")
+    if rows is None:
+        return None
+    return {(r[0], r[1], r[2]): r[3] for r in rows}
 
 
 def invariant_assert(probe: ClusterProbe, cfg: Config, report: Report, prom_ok: bool) -> None:
@@ -249,24 +285,31 @@ def invariant_assert(probe: ClusterProbe, cfg: Config, report: Report, prom_ok: 
                           detail=f"sum(drain_leader)={leaders:g}",
                           criteria="sum(drain_leader) ≤ 1 (no split-brain)"))
 
-    # G6 — terminal-state monotonicity: sample the whole table's replicated+failed count twice; it must not shrink
-    c1 = probe.pg_scalar("select count(*) from cephor_replication_status where status in ('replicated','failed')")
-    if c1 is None:
+    # G6 — terminal-state monotonicity (a REAL gate, per-row): snapshot our objects' rows keyed by
+    # (object_id, version, part_number), sleep, re-snapshot; FAIL if any row that was terminal
+    # (replicated/failed) is now non-terminal (pending/draining). A key vanishing between snapshots is
+    # GC deleting a terminal row — that is allowed, not a regression. This is still a sampled probe (the
+    # plan's end-state is a WAL-tailed event-driven guard, plan §4.2); a flap fully inside the sleep is
+    # invisible — but unlike the old count-only version it can now actually catch a regression.
+    snap1 = _our_repl_rows(probe, cfg.bucket_prefix)
+    if snap1 is None:
         report.add(Result("inv-G6-terminal-monotonic", "G6", passed=True, skipped=True,
                           detail="Postgres not reachable — skipped",
                           criteria="no replicated/failed row regresses to a non-terminal state"))
     else:
+        terminal_before = {k: s for k, s in snap1.items() if s in _TERMINAL}
         time.sleep(4)
-        c2 = probe.pg_scalar("select count(*) from cephor_replication_status where status in ('replicated','failed')")
-        # Terminal count may grow or stay; GC deletes rows entirely (fine). We assert no OUR object
-        # is stuck non-terminal, and report the global terminal delta for context.
-        our = _our_repl_counts(probe, cfg.bucket_prefix)
+        snap2 = _our_repl_rows(probe, cfg.bucket_prefix) or {}
+        regressed = {k: (terminal_before[k], snap2[k]) for k in terminal_before
+                     if snap2.get(k) in _NON_TERMINAL}
         report.add(Result("inv-G6-terminal-monotonic", "G6 terminal monotonicity",
-                          passed=True,
-                          detail=f"global terminal rows {c1}→{c2}; our objects: {our}",
-                          criteria="observed replicated/failed rows never regress (our objects tracked)"))
+                          passed=(len(regressed) == 0),
+                          detail=f"our terminal rows tracked={len(terminal_before)}, regressed={len(regressed)}"
+                                 + (f" — {list(regressed.items())[:3]}" if regressed else ""),
+                          criteria="no replicated/failed row of ours regresses to pending/draining"))
 
-    # S4 — backlog is a finite gauge (bounded, not runaway) if exported
+    # S4 — backlog gauge: reported, not gated. There is no ratified per-node ceiling yet
+    # (S4's absolute number is a RATIFY item, todo §SLO table), so this is an OBSERVED measurement.
     backlog = probe.prom_scalar(
         'max(drain_ssd_backlog_bytes{service_namespace="hippius-s3-staging"})/1e9') if prom_ok else None
     if backlog is None:
@@ -276,7 +319,8 @@ def invariant_assert(probe: ClusterProbe, cfg: Config, report: Report, prom_ok: 
     else:
         report.add(Result("inv-S4-backlog", "S4 backlog gauge",
                           passed=True,
-                          detail=f"max drain_ssd_backlog_bytes = {backlog:.1f} GB (informational)",
+                          observed=True,
+                          detail=f"max drain_ssd_backlog_bytes = {backlog:.1f} GB (no ratified ceiling yet)",
                           criteria="backlog exported + bounded (absolute ceiling is a RATIFY item)"))
 
 
