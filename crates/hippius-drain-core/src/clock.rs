@@ -111,6 +111,7 @@ impl Clock for TestClock {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::{Clock, SystemClock, TestClock};
     use std::time::Duration;

@@ -94,7 +94,7 @@ pub async fn run_tick<C: CephCeilingSource>(
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr, reason = "tests")]
+#[expect(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr, clippy::panic, reason = "tests")]
 mod tests {
     use super::{CephCeilingSource, StaticCeiling, TickConfig, TickOutcome, run_tick};
     use crate::alloc::{AllocConfig, Allocation, BudgetController, NodeObservation};
@@ -302,6 +302,6 @@ mod tests {
             b.epoch,
         );
         // Nothing was written at the stale epoch: no alloc key exists (A fenced, B never wrote).
-        assert!(c.load_allocation(&node).await.unwrap().is_none(), "the fenced tick wrote no budget",);
+        assert!(c.load_allocation(&node).await.unwrap().is_none(), "the fenced tick wrote no budget");
     }
 }
