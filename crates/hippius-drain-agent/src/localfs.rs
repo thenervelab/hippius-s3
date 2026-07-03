@@ -387,13 +387,17 @@ fn plain_name(name: &OsStr) -> Option<String> {
     Some(raw.to_owned())
 }
 
-/// Whether a part dir holds its `meta.json` marker. The api writes meta last, so its
-/// presence means the part is complete and safe to drain (an incomplete part is
-/// skipped by the scan).
-async fn part_has_meta(part_path: &Path) -> io::Result<bool> {
+/// The age of a part's `meta.json` marker (`now() - mtime`), or `None` when the marker is
+/// absent. The api writes meta last, so its presence means the part is complete and safe
+/// to drain (an incomplete part is skipped by the scan); its mtime is the part's landing
+/// age, carried on [`DiscoveredPart`] for the reclaim's orphan grace (a deleted-object
+/// part has no DB row to date). `ZERO` on clock skew — the fail-safe direction (reads
+/// young, so a borderline orphan is kept rather than reclaimed early).
+async fn part_meta_age(part_path: &Path) -> io::Result<Option<Duration>> {
     match fs::metadata(part_path.join(META_FILE_NAME)).await {
-        Ok(meta) => Ok(meta.is_file()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Ok(meta) if meta.is_file() => Ok(Some(file_age(&meta))),
+        Ok(_) => Ok(None),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err),
     }
 }
@@ -519,12 +523,12 @@ async fn scan_version_dir(path: &Path, object: &str, version: &str, out: &mut Ve
         let Some(part) = plain_name(&entry.file_name()) else {
             continue;
         };
-        if !part_has_meta(&entry.path()).await? {
+        let Some(age) = part_meta_age(&entry.path()).await? else {
             continue;
-        }
+        };
         let rel = Path::new(object).join(version).join(&part);
         if let Ok(key) = parse_part_dir(&rel) {
-            out.push(DiscoveredPart { part: key });
+            out.push(DiscoveredPart { part: key, age });
         }
     }
     Ok(())
@@ -670,7 +674,7 @@ mod part_tests {
     use std::collections::HashMap;
     use std::io;
     use std::sync::Mutex;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
 
     /// A no-op upload enqueuer for the localfs drain test.
@@ -894,6 +898,28 @@ mod part_tests {
         assert!(
             ssd.scan_parts().await.unwrap().is_empty(),
             "a missing cache root is an empty cache, not an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_carries_the_meta_mtime_age_for_the_orphan_grace() {
+        // The reclaim's orphan grace keys on this FS age (a deleted-object part has no DB
+        // row to date). Backdate the meta.json mtime and assert the scan reports it, so a
+        // future regression that hardcodes ZERO (which would reclaim every orphan
+        // instantly) is caught.
+        let dir = TempDir::new().unwrap();
+        let part = part_key(5, 1);
+        seed_ssd_part(dir.path(), &part, &[(0, b"a")]);
+        let meta = dir.path().join(part.relative_dir()).join("meta.json");
+        let handle = std::fs::OpenOptions::new().write(true).open(&meta).unwrap();
+        handle.set_modified(SystemTime::now() - Duration::from_hours(2)).unwrap();
+
+        let discovered = LocalSsd::new(dir.path()).scan_parts().await.unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert!(
+            discovered[0].age >= Duration::from_hours(1),
+            "the scanned age reflects the backdated meta mtime, not a hardcoded zero (got {:?})",
+            discovered[0].age,
         );
     }
 

@@ -17,10 +17,11 @@ use crate::ids::FileId;
 use crate::partdrain::{ClaimedPart, PartReplicationStore, PartVerified};
 use crate::reconcile::PartLandingLog;
 use crate::reconcile::PartStatus;
-use crate::ssd_reclaim::{PartStatusAge, ReclaimLog};
+use crate::ssd_reclaim::{BackingLog, PartStatusAge, ReclaimLog};
 use crate::state::ReplicationState;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -283,6 +284,38 @@ impl Store {
         .await?
         .rows_affected();
         Ok(affected)
+    }
+
+    /// The true drain backlog for `node`: the total `parts.size_bytes` of every part this
+    /// node still owns as `pending`/`draining` in `cephor_replication_status`.
+    ///
+    /// This is the WI-20c reconcile of `drain_ssd_backlog_bytes`, which the heartbeat used
+    /// to source from raw SSD occupancy (`statvfs`). Occupancy OVERCOUNTS the backlog by
+    /// the A21/orphan leak — aborted-upload and deleted-object bytes sit on the SSD but are
+    /// not undrained WORK — so a leaking node reads hundreds of GB of "backlog" with no
+    /// drain demand. Keying on the terminal-filtered replication rows counts only parts the
+    /// drain will actually replicate. A part whose `parts` row is absent contributes zero
+    /// (INNER JOIN), and a NULL `size_bytes` is treated as zero (COALESCE), so the sum is a
+    /// lower bound that never over-reports. Uses the node-scoped pending index.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn node_backlog_bytes(&self, node: &str) -> Result<u64> {
+        let (bytes,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(p.size_bytes), 0)::bigint \
+             FROM cephor_replication_status crs \
+             JOIN parts p \
+               ON p.object_id = crs.object_id::uuid \
+              AND p.object_version = crs.version \
+              AND p.part_number = crs.part_number \
+             WHERE crs.node_id = $1 AND crs.status IN ('pending', 'draining')",
+        )
+        .bind(node)
+        .fetch_one(&self.pool)
+        .await?;
+        // SUM of non-negative byte counts is >= 0; the cast guards a corrupt negative row.
+        Ok(u64::try_from(bytes).unwrap_or(0))
     }
 
     /// Claims a file for GC. Returns `Some(GcClaim)` if this caller won the claim,
@@ -760,6 +793,59 @@ impl ReclaimLog for Store {
     }
 }
 
+/// The reclaim worker's object-backing view: which scanned parts have no live
+/// `object_versions` row. Only the parts with no replication row reach this, so the batch
+/// is the reclaim's `skipped_absent` tail — usually small, empty on the steady state.
+impl BackingLog for Store {
+    type Error = StoreError;
+
+    async fn unbacked_parts(&self, parts: &[PartKey]) -> Result<HashSet<PartKey>> {
+        let mut out = HashSet::with_capacity(parts.len());
+        // Chunk the request so a pathological backlog never builds one giant array.
+        for batch in parts.chunks(RECLAIM_STATUS_BATCH) {
+            let mut object_ids: Vec<&str> = Vec::with_capacity(batch.len());
+            let mut versions: Vec<i64> = Vec::with_capacity(batch.len());
+            let mut part_numbers: Vec<i64> = Vec::with_capacity(batch.len());
+            for part in batch {
+                object_ids.push(part.object().as_str());
+                versions.push(i64::from(part.version().get()));
+                part_numbers.push(i64::from(part.part().get()));
+            }
+            // Echo back exactly the input parts whose (object_id, version) has NO
+            // object_versions row. NOT EXISTS against the ov PK stays index-only; the
+            // object_id is echoed from the input UNNEST (never read from object_versions),
+            // so the reconstructed PartKey matches the caller's key verbatim — no
+            // canonical-text round-trip to get wrong. Backing is ROW PRESENCE only: a
+            // present-but-unservable row (an aborted/abandoned or in-flight MPU) counts as
+            // backed and is NOT returned, so this never races the central `failed` sweep.
+            let rows = sqlx::query_as::<_, (String, i64, i64)>(
+                "SELECT t.object_id, t.version, t.part_number \
+                 FROM UNNEST($1::text[], $2::bigint[], $3::bigint[]) AS t(object_id, version, part_number) \
+                 WHERE NOT EXISTS ( \
+                    SELECT 1 FROM object_versions ov \
+                    WHERE ov.object_id = t.object_id::uuid AND ov.object_version = t.version \
+                 )",
+            )
+            .bind(&object_ids)
+            .bind(&versions)
+            .bind(&part_numbers)
+            .fetch_all(&self.pool)
+            .await?;
+            for (object_id, version, part_number) in rows {
+                out.insert(
+                    PartRow {
+                        object_id,
+                        version,
+                        part_number,
+                    }
+                    .into_part()?,
+                );
+            }
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 #[cfg(feature = "pg")]
 #[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
@@ -899,6 +985,7 @@ mod part_tests {
     use crate::state::ReplicationState;
     use core::str::FromStr;
     use sqlx::postgres::PgPool;
+    use std::collections::HashSet;
     use std::time::Duration;
 
     const UUID_A: &str = "466916c0-d61b-4518-b81b-9576b574270a";
@@ -1034,6 +1121,124 @@ mod part_tests {
         let store = Store::from_pool(pool);
         let states = <Store as ReclaimLog>::part_states(&store, &[]).await.unwrap();
         assert!(states.is_empty(), "no parts requested -> no query, empty map");
+    }
+
+    #[sqlx::test]
+    async fn unbacked_parts_returns_only_parts_whose_object_version_row_is_gone(pool: PgPool) {
+        use crate::ssd_reclaim::BackingLog;
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone());
+
+        // A live object_versions row exists — the part is BACKED (mid-upload / live object).
+        let backed = part(UUID_A, 1, 1);
+        seed_object_version(&pool, UUID_A, 1, Some("5Faddr")).await;
+        // No object_versions row at all — the object was hard-deleted → UNBACKED.
+        let deleted = part(UUID_B, 2, 1);
+
+        let unbacked = store.unbacked_parts(&[backed, deleted.clone()]).await.unwrap();
+        assert_eq!(unbacked, HashSet::from([deleted]), "only the deleted object's part is unbacked");
+    }
+
+    #[sqlx::test]
+    async fn a_present_but_unservable_version_is_still_backed(pool: PgPool) {
+        // The load-bearing distinction from the WI-20a servability sweep: backing is ROW
+        // PRESENCE, not servability. An aborted/abandoned or in-flight MPU has a present
+        // object_versions row (address NULL, size 0) — it must NOT be reported unbacked,
+        // so the orphan reclaim never races the central `failed` path (or an in-flight MPU).
+        use crate::ssd_reclaim::BackingLog;
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone());
+
+        seed_object_version(&pool, UUID_A, 1, None).await; // present but address NULL (unservable)
+
+        let unbacked = store.unbacked_parts(&[part(UUID_A, 1, 1)]).await.unwrap();
+        assert!(unbacked.is_empty(), "a present-but-unservable version is backed, never orphan-reclaimed");
+    }
+
+    #[sqlx::test]
+    async fn every_part_of_a_deleted_version_is_unbacked_and_a_sibling_version_is_isolated(pool: PgPool) {
+        // All parts of a deleted version are unbacked; a live sibling version on the same
+        // object is untouched (version-scoped, so deleting v2's SSD cannot strand v1).
+        use crate::ssd_reclaim::BackingLog;
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone());
+
+        seed_object_version(&pool, UUID_A, 1, Some("5Flive")).await; // v1 live
+        let v1 = part(UUID_A, 1, 1);
+        // v2 has no object_versions row (deleted) with two parts.
+        let v2_p1 = part(UUID_A, 2, 1);
+        let v2_p2 = part(UUID_A, 2, 2);
+
+        let unbacked = store.unbacked_parts(&[v1, v2_p1.clone(), v2_p2.clone()]).await.unwrap();
+        assert_eq!(unbacked, HashSet::from([v2_p1, v2_p2]), "both v2 parts unbacked; live v1 protected");
+    }
+
+    #[sqlx::test]
+    async fn unbacked_parts_of_an_empty_request_is_empty(pool: PgPool) {
+        use crate::ssd_reclaim::BackingLog;
+        let store = Store::from_pool(pool);
+        let unbacked = store.unbacked_parts(&[]).await.unwrap();
+        assert!(unbacked.is_empty());
+    }
+
+    /// Inserts one `cephor_replication_status` row with an explicit node + status.
+    async fn seed_status_node(pool: &PgPool, object: &str, version: i64, number: i64, status: &str, node: &str) {
+        sqlx::query(
+            "INSERT INTO cephor_replication_status (object_id, version, part_number, status, node_id) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(object)
+        .bind(version)
+        .bind(number)
+        .bind(status)
+        .bind(node)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Inserts one `parts` row with an explicit `size_bytes`.
+    async fn seed_part_size(pool: &PgPool, object: &str, version: i64, number: i64, size_bytes: Option<i64>) {
+        sqlx::query("INSERT INTO parts (object_id, object_version, part_number, size_bytes) VALUES ($1::uuid, $2, $3, $4)")
+            .bind(object)
+            .bind(version)
+            .bind(number)
+            .bind(size_bytes)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn node_backlog_bytes_sums_only_this_nodes_pending_and_draining_parts(pool: PgPool) {
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone());
+
+        // node-a, undrained (pending+draining): counted -> 100 + 200 = 300.
+        seed_status_node(&pool, UUID_A, 1, 1, "pending", "node-a").await;
+        seed_part_size(&pool, UUID_A, 1, 1, Some(100)).await;
+        seed_status_node(&pool, UUID_A, 1, 2, "draining", "node-a").await;
+        seed_part_size(&pool, UUID_A, 1, 2, Some(200)).await;
+        // node-a terminal (replicated/failed): excluded — no longer undrained work.
+        seed_status_node(&pool, UUID_A, 1, 3, "replicated", "node-a").await;
+        seed_part_size(&pool, UUID_A, 1, 3, Some(999)).await;
+        seed_status_node(&pool, UUID_A, 1, 4, "failed", "node-a").await;
+        seed_part_size(&pool, UUID_A, 1, 4, Some(888)).await;
+        // A peer node's pending part: excluded (its bytes are its own node's backlog).
+        seed_status_node(&pool, UUID_B, 2, 1, "pending", "node-b").await;
+        seed_part_size(&pool, UUID_B, 2, 1, Some(500)).await;
+        // node-a pending with a NULL size and one with no parts row at all: both contribute 0.
+        seed_status_node(&pool, UUID_A, 1, 5, "pending", "node-a").await;
+        seed_part_size(&pool, UUID_A, 1, 5, None).await;
+        seed_status_node(&pool, UUID_A, 1, 6, "pending", "node-a").await; // no parts row
+
+        assert_eq!(store.node_backlog_bytes("node-a").await.unwrap(), 300);
+        assert_eq!(store.node_backlog_bytes("node-b").await.unwrap(), 500);
+        assert_eq!(
+            store.node_backlog_bytes("node-c").await.unwrap(),
+            0,
+            "a node with no rows has zero backlog"
+        );
     }
 
     #[sqlx::test]
@@ -1312,7 +1517,10 @@ mod part_tests {
         let p = part(UUID_A, 5, 1);
         assert!(store.claim_part().await.unwrap().is_none(), "no row exists before the reconcile");
 
-        let scanner = OnePart(DiscoveredPart { part: p.clone() });
+        let scanner = OnePart(DiscoveredPart {
+            part: p.clone(),
+            age: std::time::Duration::ZERO,
+        });
         let report = reconcile_parts(&scanner, &store).await.unwrap();
         assert_eq!(report.recovered, 1, "the dropped-trigger part was recovered to pending");
 
@@ -1355,7 +1563,10 @@ mod part_tests {
             "a NULL-node row is unclaimable by any node before adoption",
         );
 
-        let scanner = OnePart(DiscoveredPart { part: p.clone() });
+        let scanner = OnePart(DiscoveredPart {
+            part: p.clone(),
+            age: std::time::Duration::ZERO,
+        });
         let report = reconcile_parts(&scanner, &node_b).await.unwrap();
         assert_eq!(report.adopted, 1, "the legacy nodeless row was adopted by the scanning node");
 
@@ -1380,7 +1591,8 @@ mod part_tests {
             "CREATE TABLE object_versions (object_id uuid NOT NULL, object_version bigint NOT NULL, address text, \
              PRIMARY KEY (object_id, object_version))",
             "CREATE TABLE multipart_uploads (upload_id uuid PRIMARY KEY, object_id uuid, initiated_at timestamptz NOT NULL)",
-            "CREATE TABLE parts (object_id uuid NOT NULL, object_version bigint NOT NULL, part_number bigint NOT NULL, upload_id uuid)",
+            "CREATE TABLE parts (object_id uuid NOT NULL, object_version bigint NOT NULL, part_number bigint NOT NULL, \
+             size_bytes bigint, upload_id uuid)",
         ] {
             sqlx::query(ddl).execute(pool).await.unwrap();
         }
