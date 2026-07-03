@@ -1,6 +1,6 @@
 //! The allocator's tick loop: drive [`run_tick`] on a timer until shutdown.
 
-use hippius_drain_core::{BudgetController, ByteRate, CephCeilingSource, CoordError, Coordinator, TickConfig, TickOutcome, run_tick};
+use hippius_drain_core::{BudgetController, ByteRate, CephCeilingSource, CoordError, Coordinator, TickConfig, TickOutcome, jittered, run_tick};
 use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -100,7 +100,7 @@ pub async fn run_allocator<C: CephCeilingSource>(
         }
         tokio::select! {
             () = &mut shutdown => break,
-            () = tokio::time::sleep(tick) => {}
+            () = tokio::time::sleep(jittered(tick)) => {}
         }
     }
     // Best-effort handoff; the lease TTL is the backstop if it fails (the caller
