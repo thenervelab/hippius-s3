@@ -23,7 +23,7 @@ use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
     BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, NodeId, NodeObservation,
-    SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate, reclaim_ssd, reconcile_parts,
+    SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate, jittered, reclaim_ssd, reconcile_parts,
 };
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -113,7 +113,7 @@ where
         tick().await;
         tokio::select! {
             () = token.cancelled() => return,
-            () = tokio::time::sleep(period) => {}
+            () = tokio::time::sleep(jittered(period)) => {}
         }
     }
 }
@@ -195,7 +195,7 @@ async fn run_drain<E: UploadEnqueuer>(token: CancellationToken, period: Duration
 
         tokio::select! {
             () = token.cancelled() => return,
-            () = tokio::time::sleep(period) => {}
+            () = tokio::time::sleep(jittered(period)) => {}
         }
     }
 }
@@ -360,7 +360,7 @@ async fn run_alloc(token: CancellationToken, coord: Arc<Coordinator>, rate_contr
         }
         tokio::select! {
             () = token.cancelled() => return,
-            () = tokio::time::sleep(poll) => {}
+            () = tokio::time::sleep(jittered(poll)) => {}
         }
     }
 }
