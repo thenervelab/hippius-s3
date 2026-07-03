@@ -18,6 +18,7 @@
 
 use crate::disk::disk_usage;
 use crate::localfs::{LocalFs, LocalSsd};
+use crate::readiness::ReadinessTracker;
 use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
@@ -37,6 +38,21 @@ use tokio_util::sync::CancellationToken;
 fn touch_liveness(path: &Path) {
     let _ = std::fs::write(path, b"ok");
 }
+
+/// Best-effort readiness touch (C8): the heartbeat rewrites this file ONLY while the drain is
+/// progressing (or idle), so a k8s `readinessProbe` checking its mtime marks a WEDGED node
+/// `NotReady`. Unlike liveness (process-alive), a stale readiness file means the drain loop has
+/// stopped handling parts despite a backlog — surfacing the wedge and gating a rolling update
+/// from stepping over stuck nodes. Errors ignored, like liveness.
+fn touch_readiness(path: &Path) {
+    let _ = std::fs::write(path, b"ready");
+}
+
+/// How long a backlog may sit with the drain loop processing NOTHING before the node reads
+/// `NotReady` (C8). Comfortably longer than the gap between per-part progress on a healthy — even
+/// slow — drain, so a legitimately long drain never flaps; short enough that a truly hung loop is
+/// caught within a couple of heartbeats.
+const READINESS_STALL: Duration = Duration::from_mins(2);
 
 /// Consecutive Ceph-write failures before the circuit breaker opens.
 const BREAKER_FAILURES: u32 = 5;
@@ -381,6 +397,9 @@ pub struct AgentRuntime<E: UploadEnqueuer> {
     /// Opt-in liveness file the heartbeat worker touches each tick, for the k8s probe.
     /// `None` (tests / drain-only e2e) writes no file.
     liveness_path: Option<Arc<PathBuf>>,
+    /// Opt-in readiness file the heartbeat worker touches only while the drain is progressing
+    /// (C8), for the k8s `readinessProbe`. `None` writes no file.
+    readiness_path: Option<Arc<PathBuf>>,
 }
 
 impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
@@ -400,6 +419,7 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
             coord: None,
             clock: Arc::new(SystemClock),
             liveness_path: None,
+            readiness_path: None,
         }
     }
 
@@ -445,6 +465,15 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
     #[must_use]
     pub fn with_liveness(mut self, path: PathBuf) -> Self {
         self.liveness_path = Some(Arc::new(path));
+        self
+    }
+
+    /// Sets the readiness file the heartbeat worker touches only while the drain is progressing
+    /// (C8), so a k8s `readinessProbe` marks a WEDGED node `NotReady` (a hung `CephFS` write
+    /// stalls draining while liveness stays fresh). Without it no file is written.
+    #[must_use]
+    pub fn with_readiness(mut self, path: PathBuf) -> Self {
+        self.readiness_path = Some(Arc::new(path));
         self
     }
 
@@ -517,16 +546,22 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
                 Arc::clone(&self.snapshot),
             );
             let liveness = self.liveness_path.clone();
+            let readiness = self.readiness_path.clone();
+            // Shared across ticks: the heartbeat is the single writer, so contention/poisoning
+            // is nil, but a Mutex keeps the FnMut closure's cross-tick state sound.
+            let readiness_tracker = Arc::new(Mutex::new(ReadinessTracker::new(Instant::now(), READINESS_STALL)));
             let HeartbeatConfig { node, max_drain_rate, poll } = heartbeat;
             supervisor.spawn(WorkerName::new("heartbeat"), move |token| {
                 run_periodic(token, poll, move || {
-                    let (ssd, store, coord, node, snapshot, liveness) = (
+                    let (ssd, store, coord, node, snapshot, liveness, readiness, readiness_tracker) = (
                         Arc::clone(&ssd),
                         Arc::clone(&store),
                         Arc::clone(&coord),
                         node.clone(),
                         Arc::clone(&snapshot),
                         liveness.clone(),
+                        readiness.clone(),
+                        Arc::clone(&readiness_tracker),
                     );
                     async move {
                         // Touch liveness FIRST, before the (blocking, possibly early-returning)
@@ -539,6 +574,22 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
                             touch_liveness(path);
                         }
                         heartbeat_once(&ssd, &store, &coord, &node, max_drain_rate, &snapshot).await;
+                        // C8 readiness: heartbeat_once just refreshed the backlog. The drain is
+                        // PROGRESSING iff it handled any part (committed + failed + deferred) since
+                        // the last tick; touch readiness only when progressing or idle, so a wedged
+                        // loop (hung Ceph) lets the file go stale -> NotReady.
+                        if let Some(path) = readiness.as_deref() {
+                            let snap = snapshot.load();
+                            let processed = snap.drained.saturating_add(snap.failed).saturating_add(snap.deferred);
+                            let ready = readiness_tracker.lock().unwrap_or_else(PoisonError::into_inner).observe(
+                                processed,
+                                snapshot.backlog(),
+                                Instant::now(),
+                            );
+                            if ready {
+                                touch_readiness(path);
+                            }
+                        }
                     }
                 })
             });

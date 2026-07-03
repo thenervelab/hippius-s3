@@ -108,7 +108,8 @@ async fn main() -> Result<ExitCode, StartupError> {
     .with_coordinator(coordinator)
     .with_heartbeat(config.heartbeat_config())
     .with_rate_control(rate_control)
-    .with_liveness(config.liveness_file.clone());
+    .with_liveness(config.liveness_file.clone())
+    .with_readiness(config.readiness_file.clone());
 
     // OTLP metrics read the runtime's live snapshot + the shared enforcer (for the breaker
     // gauge); grabbed before `run` consumes the runtime. Held until after shutdown to flush.

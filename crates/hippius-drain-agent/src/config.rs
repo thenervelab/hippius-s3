@@ -68,6 +68,10 @@ const DEFAULT_RECLAIM_GRACE: Duration = Duration::from_hours(1);
 /// k8s `livenessProbe` checks its freshness. Container-local `/tmp` is always writable.
 const DEFAULT_LIVENESS_FILE: &str = "/tmp/hippius-drain-agent.alive";
 
+/// Default path of the readiness file the runtime touches only while the drain is progressing
+/// (C8); the k8s `readinessProbe` checks its freshness to mark a wedged node `NotReady`.
+const DEFAULT_READINESS_FILE: &str = "/tmp/hippius-drain-agent.ready";
+
 /// The daemon's startup configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -130,6 +134,9 @@ pub struct Config {
     /// Path of the liveness file the runtime touches each heartbeat tick; a k8s
     /// `livenessProbe` checks its freshness to restart a wedged (not crashed) pod.
     pub liveness_file: PathBuf,
+    /// Path of the readiness file the runtime touches only while the drain is progressing (C8);
+    /// a k8s `readinessProbe` checks its freshness to mark a wedged node `NotReady`.
+    pub readiness_file: PathBuf,
 }
 
 /// A failure parsing the daemon configuration from the environment.
@@ -263,6 +270,7 @@ impl Config {
             orphan_reclaim_grace: duration_secs(&get, "CEPHOR_ORPHAN_RECLAIM_GRACE_SECS", DEFAULT_ORPHAN_RECLAIM_GRACE)?,
             drain_concurrency: positive_u32_or(&get, "CEPHOR_DRAIN_CONCURRENCY", DEFAULT_DRAIN_CONCURRENCY)?,
             liveness_file: path_or(&get, "CEPHOR_LIVENESS_FILE", DEFAULT_LIVENESS_FILE),
+            readiness_file: path_or(&get, "CEPHOR_READINESS_FILE", DEFAULT_READINESS_FILE),
         })
     }
 }
@@ -407,6 +415,16 @@ mod tests {
         pairs.push(("CEPHOR_LIVENESS_FILE", "/var/run/agent.alive"));
         let overridden = Config::from_lookup(lookup(&pairs)).unwrap();
         assert_eq!(overridden.liveness_file, PathBuf::from("/var/run/agent.alive"));
+    }
+
+    #[test]
+    fn readiness_file_defaults_and_is_overridable() {
+        let config = Config::from_lookup(lookup(&required_only())).unwrap();
+        assert_eq!(config.readiness_file, PathBuf::from("/tmp/hippius-drain-agent.ready"));
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_READINESS_FILE", "/var/run/agent.ready"));
+        let overridden = Config::from_lookup(lookup(&pairs)).unwrap();
+        assert_eq!(overridden.readiness_file, PathBuf::from("/var/run/agent.ready"));
     }
 
     #[test]
