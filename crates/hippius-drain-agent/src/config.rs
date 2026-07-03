@@ -205,15 +205,23 @@ impl Config {
         }
     }
 
-    /// The backends the drain enqueuer must push a replicated part to: `upload_backends`
+    /// The backends the drain enqueuer pushes a replicated part to: `upload_backends`
     /// unioned with `backup_backends`, deduped, upload order preserved.
     ///
-    /// This MUST equal the set the janitor's replication gate requires
-    /// (`is_replicated_on_all_backends` unions the per-version `upload_backends` with
-    /// `HIPPIUS_BACKUP_BACKENDS` the same way). If the enqueuer pushed only to
-    /// `upload_backends`, a configured backup backend would be required by the gate but
-    /// never enqueued, so the part could never reach full coverage and the janitor would
-    /// never reclaim its SSD copy — a permanent leak/deadlock (C10).
+    /// This closes the C10 backup half: without the union, a configured backup backend
+    /// would be required by the janitor gate (`is_replicated_on_all_backends` unions the
+    /// per-version `upload_backends` with `HIPPIUS_BACKUP_BACKENDS`) but never enqueued, so
+    /// the part could never reach full coverage and the janitor would never reclaim its
+    /// SSD copy — a permanent leak/deadlock.
+    ///
+    /// It is NOT fully per-version aware: the gate keys on each version's *persisted*
+    /// `object_versions.upload_backends` (and forces `['ipfs']` for a `migration` version),
+    /// while this uses the agent's *current* global `config.upload_backends`. The two match
+    /// only when every drained version's persisted set equals the current config and no
+    /// `migration` version transits the drain. A migration or config-drifted version can
+    /// therefore still be required-but-under-enqueued (the same leak, not data loss) — a
+    /// residual the G2 replication-gate sentinel is there to surface. The complete fix reads
+    /// the per-version set in the enqueuer (`load_upload_context` already reads that row).
     #[must_use]
     pub fn enqueue_backends(&self) -> Vec<String> {
         let mut backends = self.upload_backends.clone();
