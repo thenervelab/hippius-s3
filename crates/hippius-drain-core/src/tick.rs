@@ -49,9 +49,18 @@ pub struct TickConfig {
 /// The result of one tick.
 #[derive(Debug, Clone)]
 pub enum TickOutcome {
-    /// This instance was leader; the plan was computed and already written. Its
-    /// `controller` is the AIMD state to carry into the next tick.
-    Led(AllocationPlan),
+    /// This instance was leader; the plan was computed and already written under `epoch`
+    /// (the lease epoch stamped on the write). The plan's `controller` is the AIMD state
+    /// to carry into the next tick; `epoch` feeds the `drain_leader_epoch` gauge, so a
+    /// fleet-wide epoch DECREASE — a redis epoch-counter reset that would silently break
+    /// the allocation write-fence — is observable and alertable (S10/S11).
+    Led {
+        /// The allocation plan written this tick (carries the evolved AIMD controller).
+        plan: AllocationPlan,
+        /// The lease epoch this tick led under. Monotonic across the fleet by
+        /// construction (`INCR` at election).
+        epoch: u64,
+    },
     /// Another instance holds leadership; nothing was allocated this tick.
     NotLeader,
 }
@@ -81,7 +90,7 @@ pub async fn run_tick<C: CephCeilingSource>(
     let ceiling = ceiling_source.ceiling().await;
     let plan = allocate(&fleet, ceiling, prev, &config.alloc);
     coord.write_allocations(epoch, &plan.allocations).await?;
-    Ok(TickOutcome::Led(plan))
+    Ok(TickOutcome::Led { plan, epoch })
 }
 
 #[cfg(test)]
@@ -158,7 +167,10 @@ mod tests {
 
         let prev = BudgetController::new(ByteRate::new(190_000));
         let outcome = run_tick(&c, &open_ceiling(), &tick_config("alloc-a"), prev).await.unwrap();
-        assert!(matches!(outcome, TickOutcome::Led(_)), "first instance leads");
+        let TickOutcome::Led { epoch, .. } = outcome else {
+            panic!("first instance leads, got {outcome:?}");
+        };
+        assert_eq!(epoch, 1, "Led surfaces the lease epoch it led under");
 
         let stored = c.load_allocation(&node).await.unwrap().expect("budget written");
         assert_eq!(stored.epoch, 1, "stamped with the lease epoch");
@@ -209,7 +221,7 @@ mod tests {
         let prev = BudgetController::new(ByteRate::new(190_000));
 
         let first = run_tick(&c, &open_ceiling(), &tick_config("a"), prev).await.unwrap();
-        assert!(matches!(first, TickOutcome::Led(_)));
+        assert!(matches!(first, TickOutcome::Led { .. }));
 
         let second = run_tick(&c, &open_ceiling(), &tick_config("b"), prev).await.unwrap();
         assert!(matches!(second, TickOutcome::NotLeader), "b cannot lead while a holds the lease");

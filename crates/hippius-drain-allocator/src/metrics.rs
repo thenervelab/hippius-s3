@@ -66,8 +66,8 @@ fn build_provider(service_name: &'static str) -> Option<SdkMeterProvider> {
 }
 
 /// Builds the meter provider and registers the allocator's gauges (`drain_leader`,
-/// `drain_fleet_estimate_bps`), or returns `None` when monitoring is disabled or the
-/// exporter cannot be built. Both gauges read the shared [`AllocatorMetrics`].
+/// `drain_fleet_estimate_bps`, `drain_leader_epoch`), or returns `None` when monitoring is
+/// disabled or the exporter cannot be built. Every gauge reads the shared [`AllocatorMetrics`].
 #[must_use]
 pub fn init(service_name: &'static str, metrics: &Arc<AllocatorMetrics>) -> Option<MetricsHandle> {
     if !monitoring_enabled() {
@@ -92,6 +92,17 @@ pub fn init(service_name: &'static str, metrics: &Arc<AllocatorMetrics>) -> Opti
         meter
             .u64_observable_gauge("drain_fleet_estimate_bps")
             .with_callback(move |observer| observer.observe(m.fleet_estimate_bps.load(Ordering::Relaxed), &[]))
+            .build(),
+    ));
+
+    // The lease epoch this instance last led under. `max(drain_leader_epoch)` over the fleet
+    // is monotonic by construction (INCR at election), so alerting on a decrease catches a
+    // redis epoch-counter reset that would otherwise silently break the write-fence (S10/S11).
+    let m = Arc::clone(metrics);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_gauge("drain_leader_epoch")
+            .with_callback(move |observer| observer.observe(m.leader_epoch.load(Ordering::Relaxed), &[]))
             .build(),
     ));
 

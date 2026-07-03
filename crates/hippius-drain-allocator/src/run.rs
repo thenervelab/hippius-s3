@@ -22,6 +22,10 @@ pub struct AllocatorMetrics {
     pub leader: AtomicU64,
     /// The fleet write-budget estimate in bytes/s from the last led tick (`drain_fleet_estimate_bps`).
     pub fleet_estimate_bps: AtomicU64,
+    /// The lease epoch this instance last LED under (`drain_leader_epoch`); left at its last
+    /// led value while not leading. `max()` across the fleet is monotonic by construction, so
+    /// a decrease flags a redis epoch-counter reset that would silently break the write-fence.
+    pub leader_epoch: AtomicU64,
 }
 
 /// Loop-level observability inputs, bundled so `run_allocator` stays under the argument
@@ -72,9 +76,10 @@ pub async fn run_allocator<C: CephCeilingSource>(
             touch_liveness(path);
         }
         match run_tick(coord, ceiling, config, controller).await {
-            Ok(TickOutcome::Led(plan)) => {
+            Ok(TickOutcome::Led { plan, epoch }) => {
                 let estimate = plan.controller.total().get();
                 tracing::debug!(
+                    epoch,
                     fleet_estimate = estimate,
                     feasible = plan.feasible,
                     nodes = plan.allocations.len(),
@@ -82,6 +87,7 @@ pub async fn run_allocator<C: CephCeilingSource>(
                 );
                 obs.metrics.leader.store(1, Ordering::Relaxed);
                 obs.metrics.fleet_estimate_bps.store(estimate, Ordering::Relaxed);
+                obs.metrics.leader_epoch.store(epoch, Ordering::Relaxed);
                 // Carry the evolved AIMD state into the next tick.
                 controller = plan.controller;
             }
