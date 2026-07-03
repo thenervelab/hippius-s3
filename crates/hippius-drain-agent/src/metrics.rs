@@ -92,13 +92,26 @@ pub fn init(service_name: &'static str, snapshot: &Arc<SnapshotCell>, enforcer: 
             .build(),
     ));
 
-    // Saturation: undrained SSD bytes (gauge). Backlog growth is what fills the SSD and
-    // 503s every PUT on the node, so it is the key operational drain gauge.
+    // Backlog: undrained SSD bytes (gauge) — the DB-sourced true drain demand (pending +
+    // draining part bytes), NOT raw disk occupancy, so the A21/orphan leak no longer
+    // inflates it (WI-20c). The heartbeat writes it from Store::node_backlog_bytes.
     let snap = Arc::clone(snapshot);
     instruments.push(Box::new(
         meter
             .u64_observable_gauge("drain_ssd_backlog_bytes")
             .with_callback(move |observer| observer.observe(snap.backlog(), &[]))
+            .build(),
+    ));
+
+    // Saturation: SSD disk fill fraction (0.0..=1.0). This is what crosses the api's
+    // fs_cache_pressure cutoff and 503s every PUT on the node, so it is the operational
+    // alert signal — and unlike the backlog it rises with a leak even at zero drain demand.
+    // Sourced from the heartbeat's statvfs probe (bps in the snapshot), scaled to a fraction.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .f64_observable_gauge("drain_ssd_pressure")
+            .with_callback(move |observer| observer.observe(f64::from(snap.disk_pressure_bps()) / 10_000.0, &[]))
             .build(),
     ));
 
