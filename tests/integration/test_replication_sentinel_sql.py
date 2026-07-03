@@ -247,3 +247,54 @@ async def test_full_mix(conn):
     }
     assert (safe1[0], safe1[1], safe1[2]) not in result
     assert (safe2[0], safe2[1], safe2[2]) not in result
+
+
+# ===================================================== superseded versions
+
+
+async def _add_version(
+    conn, oid: str, version: int, *, live_backends: list[str], address: str | None = "5Faddr"
+) -> int:
+    """Adds another serveable version + single-chunk part to an EXISTING object; returns chunk_id."""
+    await conn.execute(
+        "INSERT INTO object_versions (object_id, object_version, address, version_type, upload_backends) "
+        "VALUES ($1::uuid, $2, $3, NULL, ARRAY['arion'])",
+        oid,
+        version,
+        address,
+    )
+    part_id = _oid()
+    await conn.execute(
+        "INSERT INTO parts (part_id, object_id, object_version, part_number) VALUES ($1::uuid, $2::uuid, $3, 1)",
+        part_id,
+        oid,
+        version,
+    )
+    chunk_id: int = await conn.fetchval("INSERT INTO part_chunks (part_id) VALUES ($1::uuid) RETURNING id", part_id)
+    for backend in live_backends:
+        await conn.execute(
+            "INSERT INTO chunk_backend (chunk_id, backend, deleted) VALUES ($1, $2, false)", chunk_id, backend
+        )
+    return chunk_id
+
+
+async def test_a_covered_superseded_version_of_a_live_object_is_not_flagged(conn):
+    # An overwrite leaves the old version live+serveable and fully replicated (S3 does not
+    # unpin on overwrite). The sentinel must not false-positive on such a superseded version.
+    oid = _oid()
+    await conn.execute("INSERT INTO objects (object_id, deleted_at) VALUES ($1::uuid, NULL)", oid)
+    await _add_version(conn, oid, 1, live_backends=["arion"])  # superseded, covered
+    await _add_version(conn, oid, 2, live_backends=["arion"])  # current, covered
+    assert await _violations(conn, backup=[]) == set(), "two covered live versions raise no alarm"
+
+
+async def test_an_uncovered_superseded_version_is_still_flagged(conn):
+    # But a superseded version whose copies are genuinely missing IS a real gap (its data is
+    # still readable and at risk) — the sentinel correctly flags v1, not a false positive.
+    oid = _oid()
+    await conn.execute("INSERT INTO objects (object_id, deleted_at) VALUES ($1::uuid, NULL)", oid)
+    v1_chunk = await _add_version(conn, oid, 1, live_backends=[])  # superseded, UNCOVERED
+    await _add_version(conn, oid, 2, live_backends=["arion"])  # current, covered
+    assert await _violations(conn, backup=[]) == {(oid, 1, v1_chunk)}, (
+        "only the uncovered superseded version is flagged"
+    )
