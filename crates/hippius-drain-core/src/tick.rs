@@ -87,13 +87,15 @@ pub async fn run_tick<C: CephCeilingSource>(
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr, reason = "tests")]
 mod tests {
-    use super::{StaticCeiling, TickConfig, TickOutcome, run_tick};
+    use super::{CephCeilingSource, StaticCeiling, TickConfig, TickOutcome, run_tick};
     use crate::alloc::{AllocConfig, Allocation, BudgetController, NodeObservation};
     use crate::coordination::{CoordError, Coordinator};
     use crate::ids::NodeId;
     use crate::state::CephCeiling;
     use crate::units::{ByteRate, Bytes, DiskPressure};
     use core::str::FromStr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     /// A coordinator on the test Redis under a per-test prefix, or `None` to skip (Rust
@@ -211,5 +213,83 @@ mod tests {
 
         let second = run_tick(&c, &open_ceiling(), &tick_config("b"), prev).await.unwrap();
         assert!(matches!(second, TickOutcome::NotLeader), "b cannot lead while a holds the lease");
+    }
+
+    /// A ceiling source that parks at `ceiling()` — the slow step in the R3 window — until
+    /// released, signalling when it is reached so a test can interleave a takeover precisely
+    /// there. Interior-shared via `Arc<AtomicBool>` because `ceiling(&self)` takes `&self`.
+    struct PausingCeiling {
+        ceiling: CephCeiling,
+        reached: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl CephCeilingSource for PausingCeiling {
+        async fn ceiling(&self) -> CephCeiling {
+            self.reached.store(true, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            self.ceiling
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
+    async fn r3_a_tick_paused_at_ceiling_is_fenced_when_a_successor_takes_over_mid_tick() {
+        // R3 at the tick level (T4-C failpoint): a leader deposed BETWEEN acquiring its lease
+        // and writing — while parked in the slow `ceiling()` — must have its write fenced even
+        // though the successor has bumped `cephor:epoch` but written NO alloc key yet. This is
+        // the exact window `run_tick` opens (acquire → load_fleet → ceiling[SLOW] → write) and
+        // that a per-alloc-key fence alone cannot see.
+        let Some(c) = coord("cephor-test:r3-tick-window:").await else {
+            eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");
+            return;
+        };
+        let node = NodeId::from_str("n1").unwrap();
+        // A hungry node so the plan is non-empty and `write_allocations` actually runs the
+        // fenced script (an empty plan is a no-op Ok, which would not exercise the fence).
+        c.upsert_node_state(&node, &observation()).await.unwrap();
+
+        let reached = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let ceiling = PausingCeiling {
+            ceiling: CephCeiling::Open(ByteRate::new(1_000_000_000)),
+            reached: Arc::clone(&reached),
+            release: Arc::clone(&release),
+        };
+        // A takes a SHORT lease so it lapses while parked in `ceiling()`.
+        let config = TickConfig {
+            instance_id: "a".to_owned(),
+            lease_ttl: Duration::from_secs(1),
+            alloc: alloc_config(),
+        };
+        let prev = BudgetController::new(ByteRate::new(190_000));
+        let c_a = c.clone();
+        let a_tick = tokio::spawn(async move { run_tick(&c_a, &ceiling, &config, prev).await });
+
+        // Wait until A is parked inside `ceiling()` (lease acquired at epoch eA, no write yet).
+        while !reached.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Let A's 1s lease lapse, then B takes over: `cephor:epoch` bumps to eB > eA. B does NOT
+        // write any allocation (it is modelling a successor still early in its own tick).
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let b = c
+            .acquire_or_renew_leadership("b", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .expect("b takes over the lapsed lease");
+
+        // Release A: it finishes `ceiling()` and tries to write at its now-stale epoch eA.
+        release.store(true, Ordering::SeqCst);
+        let outcome = a_tick.await.unwrap();
+        assert!(
+            matches!(outcome, Err(CoordError::Fenced { .. })),
+            "the deposed A's mid-tick write is fenced (b.epoch={}), got {outcome:?}",
+            b.epoch,
+        );
+        // Nothing was written at the stale epoch: no alloc key exists (A fenced, B never wrote).
+        assert!(c.load_allocation(&node).await.unwrap().is_none(), "the fenced tick wrote no budget",);
     }
 }
