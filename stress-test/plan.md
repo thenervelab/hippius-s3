@@ -10,6 +10,56 @@
 
 ---
 
+## 0. Status & results so far (updated 2026-07-03)
+
+The first increment of this harness (`stress-test/harness/` — the S3-facing functional/durability/concurrency
+scenarios + cluster invariant probes over kubectl→Postgres/Prometheus) is **built and running against
+`s3-staging.hippius.com`**. It is not yet the full plan below (no `inv-guard` background asserter, no chaos matrix, no
+allocator-under-pressure rigs, no in-cluster load driver) — but it already drove four production bugs to fixed, merged,
+and re-verified live. Runs are archived on PR #226 (`feat/stress-test-harness`, `results/run-*.md`).
+
+### What the harness found → what we fixed (all merged to `staging`)
+
+| Harness signal | Fix (merged) |
+|---|---|
+| `drain-convergence` slow; `drain_fleet_estimate_bps` pinned at 1 MB/s | **#227** — AIMD `target_p99` 50 ms → 2000 ms. `observed_p99` is a whole-part SSD→CephFS copy (~330–410 ms), so the 50 ms target fired the saturation back-off every tick and pinned the fleet write-budget at the `min_total` floor. **The bottleneck.** |
+| T1 crashed on CreateBucket `UploadNotPermitted: Failed to fetch billing balance` | **#229** — classify a transient billing-lookup failure as retryable → retry, then 503 SlowDown, never a hard 402. |
+| (new gate) `func-mpu-wrong-etag` | **#228** — CompleteMultipartUpload now validates client part ETags (`InvalidPart`) + ordering (`InvalidPartOrder`). |
+| A1 read-path hang | **#230** — envelope-race cold version-fallback now enqueues a download instead of hanging on pub/sub to `HIPPIUS_CACHE_TTL`. |
+| Replication lag stuck at ~5 s after the budget was unpinned | **#231** — `CEPHOR_DEFER_BACKOFF_SECS` + `CEPHOR_DRAIN_POLL_SECS` 5 s → 1 s (staging). The residual lag was two 5 s timers, not throughput: an MPU part lands before its Complete writes `object_versions.address`, so the first claim defers and re-parks 5 s. |
+
+### Benchmark — before → after (same harness, same endpoint, live staging)
+
+| | Baseline (pre-fix) | After #227–#230 | **After #231 (defer/poll 1 s)** |
+|---|---|---|---|
+| Harness verdict | 6 pass / 2 fail | 13 pass / 1 fail | 12 pass / 2 fail\* |
+| Drain fleet write-budget | **1 MB/s** (pinned at floor) | ~1 GB/s (ramps to `max_total`) | ~1 GB/s |
+| Replication lag p50 / p99 (SQL `updated_at−landed_at`) | ~5 s (under the 1 MB/s cap) | 4.6 s / 5.9 s | **1.33 s / 2.60 s** |
+| Durability (non-overridable) | 105/105 | 105/105 | **105/105 byte-identical** |
+| CreateBucket / MPU-wrong-ETag | ❌ crash / (n/a) | ✅ / ✅ rejected | ✅ / ✅ rejected |
+
+\* Both post-#231 "fails" are **not real regressions**: (1) `inv-G1-single-leader` read `sum(drain_leader)=2` because the
+harness sampled *during the deploy rollout* — the departing allocator pod's series had not expired; it settled to `1`
+immediately after (epoch fence guarantees one leader). (2) `drain-convergence` counts the two **negative-path MPU test
+objects** (`mpu-badetag`, `mpu-abort`) whose Complete was correctly rejected/aborted → `object_versions.address` NULL →
+the drain can't enqueue them **by design**. Every legitimate object (112/112 with an address) reached `replicated`,
+0 pending.
+
+### Where we are right now
+
+- **Drain throughput is no longer the bottleneck.** Budget unpinned to the ~1 GB/s ceiling; measured demand in these runs
+  was tiny (~1.4 MB/s) because the harness is **client-uplink-bound from a laptop over the internet** — so the *stack's*
+  true per-node knee (S1) is still **unmeasured**. That needs an in-cluster load driver (§4.3) — the top open perf item.
+- **Replication lag is now ~1.3 s p50 / 2.6 s p99** on staging, well inside S2/S3.
+- **Two real gaps the runs surfaced, tracked in the todo:** (A21) aborted/rejected MPUs leak orphan
+  `cephor_replication_status` pending rows the reaper never cleans (3 live, ~7 days old); and (WI-20/R1) the ingest-SSD
+  orphan-byte leak (82 %/69 %). Both are P0/P1 for cutover.
+- **Harness fix owed:** exclude the negative-path MPU objects from the `drain-convergence` set so a clean run reads 14/14.
+
+Full narrative + morning next-steps: [`../s3-2.1-checkpoint-20260702.md`](../s3-2.1-checkpoint-20260702.md).
+
+---
+
 ## 1. Why we are building this
 
 The drain stack replaced the synchronous write path with an async **SSD → CephFS → backend** pipeline coordinated by a
