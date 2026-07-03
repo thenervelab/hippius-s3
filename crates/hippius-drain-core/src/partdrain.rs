@@ -30,9 +30,16 @@ use thiserror::Error;
 /// exhausted retry is real corruption. Kept small so a genuinely-bad chunk fails promptly.
 const CHUNK_COPY_ATTEMPTS: u32 = 3;
 
-/// Which durability checkpoint an I/O error struck, for diagnostics.
+/// Which durability checkpoint an I/O error struck, for diagnostics — and, for the breaker,
+/// which SIDE raised it. The `Ssd*` steps touch the node-local SSD; the rest touch the
+/// shared `CephFS` pool, so only the latter are evidence of pool unhealth (see
+/// [`PartDrainError::is_ceph_write_failure`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainStep {
+    /// Reading the local SSD source — listing chunks, the part meta, or opening a
+    /// chunk/meta source. A failure here is local-disk unhealth, NOT `CephFS`-write
+    /// unhealth, so it must never trip the node-global Ceph breaker.
+    SsdRead,
     /// Copying, fsync, and atomic rename onto `CephFS`.
     Persist,
     /// Re-hashing a `CephFS` copy.
@@ -46,6 +53,7 @@ pub enum DrainStep {
 impl core::fmt::Display for DrainStep {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
+            Self::SsdRead => "ssd_read",
             Self::Persist => "persist",
             Self::Hash => "hash",
             Self::Cleanup => "cleanup",
@@ -309,9 +317,10 @@ impl PartDrainError {
     /// `ENOENT` (the pool dir removed between `create_dir_all` and the file write) would
     /// also read as benign, but nothing removes an actively-draining part's pool dir, and
     /// a real degrading `CephFS` mount surfaces as `ENOTCONN`/`EIO` (kind `Other`), not
-    /// `NotFound` — so a genuine pool failure still trips the breaker. Distinguishing the
-    /// source-open `ENOENT` from a pool-write `ENOENT` at the type level is a tracked
-    /// follow-up (would need a dedicated `DrainStep`/source-open error tag).
+    /// `NotFound` — so a genuine pool failure still trips the breaker. The source-open vs
+    /// pool-write `ENOENT` distinction is now expressible via [`DrainStep::SsdRead`] (added
+    /// for the breaker fix); this benign check stays step-agnostic on purpose, since nothing
+    /// removes an actively-draining pool dir, so a Ceph-side `ENOENT` cannot arise in practice.
     #[must_use]
     pub fn is_benign_deferral(&self) -> bool {
         match self {
@@ -323,16 +332,35 @@ impl PartDrainError {
 
     /// Whether this failure is genuine evidence of `CephFS`-write unhealth — the only
     /// class that should trip the node-global Ceph breaker. True for a real pool I/O error
-    /// (non-ENOENT `Io`) and a chunk byte-mismatch (a torn/corrupt pool write). A
-    /// `Store`/claim-coordination error is a Postgres-domain fault, NOT Ceph unhealth, so
-    /// it is excluded — it must not halt draining of a healthy pool; and `Enqueue` /
-    /// `IncompleteSource` are benign deferrals (see [`is_benign_deferral`](Self::is_benign_deferral)).
+    /// (a non-ENOENT `Io` on a Ceph-side step — `Persist`/`Hash`/`Cleanup`) and a chunk
+    /// byte-mismatch (a torn/corrupt pool write).
+    ///
+    /// An `Io` on an SSD-side step (`SsdRead` reading the local source, or `Unlink` removing
+    /// it after commit) is excluded WHATEVER the errno: a local-disk fault is not pool
+    /// unhealth, so it must not halt draining of a healthy pool from every OTHER part on the
+    /// node — it defers this part instead (`breaker_signal_for` maps a non-benign,
+    /// non-Ceph error to [`BreakerSignal::Deferred`]). A `Store`/claim-coordination error
+    /// (Postgres-domain) is likewise excluded, and `Enqueue` / `IncompleteSource` are benign
+    /// deferrals (see [`is_benign_deferral`](Self::is_benign_deferral)).
     #[must_use]
     pub fn is_ceph_write_failure(&self) -> bool {
         match self {
+            // SSD-side step (local-disk unhealth, whatever the errno — the fix for the
+            // `Persist`-overload where a local SSD-read EIO tripped the node-global Ceph
+            // breaker), plus the non-Ceph domains (Postgres store/claim, enqueue-not-ready,
+            // incomplete source): none is evidence of pool unhealth. Matched BEFORE the
+            // general `Io` arm so an SSD-side `Io` is caught here first.
+            Self::Io {
+                step: DrainStep::SsdRead | DrainStep::Unlink,
+                ..
+            }
+            | Self::Store(_)
+            | Self::Enqueue(_)
+            | Self::IncompleteSource { .. } => false,
+            // Any remaining `Io` is a Ceph-side step (`Persist`/`Hash`/`Cleanup`): a non-ENOENT
+            // error is genuine pool unhealth.
             Self::Io { source, .. } => source.kind() != std::io::ErrorKind::NotFound,
             Self::ChunkMismatch { .. } => true,
-            Self::Store(_) | Self::Enqueue(_) | Self::IncompleteSource { .. } => false,
         }
     }
 
@@ -387,7 +415,7 @@ where
         return Ok(DrainOutcome::AlreadyReplicated);
     }
 
-    let chunks = ssd.list_chunks(part).await.map_err(PartDrainError::io(DrainStep::Persist))?;
+    let chunks = ssd.list_chunks(part).await.map_err(PartDrainError::io(DrainStep::SsdRead))?;
 
     // Completeness gate: meta.json is the api's part-complete marker, but a part whose
     // chunks were partly removed after meta landed still scans as "has files". Read the
@@ -395,7 +423,7 @@ where
     // truncated part is deferred (SSD copy intact) rather than committed + unlinked. Since
     // list_chunks returns ascending indices, the enumerate check also rejects a hole (e.g.
     // {0,1,3} against num_chunks=3), not just a short count.
-    let meta = ssd.part_meta(part).await.map_err(PartDrainError::io(DrainStep::Persist))?;
+    let meta = ssd.part_meta(part).await.map_err(PartDrainError::io(DrainStep::SsdRead))?;
     let present = u32::try_from(chunks.len()).unwrap_or(u32::MAX);
     let complete = present == meta.num_chunks && chunks.iter().enumerate().all(|(i, c)| c.get() == u32::try_from(i).unwrap_or(u32::MAX));
     if !complete {
@@ -415,7 +443,7 @@ where
     // partial pool copy, and leaves the SSD source intact — never commit it.
     for index in &chunks {
         let index = *index;
-        let source = ssd.chunk_source(part, index).map_err(PartDrainError::io(DrainStep::Persist))?;
+        let source = ssd.chunk_source(part, index).map_err(PartDrainError::io(DrainStep::SsdRead))?;
         let mut mismatch: Option<(String, String)> = None;
         for _ in 0..CHUNK_COPY_ATTEMPTS {
             let copy_hash = ceph
@@ -445,7 +473,7 @@ where
 
     // Persist meta LAST — only now, with every chunk durably copied and byte-verified,
     // may the reader's `meta.json` gate flip on the pool copy.
-    let meta_source = ssd.meta_source(part).map_err(PartDrainError::io(DrainStep::Persist))?;
+    let meta_source = ssd.meta_source(part).map_err(PartDrainError::io(DrainStep::SsdRead))?;
     ceph.persist_meta(&meta_source, part)
         .await
         .map_err(PartDrainError::io(DrainStep::Persist))?;
@@ -496,7 +524,7 @@ mod tests {
         // is benign — the pool is healthy, there is just nothing to copy. It must NOT trip
         // the node-global Ceph breaker.
         let vanished = PartDrainError::Io {
-            step: DrainStep::Persist,
+            step: DrainStep::SsdRead,
             source: io::Error::from(io::ErrorKind::NotFound),
         };
         assert!(vanished.is_benign_deferral(), "a vanished SSD source (ENOENT) is a benign deferral");
@@ -555,7 +583,7 @@ mod tests {
         assert!(mismatch.is_ceph_write_failure(), "a torn-copy byte mismatch is a Ceph-write failure");
 
         let vanished = PartDrainError::Io {
-            step: DrainStep::Persist,
+            step: DrainStep::SsdRead,
             source: io::Error::from(io::ErrorKind::NotFound),
         };
         assert!(!vanished.is_ceph_write_failure(), "an ENOENT vanished source is not a Ceph failure");
@@ -568,6 +596,35 @@ mod tests {
         assert!(!enqueue.is_ceph_write_failure(), "an enqueue deferral is not a Ceph failure");
         let incomplete = PartDrainError::IncompleteSource { declared: 3, present: 2 };
         assert!(!incomplete.is_ceph_write_failure(), "an incomplete SSD part is not a Ceph failure");
+
+        // C13: a NON-ENOENT I/O error on an SSD-side step (a local-disk EIO reading the source,
+        // or an unlink failure after commit) is local-disk unhealth, NOT a Ceph-write failure —
+        // it must NOT trip the node-global Ceph breaker. This is the `Persist`-overload bug: the
+        // same steps used to be tagged `Persist` (Ceph-write), so a local SSD-read EIO wrongly
+        // tripped the breaker and wedged draining of a healthy pool.
+        for step in [DrainStep::SsdRead, DrainStep::Unlink] {
+            for kind in [io::ErrorKind::Other, io::ErrorKind::PermissionDenied, io::ErrorKind::TimedOut] {
+                let ssd_io = PartDrainError::Io {
+                    step,
+                    source: io::Error::from(kind),
+                };
+                assert!(
+                    !ssd_io.is_ceph_write_failure(),
+                    "an SSD-side I/O error ({step:?}, {kind:?}) is local-disk unhealth, not a Ceph failure",
+                );
+            }
+        }
+        // A non-ENOENT I/O error on each Ceph-side step DOES trip the breaker.
+        for step in [DrainStep::Persist, DrainStep::Hash, DrainStep::Cleanup] {
+            let ceph_io = PartDrainError::Io {
+                step,
+                source: io::Error::from(io::ErrorKind::Other),
+            };
+            assert!(
+                ceph_io.is_ceph_write_failure(),
+                "a real pool I/O error on a Ceph-side step ({step:?}) is a Ceph-write failure",
+            );
+        }
     }
 
     #[test]
@@ -597,6 +654,15 @@ mod tests {
             })),
             BreakerSignal::CephFailure,
             "a real pool I/O error trips the breaker",
+        );
+        // C13: a local SSD-read EIO defers the part, it does NOT trip the Ceph breaker.
+        assert_eq!(
+            breaker_signal_for(&Err(PartDrainError::Io {
+                step: DrainStep::SsdRead,
+                source: io::Error::from(io::ErrorKind::Other),
+            })),
+            BreakerSignal::Deferred,
+            "a local SSD-read EIO defers the part, it must NOT trip the Ceph breaker",
         );
     }
 
