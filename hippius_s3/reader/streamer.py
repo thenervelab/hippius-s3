@@ -29,6 +29,7 @@ async def stream_plan(
     address: str = "",
     bucket_name: str = "",
     prefetch_chunks: int = 0,
+    chunk_timeout: float | None = None,
 ) -> AsyncGenerator[bytes, None]:
     prefetch = max(0, int(prefetch_chunks))
 
@@ -41,6 +42,7 @@ async def stream_plan(
                 int(object_version),
                 int(item.part_number),
                 int(item.chunk_index),
+                timeout=chunk_timeout,
             )
             pt = await decrypt_chunk_if_needed(
                 c,
@@ -66,6 +68,7 @@ async def stream_plan(
             int(object_version),
             int(item.part_number),
             int(item.chunk_index),
+            timeout=chunk_timeout,
         )
 
     # A small lookahead window to overlap Redis fetch with decrypt + response IO.

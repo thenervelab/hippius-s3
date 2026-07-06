@@ -231,6 +231,19 @@ async def process_download_request(
                                 f"part={part_number} ci={chunk_index} "
                                 f"after {max_attempts} attempts: {exc}"
                             )
+                            # A4: wake any waiting readers. notify_chunk is a "readiness changed,
+                            # re-check" signal — on a terminal failure the woken streamer re-fetches,
+                            # finds nothing, and raises promptly instead of riding the full
+                            # per-chunk wait (stream_chunk_timeout) / cache_ttl. Request-level
+                            # retry (#237) may still re-drive the whole DCR later; a client GET that
+                            # failed fast simply re-reads and picks up the eventual success.
+                            with contextlib.suppress(Exception):
+                                await obj_cache.notify_chunk(
+                                    download_request.object_id,
+                                    int(download_request.object_version),
+                                    part_number,
+                                    chunk_index,
+                                )
                             return False
                         sleep_for = base_sleep * attempt + random.uniform(0, jitter)
                         logger.warning(
@@ -282,14 +295,20 @@ async def process_download_request(
                         await asyncio.gather(*[_fetch_chunk(part_number, spec, part_span) for spec in batch])
                     )
 
-                # Release the coalescing lock (set by build_stream_context on
-                # enqueue). Key format must match that callsite exactly.
+                # Release the coalescing lock (set by build_stream_context on enqueue). Key format
+                # must match that callsite exactly. A5: compare-and-delete on the lock's token so a
+                # slow part that outlived the lock TTL — after which ANOTHER streamer re-acquired it
+                # — doesn't have its lock stolen out from under it. The token is the enqueuing
+                # streamer's ray_id (build_stream_context sets the lock value to it); mirror the DLQ
+                # release Lua (dlq/base.py). Best-effort: a failed release just lets the TTL expire.
                 with contextlib.suppress(Exception):
                     lock_key = (
                         f"download_in_progress:{download_request.object_id}"
                         f":v:{int(download_request.object_version)}:part:{part_number}"
                     )
-                    await obj_cache.redis.delete(lock_key)
+                    token = str(getattr(download_request, "ray_id", None) or "anonymous")
+                    release_lua = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
+                    await obj_cache.redis.eval(release_lua, 1, lock_key, token)
                 return all(chunk_results)
 
         try:

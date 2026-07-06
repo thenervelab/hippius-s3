@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 from typing import Iterable
 from typing import List
@@ -7,6 +8,14 @@ from typing import List
 from .db_meta import read_parts_plain_and_chunk_sizes_batch
 from .types import ChunkPlanItem
 from .types import RangeRequest
+
+
+logger = logging.getLogger(__name__)
+
+# A6: fallback chunk size when a part has bytes but a missing/zero `chunk_size_bytes` (DB
+# inconsistency). MUST match the downloader's eager-meta fallback (`downloader.py`) so the plan and
+# the written chunks agree on chunk count/boundaries.
+_DEFAULT_CHUNK_SIZE_BYTES = 4 * 1024 * 1024
 
 
 async def build_chunk_plan(
@@ -37,8 +46,21 @@ async def build_chunk_plan(
 
     plan: List[ChunkPlanItem] = []
     for pn, plain_size, chunk_size in sizes:
-        if plain_size <= 0 or chunk_size <= 0:
-            continue
+        if plain_size <= 0:
+            continue  # genuinely empty part — nothing to plan
+        if chunk_size <= 0:
+            # A6: size>0 but no chunk_size is a DB inconsistency. Dropping the part here would
+            # truncate the response while Content-Length still counts its bytes. Mirror the
+            # downloader's 4 MiB fallback so the bytes are planned; warn so the inconsistency shows.
+            logger.warning(
+                "planner: part %s v%s has plain_size=%d but chunk_size=%d; using %d-byte fallback",
+                pn,
+                object_version,
+                plain_size,
+                chunk_size,
+                _DEFAULT_CHUNK_SIZE_BYTES,
+            )
+            chunk_size = _DEFAULT_CHUNK_SIZE_BYTES
         num_chunks = (plain_size + chunk_size - 1) // chunk_size
         part_offset = int(offsets.get(int(pn), 0))
 

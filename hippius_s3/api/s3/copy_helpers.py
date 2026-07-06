@@ -204,6 +204,7 @@ async def handle_streaming_copy(
         },
         rng=None,
         address=request.state.account.main_account,
+        bound_first_chunk=True,  # A2: fail fast (503) if the source is still draining, before writing the destination
     )
 
     content_type = str(source_object["content_type"])

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 from typing import AsyncGenerator
@@ -159,6 +160,10 @@ async def _enqueue_missing_downloads(
             chunks=dl_parts,
             ray_id=info.get("ray_id"),
             download_backends=db_backends if db_backends else None,
+            # A6: a genuine backstop so the downloader's stale-discard isn't dead for read-path
+            # DCRs. cache_ttl is the longest any streamer waits, so a DCR older than that has no
+            # live waiter and is safe to drop unprocessed.
+            expire_at=time.time() + float(cfg.cache_ttl_seconds),
         )
         await enqueue_download_request(req)
 
@@ -325,13 +330,15 @@ async def read_response(
         address=address,
         bucket_name=str(info.get("bucket_name", "")),
         prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
+        chunk_timeout=float(cfg.stream_chunk_timeout_seconds),
     )
     # A2: bound the wait for the FIRST chunk. `stream_plan` otherwise waits up to cache_ttl_seconds
     # (~1h) per chunk, so an un-drained object whose part is on no backend yet would hang the whole
     # GET for an hour. Peek the first chunk here, before the StreamingResponse is returned, so a
     # first-chunk timeout surfaces as a retryable 503 (DownloadNotReadyError, caught by the endpoint)
-    # *before* the 200/206 headers are committed. Warm reads return the chunk immediately; once the
-    # first chunk lands the object is actively draining, so later chunks keep the full wait.
+    # *before* the 200/206 headers are committed. Warm reads return the chunk immediately. A3 bounds
+    # each LATER chunk to stream_chunk_timeout_seconds (via chunk_timeout above), so a mid-stream
+    # permanent failure breaks the stream in minutes instead of hanging the open response ~1h.
     first_timeout = float(cfg.stream_first_chunk_timeout_seconds)
     first_chunk: bytes | None = None
     try:
@@ -376,11 +383,18 @@ async def stream_object(
     *,
     rng: RangeRequest | None,
     address: str,
+    bound_first_chunk: bool = False,
 ) -> Any:
     """Return an async iterator of plaintext bytes for the requested object.
 
     This wraps build_stream_context and stream_plan so callers don't need to know
     about parts catalogs, chunk plans, or downloader details.
+
+    A2/A3: `bound_first_chunk=True` (used by streaming CopyObject, which reads a *source* object)
+    eagerly peeks the first chunk under `stream_first_chunk_timeout_seconds` and raises
+    `DownloadNotReadyError` if it doesn't arrive — so a copy whose source is still draining fails
+    fast with a retryable 503 *before* the caller writes a partial destination, instead of hanging
+    up to cache_ttl. Every chunk is bounded by `stream_chunk_timeout_seconds` regardless.
     """
     cfg = get_config()
     ctx = await build_stream_context(
@@ -391,7 +405,7 @@ async def stream_object(
         rng=rng,
         address=address,
     )
-    return stream_plan(
+    gen = stream_plan(
         obj_cache=obj_cache,
         object_id=info["object_id"],
         object_version=ctx.object_version,
@@ -404,4 +418,27 @@ async def stream_object(
         address=address,
         bucket_name=str(info.get("bucket_name", "")),
         prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
+        chunk_timeout=float(cfg.stream_chunk_timeout_seconds),
     )
+    if not bound_first_chunk:
+        return gen
+
+    # Eager bounded first-chunk peek (A2), mirroring read_response, so a not-ready source surfaces
+    # as DownloadNotReadyError before any destination bytes are written.
+    try:
+        first_chunk = await asyncio.wait_for(gen.__anext__(), timeout=float(cfg.stream_first_chunk_timeout_seconds))
+    except StopAsyncIteration:
+        first_chunk = None  # empty (zero-byte) source
+    except (TimeoutError, asyncio.TimeoutError) as exc:
+        await gen.aclose()
+        raise DownloadNotReadyError(
+            "Parts not ready: source first chunk did not arrive within the initial stream timeout"
+        ) from exc
+
+    async def _bounded() -> AsyncGenerator[bytes, None]:
+        if first_chunk is not None:
+            yield first_chunk
+        async for chunk in gen:
+            yield chunk
+
+    return _bounded()

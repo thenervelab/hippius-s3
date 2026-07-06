@@ -272,8 +272,19 @@ class RedisObjectPartsCache:
 
     # ---- pub/sub API ----
 
-    async def wait_for_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> bytes:
-        timeout = _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS)
+    async def wait_for_chunk(
+        self,
+        object_id: str,
+        object_version: int,
+        part_number: int,
+        chunk_index: int,
+        *,
+        timeout: float | None = None,  # noqa: ASYNC109
+    ) -> bytes:
+        # A3: callers (the streamer) can pass a per-chunk bound; default to the full cache TTL so
+        # existing callers are unchanged.
+        if timeout is None:
+            timeout = _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS)
         return await self._notifier.wait_for_chunk(
             object_id,
             int(object_version),
