@@ -9,6 +9,7 @@ from __future__ import annotations
 import pathlib
 import sys
 
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "stress-test"))
 
 from inv import guards  # noqa: E402
