@@ -36,7 +36,6 @@ from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
 from hippius_s3.repositories.sub_token_scope_repository import SubTokenScopeRepository
-from hippius_s3.storage_version import UnsupportedStorageVersionError
 
 
 logger = logging.getLogger(__name__)
@@ -305,28 +304,12 @@ def factory() -> FastAPI:
 
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception) -> Response:
-        if exc.__class__.__name__ == "DownloadNotReadyError" or str(exc) in {"initial_stream_timeout"}:
-            return s3_errors.s3_error_response(
-                code="SlowDown",
-                message="Object not ready for download yet. Please retry.",
-                status_code=503,
-            )
-        # DB connection-pool saturation → retryable 503 SlowDown (see errors.pool_saturation_response).
-        pool_busy = s3_errors.pool_saturation_response(exc)
-        if pool_busy is not None:
-            return pool_busy
-        # Read-path key/crypto failures → clean S3 error instead of a bare 500: a KMS brownout is a
-        # retryable 503; a genuinely unreadable object (missing envelope / InvalidTag) is a 500 with
-        # a proper S3 body. See errors.read_path_crypto_error_response.
-        crypto_err = s3_errors.read_path_crypto_error_response(exc)
-        if crypto_err is not None:
-            return crypto_err
-        if isinstance(exc, UnsupportedStorageVersionError):
-            return s3_errors.s3_error_response(
-                code="NotImplemented",
-                message=(f"Object uses unsupported storage version (sv={exc.storage_version}). Migrate object to v5."),
-                status_code=501,
-            )
+        # The full read-path mapping (not-ready → 503, pool saturation → 503, key/crypto → 503/500,
+        # unsupported storage/suite → 501) is a testable pure function in errors.py. A recognized
+        # failure returns a well-formed S3 error; anything else re-raises to uvicorn's 500.
+        mapped = s3_errors.map_read_path_exception(exc)
+        if mapped is not None:
+            return mapped
         raise exc
 
     @app.get("/robots.txt", include_in_schema=False)

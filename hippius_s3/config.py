@@ -202,7 +202,7 @@ class Config:
     # (DownloadNotReadyError). Keeps an un-drained/never-arriving object (e.g. a part not yet on any
     # backend) from hanging the whole request up to cache_ttl_seconds (~1h). Later chunks keep the
     # full wait — once the first chunk lands the object is actively draining.
-    stream_first_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS:60", convert=int)
+    stream_first_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS:90", convert=int)
     # Hot-retention window for the FS cache: chunks read within this window
     # are protected from janitor deletion so frequently-accessed content
     # stays on NVMe. Touched on every read by the API/streamer.

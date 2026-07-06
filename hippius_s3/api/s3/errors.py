@@ -118,28 +118,34 @@ def pool_saturation_response(exc: BaseException) -> Response | None:
     return None
 
 
-# Stable RuntimeError markers raised by kek_service on a KMS/key failure. The transient set is a
-# brownout (retry helps); the permanent set means the object's key material is unusable (retry does
-# not help). We string-match because kek_service raises RuntimeError(<marker>) — same convention the
-# global handler already uses for "initial_stream_timeout".
-_KMS_BROWNOUT_MARKERS = frozenset({"kms_unavailable", "kms_auth_failed", "kms_error"})
-_KEY_UNREADABLE_MARKERS = frozenset({"v5_missing_envelope_metadata", "local_unwrap_failed"})
+# Stable RuntimeError markers raised by kek_service on a KMS/key failure. TRANSIENT is a brownout
+# (retry helps → 503); UNREADABLE means the object's key material is unusable (retry can't help →
+# 500). We string-match because kek_service raises RuntimeError(<marker>) — same convention the
+# global handler already uses for "initial_stream_timeout". Keep these in sync with the raises in
+# hippius_s3/services/kek_service.py.
+_KEY_TRANSIENT_MARKERS = frozenset({"kms_unavailable", "kms_auth_failed", "kms_error", "kek_database_unavailable"})
+_KEY_UNREADABLE_MARKERS = frozenset({"v5_missing_envelope_metadata", "local_unwrap_failed", "kek_not_found"})
+# Deploy-misconfig KEK errors raised as full sentences (KMS mode disabled with KMS-wrapped keys, or
+# the client never initialized). Reachable on a cold GET of a misconfigured pod — still a permanent
+# 500, but with a proper S3 body instead of a bare one. Matched by a stable substring.
+_KEY_MISCONFIG_SUBSTRINGS = ("KMS client not initialized", "HIPPIUS_KMS_MODE=disabled")
 
 
 def read_path_crypto_error_response(exc: BaseException) -> Response | None:
     """Map read-path key/crypto failures to a well-formed S3 error instead of a bare 500.
 
-    - **Transient KMS brownout** (`kek_service` raises `RuntimeError('kms_unavailable' |
-      'kms_auth_failed' | 'kms_error')`) → retryable **503 SlowDown**. The key service is down, not
-      the object.
-    - **Genuinely unreadable object** — missing envelope metadata (a v5 orphan row) or a DEK/KEK
-      that fails AEAD authentication (`InvalidTag`) or a malformed wrapped key
-      (`local_unwrap_failed`) → **500 InternalError** with a proper S3 XML body (permanent; retry
-      won't help). This replaces the bare, body-less 500 uvicorn would otherwise return.
+    - **Transient** (`kms_unavailable`/`kms_auth_failed`/`kms_error` KMS brownout, or
+      `kek_database_unavailable` keystore-DB blip) → retryable **503 SlowDown** — the key/DB layer is
+      down, not the object.
+    - **Genuinely unreadable object** — missing envelope metadata (`v5_missing_envelope_metadata`), a
+      lost KEK row (`kek_not_found`), a malformed wrapped key (`local_unwrap_failed`), an AEAD auth
+      failure (`InvalidTag`), or a KMS deploy-misconfig → **500 InternalError** with a proper S3 XML
+      body (permanent; retry won't help). This replaces the bare, body-less 500 uvicorn returns.
 
-    Returns ``None`` for anything else (the caller re-raises).
+    Returns ``None`` for anything else (the caller re-raises). Note `unsupported_enc_suite_id` is
+    handled by `map_read_path_exception` (→ 501), not here.
     """
-    if isinstance(exc, RuntimeError) and str(exc) in _KMS_BROWNOUT_MARKERS:
+    if isinstance(exc, RuntimeError) and str(exc) in _KEY_TRANSIENT_MARKERS:
         return s3_error_response(
             code="SlowDown",
             message="Encryption key service is temporarily unavailable. Please retry.",
@@ -149,10 +155,52 @@ def read_path_crypto_error_response(exc: BaseException) -> Response | None:
     # InvalidTag is the AEAD authentication failure from `unwrap_dek` (cryptography); match by class
     # name to avoid importing the crypto exception type into the error module.
     is_invalid_tag = exc.__class__.__name__ == "InvalidTag"
-    if is_invalid_tag or (isinstance(exc, RuntimeError) and str(exc) in _KEY_UNREADABLE_MARKERS):
+    is_marker = isinstance(exc, RuntimeError) and str(exc) in _KEY_UNREADABLE_MARKERS
+    is_misconfig = isinstance(exc, RuntimeError) and any(s in str(exc) for s in _KEY_MISCONFIG_SUBSTRINGS)
+    if is_invalid_tag or is_marker or is_misconfig:
         return s3_error_response(
             code="InternalError",
             message="Object could not be decrypted (encryption metadata missing or key authentication failed).",
             status_code=500,
+        )
+    return None
+
+
+def map_read_path_exception(exc: BaseException) -> Response | None:
+    """The API's global exception-handler mapping, as a testable pure function.
+
+    Returns a well-formed S3 ``Response`` for a recognized read-path failure, or ``None`` (the
+    handler then re-raises so uvicorn returns a 500). Extracted from the inline handler body so the
+    WHOLE chain is unit-tested — the handler was previously inline and untested, which is how the
+    `v5_missing_envelope_metadata` bare-500 regression slipped in. Order matters: the first match
+    wins. `DownloadNotReadyError` and `UnsupportedStorageVersionError` are matched by class name to
+    avoid importing them here (they live in modules that would import this one).
+    """
+    # Not-ready (download pipeline / first-chunk bound) → retryable 503.
+    if exc.__class__.__name__ == "DownloadNotReadyError" or str(exc) == "initial_stream_timeout":
+        return s3_error_response(
+            code="SlowDown",
+            message="Object not ready for download yet. Please retry.",
+            status_code=503,
+        )
+    pool_busy = pool_saturation_response(exc)
+    if pool_busy is not None:
+        return pool_busy
+    crypto = read_path_crypto_error_response(exc)
+    if crypto is not None:
+        return crypto
+    # Unsupported storage version (typed) OR unknown enc-suite (read-path RuntimeError) → 501.
+    if exc.__class__.__name__ == "UnsupportedStorageVersionError":
+        sv = getattr(exc, "storage_version", "?")
+        return s3_error_response(
+            code="NotImplemented",
+            message=f"Object uses unsupported storage version (sv={sv}). Migrate object to v5.",
+            status_code=501,
+        )
+    if isinstance(exc, RuntimeError) and str(exc).startswith("unsupported_enc_suite_id"):
+        return s3_error_response(
+            code="NotImplemented",
+            message="Object uses an unsupported encryption suite and cannot be served.",
+            status_code=501,
         )
     return None
