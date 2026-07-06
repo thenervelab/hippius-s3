@@ -218,6 +218,19 @@ pub trait PartReplicationStore: Send + Sync {
 
     /// Record that the part's drain failed (e.g. a byte-mismatch on copy).
     fn mark_failed(&self, part: &ClaimedPart, reason: &str) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Record that the part's drain hit a persistent byte-mismatch on a still-SERVABLE object
+    /// — the pool copy is corrupt but the SSD copy is the last good source (R4). Distinct from
+    /// [`mark_failed`](Self::mark_failed): a `corrupt` part is never reclaimed and is re-driven,
+    /// where a `failed` part is an abandoned upload safe to reclaim.
+    fn mark_corrupt(&self, part: &ClaimedPart, reason: &str) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Whether the part's `object_versions` row is still SERVABLE — the discriminator between a
+    /// corrupt-live object ([`mark_corrupt`](Self::mark_corrupt)) and an abandoned upload
+    /// ([`mark_failed`](Self::mark_failed)) at the moment a persistent `ChunkMismatch` is
+    /// detected. Same predicate as the reclaim gate's `servable_parts` and the janitor's
+    /// unservable predicate: address set OR a real size OR an md5.
+    fn is_version_servable(&self, part: &PartKey) -> impl Future<Output = Result<bool, Self::Error>> + Send;
 }
 
 /// Publishes the per-part backend upload request once the part is durably on the pool.
@@ -458,10 +471,23 @@ where
             mismatch = Some((copy_hash, pool_hash));
         }
         if let Some((source_hash, pool_hash)) = mismatch {
-            store
-                .mark_failed(claim, "chunk copy byte mismatch")
-                .await
-                .map_err(PartDrainError::store)?;
+            // R4: a persistent byte-mismatch means the POOL copy is corrupt. If the object is
+            // still servable, this SSD part is its last good source — mark it `corrupt` (held
+            // + re-driven), NOT `failed` (which the reclaim would eventually delete as debris).
+            // An unservable version (abandoned/in-flight upload) is the ordinary `failed` case.
+            // The servability read is on the rare mismatch path only, so it never touches the
+            // happy drain path.
+            if store.is_version_servable(part).await.map_err(PartDrainError::store)? {
+                store
+                    .mark_corrupt(claim, "chunk copy byte mismatch on a servable object")
+                    .await
+                    .map_err(PartDrainError::store)?;
+            } else {
+                store
+                    .mark_failed(claim, "chunk copy byte mismatch")
+                    .await
+                    .map_err(PartDrainError::store)?;
+            }
             ceph.remove_part(part).await.map_err(PartDrainError::io(DrainStep::Cleanup))?;
             return Err(PartDrainError::ChunkMismatch {
                 index,
@@ -711,6 +737,9 @@ mod tests {
         enqueue_fault: bool,
         /// Parts the enqueuer was asked to enqueue, in order.
         enqueued: Vec<String>,
+        /// When set, `is_version_servable` returns true, so a persistent mismatch marks the
+        /// part `Corrupt` (R4) instead of `Failed`. Default false = the abandoned-upload shape.
+        servable: bool,
     }
 
     /// One struct implementing all three part contracts.
@@ -750,6 +779,13 @@ mod tests {
 
         fn corrupt_persist(self) -> Self {
             self.world.lock().unwrap().corrupt_persist = true;
+            self
+        }
+
+        /// Mark the object servable, so a persistent mismatch marks the part `Corrupt` (R4)
+        /// rather than `Failed` (the abandoned-upload default).
+        fn servable(self) -> Self {
+            self.world.lock().unwrap().servable = true;
             self
         }
 
@@ -979,6 +1015,19 @@ mod tests {
                 Ok(())
             }
         }
+
+        fn mark_corrupt(&self, part: &ClaimedPart, _reason: &str) -> impl Future<Output = Result<(), io::Error>> + Send {
+            let key = key_of(part.part());
+            async move {
+                self.world.lock().unwrap().status.insert(key, ReplicationState::Corrupt);
+                Ok(())
+            }
+        }
+
+        fn is_version_servable(&self, _part: &PartKey) -> impl Future<Output = Result<bool, io::Error>> + Send {
+            let servable = self.world.lock().unwrap().servable;
+            async move { Ok(servable) }
+        }
     }
 
     impl UploadEnqueuer for Fakes {
@@ -1057,6 +1106,27 @@ mod tests {
         assert_eq!(fakes.status_of(&part), Some(ReplicationState::Failed));
         assert!(fakes.ssd_has(&part), "corrupt drain must NOT delete the SSD copy");
         assert!(fakes.pool_part(&part).is_none(), "the corrupt, never-committed pool copy is removed");
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_chunk_on_a_servable_object_marks_corrupt_not_failed() {
+        // R4: the same persistent mismatch, but the object is still SERVABLE — so this SSD part
+        // is the last good source of a live object. It must be marked `Corrupt` (held + re-driven),
+        // NOT `Failed` (which the reclaim would eventually delete as abandoned-upload debris). The
+        // SSD copy is preserved and the corrupt pool copy is removed, exactly as the Failed path.
+        let part = part();
+        let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]).corrupt_persist().servable();
+
+        let err = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
+
+        assert!(matches!(err, PartDrainError::ChunkMismatch { index, .. } if index == ChunkIndex::new(0)));
+        assert_eq!(
+            fakes.status_of(&part),
+            Some(ReplicationState::Corrupt),
+            "a servable object's part is held Corrupt"
+        );
+        assert!(fakes.ssd_has(&part), "the last good SSD source must NOT be deleted");
+        assert!(fakes.pool_part(&part).is_none(), "the corrupt pool copy is still removed");
     }
 
     #[tokio::test]

@@ -165,12 +165,13 @@ pub struct ReclaimReport {
     pub skipped_absent: u64,
     /// `failed` but within the grace window (diagnosis / abort-race headroom).
     pub skipped_young: u64,
-    /// Aged `failed` but the version is still SERVABLE — the corrupt-live case (a live
-    /// object whose pool copy is corrupt, marked `failed` by the drain's `ChunkMismatch`
-    /// path). This SSD part is the last good source, so it is NEVER reclaimed. A non-zero
-    /// value is a durability incident, not routine GC — the agent logs it at ERROR so it
-    /// pages. Today this is always zero (no path yet marks a servable part `failed`); the
-    /// gate is R4's precondition, live the moment that mark path lands.
+    /// A part held because its live object's pool copy is corrupt (R4): either a first-class
+    /// `Corrupt` row (the drain's `ChunkMismatch` path marks a servable object `corrupt`
+    /// directly) OR the defense-in-depth aged-`failed`+still-servable case not yet promoted.
+    /// This SSD part is the last good source, so it is NEVER reclaimed. This is LIVE, not
+    /// hypothetical — the drain marks servable parts `corrupt` today — so a non-zero value is a
+    /// real durability incident, not routine GC; the agent logs it at ERROR and the
+    /// `drain_corrupt_parts` gauge/alert pages. The re-drive worker recovers these.
     pub skipped_corrupt: u64,
 }
 
@@ -351,6 +352,11 @@ where
                     report.reclaimed += 1;
                 }
             }
+            // Corrupt = a live object whose pool copy is corrupt, marked directly by the drain
+            // (R4). Its SSD copy is the last good source and the re-drive worker owns it, so it
+            // is NEVER reclaimed however aged — held and counted (the `Failed`+servable arm above
+            // stays as defense-in-depth for a row not yet promoted to `Corrupt`).
+            ReplicationState::Corrupt => report.skipped_corrupt += 1,
         }
     }
 
@@ -905,6 +911,44 @@ mod tests {
                 Ok(())
             })?;
         }
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_state_part_is_never_reclaimed_however_aged() {
+        // R4 first-class state: a `Corrupt` part (drain marked it directly — a live object whose
+        // pool copy is corrupt) is held unconditionally, no servability re-check needed, however
+        // aged. The state itself says "last good source"; never unlink.
+        let part = part_at(UUID_A, 5, 1);
+        let scan = FakeScan::of(std::slice::from_ref(&part));
+        let remover = FakeRemover::default();
+        let log = FakeLog::with(&[(&part, ReplicationState::Corrupt, HOUR)]);
+
+        let report = reclaim_ssd(&scan, &remover, &log, &FakeBacking::all_backed(), GRACE, ORPHAN_GRACE)
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_corrupt, 1);
+        assert_eq!(report.reclaimed, 0);
+        assert!(remover.removed().is_empty(), "a Corrupt part's SSD source is preserved");
+    }
+
+    #[tokio::test]
+    async fn a_servable_failed_part_at_exactly_the_grace_boundary_is_held() {
+        // WI-G boundary: the failed-aged filter is `age >= grace` and the reclaim arm is
+        // `age < grace ? young : ...`, so a part at EXACTLY age==grace must be adjudicated (not
+        // young) and, being servable, held — the two boundary expressions must agree.
+        let part = part_at(UUID_A, 5, 1);
+        let scan = FakeScan::of(std::slice::from_ref(&part));
+        let remover = FakeRemover::default();
+        let log = FakeLog::with(&[(&part, ReplicationState::Failed, GRACE)]);
+        let backing = FakeBacking::servable(&[&part]);
+
+        let report = reclaim_ssd(&scan, &remover, &log, &backing, GRACE, ORPHAN_GRACE).await.unwrap();
+        assert_eq!(
+            report.skipped_corrupt, 1,
+            "a servable failed part exactly at grace is held, not reclaimed"
+        );
+        assert_eq!(report.skipped_young, 0);
+        assert!(remover.removed().is_empty());
     }
 
     // ----------------------------------------------- deleted-object orphans (WI-20b)

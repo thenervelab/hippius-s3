@@ -16,6 +16,12 @@ pub enum ReplicationState {
     Replicated,
     /// Drain abandoned after exhausting retries (reconciled to a client error).
     Failed,
+    /// A live, servable object whose pool copy is corrupt (a persistent `ChunkMismatch` on
+    /// drain). Its SSD copy is the last good source, so it is NEVER reclaimed; a bounded
+    /// re-drive worker resets it back to `Pending` to re-copy over the corrupt pool copy.
+    /// Distinct from `Failed` (abandoned upload, safe to reclaim). NOT terminal — unlike
+    /// `Replicated`/`Failed` it can transition back to `Pending` under the re-drive cap (R4).
+    Corrupt,
 }
 
 /// Disk-pressure severity band.

@@ -34,6 +34,10 @@ const DEFAULT_ALLOCATION_POLL: Duration = Duration::from_secs(2);
 /// Tuning this lets the node hide fsync latency behind more in-flight parts (the
 /// AIMD allocator only tunes bytes/sec, never the concurrency).
 const DEFAULT_DRAIN_CONCURRENCY: u32 = 4;
+/// Max R4 re-drive attempts when `CEPHOR_REDRIVE_MAX_ATTEMPTS` is unset. A corrupt-live part
+/// is re-copied from its intact SSD source this many times before being held `corrupt` and
+/// paged — enough to ride out a transient pool-copy corruption without looping on a durable one.
+const DEFAULT_REDRIVE_MAX_ATTEMPTS: u32 = 3;
 /// Claim lease TTL when `CEPHOR_CLAIM_LEASE_TTL_SECS` is unset: a `draining`
 /// claim older than this is treated as abandoned (the H1 crash-recovery TTL).
 /// Mirrors the store-side default; long enough not to reclaim a live slow drain,
@@ -131,6 +135,9 @@ pub struct Config {
     /// Maximum parts the drain worker processes concurrently — the in-flight gate
     /// that lets the node overlap fsync latency across parts.
     pub drain_concurrency: u32,
+    /// Max times an R4 `corrupt` part is re-driven before it is held and paged. Bounds the
+    /// re-drive so a persistently-bad pool copy cannot loop forever.
+    pub redrive_max_attempts: u32,
     /// Path of the liveness file the runtime touches each heartbeat tick; a k8s
     /// `livenessProbe` checks its freshness to restart a wedged (not crashed) pod.
     pub liveness_file: PathBuf,
@@ -209,6 +216,7 @@ impl Config {
             orphan_reclaim_grace: self.orphan_reclaim_grace,
             grace: self.grace,
             drain_concurrency: self.drain_concurrency,
+            redrive_max_attempts: self.redrive_max_attempts,
         }
     }
 
@@ -277,6 +285,7 @@ impl Config {
             reclaim_grace: duration_secs(&get, "CEPHOR_RECLAIM_GRACE_SECS", DEFAULT_RECLAIM_GRACE)?,
             orphan_reclaim_grace: duration_secs(&get, "CEPHOR_ORPHAN_RECLAIM_GRACE_SECS", DEFAULT_ORPHAN_RECLAIM_GRACE)?,
             drain_concurrency: positive_u32_or(&get, "CEPHOR_DRAIN_CONCURRENCY", DEFAULT_DRAIN_CONCURRENCY)?,
+            redrive_max_attempts: positive_u32_or(&get, "CEPHOR_REDRIVE_MAX_ATTEMPTS", DEFAULT_REDRIVE_MAX_ATTEMPTS)?,
             liveness_file: path_or(&get, "CEPHOR_LIVENESS_FILE", DEFAULT_LIVENESS_FILE),
             readiness_file: path_or(&get, "CEPHOR_READINESS_FILE", DEFAULT_READINESS_FILE),
         })

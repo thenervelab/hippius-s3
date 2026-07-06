@@ -114,6 +114,17 @@ pub fn init(service_name: &'static str, snapshot: &Arc<SnapshotCell>, enforcer: 
             .build(),
     ));
 
+    // Durability alarm: parts held `corrupt` (a live object whose pool copy is corrupt, kept
+    // alive by its SSD source — R4). A gauge, not a counter: it falls when a re-drive recovers
+    // a part. Any nonzero value pages (the alert), distinct from the drain's routine failures.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_gauge("drain_corrupt_parts")
+            .with_callback(move |observer| observer.observe(snap.corrupt_parts(), &[]))
+            .build(),
+    ));
+
     // Saturation: SSD disk fill fraction (0.0..=1.0). This is what crosses the api's
     // fs_cache_pressure cutoff and 503s every PUT on the node, so it is the operational
     // alert signal — and unlike the backlog it rises with a leak even at zero drain demand.

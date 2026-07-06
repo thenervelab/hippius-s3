@@ -143,6 +143,10 @@ class TerminalMonotonicity:
     Samples every row's status each poll and compares to the previous sample; any
     `replicated->*` or `failed->*` transition is a breach (a terminal row must be inert). First
     poll only seeds the baseline.
+
+    NOTE: `corrupt` (R4) is deliberately NOT terminal — the bounded re-drive worker legitimately
+    resets `corrupt->pending` to re-copy a live object's intact SSD source over its corrupt pool
+    copy. Only `replicated`/`failed` are inert sinks, so `corrupt->pending` must not be flagged.
     """
 
     name = "G6"

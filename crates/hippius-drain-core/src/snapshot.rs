@@ -147,6 +147,12 @@ pub struct SnapshotCell {
     /// a leak can fill the disk without any drain demand. bps not f64 so the gauge stays a
     /// plain atomic; the metrics layer scales it to a 0..1 fraction.
     disk_pressure_bps: AtomicU64,
+    /// Count of parts currently held `corrupt` on this node — a LEVEL, set each cycle by the
+    /// re-drive pass from `Store::count_corrupt_parts`. A nonzero value is a live object whose
+    /// pool copy is corrupt, kept alive only by its SSD source: a durability incident (R4), so
+    /// it is exported as the `drain_corrupt_parts` gauge and alerted, distinct from the drain's
+    /// routine failure counters.
+    corrupt_parts: AtomicU64,
     /// Recent drain latencies, behind a `Mutex` because a percentile needs the
     /// whole window (no single atomic suffices). Off the wait-free `load` path.
     latency: Mutex<LatencyWindow>,
@@ -214,6 +220,18 @@ impl SnapshotCell {
     #[must_use]
     pub fn disk_pressure_bps(&self) -> u16 {
         u16::try_from(self.disk_pressure_bps.load(Ordering::Relaxed)).unwrap_or(10_000)
+    }
+
+    /// Records the current count of parts held `corrupt` on this node. A gauge: `store`, not
+    /// add. The re-drive pass writes it each cycle from `Store::count_corrupt_parts`.
+    pub fn record_corrupt(&self, count: u64) {
+        self.corrupt_parts.store(count, Ordering::Relaxed);
+    }
+
+    /// The last-recorded count of `corrupt`-held parts (the `drain_corrupt_parts` gauge source).
+    #[must_use]
+    pub fn corrupt_parts(&self) -> u64 {
+        self.corrupt_parts.load(Ordering::Relaxed)
     }
 
     /// Records a completed drain's latency for the windowed p99 estimate.

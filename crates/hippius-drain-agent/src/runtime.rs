@@ -98,6 +98,10 @@ pub struct RuntimeConfig {
     /// Maximum parts the drain worker processes concurrently (the in-flight gate
     /// that overlaps fsync latency across parts).
     pub drain_concurrency: u32,
+    /// Max times an R4 `corrupt` part is re-driven (reset to `pending` for a fresh SSD->pool
+    /// copy) before it is held `corrupt` and paged. Bounds the re-drive so a persistently-bad
+    /// pool copy cannot loop forever.
+    pub redrive_max_attempts: u32,
 }
 
 /// Runs `tick` immediately and then once per `period`, until `token` is
@@ -285,13 +289,16 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
                     "replicated parts still on SSD — drain crash-orphans nothing currently reclaims"
                 );
             }
-            // A servable object with a `failed` replication row: its pool copy is corrupt and
-            // this preserved SSD part is the last good source. A durability incident, not GC —
-            // ERROR so a log-based alert pages. (Zero until the R4 mark path lands.)
+            // Parts held because their live object's pool copy is corrupt (R4): a `corrupt`
+            // row, or the defense-in-depth `failed`+servable case not yet promoted. Their SSD
+            // copy is the last good source. This is LIVE, not hypothetical — the drain's
+            // ChunkMismatch path marks a servable part `corrupt` today — so a nonzero value is a
+            // real durability incident, not GC. ERROR so a log-based alert pages (the
+            // drain_corrupt_parts gauge + alert is the metric path).
             if report.skipped_corrupt > 0 {
                 tracing::error!(
                     skipped_corrupt = report.skipped_corrupt,
-                    "servable objects have a failed replication row — SSD source preserved; corrupt pool copy suspected (R4)"
+                    "corrupt-live SSD parts held (pool copy corrupt) — last good source preserved, awaiting re-drive (R4)"
                 );
             }
         }
@@ -302,6 +309,24 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
         Ok(0) => {}
         Ok(removed) => tracing::info!(removed, "swept orphan SSD write-temps"),
         Err(err) => tracing::warn!(error = %err, "orphan-temp sweep failed; will retry next poll"),
+    }
+}
+
+/// One R4 re-drive pass: reset this node's bounded `corrupt` parts back to `pending` (so the
+/// drain re-copies the intact SSD source over the corrupt pool copy), then publish the
+/// held-corrupt gauge. A part at the attempt cap is NOT reset — it stays `corrupt` and is
+/// surfaced by the gauge/alert for an operator. Errors log and retry next poll (fail-safe).
+async fn redrive_corrupt_once(store: &Store, snapshot: &SnapshotCell, max_attempts: u32) {
+    match store.redrive_corrupt_parts(i32::try_from(max_attempts).unwrap_or(i32::MAX)).await {
+        Ok(0) => {}
+        Ok(redriven) => tracing::warn!(redriven, "re-drove corrupt-live parts (corrupt pool copy; re-copying from SSD source)"),
+        Err(err) => tracing::warn!(error = %err, "corrupt re-drive failed; will retry next poll"),
+    }
+    // Publish the standing held-corrupt count (includes parts at the attempt cap). A nonzero
+    // value is a live object kept alive only by its SSD source — a durability incident (R4).
+    match store.count_corrupt_parts().await {
+        Ok(count) => snapshot.record_corrupt(count),
+        Err(err) => tracing::warn!(error = %err, "corrupt-parts count failed; gauge stale this cycle"),
     }
 }
 
@@ -535,11 +560,16 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
         let reclaim_poll = self.config.reclaim_poll;
         let reclaim_grace = self.config.reclaim_grace;
         let orphan_reclaim_grace = self.config.orphan_reclaim_grace;
+        let redrive_max_attempts = self.config.redrive_max_attempts;
         supervisor.spawn(WorkerName::new("ssd_reclaim"), move |token| {
             run_periodic(token, reclaim_poll, move || {
                 let (ssd, store, snapshot) = (Arc::clone(&ssd), Arc::clone(&store), Arc::clone(&snapshot));
                 async move {
                     reclaim_once(&ssd, &store, &snapshot, reclaim_grace, orphan_reclaim_grace).await;
+                    // R4 re-drive: reset bounded `corrupt` parts to `pending` for a fresh copy,
+                    // then publish the held-corrupt gauge. Same cadence as reclaim (both are the
+                    // node-local SSD lifecycle); errors log and retry next poll (fail-safe).
+                    redrive_corrupt_once(&store, &snapshot, redrive_max_attempts).await;
                 }
             })
         });
@@ -777,6 +807,7 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                redrive_max_attempts: 3,
             },
         )
         .with_coordinator(Arc::clone(&coord))
@@ -849,6 +880,7 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                redrive_max_attempts: 3,
             },
         )
         .with_coordinator(Arc::clone(&coord))
@@ -939,6 +971,7 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                redrive_max_attempts: 3,
             },
         )
         .with_coordinator(Arc::clone(&coord))
@@ -1002,6 +1035,7 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                redrive_max_attempts: 3,
             },
         );
 
@@ -1048,6 +1082,7 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                redrive_max_attempts: 3,
             },
         );
 

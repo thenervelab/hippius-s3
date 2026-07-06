@@ -70,7 +70,7 @@ pub enum StoreError {
 
 type Result<T> = core::result::Result<T, StoreError>;
 
-/// Parses a stored status string back into a [`ReplicationState`]. The four
+/// Parses a stored status string back into a [`ReplicationState`]. The five
 /// literals match the `cephor_replication_status.status` CHECK constraint and
 /// the `'draining'`/`'replicated'`/etc. literals the write queries set.
 fn state_from_db(raw: &str) -> Result<ReplicationState> {
@@ -79,6 +79,7 @@ fn state_from_db(raw: &str) -> Result<ReplicationState> {
         "draining" => Ok(ReplicationState::Draining),
         "replicated" => Ok(ReplicationState::Replicated),
         "failed" => Ok(ReplicationState::Failed),
+        "corrupt" => Ok(ReplicationState::Corrupt),
         other => Err(StoreError::UnknownState { value: other.into() }),
     }
 }
@@ -316,6 +317,48 @@ impl Store {
         .await?;
         // SUM of non-negative byte counts is >= 0; the cast guards a corrupt negative row.
         Ok(u64::try_from(bytes).unwrap_or(0))
+    }
+
+    /// R4 re-drive: reset this node's `corrupt` parts back to `pending` for a fresh SSD->pool
+    /// copy (overwriting the corrupt pool copy from the intact SSD source), bounded by
+    /// `max_attempts`. Only rows still under the cap are reset; each reset bumps
+    /// `corrupt_attempts`, so a persistently-unrecoverable pool copy stops re-driving after
+    /// `max_attempts` and is held `corrupt` (paged via the corrupt-backlog gauge/alert) rather
+    /// than looping forever. Clears `claimed_at`/`deferred_until` so the part is immediately
+    /// re-claimable. Returns how many parts were re-driven.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`].
+    pub async fn redrive_corrupt_parts(&self, max_attempts: i32) -> Result<u64> {
+        let affected = sqlx::query(
+            "UPDATE cephor_replication_status \
+             SET status = 'pending', corrupt_attempts = corrupt_attempts + 1, \
+                 claimed_at = NULL, deferred_until = NULL, updated_at = now() \
+             WHERE node_id = $1 AND status = 'corrupt' AND corrupt_attempts < $2",
+        )
+        .bind(self.node_id.as_deref())
+        .bind(max_attempts)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected)
+    }
+
+    /// The count of this node's parts currently held in `corrupt` (the `drain_corrupt_parts`
+    /// gauge). A nonzero value is a live object with a corrupt pool copy being kept alive by its
+    /// SSD source — a durability incident, not routine GC. Includes rows still eligible for
+    /// re-drive AND those held at the attempt cap (the standing, unrecoverable backlog).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`].
+    pub async fn count_corrupt_parts(&self) -> Result<u64> {
+        let (count,): (i64,) = sqlx::query_as("SELECT count(*)::bigint FROM cephor_replication_status WHERE node_id = $1 AND status = 'corrupt'")
+            .bind(self.node_id.as_deref())
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(u64::try_from(count).unwrap_or(0))
     }
 
     /// Claims a file for GC. Returns `Some(GcClaim)` if this caller won the claim,
@@ -654,6 +697,46 @@ impl PartReplicationStore for Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn mark_corrupt(&self, claim: &ClaimedPart, _reason: &str) -> Result<()> {
+        // Same claim-fence + idempotency shape as mark_failed (a fenced stale claimant matches
+        // zero rows and must NOT touch the live re-claimed part; a second call finds 'corrupt',
+        // not 'draining'). Clears claimed_at like mark_failed. The corrupt_attempts counter is
+        // left as-is: a fresh corruption reuses whatever re-drive budget the row already spent.
+        let part = claim.part();
+        sqlx::query(
+            "UPDATE cephor_replication_status SET status = 'corrupt', updated_at = now(), claimed_at = NULL \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining' AND claim_seq = $4",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .bind(claim.claim_seq())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn is_version_servable(&self, part: &PartKey) -> Result<bool> {
+        // The exact inverse of janitor_part_terminally_abandoned.sql's unservable predicate and
+        // the reclaim gate's servable_parts: a version SERVES a GET if its address is set, OR it
+        // has a real size, OR an md5. address is written AFTER size/md5 in a separate step, so a
+        // fully-servable version briefly has address=NULL (the mid-finalize window); the size/md5
+        // disjuncts keep such a live version from reading as unservable. Do NOT reduce to
+        // address-only. A missing row (deleted object) is not servable.
+        let servable = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS ( \
+                SELECT 1 FROM object_versions ov \
+                WHERE ov.object_id = $1::uuid AND ov.object_version = $2 \
+                  AND (ov.address IS NOT NULL OR ov.size_bytes > 0 OR COALESCE(ov.md5_hash, '') <> '') \
+             )",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(servable)
     }
 }
 
@@ -1279,6 +1362,30 @@ mod part_tests {
         assert!(store.servable_parts(&[]).await.unwrap().is_empty());
     }
 
+    #[sqlx::test]
+    async fn is_version_servable_is_the_drain_time_corrupt_discriminator(pool: PgPool) {
+        // The R4 mark-path discriminator: same predicate as servable_parts, one part at a time.
+        // A servable version (any disjunct) -> Corrupt; an unservable/missing one -> Failed.
+        use crate::partdrain::PartReplicationStore;
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone());
+        seed_ov(&pool, UUID_A, 1, Some("5Faddr"), None, None).await; // address set -> servable
+        seed_ov(&pool, UUID_A, 2, None, Some(4096), None).await; // size>0 -> servable (mid-finalize)
+        seed_ov(&pool, UUID_A, 3, None, Some(0), Some("")).await; // abandoned-upload -> unservable
+        // no row for v4 -> unservable (deleted object)
+
+        assert!(store.is_version_servable(&part(UUID_A, 1, 1)).await.unwrap(), "address set is servable");
+        assert!(store.is_version_servable(&part(UUID_A, 2, 1)).await.unwrap(), "a real size is servable");
+        assert!(
+            !store.is_version_servable(&part(UUID_A, 3, 1)).await.unwrap(),
+            "the abandoned-upload shape is not"
+        );
+        assert!(
+            !store.is_version_servable(&part(UUID_A, 4, 1)).await.unwrap(),
+            "a missing row is not servable"
+        );
+    }
+
     /// Inserts one `object_versions` row with explicit servability columns (address, size,
     /// md5). Used by the `servable_parts` predicate tests where each disjunct matters.
     async fn seed_ov(pool: &PgPool, object: &str, version: i64, address: Option<&str>, size_bytes: Option<i64>, md5: Option<&str>) {
@@ -1456,6 +1563,67 @@ mod part_tests {
             store.claim_part().await.unwrap().is_none(),
             "a freshly-claimed draining part is still held, not re-claimable",
         );
+    }
+
+    #[sqlx::test]
+    async fn mark_corrupt_sets_the_corrupt_state_on_a_claimed_part(pool: PgPool) {
+        // R4: a servable object's persistent byte-mismatch is marked `corrupt` (held), distinct
+        // from `failed` (abandoned upload). Claim-fenced like mark_failed; clears claimed_at.
+        let store = Store::from_pool(pool);
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        let claimed = store.claim_part().await.unwrap().unwrap();
+        store
+            .mark_corrupt(&claimed, "chunk copy byte mismatch on a servable object")
+            .await
+            .unwrap();
+        assert_eq!(store.status(&p).await.unwrap(), Some(ReplicationState::Corrupt));
+    }
+
+    #[sqlx::test]
+    async fn redrive_resets_corrupt_parts_under_the_cap_and_holds_those_at_it(pool: PgPool) {
+        // The bounded re-drive: a `corrupt` part under the attempt cap is reset to `pending`
+        // (re-claimable, its attempt count bumped) so the drain re-copies from the intact SSD
+        // source; a part already at the cap is left `corrupt` (held + paged), never looping.
+        let store = Store::from_pool(pool.clone());
+        let under = part(UUID_A, 5, 1);
+        let at_cap = part(UUID_A, 5, 2);
+        seed_status_node(&pool, UUID_A, 5, 1, "corrupt", "test-node").await;
+        seed_status_node(&pool, UUID_A, 5, 2, "corrupt", "test-node").await;
+        sqlx::query("UPDATE cephor_replication_status SET corrupt_attempts = 3 WHERE object_id = $1 AND part_number = 2")
+            .bind(UUID_A)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let redriven = store.redrive_corrupt_parts(3).await.unwrap();
+        assert_eq!(redriven, 1, "only the under-cap corrupt part is re-driven");
+        assert_eq!(
+            store.status(&under).await.unwrap(),
+            Some(ReplicationState::Pending),
+            "re-driven back to pending"
+        );
+        assert_eq!(
+            store.status(&at_cap).await.unwrap(),
+            Some(ReplicationState::Corrupt),
+            "the capped part is held"
+        );
+        let bumped: i32 = sqlx::query_scalar("SELECT corrupt_attempts FROM cephor_replication_status WHERE object_id = $1 AND part_number = 1")
+            .bind(UUID_A)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(bumped, 1, "the re-drive increments the attempt counter");
+    }
+
+    #[sqlx::test]
+    async fn count_corrupt_parts_counts_only_this_nodes_corrupt_rows(pool: PgPool) {
+        let store = Store::from_pool(pool.clone());
+        seed_status_node(&pool, UUID_A, 5, 1, "corrupt", "test-node").await;
+        seed_status_node(&pool, UUID_A, 5, 2, "corrupt", "test-node").await;
+        seed_status_node(&pool, UUID_A, 5, 3, "failed", "test-node").await; // not corrupt
+        seed_status_node(&pool, UUID_B, 6, 1, "corrupt", "other-node").await; // a peer node
+        assert_eq!(store.count_corrupt_parts().await.unwrap(), 2, "counts only this node's corrupt rows");
     }
 
     #[sqlx::test]

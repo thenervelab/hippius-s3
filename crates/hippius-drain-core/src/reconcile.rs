@@ -43,6 +43,10 @@ pub struct ReconcileReport {
     /// Marked failed (e.g. a byte mismatch); the SSD copy is kept for diagnosis, so
     /// the reconciler leaves it alone.
     pub failed: u64,
+    /// Held `corrupt` — a live object whose pool copy is corrupt (R4). The SSD copy is the
+    /// last good source, owned by the re-drive worker, so the reconciler MUST leave it alone
+    /// (never re-record it to `pending` from SSD, which would bypass the bounded re-drive).
+    pub corrupt: u64,
 }
 
 impl ReconcileReport {
@@ -60,6 +64,7 @@ impl ReconcileReport {
             .saturating_add(self.in_flight)
             .saturating_add(self.replicated_orphan)
             .saturating_add(self.failed)
+            .saturating_add(self.corrupt)
     }
 }
 
@@ -205,6 +210,9 @@ where
                 ReplicationState::Draining => report.in_flight += 1,
                 ReplicationState::Replicated => report.replicated_orphan += 1,
                 ReplicationState::Failed => report.failed += 1,
+                // Held corrupt (R4): the re-drive worker owns the failed→pending decision, so
+                // the reconciler must NOT re-record it from SSD — just count it and move on.
+                ReplicationState::Corrupt => report.corrupt += 1,
             },
         }
     }
@@ -366,11 +374,12 @@ mod part_tests {
 
     #[tokio::test]
     async fn a_mixed_cache_tallies_each_category_and_sums_to_scanned() {
-        // Five distinct parts across two objects, one per status plus a fresh one.
+        // Six distinct parts across two objects, one per status plus a fresh one.
         let pend = part_at(UUID_A, 1, 2);
         let drain = part_at(UUID_A, 1, 3);
         let done = part_at(UUID_B, 7, 1);
         let bad = part_at(UUID_B, 7, 2);
+        let corr = part_at(UUID_B, 7, 3);
         let scan = FakePartScan {
             parts: vec![
                 discovered(UUID_A, 1, 1), // new
@@ -390,6 +399,10 @@ mod part_tests {
                     part: bad.clone(),
                     age: Duration::ZERO,
                 },
+                DiscoveredPart {
+                    part: corr.clone(),
+                    age: Duration::ZERO,
+                },
             ],
             fail: false,
         };
@@ -398,18 +411,21 @@ mod part_tests {
             (&drain, ReplicationState::Draining),
             (&done, ReplicationState::Replicated),
             (&bad, ReplicationState::Failed),
+            (&corr, ReplicationState::Corrupt),
         ]);
         let report = reconcile_parts(&scan, &log).await.unwrap();
         assert_eq!(
             report,
             ReconcileReport {
-                scanned: 5,
+                scanned: 6,
                 recovered: 1,
                 adopted: 0,
                 already_pending: 1,
                 in_flight: 1,
                 replicated_orphan: 1,
                 failed: 1,
+                // A corrupt row is categorized and left alone — never re-recorded from SSD.
+                corrupt: 1,
             }
         );
         assert_eq!(report.scanned, report.categorized(), "every scanned part lands in exactly one category");

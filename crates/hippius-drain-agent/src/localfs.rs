@@ -784,6 +784,22 @@ mod part_tests {
                 Ok(())
             }
         }
+
+        fn mark_corrupt(&self, part: &ClaimedPart, _reason: &str) -> impl Future<Output = Result<(), io::Error>> + Send {
+            let key = Self::key(part.part());
+            async move {
+                self.status.lock().unwrap().insert(key, ReplicationState::Corrupt);
+                Ok(())
+            }
+        }
+
+        fn is_version_servable(&self, _part: &PartKey) -> impl Future<Output = Result<bool, io::Error>> + Send {
+            // The e2e drain tests exercise the happy/abandoned paths; an unservable default keeps
+            // a mismatch on the `Failed` path (the R4 servable→Corrupt branch is unit-tested in
+            // partdrain against a servable fake).
+            let servable = false;
+            async move { Ok(servable) }
+        }
     }
 
     #[tokio::test]

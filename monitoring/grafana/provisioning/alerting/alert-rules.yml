@@ -503,3 +503,56 @@ groups:
           summary: Drain leader epoch counter was reset (write-fence degraded)
         labels:
           severity: critical
+
+      # R4 corrupt-live durability incident. drain_corrupt_parts counts parts held `corrupt`:
+      # a live, servable object whose CephFS pool copy is corrupt (a persistent byte-mismatch on
+      # drain), kept alive ONLY by its intact SSD source. The re-drive worker re-copies from SSD,
+      # so a transient corruption clears on its own; a value that persists is a part stuck at the
+      # re-drive attempt cap — an unrecoverable pool copy needing an operator. Any nonzero value
+      # is a real durability risk (the last good copy is one SSD-node loss from gone), so this
+      # pages; a modest `for` lets a single re-drive cycle clear a transient blip first.
+      - uid: drain-corrupt-live-parts
+        title: Drain R4 - Corrupt-Live Parts (last good copy on SSD only)
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(drain_corrupt_parts{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        annotations:
+          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} part(s) held corrupt — a live object''s pool copy is corrupt and only its SSD source remains. If it persists, the re-drive has exhausted its attempts (unrecoverable pool copy); investigate the object and CephFS pool health.'
+          summary: Live objects have a corrupt pool copy and only an SSD source (R4)
+        labels:
+          severity: critical
