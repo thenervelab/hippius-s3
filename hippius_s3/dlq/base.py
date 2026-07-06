@@ -16,6 +16,7 @@ from typing import TypeVar
 import redis.asyncio as async_redis
 from pydantic import BaseModel
 
+from hippius_s3.config import get_config
 from hippius_s3.monitoring import get_metrics_collector
 
 
@@ -39,6 +40,7 @@ class BaseDLQManager(Generic[T]):
         self.enqueue_func = enqueue_func
         self.request_class = request_class
         self.lock_prefix = f"dlq:requeue:lock:{dlq_key}:"
+        self.max_entries = get_config().dlq_max_entries
 
     def _lock_key(self, identifier: str) -> str:
         return f"{self.lock_prefix}{identifier}"
@@ -63,9 +65,22 @@ class BaseDLQManager(Generic[T]):
 
         dlq_entry = self._create_entry(payload, last_error, etype)
 
+        identifier = self._get_identifier(payload)
+
+        # redis-queues is noeviction: an uncapped DLQ can fill the 2GB instance and fail ALL writes
+        # (drain leases, work queues, pub/sub). At the cap we drop-newest — Postgres holds the durable
+        # state, so the failure record is re-derivable (scripts/resubmit_failed_pins.py). The alert on
+        # dlq_dropped_total / hippius_queue_length fires long before this is reached.
+        if self.max_entries and await self.redis_client.llen(self.dlq_key) >= self.max_entries:  # ty: ignore[invalid-await]
+            get_metrics_collector().record_dlq_dropped(self.dlq_key, etype)
+            logger.error(
+                f"DLQ_FULL dropped entry ({self.dlq_key}): identifier={identifier}, error_type={etype}, "
+                f"cap={self.max_entries}, error={last_error} — recover via PSQL re-derive (resubmit_failed_pins.py)"
+            )
+            return
+
         await self.redis_client.lpush(self.dlq_key, json.dumps(dlq_entry))  # ty: ignore[invalid-await]
         get_metrics_collector().record_dlq_push(self.dlq_key, etype)
-        identifier = self._get_identifier(payload)
         logger.warning(
             f"Pushed to DLQ ({self.dlq_key}): identifier={identifier}, error_type={etype}, error={last_error}"
         )

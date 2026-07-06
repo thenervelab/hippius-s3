@@ -7,6 +7,7 @@ from typing import Union
 from redis.asyncio import Redis
 from redis.asyncio.cluster import RedisCluster
 
+from hippius_s3.config import get_config
 from hippius_s3.monitoring import MetricsCollector
 
 
@@ -73,17 +74,24 @@ class BackgroundMetricsCollector:
         "arion_unpin_requests",
         "ovh_unpin_requests",
         "substrate_requests",
-        "arion_upload_requests:dlq",
     ]
     ZSET_QUEUES = [
         "arion_upload_retries",
     ]
 
+    @staticmethod
+    def _dlq_queues() -> list[str]:
+        # Every DLQ, derived the same way the janitor derives its protection set — adding a backend
+        # extends coverage automatically. Previously only arion_upload_requests:dlq was gauged, so a
+        # full ovh or unpin DLQ was invisible until it caused a pipeline-wide redis-queues stall.
+        config = get_config()
+        return [f"{b}_upload_requests:dlq" for b in config.upload_backends] + ["unpin_requests:dlq"]
+
     async def _collect_redis_metrics(self) -> None:
         try:
             rc = self.redis_queues_client or self.redis_client
 
-            for queue_name in self.LIST_QUEUES:
+            for queue_name in self.LIST_QUEUES + self._dlq_queues():
                 length = int(await rc.llen(queue_name) or 0)  # ty: ignore
                 self.metrics_collector.set_queue_length(queue_name, length)
 

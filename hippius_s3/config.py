@@ -269,6 +269,12 @@ class Config:
     # DLQ configuration
     dlq_dir: str = env("HIPPIUS_DLQ_DIR:/tmp/hippius_dlq")
     dlq_archive_dir: str = env("HIPPIUS_DLQ_ARCHIVE_DIR:/tmp/hippius_dlq_archive")
+    # Hard cap on entries per DLQ list. The DLQ lives on redis-queues (2GB, noeviction) alongside
+    # the drain's cephor:* lease/fence keys, work queues and notify:* pub/sub — a permanent-error
+    # storm on an uncapped DLQ can fill the instance and fail ALL writes pipeline-wide. At the cap,
+    # push() is a no-op (drop-newest): Postgres is the durable source of truth, so a lost failure
+    # record is re-derivable (scripts/resubmit_failed_pins.py). 0 disables the cap.
+    dlq_max_entries: int = env("HIPPIUS_DLQ_MAX_ENTRIES:10000", convert=int)
 
     # Object parts filesystem cache configuration
     object_cache_dir: str = env("HIPPIUS_OBJECT_CACHE_DIR:/var/lib/hippius/object_cache")
