@@ -198,6 +198,11 @@ class Config:
 
     # Cache TTL (shared across components — still used for pub/sub wait timeout)
     cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:3600", convert=int)
+    # Bound on how long a GET waits for its FIRST chunk before failing fast with a retryable 503
+    # (DownloadNotReadyError). Keeps an un-drained/never-arriving object (e.g. a part not yet on any
+    # backend) from hanging the whole request up to cache_ttl_seconds (~1h). Later chunks keep the
+    # full wait — once the first chunk lands the object is actively draining.
+    stream_first_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS:90", convert=int)
     # Hot-retention window for the FS cache: chunks read within this window
     # are protected from janitor deletion so frequently-accessed content
     # stays on NVMe. Touched on every read by the API/streamer.
@@ -213,6 +218,12 @@ class Config:
     downloader_chunk_retries: int = env("DOWNLOADER_CHUNK_RETRIES:3", convert=int)
     downloader_retry_base_seconds: float = env("DOWNLOADER_RETRY_BASE_SECONDS:0.1", convert=float)
     downloader_retry_jitter_seconds: float = env("DOWNLOADER_RETRY_JITTER_SECONDS:0.1", convert=float)
+    # Request-level retry: when a whole DownloadChainRequest fails (Arion exhaustion or a process
+    # error), requeue it via a per-backend retry ZSET + 2s mover instead of dropping it (A12).
+    # Mirrors the uploader's request-level retry (uploader_max_attempts / _backoff_*_ms).
+    downloader_max_attempts: int = env("HIPPIUS_DOWNLOADER_MAX_ATTEMPTS:5", convert=int)
+    downloader_backoff_base_ms: int = env("HIPPIUS_DOWNLOADER_BACKOFF_BASE_MS:500", convert=int)
+    downloader_backoff_max_ms: int = env("HIPPIUS_DOWNLOADER_BACKOFF_MAX_MS:60000", convert=int)
     downloader_semaphore: int = env("DOWNLOADER_SEMAPHORE:20", convert=int)
     # Max concurrent DownloadChainRequests a single downloader pod processes.
     # The main loop dequeues and spawns tasks up to this cap; the semaphore
@@ -269,6 +280,16 @@ class Config:
     # DLQ configuration
     dlq_dir: str = env("HIPPIUS_DLQ_DIR:/tmp/hippius_dlq")
     dlq_archive_dir: str = env("HIPPIUS_DLQ_ARCHIVE_DIR:/tmp/hippius_dlq_archive")
+    # Soft cap on entries per DLQ list (best-effort: a non-atomic LLEN+LPUSH may overshoot by up to
+    # the number of concurrent pushers). The DLQ lives on redis-queues (2GB, noeviction) alongside the
+    # drain's cephor:* lease/fence keys, work queues and notify:* pub/sub — a permanent-error storm on
+    # an uncapped DLQ can fill the instance and fail ALL writes pipeline-wide. At the cap, push() is a
+    # no-op (drop-newest). This drops the failure RECORD, never object data: the janitor's absolute
+    # replication gate still refuses to evict a non-replicated chunk. Entries already in the DLQ remain
+    # requeuable via scripts/dlq_requeue.py; a dropped failure's durable trace is object_versions.status
+    # (e.g. 'failed'), and the 50%/90% alerts fire long before the cap so drops shouldn't occur in
+    # practice. 0 (or negative) disables the cap.
+    dlq_max_entries: int = env("HIPPIUS_DLQ_MAX_ENTRIES:10000", convert=int)
 
     # Object parts filesystem cache configuration
     object_cache_dir: str = env("HIPPIUS_OBJECT_CACHE_DIR:/var/lib/hippius/object_cache")
