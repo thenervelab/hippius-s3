@@ -43,6 +43,7 @@ class _StubDLQ(BaseDLQManager[_FakeReq]):
 def _fake_redis() -> MagicMock:
     r = MagicMock()
     r.lpush = AsyncMock()
+    r.llen = AsyncMock(return_value=0)  # below the DLQ cap → push proceeds
     r.set = AsyncMock(return_value="tok")  # lock acquired
     r.eval = AsyncMock(return_value=1)  # lock released
     return r

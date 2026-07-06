@@ -355,10 +355,13 @@ async def run_downloader_loop(
 
     from hippius_s3.monitoring import initialize_metrics_collector
     from hippius_s3.queue import dequeue_download_request
+    from hippius_s3.queue import enqueue_download_retry_request
     from hippius_s3.queue import initialize_queue_client
+    from hippius_s3.queue import move_due_download_retries
     from hippius_s3.redis_cache import initialize_cache_client
     from hippius_s3.services.ray_id_service import get_logger_with_ray_id
     from hippius_s3.services.ray_id_service import ray_id_context
+    from hippius_s3.workers.errors import compute_backoff_ms
 
     config = get_config()
 
@@ -376,6 +379,41 @@ async def run_downloader_loop(
     if backend_name == "arion":
         backend_info = f" base_url={config.arion_base_url} verify_ssl={config.arion_verify_ssl}"
         logger.info(f"[{backend_name}] Starting downloader, queue={queue_name}{backend_info}")
+
+    async def _requeue_or_drop(
+        request: DownloadChainRequest, worker_logger: logging.LoggerAdapter, err_str: str
+    ) -> None:
+        """Requeue a failed DownloadChainRequest via the retry ZSET, or drop it at the attempts cap.
+
+        No download DLQ: chunks are re-derivable and a reader re-enqueues on the next cache-miss,
+        so a dropped request is recoverable — we only bound the server-side retry effort.
+
+        This reuses the uploader's retry PLUMBING (per-backend ZSET + 2s mover) but NOT its
+        transient/permanent classification. process_download_request swallows every per-chunk error
+        and returns ok=False (the terminal error class never reaches here), so we cannot cheaply tell
+        a permanent 404 from a transient 5xx without threading error types out of that hot path. We
+        therefore retry ALL failures up to the cap — a bounded, deliberate trade-off: a genuine
+        permanent failure costs at most downloader_max_attempts extra idempotent Arion GETs before
+        being dropped, no worse in kind than the pre-existing reader-driven re-enqueue that re-drives
+        permanents on every cache-miss regardless.
+        """
+        attempts_next = (request.attempts or 0) + 1
+        if attempts_next <= config.downloader_max_attempts:
+            delay_ms = compute_backoff_ms(
+                attempts_next, config.downloader_backoff_base_ms, config.downloader_backoff_max_ms
+            )
+            await enqueue_download_retry_request(
+                request, backend_name=backend_name, delay_seconds=delay_ms / 1000.0, last_error=err_str
+            )
+            worker_logger.warning(
+                f"[{backend_name}] Requeued {request.bucket_name}/{request.object_key} "
+                f"attempt={attempts_next}/{config.downloader_max_attempts} err={err_str}"
+            )
+        else:
+            worker_logger.error(
+                f"[{backend_name}] Dropping {request.bucket_name}/{request.object_key} after "
+                f"{attempts_next - 1} attempts (readers re-enqueue on demand) err={err_str}"
+            )
 
     async def _run_job(request: DownloadChainRequest) -> None:
         ray_id = request.ray_id or "no-ray-id"
@@ -405,10 +443,17 @@ async def run_downloader_loop(
                 else:
                     job_span.set_status(trace.StatusCode.ERROR, "partial failure")
                     worker_logger.error(f"[{backend_name}] Failed: {request.bucket_name}/{request.object_key}")
+                    await _requeue_or_drop(request, worker_logger, "partial failure")
             except Exception as exc:
                 job_span.record_exception(exc)
                 job_span.set_status(trace.StatusCode.ERROR, str(exc))
                 worker_logger.error(f"[{backend_name}] job error: {exc}", exc_info=True)
+                # Requeue before re-raising so the request survives a process/infra error. The raise
+                # still propagates to _reap so an infra failure rebuilds the stale client. If redis is
+                # the thing that's down the requeue can't land — suppress so the original error wins;
+                # the reader re-enqueues on the next miss regardless.
+                with contextlib.suppress(Exception):
+                    await _requeue_or_drop(request, worker_logger, str(exc))
                 raise
 
     max_inflight = max(1, config.downloader_max_inflight)
@@ -434,6 +479,20 @@ async def run_downloader_loop(
                 needs_db_reconnect = True
 
     logger.info(f"[{backend_name}] Inflight pool size: {max_inflight}")
+
+    # Periodic retry-mover — one per pod, off the per-request hot path. Moves due items from
+    # the retry ZSET back onto the download queue (mirrors the uploader's _retry_mover).
+    async def _retry_mover() -> None:
+        while True:
+            try:
+                moved = await move_due_download_retries(backend_name=backend_name, now_ts=time.time(), max_items=256)
+                if moved:
+                    logger.info(f"[{backend_name}] Moved {moved} due download retries back to queue")
+            except Exception as e:
+                logger.error(f"[{backend_name}] Error moving download retries: {e}")
+            await asyncio.sleep(2.0)
+
+    mover_task = asyncio.create_task(_retry_mover())
 
     try:
         while True:
@@ -503,6 +562,8 @@ async def run_downloader_loop(
         logger.error(f"[{backend_name}] Fatal loop error: {exc}", exc_info=True)
         raise
     finally:
+        mover_task.cancel()
+        await asyncio.gather(mover_task, return_exceptions=True)
         await redis_client.aclose()
         await redis_queues_client.aclose()
         await db_pool.close()

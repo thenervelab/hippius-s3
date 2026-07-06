@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
 import pytest
+from redis.exceptions import RedisError
 
 from gateway.repositories.cached_acl_repository import CachedACLRepository
 from hippius_s3.models.acl import ACL
@@ -232,3 +233,70 @@ class TestInvalidation:
         mock_redis.delete.assert_called_once()
         args = mock_redis.delete.call_args[0]
         assert len(args) == 2
+
+
+class TestRedisOutageFallsBackToDB:
+    """A6: a redis-acl outage must not 500 permission checks — the cache falls through to the DB
+    (the ACL source of truth). Reads fall back; writes/invalidations are best-effort."""
+
+    @pytest.mark.asyncio
+    async def test_bucket_read_falls_back_to_db_on_redis_error(
+        self, cached_repo: CachedACLRepository, mock_redis: Any, mock_base_repo: Any, sample_acl: ACL
+    ) -> None:
+        mock_redis.get.side_effect = RedisError("redis-acl down")
+        mock_base_repo.get_bucket_acl.return_value = sample_acl
+
+        result = await cached_repo.get_bucket_acl("my-bucket")
+
+        assert result is sample_acl  # authoritative DB grants returned, no 500
+        mock_base_repo.get_bucket_acl.assert_awaited_once_with("my-bucket")
+
+    @pytest.mark.asyncio
+    async def test_object_read_falls_back_to_db_on_redis_error(
+        self, cached_repo: CachedACLRepository, mock_redis: Any, mock_base_repo: Any, sample_acl: ACL
+    ) -> None:
+        mock_redis.get.side_effect = RedisError("redis-acl down")
+        mock_base_repo.get_object_acl.return_value = sample_acl
+
+        result = await cached_repo.get_object_acl("my-bucket", "k")
+
+        assert result is sample_acl
+        mock_base_repo.get_object_acl.assert_awaited_once_with("my-bucket", "k")
+
+    @pytest.mark.asyncio
+    async def test_write_failure_does_not_fail_the_lookup(
+        self, cached_repo: CachedACLRepository, mock_redis: Any, mock_base_repo: Any, sample_acl: ACL
+    ) -> None:
+        mock_redis.get.return_value = None  # cache miss → DB read → cache write (which explodes)
+        mock_redis.setex.side_effect = RedisError("redis-acl down")
+        mock_base_repo.get_bucket_acl.return_value = sample_acl
+
+        result = await cached_repo.get_bucket_acl("my-bucket")
+
+        assert result is sample_acl  # the SETEX failure is swallowed; the DB value is returned
+
+    @pytest.mark.asyncio
+    async def test_invalidation_does_not_raise_on_redis_error(
+        self, cached_repo: CachedACLRepository, mock_redis: Any
+    ) -> None:
+        mock_redis.delete.side_effect = RedisError("redis-acl down")
+        # must not raise — the DB write already committed upstream
+        await cached_repo.invalidate_bucket_acl("my-bucket")
+        await cached_repo.invalidate_object_acl("my-bucket", "k")
+
+    @pytest.mark.asyncio
+    async def test_db_failure_during_outage_propagates_never_fails_open(
+        self, cached_repo: CachedACLRepository, mock_redis: Any, mock_base_repo: Any
+    ) -> None:
+        # SECURITY guard: only RedisError is caught. If redis is down AND the authoritative DB read
+        # ALSO fails, the DB exception must PROPAGATE (→ 500 = deny), never be swallowed into a
+        # permissive default. This test pins the boundary so a future widened `except` can't fail open.
+        mock_redis.get.side_effect = RedisError("redis-acl down")
+        mock_base_repo.get_bucket_acl.side_effect = RuntimeError("acl DB unavailable")
+
+        with pytest.raises(RuntimeError, match="acl DB unavailable"):
+            await cached_repo.get_bucket_acl("my-bucket")
+
+        mock_base_repo.get_object_acl.side_effect = RuntimeError("acl DB unavailable")
+        with pytest.raises(RuntimeError, match="acl DB unavailable"):
+            await cached_repo.get_object_acl("my-bucket", "k")

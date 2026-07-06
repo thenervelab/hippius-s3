@@ -240,3 +240,144 @@ groups:
           summary: API response times severely degraded during user activity
         labels:
           severity: high
+
+      # DLQs live on redis-queues (2GB, noeviction) — a full DLQ fails ALL writes pipeline-wide.
+      # Thresholds are LITERALS for the default HIPPIUS_DLQ_MAX_ENTRIES=10000 (warn at 50%, page at 90%).
+      # If you change the cap, update 5000/9000 below in lockstep — otherwise the ratios drift.
+      - uid: dlq-near-full-warning
+        title: DLQ Filling - 50% of Cap
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(hippius_queue_length{queue_name=~".*:dlq"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 5000
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          summary: 'A DLQ is at {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} entries (warn threshold: 5000 = 50% of cap)'
+          description: 'A dead-letter queue is filling on redis-queues (noeviction). Triage/requeue via scripts/dlq_requeue.py before it hits the cap and drops entries.'
+        labels:
+          severity: high
+
+      - uid: dlq-near-full-critical
+        title: DLQ Near Cap - 90% of Cap
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(hippius_queue_length{queue_name=~".*:dlq"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 9000
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          summary: 'A DLQ is at {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} entries (page threshold: 9000 = 90% of cap)'
+          description: 'A dead-letter queue is about to hit its cap and drop new entries. Requeue via scripts/dlq_requeue.py NOW.'
+        labels:
+          severity: critical
+
+      - uid: dlq-entries-dropped
+        title: DLQ Dropping Entries - At Cap
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'sum(increase(dlq_dropped_total{job="otel-collector"}[5m])) or vector(0)'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 0m
+        annotations:
+          summary: 'A DLQ is at its cap and dropping entries - {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} dropped in last 5 minutes'
+          description: 'A DLQ hit HIPPIUS_DLQ_MAX_ENTRIES and is dropping failure records (drop-newest). This drops the failure record, not object data (janitor replication gate still protects chunks); durable trace is object_versions.status. Drain the DLQ immediately via scripts/dlq_requeue.py.'
+        labels:
+          severity: critical
