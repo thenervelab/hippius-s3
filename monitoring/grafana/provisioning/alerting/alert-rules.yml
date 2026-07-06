@@ -346,3 +346,55 @@ groups:
           summary: Live objects have chunks the replication gate cannot safely retain
         labels:
           severity: critical
+
+      # A21 aged-pending orphan backlog. janitor_aged_pending_orphans counts unservable
+      # pending/draining versions idle past the grace — the leak the replicated-only soak
+      # gate is blind to. A sustained elevated value means orphans accrue faster than the
+      # sweep (list_orphan_replication_versions.sql) clears them: a re-introduced leak (e.g.
+      # the abort-path bug) or a stalled sweep. A long `for` tolerates the transient backlog
+      # between a leak and the next sweep, firing only on a standing, non-draining backlog.
+      - uid: aged-pending-orphan-backlog
+        title: Drain A21 - Aged Pending Orphans Not Draining
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(janitor_aged_pending_orphans{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 100
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 30m
+        annotations:
+          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} aged pending/draining orphan version(s) are not draining — the A21 sweep is not keeping up (re-introduced leak or stalled reaper). This population is invisible to the replicated-only soak gate.'
+          summary: A21 orphan backlog is standing above threshold and not draining
+        labels:
+          severity: warning

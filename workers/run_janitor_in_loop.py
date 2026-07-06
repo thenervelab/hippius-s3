@@ -81,6 +81,11 @@ TMP_FILE_MAX_AGE_SECONDS = 3600  # 1h
 # Cap on the G2 sentinel scan: it needs only to DETECT a durability gap and sample a few
 # offenders, not enumerate every one, so a bounded page keeps the read-only query cheap.
 SENTINEL_SCAN_LIMIT = 500
+# Idle grace before a pending/draining orphan counts toward the aged-orphan gauge. Below
+# this, an unservable pending version is indistinguishable from a still-arriving upload; the
+# reaper's own grace is the reference, so a value comfortably above normal ingest latency
+# keeps live uploads out of the leak signal the soak gate watches.
+AGED_PENDING_ORPHAN_GRACE_SECONDS = 3600  # 1h
 
 _fs_parts_on_disk = 0
 _fs_oldest_age_seconds = 0.0
@@ -93,6 +98,10 @@ _fs_age_buckets: dict[str, int] = dict.fromkeys(AGE_BUCKET_NAMES, 0)
 # (the population the gate must never reclaim). Any nonzero value is a standing durability
 # alarm; sampled/capped by SENTINEL_SCAN_LIMIT, so a value at the cap means ">=".
 _replication_sentinel_violations = 0
+# Aged pending/draining orphan count (A21 leak backlog): the soak-gate feed the replicated-
+# only gate is blind to. A standing or rising value means orphans are accumulating faster
+# than the sweep clears them — a re-introduced leak.
+_aged_pending_orphans = 0
 
 _janitor_deleted_counter = None  # set by _setup_janitor_metrics
 _janitor_tmp_deleted_counter = None
@@ -129,6 +138,10 @@ def _obs_age_buckets(_: object) -> list[otel_metrics.Observation]:
 
 def _obs_replication_sentinel(_: object) -> list[otel_metrics.Observation]:
     return [otel_metrics.Observation(_replication_sentinel_violations, {})]
+
+
+def _obs_aged_pending_orphans(_: object) -> list[otel_metrics.Observation]:
+    return [otel_metrics.Observation(_aged_pending_orphans, {})]
 
 
 def _classify_age_bucket(age_seconds: float) -> str:
@@ -316,6 +329,11 @@ def _setup_janitor_metrics() -> None:
         name="janitor_underreplicated_live_chunks",
         callbacks=[_obs_replication_sentinel],
         description="Live serveable chunks lacking full-union backend coverage (G2 sentinel; nonzero = durability gap)",
+    )
+    meter.create_observable_gauge(
+        name="janitor_aged_pending_orphans",
+        callbacks=[_obs_aged_pending_orphans],
+        description="Aged pending/draining unservable orphan versions (A21 leak backlog; the soak gate asserts bounded / slope ~ 0)",
     )
     _janitor_deleted_counter = meter.create_counter(
         name="fs_janitor_deleted_total",
@@ -615,6 +633,31 @@ async def check_replication_sentinel(db_pool: asyncpg.Pool, pressure: int) -> in
             sample,
         )
     return violations
+
+
+async def check_aged_pending_orphans(db_pool: asyncpg.Pool) -> int:
+    """A21 soak-gate feed: count the standing aged pending/draining unservable orphan
+    versions and publish the gauge.
+
+    The 6h-soak gate asserts only the `replicated`-on-SSD count, so it is blind to A21
+    orphans (which never reach `replicated`). This publishes the population the sweep
+    (`list_orphan_replication_versions.sql`) exists to clear, so the soak gate can assert it
+    is bounded and its slope is ~ 0 — a rising value means orphans accrue faster than the
+    sweep drains them (a re-introduced leak). Purely a SELECT, safe every cycle.
+
+    Unlike the G2 sentinel this does NOT log on a nonzero value: a transient backlog between
+    a leak and the next sweep is normal, so alerting is left to the gauge's slope/sustained
+    threshold (see the ``aged-pending-orphan-backlog`` Grafana rule), not a per-cycle log.
+    Returns the count.
+    """
+    global _aged_pending_orphans
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval(
+            get_query("count_aged_pending_orphans"),
+            AGED_PENDING_ORPHAN_GRACE_SECONDS,
+        )
+    _aged_pending_orphans = int(count or 0)
+    return _aged_pending_orphans
 
 
 async def is_terminally_abandoned(
@@ -986,9 +1029,17 @@ async def run_janitor_loop():
             except Exception as e:
                 logger.error(f"Phase 5 (replication sentinel) error: {e}", exc_info=True)
 
+            # Phase 6: read-only aged-pending orphan gauge (A21 soak-gate feed). Publishes the
+            # standing leak backlog the replicated-only soak gate cannot see.
+            aged_orphans = 0
+            try:
+                aged_orphans = await check_aged_pending_orphans(db_pool)
+            except Exception as e:
+                logger.error(f"Phase 6 (aged-pending orphan gauge) error: {e}", exc_info=True)
+
             logger.info(
                 f"Janitor cycle complete: stale={stale_count} gc={gc_count} tmp={tmp_count} "
-                f"hard_deleted={hard_deleted} sentinel_violations={sentinel_violations}"
+                f"hard_deleted={hard_deleted} sentinel_violations={sentinel_violations} aged_orphans={aged_orphans}"
             )
 
             # Pick sleep interval based on current pressure (already probed for Phase 5)
