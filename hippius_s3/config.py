@@ -198,6 +198,11 @@ class Config:
 
     # Cache TTL (shared across components — still used for pub/sub wait timeout)
     cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:3600", convert=int)
+    # Bound on how long a GET waits for its FIRST chunk before failing fast with a retryable 503
+    # (DownloadNotReadyError). Keeps an un-drained/never-arriving object (e.g. a part not yet on any
+    # backend) from hanging the whole request up to cache_ttl_seconds (~1h). Later chunks keep the
+    # full wait — once the first chunk lands the object is actively draining.
+    stream_first_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS:90", convert=int)
     # Hot-retention window for the FS cache: chunks read within this window
     # are protected from janitor deletion so frequently-accessed content
     # stays on NVMe. Touched on every read by the API/streamer.

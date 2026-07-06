@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
+from typing import AsyncGenerator
 
 from fastapi import Response
 from fastapi.responses import StreamingResponse
@@ -324,6 +326,32 @@ async def read_response(
         bucket_name=str(info.get("bucket_name", "")),
         prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
     )
+    # A2: bound the wait for the FIRST chunk. `stream_plan` otherwise waits up to cache_ttl_seconds
+    # (~1h) per chunk, so an un-drained object whose part is on no backend yet would hang the whole
+    # GET for an hour. Peek the first chunk here, before the StreamingResponse is returned, so a
+    # first-chunk timeout surfaces as a retryable 503 (DownloadNotReadyError, caught by the endpoint)
+    # *before* the 200/206 headers are committed. Warm reads return the chunk immediately; once the
+    # first chunk lands the object is actively draining, so later chunks keep the full wait.
+    first_timeout = float(cfg.stream_first_chunk_timeout_seconds)
+    first_chunk: bytes | None = None
+    try:
+        first_chunk = await asyncio.wait_for(gen.__anext__(), timeout=first_timeout)
+    except StopAsyncIteration:
+        first_chunk = None  # empty (zero-byte) object — nothing to stream
+    except (TimeoutError, asyncio.TimeoutError) as exc:
+        await gen.aclose()
+        raise DownloadNotReadyError(
+            "Parts not ready: first chunk did not arrive within the initial stream timeout"
+        ) from exc
+
+    async def _body() -> AsyncGenerator[bytes, None]:
+        nonlocal first_chunk
+        if first_chunk is not None:
+            yield first_chunk
+            first_chunk = None  # release the (up to ~4 MiB) first chunk for the rest of the stream
+        async for chunk in gen:
+            yield chunk
+
     headers = build_headers(
         info,
         source=ctx.source,
@@ -333,7 +361,7 @@ async def read_response(
     )
     status_code = 200 if rng is None or range_was_invalid else 206
     return StreamingResponse(
-        gen,
+        _body(),
         status_code=status_code,
         media_type=info.get("content_type", "application/octet-stream"),
         headers=headers,
