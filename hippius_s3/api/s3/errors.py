@@ -134,30 +134,25 @@ _KEY_MISCONFIG_SUBSTRINGS = ("KMS client not initialized", "HIPPIUS_KMS_MODE=dis
 def read_path_crypto_error_response(exc: BaseException) -> Response | None:
     """Map read-path key/crypto failures to a well-formed S3 error instead of a bare 500.
 
-    - **Transient** (`kms_unavailable`/`kms_auth_failed`/`kms_error` KMS brownout, or
-      `kek_database_unavailable` keystore-DB blip) → retryable **503 SlowDown** — the key/DB layer is
-      down, not the object.
-    - **Genuinely unreadable object** — missing envelope metadata (`v5_missing_envelope_metadata`), a
-      lost KEK row (`kek_not_found`), a malformed wrapped key (`local_unwrap_failed`), an AEAD auth
-      failure (`InvalidTag`), or a KMS deploy-misconfig → **500 InternalError** with a proper S3 XML
-      body (permanent; retry won't help). This replaces the bare, body-less 500 uvicorn returns.
-
-    Returns ``None`` for anything else (the caller re-raises). Note `unsupported_enc_suite_id` is
-    handled by `map_read_path_exception` (→ 501), not here.
+    Transient key/DB failures (KMS brownout, keystore-DB blip) → retryable 503; a genuinely
+    unreadable object (missing envelope, lost KEK, bad wrapped key, AEAD `InvalidTag`, KMS
+    deploy-misconfig) → 500 with a proper S3 body. Returns ``None`` for anything else (the caller
+    re-raises). `unsupported_enc_suite_id` is handled by `map_read_path_exception` (→ 501), not here.
     """
-    if isinstance(exc, RuntimeError) and str(exc) in _KEY_TRANSIENT_MARKERS:
+    msg = str(exc)
+    if isinstance(exc, RuntimeError) and msg in _KEY_TRANSIENT_MARKERS:
         return s3_error_response(
             code="SlowDown",
             message="Encryption key service is temporarily unavailable. Please retry.",
             status_code=503,
             extra_headers={"Retry-After": "3"},
         )
-    # InvalidTag is the AEAD authentication failure from `unwrap_dek` (cryptography); match by class
-    # name to avoid importing the crypto exception type into the error module.
-    is_invalid_tag = exc.__class__.__name__ == "InvalidTag"
-    is_marker = isinstance(exc, RuntimeError) and str(exc) in _KEY_UNREADABLE_MARKERS
-    is_misconfig = isinstance(exc, RuntimeError) and any(s in str(exc) for s in _KEY_MISCONFIG_SUBSTRINGS)
-    if is_invalid_tag or is_marker or is_misconfig:
+    # InvalidTag (AEAD auth failure from unwrap_dek) is matched by class name to avoid importing the
+    # crypto exception type here; the two marker sets and the misconfig sentences are the key errors.
+    if exc.__class__.__name__ == "InvalidTag" or (
+        isinstance(exc, RuntimeError)
+        and (msg in _KEY_UNREADABLE_MARKERS or any(s in msg for s in _KEY_MISCONFIG_SUBSTRINGS))
+    ):
         return s3_error_response(
             code="InternalError",
             message="Object could not be decrypted (encryption metadata missing or key authentication failed).",

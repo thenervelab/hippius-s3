@@ -8,8 +8,10 @@ normally, and the first chunk is preserved (not dropped by the peek).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from types import SimpleNamespace
 from typing import Any
+from typing import Iterator
 from unittest.mock import AsyncMock
 from unittest.mock import patch
 
@@ -41,13 +43,17 @@ def _info() -> dict:
     }
 
 
-def _patches(cfg: Any, stream_plan_factory: Any) -> list:
-    return [
+@contextlib.contextmanager
+def _patched(cfg: Any, stream_plan_factory: Any) -> Iterator[None]:
+    """Patch read_response's collaborators: a fixed ctx, the given config, no-op headers, and a
+    controllable stream_plan (each call returns a fresh generator from `stream_plan_factory`)."""
+    with (
         patch.object(object_reader, "build_stream_context", new=AsyncMock(return_value=_ctx())),
         patch.object(object_reader, "get_config", return_value=cfg),
         patch.object(object_reader, "build_headers", return_value={}),
         patch.object(object_reader, "stream_plan", new=lambda **kw: stream_plan_factory()),
-    ]
+    ):
+        yield
 
 
 async def _collect(resp: Any) -> bytes:
@@ -63,8 +69,7 @@ async def test_first_chunk_timeout_raises_download_not_ready() -> None:
         yield b"unreachable"
 
     cfg = SimpleNamespace(stream_first_chunk_timeout_seconds=0.15, http_stream_prefetch_chunks=0)
-    p = _patches(cfg, _hanging)
-    with p[0], p[1], p[2], p[3]:
+    with _patched(cfg, _hanging):
         loop = asyncio.get_event_loop()
         t0 = loop.time()
         with pytest.raises(object_reader.DownloadNotReadyError):
@@ -83,8 +88,7 @@ async def test_warm_read_streams_all_chunks_including_the_peeked_first() -> None
         yield b"world"
 
     cfg = SimpleNamespace(stream_first_chunk_timeout_seconds=5, http_stream_prefetch_chunks=0)
-    p = _patches(cfg, _two)
-    with p[0], p[1], p[2], p[3]:
+    with _patched(cfg, _two):
         resp = await object_reader.read_response(
             db=None, redis=None, obj_cache=None, info=_info(), read_mode="auto", rng=None, address="a"
         )
@@ -101,8 +105,7 @@ async def test_zero_byte_object_streams_empty_body() -> None:
         yield b""  # pragma: no cover — makes this an async generator
 
     cfg = SimpleNamespace(stream_first_chunk_timeout_seconds=5, http_stream_prefetch_chunks=0)
-    p = _patches(cfg, _empty)
-    with p[0], p[1], p[2], p[3]:
+    with _patched(cfg, _empty):
         resp = await object_reader.read_response(
             db=None, redis=None, obj_cache=None, info=_info(), read_mode="auto", rng=None, address="a"
         )

@@ -332,7 +332,7 @@ async def read_response(
     # first-chunk timeout surfaces as a retryable 503 (DownloadNotReadyError, caught by the endpoint)
     # *before* the 200/206 headers are committed. Warm reads return the chunk immediately; once the
     # first chunk lands the object is actively draining, so later chunks keep the full wait.
-    first_timeout = float(getattr(cfg, "stream_first_chunk_timeout_seconds", 90) or 90)
+    first_timeout = float(cfg.stream_first_chunk_timeout_seconds)
     first_chunk: bytes | None = None
     try:
         first_chunk = await asyncio.wait_for(gen.__anext__(), timeout=first_timeout)
@@ -345,8 +345,10 @@ async def read_response(
         ) from exc
 
     async def _body() -> AsyncGenerator[bytes, None]:
+        nonlocal first_chunk
         if first_chunk is not None:
             yield first_chunk
+            first_chunk = None  # release the (up to ~4 MiB) first chunk for the rest of the stream
         async for chunk in gen:
             yield chunk
 
