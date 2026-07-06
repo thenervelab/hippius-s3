@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
@@ -257,18 +258,32 @@ async fn stream_copy_hash(source: &Path, dest: &Path) -> io::Result<String> {
     Ok(hex_lower(hasher.finalize().as_slice()))
 }
 
+/// A monotonic per-process counter that, with the pid, makes each write temp unique —
+/// so two tasks persisting the SAME `name` concurrently never share a temp file (C11).
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// The write-temp name for `name`: the agent's `.tmp-` prefix (recognized by
+/// [`is_temp_name`] and the orphan sweep) plus a per-writer `pid.counter` suffix, so
+/// two concurrent persists of the same part write to DISTINCT temps.
+fn temp_name(name: &str) -> String {
+    format!(".tmp-{name}.{}.{}", std::process::id(), TEMP_SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
 /// Atomically place `source`'s bytes into `dir` as `name`, returning the lowercase-hex
 /// SHA-256 of the bytes streamed during the copy: stream into a temp inside `dir`
 /// (`fdatasync`'d), rename into place, then — only when `sync_dir` is set — fsync `dir`.
-/// A crash leaves either no file or the complete one. The single-writer-per-part claim
-/// makes the `.tmp-<name>` temp collision-free (mirrors the within-folder atomic rename).
+/// A crash leaves either no file or the complete one. The temp is suffixed per-writer
+/// ([`temp_name`]), so two tasks draining the SAME part concurrently — a re-claim after a
+/// lease lapses under slow Ceph, which the single-writer claim does NOT prevent (`claim_seq`
+/// fences the COMMIT, not the in-flight copy) — write to distinct temps; last rename wins,
+/// harmless since the bytes are deterministic per (part, chunk).
 ///
 /// The directory fsync is deferred (`sync_dir = false` for chunks + meta) so the whole
 /// part costs ONE dir-fsync via [`sync_parent_dir`], not one per file — the caller drives
 /// it through `PartPool::finalize_part` after every rename lands.
 async fn copy_into(dir: &Path, name: &str, source: &Path, sync_dir: bool) -> io::Result<String> {
     let dest = dir.join(name);
-    let tmp = dir.join(format!(".tmp-{name}"));
+    let tmp = dir.join(temp_name(name));
     fs::create_dir_all(dir).await?;
     // Arm temp cleanup before the copy: any failure or cancellation before the rename
     // must not leave a `.tmp-*` orphan in the pool (the drop-guard idiom, RfR ch.1).
@@ -570,7 +585,7 @@ impl PartRemover for LocalSsd {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::{LocalSsd, TmpGuard, hex_lower, safe_component};
+    use super::{LocalSsd, TmpGuard, hex_lower, is_temp_name, safe_component, temp_name};
     use core::str::FromStr;
     use hippius_drain_core::{FileId, SsdCache};
     use proptest::prelude::*;
@@ -580,6 +595,20 @@ mod tests {
 
     fn fid(raw: &str) -> FileId {
         FileId::from_str(raw).unwrap()
+    }
+
+    #[test]
+    fn temp_name_is_unique_per_writer_and_still_recognized_as_a_temp() {
+        // C11: two persists of the SAME name must get DISTINCT temp files. Sharing one temp
+        // is a real tear risk when a lapsed lease under slow Ceph lets two tasks drain one
+        // part at once (claim_seq fences the commit, not the in-flight copy).
+        let a = temp_name("chunk_0.bin");
+        let b = temp_name("chunk_0.bin");
+        assert_ne!(a, b, "two temps for the same name must differ");
+        for t in [&a, &b] {
+            assert!(t.starts_with(".tmp-"), "keeps the agent temp prefix: {t}");
+            assert!(is_temp_name(t), "the orphan sweep still recognizes it as a temp: {t}");
+        }
     }
 
     #[tokio::test]
