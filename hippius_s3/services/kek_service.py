@@ -278,6 +278,22 @@ async def _unwrap_kek(
             raise RuntimeError("kms_error") from e
 
 
+# A14: per-(bucket, kek) singleflight so N concurrent cold cache-misses (e.g. a burst of GETs
+# on one bucket right after a cache flush) coalesce into ONE KMS unwrap instead of N. The lock
+# only guards the unwrap; the cache read/write around it is unchanged. Process-local (one per
+# API pod), which is where the KMS-call fan-out is.
+_kek_unwrap_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+
+def _kek_unwrap_lock(bucket_id: str, kek_id: uuid.UUID) -> asyncio.Lock:
+    key = (str(bucket_id), str(kek_id))
+    lock = _kek_unwrap_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _kek_unwrap_locks[key] = lock
+    return lock
+
+
 async def _get_cached_kek(bucket_id: str, kek_id: uuid.UUID) -> bytes | None:
     cfg = get_config()
     ttl = int(cfg.kek_cache_ttl_seconds)
@@ -427,13 +443,18 @@ async def get_or_create_active_bucket_kek(
             if cached is not None:
                 return kek_id, cached
 
-            # Unwrap the KEK
-            wrapped_kek_bytes = row["wrapped_kek_bytes"]
-            kms_key_id = row["kms_key_id"]
-            kek_bytes = await _unwrap_kek(bytes(wrapped_kek_bytes), kms_key_id, kek_id)
-
-            await _set_cached_kek(bucket_id, kek_id, kek_bytes)
-            return kek_id, kek_bytes
+            # A14 singleflight: coalesce concurrent cold misses. Hold the per-key lock, then
+            # RE-CHECK the cache — the first waiter's unwrap+cache means every later waiter hits
+            # the cache and skips its own KMS call.
+            async with _kek_unwrap_lock(bucket_id, kek_id):
+                cached = await _get_cached_kek(bucket_id, kek_id)
+                if cached is not None:
+                    return kek_id, cached
+                wrapped_kek_bytes = row["wrapped_kek_bytes"]
+                kms_key_id = row["kms_key_id"]
+                kek_bytes = await _unwrap_kek(bytes(wrapped_kek_bytes), kms_key_id, kek_id)
+                await _set_cached_kek(bucket_id, kek_id, kek_bytes)
+                return kek_id, kek_bytes
 
         # Create new KEK (KMS generates the key, or we generate locally)
         kek_id = uuid.uuid4()

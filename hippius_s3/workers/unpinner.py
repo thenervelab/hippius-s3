@@ -125,9 +125,14 @@ async def process_unpin_request(
             span.set_attribute("num_identifiers", len(rows))
 
             async with backend_client_factory() as client:
-                # Unpin each identifier concurrently, bounded by the shared per-pod `sem`. Each
-                # identifier is best-effort (a failed DELETE/soft-delete logs a warning but must not
-                # fail the whole request), mirroring the original serial behavior.
+                # A9: the soft-delete is now GATED on a successful backend DELETE. Marking the
+                # chunk_backend row deleted while the backend object still exists would strand the
+                # pin forever (nothing retries a soft-deleted row) — a silent leak. So on an unpin
+                # failure we do NOT soft-delete; we record the failure and re-raise after the
+                # batch so process_unpin_request routes the whole request to retry/DLQ (the
+                # backend DELETE and the soft-delete are both idempotent, so a full retry is safe).
+                failures: list[Exception] = []
+
                 async def _unpin_one(row: Any) -> None:
                     identifier = row["backend_identifier"]
                     chunk_id = row["chunk_id"]
@@ -139,6 +144,8 @@ async def process_unpin_request(
                             worker_logger.warning(
                                 f"Failed to unpin {backend_name} identifier={identifier}: {unpin_err}"
                             )
+                            failures.append(unpin_err)
+                            return  # do NOT soft-delete a still-pinned backend object
 
                         try:
                             async with db_pool.acquire() as conn:
@@ -151,8 +158,16 @@ async def process_unpin_request(
                             worker_logger.warning(
                                 f"Failed to soft-delete chunk_backend row chunk_id={chunk_id}: {db_err}"
                             )
+                            failures.append(db_err)
 
                 await asyncio.gather(*[_unpin_one(row) for row in rows])
+                if failures:
+                    # Surface a partial failure so process_unpin_request's handler routes the whole
+                    # request to retry/DLQ. Re-raise the FIRST underlying exception (not a generic
+                    # wrapper) so its transient/permanent classification is preserved — a transient
+                    # backend blip retries, a permanent error DLQs. Succeeded identifiers are already
+                    # soft-deleted; the idempotent re-unpin tolerates their 404 on retry.
+                    raise failures[0]
 
             get_metrics_collector().record_unpinner_operation(
                 main_account=request.address,

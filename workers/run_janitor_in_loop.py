@@ -353,11 +353,18 @@ def _setup_janitor_metrics() -> None:
     )
 
 
+class DLQProtectionUnavailable(Exception):
+    """A15: a DLQ read failed, so the protection set is INCOMPLETE. Raised so the caller
+    fails CLOSED — skipping the destructive reap rather than running it with partial (or empty)
+    protection exactly when redis-queues is down and a DLQ'd object's data must NOT be reaped."""
+
+
 async def get_all_dlq_object_ids(redis_client: Redis) -> set[str]:
     """Fetch all object_ids currently in both upload and unpin DLQs.
 
-    Returns:
-        Set of object_id strings present in any DLQ
+    Returns the set of protected object_ids. Raises [`DLQProtectionUnavailable`] if ANY DLQ
+    list read fails — the janitor's reaps use this set to PROTECT in-flight DLQ objects from
+    eviction, so an incomplete set must never be treated as "nothing to protect" (fail-closed).
     """
     object_ids = set()
 
@@ -369,17 +376,18 @@ async def get_all_dlq_object_ids(redis_client: Redis) -> set[str]:
     for dlq_key in dlq_keys:
         try:
             dlq_entries = await asyncio.wait_for(redis_client.lrange(dlq_key, 0, -1), timeout=5.0)
-            for entry_json in dlq_entries:
-                try:
-                    entry = json.loads(entry_json)
-                    if obj_id := entry.get("object_id"):
-                        object_ids.add(str(obj_id))
-                except json.JSONDecodeError:
-                    logger.warning(f"Invalid JSON in {dlq_key}: {entry_json[:100]}")
-        except asyncio.TimeoutError:
-            logger.error(f"{dlq_key} fetch timeout (5s)")
-        except Exception as e:
-            logger.error(f"Failed to fetch {dlq_key} object_ids: {e}")
+        except asyncio.TimeoutError as exc:
+            raise DLQProtectionUnavailable(f"{dlq_key} fetch timeout (5s)") from exc
+        except Exception as exc:
+            raise DLQProtectionUnavailable(f"failed to fetch {dlq_key}: {exc}") from exc
+        for entry_json in dlq_entries:
+            try:
+                entry = json.loads(entry_json)
+                if obj_id := entry.get("object_id"):
+                    object_ids.add(str(obj_id))
+            except json.JSONDecodeError:
+                # A single malformed entry does not compromise the rest of the set — skip it.
+                logger.warning(f"Invalid JSON in {dlq_key}: {entry_json[:100]}")
 
     if object_ids:
         logger.info(f"Found {len(object_ids)} unique object_ids protected across all DLQs")
@@ -406,7 +414,14 @@ async def cleanup_stale_parts(
     stale_threshold_seconds = config.mpu_stale_seconds
     cutoff_sql = "NOW() - INTERVAL '1 second' * $4"
 
-    dlq_object_ids = await get_all_dlq_object_ids(redis_client)
+    try:
+        dlq_object_ids = await get_all_dlq_object_ids(redis_client)
+    except DLQProtectionUnavailable as exc:
+        # A15 fail-closed: without a complete DLQ protection set we cannot know which parts
+        # belong to in-flight DLQ operations, so skip this reap entirely rather than delete
+        # unprotected. Retry next cycle when redis-queues is back.
+        logger.error(f"Skipping stale-parts cleanup — DLQ protection unavailable: {exc}")
+        return 0
     if dlq_object_ids:
         logger.info(f"Protecting {len(dlq_object_ids)} DLQ objects from stale cleanup")
 
@@ -764,7 +779,14 @@ async def cleanup_old_parts_by_mtime(
     max_age_seconds = config.fs_cache_gc_max_age_seconds
     logger.info(f"Scanning FS parts eligible for GC (max_age={max_age_seconds}s, replication-gated)")
 
-    dlq_object_ids = await get_all_dlq_object_ids(redis_client)
+    try:
+        dlq_object_ids = await get_all_dlq_object_ids(redis_client)
+    except DLQProtectionUnavailable as exc:
+        # A15 fail-closed: skip age-based GC when the DLQ protection set is incomplete rather
+        # than evict data for an in-flight DLQ operation. (The replication gate still protects
+        # unreplicated data; this guards the DLQ dimension specifically.)
+        logger.error(f"Skipping age-based GC — DLQ protection unavailable: {exc}")
+        return 0
     if dlq_object_ids:
         logger.info(f"Protecting {len(dlq_object_ids)} DLQ objects from GC")
 
