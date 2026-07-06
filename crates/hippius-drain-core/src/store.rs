@@ -844,6 +844,56 @@ impl BackingLog for Store {
         }
         Ok(out)
     }
+
+    async fn servable_parts(&self, parts: &[PartKey]) -> Result<HashSet<PartKey>> {
+        let mut out = HashSet::with_capacity(parts.len());
+        // Chunk the request so a pathological backlog never builds one giant array.
+        for batch in parts.chunks(RECLAIM_STATUS_BATCH) {
+            let mut object_ids: Vec<&str> = Vec::with_capacity(batch.len());
+            let mut versions: Vec<i64> = Vec::with_capacity(batch.len());
+            let mut part_numbers: Vec<i64> = Vec::with_capacity(batch.len());
+            for part in batch {
+                object_ids.push(part.object().as_str());
+                versions.push(i64::from(part.version().get()));
+                part_numbers.push(i64::from(part.part().get()));
+            }
+            // Echo back exactly the input parts whose (object_id, version) row EXISTS and is
+            // SERVABLE — the exact inverse of janitor_part_terminally_abandoned.sql's
+            // unservable predicate. MUST stay in lockstep with that file (and the A21 sweep's
+            // list_orphan_replication_versions.sql): servable = address written, OR a real
+            // size, OR an md5 — the download filter `(size_bytes > 0 OR md5_hash <> '')` plus
+            // a set address. `address` is written AFTER size/md5 in a separate step, so a
+            // fully-servable version briefly has address=NULL (the mid-finalize window); the
+            // size/md5 disjuncts are what keep such a live version from being read as
+            // reclaimable. Do NOT "simplify" to address-only. The object_id is echoed from the
+            // input UNNEST so the reconstructed PartKey matches the caller's key verbatim.
+            let rows = sqlx::query_as::<_, (String, i64, i64)>(
+                "SELECT t.object_id, t.version, t.part_number \
+                 FROM UNNEST($1::text[], $2::bigint[], $3::bigint[]) AS t(object_id, version, part_number) \
+                 WHERE EXISTS ( \
+                    SELECT 1 FROM object_versions ov \
+                    WHERE ov.object_id = t.object_id::uuid AND ov.object_version = t.version \
+                      AND (ov.address IS NOT NULL OR ov.size_bytes > 0 OR COALESCE(ov.md5_hash, '') <> '') \
+                 )",
+            )
+            .bind(&object_ids)
+            .bind(&versions)
+            .bind(&part_numbers)
+            .fetch_all(&self.pool)
+            .await?;
+            for (object_id, version, part_number) in rows {
+                out.insert(
+                    PartRow {
+                        object_id,
+                        version,
+                        part_number,
+                    }
+                    .into_part()?,
+                );
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -1179,6 +1229,79 @@ mod part_tests {
         let store = Store::from_pool(pool);
         let unbacked = store.unbacked_parts(&[]).await.unwrap();
         assert!(unbacked.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn servable_parts_returns_each_servable_row_and_excludes_unservable_and_missing(pool: PgPool) {
+        // The corrupt-live guard's discriminator, exercising every disjunct of the servable
+        // predicate (address set / size>0 / md5 set) AND its two exclusions (unservable row,
+        // no row). Each disjunct is checked in isolation because `address` is written AFTER
+        // size/md5 in a separate step, so the size/md5-only rows are real mid-finalize states
+        // a servable object passes through — dropping them would strand a live GET.
+        use crate::ssd_reclaim::BackingLog;
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone());
+
+        // address set, size/md5 unset → servable.
+        seed_ov(&pool, UUID_A, 1, Some("5Faddr"), None, None).await;
+        // address NULL but size>0 → servable (the mid-finalize window: size written, address not yet).
+        seed_ov(&pool, UUID_A, 2, None, Some(4096), None).await;
+        // address NULL, size 0, md5 set → servable (md5 alone satisfies the download filter).
+        seed_ov(&pool, UUID_A, 3, None, Some(0), Some("d41d8cd9")).await;
+        // address NULL, size 0, md5 '' → UNSERVABLE (the abandoned-upload shape).
+        seed_ov(&pool, UUID_A, 4, None, Some(0), Some("")).await;
+        // address NULL, size NULL, md5 NULL → UNSERVABLE (bare reserved row).
+        seed_ov(&pool, UUID_A, 5, None, None, None).await;
+        // no object_versions row at all (v6) → UNSERVABLE (deleted object).
+
+        let addr = part(UUID_A, 1, 1);
+        let sized = part(UUID_A, 2, 1);
+        let md5 = part(UUID_A, 3, 1);
+        let empty = part(UUID_A, 4, 1);
+        let bare = part(UUID_A, 5, 1);
+        let missing = part(UUID_A, 6, 1);
+
+        let servable = store
+            .servable_parts(&[addr.clone(), sized.clone(), md5.clone(), empty, bare, missing])
+            .await
+            .unwrap();
+        assert_eq!(
+            servable,
+            HashSet::from([addr, sized, md5]),
+            "each servable disjunct is returned; unservable and missing rows are excluded"
+        );
+    }
+
+    #[sqlx::test]
+    async fn servable_parts_of_an_empty_request_is_empty(pool: PgPool) {
+        use crate::ssd_reclaim::BackingLog;
+        let store = Store::from_pool(pool);
+        assert!(store.servable_parts(&[]).await.unwrap().is_empty());
+    }
+
+    /// Inserts one `object_versions` row with explicit servability columns (address, size,
+    /// md5). Used by the `servable_parts` predicate tests where each disjunct matters.
+    async fn seed_ov(pool: &PgPool, object: &str, version: i64, address: Option<&str>, size_bytes: Option<i64>, md5: Option<&str>) {
+        sqlx::query("INSERT INTO buckets (bucket_id, bucket_name) VALUES ($1::uuid, 'b') ON CONFLICT DO NOTHING")
+            .bind(UUID_B)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO objects (object_id, bucket_id, object_key) VALUES ($1::uuid, $2::uuid, 'k') ON CONFLICT DO NOTHING")
+            .bind(object)
+            .bind(UUID_B)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO object_versions (object_id, object_version, address, size_bytes, md5_hash) VALUES ($1::uuid, $2, $3, $4, $5)")
+            .bind(object)
+            .bind(version)
+            .bind(address)
+            .bind(size_bytes)
+            .bind(md5)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     /// Inserts one `cephor_replication_status` row with an explicit node + status.
@@ -1589,6 +1712,7 @@ mod part_tests {
             "CREATE TABLE buckets (bucket_id uuid PRIMARY KEY, bucket_name text NOT NULL)",
             "CREATE TABLE objects (object_id uuid PRIMARY KEY, bucket_id uuid NOT NULL, object_key text NOT NULL)",
             "CREATE TABLE object_versions (object_id uuid NOT NULL, object_version bigint NOT NULL, address text, \
+             size_bytes bigint, md5_hash text, \
              PRIMARY KEY (object_id, object_version))",
             "CREATE TABLE multipart_uploads (upload_id uuid PRIMARY KEY, object_id uuid, initiated_at timestamptz NOT NULL)",
             "CREATE TABLE parts (object_id uuid NOT NULL, object_version bigint NOT NULL, part_number bigint NOT NULL, \

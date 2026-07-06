@@ -7,6 +7,17 @@
 //! so the drain never unlinks it and its SSD bytes leak with nothing else to reclaim
 //! them. This worker is that missing owner.
 //!
+//! But `failed` is not a clean proxy for "safe to delete": the drain's corruption path
+//! (`mark_failed` on a persistent `ChunkMismatch`) can mark a part of a *servable, live*
+//! object `failed` when its pool copy is corrupt — and then this SSD part is the **last
+//! good source**, not junk. So the `failed` reclaim is gated on the version being
+//! **unservable**: an aged `failed` part is reclaimed only when its `object_versions` row
+//! is absent or unservable (the abandoned-upload shape); a `failed` part whose version is
+//! still servable is the corrupt-live case — left in place, counted `skipped_corrupt`, and
+//! alarmed by the agent. The servable/unservable split is the same download-servability
+//! predicate the Python A21 sweep and `janitor_part_terminally_abandoned.sql` use, so one
+//! definition of "servable" governs the mark path and this delete gate.
+//!
 //! It also reclaims **deleted-object orphans**: a part with NO replication row whose
 //! `object_versions` row is gone (a hard-deleted/purged object), once aged past
 //! `orphan_grace`. Such a part has no terminal `failed` row to key on — its cephor row
@@ -91,21 +102,26 @@ pub trait ReclaimLog: Send + Sync {
     fn part_states(&self, parts: &[PartKey]) -> impl Future<Output = Result<HashMap<PartKey, PartStatusAge>, Self::Error>> + Send;
 }
 
-/// The object-backing seam: which scanned parts have NO live `object_versions` row.
+/// The `object_versions` backing seam: answers two questions about a batch of parts, both
+/// resolved against the same table so they share one seam (and one [`ReclaimError::Backing`]
+/// error bucket) rather than fanning into separate traits.
 ///
-/// Consulted only for parts the reclaim log has no replication row for — the
-/// [`skipped_absent`](ReclaimReport::skipped_absent) bucket — to split a genuinely
-/// orphaned part (its object was hard-deleted) from one that is merely mid-upload or
-/// pre-reconcile. The safety rests on the api's reserve-before-write ordering: the
-/// `object_versions` row is created *before* any part is written to the ingest SSD, so
-/// a part whose `(object_id, version)` has NO row can only be a deleted object — never
-/// an in-flight upload. A present-but-unservable row (an aborted/abandoned upload) is
-/// deliberately NOT returned here: those are marked `failed` centrally (the Python A21
-/// sweep) and reclaimed via the `failed` path, so treating them as unbacked would risk
-/// racing an in-progress MPU whose reserved row is also unservable.
+/// - [`unbacked_parts`](Self::unbacked_parts) — which parts have NO row at all (a
+///   hard-deleted object). Consulted only for parts the reclaim log has no replication row
+///   for (the [`skipped_absent`](ReclaimReport::skipped_absent) tail), to split a genuinely
+///   orphaned part from one merely mid-upload or pre-reconcile. The safety rests on the
+///   api's reserve-before-write ordering: the `object_versions` row is created *before* any
+///   part is written to the ingest SSD, so a part whose `(object_id, version)` has NO row
+///   can only be a deleted object — never an in-flight upload.
+/// - [`servable_parts`](Self::servable_parts) — which parts' version row still SERVES a GET.
+///   Consulted only for aged `failed` parts, to hold back the corrupt-live case (a servable
+///   object whose pool copy is corrupt) from the `failed` reclaim. Row *presence* alone is
+///   not enough here: an aborted/abandoned upload leaves a present-but-unservable row, which
+///   `unbacked_parts` counts as backed but which is still safe to reclaim — so the two
+///   questions are genuinely distinct and both are needed.
 ///
-/// Implemented by [`crate::Store`] (under `pg`) with one batched PK lookup against
-/// `object_versions`; faked in tests. The future is `Send` for the multithreaded runtime.
+/// Implemented by [`crate::Store`] (under `pg`) with batched PK lookups against
+/// `object_versions`; faked in tests. The futures are `Send` for the multithreaded runtime.
 pub trait BackingLog: Send + Sync {
     /// Store-specific failure, boxed into [`ReclaimError::Backing`].
     type Error: std::error::Error + Send + Sync + 'static;
@@ -113,10 +129,19 @@ pub trait BackingLog: Send + Sync {
     /// The subset of `parts` whose `(object_id, version)` has NO `object_versions` row.
     /// A part WITH a row is absent from the result (it has live backing — left alone).
     fn unbacked_parts(&self, parts: &[PartKey]) -> impl Future<Output = Result<HashSet<PartKey>, Self::Error>> + Send;
+
+    /// The subset of `parts` whose `(object_id, version)` row EXISTS and is SERVABLE — the
+    /// exact inverse of `janitor_part_terminally_abandoned.sql`'s unservable predicate
+    /// (`address IS NULL AND size_bytes <= 0 AND COALESCE(md5_hash,'') = ''`), i.e. a row
+    /// with `address` set OR `size_bytes > 0` OR a non-empty `md5_hash`. A part with no row,
+    /// or with an unservable (abandoned-upload) row, is absent from the result — the
+    /// reclaim treats those as safe to delete. A returned part is the corrupt-live case the
+    /// `failed` reclaim must NOT delete.
+    fn servable_parts(&self, parts: &[PartKey]) -> impl Future<Output = Result<HashSet<PartKey>, Self::Error>> + Send;
 }
 
 /// What one reclaim pass did, tallied by the part's disposition. `scanned` always
-/// equals the sum of the six outcome counts.
+/// equals the sum of the seven outcome counts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReclaimReport {
     /// Parts seen on SSD.
@@ -140,6 +165,13 @@ pub struct ReclaimReport {
     pub skipped_absent: u64,
     /// `failed` but within the grace window (diagnosis / abort-race headroom).
     pub skipped_young: u64,
+    /// Aged `failed` but the version is still SERVABLE — the corrupt-live case (a live
+    /// object whose pool copy is corrupt, marked `failed` by the drain's `ChunkMismatch`
+    /// path). This SSD part is the last good source, so it is NEVER reclaimed. A non-zero
+    /// value is a durability incident, not routine GC — the agent logs it at ERROR so it
+    /// pages. Today this is always zero (no path yet marks a servable part `failed`); the
+    /// gate is R4's precondition, live the moment that mark path lands.
+    pub skipped_corrupt: u64,
 }
 
 impl ReclaimReport {
@@ -156,6 +188,7 @@ impl ReclaimReport {
             .saturating_add(self.skipped_replicated)
             .saturating_add(self.skipped_absent)
             .saturating_add(self.skipped_young)
+            .saturating_add(self.skipped_corrupt)
     }
 }
 
@@ -195,12 +228,19 @@ impl ReclaimError {
 /// SSD cache, once aged.
 ///
 /// Scans every complete part on SSD, reads all their replication states in one batch, and
-/// unlinks each `failed` part older than `grace`. A part with NO replication row is then
-/// checked against [`BackingLog`]: if its object was hard-deleted (no `object_versions`
-/// row) AND it has aged past `orphan_grace`, it is a deleted-object orphan and is
-/// reclaimed too. Everything else is left untouched: `pending`/`draining` are live
+/// unlinks each `failed` part that is older than `grace` **and whose version is unservable**
+/// (an aged `failed` part whose object is still servable is the corrupt-live case — held
+/// back as `skipped_corrupt`, never deleted; see the module doc). A part with NO replication
+/// row is checked against [`BackingLog::unbacked_parts`]: if its object was hard-deleted (no
+/// `object_versions` row) AND it has aged past `orphan_grace`, it is a deleted-object orphan
+/// and is reclaimed too. Everything else is left untouched: `pending`/`draining` are live
 /// (drain-owned), `replicated` is the drain's own to clean up, and a no-row part that
 /// still has a live `object_versions` row may be mid-upload — the absolute safety gate.
+///
+/// The servability read ([`BackingLog::servable_parts`]) and the orphan-backing read
+/// ([`BackingLog::unbacked_parts`]) each run over a disjoint subset (aged-`failed` vs
+/// no-row) and are both empty on the steady-state happy path, so neither adds a round-trip
+/// unless there is actually broken data to adjudicate.
 ///
 /// The `failed` grace uses the store clock (the row's `updated_at`); the orphan grace
 /// uses the part's SSD `meta.json` age ([`DiscoveredPart::age`](crate::DiscoveredPart)),
@@ -253,6 +293,25 @@ where
         backing.unbacked_parts(&absent).await.map_err(ReclaimError::backing)?
     };
 
+    // The servability read guards the `failed` reclaim against deleting a corrupt-live
+    // object's last good copy. Scoped to aged `failed` parts only (the sole reclaim
+    // candidates on the status path): a young `failed`, or any non-`failed` state, is
+    // decided without it, so this stays off the happy path exactly like the backing read.
+    let failed_aged: Vec<PartKey> = parts
+        .iter()
+        .filter(|discovered| {
+            states
+                .get(&discovered.part)
+                .is_some_and(|status| status.state == ReplicationState::Failed && status.age >= grace)
+        })
+        .map(|discovered| discovered.part.clone())
+        .collect();
+    let servable = if failed_aged.is_empty() {
+        HashSet::new()
+    } else {
+        backing.servable_parts(&failed_aged).await.map_err(ReclaimError::backing)?
+    };
+
     for discovered in parts {
         report.scanned += 1;
         let part = &discovered.part;
@@ -279,10 +338,14 @@ where
             // see the module doc); left alone here, counted for visibility.
             ReplicationState::Replicated => report.skipped_replicated += 1,
             // Failed = a broken/abandoned upload (MPU abort, abandoned MPU, or a failed
-            // single-part PUT). The only thing we reclaim — once past the grace window.
+            // single-part PUT) — reclaimed once past grace — UNLESS the version is still
+            // servable, in which case `failed` means "corrupt pool copy on a live object"
+            // and this SSD part is the last good source (skipped_corrupt; never deleted).
             ReplicationState::Failed => {
                 if status.age < grace {
                     report.skipped_young += 1;
+                } else if servable.contains(part) {
+                    report.skipped_corrupt += 1;
                 } else {
                     remover.unlink_part(part).await.map_err(ReclaimError::Remove)?;
                     report.reclaimed += 1;
@@ -359,14 +422,19 @@ mod tests {
         }
     }
 
-    /// The object-backing fake: reports a fixed set of parts as unbacked (their object was
-    /// deleted). `all_backed` (the default) returns nothing, so no part is ever an orphan —
-    /// exactly the state the pre-WI-20b `failed`-only tests assume. Records the parts it was
-    /// asked about so a test can assert the read covers only the no-row subset.
+    /// The object-backing fake, over two independent axes: `unbacked` (their object was
+    /// deleted → returned by `unbacked_parts`) and `servable` (their version still serves a
+    /// GET → returned by `servable_parts`). `all_backed` (the default) leaves both empty, so
+    /// no part is an orphan and none is servable — exactly the state the pre-WI-20b
+    /// `failed`-only tests assume (aged `failed` parts reclaim, none held as corrupt-live).
+    /// Records what each read was asked about so a test can assert each stays scoped to its
+    /// subset (no-row parts for backing; aged-`failed` parts for servability).
     #[derive(Default)]
     struct FakeBacking {
         unbacked: HashSet<String>,
+        servable: HashSet<String>,
         asked: Mutex<Vec<String>>,
+        servable_asked: Mutex<Vec<String>>,
         fail: bool,
     }
 
@@ -382,8 +450,21 @@ mod tests {
             }
         }
 
+        fn servable(parts: &[&PartKey]) -> Self {
+            Self {
+                servable: parts.iter().map(|p| key(p)).collect(),
+                ..Self::default()
+            }
+        }
+
         fn asked(&self) -> Vec<String> {
             let mut out = self.asked.lock().unwrap().clone();
+            out.sort();
+            out
+        }
+
+        fn servable_asked(&self) -> Vec<String> {
+            let mut out = self.servable_asked.lock().unwrap().clone();
             out.sort();
             out
         }
@@ -398,6 +479,16 @@ mod tests {
             } else {
                 self.asked.lock().unwrap().extend(parts.iter().map(key));
                 Ok(parts.iter().filter(|p| self.unbacked.contains(&key(p))).cloned().collect())
+            };
+            async move { outcome }
+        }
+
+        fn servable_parts(&self, parts: &[PartKey]) -> impl Future<Output = Result<HashSet<PartKey>, io::Error>> + Send {
+            let outcome = if self.fail {
+                Err(io::Error::other("servability read failed"))
+            } else {
+                self.servable_asked.lock().unwrap().extend(parts.iter().map(key));
+                Ok(parts.iter().filter(|p| self.servable.contains(&key(p))).cloned().collect())
             };
             async move { outcome }
         }
@@ -615,6 +706,7 @@ mod tests {
                 skipped_replicated: 1,
                 skipped_absent: 1,
                 skipped_young: 1,
+                skipped_corrupt: 0,
             }
         );
         assert_eq!(
@@ -678,6 +770,141 @@ mod tests {
             .unwrap();
         assert_eq!(report, ReclaimReport::default());
         assert_eq!(log.calls(), 0, "an empty scan never queries the store");
+    }
+
+    // ------------------------------------------ servability gate (R4 corrupt-live guard)
+
+    #[tokio::test]
+    async fn a_servable_object_with_a_failed_row_is_never_reclaimed() {
+        // R4: an aged `failed` part whose version is still servable is a live object with a
+        // corrupt pool copy — this SSD part is the last good source. Held as skipped_corrupt,
+        // never unlinked, however aged.
+        let part = part_at(UUID_A, 5, 1);
+        let scan = FakeScan::of(std::slice::from_ref(&part));
+        let remover = FakeRemover::default();
+        let log = FakeLog::with(&[(&part, ReplicationState::Failed, HOUR)]);
+        let backing = FakeBacking::servable(&[&part]);
+
+        let report = reclaim_ssd(&scan, &remover, &log, &backing, GRACE, ORPHAN_GRACE).await.unwrap();
+        assert_eq!(report.skipped_corrupt, 1);
+        assert_eq!(report.reclaimed, 0);
+        assert!(remover.removed().is_empty(), "a servable object's last good copy is preserved");
+    }
+
+    #[tokio::test]
+    async fn an_unservable_aged_failed_part_reclaims_beside_a_servable_sibling() {
+        // The discriminator in action: two aged `failed` parts, one servable (corrupt-live,
+        // kept) and one not (abandoned upload, reclaimed). Same state, opposite disposition.
+        let abandoned = part_at(UUID_A, 1, 1);
+        let corrupt_live = part_at(UUID_A, 2, 1);
+        let scan = FakeScan::of(&[abandoned.clone(), corrupt_live.clone()]);
+        let remover = FakeRemover::default();
+        let log = FakeLog::with(&[
+            (&abandoned, ReplicationState::Failed, HOUR),
+            (&corrupt_live, ReplicationState::Failed, HOUR),
+        ]);
+        let backing = FakeBacking::servable(&[&corrupt_live]);
+
+        let report = reclaim_ssd(&scan, &remover, &log, &backing, GRACE, ORPHAN_GRACE).await.unwrap();
+        assert_eq!(report.reclaimed, 1);
+        assert_eq!(report.skipped_corrupt, 1);
+        assert_eq!(remover.removed(), vec![key(&abandoned)], "only the unservable (abandoned) part");
+    }
+
+    #[tokio::test]
+    async fn the_servability_read_covers_only_aged_failed_parts() {
+        // Scoped exactly like the backing read: a young `failed`, a `pending`, and a
+        // `replicated` part are decided without a servability check — only the aged `failed`
+        // candidate is asked about, keeping the object_versions read off the happy path.
+        let aged_failed = part_at(UUID_A, 1, 1);
+        let young_failed = part_at(UUID_A, 1, 2);
+        let pending = part_at(UUID_A, 1, 3);
+        let replicated = part_at(UUID_A, 1, 4);
+        let scan = FakeScan::of(&[aged_failed.clone(), young_failed.clone(), pending.clone(), replicated.clone()]);
+        let remover = FakeRemover::default();
+        let log = FakeLog::with(&[
+            (&aged_failed, ReplicationState::Failed, HOUR),
+            (&young_failed, ReplicationState::Failed, Duration::from_secs(1)),
+            (&pending, ReplicationState::Pending, HOUR),
+            (&replicated, ReplicationState::Replicated, HOUR),
+        ]);
+        let backing = FakeBacking::all_backed();
+
+        let report = reclaim_ssd(&scan, &remover, &log, &backing, GRACE, ORPHAN_GRACE).await.unwrap();
+        assert_eq!(report.reclaimed, 1, "the aged failed part reclaims (not servable)");
+        assert_eq!(
+            backing.servable_asked(),
+            vec![key(&aged_failed)],
+            "only the aged failed part was servability-checked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_servability_read_failure_is_surfaced_and_nothing_is_removed() {
+        // The servability read shares the Backing error bucket (both hit object_versions).
+        // No absent parts here, so only the servability read runs — its failure must abort
+        // the whole pass fail-safe, removing nothing.
+        let part = part_at(UUID_A, 5, 1);
+        let scan = FakeScan::of(std::slice::from_ref(&part));
+        let remover = FakeRemover::default();
+        let log = FakeLog::with(&[(&part, ReplicationState::Failed, HOUR)]);
+        let backing = FakeBacking {
+            fail: true,
+            ..FakeBacking::default()
+        };
+        let err = reclaim_ssd(&scan, &remover, &log, &backing, GRACE, ORPHAN_GRACE).await.unwrap_err();
+        assert!(matches!(err, ReclaimError::Backing(_)), "got: {err:?}");
+        assert!(remover.removed().is_empty(), "a failed servability read removes nothing (fail-safe)");
+    }
+
+    // A property test over arbitrary aged `failed` parts each independently servable-or-not:
+    // the reclaimed set is EXACTLY the unservable parts and skipped_corrupt EXACTLY the
+    // servable count — the corrupt-live guard never deletes a servable part and never spares
+    // an unservable one. The shrinker probes the servable/unservable partition a handful of
+    // fixtures cannot.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(200))]
+        #[test]
+        fn failed_reclaim_removes_exactly_the_unservable_parts(
+            specs in proptest::collection::vec((0u32..64, proptest::bool::ANY), 0..40)
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            rt.block_on(async {
+                let mut entries: Vec<(PartKey, ReplicationState, Duration)> = Vec::new();
+                let mut servable_refs: Vec<PartKey> = Vec::new();
+                let mut parts: Vec<PartKey> = Vec::new();
+                let mut expected_removed: Vec<String> = Vec::new();
+                let mut expected_corrupt = 0u64;
+                for (i, (number, is_servable)) in specs.iter().enumerate() {
+                    // Distinct parts: vary version by index so no two collide. All aged
+                    // failed, so servability is the sole discriminator.
+                    let part = part_at(UUID_A, u32::try_from(i).unwrap() + 1, *number);
+                    parts.push(part.clone());
+                    entries.push((part.clone(), ReplicationState::Failed, HOUR));
+                    if *is_servable {
+                        servable_refs.push(part.clone());
+                        expected_corrupt += 1;
+                    } else {
+                        expected_removed.push(key(&part));
+                    }
+                }
+                let scan = FakeScan::of(&parts);
+                let remover = FakeRemover::default();
+                let entry_refs: Vec<(&PartKey, ReplicationState, Duration)> =
+                    entries.iter().map(|(p, s, a)| (p, *s, *a)).collect();
+                let log = FakeLog::with(&entry_refs);
+                let refs: Vec<&PartKey> = servable_refs.iter().collect();
+                let backing = FakeBacking::servable(&refs);
+
+                let report = reclaim_ssd(&scan, &remover, &log, &backing, GRACE, ORPHAN_GRACE).await.unwrap();
+                expected_removed.sort();
+                proptest::prop_assert_eq!(remover.removed(), expected_removed.clone());
+                proptest::prop_assert_eq!(usize::try_from(report.reclaimed).unwrap(), expected_removed.len());
+                proptest::prop_assert_eq!(report.skipped_corrupt, expected_corrupt);
+                proptest::prop_assert_eq!(report.scanned, report.categorized());
+                Ok(())
+            })?;
+        }
     }
 
     // ----------------------------------------------- deleted-object orphans (WI-20b)

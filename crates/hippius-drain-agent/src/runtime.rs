@@ -269,6 +269,15 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
                     "replicated parts still on SSD — drain crash-orphans nothing currently reclaims"
                 );
             }
+            // A servable object with a `failed` replication row: its pool copy is corrupt and
+            // this preserved SSD part is the last good source. A durability incident, not GC —
+            // ERROR so a log-based alert pages. (Zero until the R4 mark path lands.)
+            if report.skipped_corrupt > 0 {
+                tracing::error!(
+                    skipped_corrupt = report.skipped_corrupt,
+                    "servable objects have a failed replication row — SSD source preserved; corrupt pool copy suspected (R4)"
+                );
+            }
         }
         Err(err) => tracing::warn!(error = ?err, "ssd reclaim cycle failed; will retry next poll"),
     }
@@ -1015,12 +1024,16 @@ mod tests {
         let ssd_dir = tempfile::tempdir().unwrap();
         let store = Store::from_pool(pool.clone());
         let snapshot = SnapshotCell::new();
+        create_object_versions_table(&pool).await;
 
-        // A failed part (abandoned upload), forced 2h old -> reclaimable.
+        // A failed part (abandoned upload), forced 2h old -> reclaimable. Its version row is
+        // unservable (the abandoned-upload shape: no address, size 0, empty md5), so the
+        // servability gate permits the reclaim.
         let failed = part_at(5, 1);
         seed_ssd_dir(ssd_dir.path(), &failed);
         store.record_landed_part(&failed).await.unwrap();
         force_terminal_2h(&pool, &failed, "failed").await;
+        seed_object_version(&pool, &failed, None, Some(0), Some("")).await;
 
         // A replicated part -> the drain's own to clean up; the reclaimer leaves it.
         let replicated = part_at(5, 2);
@@ -1081,13 +1094,7 @@ mod tests {
         let ssd_dir = tempfile::tempdir().unwrap();
         let store = Store::from_pool(pool.clone());
         let snapshot = SnapshotCell::new();
-        sqlx::query(
-            "CREATE TABLE object_versions (object_id uuid NOT NULL, object_version bigint NOT NULL, \
-             PRIMARY KEY (object_id, object_version))",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        create_object_versions_table(&pool).await;
 
         // The deleted-object orphan: on SSD, no cephor row, no object_versions row, aged 2h.
         let orphan = part_at(5, 1);
@@ -1098,12 +1105,7 @@ mod tests {
         let live = part_at(7, 1);
         seed_ssd_dir(ssd_dir.path(), &live);
         backdate_meta_2h(ssd_dir.path(), &live);
-        sqlx::query("INSERT INTO object_versions (object_id, object_version) VALUES ($1::uuid, $2)")
-            .bind(live.object().as_str())
-            .bind(i64::from(live.version().get()))
-            .execute(&pool)
-            .await
-            .unwrap();
+        seed_object_version(&pool, &live, Some("5Flive"), Some(4096), None).await;
 
         let ssd = LocalSsd::new(ssd_dir.path());
         super::reclaim_once(&ssd, &store, &snapshot, Duration::from_secs(1), Duration::from_hours(1)).await;
@@ -1117,6 +1119,64 @@ mod tests {
             "a part whose object_versions row still exists is kept (mid-upload / live object)",
         );
         assert_eq!(snapshot.load().reclaimed, 1, "exactly the deleted-object orphan was counted");
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn reclaim_once_preserves_a_servable_objects_last_copy_on_a_failed_row(pool: PgPool) {
+        // R4 end-to-end through reclaim_once, against real Postgres: a `failed` part whose
+        // object_versions row is still SERVABLE (a live object with a corrupt pool copy) is
+        // NEVER evicted — this SSD part is the last good source. It counts skipped_corrupt,
+        // not reclaimed, and the SSD directory survives.
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let store = Store::from_pool(pool.clone());
+        let snapshot = SnapshotCell::new();
+        create_object_versions_table(&pool).await;
+
+        // Aged `failed` but the object is servable (address written) — the corrupt-live case.
+        let corrupt_live = part_at(5, 1);
+        seed_ssd_dir(ssd_dir.path(), &corrupt_live);
+        store.record_landed_part(&corrupt_live).await.unwrap();
+        force_terminal_2h(&pool, &corrupt_live, "failed").await;
+        seed_object_version(&pool, &corrupt_live, Some("5Fserve"), Some(4096), None).await;
+
+        let ssd = LocalSsd::new(ssd_dir.path());
+        super::reclaim_once(&ssd, &store, &snapshot, Duration::from_secs(1), Duration::from_secs(1)).await;
+
+        assert!(
+            ssd_dir.path().join(corrupt_live.relative_dir()).exists(),
+            "a servable object's last good SSD copy is preserved even with a failed replication row",
+        );
+        assert_eq!(snapshot.load().reclaimed, 0, "the corrupt-live part is not counted as reclaimed");
+    }
+
+    /// Stands up the `object_versions` table the reclaim's backing/servability reads
+    /// touch — prod-shaped (`address`, `size_bytes`, `md5_hash`) so the servable predicate
+    /// resolves. The drain-core migrations are cephor-only, so any reclaim test exercising a
+    /// `failed` or absent part must create it (else the read errors and `reclaim_once` no-ops).
+    async fn create_object_versions_table(pool: &PgPool) {
+        sqlx::query(
+            "CREATE TABLE object_versions (object_id uuid NOT NULL, object_version bigint NOT NULL, \
+             address text, size_bytes bigint, md5_hash text, \
+             PRIMARY KEY (object_id, object_version))",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Seeds one `object_versions` row with explicit servability columns. An abandoned
+    /// upload is `(None, Some(0), Some(""))` (unservable → reclaimable); a live object is
+    /// any row with an address, a real size, or an md5 (servable → the corrupt-live guard).
+    async fn seed_object_version(pool: &PgPool, part: &PartKey, address: Option<&str>, size_bytes: Option<i64>, md5: Option<&str>) {
+        sqlx::query("INSERT INTO object_versions (object_id, object_version, address, size_bytes, md5_hash) VALUES ($1::uuid, $2, $3, $4, $5)")
+            .bind(part.object().as_str())
+            .bind(i64::from(part.version().get()))
+            .bind(address)
+            .bind(size_bytes)
+            .bind(md5)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     /// Forces a part's row to `status` with `updated_at` backdated 2h, so the reclaim
