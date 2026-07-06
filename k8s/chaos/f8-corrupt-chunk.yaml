@@ -1,0 +1,31 @@
+# F8 — corrupt / partial chunk on SSD.
+# PRIMARY mechanism is the toxiproxy `slicer` toxic (a truncated backend body) — see
+# tests/e2e/support/compose.py:add_toxic("arion", "slicer", ...); that is deterministic and does NOT
+# risk the shared mount. This IOChaos is an OPT-IN, tightly-scoped alternative that flips a byte on
+# reads inside a SINGLE disposable drain-agent container's ingest path.
+#
+# Gate: the agent's per-chunk verify catches the corruption and NEVER commits it as `replicated`;
+# blast radius = 1 part; detect ≤5s; reclaim ≤1h.
+#
+# DANGER: `volumePath`/`path` MUST point at a DISPOSABLE agent's local ingest dir, never the shared
+# CephFS pool mount. Confirm the target is a throwaway node before applying.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: IOChaos
+metadata:
+  name: f8-corrupt-chunk
+  namespace: hippius-s3-staging
+spec:
+  action: attrOverride  # placeholder-safe op; switch to `fault`/`mistake` only on a disposable node
+  mode: one
+  duration: 30s
+  selector:
+    namespaces:
+      - hippius-s3-staging
+    labelSelectors:
+      app: drain-agent
+  volumePath: /var/lib/hippius/local_object_cache
+  path: /var/lib/hippius/local_object_cache/**
+  containerNames:
+    - agent
+  attr:
+    perm: 0644

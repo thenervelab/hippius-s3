@@ -1,0 +1,35 @@
+# F3 — redis-queues blip/hang (network layer).
+# The eviction / noeviction-full sub-cells are driven by toxiproxy + the noeviction override
+# (stress-test/compose/docker-compose.faults.yml) — this CRD covers the NETWORK blip/hang half:
+# 800ms±200 latency + 20% loss between the drain-allocator and the coordinator Redis for 30s.
+# Gate: the leader survives the lease-renewal path (coord recovers ≤30s); no duplicate allocation;
+# backlog drains ≤2min after heal.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: f3-redis-queues-blip
+  namespace: hippius-s3-staging
+spec:
+  action: delay
+  mode: all
+  duration: 30s
+  direction: to
+  selector:
+    namespaces:
+      - hippius-s3-staging
+    labelSelectors:
+      app: drain-allocator
+  target:
+    mode: all
+    selector:
+      namespaces:
+        - hippius-s3-staging
+      labelSelectors:
+        app: redis-queues
+  delay:
+    latency: 800ms
+    jitter: 200ms
+    correlation: "50"
+  loss:
+    loss: "20"
+    correlation: "25"

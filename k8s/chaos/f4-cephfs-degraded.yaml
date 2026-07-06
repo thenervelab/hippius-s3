@@ -1,0 +1,35 @@
+# F4 — CephFS slow/degraded (via the network toward the OSD/MDS, NOT IOChaos on the shared mount).
+# Degrading the shared object-cache mount directly would hit every tenant; instead we slow the
+# drain-agent's path to the Ceph data/metadata daemons. Gate: the Ceph breaker trips ≤20s on a
+# genuine pool-write fault and NEVER marks a part `replicated` falsely; the backlog drains ≤10min
+# after heal. Requires the drain-agent and Ceph OSD/MDS to be reachable by label.
+#
+# ADJUST the target selector to your Ceph deployment (rook-ceph mon/osd/mds pods). Placeholder
+# targets a `rook-ceph` namespace with the standard rook app labels.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: f4-cephfs-degraded
+  namespace: hippius-s3-staging
+spec:
+  action: delay
+  mode: all
+  duration: 120s
+  direction: to
+  selector:
+    namespaces:
+      - hippius-s3-staging
+    labelSelectors:
+      app: drain-agent
+  target:
+    mode: all
+    selector:
+      namespaces:
+        - rook-ceph
+      labelSelectors:
+        # rook-ceph OSD + MDS daemons; narrow further per your cluster.
+        app: rook-ceph-osd
+  delay:
+    latency: 2s
+    jitter: 500ms
+    correlation: "50"

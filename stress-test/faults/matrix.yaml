@@ -1,0 +1,68 @@
+# WI-19 §4.5 chaos matrix — F1–F8 cells + recovery bounds + the mechanism that injects each.
+# Consumed by inject.py (applies/cleans a cell) and run_chaos.sh (drives the cells under inv-guard +
+# the durability ledger). Bounds are the RATIFY-pending targets from stress-test/plan.md §4.5; a cell
+# PASSES iff (recovery within bound) AND (zero inv-guard violation) AND (ledger 100%).
+namespace: hippius-s3-staging
+
+cells:
+  F1:
+    name: agent-node kill mid-replication
+    headline_gate: no false-commit under a stale claim_seq (G5/G6)
+    recovery: { resume_s: 60, stuck_claim_s: 360 }
+    guards: [G3, G5, G6]
+    mechanism: { kind: chaos-crd, manifest: k8s/chaos/f1-agent-kill.yaml }
+
+  F2:
+    name: allocator failover + epoch fence (HEADLINE)
+    headline_gate: single-leader + epoch fence (G1)
+    recovery: { partition_s: 45, clean_relinquish_s: 10 }
+    guards: [G1, G4, G6]
+    # Sub-injection (a)+(b) are the CRDs; (c) clean SIGTERM is a kubectl delete in run_chaos.sh.
+    mechanism: { kind: chaos-crd, manifest: k8s/chaos/f2-allocator-failover.yaml }
+    extra: { clean_relinquish: "kubectl -n {ns} delete pod -l app=drain-allocator --grace-period=30" }
+
+  F3:
+    name: redis-queues blip/hang/evict/noeviction-full
+    headline_gate: leader survives lease eviction; no duplicate allocation
+    recovery: { coord_s: 30, backlog_s: 120 }
+    guards: [G1, G5]
+    # Network blip is a CRD; evict/noeviction-full is a toxiproxy cell (needs the faults overlay).
+    mechanism: { kind: chaos-crd, manifest: k8s/chaos/f3-redis-queues-netchaos.yaml }
+    extra: { noeviction_note: "use docker-compose.faults.yml (noeviction) + toxiproxy limit_data for the full cell" }
+
+  F4:
+    name: CephFS slow/degraded/down
+    headline_gate: no stuck breaker; no false `replicated`
+    recovery: { breaker_s: 20, drain_s: 600 }
+    guards: [G2, G3, G6]
+    mechanism: { kind: chaos-crd, manifest: k8s/chaos/f4-cephfs-degraded.yaml }
+
+  F5:
+    name: SSD fill pressure/critical
+    headline_gate: clean 503 SlowDown; replication gate absolute
+    recovery: { clear_503_s: 120 }
+    guards: [G2, G3]
+    mechanism: { kind: chaos-crd, manifest: k8s/chaos/f5-ssd-fill.yaml }
+
+  F6:
+    name: postgres failover
+    headline_gate: leadership unaffected; breaker not tripped by a PG-only fault
+    recovery: { query_s: 20, drain_s: 600 }
+    guards: [G1, G6]
+    mechanism: { kind: chaos-crd, manifest: k8s/chaos/f6-postgres-failover.yaml }
+
+  F7:
+    name: clock skew (disposable pods only)
+    headline_gate: single-leader + epoch monotonic
+    recovery: { stable_s: 120 }
+    guards: [G1]
+    mechanism: { kind: chaos-crd, manifest: k8s/chaos/f7-clock-skew.yaml }
+
+  F8:
+    name: corrupt/partial chunk on SSD
+    headline_gate: never commit corrupt as `replicated`; blast-radius = 1 part
+    recovery: { detect_s: 5, reclaim_s: 3600 }
+    guards: [G3, G6]
+    # PRIMARY = toxiproxy slicer (deterministic, safe); the CRD is the opt-in scoped IOChaos.
+    mechanism: { kind: toxiproxy, proxy: arion, toxic: slicer, attributes: { average_size: 64, size_variation: 8 } }
+    extra: { crd: k8s/chaos/f8-corrupt-chunk.yaml }
