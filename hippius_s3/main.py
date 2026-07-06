@@ -315,6 +315,12 @@ def factory() -> FastAPI:
         pool_busy = s3_errors.pool_saturation_response(exc)
         if pool_busy is not None:
             return pool_busy
+        # Read-path key/crypto failures → clean S3 error instead of a bare 500: a KMS brownout is a
+        # retryable 503; a genuinely unreadable object (missing envelope / InvalidTag) is a 500 with
+        # a proper S3 body. See errors.read_path_crypto_error_response.
+        crypto_err = s3_errors.read_path_crypto_error_response(exc)
+        if crypto_err is not None:
+            return crypto_err
         if isinstance(exc, UnsupportedStorageVersionError):
             return s3_errors.s3_error_response(
                 code="NotImplemented",

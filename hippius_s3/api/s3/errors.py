@@ -116,3 +116,43 @@ def pool_saturation_response(exc: BaseException) -> Response | None:
             extra_headers={"Retry-After": "3"},
         )
     return None
+
+
+# Stable RuntimeError markers raised by kek_service on a KMS/key failure. The transient set is a
+# brownout (retry helps); the permanent set means the object's key material is unusable (retry does
+# not help). We string-match because kek_service raises RuntimeError(<marker>) — same convention the
+# global handler already uses for "initial_stream_timeout".
+_KMS_BROWNOUT_MARKERS = frozenset({"kms_unavailable", "kms_auth_failed", "kms_error"})
+_KEY_UNREADABLE_MARKERS = frozenset({"v5_missing_envelope_metadata", "local_unwrap_failed"})
+
+
+def read_path_crypto_error_response(exc: BaseException) -> Response | None:
+    """Map read-path key/crypto failures to a well-formed S3 error instead of a bare 500.
+
+    - **Transient KMS brownout** (`kek_service` raises `RuntimeError('kms_unavailable' |
+      'kms_auth_failed' | 'kms_error')`) → retryable **503 SlowDown**. The key service is down, not
+      the object.
+    - **Genuinely unreadable object** — missing envelope metadata (a v5 orphan row) or a DEK/KEK
+      that fails AEAD authentication (`InvalidTag`) or a malformed wrapped key
+      (`local_unwrap_failed`) → **500 InternalError** with a proper S3 XML body (permanent; retry
+      won't help). This replaces the bare, body-less 500 uvicorn would otherwise return.
+
+    Returns ``None`` for anything else (the caller re-raises).
+    """
+    if isinstance(exc, RuntimeError) and str(exc) in _KMS_BROWNOUT_MARKERS:
+        return s3_error_response(
+            code="SlowDown",
+            message="Encryption key service is temporarily unavailable. Please retry.",
+            status_code=503,
+            extra_headers={"Retry-After": "3"},
+        )
+    # InvalidTag is the AEAD authentication failure from `unwrap_dek` (cryptography); match by class
+    # name to avoid importing the crypto exception type into the error module.
+    is_invalid_tag = exc.__class__.__name__ == "InvalidTag"
+    if is_invalid_tag or (isinstance(exc, RuntimeError) and str(exc) in _KEY_UNREADABLE_MARKERS):
+        return s3_error_response(
+            code="InternalError",
+            message="Object could not be decrypted (encryption metadata missing or key authentication failed).",
+            status_code=500,
+        )
+    return None
