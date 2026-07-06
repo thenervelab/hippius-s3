@@ -330,11 +330,6 @@ class MetricsCollector:
         self.dlq_requeued_total = self.meter.create_counter(
             name="dlq_requeued_total", description="Entries requeued out of a dead-letter queue", unit="1"
         )
-        self.dlq_dropped_total = self.meter.create_counter(
-            name="dlq_dropped_total",
-            description="Oldest DLQ entries dropped when the queue hit its size cap (A10 cascade guard)",
-            unit="1",
-        )
 
         logger.info("Metrics setup complete")
 
@@ -719,10 +714,6 @@ class MetricsCollector:
         if count > 0:
             self.dlq_requeued_total.add(count, attributes={"queue": queue})
 
-    def record_dlq_dropped(self, queue: str, count: int = 1) -> None:
-        if count > 0:
-            self.dlq_dropped_total.add(count, attributes={"queue": queue})
-
 
 class NullMetricsCollector:
     def __init__(self) -> None:
@@ -790,9 +781,6 @@ class NullMetricsCollector:
         pass
 
     def record_dlq_requeue(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def record_dlq_dropped(self, *args: object, **kwargs: object) -> None:
         pass
 
 

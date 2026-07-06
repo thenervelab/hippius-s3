@@ -2,7 +2,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import os
 import time
 import uuid
 from pathlib import Path
@@ -24,13 +23,6 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
-# A10: hard cap on DLQ length. The DLQ lives on redis-queues (noeviction), so an unbounded
-# permanent-error storm would fill the instance and fail EVERY write — queues, pub/sub, and the
-# cephor:* coordination keys — a pipeline-wide cascade. Capping bounds the blast radius: past the
-# cap the OLDEST entries are dropped (they are the least actionable — failing longest) and the
-# drop is logged at ERROR + counted so the storm is still visible. 0 disables the cap.
-DEFAULT_DLQ_MAX_ENTRIES = int(os.getenv("HIPPIUS_DLQ_MAX_ENTRIES", "100000"))
-
 
 class BaseDLQManager(Generic[T]):
     """Base class for Dead-Letter Queue management operations."""
@@ -41,30 +33,12 @@ class BaseDLQManager(Generic[T]):
         dlq_key: str,
         enqueue_func: Callable[[T], Any],
         request_class: type[T],
-        max_entries: int = DEFAULT_DLQ_MAX_ENTRIES,
     ):
         self.redis_client = redis_client
         self.dlq_key = dlq_key
         self.enqueue_func = enqueue_func
         self.request_class = request_class
-        self.max_entries = max_entries
         self.lock_prefix = f"dlq:requeue:lock:{dlq_key}:"
-
-    async def _enforce_cap(self, new_length: int) -> None:
-        """Trim the DLQ back to `max_entries` after a push, dropping the oldest entries. A
-        no-op when the cap is disabled (0) or not exceeded. Best-effort: a trim failure just
-        leaves the list longer until the next push retries it."""
-        if self.max_entries <= 0 or new_length <= self.max_entries:
-            return
-        dropped = new_length - self.max_entries
-        with contextlib.suppress(Exception):
-            # LPUSH prepends, so the newest are at the head [0..]; keep them and drop the tail.
-            await self.redis_client.ltrim(self.dlq_key, 0, self.max_entries - 1)  # ty: ignore[invalid-await]
-        get_metrics_collector().record_dlq_dropped(self.dlq_key, dropped)
-        logger.error(
-            f"DLQ {self.dlq_key} exceeded cap {self.max_entries}: dropped {dropped} oldest entry(ies). "
-            f"A permanent-error storm is filling redis-queues — investigate the failing operation."
-        )
 
     def _lock_key(self, identifier: str) -> str:
         return f"{self.lock_prefix}{identifier}"
@@ -89,8 +63,7 @@ class BaseDLQManager(Generic[T]):
 
         dlq_entry = self._create_entry(payload, last_error, etype)
 
-        new_length = await self.redis_client.lpush(self.dlq_key, json.dumps(dlq_entry))  # ty: ignore[invalid-await]
-        await self._enforce_cap(int(new_length or 0))
+        await self.redis_client.lpush(self.dlq_key, json.dumps(dlq_entry))  # ty: ignore[invalid-await]
         get_metrics_collector().record_dlq_push(self.dlq_key, etype)
         identifier = self._get_identifier(payload)
         logger.warning(

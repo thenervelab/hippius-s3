@@ -354,10 +354,8 @@ async def run_downloader_loop(
     from redis.exceptions import TimeoutError as RedisTimeoutError
 
     from hippius_s3.monitoring import initialize_metrics_collector
-    from hippius_s3.queue import ack_reliable
-    from hippius_s3.queue import dequeue_download_request_reliable
+    from hippius_s3.queue import dequeue_download_request
     from hippius_s3.queue import initialize_queue_client
-    from hippius_s3.queue import requeue_stale_inflight
     from hippius_s3.redis_cache import initialize_cache_client
     from hippius_s3.services.ray_id_service import get_logger_with_ray_id
     from hippius_s3.services.ray_id_service import ray_id_context
@@ -379,7 +377,7 @@ async def run_downloader_loop(
         backend_info = f" base_url={config.arion_base_url} verify_ssl={config.arion_verify_ssl}"
         logger.info(f"[{backend_name}] Starting downloader, queue={queue_name}{backend_info}")
 
-    async def _run_job(request: DownloadChainRequest, handle: str) -> None:
+    async def _run_job(request: DownloadChainRequest) -> None:
         ray_id = request.ray_id or "no-ray-id"
         ray_id_context.set(ray_id)
         worker_logger = get_logger_with_ray_id(__name__, ray_id)
@@ -412,12 +410,6 @@ async def run_downloader_loop(
                 job_span.set_status(trace.StatusCode.ERROR, str(exc))
                 worker_logger.error(f"[{backend_name}] job error: {exc}", exc_info=True)
                 raise
-            finally:
-                # A12 ack: the job ran to completion (success, partial, or a handled exception),
-                # so remove it from the in-flight set — only a hard process crash (which skips
-                # this finally) leaves it for the reaper to redeliver. The re-GET path re-enqueues
-                # a genuinely-failed download, so acking a partial failure here is correct.
-                await ack_reliable(queue_name, handle)
 
     max_inflight = max(1, config.downloader_max_inflight)
     inflight: set[asyncio.Task[None]] = set()
@@ -469,7 +461,7 @@ async def run_downloader_loop(
                 continue
 
             try:
-                dequeued = await dequeue_download_request_reliable(queue_name)
+                request = await dequeue_download_request(queue_name)
             except (BusyLoadingError, RedisConnectionError, RedisTimeoutError) as exc:
                 logger.warning(f"[{backend_name}] Redis error dequeuing: {exc}. Reconnecting…")
                 with contextlib.suppress(Exception):
@@ -482,12 +474,10 @@ async def run_downloader_loop(
                 logger.error(f"[{backend_name}] Dequeue/parse error, skipping: {exc}", exc_info=True)
                 continue
 
-            if dequeued is None:
-                # Nothing to pick up. Redeliver any in-flight requests whose owner crashed
-                # (past the visibility window) so a lost DCR no longer strands a reader, then
-                # wait on live tasks or idle-poll.
-                with contextlib.suppress(Exception):
-                    await requeue_stale_inflight(queue_name)
+            if request is None:
+                # Nothing to pick up. If we have inflight work, wait on it
+                # instead of sleeping — keeps the loop responsive to task
+                # completions without an idle poll.
                 if inflight:
                     done_wait, _ = await asyncio.wait(
                         inflight, return_when=asyncio.FIRST_COMPLETED, timeout=config.downloader_sleep_loop
@@ -497,13 +487,11 @@ async def run_downloader_loop(
                     await asyncio.sleep(config.downloader_sleep_loop)
                 continue
 
-            request, handle = dequeued
             if request.expire_at and time.time() > request.expire_at:
                 logger.warning(f"[{backend_name}] Discarding expired request {request.name}")
-                await ack_reliable(queue_name, handle)  # terminal: ack so the reaper won't redeliver
                 continue
 
-            inflight.add(asyncio.create_task(_run_job(request, handle)))
+            inflight.add(asyncio.create_task(_run_job(request)))
 
     except KeyboardInterrupt:
         logger.info(f"[{backend_name}] Downloader stopping…")
