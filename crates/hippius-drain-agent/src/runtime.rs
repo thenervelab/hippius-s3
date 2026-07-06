@@ -317,16 +317,19 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
 /// held-corrupt gauge. A part at the attempt cap is NOT reset — it stays `corrupt` and is
 /// surfaced by the gauge/alert for an operator. Errors log and retry next poll (fail-safe).
 async fn redrive_corrupt_once(store: &Store, snapshot: &SnapshotCell, max_attempts: u32) {
+    // Publish the gauge BEFORE re-driving: the re-drive flips every under-cap corrupt row to
+    // `pending`, so a count taken afterwards would only ever see the at-cap remnant and a
+    // transient (recoverable) corrupt-live incident would never register on the metric. Sampling
+    // first makes `drain_corrupt_parts` reflect the true standing corrupt population (eligible +
+    // at-cap) — a nonzero value is a live object kept alive only by its SSD source (R4).
+    match store.count_corrupt_parts().await {
+        Ok(count) => snapshot.record_corrupt(count),
+        Err(err) => tracing::warn!(error = %err, "corrupt-parts count failed; gauge stale this cycle"),
+    }
     match store.redrive_corrupt_parts(i32::try_from(max_attempts).unwrap_or(i32::MAX)).await {
         Ok(0) => {}
         Ok(redriven) => tracing::warn!(redriven, "re-drove corrupt-live parts (corrupt pool copy; re-copying from SSD source)"),
         Err(err) => tracing::warn!(error = %err, "corrupt re-drive failed; will retry next poll"),
-    }
-    // Publish the standing held-corrupt count (includes parts at the attempt cap). A nonzero
-    // value is a live object kept alive only by its SSD source — a durability incident (R4).
-    match store.count_corrupt_parts().await {
-        Ok(count) => snapshot.record_corrupt(count),
-        Err(err) => tracing::warn!(error = %err, "corrupt-parts count failed; gauge stale this cycle"),
     }
 }
 

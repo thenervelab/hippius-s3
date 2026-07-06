@@ -18,6 +18,7 @@ from hippius_s3.cache import FileSystemPartsStore
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "workers"))
+from run_janitor_in_loop import DLQProtectionUnavailable  # noqa: E402
 from run_janitor_in_loop import get_all_dlq_object_ids  # noqa: E402
 
 
@@ -133,20 +134,22 @@ class TestGetAllDlqObjectIds:
         assert result == {"obj-123"}
 
     @pytest.mark.asyncio
-    async def test_timeout_returns_empty_set(self):
-        """Test that timeout returns empty set."""
+    async def test_timeout_raises_fail_closed(self):
+        """A15: a DLQ read timeout must FAIL CLOSED (raise DLQProtectionUnavailable), not
+        return an empty set — an incomplete protection set must never be read as 'nothing to
+        protect', which would let the reap evict in-flight DLQ objects' data."""
         mock_redis = MagicMock()
         mock_redis.lrange = AsyncMock(side_effect=asyncio.TimeoutError())
-        result = await get_all_dlq_object_ids(mock_redis)
-        assert result == set()
+        with pytest.raises(DLQProtectionUnavailable):
+            await get_all_dlq_object_ids(mock_redis)
 
     @pytest.mark.asyncio
-    async def test_redis_error_returns_empty_set(self):
-        """Test that Redis errors return empty set."""
+    async def test_redis_error_raises_fail_closed(self):
+        """A15: a Redis error on a DLQ read must FAIL CLOSED (raise), not return empty."""
         mock_redis = MagicMock()
         mock_redis.lrange = AsyncMock(side_effect=Exception("Redis connection failed"))
-        result = await get_all_dlq_object_ids(mock_redis)
-        assert result == set()
+        with pytest.raises(DLQProtectionUnavailable):
+            await get_all_dlq_object_ids(mock_redis)
 
     @pytest.mark.asyncio
     async def test_returns_object_ids_from_both_upload_and_unpin_dlqs(self, redis_with_dlq):

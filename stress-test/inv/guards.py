@@ -66,9 +66,13 @@ class SingleLeaderEpoch:
         epoch = probe.prom_scalar("max(drain_leader_epoch)")
         if epoch is not None:
             if self._max_epoch is not None and epoch < self._max_epoch:
-                return GuardResult(self.name, "breach", f"epoch decreased {int(self._max_epoch)}->{int(epoch)} (counter reset)", epoch)
+                return GuardResult(
+                    self.name, "breach", f"epoch decreased {int(self._max_epoch)}->{int(epoch)} (counter reset)", epoch
+                )
             self._max_epoch = epoch if self._max_epoch is None else max(self._max_epoch, epoch)
-        return GuardResult(self.name, "ok", f"leaders={int(leaders)} epoch={int(epoch) if epoch is not None else 'n/a'}", leaders)
+        return GuardResult(
+            self.name, "ok", f"leaders={int(leaders)} epoch={int(epoch) if epoch is not None else 'n/a'}", leaders
+        )
 
 
 class ReplicationGateCoverage:
@@ -111,7 +115,9 @@ class StalledDrain:
             return GuardResult(self.name, "skip", "postgres unreachable")
         count = int(stalled)
         if count > 0:
-            return GuardResult(self.name, "breach", f"{count} part(s) stalled > {self._stall_secs}s in pending/draining", float(count))
+            return GuardResult(
+                self.name, "breach", f"{count} part(s) stalled > {self._stall_secs}s in pending/draining", float(count)
+            )
         return GuardResult(self.name, "ok", f"no part stalled past {self._stall_secs}s", 0.0)
 
 
@@ -180,10 +186,12 @@ class AgedPendingOrphanBacklog:
     near zero; a re-introduced A21 leak makes it climb. Two breach conditions:
 
       * BOUNDED — the backlog exceeds `bound` (a standing leak the sweep is not clearing).
-      * RISING  — the backlog net-increased by >= `rise_delta` across the last `rise_window`
-        polls (accumulating faster than the sweep drains it). This is the slope≈0 assertion,
-        measured in poll-deltas rather than wall-clock so the predicate stays deterministic
-        (the runner's poll interval is fixed, so a net rise over K polls IS a positive slope).
+      * RISING  — the post-sweep TROUGH is climbing. The gauge is inherently a sawtooth (it
+        accumulates as versions age past the grace, then drops toward 0 each time the reaper's
+        sweep clears them), so a two-point endpoint delta gives false positives/negatives. The
+        real leak signal is the FLOOR rising: over a `2*rise_window` history, breach if the
+        minimum of the recent half exceeds the minimum of the older half by >= `rise_delta`.
+        Comparing troughs is immune to where in the sawtooth each sample landed.
 
     Absent metric → skip (janitor sentinel not deployed), never a silent pass.
     """
@@ -200,17 +208,24 @@ class AgedPendingOrphanBacklog:
         backlog = probe.prom_scalar("max(janitor_aged_pending_orphans)")
         if backlog is None:
             return GuardResult(self.name, "skip", "janitor_aged_pending_orphans absent (gauge not deployed)")
+        span = 2 * self._rise_window
         self._history.append(backlog)
-        if len(self._history) > self._rise_window:
-            self._history = self._history[-self._rise_window :]
+        if len(self._history) > span:
+            self._history = self._history[-span:]
         if backlog > self._bound:
-            return GuardResult(self.name, "breach", f"aged-pending-orphan backlog {int(backlog)} > bound {self._bound}", backlog)
-        # A sustained climb across the full window (a leak) — only assertable once the window is full.
-        if len(self._history) == self._rise_window:
-            net_rise = self._history[-1] - self._history[0]
-            if net_rise >= self._rise_delta:
+            return GuardResult(
+                self.name, "breach", f"aged-pending-orphan backlog {int(backlog)} > bound {self._bound}", backlog
+            )
+        # Trough-rising check — only assertable once both halves of the window are full.
+        if len(self._history) == span:
+            old_trough = min(self._history[: self._rise_window])
+            new_trough = min(self._history[self._rise_window :])
+            if new_trough - old_trough >= self._rise_delta:
                 return GuardResult(
-                    self.name, "breach", f"aged-pending-orphan backlog rising +{net_rise:g} over {self._rise_window} polls", backlog
+                    self.name,
+                    "breach",
+                    f"aged-pending-orphan post-sweep trough rising {old_trough:g}->{new_trough:g} over {span} polls",
+                    backlog,
                 )
         return GuardResult(self.name, "ok", f"aged-pending-orphan backlog {int(backlog)} bounded & flat", backlog)
 

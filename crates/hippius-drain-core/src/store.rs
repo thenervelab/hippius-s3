@@ -657,8 +657,12 @@ impl PartReplicationStore for Store {
         // false Ok. The claim_seq is what distinguishes "I still hold it" from "someone
         // re-won it and it's draining again under them" (F4).
         let part = claim.part();
+        // Reset corrupt_attempts on a genuine commit: the counter bounds re-drives for ONE
+        // corruption episode, so a part that recovered (corrupt→pending→replicated) must not
+        // carry a spent budget if the same row is ever corrupted again. Harmless on the common
+        // path (it is already 0).
         let affected = sqlx::query(
-            "UPDATE cephor_replication_status SET status = 'replicated', updated_at = now() \
+            "UPDATE cephor_replication_status SET status = 'replicated', corrupt_attempts = 0, updated_at = now() \
              WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining' AND claim_seq = $4",
         )
         .bind(part.object().as_str())

@@ -116,7 +116,9 @@ class BackgroundMetricsCollector:
                         f"instance fails EVERY write (upload LPUSH, pub/sub, cephor:*). Investigate DLQ/backlog growth."
                     )
                 elif fill >= 0.70:
-                    logger.warning(f"redis-queues at {fill:.0%} of its memory cap (noeviction); watch for a fill trend.")
+                    logger.warning(
+                        f"redis-queues at {fill:.0%} of its memory cap (noeviction); watch for a fill trend."
+                    )
 
             logger.debug("Redis metrics collected successfully")
 

@@ -283,12 +283,21 @@ async def _unwrap_kek(
 # only guards the unwrap; the cache read/write around it is unchanged. Process-local (one per
 # API pod), which is where the KMS-call fan-out is.
 _kek_unwrap_locks: dict[tuple[str, str], asyncio.Lock] = {}
+# Cap the map so it can't grow unbounded across the life of a pod fronting many buckets×KEKs.
+# When exceeded, drop the IDLE locks (nothing holding or awaiting them) — losing an idle lock is
+# harmless (it only optimizes a cache fill; at worst two cold misses race one extra KMS unwrap).
+_KEK_LOCK_MAP_MAX = 4096
 
 
 def _kek_unwrap_lock(bucket_id: str, kek_id: uuid.UUID) -> asyncio.Lock:
     key = (str(bucket_id), str(kek_id))
     lock = _kek_unwrap_locks.get(key)
     if lock is None:
+        if len(_kek_unwrap_locks) >= _KEK_LOCK_MAP_MAX:
+            # asyncio is single-threaded, so a `locked()` lock is genuinely in use right now;
+            # rebuild keeping only those (plus, below, the fresh one for this key).
+            for k in [k for k, v in _kek_unwrap_locks.items() if not v.locked()]:
+                del _kek_unwrap_locks[k]
         lock = asyncio.Lock()
         _kek_unwrap_locks[key] = lock
     return lock

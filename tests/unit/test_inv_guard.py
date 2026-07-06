@@ -160,20 +160,24 @@ def test_g9_breach_over_bound():
     assert r.status == "breach" and "bound" in r.detail
 
 
-def test_g9_breach_on_rising_trend_within_bound():
-    # A steady climb (a leak) below the absolute bound must still breach via the slope check.
-    g = guards.AgedPendingOrphanBacklog(bound=1000, rise_window=5, rise_delta=5.0)
-    statuses = [g.check(_orphan_probe(float(v))).status for v in (10, 12, 14, 16, 18)]
-    # window fills on the 5th poll; net rise 10->18 = 8 >= delta 5 → breach
-    assert statuses[-1] == "breach"
-    assert statuses[:4] == ["ok", "ok", "ok", "ok"], "no verdict until the window is full"
+def test_g9_breach_on_rising_trough_within_bound():
+    # A leak below the absolute bound must breach via the trough-rising check. The signal is a
+    # SAWTOOTH (accumulate then sweep-drop); the peaks (50, 55) are noise — the leak shows as the
+    # post-sweep FLOOR climbing 5 -> 12. span = 2*rise_window = 4.
+    g = guards.AgedPendingOrphanBacklog(bound=1000, rise_window=2, rise_delta=5.0)
+    statuses = [g.check(_orphan_probe(float(v))).status for v in (5, 50, 12, 55)]
+    assert statuses[-1] == "breach", "rising trough (5->12) over the window must breach"
+    assert statuses[:3] == ["ok", "ok", "ok"], "no verdict until both window halves are full"
 
 
-def test_g9_ok_when_flat_over_full_window():
-    g = guards.AgedPendingOrphanBacklog(bound=1000, rise_window=3, rise_delta=5.0)
-    for v in (20, 21, 20):  # jitter, net change ~0
+def test_g9_ok_on_sawtooth_with_flat_trough():
+    # The false-positive a two-point endpoint delta would hit: big sawtooth swings but a FLAT
+    # trough (5 -> 6) is healthy — the trough comparison must NOT breach.
+    g = guards.AgedPendingOrphanBacklog(bound=1000, rise_window=2, rise_delta=5.0)
+    r = None
+    for v in (5, 50, 6, 55):
         r = g.check(_orphan_probe(float(v)))
-    assert r.status == "ok"
+    assert r.status == "ok", "a flat trough under a swinging sawtooth is healthy, not a leak"
 
 
 # ----------------------------------------------------------------- G5/G7/G8 are inv-det/scenario
