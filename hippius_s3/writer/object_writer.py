@@ -855,40 +855,71 @@ class ObjectWriter:
         upload_id: str,
         object_version: int,
         address: str,
+        selected_parts: list[int] | None = None,
     ) -> CompleteResult:
-        # Compute combined ETag from part etags for this version
+        # B1: S3 allows completing with a SUBSET of the uploaded parts. `selected_parts` is the
+        # client's <Part> list (already validated exists+ETag-matches by the endpoint); the final
+        # ETag, size, AND the served bytes must reflect ONLY those parts. We filter the ETag/size
+        # here and persist `completed_part_numbers` so the reader (parts_catalog) serves the same
+        # set — rather than deleting the unlisted parts (unsafe: multi-node SSD + in-flight drain +
+        # chunk_backend/Arion pin leak via cascade). `selected_parts=None` (or the full set) →
+        # every part, unchanged behaviour.
+        selected = sorted({int(pn) for pn in selected_parts}) if selected_parts else None
+
+        # Compute combined ETag from part etags for this version (client-selected subset only).
         parts = await self.pool.fetch(
             get_query("get_parts_etags_for_version"),
             object_id,
             int(object_version),
         )
+        if selected is not None:
+            selected_set = set(selected)
+            parts = [p for p in parts if int(p["part_number"]) in selected_set]
         etags = [p["etag"].split("-")[0] for p in parts]
         binary = b"".join(bytes.fromhex(e) for e in etags) if etags else b""
         final_md5 = hashlib.md5(binary).hexdigest() + f"-{len(etags)}"
 
-        # Total size
+        # Total size (client-selected subset only).
         all_parts = await self.pool.fetch(
             get_query("list_parts_for_version"),
             object_id,
             int(object_version),
         )
+        all_pns = {int(p["part_number"]) for p in all_parts}
+        if selected is not None:
+            all_parts = [p for p in all_parts if int(p["part_number"]) in set(selected)]
         total_size = sum(int(p["size_bytes"]) for p in all_parts)
 
+        # Only persist the filter when the client named a STRICT subset — a full-set completion
+        # (the overwhelming common case) leaves the column NULL so no per-read filter/array is
+        # stored (matters for MPUs with thousands of parts).
+        subset_to_store = selected if (selected is not None and set(selected) != all_pns) else None
+        if subset_to_store is not None:
+            logger.info(
+                "mpu_complete: object_id=%s v=%s completed with a %d-of-%d part SUBSET; unlisted parts excluded from reads",
+                object_id,
+                object_version,
+                len(subset_to_store),
+                len(all_pns),
+            )
+
         async with self.pool.acquire() as conn, conn.transaction():
-            # Update object_versions
+            # Update object_versions (record the completed subset so the reader filters to it).
             await conn.execute(
                 """
                 UPDATE object_versions ov
                 SET md5_hash = $1,
                     size_bytes = $2,
                     last_modified = NOW(),
-                    status = 'publishing'
+                    status = 'publishing',
+                    completed_part_numbers = $5
                 WHERE ov.object_id = $3 AND ov.object_version = $4
                 """,
                 final_md5,
                 int(total_size),
                 object_id,
                 int(object_version),
+                subset_to_store,
             )
 
             # Mark MPU completed

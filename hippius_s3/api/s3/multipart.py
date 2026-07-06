@@ -791,6 +791,18 @@ async def abort_multipart_upload(
                 upload_id,
             )
 
+        # B5: drop the empty reserved object_versions row this aborted upload left behind and
+        # repoint current_object_version off it. Reads already fall back to the latest completed
+        # version, so this is DB hygiene (no data loss) — best-effort so a hiccup never fails the
+        # abort. Skipped when the upload had no version of its own.
+        if object_version is not None:
+            with contextlib.suppress(Exception):
+                await db.fetchrow(
+                    get_query("abort_cleanup_orphan_version"),
+                    object_id,
+                    object_version,
+                )
+
         # Best-effort node-local cleanup: drop THIS node's cached parts (other nodes' copies
         # are left to the orphan GC; the central mark above already stopped their churn).
         if object_version is not None:
@@ -1103,6 +1115,9 @@ async def complete_multipart_upload(
             upload_id=str(upload_id),
             object_version=int(object_version),
             address=request.state.account.main_account,
+            # B1: the client's <Part> selection — the final object (bytes + ETag + size) reflects
+            # only these; a strict subset is recorded so the reader excludes the unlisted parts.
+            selected_parts=[pn for pn, _ in part_info],
         )
 
         # Drain-direct (s3-2.1 PR-11): the api does NOT enqueue the backend upload. It
