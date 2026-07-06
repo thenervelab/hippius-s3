@@ -24,6 +24,22 @@ spec:
             - sh
             - -c
             - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
+        # D2: gate on DB migrations. Workers `exec python <script>` with no migrate step of their
+        # own (unlike the API, whose start-api.sh runs migrate before uvicorn), so a freshly-rolled
+        # worker could start against a schema older than its code and error on a new column/table.
+        # This WAITS for the newest baked-in migration to appear in schema_migrations; the API and
+        # the db-migrations Job own applying them.
+        - name: wait-for-migrations
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          command:
+            - python
+            - scripts/wait_for_migrations.py
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
       containers:
         - name: arion-uploader
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
@@ -198,6 +214,22 @@ spec:
             - sh
             - -c
             - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
+        # D2: gate on DB migrations. Workers `exec python <script>` with no migrate step of their
+        # own (unlike the API, whose start-api.sh runs migrate before uvicorn), so a freshly-rolled
+        # worker could start against a schema older than its code and error on a new column/table.
+        # This WAITS for the newest baked-in migration to appear in schema_migrations; the API and
+        # the db-migrations Job own applying them.
+        - name: wait-for-migrations
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          command:
+            - python
+            - scripts/wait_for_migrations.py
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
       containers:
         - name: arion-downloader
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
@@ -365,6 +397,22 @@ spec:
             - sh
             - -c
             - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
+        # D2: gate on DB migrations. Workers `exec python <script>` with no migrate step of their
+        # own (unlike the API, whose start-api.sh runs migrate before uvicorn), so a freshly-rolled
+        # worker could start against a schema older than its code and error on a new column/table.
+        # This WAITS for the newest baked-in migration to appear in schema_migrations; the API and
+        # the db-migrations Job own applying them.
+        - name: wait-for-migrations
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          command:
+            - python
+            - scripts/wait_for_migrations.py
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
       containers:
         - name: arion-unpinner
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
@@ -499,6 +547,19 @@ spec:
             - sh
             - -c
             - until nc -z postgres-rw 5432 && nc -z redis 6379; do echo waiting for services; sleep 5; done
+        # D2: gate on DB migrations (see the uploader deployment for the rationale) — the janitor
+        # reads object_versions/parts/chunk_backend and must not run against a stale schema.
+        - name: wait-for-migrations
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          command:
+            - python
+            - scripts/wait_for_migrations.py
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
       containers:
         - name: janitor
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
