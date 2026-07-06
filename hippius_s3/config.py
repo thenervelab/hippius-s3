@@ -275,11 +275,15 @@ class Config:
     # DLQ configuration
     dlq_dir: str = env("HIPPIUS_DLQ_DIR:/tmp/hippius_dlq")
     dlq_archive_dir: str = env("HIPPIUS_DLQ_ARCHIVE_DIR:/tmp/hippius_dlq_archive")
-    # Hard cap on entries per DLQ list. The DLQ lives on redis-queues (2GB, noeviction) alongside
-    # the drain's cephor:* lease/fence keys, work queues and notify:* pub/sub — a permanent-error
-    # storm on an uncapped DLQ can fill the instance and fail ALL writes pipeline-wide. At the cap,
-    # push() is a no-op (drop-newest): Postgres is the durable source of truth, so a lost failure
-    # record is re-derivable (scripts/resubmit_failed_pins.py). 0 disables the cap.
+    # Soft cap on entries per DLQ list (best-effort: a non-atomic LLEN+LPUSH may overshoot by up to
+    # the number of concurrent pushers). The DLQ lives on redis-queues (2GB, noeviction) alongside the
+    # drain's cephor:* lease/fence keys, work queues and notify:* pub/sub — a permanent-error storm on
+    # an uncapped DLQ can fill the instance and fail ALL writes pipeline-wide. At the cap, push() is a
+    # no-op (drop-newest). This drops the failure RECORD, never object data: the janitor's absolute
+    # replication gate still refuses to evict a non-replicated chunk. Entries already in the DLQ remain
+    # requeuable via scripts/dlq_requeue.py; a dropped failure's durable trace is object_versions.status
+    # (e.g. 'failed'), and the 50%/90% alerts fire long before the cap so drops shouldn't occur in
+    # practice. 0 (or negative) disables the cap.
     dlq_max_entries: int = env("HIPPIUS_DLQ_MAX_ENTRIES:10000", convert=int)
 
     # Object parts filesystem cache configuration

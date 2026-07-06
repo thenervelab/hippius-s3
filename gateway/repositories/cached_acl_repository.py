@@ -109,7 +109,10 @@ class CachedACLRepository:
     async def invalidate_bucket_acl(self, bucket_name: str) -> None:
         cache_key = self._bucket_acl_key(bucket_name)
         # Best-effort: the DB write already committed; a redis-acl outage must not fail the mutation.
-        # A stale entry self-heals at TTL, and a fallback read during the outage goes to the DB anyway.
+        # SECURITY: if this DELETE fails transiently while redis is otherwise serving reads, a REVOKED
+        # grant stays cached (stale ALLOW) until the entry's TTL. Bounded and self-healing — and no worse
+        # than raising: the DELETE already failed, so the stale entry persists either way; swallowing just
+        # spares the caller a 500. A full outage is safe regardless — reads fall through to the DB.
         try:
             deleted = await self.redis.delete(cache_key)
         except RedisError as exc:

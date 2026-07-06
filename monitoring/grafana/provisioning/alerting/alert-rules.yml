@@ -242,7 +242,8 @@ groups:
           severity: high
 
       # DLQs live on redis-queues (2GB, noeviction) — a full DLQ fails ALL writes pipeline-wide.
-      # Thresholds track HIPPIUS_DLQ_MAX_ENTRIES (default 10000): warn at 50%, page at 90%.
+      # Thresholds are LITERALS for the default HIPPIUS_DLQ_MAX_ENTRIES=10000 (warn at 50%, page at 90%).
+      # If you change the cap, update 5000/9000 below in lockstep — otherwise the ratios drift.
       - uid: dlq-near-full-warning
         title: DLQ Filling - 50% of Cap
         condition: C
@@ -377,6 +378,6 @@ groups:
         for: 0m
         annotations:
           summary: 'A DLQ is at its cap and dropping entries - {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} dropped in last 5 minutes'
-          description: 'A DLQ hit HIPPIUS_DLQ_MAX_ENTRIES and is dropping failure records (drop-newest). Records are re-derivable from Postgres (resubmit_failed_pins.py), but the DLQ must be drained immediately.'
+          description: 'A DLQ hit HIPPIUS_DLQ_MAX_ENTRIES and is dropping failure records (drop-newest). This drops the failure record, not object data (janitor replication gate still protects chunks); durable trace is object_versions.status. Drain the DLQ immediately via scripts/dlq_requeue.py.'
         labels:
           severity: critical

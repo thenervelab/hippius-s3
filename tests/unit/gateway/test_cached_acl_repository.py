@@ -283,3 +283,20 @@ class TestRedisOutageFallsBackToDB:
         # must not raise — the DB write already committed upstream
         await cached_repo.invalidate_bucket_acl("my-bucket")
         await cached_repo.invalidate_object_acl("my-bucket", "k")
+
+    @pytest.mark.asyncio
+    async def test_db_failure_during_outage_propagates_never_fails_open(
+        self, cached_repo: CachedACLRepository, mock_redis: Any, mock_base_repo: Any
+    ) -> None:
+        # SECURITY guard: only RedisError is caught. If redis is down AND the authoritative DB read
+        # ALSO fails, the DB exception must PROPAGATE (→ 500 = deny), never be swallowed into a
+        # permissive default. This test pins the boundary so a future widened `except` can't fail open.
+        mock_redis.get.side_effect = RedisError("redis-acl down")
+        mock_base_repo.get_bucket_acl.side_effect = RuntimeError("acl DB unavailable")
+
+        with pytest.raises(RuntimeError, match="acl DB unavailable"):
+            await cached_repo.get_bucket_acl("my-bucket")
+
+        mock_base_repo.get_object_acl.side_effect = RuntimeError("acl DB unavailable")
+        with pytest.raises(RuntimeError, match="acl DB unavailable"):
+            await cached_repo.get_object_acl("my-bucket", "k")

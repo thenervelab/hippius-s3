@@ -40,7 +40,9 @@ class BaseDLQManager(Generic[T]):
         self.enqueue_func = enqueue_func
         self.request_class = request_class
         self.lock_prefix = f"dlq:requeue:lock:{dlq_key}:"
-        self.max_entries = get_config().dlq_max_entries
+        # max(0, …): a negative config must DISABLE the cap (like 0), never make `llen >= max`
+        # trivially true and silently drop every push (including on an empty DLQ).
+        self.max_entries = max(0, get_config().dlq_max_entries)
 
     def _lock_key(self, identifier: str) -> str:
         return f"{self.lock_prefix}{identifier}"
@@ -68,14 +70,15 @@ class BaseDLQManager(Generic[T]):
         identifier = self._get_identifier(payload)
 
         # redis-queues is noeviction: an uncapped DLQ can fill the 2GB instance and fail ALL writes
-        # (drain leases, work queues, pub/sub). At the cap we drop-newest — Postgres holds the durable
-        # state, so the failure record is re-derivable (scripts/resubmit_failed_pins.py). The alert on
-        # dlq_dropped_total / hippius_queue_length fires long before this is reached.
+        # (drain leases, work queues, pub/sub). At the cap we drop-newest — this loses the failure
+        # RECORD, not object data (the janitor's replication gate still protects non-replicated chunks).
+        # The 50%/90% alerts fire long before this; entries in the DLQ stay requeuable via dlq_requeue.py.
         if self.max_entries and await self.redis_client.llen(self.dlq_key) >= self.max_entries:  # ty: ignore[invalid-await]
             get_metrics_collector().record_dlq_dropped(self.dlq_key, etype)
             logger.error(
                 f"DLQ_FULL dropped entry ({self.dlq_key}): identifier={identifier}, error_type={etype}, "
-                f"cap={self.max_entries}, error={last_error} — recover via PSQL re-derive (resubmit_failed_pins.py)"
+                f"cap={self.max_entries}, error={last_error} — durable trace in object_versions.status; "
+                f"drain the DLQ via scripts/dlq_requeue.py"
             )
             return
 

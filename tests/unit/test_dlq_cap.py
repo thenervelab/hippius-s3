@@ -78,6 +78,21 @@ async def test_cap_zero_disables_the_cap() -> None:
 
 
 @pytest.mark.asyncio
+async def test_negative_cap_is_clamped_to_disabled() -> None:
+    # A negative config must DISABLE the cap, not make `llen >= max` trivially true and drop
+    # every push (including the first on an empty DLQ). __init__ clamps via max(0, ...).
+    cfg = MagicMock()
+    cfg.dlq_max_entries = -1
+    with patch("hippius_s3.dlq.base.get_config", return_value=cfg):
+        mgr = UploadDLQManager(FakeRedis(), backend_name="arion")
+
+    assert mgr.max_entries == 0  # clamped
+
+    await mgr.push(_req("obj-0"), last_error="boom", error_type="transient")
+    assert await mgr.redis_client.llen(mgr.dlq_key) == 1  # push landed, not dropped
+
+
+@pytest.mark.asyncio
 async def test_requeue_all_drains_a_capped_dlq() -> None:
     mgr = UploadDLQManager(FakeRedis(), backend_name="arion")
     mgr.max_entries = 3

@@ -387,6 +387,15 @@ async def run_downloader_loop(
 
         No download DLQ: chunks are re-derivable and a reader re-enqueues on the next cache-miss,
         so a dropped request is recoverable — we only bound the server-side retry effort.
+
+        This reuses the uploader's retry PLUMBING (per-backend ZSET + 2s mover) but NOT its
+        transient/permanent classification. process_download_request swallows every per-chunk error
+        and returns ok=False (the terminal error class never reaches here), so we cannot cheaply tell
+        a permanent 404 from a transient 5xx without threading error types out of that hot path. We
+        therefore retry ALL failures up to the cap — a bounded, deliberate trade-off: a genuine
+        permanent failure costs at most downloader_max_attempts extra idempotent Arion GETs before
+        being dropped, no worse in kind than the pre-existing reader-driven re-enqueue that re-drives
+        permanents on every cache-miss regardless.
         """
         attempts_next = (request.attempts or 0) + 1
         if attempts_next <= config.downloader_max_attempts:
