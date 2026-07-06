@@ -240,3 +240,161 @@ groups:
           summary: API response times severely degraded during user activity
         labels:
           severity: high
+
+  - orgId: 1
+    name: hippius-s3-drain
+    folder: Hippius S3 Alerts
+    interval: 1m
+    rules:
+      # Pages BEFORE the api's fs_cache_pressure 90% cutoff (which 503s every PUT on the
+      # node), leaving runway to drain or reclaim. drain_ssd_pressure is a 0..1 fill
+      # fraction per node; max() catches the worst node. Unlike drain_ssd_backlog_bytes
+      # (undrained work), this rises with an SSD leak even at zero drain demand — so a
+      # stalled reclaim (WI-20a/b) surfaces here.
+      - uid: drain-ssd-pressure-high
+        title: Drain SSD Pressure - Node Near the PUT-shedding Cutoff
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(drain_ssd_pressure{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 0.85
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: 'Worst node SSD fill is {{ if $values.B }}{{ printf "%.0f" (mulf $values.B.Value 100) }}{{ else }}N/A{{ end }}% (pages at 85%; the api sheds PUTs with 503 at 90%)'
+          summary: A drain node''s ingest SSD is filling toward the PUT-shedding cutoff
+        labels:
+          severity: critical
+
+      # G2 replication-gate sentinel. janitor_underreplicated_live_chunks counts live,
+      # serveable chunks lacking full-union backend coverage — the exact chunks the janitor
+      # gate refuses to reclaim, so any nonzero value is a standing data-loss risk (a chunk
+      # one eviction away from loss) and surfaces the C10 divergence. Fires on ANY breach.
+      - uid: replication-gate-coverage-gap
+        title: Replication Gate - Live Chunks Under-replicated
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(janitor_underreplicated_live_chunks{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        annotations:
+          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} live serveable chunk(s) lack full-union backend coverage — at data-loss risk if reclaimed. Check the janitor "REPLICATION-GATE SENTINEL" logs for samples.'
+          summary: Live objects have chunks the replication gate cannot safely retain
+        labels:
+          severity: critical
+
+      # A21 aged-pending orphan backlog. janitor_aged_pending_orphans counts unservable
+      # pending/draining versions idle past the grace — the leak the replicated-only soak
+      # gate is blind to. A sustained elevated value means orphans accrue faster than the
+      # sweep (list_orphan_replication_versions.sql) clears them: a re-introduced leak (e.g.
+      # the abort-path bug) or a stalled sweep. A long `for` tolerates the transient backlog
+      # between a leak and the next sweep, firing only on a standing, non-draining backlog.
+      - uid: aged-pending-orphan-backlog
+        title: Drain A21 - Aged Pending Orphans Not Draining
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(janitor_aged_pending_orphans{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 100
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 30m
+        annotations:
+          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} aged pending/draining orphan version(s) are not draining — the A21 sweep is not keeping up (re-introduced leak or stalled reaper). This population is invisible to the replicated-only soak gate.'
+          summary: A21 orphan backlog is standing above threshold and not draining
+        labels:
+          severity: warning

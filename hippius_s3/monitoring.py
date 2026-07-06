@@ -273,6 +273,14 @@ class MetricsCollector:
         self.mpu_reaper_versions_reaped_total = self.meter.create_counter(
             name="mpu_reaper_versions_reaped_total", description="Abandoned MPU versions reaped", unit="1"
         )
+        # A21 sweep counter, kept distinct from the reaper's: the soak gate watches this to
+        # assert pending/draining orphans stay bounded (a rising sweep count with no fresh
+        # aborts means a leak the reaper is blind to). See s3-2.1 WI-20a / soak gate.
+        self.mpu_reaper_orphans_swept_total = self.meter.create_counter(
+            name="mpu_reaper_orphans_swept_total",
+            description="Leaked cephor orphan versions marked terminal by the sweep",
+            unit="1",
+        )
         self.mpu_reaper_duration_seconds = self.meter.create_histogram(
             name="mpu_reaper_duration_seconds", description="MPU reaper cycle duration", unit="s"
         )
@@ -659,11 +667,14 @@ class MetricsCollector:
         reaped: int,
         duration: float,
         oldest_reaped_age: Optional[float] = None,
+        swept: int = 0,
     ) -> None:
         self.mpu_reaper_cycles_total.add(1, attributes={"success": str(success).lower()})
         self.mpu_reaper_duration_seconds.record(duration)
         if reaped > 0:
             self.mpu_reaper_versions_reaped_total.add(reaped)
+        if swept > 0:
+            self.mpu_reaper_orphans_swept_total.add(swept)
         if oldest_reaped_age is not None:
             self.mpu_reaper_oldest_reaped_age_seconds.record(oldest_reaped_age)
 

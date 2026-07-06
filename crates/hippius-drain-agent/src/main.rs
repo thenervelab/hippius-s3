@@ -72,7 +72,10 @@ async fn main() -> Result<ExitCode, StartupError> {
         .set_response_timeout(DEFAULT_REDIS_TIMEOUT)
         .set_connection_timeout(DEFAULT_REDIS_TIMEOUT);
     let redis = redis::aio::ConnectionManager::new_with_config(redis::Client::open(config.redis_queues_url.as_str())?, redis_config).await?;
-    let enqueuer = Arc::new(RedisEnqueuer::new(Arc::clone(&store), redis.clone(), config.upload_backends.clone()));
+    // Enqueue to upload ∪ backup backends — the SAME union the janitor's replication gate
+    // requires before it will reclaim a part (C10). Pushing only to upload_backends would
+    // strand any configured backup backend as required-but-never-enqueued.
+    let enqueuer = Arc::new(RedisEnqueuer::new(Arc::clone(&store), redis.clone(), config.enqueue_backends()));
 
     // The Redis-backed coordinator: the heartbeat worker upserts this node's state under
     // `heartbeat_ttl`, and the allocation-pull worker reads its budget. The agent never
@@ -116,6 +119,8 @@ async fn main() -> Result<ExitCode, StartupError> {
         pool_root = %config.pool_root.display(),
         ssd_root = %config.ssd_root.display(),
         upload_backends = ?config.upload_backends,
+        backup_backends = ?config.backup_backends,
+        enqueue_backends = ?config.enqueue_backends(),
         "hippius-drain-agent started"
     );
     let report = runtime.run(shutdown_signal()).await;

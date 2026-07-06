@@ -52,6 +52,13 @@ const DEFAULT_HEARTBEAT_TTL: Duration = Duration::from_secs(30);
 /// Reclaim scan period when `CEPHOR_RECLAIM_POLL_SECS` is unset: the SSD-ingest GC
 /// runs less often than the drain — eviction is a backstop, not a hot path.
 const DEFAULT_RECLAIM_POLL: Duration = Duration::from_mins(5);
+/// Orphan-reclaim grace when `CEPHOR_ORPHAN_RECLAIM_GRACE_SECS` is unset: how long a
+/// no-DB-backing part (its object hard-deleted) is kept on SSD before eviction. Longer
+/// than the `failed` grace because this age is the FS `meta.json` mtime (a deleted object
+/// has no DB row to date), so a generous window absorbs the agent-clock dependence and
+/// any delete-racing-recreate window. A deleted object never returns, so there is no cost
+/// to waiting.
+const DEFAULT_ORPHAN_RECLAIM_GRACE: Duration = Duration::from_hours(24);
 /// Reclaim grace when `CEPHOR_RECLAIM_GRACE_SECS` is unset: how long a `failed`
 /// (abandoned-upload) part — and an orphan write-temp — is kept on SSD before
 /// eviction (a diagnosis / abort-settle window).
@@ -103,11 +110,20 @@ pub struct Config {
     /// Backends to enqueue each part's upload to (`{backend}_upload_requests`), from
     /// `HIPPIUS_UPLOAD_BACKENDS` (comma-list). Defaults to `["arion"]`.
     pub upload_backends: Vec<String>,
+    /// `HIPPIUS_BACKUP_BACKENDS` (comma-list). Defaults to EMPTY — a backup backend is a
+    /// deliberate opt-in. The janitor gate requires coverage on `upload_backends ∪
+    /// backup_backends` before reclaiming a part, so the enqueuer MUST push to the same
+    /// union ([`enqueue_backends`](Config::enqueue_backends)) — otherwise a configured
+    /// backup backend is required-but-never-enqueued and the gate deadlocks (C10).
+    pub backup_backends: Vec<String>,
     /// How often the SSD-reclaim worker scans for `failed` (abandoned-upload) parts.
     pub reclaim_poll: Duration,
     /// How long a `failed` part (and an orphan write-temp) is kept on SSD before
     /// eviction (a diagnosis / abort-settle window).
     pub reclaim_grace: Duration,
+    /// How long a no-DB-backing part (its object hard-deleted) is kept on SSD before the
+    /// orphan reclaim evicts it. Keyed on the part's FS `meta.json` age, so set generously.
+    pub orphan_reclaim_grace: Duration,
     /// Maximum parts the drain worker processes concurrently — the in-flight gate
     /// that lets the node overlap fsync latency across parts.
     pub drain_concurrency: u32,
@@ -183,9 +199,38 @@ impl Config {
             reconcile_poll: self.reconcile_poll,
             reclaim_poll: self.reclaim_poll,
             reclaim_grace: self.reclaim_grace,
+            orphan_reclaim_grace: self.orphan_reclaim_grace,
             grace: self.grace,
             drain_concurrency: self.drain_concurrency,
         }
+    }
+
+    /// The backends the drain enqueuer pushes a replicated part to: `upload_backends`
+    /// unioned with `backup_backends`, deduped, upload order preserved.
+    ///
+    /// This closes the C10 backup half: without the union, a configured backup backend
+    /// would be required by the janitor gate (`is_replicated_on_all_backends` unions the
+    /// per-version `upload_backends` with `HIPPIUS_BACKUP_BACKENDS`) but never enqueued, so
+    /// the part could never reach full coverage and the janitor would never reclaim its
+    /// SSD copy — a permanent leak/deadlock.
+    ///
+    /// It is NOT fully per-version aware: the gate keys on each version's *persisted*
+    /// `object_versions.upload_backends` (and forces `['ipfs']` for a `migration` version),
+    /// while this uses the agent's *current* global `config.upload_backends`. The two match
+    /// only when every drained version's persisted set equals the current config and no
+    /// `migration` version transits the drain. A migration or config-drifted version can
+    /// therefore still be required-but-under-enqueued (the same leak, not data loss) — a
+    /// residual the G2 replication-gate sentinel is there to surface. The complete fix reads
+    /// the per-version set in the enqueuer (`load_upload_context` already reads that row).
+    #[must_use]
+    pub fn enqueue_backends(&self) -> Vec<String> {
+        let mut backends = self.upload_backends.clone();
+        for backup in &self.backup_backends {
+            if !backends.contains(backup) {
+                backends.push(backup.clone());
+            }
+        }
+        backends
     }
 
     /// The [`HeartbeatConfig`](crate::runtime::HeartbeatConfig) for this node.
@@ -220,8 +265,10 @@ impl Config {
             heartbeat_ttl: duration_secs(&get, "CEPHOR_HEARTBEAT_TTL_SECS", DEFAULT_HEARTBEAT_TTL)?,
             redis_queues_url: required(&get, "REDIS_QUEUES_URL")?,
             upload_backends: parse_backends(&get, "HIPPIUS_UPLOAD_BACKENDS"),
+            backup_backends: parse_optional_backends(&get, "HIPPIUS_BACKUP_BACKENDS"),
             reclaim_poll: duration_secs(&get, "CEPHOR_RECLAIM_POLL_SECS", DEFAULT_RECLAIM_POLL)?,
             reclaim_grace: duration_secs(&get, "CEPHOR_RECLAIM_GRACE_SECS", DEFAULT_RECLAIM_GRACE)?,
+            orphan_reclaim_grace: duration_secs(&get, "CEPHOR_ORPHAN_RECLAIM_GRACE_SECS", DEFAULT_ORPHAN_RECLAIM_GRACE)?,
             drain_concurrency: positive_u32_or(&get, "CEPHOR_DRAIN_CONCURRENCY", DEFAULT_DRAIN_CONCURRENCY)?,
             liveness_file: path_or(&get, "CEPHOR_LIVENESS_FILE", DEFAULT_LIVENESS_FILE),
         })
@@ -232,14 +279,20 @@ impl Config {
 /// dropping empties. Defaults to `["arion"]` when unset or empty (mirrors the Python
 /// `config.upload_backends` default).
 fn parse_backends(get: &impl Fn(&str) -> Option<String>, var: &'static str) -> Vec<String> {
-    let parsed: Vec<String> = get(var)
+    let parsed = parse_optional_backends(get, var);
+    if parsed.is_empty() { vec!["arion".to_owned()] } else { parsed }
+}
+
+/// Parses a comma-separated backend list with an EMPTY default (no fallback backend) —
+/// for `HIPPIUS_BACKUP_BACKENDS`, where "unset" must mean "no backup", never `["arion"]`.
+fn parse_optional_backends(get: &impl Fn(&str) -> Option<String>, var: &'static str) -> Vec<String> {
+    get(var)
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
-        .collect();
-    if parsed.is_empty() { vec!["arion".to_owned()] } else { parsed }
+        .collect()
 }
 
 /// Resolves a required identifier variable into a validated [`NodeId`].
@@ -321,8 +374,8 @@ fn duration_secs(get: &impl Fn(&str) -> Option<String>, var: &'static str, defau
 mod tests {
     use super::{
         Config, ConfigError, DEFAULT_ALLOCATION_POLL, DEFAULT_CLAIM_LEASE, DEFAULT_DECAY_HALF_LIFE, DEFAULT_DRAIN_CONCURRENCY, DEFAULT_DRAIN_POLL,
-        DEFAULT_FLOOR_RATE_BPS, DEFAULT_HEARTBEAT_POLL, DEFAULT_HEARTBEAT_TTL, DEFAULT_MAX_DRAIN_RATE_BPS, DEFAULT_RECLAIM_GRACE,
-        DEFAULT_RECLAIM_POLL,
+        DEFAULT_FLOOR_RATE_BPS, DEFAULT_HEARTBEAT_POLL, DEFAULT_HEARTBEAT_TTL, DEFAULT_MAX_DRAIN_RATE_BPS, DEFAULT_ORPHAN_RECLAIM_GRACE,
+        DEFAULT_RECLAIM_GRACE, DEFAULT_RECLAIM_POLL,
     };
     use core::str::FromStr;
     use hippius_drain_core::{ByteRate, NodeId};
@@ -445,6 +498,7 @@ mod tests {
         let config = Config::from_lookup(lookup(&required_only())).unwrap();
         assert_eq!(config.reclaim_poll, DEFAULT_RECLAIM_POLL);
         assert_eq!(config.reclaim_grace, DEFAULT_RECLAIM_GRACE);
+        assert_eq!(config.orphan_reclaim_grace, DEFAULT_ORPHAN_RECLAIM_GRACE);
     }
 
     #[test]
@@ -452,9 +506,11 @@ mod tests {
         let mut pairs = required_only();
         pairs.push(("CEPHOR_RECLAIM_POLL_SECS", "120"));
         pairs.push(("CEPHOR_RECLAIM_GRACE_SECS", "600"));
+        pairs.push(("CEPHOR_ORPHAN_RECLAIM_GRACE_SECS", "7200"));
         let config = Config::from_lookup(lookup(&pairs)).unwrap();
         assert_eq!(config.reclaim_poll, Duration::from_mins(2));
         assert_eq!(config.reclaim_grace, Duration::from_mins(10));
+        assert_eq!(config.orphan_reclaim_grace, Duration::from_hours(2));
     }
 
     #[test]
@@ -627,5 +683,46 @@ mod tests {
         pairs.push(("HIPPIUS_UPLOAD_BACKENDS", " arion , ovh "));
         let config = Config::from_lookup(lookup(&pairs)).unwrap();
         assert_eq!(config.upload_backends, vec!["arion".to_owned(), "ovh".to_owned()]);
+    }
+
+    #[test]
+    fn backup_backends_default_to_empty_not_arion() {
+        // Unlike upload_backends (which defaults to ["arion"]), backup must default EMPTY:
+        // a spurious default backup backend would make the janitor gate require coverage
+        // the enqueuer then has to satisfy for no reason.
+        let config = Config::from_lookup(lookup(&required_only())).unwrap();
+        assert!(config.backup_backends.is_empty(), "no HIPPIUS_BACKUP_BACKENDS -> no backup backends");
+    }
+
+    #[test]
+    fn backup_backends_parse_a_trimmed_comma_list() {
+        let mut pairs = required_only();
+        pairs.push(("HIPPIUS_BACKUP_BACKENDS", " ipfs , s3backup "));
+        let config = Config::from_lookup(lookup(&pairs)).unwrap();
+        assert_eq!(config.backup_backends, vec!["ipfs".to_owned(), "s3backup".to_owned()]);
+    }
+
+    #[test]
+    fn enqueue_backends_is_the_deduped_ordered_union_of_upload_and_backup() {
+        // C10: the enqueuer must push to every backend the janitor gate requires
+        // (upload ∪ backup). Upload order is preserved; a backup already in upload is not
+        // duplicated; a genuinely new backup backend is appended.
+        let mut pairs = required_only();
+        pairs.push(("HIPPIUS_UPLOAD_BACKENDS", "arion,ipfs"));
+        pairs.push(("HIPPIUS_BACKUP_BACKENDS", "ipfs,s3backup")); // ipfs overlaps, s3backup is new
+        let config = Config::from_lookup(lookup(&pairs)).unwrap();
+        assert_eq!(
+            config.enqueue_backends(),
+            vec!["arion".to_owned(), "ipfs".to_owned(), "s3backup".to_owned()],
+            "upload order kept, overlap deduped, new backup appended",
+        );
+    }
+
+    #[test]
+    fn enqueue_backends_with_no_backup_is_just_upload() {
+        let mut pairs = required_only();
+        pairs.push(("HIPPIUS_UPLOAD_BACKENDS", "arion"));
+        let config = Config::from_lookup(lookup(&pairs)).unwrap();
+        assert_eq!(config.enqueue_backends(), vec!["arion".to_owned()]);
     }
 }

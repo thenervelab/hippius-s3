@@ -20,16 +20,36 @@ from hippius_s3.services import mpu_cleanup
 
 
 class FakeDb:
-    """A minimal asyncpg-connection stand-in: fetch returns canned rows; execute records."""
+    """A minimal asyncpg-connection stand-in: fetch returns canned rows; execute records.
 
-    def __init__(self, fetch_rows: list[dict] | None = None) -> None:
+    `fetch` dispatches on the query text so one FakeDb can back both reaper paths in a
+    single cycle: the abandoned-MPU query selects from ``multipart_uploads`` while the
+    orphan sweep's query selects from ``cephor_replication_status`` — they return
+    differently-shaped rows and must not cross-feed. ``raise_mark_for`` forces the
+    terminal-mark ``execute`` to throw for one object_id, modelling a poison row the
+    sweep must skip without aborting the rest of the pass.
+    """
+
+    def __init__(
+        self,
+        fetch_rows: list[dict] | None = None,
+        *,
+        sweep_rows: list[dict] | None = None,
+        raise_mark_for: str | None = None,
+    ) -> None:
         self._fetch_rows = fetch_rows or []
+        self._sweep_rows = sweep_rows or []
+        self._raise_mark_for = raise_mark_for
         self.executed: list[tuple[str, tuple]] = []
 
     async def fetch(self, query: str, *args: object) -> list[dict]:
+        if "cephor_replication_status" in query:
+            return self._sweep_rows
         return self._fetch_rows
 
     async def execute(self, query: str, *args: object) -> str:
+        if self._raise_mark_for is not None and args and args[0] == self._raise_mark_for:
+            raise RuntimeError(f"forced mark failure for {self._raise_mark_for}")
         self.executed.append((query, args))
         return "UPDATE 1"
 
@@ -167,3 +187,82 @@ async def test_run_reaper_cycle_records_a_failure_without_raising() -> None:
     _, kwargs = collector.record_mpu_reaper_cycle.call_args
     assert kwargs["success"] is False
     assert kwargs["reaped"] == 0
+
+
+# ---------------------------------------------------------------- orphan sweep (WI-20a/A21)
+# The abandoned-MPU reaper above keys on multipart_uploads rows. An aborted upload deletes
+# that header row, so its leaked cephor_replication_status rows are invisible to it. The
+# sweep is the real A21 backstop: it keys DIRECTLY on cephor_replication_status, so it
+# catches orphans whose MPU/parts rows are already gone. It only ever MARKS 'failed' (never
+# deletes), so unlike the reaper it can tolerate a per-version mark failure and press on.
+
+
+@pytest.mark.asyncio
+async def test_sweep_marks_each_orphan_version_failed() -> None:
+    rows = [
+        {"object_id": "obj-1", "version": 1, "age_seconds": 90000.0},
+        {"object_id": "obj-2", "version": 5, "age_seconds": 172800.0},
+    ]
+    db = FakeDb(sweep_rows=rows)
+    result = await mpu_cleanup.sweep_orphan_replication_versions(db, stale_seconds=86400, dlq_object_ids=set())
+    assert result.count == 2
+    assert result.oldest_reaped_age_seconds == 172800.0, "reports the age of the oldest swept orphan"
+    marked = [args for query, args in db.executed if "'failed'" in query]
+    assert marked == [("obj-1", 1), ("obj-2", 5)], "every orphan version's active rows are marked terminal"
+    assert not any("DELETE" in query for query, _ in db.executed), "the sweep never deletes — only marks"
+
+
+@pytest.mark.asyncio
+async def test_sweep_spares_dlq_protected_objects() -> None:
+    rows = [{"object_id": "obj-1", "version": 1, "age_seconds": 90000.0}]
+    db = FakeDb(sweep_rows=rows)
+    result = await mpu_cleanup.sweep_orphan_replication_versions(db, stale_seconds=86400, dlq_object_ids={"obj-1"})
+    assert result.count == 0
+    assert result.oldest_reaped_age_seconds is None
+    assert db.executed == [], "an in-flight DLQ object is never swept"
+
+
+@pytest.mark.asyncio
+async def test_sweep_presses_on_when_one_versions_mark_throws() -> None:
+    # A poison version (e.g. transient row-lock) must not starve the rest of the pass: the
+    # sweep is mark-only and idempotent, so it logs the failure, counts only successes, and
+    # the failed one is retried on the next cycle (it stays active in cephor).
+    rows = [
+        {"object_id": "obj-boom", "version": 1, "age_seconds": 90000.0},
+        {"object_id": "obj-ok", "version": 2, "age_seconds": 100000.0},
+    ]
+    db = FakeDb(sweep_rows=rows, raise_mark_for="obj-boom")
+    result = await mpu_cleanup.sweep_orphan_replication_versions(db, stale_seconds=86400, dlq_object_ids=set())
+    assert result.count == 1, "only the successfully-marked version is counted"
+    marked = [args for query, args in db.executed if "'failed'" in query]
+    assert marked == [("obj-ok", 2)], "the healthy version is still swept despite the earlier failure"
+    assert result.oldest_reaped_age_seconds == 100000.0, "age is reported from swept versions only"
+
+
+@pytest.mark.asyncio
+async def test_sweep_reports_none_age_when_nothing_to_sweep() -> None:
+    db = FakeDb(sweep_rows=[])
+    result = await mpu_cleanup.sweep_orphan_replication_versions(db, stale_seconds=86400, dlq_object_ids=set())
+    assert result.count == 0
+    assert result.oldest_reaped_age_seconds is None
+
+
+@pytest.mark.asyncio
+async def test_run_reaper_cycle_runs_the_sweep_and_records_its_count() -> None:
+    # One cycle drains BOTH paths: the abandoned-MPU reaper and the cephor-orphan sweep.
+    mpu_rows = [{"upload_id": "u1", "object_id": "obj-1", "object_version": 1, "age_seconds": 90000.0}]
+    sweep_rows = [
+        {"object_id": "orphan-a", "version": 1, "age_seconds": 200000.0},
+        {"object_id": "orphan-b", "version": 2, "age_seconds": 50000.0},
+    ]
+    pool = FakePool(FakeDb(mpu_rows, sweep_rows=sweep_rows))
+    collector = MagicMock()
+
+    with patch.object(mpu_cleanup, "get_metrics_collector", return_value=collector):
+        await mpu_cleanup.run_reaper_cycle(pool, _fake_redis(), stale_seconds=86400, upload_backends=["arion"])
+
+    collector.record_mpu_reaper_cycle.assert_called_once()
+    _, kwargs = collector.record_mpu_reaper_cycle.call_args
+    assert kwargs["success"] is True
+    assert kwargs["reaped"] == 1, "the abandoned-MPU reaper still runs"
+    assert kwargs["swept"] == 2, "the cephor-orphan sweep count is recorded separately"

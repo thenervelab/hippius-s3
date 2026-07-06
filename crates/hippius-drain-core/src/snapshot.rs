@@ -131,6 +131,13 @@ pub struct SnapshotCell {
     /// The heartbeat worker writes it (`usage.used_bytes`) each tick; the metrics layer
     /// reads it as a gauge. Kept off the wait-free `load` path so a scrape never blocks.
     backlog_bytes: AtomicU64,
+    /// Current SSD disk saturation in basis points (`0..=10000` = `0.0..=1.0` full) — a
+    /// LEVEL like `backlog_bytes`, set each heartbeat from the same `statvfs` probe. This
+    /// is the fill fraction that 503s every PUT once it crosses the api's cutoff, so it is
+    /// the operational alert signal; distinct from `backlog_bytes` (undrained WORK), since
+    /// a leak can fill the disk without any drain demand. bps not f64 so the gauge stays a
+    /// plain atomic; the metrics layer scales it to a 0..1 fraction.
+    disk_pressure_bps: AtomicU64,
     /// Recent drain latencies, behind a `Mutex` because a percentile needs the
     /// whole window (no single atomic suffices). Off the wait-free `load` path.
     latency: Mutex<LatencyWindow>,
@@ -178,6 +185,19 @@ impl SnapshotCell {
     #[must_use]
     pub fn backlog(&self) -> u64 {
         self.backlog_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Records the current SSD disk saturation in basis points (`0..=10000`). A gauge:
+    /// `store`, not add. The heartbeat writes it from the `statvfs` pressure each tick.
+    pub fn record_disk_pressure(&self, bps: u16) {
+        self.disk_pressure_bps.store(u64::from(bps), Ordering::Relaxed);
+    }
+
+    /// The last-recorded SSD disk saturation in basis points (the `drain_ssd_pressure`
+    /// gauge source). Clamped to `10000` should a wider value ever be stored.
+    #[must_use]
+    pub fn disk_pressure_bps(&self) -> u16 {
+        u16::try_from(self.disk_pressure_bps.load(Ordering::Relaxed)).unwrap_or(10_000)
     }
 
     /// Records a completed drain's latency for the windowed p99 estimate.
@@ -244,6 +264,16 @@ mod tests {
         assert_eq!(cell.backlog(), 4096);
         cell.record_backlog(100);
         assert_eq!(cell.backlog(), 100, "backlog is a level: a later record replaces, not accumulates");
+    }
+
+    #[test]
+    fn disk_pressure_is_a_settable_gauge_in_basis_points() {
+        let cell = SnapshotCell::new();
+        assert_eq!(cell.disk_pressure_bps(), 0, "a fresh cell reports no disk pressure");
+        cell.record_disk_pressure(8500); // 85% full
+        assert_eq!(cell.disk_pressure_bps(), 8500);
+        cell.record_disk_pressure(200);
+        assert_eq!(cell.disk_pressure_bps(), 200, "disk pressure is a level: a later record replaces");
     }
 
     #[test]

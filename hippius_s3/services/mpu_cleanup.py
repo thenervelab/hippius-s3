@@ -44,6 +44,15 @@ class ReapResult:
     oldest_reaped_age_seconds: float | None
 
 
+def _max_optional(a: float | None, b: float | None) -> float | None:
+    """Largest of two optional ages, ignoring None (nothing-reaped) operands."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return max(a, b)
+
+
 async def fail_version_replication(db: Any, *, object_id: Any, object_version: int | None) -> None:
     """Mark one object version's active replication rows terminal ('failed').
 
@@ -83,6 +92,41 @@ async def reap_abandoned_uploads(db: Any, *, stale_seconds: int, dlq_object_ids:
         if age is not None:
             oldest_age = age if oldest_age is None else max(oldest_age, age)
     return ReapResult(count=reaped, oldest_reaped_age_seconds=oldest_age)
+
+
+async def sweep_orphan_replication_versions(db: Any, *, stale_seconds: int, dlq_object_ids: set[str]) -> ReapResult:
+    """Mark leaked drain replication rows terminal, keyed directly on cephor (the A21 backstop).
+
+    The abandoned-MPU reaper only sees uploads that still have a ``multipart_uploads`` row;
+    an abort deletes that header before its best-effort terminal-mark, so an abort that dies
+    in that window orphans the version's ``cephor_replication_status`` rows where the reaper
+    can never find them — and the drain re-claims/re-copies/re-defers them forever. This
+    sweep finds those versions from the drain rows alone (``list_orphan_replication_versions``)
+    and marks each one 'failed'. DLQ-protected objects are spared, mirroring the reaper.
+
+    Unlike the reaper this only ever MARKS (never deletes), so it is safe to be resilient
+    per version: a transient mark failure (e.g. a row lock) is logged and skipped rather than
+    aborting the pass, and the version — still active in cephor — is retried next cycle.
+    Returns the count marked + the age of the oldest swept version (the backstop's lag).
+    """
+    rows = await db.fetch(get_query("list_orphan_replication_versions"), int(stale_seconds))
+    swept = 0
+    oldest_age: float | None = None
+    for row in rows:
+        object_id = row["object_id"]
+        if str(object_id) in dlq_object_ids:
+            logger.debug("mpu-sweep: skipping DLQ-protected object_id=%s", object_id)
+            continue
+        try:
+            await fail_version_replication(db, object_id=object_id, object_version=row["version"])
+        except Exception:
+            logger.exception("mpu-sweep: failed to mark object_id=%s terminal; retrying next cycle", object_id)
+            continue
+        swept += 1
+        age = row.get("age_seconds")
+        if age is not None:
+            oldest_age = age if oldest_age is None else max(oldest_age, age)
+    return ReapResult(count=swept, oldest_reaped_age_seconds=oldest_age)
 
 
 async def gather_dlq_object_ids(redis_client: Any, upload_backends: Iterable[str]) -> set[str]:
@@ -126,17 +170,26 @@ async def run_reaper_cycle(
         dlq_object_ids = await gather_dlq_object_ids(redis_client, upload_backends)
         async with db_pool.acquire() as db:
             result = await reap_abandoned_uploads(db, stale_seconds=stale_seconds, dlq_object_ids=dlq_object_ids)
+            sweep = await sweep_orphan_replication_versions(
+                db, stale_seconds=stale_seconds, dlq_object_ids=dlq_object_ids
+            )
         if result.count:
             logger.info("mpu-reaper: reaped %d abandoned multipart upload(s)", result.count)
+        if sweep.count:
+            logger.info("mpu-sweep: marked %d leaked orphan version(s) terminal", sweep.count)
+        # Report the lag as the oldest across BOTH paths so the dashboard reflects the
+        # worst backstop delay, not just the abandoned-MPU reaper's.
+        oldest = _max_optional(result.oldest_reaped_age_seconds, sweep.oldest_reaped_age_seconds)
         collector.record_mpu_reaper_cycle(
             success=True,
             reaped=result.count,
+            swept=sweep.count,
             duration=time.monotonic() - started,
-            oldest_reaped_age=result.oldest_reaped_age_seconds,
+            oldest_reaped_age=oldest,
         )
     except Exception:
         logger.exception("mpu-reaper cycle failed; will retry next interval")
-        collector.record_mpu_reaper_cycle(success=False, reaped=0, duration=time.monotonic() - started)
+        collector.record_mpu_reaper_cycle(success=False, reaped=0, swept=0, duration=time.monotonic() - started)
 
 
 async def run_mpu_reaper_loop() -> None:
