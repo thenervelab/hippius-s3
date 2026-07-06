@@ -26,17 +26,20 @@ and re-verified live. Runs are archived on PR #226 (`feat/stress-test-harness`, 
 | T1 crashed on CreateBucket `UploadNotPermitted: Failed to fetch billing balance` | **#229** — classify a transient billing-lookup failure as retryable → retry, then 503 SlowDown, never a hard 402. |
 | (new gate) `func-mpu-wrong-etag` | **#228** — CompleteMultipartUpload now validates client part ETags (`InvalidPart`) + ordering (`InvalidPartOrder`). |
 | A1 read-path hang | **#230** — envelope-race cold version-fallback now enqueues a download instead of hanging on pub/sub to `HIPPIUS_CACHE_TTL`. |
-| Replication lag stuck at ~5 s after the budget was unpinned | **#231** — `CEPHOR_DEFER_BACKOFF_SECS` + `CEPHOR_DRAIN_POLL_SECS` 5 s → 1 s (staging). The residual lag was two 5 s timers, not throughput: an MPU part lands before its Complete writes `object_versions.address`, so the first claim defers and re-parks 5 s. |
+| Replication lag stuck at ~5 s after the budget was unpinned | **#231/#232** — `CEPHOR_DRAIN_POLL_SECS` 5 s → 1 s (staging); the residual lag was the poll floor, not throughput. (#231 also tried `CEPHOR_DEFER_BACKOFF_SECS` → 1 s; **#232 reverted it to the 5 s default** — the defer only re-parks a not-yet-drainable part, so 1 s is pure claim churn on stuck/A21-orphan parts.) |
 
 ### Benchmark — before → after (same harness, same endpoint, live staging)
 
-| | Baseline (pre-fix) | After #227–#230 | **After #231 (defer/poll 1 s)** |
+| | Baseline (pre-fix) | After #227–#230 | **After #231 (poll+defer 1 s)** |
 |---|---|---|---|
 | Harness verdict | 6 pass / 2 fail | 13 pass / 1 fail | 12 pass / 2 fail\* |
 | Drain fleet write-budget | **1 MB/s** (pinned at floor) | ~1 GB/s (ramps to `max_total`) | ~1 GB/s |
 | Replication lag p50 / p99 (SQL `updated_at−landed_at`) | ~5 s (under the 1 MB/s cap) | 4.6 s / 5.9 s | **1.33 s / 2.60 s** |
 | Durability (non-overridable) | 105/105 | 105/105 | **105/105 byte-identical** |
 | CreateBucket / MPU-wrong-ETag | ❌ crash / (n/a) | ✅ / ✅ rejected | ✅ / ✅ rejected |
+
+> The 1.33 s / 2.60 s figures were measured with **both** poll and defer at 1 s. **#232** reverts defer to the 5 s
+> default (keeps poll 1 s) — the poll is expected to carry the win for the common simple-PUT case; re-measure pending.
 
 \* Both post-#231 "fails" are **not real regressions**: (1) `inv-G1-single-leader` read `sum(drain_leader)=2` because the
 harness sampled *during the deploy rollout* — the departing allocator pod's series had not expired; it settled to `1`
