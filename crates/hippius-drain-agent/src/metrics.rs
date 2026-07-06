@@ -103,6 +103,17 @@ pub fn init(service_name: &'static str, snapshot: &Arc<SnapshotCell>, enforcer: 
             .build(),
     ));
 
+    // Reclaim throughput: terminal SSD parts the reclaim worker unlinked (monotonic counter).
+    // The SSD-ingest tier's eviction rate — distinct from the drain's CephFS throughput — so a
+    // stalled reclaim (backlog rising while this stays flat) is visible without reading logs.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_ssd_reclaimed_total")
+            .with_callback(move |observer| observer.observe(snap.load().reclaimed, &[]))
+            .build(),
+    ));
+
     // Saturation: SSD disk fill fraction (0.0..=1.0). This is what crosses the api's
     // fs_cache_pressure cutoff and 503s every PUT on the node, so it is the operational
     // alert signal — and unlike the backlog it rises with a leak even at zero drain demand.

@@ -584,12 +584,20 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
                         }
                         heartbeat_once(&ssd, &store, &coord, &node, max_drain_rate, &snapshot).await;
                         // C8 readiness: heartbeat_once just refreshed the backlog. The drain is
-                        // PROGRESSING iff it handled any part (committed + failed + deferred) since
-                        // the last tick; touch readiness only when progressing or idle, so a wedged
-                        // loop (hung Ceph) lets the file go stale -> NotReady.
+                        // PROGRESSING iff it cycled any claim (committed + failed + deferred +
+                        // throttled) since the last tick; touch readiness only when progressing or
+                        // idle, so a wedged loop (hung Ceph) lets the file go stale -> NotReady.
+                        // `throttled` is included so a pool-wide Ceph outage — which trips the
+                        // breaker and denies EVERY claim — reads as a healthy back-off, not a wedge:
+                        // otherwise the whole DaemonSet flips NotReady at once and a rolling update
+                        // can never make progress over the outage.
                         if let Some(path) = readiness.as_deref() {
                             let snap = snapshot.load();
-                            let processed = snap.drained.saturating_add(snap.failed).saturating_add(snap.deferred);
+                            let processed = snap
+                                .drained
+                                .saturating_add(snap.failed)
+                                .saturating_add(snap.deferred)
+                                .saturating_add(snap.throttled);
                             let ready = readiness_tracker.lock().unwrap_or_else(PoisonError::into_inner).observe(
                                 processed,
                                 snapshot.backlog(),

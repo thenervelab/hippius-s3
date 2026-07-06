@@ -46,11 +46,14 @@ impl ReadinessTracker {
     /// within `stall` (the loop is cycling). `NotReady` iff there is a backlog but `processed` has
     /// not advanced for longer than `stall` — the loop is WEDGED (blocked on a hung `CephFS` op).
     ///
-    /// `processed` is the cumulative count of parts the drain loop HANDLED — committed
-    /// (`drained`) + `failed` + `deferred` — NOT just committed, so a node legitimately deferring
-    /// not-ready/orphan backlog or failing fast on a degraded pool still reads as cycling (its
-    /// loop is alive); only a loop that has stopped handling parts at all reads as wedged.
-    /// `backlog` is the current undrained bytes.
+    /// `processed` is the cumulative count of claims the drain loop CYCLED — committed
+    /// (`drained`) + `failed` + `deferred` + `throttled` — NOT just committed, so a node
+    /// legitimately deferring not-ready/orphan backlog, failing fast on a degraded pool, or
+    /// backing off every claim under an open breaker (a pool-wide Ceph outage) still reads as
+    /// cycling (its loop is alive); only a loop that has stopped handling claims at all reads as
+    /// wedged. Including `throttled` is what stops a Ceph outage from flipping the whole
+    /// `DaemonSet` `NotReady` at once (which would wedge a rolling update). `backlog` is the
+    /// current undrained bytes.
     pub fn observe(&mut self, processed: u64, backlog: u64, now: Instant) -> bool {
         if processed > self.last_processed {
             self.last_processed = processed;

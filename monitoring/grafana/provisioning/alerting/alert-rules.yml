@@ -398,3 +398,108 @@ groups:
           summary: A21 orphan backlog is standing above threshold and not draining
         labels:
           severity: warning
+
+      # Split-brain: two allocators leading at once. drain_leader is 0/1 per instance, so
+      # sum(drain_leader) > 1 means the single-leader lease/epoch fence has failed and two
+      # leaders may both be writing budgets — the drain's core coordination invariant broken.
+      # Short `for` because a split-brain is urgent (concurrent Ceph overrun risk), not a slow
+      # trend. Complements the R3 write-fence: the fence prevents a STALE leader's writes; this
+      # catches the fence itself failing open.
+      - uid: drain-split-brain-two-leaders
+        title: Drain Allocator - Split-Brain (more than one leader)
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'sum(drain_leader{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 1
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        annotations:
+          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} allocators are leading simultaneously (expected exactly 1). The leader lease/epoch fence has failed open — two leaders may be writing conflicting budgets. Investigate cephor:leader / cephor:epoch in redis-queues immediately.'
+          summary: More than one drain allocator is leading (split-brain)
+        labels:
+          severity: critical
+
+      # Epoch-counter reset. drain_leader_epoch is the monotonic leadership era; max() over the
+      # fleet only ever climbs BY CONSTRUCTION, so any decrease means the redis cephor:epoch
+      # counter was rewound (AOF reload / FLUSHALL / replica failover) — which silently degrades
+      # the R3 allocation write-fence OPEN (a legit leader can be fenced by cached higher-epoch
+      # alloc keys, or a stale writer slips through). The expr yields (epoch 5m ago − epoch now):
+      # positive only on a regression. This is the sole failure mode of the write-fence, so it
+      # pages critical even though no split-brain has occurred YET.
+      - uid: drain-leader-epoch-decrease
+        title: Drain Allocator - Leader Epoch Decreased (counter reset)
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(drain_leader_epoch{job="otel-collector"} offset 5m) - max(drain_leader_epoch{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 0m
+        annotations:
+          description: 'The drain leader epoch decreased (counter reset in redis-queues) — the R3 allocation write-fence is degraded open and split-brain is now possible. Confirm redis-queues persistence (noeviction + AOF) and the cephor:epoch value.'
+          summary: Drain leader epoch counter was reset (write-fence degraded)
+        labels:
+          severity: critical

@@ -92,6 +92,14 @@ pub struct AgentSnapshot {
     /// `failed` (broken/abandoned-upload) SSD parts the reclaim worker unlinked — the
     /// SSD-ingest tier's eviction throughput, distinct from the drain's `CephFS` work.
     pub reclaimed: u64,
+    /// Claims handed back un-drained because the breaker/throttle `Denied` the tick (the
+    /// pool is unhealthy or the write budget is spent). NOT a drain outcome — no part moved
+    /// — but the loop DID cycle, so the readiness tracker folds it into `processed`: a
+    /// pool-wide Ceph outage trips the breaker on every claim, and without this the agent
+    /// would record zero progress and flip `NotReady` even though it is healthily backing off
+    /// (a wedge, not an outage, is what readiness must catch). Kept out of `error_bps` (a
+    /// throttle is not a Ceph-write failure), exactly like `deferred`.
+    pub throttled: u64,
 }
 
 impl AgentSnapshot {
@@ -126,6 +134,7 @@ pub struct SnapshotCell {
     deferred: AtomicU64,
     reconciler_recovered: AtomicU64,
     reclaimed: AtomicU64,
+    throttled: AtomicU64,
     /// Current SSD backlog (undrained bytes) — a LEVEL, not a monotonic counter, so it
     /// has its own atomic (set, not accumulated) rather than living in [`AgentSnapshot`].
     /// The heartbeat worker writes it (`usage.used_bytes`) each tick; the metrics layer
@@ -174,6 +183,13 @@ impl SnapshotCell {
     /// Adds `n` to the SSD-reclaim total (terminal parts the reclaim worker unlinked).
     pub fn record_reclaimed(&self, n: u64) {
         self.reclaimed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Records `n` claims handed back because the breaker/throttle denied the tick. Counts
+    /// as liveness progress (the loop cycled) but is not a drain outcome — see
+    /// [`AgentSnapshot::throttled`].
+    pub fn record_throttled(&self, n: u64) {
+        self.throttled.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Records the current SSD backlog (undrained bytes). A gauge: `store`, not add.
@@ -225,6 +241,7 @@ impl SnapshotCell {
             deferred: self.deferred.load(Ordering::Relaxed),
             reconciler_recovered: self.reconciler_recovered.load(Ordering::Relaxed),
             reclaimed: self.reclaimed.load(Ordering::Relaxed),
+            throttled: self.throttled.load(Ordering::Relaxed),
         }
     }
 }
@@ -284,6 +301,7 @@ mod tests {
         cell.record_failed(1);
         cell.record_reconciled(4);
         cell.record_reclaimed(6);
+        cell.record_throttled(9);
         assert_eq!(
             cell.load(),
             AgentSnapshot {
@@ -292,8 +310,22 @@ mod tests {
                 deferred: 0,
                 reconciler_recovered: 4,
                 reclaimed: 6,
+                throttled: 9,
             },
         );
+    }
+
+    #[test]
+    fn throttled_records_accumulate_without_polluting_error_bps() {
+        // A breaker/throttle denial is liveness progress (the loop cycled) but not a
+        // Ceph-write failure, so — like `deferred` — it must stay out of error_bps.
+        let cell = SnapshotCell::new();
+        cell.record_drained(7);
+        cell.record_failed(3);
+        cell.record_throttled(40);
+        let snap = cell.load();
+        assert_eq!(snap.throttled, 40, "throttled ticks are counted for readiness/visibility");
+        assert_eq!(snap.error_bps(), 3000, "throttled ticks stay out of the Ceph failure rate");
     }
 
     #[test]
@@ -326,6 +358,7 @@ mod tests {
             deferred: 0,
             reconciler_recovered: 0,
             reclaimed: 0,
+            throttled: 0,
         };
         assert_eq!(snapshot.error_bps(), 10_000);
     }
@@ -338,6 +371,7 @@ mod tests {
             deferred: 0,
             reconciler_recovered: 0,
             reclaimed: 0,
+            throttled: 0,
         };
         // 3 failed attempts of 10 total attempts = 30%, i.e. 3000 basis points.
         assert_eq!(snapshot.error_bps(), 3000);
