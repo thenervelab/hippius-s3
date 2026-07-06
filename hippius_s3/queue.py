@@ -391,3 +391,60 @@ async def dequeue_download_request(queue_name: str) -> DownloadChainRequest | No
         _, queue_data = result
         return DownloadChainRequest.model_validate_json(queue_data)
     return None
+
+
+# Per-backend download retry handling (mirrors the upload retry ZSET above)
+
+
+def _download_retry_zset(backend: str) -> str:
+    return f"{backend}_download_retries"
+
+
+async def enqueue_download_retry_request(
+    payload: DownloadChainRequest,
+    *,
+    backend_name: str,
+    delay_seconds: float,
+    last_error: str | None = None,
+) -> None:
+    client = get_queue_client()
+    if payload.request_id is None:
+        payload.request_id = uuid.uuid4().hex
+    payload.attempts = int((payload.attempts or 0) + 1)
+    payload.last_error = last_error
+    if payload.first_enqueued_at is None:
+        payload.first_enqueued_at = time.time()
+    next_ts = time.time() + max(0.0, float(delay_seconds))
+    member = payload.model_dump_json()
+    zset_key = _download_retry_zset(backend_name)
+    await client.zadd(zset_key, {member: next_ts})
+    logger.info(
+        f"Scheduled download retry for {payload.name=} backend={backend_name} "
+        f"attempts={payload.attempts} next_at={int(next_ts)}"
+    )
+
+
+async def move_due_download_retries(
+    *,
+    backend_name: str,
+    now_ts: float | None = None,
+    max_items: int = 64,
+) -> int:
+    """Move due retry items back to the backend's download queue. Returns number moved."""
+    client = get_queue_client()
+    target_queue = f"{backend_name}_download_requests"
+    zset_key = _download_retry_zset(backend_name)
+
+    now_ts = time.time() if now_ts is None else now_ts
+    members = await client.zrangebyscore(zset_key, min="-inf", max=now_ts, start=0, num=max_items)
+    moved = 0
+    for m in members:
+        try:
+            async with client.pipeline(transaction=True) as pipe:
+                pipe.zrem(zset_key, m)
+                pipe.lpush(target_queue, m)
+                await pipe.execute()
+            moved += 1
+        except Exception:
+            logger.exception(f"Failed to move download retry item back to {target_queue}")
+    return moved

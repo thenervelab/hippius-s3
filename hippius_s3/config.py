@@ -213,6 +213,12 @@ class Config:
     downloader_chunk_retries: int = env("DOWNLOADER_CHUNK_RETRIES:3", convert=int)
     downloader_retry_base_seconds: float = env("DOWNLOADER_RETRY_BASE_SECONDS:0.1", convert=float)
     downloader_retry_jitter_seconds: float = env("DOWNLOADER_RETRY_JITTER_SECONDS:0.1", convert=float)
+    # Request-level retry: when a whole DownloadChainRequest fails (Arion exhaustion or a process
+    # error), requeue it via a per-backend retry ZSET + 2s mover instead of dropping it (A12).
+    # Mirrors the uploader's request-level retry (uploader_max_attempts / _backoff_*_ms).
+    downloader_max_attempts: int = env("HIPPIUS_DOWNLOADER_MAX_ATTEMPTS:5", convert=int)
+    downloader_backoff_base_ms: int = env("HIPPIUS_DOWNLOADER_BACKOFF_BASE_MS:500", convert=int)
+    downloader_backoff_max_ms: int = env("HIPPIUS_DOWNLOADER_BACKOFF_MAX_MS:60000", convert=int)
     downloader_semaphore: int = env("DOWNLOADER_SEMAPHORE:20", convert=int)
     # Max concurrent DownloadChainRequests a single downloader pod processes.
     # The main loop dequeues and spawns tasks up to this cap; the semaphore
