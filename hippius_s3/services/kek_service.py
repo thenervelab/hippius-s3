@@ -374,30 +374,31 @@ async def _ensure_tables(conn: asyncpg.Connection) -> None:
     C3: `CREATE TABLE IF NOT EXISTS` is NOT race-free under concurrency — when several pods
     cold-start together they can all observe the table missing and collide in pg_class/pg_type,
     and one raises "duplicate key"/"relation already exists", surfacing as a transient 500 on the
-    first GET/PUT after a deploy. A transaction-scoped advisory lock makes the check-and-create
-    atomic fleet-wide. The DDL stays here (rather than a dbmate migration) because bucket_keks
-    lives in the KEYSTORE database, which the migrator (DATABASE_URL only) does not target when
-    it is a separate DB.
+    first GET/PUT after a deploy. Postgres runs a multi-statement SIMPLE query as ONE implicit
+    transaction, so prefixing this DDL with `pg_advisory_xact_lock` makes the whole check-and-create
+    atomic fleet-wide — no explicit `conn.transaction()` needed. The lock key is inlined as a literal
+    because the simple-query protocol (multi-statement, no args) takes no parameters. The DDL stays
+    here (rather than a dbmate migration) because bucket_keks lives in the KEYSTORE database, which
+    the migrator (DATABASE_URL only) does not target when it is a separate DB.
     """
-    async with conn.transaction():
-        await conn.execute("SELECT pg_advisory_xact_lock($1)", _BUCKET_KEKS_DDL_ADVISORY_KEY)
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS bucket_keks (
-                bucket_id UUID NOT NULL,
-                kek_id UUID PRIMARY KEY,
-                wrapped_kek_bytes BYTEA NOT NULL,
-                kms_key_id TEXT NOT NULL CHECK (kms_key_id <> ''),
-                status TEXT NOT NULL DEFAULT 'active',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-            CREATE INDEX IF NOT EXISTS idx_bucket_keks_bucket_status_created
-              ON bucket_keks(bucket_id, status, created_at DESC);
-            CREATE UNIQUE INDEX IF NOT EXISTS uniq_bucket_active_kek
-              ON bucket_keks(bucket_id)
-             WHERE status = 'active';
-            """
-        )
+    await conn.execute(
+        f"""
+        SELECT pg_advisory_xact_lock({_BUCKET_KEKS_DDL_ADVISORY_KEY});
+        CREATE TABLE IF NOT EXISTS bucket_keks (
+            bucket_id UUID NOT NULL,
+            kek_id UUID PRIMARY KEY,
+            wrapped_kek_bytes BYTEA NOT NULL,
+            kms_key_id TEXT NOT NULL CHECK (kms_key_id <> ''),
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS idx_bucket_keks_bucket_status_created
+          ON bucket_keks(bucket_id, status, created_at DESC);
+        CREATE UNIQUE INDEX IF NOT EXISTS uniq_bucket_active_kek
+          ON bucket_keks(bucket_id)
+         WHERE status = 'active';
+        """
+    )
 
 
 async def _maybe_ensure_tables(conn: asyncpg.Connection) -> None:
