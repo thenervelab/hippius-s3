@@ -1,0 +1,118 @@
+# WI-19 §4.6 Rig A — allocator-under-pressure (the USER-PRIORITY cells).
+#
+# A self-contained fleet of N drain-allocators sharing one Redis Coordinator, fronted by a
+# toxiproxy `redis_queues` proxy — the only way to inject coordinator<->Redis latency/eviction/
+# reset without patching the binary. The allocators own + migrate the cephor_* schema, elect a
+# single leader via the Redis lease, and write epoch-fenced per-node allocations. This rig proves
+# the split-brain core (0 executed coverage under default `cargo test`) holds under real Redis
+# pathology: scenarios A–F in ../alloc-stress/run_scenario.sh.
+#
+# Run from the repo root:
+#   docker compose -f stress-test/compose/docker-compose.alloc-stress.yml up -d --build
+#   bash stress-test/alloc-stress/run_scenario.sh A B C D E F
+#   docker compose -f stress-test/compose/docker-compose.alloc-stress.yml down -v
+#
+# The sampler (../alloc-stress/monitor.py) reads sum(drain_leader) via each allocator's metrics
+# port, and cephor:epoch / cephor:alloc:<id> straight from Redis (host-mapped :6390).
+name: hippius-alloc-stress
+
+x-allocator: &allocator
+  build:
+    context: ../..
+    dockerfile: Dockerfile.drain
+  command: ["/usr/local/bin/hippius-drain-allocator"]
+  restart: unless-stopped
+  depends_on:
+    db:
+      condition: service_healthy
+    redis-queues:
+      condition: service_started
+    toxiproxy:
+      condition: service_started
+  networks:
+    - alloc_net
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=hippius
+    command: ["postgres", "-c", "max_connections=200"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks:
+      - alloc_net
+
+  redis-queues:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6390:6379"
+    # Default allkeys-lru; scenario D re-runs with `--maxmemory-policy noeviction` to prove the
+    # eviction-vs-noeviction split (override REDIS_MAXMEMORY_POLICY at the compose invocation).
+    command:
+      [
+        "redis-server",
+        "--maxmemory",
+        "256mb",
+        "--maxmemory-policy",
+        "${REDIS_MAXMEMORY_POLICY:-allkeys-lru}",
+      ]
+    networks:
+      - alloc_net
+
+  toxiproxy:
+    image: shopify/toxiproxy:latest
+    ports:
+      - "127.0.0.1:8475:8474"
+    volumes:
+      - ./toxiproxy-alloc.json:/config/toxiproxy.json:ro
+    command: ["-host", "0.0.0.0", "-config", "/config/toxiproxy.json"]
+    depends_on:
+      - redis-queues
+    networks:
+      - alloc_net
+
+  alloc-1:
+    <<: *allocator
+    environment:
+      - CEPHOR_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
+      - CEPHOR_ALLOCATOR_INSTANCE_ID=alloc-1
+      - REDIS_QUEUES_URL=redis://toxiproxy:16379
+      - ENABLE_MONITORING=true
+      - RUST_LOG=hippius_drain_allocator=debug,info
+
+  alloc-2:
+    <<: *allocator
+    environment:
+      - CEPHOR_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
+      - CEPHOR_ALLOCATOR_INSTANCE_ID=alloc-2
+      - REDIS_QUEUES_URL=redis://toxiproxy:16379
+      - ENABLE_MONITORING=true
+      - RUST_LOG=hippius_drain_allocator=debug,info
+
+  alloc-3:
+    <<: *allocator
+    environment:
+      - CEPHOR_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
+      - CEPHOR_ALLOCATOR_INSTANCE_ID=alloc-3
+      - REDIS_QUEUES_URL=redis://toxiproxy:16379
+      - ENABLE_MONITORING=true
+      - RUST_LOG=hippius_drain_allocator=debug,info
+
+  alloc-4:
+    <<: *allocator
+    environment:
+      - CEPHOR_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
+      - CEPHOR_ALLOCATOR_INSTANCE_ID=alloc-4
+      - REDIS_QUEUES_URL=redis://toxiproxy:16379
+      - ENABLE_MONITORING=true
+      - RUST_LOG=hippius_drain_allocator=debug,info
+
+networks:
+  alloc_net:
+    driver: bridge

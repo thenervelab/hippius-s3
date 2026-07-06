@@ -209,3 +209,104 @@ def unpause_service(service: str) -> None:
         enable_arion_proxy()
     else:
         raise ValueError(f"Unknown service: {service}. Supported: mock-kms, arion")
+
+
+# ---- WI-19 §4.4: generic toxics + redis-queues/Postgres proxies + mock fault modes ----
+#
+# Until WI-19, toxiproxy was used on/off only (whole-proxy enable/disable) with proxies for
+# arion + kms alone. The chaos matrix (F3 redis blip/hang, F6 PG failover) and the allocator
+# Redis-pathology cells need real toxics (latency/timeout/bandwidth/reset_peer/slicer) in front
+# of redis-queues and Postgres, plus the ability to brown-out a mock without tearing it down.
+
+# redis-queues proxy: coordinator + queue Redis. The consumer must point REDIS_QUEUES_URL at the
+# proxy for a toxic to bite — the alloc-stress overlay (compose/docker-compose.alloc-stress.yml)
+# and the faults overlay do that.
+_TOXI_LISTEN_REDIS_QUEUES = os.environ.get("TOXI_LISTEN_REDIS_QUEUES", "0.0.0.0:16379")
+_TOXI_UPSTREAM_REDIS_QUEUES = os.environ.get("TOXI_UPSTREAM_REDIS_QUEUES", "redis-queues:6379")
+
+# Postgres proxy (the base compose service is `db`).
+_TOXI_LISTEN_PG = os.environ.get("TOXI_LISTEN_PG", "0.0.0.0:15432")
+_TOXI_UPSTREAM_PG = os.environ.get("TOXI_UPSTREAM_PG", "db:5432")
+
+
+def _ensure_proxy(name: str, listen: str, upstream: str) -> None:
+    """Create a toxiproxy proxy if it does not already exist."""
+    r = _toxiproxy_get(name)
+    if r.status_code == 404:
+        if not _toxiproxy_create(name, listen, upstream):
+            raise RuntimeError(f"failed to create toxiproxy {name} ({listen} -> {upstream})")
+
+
+def ensure_redis_queues_proxy() -> None:
+    _ensure_proxy("redis_queues", _TOXI_LISTEN_REDIS_QUEUES, _TOXI_UPSTREAM_REDIS_QUEUES)
+
+
+def ensure_pg_proxy() -> None:
+    _ensure_proxy("postgres", _TOXI_LISTEN_PG, _TOXI_UPSTREAM_PG)
+
+
+def add_toxic(
+    proxy: str,
+    toxic_type: str,
+    attributes: dict,
+    *,
+    name: str | None = None,
+    stream: str = "downstream",
+    toxicity: float = 1.0,
+) -> str:
+    """Attach a toxic to an existing proxy and return its name.
+
+    toxic_type ∈ {latency, timeout, bandwidth, limit_data, slicer, reset_peer, slow_close, ...}
+    stream ∈ {downstream, upstream}. Examples:
+      add_toxic("redis_queues", "latency", {"latency": 800, "jitter": 100})   # +800±100ms
+      add_toxic("redis_queues", "timeout", {"timeout": 0})                    # hang (F3)
+      add_toxic("arion", "bandwidth", {"rate": 10})                           # 10 KB/s (F4)
+      add_toxic("arion", "slicer", {"average_size": 64, "size_variation": 8}) # chop body (F8)
+      add_toxic("postgres", "reset_peer", {"timeout": 0})                     # RST (F6)
+    """
+    toxic_name = name or f"{toxic_type}_{stream}"
+    payload = {
+        "name": toxic_name,
+        "type": toxic_type,
+        "stream": stream,
+        "toxicity": toxicity,
+        "attributes": attributes,
+    }
+    resp = requests.post(f"{_TOXI_BASE}/proxies/{proxy}/toxics", json=payload, timeout=3)
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"add_toxic {proxy}/{toxic_name} failed: {resp.status_code} {resp.text}")
+    return toxic_name
+
+
+def remove_toxic(proxy: str, toxic_name: str) -> None:
+    with suppress(Exception):
+        requests.delete(f"{_TOXI_BASE}/proxies/{proxy}/toxics/{toxic_name}", timeout=3)
+
+
+def clear_toxics(proxy: str) -> None:
+    """Remove every toxic on a proxy (leaving the proxy itself enabled)."""
+    with suppress(Exception):
+        resp = requests.get(f"{_TOXI_BASE}/proxies/{proxy}/toxics", timeout=3)
+        if resp.status_code == 200:
+            for toxic in resp.json():
+                remove_toxic(proxy, toxic["name"])
+
+
+# ---- Mock fault-mode control (mock_faults.install_fault_controller mounts /_fault) ----
+
+
+def set_mock_fault(base_url: str, rules: dict | list) -> None:
+    """POST fault rule(s) to a mock's /_fault control endpoint.
+
+    base_url is the mock's reachable root, e.g. http://localhost:8002 (arion). A rule is
+    {"op": "upload"|"download"|..., "mode": "error"|"slow"|"fail_after_n"|"truncate"|"reject",
+     "status": 500, "delay_s": 0, "after_n": 0, "truncate_bytes": 0}.
+    """
+    resp = requests.post(f"{base_url.rstrip('/')}/_fault", json=rules, timeout=3)
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"set_mock_fault {base_url} failed: {resp.status_code} {resp.text}")
+
+
+def clear_mock_fault(base_url: str) -> None:
+    with suppress(Exception):
+        requests.delete(f"{base_url.rstrip('/')}/_fault", timeout=3)
