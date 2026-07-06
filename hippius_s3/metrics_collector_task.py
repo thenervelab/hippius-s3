@@ -91,9 +91,24 @@ class BackgroundMetricsCollector:
                 length = int(await rc.zcard(queue_name) or 0)
                 self.metrics_collector.set_queue_length(queue_name, length)
 
-            info = await self.redis_client.info("memory")
-            self.metrics_collector._used_mem = info.get("used_memory", 0)
-            self.metrics_collector._max_mem = info.get("maxmemory", 0)
+            # Gauge the REDIS-QUEUES instance memory, not the main cache: redis-queues is
+            # `noeviction`, so once it fills EVERY write fails — the sole-producer upload LPUSH,
+            # the chunk pub/sub, and the cephor:* coordination keys — a pipeline-wide cascade.
+            # (The old code read the main redis, whose fullness is harmless — it just evicts.)
+            info = await rc.info("memory")
+            used_mem = int(info.get("used_memory", 0) or 0)
+            max_mem = int(info.get("maxmemory", 0) or 0)
+            self.metrics_collector._used_mem = used_mem
+            self.metrics_collector._max_mem = max_mem
+            if max_mem > 0:
+                fill = used_mem / max_mem
+                if fill >= 0.85:
+                    logger.error(
+                        f"redis-queues at {fill:.0%} of its {max_mem} byte cap — a full noeviction "
+                        f"instance fails EVERY write (upload LPUSH, pub/sub, cephor:*). Investigate DLQ/backlog growth."
+                    )
+                elif fill >= 0.70:
+                    logger.warning(f"redis-queues at {fill:.0%} of its memory cap (noeviction); watch for a fill trend.")
 
             logger.debug("Redis metrics collected successfully")
 
