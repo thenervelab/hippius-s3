@@ -1,5 +1,7 @@
+import contextlib
 import json
 import logging
+import os
 import time
 import uuid
 from typing import Optional
@@ -174,6 +176,17 @@ async def dequeue_upload_request(queue_name: str) -> UploadChainRequest | None:
     return None
 
 
+async def dequeue_upload_request_reliable(queue_name: str) -> tuple[UploadChainRequest, str] | None:
+    """At-least-once variant of `dequeue_upload_request`: returns (request, handle). The caller
+    MUST `ack_reliable(queue_name, handle)` once the upload is terminal (done, retry-scheduled,
+    or DLQ'd); an un-acked handle is redelivered after the visibility window, so an uploader
+    crash mid-upload re-drives the request instead of dropping it (idempotent `chunk_backend`)."""
+    raw = await reliable_brpop(queue_name, timeout=0.5)
+    if raw is None:
+        return None
+    return UploadChainRequest.model_validate(json.loads(raw)), raw
+
+
 # Per-backend retry handling (ZSET with score = next_attempt_unix_ts)
 
 
@@ -290,6 +303,16 @@ async def dequeue_unpin_request(queue_name: str = "unpin_requests") -> UnpinChai
     return None
 
 
+async def dequeue_unpin_request_reliable(queue_name: str = "unpin_requests") -> tuple[UnpinChainRequest, str] | None:
+    """At-least-once variant of `dequeue_unpin_request`: returns (request, handle). The caller
+    MUST `ack_reliable(queue_name, handle)` when the unpin is terminal; an un-acked handle is
+    redelivered after the visibility window (idempotent soft-delete makes redelivery safe)."""
+    raw = await reliable_brpop(queue_name, timeout=3)
+    if raw is None:
+        return None
+    return UnpinChainRequest.model_validate_json(raw), raw
+
+
 def _unpin_retry_zset(backend: str) -> str:
     return f"{backend}_unpin_retries"
 
@@ -391,3 +414,96 @@ async def dequeue_download_request(queue_name: str) -> DownloadChainRequest | No
         _, queue_data = result
         return DownloadChainRequest.model_validate_json(queue_data)
     return None
+
+
+# ---------------------------------------------------------------------------------------------
+# A12: at-least-once reliable dequeue (in-flight ZSET + reaper).
+#
+# A plain BRPOP removes the request the instant it is read, so a consumer that crashes between
+# the pop and completing the work LOSES the request — and a reader waiting on the resulting chunk
+# hangs to the cache TTL (~1h). These helpers make dequeue at-least-once: the popped raw member is
+# recorded in a per-queue in-flight ZSET scored by a visibility deadline; the consumer ACKs
+# (ZREM) on completion, and a periodic reaper moves any member past its deadline back onto the
+# main list (a crash redelivery). Redelivery is safe because every consumer is idempotent
+# (deterministic chunk writes, `insert_chunk_backend ON CONFLICT`, idempotent soft-delete), so a
+# duplicate is harmless. The visibility window must exceed the worst-case processing time or a
+# still-in-flight request is redelivered as a (harmless but wasteful) duplicate. Mirrors the
+# existing retry-ZSET move pattern (`move_due_upload_retries`).
+# ---------------------------------------------------------------------------------------------
+
+DEFAULT_QUEUE_VISIBILITY_SECONDS = float(os.getenv("HIPPIUS_QUEUE_VISIBILITY_SECONDS", "600"))
+
+
+def _inflight_zset(queue_name: str) -> str:
+    return f"{_normalize_queue_name(queue_name)}:inflight"
+
+
+async def reliable_brpop(
+    queue_name: str,
+    *,
+    timeout: float = 5,
+    visibility_seconds: float = DEFAULT_QUEUE_VISIBILITY_SECONDS,
+) -> Optional[str]:
+    """BRPOP the next raw member and record it in the in-flight ZSET with a visibility deadline.
+
+    Returns the raw member string (which is also the ACK/reap handle) or None on timeout. After
+    this returns, the member is owned by this consumer until it `ack_reliable`s it or the
+    visibility window lapses and the reaper redelivers it.
+    """
+    client = get_queue_client()
+    qn = _normalize_queue_name(queue_name)
+    result = await client.brpop(qn, timeout=timeout)  # ty: ignore[invalid-await, invalid-argument-type]
+    if not result:
+        return None
+    _, raw = result
+    deadline = time.time() + max(1.0, float(visibility_seconds))
+    await client.zadd(_inflight_zset(qn), {raw: deadline})
+    return raw
+
+
+async def ack_reliable(queue_name: str, handle: str) -> None:
+    """Mark an in-flight member done (remove it from the in-flight ZSET) so the reaper never
+    redelivers it. Best-effort: a failed ack just risks one harmless idempotent redelivery."""
+    client = get_queue_client()
+    with contextlib.suppress(Exception):
+        await client.zrem(_inflight_zset(queue_name), handle)  # ty: ignore[invalid-await]
+
+
+async def requeue_stale_inflight(
+    queue_name: str,
+    *,
+    now_ts: float | None = None,
+    max_items: int = 128,
+) -> int:
+    """Redeliver in-flight members past their visibility deadline (a consumer crashed mid-work):
+    move each back onto the main list. Returns the number redelivered. Mirrors
+    `move_due_upload_retries`."""
+    client = get_queue_client()
+    qn = _normalize_queue_name(queue_name)
+    zkey = _inflight_zset(qn)
+    now_ts = time.time() if now_ts is None else now_ts
+    members = await client.zrangebyscore(zkey, min="-inf", max=now_ts, start=0, num=max_items)
+    moved = 0
+    for m in members:
+        try:
+            async with client.pipeline(transaction=True) as pipe:
+                pipe.zrem(zkey, m)
+                pipe.lpush(qn, m)
+                await pipe.execute()
+            moved += 1
+        except Exception:
+            logger.exception(f"Failed to redeliver a stale in-flight member to {qn}")
+    if moved:
+        logger.warning(f"Redelivered {moved} stale in-flight request(s) to {qn} (a consumer crashed mid-processing)")
+    return moved
+
+
+async def dequeue_download_request_reliable(queue_name: str) -> tuple[DownloadChainRequest, str] | None:
+    """At-least-once variant of `dequeue_download_request`: returns (request, handle). The caller
+    MUST `ack_reliable(queue_name, handle)` once the download completes (success or terminal
+    discard); an un-acked handle is redelivered by `requeue_stale_inflight` after the visibility
+    window, so a downloader crash no longer strands the reader on a chunk that never arrives."""
+    raw = await reliable_brpop(queue_name, timeout=5)
+    if raw is None:
+        return None
+    return DownloadChainRequest.model_validate_json(raw), raw

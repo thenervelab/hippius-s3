@@ -7,6 +7,7 @@ instantiates the correct client and calls run_unpinner_loop from here.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import Any
 from typing import Protocol
@@ -20,8 +21,10 @@ from hippius_s3.dlq.unpin_dlq import UnpinDLQManager
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.queue import UnpinChainRequest
-from hippius_s3.queue import dequeue_unpin_request
+from hippius_s3.queue import ack_reliable
+from hippius_s3.queue import dequeue_unpin_request_reliable
 from hippius_s3.queue import enqueue_unpin_retry_request
+from hippius_s3.queue import requeue_stale_inflight
 from hippius_s3.queue import move_due_unpin_retries
 from hippius_s3.redis_utils import create_redis_client
 from hippius_s3.redis_utils import with_redis_retry
@@ -245,29 +248,35 @@ async def run_unpinner_loop(
         f"delete_concurrency={delete_concurrency} db_pool_max={pool_max})"
     )
 
-    async def _handle_unpin(request: UnpinChainRequest) -> None:
+    async def _handle_unpin(request: UnpinChainRequest, handle: str) -> None:
         ray_id = request.ray_id or "no-ray-id"
         ray_id_context.set(ray_id)
         worker_logger = get_logger_with_ray_id(__name__, ray_id)
-        with tracer.start_as_current_span(
-            "unpinner.job",
-            attributes={
-                "object_id": request.object_id,
-                "hippius.ray_id": ray_id,
-                "backend": backend_name,
-                "hippius.account.main": request.address,
-                "attempts": request.attempts or 0,
-            },
-        ):
-            await process_unpin_request(
-                request,
-                backend_name=backend_name,
-                backend_client_factory=backend_client_factory,
-                worker_logger=worker_logger,
-                dlq_manager=dlq_manager,
-                db_pool=db_pool,
-                sem=delete_sem,
-            )
+        try:
+            with tracer.start_as_current_span(
+                "unpinner.job",
+                attributes={
+                    "object_id": request.object_id,
+                    "hippius.ray_id": ray_id,
+                    "backend": backend_name,
+                    "hippius.account.main": request.address,
+                    "attempts": request.attempts or 0,
+                },
+            ):
+                await process_unpin_request(
+                    request,
+                    backend_name=backend_name,
+                    backend_client_factory=backend_client_factory,
+                    worker_logger=worker_logger,
+                    dlq_manager=dlq_manager,
+                    db_pool=db_pool,
+                    sem=delete_sem,
+                )
+        finally:
+            # A12 ack: process_unpin_request routes its own failures to retry/DLQ (terminal), so
+            # any normal completion acks; only a hard crash leaves it for the reaper (idempotent
+            # soft-delete makes redelivery safe).
+            await ack_reliable(queue_name, handle)
 
     # Periodic retry-mover — one per pod, off the per-request hot path (running it per dequeue across
     # N concurrent workers would multiply Redis load).
@@ -301,14 +310,16 @@ async def run_unpinner_loop(
                 _reap(done_wait)
                 continue
 
-            unpin_request, redis_queues_client = await with_redis_retry(
-                lambda rc: dequeue_unpin_request(queue_name),
+            dequeued, redis_queues_client = await with_redis_retry(
+                lambda rc: dequeue_unpin_request_reliable(queue_name),
                 redis_queues_client,
                 config.redis_queues_url,
                 f"dequeue {backend_name} unpin request",
             )
 
-            if not unpin_request:
+            if not dequeued:
+                with contextlib.suppress(Exception):
+                    await requeue_stale_inflight(queue_name)
                 if inflight:
                     done_wait, _ = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED, timeout=0.5)
                     _reap(done_wait)
@@ -316,7 +327,8 @@ async def run_unpinner_loop(
                     await asyncio.sleep(0.1)
                 continue
 
-            inflight.add(asyncio.create_task(_handle_unpin(unpin_request)))
+            unpin_request, handle = dequeued
+            inflight.add(asyncio.create_task(_handle_unpin(unpin_request, handle)))
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info(f"{backend_name} unpinner stopping…")
     finally:

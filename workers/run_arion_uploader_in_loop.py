@@ -20,7 +20,9 @@ from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.monitoring import initialize_metrics_collector
-from hippius_s3.queue import dequeue_upload_request
+from hippius_s3.queue import ack_reliable
+from hippius_s3.queue import dequeue_upload_request_reliable
+from hippius_s3.queue import requeue_stale_inflight
 from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.queue import move_due_upload_retries
 from hippius_s3.redis_utils import with_redis_retry
@@ -42,7 +44,7 @@ logger = logging.getLogger(__name__)
 init_sentry("arion-uploader", is_worker=True)
 
 
-async def _handle_upload(uploader, db_pool, upload_request) -> None:
+async def _handle_upload(uploader, db_pool, upload_request, queue_name, handle) -> None:
     """Process one upload request and route failures to retry/DLQ.
 
     This is the body the serial loop used to run inline; it now runs as a
@@ -100,6 +102,11 @@ async def _handle_upload(uploader, db_pool, upload_request) -> None:
                         upload_request.object_id,
                         int(getattr(upload_request, "object_version", 1) or 1),
                     )
+        finally:
+            # A12 ack: the request reached a terminal disposition (uploaded, retry-scheduled, or
+            # DLQ'd), so remove it from the in-flight set. Only a hard crash skips this finally,
+            # leaving it for the reaper to redeliver (idempotent chunk_backend makes that safe).
+            await ack_reliable(queue_name, handle)
 
 
 async def run_arion_uploader_loop():
@@ -175,8 +182,8 @@ async def run_arion_uploader_loop():
                 continue
 
             try:
-                upload_request, redis_queues_client = await with_redis_retry(
-                    lambda rc: dequeue_upload_request(queue_name),
+                dequeued, redis_queues_client = await with_redis_retry(
+                    lambda rc: dequeue_upload_request_reliable(queue_name),
                     redis_queues_client,
                     config.redis_queues_url,
                     "dequeue upload request",
@@ -186,7 +193,9 @@ async def run_arion_uploader_loop():
                 await asyncio.sleep(0.1)
                 continue
 
-            if upload_request is None:
+            if dequeued is None:
+                with contextlib.suppress(Exception):
+                    await requeue_stale_inflight(queue_name)
                 if inflight:
                     done_wait, _ = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED, timeout=0.5)
                     _reap(done_wait)
@@ -194,7 +203,8 @@ async def run_arion_uploader_loop():
                     await asyncio.sleep(0.1)
                 continue
 
-            inflight.add(asyncio.create_task(_handle_upload(uploader, db_pool, upload_request)))
+            upload_request, handle = dequeued
+            inflight.add(asyncio.create_task(_handle_upload(uploader, db_pool, upload_request, queue_name, handle)))
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Arion uploader stopping…")
     finally:
