@@ -65,6 +65,9 @@ _KMS_CLIENT_LOCK = asyncio.Lock()
 # Table initialization tracking
 _TABLES_ENSURED = False
 _TABLES_LOCK = asyncio.Lock()
+# C3: transaction-scoped advisory-lock key that serializes the lazy bucket_keks DDL across pods.
+# Arbitrary stable constant ("bukek" as hex) — only has to be unique among this DB's advisory locks.
+_BUCKET_KEKS_DDL_ADVISORY_KEY = 0x62756B656B
 
 
 async def _get_pool(dsn: str) -> asyncpg.Pool:
@@ -367,24 +370,34 @@ async def _ensure_tables(conn: asyncpg.Connection) -> None:
     Schema:
     - wrapped_kek_bytes: Encrypted KEK bytes (NOT NULL)
     - kms_key_id: "local" or KMS key UUID (NOT NULL)
+
+    C3: `CREATE TABLE IF NOT EXISTS` is NOT race-free under concurrency — when several pods
+    cold-start together they can all observe the table missing and collide in pg_class/pg_type,
+    and one raises "duplicate key"/"relation already exists", surfacing as a transient 500 on the
+    first GET/PUT after a deploy. A transaction-scoped advisory lock makes the check-and-create
+    atomic fleet-wide. The DDL stays here (rather than a dbmate migration) because bucket_keks
+    lives in the KEYSTORE database, which the migrator (DATABASE_URL only) does not target when
+    it is a separate DB.
     """
-    await conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS bucket_keks (
-            bucket_id UUID NOT NULL,
-            kek_id UUID PRIMARY KEY,
-            wrapped_kek_bytes BYTEA NOT NULL,
-            kms_key_id TEXT NOT NULL CHECK (kms_key_id <> ''),
-            status TEXT NOT NULL DEFAULT 'active',
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-        CREATE INDEX IF NOT EXISTS idx_bucket_keks_bucket_status_created
-          ON bucket_keks(bucket_id, status, created_at DESC);
-        CREATE UNIQUE INDEX IF NOT EXISTS uniq_bucket_active_kek
-          ON bucket_keks(bucket_id)
-         WHERE status = 'active';
-        """
-    )
+    async with conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock($1)", _BUCKET_KEKS_DDL_ADVISORY_KEY)
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bucket_keks (
+                bucket_id UUID NOT NULL,
+                kek_id UUID PRIMARY KEY,
+                wrapped_kek_bytes BYTEA NOT NULL,
+                kms_key_id TEXT NOT NULL CHECK (kms_key_id <> ''),
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            CREATE INDEX IF NOT EXISTS idx_bucket_keks_bucket_status_created
+              ON bucket_keks(bucket_id, status, created_at DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS uniq_bucket_active_kek
+              ON bucket_keks(bucket_id)
+             WHERE status = 'active';
+            """
+        )
 
 
 async def _maybe_ensure_tables(conn: asyncpg.Connection) -> None:

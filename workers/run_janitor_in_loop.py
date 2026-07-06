@@ -71,9 +71,13 @@ AGE_BUCKET_BOUNDARIES = [
 ]
 AGE_BUCKET_NAMES = [b[0] for b in AGE_BUCKET_BOUNDARIES] + ["7d+"]
 
-# Disk pressure thresholds (fraction of total disk used).
+# Disk pressure thresholds (fraction of total disk used). Enter thresholds are higher than exit
+# thresholds (hysteresis) so a disk hovering at a boundary doesn't flap the mode — and with it the
+# hot-retention window and loop-sleep — every cycle. C2.
 PRESSURE_ELEVATED = 0.85
+PRESSURE_ELEVATED_EXIT = 0.83
 PRESSURE_CRITICAL = 0.95
+PRESSURE_CRITICAL_EXIT = 0.93
 
 # Maximum age of an orphan `.tmp.*` file before we delete it. Atomic writes
 # finish in milliseconds; anything older than this is a crashed-write orphan.
@@ -94,6 +98,7 @@ _fs_disk_used_bytes = 0
 _fs_disk_total_bytes = 0
 _fs_hot_parts = 0
 _fs_pressure_mode = 0  # 0 = normal, 1 = elevated, 2 = critical
+_prev_pressure_mode = 0  # C2: last mode returned by _pressure_mode, for hysteresis (single-instance janitor)
 _fs_age_buckets: dict[str, int] = dict.fromkeys(AGE_BUCKET_NAMES, 0)
 # G2 replication-gate sentinel: live/serveable chunks lacking full-union backend coverage
 # (the population the gate must never reclaim). Any nonzero value is a standing durability
@@ -153,17 +158,29 @@ def _classify_age_bucket(age_seconds: float) -> str:
 
 
 def _pressure_mode(root: Path) -> int:
-    """Return the current disk-pressure mode (0/1/2)."""
+    """Return the current disk-pressure mode (0/1/2) with hysteresis.
+
+    C2: a mode is entered at its (higher) enter threshold and only released once the disk drops
+    below the (lower) exit threshold, using the previous mode. This stops a disk sitting right at
+    0.85 or 0.95 from oscillating the mode — and the hot-retention window and loop sleep that key
+    off it — on every cycle. The janitor is single-instance, so a module-global previous-mode is
+    safe. On a stat error we hold the previous mode rather than snapping to normal.
+    """
+    global _prev_pressure_mode
     try:
         usage = shutil.disk_usage(root)
         ratio = usage.used / usage.total if usage.total else 0.0
     except OSError:
-        return 0
-    if ratio >= PRESSURE_CRITICAL:
-        return 2
-    if ratio >= PRESSURE_ELEVATED:
-        return 1
-    return 0
+        return _prev_pressure_mode
+    prev = _prev_pressure_mode
+    if ratio >= PRESSURE_CRITICAL or (prev == 2 and ratio >= PRESSURE_CRITICAL_EXIT):
+        mode = 2
+    elif ratio >= PRESSURE_ELEVATED or (prev >= 1 and ratio >= PRESSURE_ELEVATED_EXIT):
+        mode = 1
+    else:
+        mode = 0
+    _prev_pressure_mode = mode
+    return mode
 
 
 def _effective_hot_retention(mode: int) -> float:
@@ -782,11 +799,16 @@ async def cleanup_old_parts_by_mtime(
     try:
         dlq_object_ids = await get_all_dlq_object_ids(redis_client)
     except DLQProtectionUnavailable as exc:
-        # A15 fail-closed: skip age-based GC when the DLQ protection set is incomplete rather
-        # than evict data for an in-flight DLQ operation. (The replication gate still protects
-        # unreplicated data; this guards the DLQ dimension specifically.)
-        logger.error(f"Skipping age-based GC — DLQ protection unavailable: {exc}")
-        return 0
+        # C1 (refines A15): do NOT skip the whole age-GC pass when the DLQ set is unavailable.
+        # This pass only ever deletes FULLY-REPLICATED parts (the replication gate below is the
+        # hard safety net), and a part that is live on every required backend is safe to evict
+        # from SSD regardless of any DLQ entry — its bytes can be re-fetched. Skipping entirely
+        # meant a redis-queues outage froze eviction at ANY disk level; combined with the drain
+        # (also on redis-queues) being down, that is a disk-fill spiral precisely when the janitor
+        # is the only thing that can free space. Fall back to replication-gate-only eviction (no
+        # DLQ dimension). The non-replication-gated cleanup_stale_parts pass stays fail-closed.
+        logger.error(f"DLQ protection unavailable — age-GC falling back to replication-gate-only eviction: {exc}")
+        dlq_object_ids = set()
     if dlq_object_ids:
         logger.info(f"Protecting {len(dlq_object_ids)} DLQ objects from GC")
 

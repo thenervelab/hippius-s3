@@ -289,3 +289,43 @@ class TestJanitorDlqProtection:
 
         result = await get_all_dlq_object_ids(redis_with_dlq)
         assert "obj-123" in result
+
+
+@pytest.mark.asyncio
+async def test_age_gc_falls_back_to_replication_gate_when_dlq_unavailable(mock_config, caplog):
+    """C1: when the DLQ protection set is unavailable, the age-based GC pass must NOT skip
+    entirely (that froze eviction during a redis-queues outage → disk-fill spiral). It falls
+    back to replication-gate-only eviction: it proceeds into the FS walk instead of returning
+    early. The replication gate (unchanged) is the hard safety net for non-replicated data.
+
+    (cleanup_stale_parts, which is NOT replication-gated, must still fail closed — that path is
+    covered by the get_all_dlq_object_ids fail-closed tests above.)
+    """
+    import logging
+
+    import run_janitor_in_loop as janitor
+
+    caplog.set_level(logging.INFO)
+
+    # Empty-but-present FS root: the pass reaches the walk (proving it did not early-return on the
+    # exception) and finds nothing to delete → returns 0. The distinguishing signal is the
+    # fallback log line, which the old skip-the-whole-pass behaviour never emitted.
+    fs_store = MagicMock(spec=FileSystemPartsStore)
+    root = MagicMock()
+    fs_store.root = root
+    root.exists.return_value = True
+    root.iterdir.return_value = []
+
+    async def _raise(_redis):
+        raise DLQProtectionUnavailable("redis-queues down")
+
+    with (
+        patch("run_janitor_in_loop.config", mock_config),
+        patch.object(janitor, "get_all_dlq_object_ids", _raise),
+    ):
+        result = await janitor.cleanup_old_parts_by_mtime(_FakePool(AsyncMock()), fs_store, FakeRedis())
+
+    assert result == 0
+    assert any("replication-gate-only" in r.message for r in caplog.records), (
+        "age-GC should log the replication-gate-only fallback, not skip the pass"
+    )
