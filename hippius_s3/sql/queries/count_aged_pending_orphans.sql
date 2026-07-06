@@ -19,7 +19,11 @@
 -- the subquery, so the outer count is a version count (the unit the sweep and the leak alarm
 -- both reason in), not a part count.
 --
--- Parameter: $1 stale_seconds (int) — the idle grace window.
+-- Parameter: $1 stale_seconds (int) — the idle grace window. This MUST be passed the SAME
+-- value as list_orphan_replication_versions.sql's grace (both sourced from
+-- config.mpu_sweep_grace_seconds). If the gauge grace were smaller than the sweep grace it
+-- would count orphans the sweep cannot yet clear, reading non-zero forever on a healthy stack
+-- and defeating the soak gate's bounded/slope≈0 assertion.
 SELECT count(*)::bigint AS aged_pending_orphans
 FROM (
     SELECT crs.object_id, crs.version

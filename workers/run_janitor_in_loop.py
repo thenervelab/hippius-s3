@@ -81,11 +81,12 @@ TMP_FILE_MAX_AGE_SECONDS = 3600  # 1h
 # Cap on the G2 sentinel scan: it needs only to DETECT a durability gap and sample a few
 # offenders, not enumerate every one, so a bounded page keeps the read-only query cheap.
 SENTINEL_SCAN_LIMIT = 500
-# Idle grace before a pending/draining orphan counts toward the aged-orphan gauge. Below
-# this, an unservable pending version is indistinguishable from a still-arriving upload; the
-# reaper's own grace is the reference, so a value comfortably above normal ingest latency
-# keeps live uploads out of the leak signal the soak gate watches.
-AGED_PENDING_ORPHAN_GRACE_SECONDS = 3600  # 1h
+# The idle grace before a pending/draining orphan counts toward the aged-orphan gauge is
+# `config.mpu_sweep_grace_seconds` — the SAME window the reaper's orphan sweep
+# (list_orphan_replication_versions.sql) uses. They MUST match: the gauge is only meaningful
+# if it counts exactly the population the sweep can clear, otherwise it reads non-zero forever
+# (an orphan aged past the gauge grace but not yet past a larger sweep grace) and the soak
+# gate's slope≈0/bounded assertion watches a phantom backlog.
 
 _fs_parts_on_disk = 0
 _fs_oldest_age_seconds = 0.0
@@ -654,7 +655,7 @@ async def check_aged_pending_orphans(db_pool: asyncpg.Pool) -> int:
     async with db_pool.acquire() as conn:
         count = await conn.fetchval(
             get_query("count_aged_pending_orphans"),
-            AGED_PENDING_ORPHAN_GRACE_SECONDS,
+            config.mpu_sweep_grace_seconds,
         )
     _aged_pending_orphans = int(count or 0)
     return _aged_pending_orphans
@@ -976,6 +977,7 @@ async def run_janitor_loop():
     logger.info("Starting janitor service...")
     logger.info(f"FS store root: {config.object_cache_dir}")
     logger.info(f"MPU stale threshold: {config.mpu_stale_seconds}s")
+    logger.info(f"Aged-pending-orphan gauge grace: {config.mpu_sweep_grace_seconds}s (matches the reaper sweep)")
     logger.info(f"FS GC max age: {config.fs_cache_gc_max_age_seconds}s")
     logger.info(f"FS hot retention: {getattr(config, 'fs_cache_hot_retention_seconds', 10800)}s")
     logger.info(f"Cleanup concurrency: {concurrency}")

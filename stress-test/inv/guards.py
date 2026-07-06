@@ -167,6 +167,50 @@ class TerminalMonotonicity:
         return GuardResult(self.name, "ok", f"{len(current)} rows tracked, no terminal regression")
 
 
+class AgedPendingOrphanBacklog:
+    """G9 (A21 soak-gate feed): the aged-pending-orphan backlog stays bounded and flat.
+
+    Reads the janitor's `janitor_aged_pending_orphans` gauge — the standing count of aged,
+    unservable `pending`/`draining` versions, i.e. the exact population the reaper's orphan
+    sweep clears (gauge grace == sweep grace by construction). On a healthy stack this hovers
+    near zero; a re-introduced A21 leak makes it climb. Two breach conditions:
+
+      * BOUNDED — the backlog exceeds `bound` (a standing leak the sweep is not clearing).
+      * RISING  — the backlog net-increased by >= `rise_delta` across the last `rise_window`
+        polls (accumulating faster than the sweep drains it). This is the slope≈0 assertion,
+        measured in poll-deltas rather than wall-clock so the predicate stays deterministic
+        (the runner's poll interval is fixed, so a net rise over K polls IS a positive slope).
+
+    Absent metric → skip (janitor sentinel not deployed), never a silent pass.
+    """
+
+    name = "G9"
+
+    def __init__(self, bound: int = 100, rise_window: int = 5, rise_delta: float = 5.0) -> None:
+        self._bound = bound
+        self._rise_window = rise_window
+        self._rise_delta = rise_delta
+        self._history: list[float] = []
+
+    def check(self, probe: Probe) -> GuardResult:
+        backlog = probe.prom_scalar("max(janitor_aged_pending_orphans)")
+        if backlog is None:
+            return GuardResult(self.name, "skip", "janitor_aged_pending_orphans absent (gauge not deployed)")
+        self._history.append(backlog)
+        if len(self._history) > self._rise_window:
+            self._history = self._history[-self._rise_window :]
+        if backlog > self._bound:
+            return GuardResult(self.name, "breach", f"aged-pending-orphan backlog {int(backlog)} > bound {self._bound}", backlog)
+        # A sustained climb across the full window (a leak) — only assertable once the window is full.
+        if len(self._history) == self._rise_window:
+            net_rise = self._history[-1] - self._history[0]
+            if net_rise >= self._rise_delta:
+                return GuardResult(
+                    self.name, "breach", f"aged-pending-orphan backlog rising +{net_rise:g} over {self._rise_window} polls", backlog
+                )
+        return GuardResult(self.name, "ok", f"aged-pending-orphan backlog {int(backlog)} bounded & flat", backlog)
+
+
 class _InvDetGuard:
     """G5/G7/G8: covered by inv-det or the scenario runner, not this periodic asserter — reported
     as `skip` so the guard table is explicit rather than silently omitting them."""
@@ -190,6 +234,7 @@ def make_guard(name: str) -> _Guard:
         "G6": TerminalMonotonicity,
         "G7": lambda: _InvDetGuard("G7", "inv-det (AEAD determinism)"),
         "G8": lambda: _InvDetGuard("G8", "inv-det + reaper scenario (reaper safety)"),
+        "G9": AgedPendingOrphanBacklog,
     }
     return factories[name]()
 

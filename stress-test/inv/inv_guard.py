@@ -9,7 +9,7 @@ run fails fast instead of soaking on a broken cluster. The JSONL stream is the s
 chaos `gate.py` and the durability ledger consume.
 
 JSONL event shape (one per guard per poll):
-    {"run_id": str, "seq": int, "ts": float, "guard": "G1".."G8", "status": "ok"|"breach"|"skip",
+    {"run_id": str, "seq": int, "ts": float, "guard": "G1".."G9", "status": "ok"|"breach"|"skip",
      "detail": str, "value": float|null}
 
 Usage (from the repo root):
@@ -34,7 +34,7 @@ from harness import config  # noqa: E402
 from harness.probes import ClusterProbe  # noqa: E402
 from inv.guards import GuardResult, make_guard, run_once  # noqa: E402
 
-DEFAULT_GUARDS = "G1,G2,G3,G4,G6"
+DEFAULT_GUARDS = "G1,G2,G3,G4,G6,G9"
 
 
 def _event(run_id: str, seq: int, result: GuardResult) -> dict:
@@ -51,13 +51,16 @@ def _event(run_id: str, seq: int, result: GuardResult) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="inv-guard — continuous invariant asserter")
-    ap.add_argument("--guards", default=DEFAULT_GUARDS, help="comma list of G1..G8 (default: G1,G2,G3,G4,G6)")
+    ap.add_argument("--guards", default=DEFAULT_GUARDS, help="comma list of G1..G9 (default: G1,G2,G3,G4,G6,G9)")
     ap.add_argument("--run-id", default=f"invguard-{int(time.time())}")
     ap.add_argument("--out", type=pathlib.Path, help="append JSONL events here (default: stdout only)")
     ap.add_argument("--interval", type=float, default=10.0, help="seconds between polls")
     ap.add_argument("--once", action="store_true", help="one poll then exit")
     ap.add_argument("--abort", action="store_true", help="exit non-zero on the first breach")
     ap.add_argument("--stall-secs", type=int, default=120, help="G3 stalled-part threshold")
+    ap.add_argument("--orphan-bound", type=int, default=100, help="G9 aged-pending-orphan backlog ceiling")
+    ap.add_argument("--orphan-rise-window", type=int, default=5, help="G9 poll window for the rising-trend check")
+    ap.add_argument("--orphan-rise-delta", type=float, default=5.0, help="G9 net backlog rise over the window that breaches")
     ap.add_argument("--env-file", type=pathlib.Path, default=None)
     args = ap.parse_args()
 
@@ -65,11 +68,15 @@ def main() -> int:
     try:
         guards = [make_guard(name) for name in names]
     except KeyError as exc:
-        print(f"unknown guard {exc}; valid: G1..G8", file=sys.stderr)
+        print(f"unknown guard {exc}; valid: G1..G9", file=sys.stderr)
         return 2
-    for guard in guards:  # thread G3's threshold through without a global
+    for guard in guards:  # thread per-guard thresholds through without a global
         if getattr(guard, "name", None) == "G3":
             guard._stall_secs = args.stall_secs  # noqa: SLF001
+        if getattr(guard, "name", None) == "G9":
+            guard._bound = args.orphan_bound  # noqa: SLF001
+            guard._rise_window = args.orphan_rise_window  # noqa: SLF001
+            guard._rise_delta = args.orphan_rise_delta  # noqa: SLF001
 
     cfg = config.load(args.env_file)
     probe = ClusterProbe(cfg)

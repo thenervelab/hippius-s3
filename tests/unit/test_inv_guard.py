@@ -138,10 +138,52 @@ def test_g6_skip_when_pg_unreachable():
     assert guards.TerminalMonotonicity().check(FakeProbe(rows=None)).status == "skip"
 
 
+# ----------------------------------------------------------------- G9 aged-pending-orphan backlog
+def _orphan_probe(value: float | None) -> FakeProbe:
+    return FakeProbe(prom={"max(janitor_aged_pending_orphans)": value})
+
+
+def test_g9_skip_when_gauge_absent():
+    assert guards.AgedPendingOrphanBacklog().check(FakeProbe(prom={})).status == "skip"
+
+
+def test_g9_ok_when_bounded_and_flat():
+    g = guards.AgedPendingOrphanBacklog(bound=100, rise_window=5, rise_delta=5.0)
+    for _ in range(6):
+        r = g.check(_orphan_probe(3.0))  # steady low backlog
+    assert r.status == "ok" and r.value == 3.0
+
+
+def test_g9_breach_over_bound():
+    g = guards.AgedPendingOrphanBacklog(bound=50)
+    r = g.check(_orphan_probe(51.0))
+    assert r.status == "breach" and "bound" in r.detail
+
+
+def test_g9_breach_on_rising_trend_within_bound():
+    # A steady climb (a leak) below the absolute bound must still breach via the slope check.
+    g = guards.AgedPendingOrphanBacklog(bound=1000, rise_window=5, rise_delta=5.0)
+    statuses = [g.check(_orphan_probe(float(v))).status for v in (10, 12, 14, 16, 18)]
+    # window fills on the 5th poll; net rise 10->18 = 8 >= delta 5 → breach
+    assert statuses[-1] == "breach"
+    assert statuses[:4] == ["ok", "ok", "ok", "ok"], "no verdict until the window is full"
+
+
+def test_g9_ok_when_flat_over_full_window():
+    g = guards.AgedPendingOrphanBacklog(bound=1000, rise_window=3, rise_delta=5.0)
+    for v in (20, 21, 20):  # jitter, net change ~0
+        r = g.check(_orphan_probe(float(v)))
+    assert r.status == "ok"
+
+
 # ----------------------------------------------------------------- G5/G7/G8 are inv-det/scenario
 def test_invdet_guards_skip():
     for name in ("G5", "G7", "G8"):
         assert guards.make_guard(name).check(FakeProbe()).status == "skip"
+
+
+def test_g9_registered_in_factory():
+    assert isinstance(guards.make_guard("G9"), guards.AgedPendingOrphanBacklog)
 
 
 # ----------------------------------------------------------------- run_once aggregation

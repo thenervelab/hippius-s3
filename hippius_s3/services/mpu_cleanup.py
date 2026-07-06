@@ -160,10 +160,17 @@ async def run_reaper_cycle(
     redis_client: Any,
     *,
     stale_seconds: int,
+    sweep_grace_seconds: int,
     upload_backends: Iterable[str],
 ) -> None:
     """Run one reaper pass, time it, and record its metrics. Never raises — a failed
-    cycle is logged and recorded as ``success=false`` so the loop keeps going."""
+    cycle is logged and recorded as ``success=false`` so the loop keeps going.
+
+    ``stale_seconds`` is the abandoned-MPU reaper's window; ``sweep_grace_seconds`` is the
+    orphan-replication sweep's window. They are separate knobs (though they default equal) so
+    the leak backstop can be tuned without moving the reaper — and, critically, so the sweep
+    grace stays in lockstep with the janitor's aged-pending-orphan gauge, which counts exactly
+    the population this sweep clears."""
     collector = get_metrics_collector()
     started = time.monotonic()
     try:
@@ -171,7 +178,7 @@ async def run_reaper_cycle(
         async with db_pool.acquire() as db:
             result = await reap_abandoned_uploads(db, stale_seconds=stale_seconds, dlq_object_ids=dlq_object_ids)
             sweep = await sweep_orphan_replication_versions(
-                db, stale_seconds=stale_seconds, dlq_object_ids=dlq_object_ids
+                db, stale_seconds=sweep_grace_seconds, dlq_object_ids=dlq_object_ids
             )
         if result.count:
             logger.info("mpu-reaper: reaped %d abandoned multipart upload(s)", result.count)
@@ -211,8 +218,9 @@ async def run_mpu_reaper_loop() -> None:
     redis_client = async_redis.from_url(config.redis_queues_url)
     initialize_metrics_collector(redis_client)
     logger.info(
-        "mpu-reaper: started (stale_seconds=%s interval=%ss)",
+        "mpu-reaper: started (stale_seconds=%s sweep_grace_seconds=%s interval=%ss)",
         config.mpu_stale_seconds,
+        config.mpu_sweep_grace_seconds,
         config.mpu_reaper_interval_seconds,
     )
     try:
@@ -221,6 +229,7 @@ async def run_mpu_reaper_loop() -> None:
                 db_pool,
                 redis_client,
                 stale_seconds=config.mpu_stale_seconds,
+                sweep_grace_seconds=config.mpu_sweep_grace_seconds,
                 upload_backends=config.upload_backends,
             )
             await asyncio.sleep(config.mpu_reaper_interval_seconds)

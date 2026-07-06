@@ -41,8 +41,10 @@ class FakeDb:
         self._sweep_rows = sweep_rows or []
         self._raise_mark_for = raise_mark_for
         self.executed: list[tuple[str, tuple]] = []
+        self.fetched: list[tuple[str, tuple]] = []
 
     async def fetch(self, query: str, *args: object) -> list[dict]:
+        self.fetched.append((query, args))
         if "cephor_replication_status" in query:
             return self._sweep_rows
         return self._fetch_rows
@@ -162,7 +164,9 @@ async def test_run_reaper_cycle_records_a_successful_cycle() -> None:
     collector = MagicMock()
 
     with patch.object(mpu_cleanup, "get_metrics_collector", return_value=collector):
-        await mpu_cleanup.run_reaper_cycle(pool, _fake_redis(), stale_seconds=86400, upload_backends=["arion"])
+        await mpu_cleanup.run_reaper_cycle(
+            pool, _fake_redis(), stale_seconds=86400, sweep_grace_seconds=86400, upload_backends=["arion"]
+        )
 
     collector.record_mpu_reaper_cycle.assert_called_once()
     _, kwargs = collector.record_mpu_reaper_cycle.call_args
@@ -181,7 +185,9 @@ async def test_run_reaper_cycle_records_a_failure_without_raising() -> None:
     collector = MagicMock()
 
     with patch.object(mpu_cleanup, "get_metrics_collector", return_value=collector):
-        await mpu_cleanup.run_reaper_cycle(pool, _fake_redis(), stale_seconds=86400, upload_backends=["arion"])
+        await mpu_cleanup.run_reaper_cycle(
+            pool, _fake_redis(), stale_seconds=86400, sweep_grace_seconds=86400, upload_backends=["arion"]
+        )
 
     collector.record_mpu_reaper_cycle.assert_called_once()
     _, kwargs = collector.record_mpu_reaper_cycle.call_args
@@ -259,10 +265,33 @@ async def test_run_reaper_cycle_runs_the_sweep_and_records_its_count() -> None:
     collector = MagicMock()
 
     with patch.object(mpu_cleanup, "get_metrics_collector", return_value=collector):
-        await mpu_cleanup.run_reaper_cycle(pool, _fake_redis(), stale_seconds=86400, upload_backends=["arion"])
+        await mpu_cleanup.run_reaper_cycle(
+            pool, _fake_redis(), stale_seconds=86400, sweep_grace_seconds=86400, upload_backends=["arion"]
+        )
 
     collector.record_mpu_reaper_cycle.assert_called_once()
     _, kwargs = collector.record_mpu_reaper_cycle.call_args
     assert kwargs["success"] is True
     assert kwargs["reaped"] == 1, "the abandoned-MPU reaper still runs"
     assert kwargs["swept"] == 2, "the cephor-orphan sweep count is recorded separately"
+
+
+@pytest.mark.asyncio
+async def test_run_reaper_cycle_threads_distinct_grace_windows() -> None:
+    # The reaper and the orphan sweep take SEPARATE grace windows: the abandoned-MPU query
+    # gets stale_seconds, the cephor-orphan sweep gets sweep_grace_seconds. The sweep grace
+    # must be the value the janitor's aged-pending-orphan gauge also uses, so it is critical
+    # that run_reaper_cycle threads it to the sweep query and NOT the reaper's stale_seconds.
+    db = FakeDb([], sweep_rows=[])
+    pool = FakePool(db)
+    collector = MagicMock()
+
+    with patch.object(mpu_cleanup, "get_metrics_collector", return_value=collector):
+        await mpu_cleanup.run_reaper_cycle(
+            pool, _fake_redis(), stale_seconds=86400, sweep_grace_seconds=999, upload_backends=["arion"]
+        )
+
+    reaper_grace = next(args[0] for query, args in db.fetched if "multipart_uploads" in query)
+    sweep_grace = next(args[0] for query, args in db.fetched if "cephor_replication_status" in query)
+    assert reaper_grace == 86400, "the abandoned-MPU reaper uses stale_seconds"
+    assert sweep_grace == 999, "the orphan sweep uses the distinct sweep_grace_seconds"

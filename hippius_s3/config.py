@@ -279,6 +279,12 @@ class Config:
     # initiation) — a user can pause a multipart upload and resume it, so the window must
     # exceed a realistic pause. 2 days gives leeway over a full-day pause + resume.
     mpu_stale_seconds: int = env("HIPPIUS_MPU_STALE_SECONDS:172800", convert=int)  # 2 days
+    # Idle grace before an orphaned cephor_replication_status version (pending/draining,
+    # unservable) is swept to `failed` AND counted by the janitor's aged-pending-orphan gauge.
+    # MUST be the same value for both so the gauge counts EXACTLY the population the sweep can
+    # clear (otherwise the gauge reads non-zero forever). Defaults to mpu_stale_seconds so the
+    # leak backstop can be tuned independently of the abandoned-MPU reaper's own window.
+    mpu_sweep_grace_seconds: int = env("HIPPIUS_MPU_SWEEP_GRACE_SECONDS:172800", convert=int)  # 2 days
     # How often the abandoned-multipart-upload reaper sweeps. The reaper auto-aborts
     # never-finalized uploads older than mpu_stale_seconds (address never written),
     # purging their SSD parts + drain replication rows so the drain stops re-deferring.
