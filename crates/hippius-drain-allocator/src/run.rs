@@ -22,10 +22,30 @@ pub struct AllocatorMetrics {
     pub leader: AtomicU64,
     /// The fleet write-budget estimate in bytes/s from the last led tick (`drain_fleet_estimate_bps`).
     pub fleet_estimate_bps: AtomicU64,
-    /// The lease epoch this instance last LED under (`drain_leader_epoch`); left at its last
-    /// led value while not leading. `max()` across the fleet is monotonic by construction, so
-    /// a decrease flags a redis epoch-counter reset that would silently break the write-fence.
+    /// The lease epoch this instance last LED under (`drain_leader_epoch`), reset to 0 on lease
+    /// loss (`NotLeader`/`Fenced`). Because a deposed leader drops to 0, `max()` across the fleet
+    /// tracks only the *live* leader's epoch — so a redis epoch-counter reset shows up as the
+    /// monotonic decrease the fleet alert watches for. Leaving a stale ex-leader exporting its
+    /// old (higher) epoch would mask that decrease and the write-fence-break alert could never fire.
     pub leader_epoch: AtomicU64,
+}
+
+impl AllocatorMetrics {
+    /// Record a led tick: this instance held the lease and wrote budgets stamped with `epoch`.
+    fn record_led(&self, epoch: u64, estimate: u64) {
+        self.leader.store(1, Ordering::Relaxed);
+        self.fleet_estimate_bps.store(estimate, Ordering::Relaxed);
+        self.leader_epoch.store(epoch, Ordering::Relaxed);
+    }
+
+    /// Record a lost lease (`NotLeader` or `Fenced`): drop BOTH leadership and its epoch to 0.
+    /// Resetting `leader_epoch` (not just `leader`) is what keeps `max(drain_leader_epoch)` across
+    /// the fleet tracking only the live leader, so a redis epoch-counter reset produces the
+    /// monotonic decrease the write-fence-break alert watches for (see the field doc above).
+    fn record_not_leading(&self) {
+        self.leader.store(0, Ordering::Relaxed);
+        self.leader_epoch.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Loop-level observability inputs, bundled so `run_allocator` stays under the argument
@@ -85,22 +105,20 @@ pub async fn run_allocator<C: CephCeilingSource>(
                     nodes = plan.allocations.len(),
                     "led allocation tick"
                 );
-                obs.metrics.leader.store(1, Ordering::Relaxed);
-                obs.metrics.fleet_estimate_bps.store(estimate, Ordering::Relaxed);
-                obs.metrics.leader_epoch.store(epoch, Ordering::Relaxed);
+                obs.metrics.record_led(epoch, estimate);
                 // Carry the evolved AIMD state into the next tick.
                 controller = plan.controller;
             }
             Ok(TickOutcome::NotLeader) => {
                 tracing::debug!("another instance holds leadership this tick");
-                obs.metrics.leader.store(0, Ordering::Relaxed);
+                obs.metrics.record_not_leading();
             }
             // The coordinator fenced this instance's stale-epoch write: a higher-epoch
             // leader exists, so this instance is deposed. Expected handoff, not an
             // alert. Keep the carried controller so a re-win resumes from a sane rate.
             Err(CoordError::Fenced { epoch }) => {
                 tracing::info!(epoch, "allocation fenced; leadership has moved on");
-                obs.metrics.leader.store(0, Ordering::Relaxed);
+                obs.metrics.record_not_leading();
             }
             Err(err) => tracing::warn!(error = %err, "allocation tick failed; retrying next tick"),
         }
@@ -171,6 +189,31 @@ mod tests {
 
     fn open_ceiling() -> StaticCeiling {
         StaticCeiling(CephCeiling::Open(ByteRate::new(1_000_000_000)))
+    }
+
+    /// Regression for PR #235 D2: on lease loss the `drain_leader_epoch` gauge must drop to 0,
+    /// not keep exporting the last-led epoch. Both the `NotLeader` and `Fenced` tick arms delegate
+    /// to `record_not_leading`, so testing that function covers both. Were the epoch left stale, a
+    /// deposed leader would keep exporting its old (higher) epoch and `max(drain_leader_epoch)`
+    /// across the fleet would never decrease after a redis epoch-counter reset — the alert that
+    /// exists to catch that fence-break could never fire.
+    #[test]
+    fn lease_loss_resets_the_leader_epoch_gauge() {
+        use std::sync::atomic::Ordering;
+
+        let metrics = AllocatorMetrics::default();
+        metrics.record_led(100, 190_000);
+        assert_eq!(metrics.leader.load(Ordering::Relaxed), 1, "led: leader gauge set");
+        assert_eq!(metrics.leader_epoch.load(Ordering::Relaxed), 100, "led: epoch stamped");
+
+        // Lease loss (the shared path for both NotLeader and Fenced).
+        metrics.record_not_leading();
+        assert_eq!(metrics.leader.load(Ordering::Relaxed), 0, "lease loss drops leadership");
+        assert_eq!(
+            metrics.leader_epoch.load(Ordering::Relaxed),
+            0,
+            "lease loss must reset the epoch so max(drain_leader_epoch) can decrease on a redis reset",
+        );
     }
 
     #[tokio::test]
