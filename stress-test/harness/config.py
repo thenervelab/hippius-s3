@@ -27,6 +27,12 @@ class Config:
     bucket_prefix: str
     drain_convergence_timeout_s: int
     keep_objects: bool
+    # durability re-verify eviction: which api pods carry the writable SSD ingest cache, and where.
+    # The re-verify deletes each corpus object from this dir on every matching pod so the read is
+    # forced off the SSD ingest copy and onto the drained (read-only CephFS) copy — see
+    # scenarios.durability_reverify for why reading the SSD cache proves nothing about the drain.
+    api_selector: str
+    ssd_cache_dir: str
 
 
 def _load_env_file(path: pathlib.Path) -> dict[str, str]:
@@ -68,4 +74,6 @@ def load(env_file: pathlib.Path | None = None) -> Config:
         bucket_prefix=os.environ.get("HIPPIUS_BUCKET_PREFIX", "prodgate"),
         drain_convergence_timeout_s=int(os.environ.get("HIPPIUS_DRAIN_TIMEOUT_S", "300")),
         keep_objects=os.environ.get("HIPPIUS_KEEP_OBJECTS", "").lower() in ("1", "true", "yes"),
+        api_selector=os.environ.get("HIPPIUS_API_SELECTOR", "api-local"),
+        ssd_cache_dir=os.environ.get("HIPPIUS_SSD_CACHE_DIR", "/var/lib/hippius/local_object_cache"),
     )

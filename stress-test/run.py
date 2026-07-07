@@ -82,8 +82,10 @@ def main() -> int:
         # give the drain a moment before the durability re-verify even without cluster probes
         time.sleep(10)
 
+    # Pass the probe only when the cluster is reachable: the re-verify uses it to evict the SSD ingest
+    # cache so the re-GET reads the drained copy, not the intact ingest copy (see durability_reverify).
     guarded("durability re-verify (the no-data-loss gate)",
-            lambda: scenarios.durability_reverify(client, cfg, ledger, report))
+            lambda: scenarios.durability_reverify(client, cfg, ledger, report, probe if cluster else None))
 
     # cleanup
     if not cfg.keep_objects:

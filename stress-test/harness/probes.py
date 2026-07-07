@@ -55,6 +55,47 @@ class ClusterProbe:
             return None
         return rows[0][0]
 
+    # ---------------------------------------------------------------- ssd-cache eviction (durability gate)
+    def api_pods(self) -> list[str]:
+        """Names of the api pods carrying the writable SSD ingest cache (one per ingest node)."""
+        cmd = [
+            "kubectl", "-n", self.cfg.namespace, "get", "pods",
+            "-l", f"app={self.cfg.api_selector}", "--field-selector=status.phase=Running",
+            "-o", "jsonpath={.items[*].metadata.name}",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            return []
+        return proc.stdout.split()
+
+    def evict_ssd_parts(self, object_ids: list[str]) -> tuple[int, int]:
+        """Delete each object's part tree from the WRITABLE SSD primary cache on every api pod.
+
+        The reader's chunks_exist_batch then misses the SSD ingest copy and serves the read-only
+        CephFS fallback — the drain's durable output. The CephFS mount is readOnly inside the api
+        pod, so this can never delete the drained copy itself; only the ephemeral ingest copy goes.
+        An object is ingested on one node only, so its SSD copy lives on a single pod — but the GET
+        may be served by either pod, so we evict on ALL of them. Returns (objects_targeted, pods_hit).
+        """
+        if not object_ids:
+            return (0, 0)
+        pods = self.api_pods()
+        dirs = [f"{self.cfg.ssd_cache_dir.rstrip('/')}/{oid}" for oid in object_ids]
+        hit = 0
+        for pod in pods:
+            ok = True
+            # Bound the arg vector: chunk the rm so a large corpus can't blow the exec argv limit.
+            for i in range(0, len(dirs), 100):
+                proc = subprocess.run(  # noqa: S603 — fixed argv, oids are DB uuids
+                    ["kubectl", "-n", self.cfg.namespace, "exec", pod, "-c", "api",
+                     "--", "rm", "-rf", *dirs[i:i + 100]],
+                    capture_output=True, text=True, timeout=60,
+                )
+                ok = ok and proc.returncode == 0
+            if ok:
+                hit += 1
+        return (len(object_ids), hit)
+
     # ---------------------------------------------------------------- prometheus (port-forward)
     def start_prometheus(self) -> bool:
         """Start a port-forward to prometheus-server; returns True if it answers."""

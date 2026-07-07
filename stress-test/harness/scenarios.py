@@ -279,6 +279,18 @@ def _our_repl_rows(probe: ClusterProbe, prefix: str) -> dict[tuple[str, str, str
     return {(r[0], r[1], r[2]): r[3] for r in rows}
 
 
+def _our_object_ids(probe: ClusterProbe, prefix: str) -> list[str] | None:
+    """object_ids of every object in our test buckets — the set the durability gate must force off
+    the SSD ingest cache before re-GETting. None if Postgres is unreachable."""
+    rows = probe.pg(
+        "select distinct o.object_id::text from objects o "
+        "join buckets b on b.bucket_id = o.bucket_id "
+        f"where b.bucket_name like '{_safe_prefix(prefix)}-%'")
+    if rows is None:
+        return None
+    return [r[0] for r in rows]
+
+
 def invariant_assert(probe: ClusterProbe, cfg: Config, report: Report, prom_ok: bool) -> None:
     # G1 — single leader (Prometheus)
     leaders = probe.prom_scalar('sum(drain_leader{service_namespace="hippius-s3-staging"})') if prom_ok else None
@@ -364,8 +376,37 @@ def replication_convergence(probe: ClusterProbe, cfg: Config, report: Report, pr
 
 
 # ---------------------------------------------------------------- 6. DURABILITY RE-VERIFY (the gate)
-def durability_reverify(client, cfg: Config, ledger: Ledger, report: Report) -> None:
+def _evict_ssd_before_reverify(probe: ClusterProbe | None, cfg: Config) -> tuple[bool, str]:
+    """Force the re-GETs off the SSD ingest cache and onto the drained copy.
+
+    THIS is the whole point of the no-data-loss gate: a re-GET that reads the node-local SSD ingest
+    cache proves NOTHING about the drained copy. Right after convergence the SSD part is still present
+    (the drain/janitor keep it under replication-gate + hot-retention), so object_reader's
+    chunks_exist_batch hits the SSD primary (HIPPIUS_OBJECT_CACHE_DIR=local_object_cache) and serves
+    source="cache" from it — the drained CephFS pool copy is never touched, so a corrupt or missing
+    drained copy would still re-GET byte-identical off the intact SSD copy and pass the gate green.
+    Deleting each object's parts from the WRITABLE SSD primary on every api pod makes chunks_exist_batch
+    miss it, so the reader serves the read-only CephFS fallback (object_cache) — the drain's durable
+    output. The CephFS mount is readOnly in the api pod, so eviction can never delete the drained copy.
+    Returns (authoritative, note): authoritative is True only when the SSD copy was actually evicted on
+    at least one pod, i.e. the re-verify genuinely tested the drained copy.
+    """
+    if probe is None:
+        return (False, "no cluster access — SSD not evicted; reads may be served from the ingest cache "
+                       "(NOT an authoritative drained-copy proof)")
+    oids = _our_object_ids(probe, cfg.bucket_prefix)
+    if oids is None:
+        return (False, "Postgres unreachable — could not resolve object_ids to evict; reads may be cache-served")
+    targeted, pods = probe.evict_ssd_parts(oids)
+    if pods == 0:
+        return (False, "SSD eviction reached 0 api pods — reads may be cache-served (not authoritative)")
+    return (True, f"evicted {targeted} obj from the SSD ingest cache on {pods} api pod(s) → re-GET reads the drained CephFS copy")
+
+
+def durability_reverify(client, cfg: Config, ledger: Ledger, report: Report,
+                        probe: ClusterProbe | None = None) -> None:
     items = ledger.all()
+    authoritative, evict_note = _evict_ssd_before_reverify(probe, cfg)
     mismatches: list[str] = []
     missing: list[str] = []
 
@@ -385,12 +426,20 @@ def durability_reverify(client, cfg: Config, ledger: Ledger, report: Report) -> 
             elif kind == "missing":
                 missing.append(f"{key}:{why}")
     ok = len(items) - len(mismatches) - len(missing)
+    passed = (len(mismatches) == 0 and len(missing) == 0)
+    # A green re-verify that could NOT evict the SSD cache is NOT a durability proof — it may have read
+    # the ingest copy, not the drained copy — so it is downgraded to OBSERVED (informational, never
+    # flips GO) rather than claiming a false-green PASS. A corruption that surfaces even from the cache
+    # is still a real finding, so a FAILING non-authoritative run stays a hard gate.
     report.add(Result(
         name="durability-reverify",
         invariant="S8/G3 no-data-loss (NON-OVERRIDABLE)",
-        passed=(len(mismatches) == 0 and len(missing) == 0),
-        detail=f"{ok}/{len(items)} byte-identical; {len(mismatches)} corrupt, {len(missing)} missing"
+        passed=passed,
+        observed=(not authoritative) and passed,
+        detail=f"{evict_note}; {ok}/{len(items)} byte-identical; {len(mismatches)} corrupt, {len(missing)} missing"
                + (f" — corrupt:{mismatches[:3]} missing:{missing[:3]}" if (mismatches or missing) else ""),
-        criteria="every acked object re-GETs byte-identical (plaintext md5 + size)",
-        metrics={"total": len(items), "ok": ok, "corrupt": len(mismatches), "missing": len(missing)},
+        criteria="after evicting the SSD ingest cache, every acked object re-GETs byte-identical FROM THE "
+                 "DRAINED COPY (plaintext md5 + size)",
+        metrics={"total": len(items), "ok": ok, "corrupt": len(mismatches), "missing": len(missing),
+                 "authoritative": authoritative},
     ))
