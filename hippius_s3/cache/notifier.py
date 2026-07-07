@@ -26,6 +26,16 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 logger = logging.getLogger(__name__)
 
 
+class ChunkNotReadyError(Exception):
+    """A chunk is still absent after a pub/sub notification woke the waiter.
+
+    Distinct from `asyncio.TimeoutError` (no notification arrived in time): here the downloader
+    DID notify — typically after giving up fast on a backend miss for an undrained object — but the
+    chunk never materialized. Typed so the read-path peek can map it to a retryable 503 instead of
+    letting a bare `RuntimeError` escape to a 500. See PR #235 task B1.
+    """
+
+
 def build_chunk_key(object_id: str, object_version: int, part_number: int, chunk_index: int) -> str:
     """Deterministic cache key used for pub/sub channels.
 
@@ -92,7 +102,7 @@ class ChunkNotifier:
             Chunk bytes.
 
         Raises:
-            RuntimeError: If the chunk is still missing after notification + retry.
+            ChunkNotReadyError: If the chunk is still missing after notification + retry.
             asyncio.TimeoutError: If no notification arrives within `timeout`.
         """
         # Fast path
@@ -144,5 +154,5 @@ class ChunkNotifier:
             await asyncio.sleep(0.1)
             data = await fetch_fn(object_id, int(object_version), int(part_number), int(chunk_index))
         if data is None:
-            raise RuntimeError(f"Chunk missing after pub/sub notification: {chunk_key}")
+            raise ChunkNotReadyError(f"Chunk missing after pub/sub notification: {chunk_key}")
         return data

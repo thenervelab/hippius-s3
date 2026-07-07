@@ -17,10 +17,11 @@ use crate::ids::FileId;
 use crate::partdrain::{ClaimedPart, PartReplicationStore, PartVerified};
 use crate::reconcile::PartLandingLog;
 use crate::reconcile::PartStatus;
-use crate::ssd_reclaim::{PartStatusAge, ReclaimLog};
+use crate::ssd_reclaim::{BackingLog, PartStatusAge, ReclaimLog};
 use crate::state::ReplicationState;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -69,7 +70,7 @@ pub enum StoreError {
 
 type Result<T> = core::result::Result<T, StoreError>;
 
-/// Parses a stored status string back into a [`ReplicationState`]. The four
+/// Parses a stored status string back into a [`ReplicationState`]. The five
 /// literals match the `cephor_replication_status.status` CHECK constraint and
 /// the `'draining'`/`'replicated'`/etc. literals the write queries set.
 fn state_from_db(raw: &str) -> Result<ReplicationState> {
@@ -78,6 +79,7 @@ fn state_from_db(raw: &str) -> Result<ReplicationState> {
         "draining" => Ok(ReplicationState::Draining),
         "replicated" => Ok(ReplicationState::Replicated),
         "failed" => Ok(ReplicationState::Failed),
+        "corrupt" => Ok(ReplicationState::Corrupt),
         other => Err(StoreError::UnknownState { value: other.into() }),
     }
 }
@@ -283,6 +285,80 @@ impl Store {
         .await?
         .rows_affected();
         Ok(affected)
+    }
+
+    /// The true drain backlog for `node`: the total `parts.size_bytes` of every part this
+    /// node still owns as `pending`/`draining` in `cephor_replication_status`.
+    ///
+    /// This is the WI-20c reconcile of `drain_ssd_backlog_bytes`, which the heartbeat used
+    /// to source from raw SSD occupancy (`statvfs`). Occupancy OVERCOUNTS the backlog by
+    /// the A21/orphan leak — aborted-upload and deleted-object bytes sit on the SSD but are
+    /// not undrained WORK — so a leaking node reads hundreds of GB of "backlog" with no
+    /// drain demand. Keying on the terminal-filtered replication rows counts only parts the
+    /// drain will actually replicate. A part whose `parts` row is absent contributes zero
+    /// (INNER JOIN), and a NULL `size_bytes` is treated as zero (COALESCE), so the sum is a
+    /// lower bound that never over-reports. Uses the node-scoped pending index.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn node_backlog_bytes(&self, node: &str) -> Result<u64> {
+        let (bytes,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(p.size_bytes), 0)::bigint \
+             FROM cephor_replication_status crs \
+             JOIN parts p \
+               ON p.object_id = crs.object_id::uuid \
+              AND p.object_version = crs.version \
+              AND p.part_number = crs.part_number \
+             WHERE crs.node_id = $1 AND crs.status IN ('pending', 'draining')",
+        )
+        .bind(node)
+        .fetch_one(&self.pool)
+        .await?;
+        // SUM of non-negative byte counts is >= 0; the cast guards a corrupt negative row.
+        Ok(u64::try_from(bytes).unwrap_or(0))
+    }
+
+    /// R4 re-drive: reset this node's `corrupt` parts back to `pending` for a fresh SSD->pool
+    /// copy (overwriting the corrupt pool copy from the intact SSD source), bounded by
+    /// `max_attempts`. Only rows still under the cap are reset; each reset bumps
+    /// `corrupt_attempts`, so a persistently-unrecoverable pool copy stops re-driving after
+    /// `max_attempts` and is held `corrupt` (paged via the corrupt-backlog gauge/alert) rather
+    /// than looping forever. Clears `claimed_at`/`deferred_until` so the part is immediately
+    /// re-claimable. Returns how many parts were re-driven.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`].
+    pub async fn redrive_corrupt_parts(&self, max_attempts: i32) -> Result<u64> {
+        let affected = sqlx::query(
+            "UPDATE cephor_replication_status \
+             SET status = 'pending', corrupt_attempts = corrupt_attempts + 1, \
+                 claimed_at = NULL, deferred_until = NULL, updated_at = now() \
+             WHERE node_id = $1 AND status = 'corrupt' AND corrupt_attempts < $2",
+        )
+        .bind(self.node_id.as_deref())
+        .bind(max_attempts)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected)
+    }
+
+    /// The count of this node's parts currently held in `corrupt` (the `drain_corrupt_parts`
+    /// gauge). A nonzero value is a live object with a corrupt pool copy being kept alive by its
+    /// SSD source — a durability incident, not routine GC. Includes rows still eligible for
+    /// re-drive AND those held at the attempt cap (the standing, unrecoverable backlog).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`].
+    pub async fn count_corrupt_parts(&self) -> Result<u64> {
+        let (count,): (i64,) = sqlx::query_as("SELECT count(*)::bigint FROM cephor_replication_status WHERE node_id = $1 AND status = 'corrupt'")
+            .bind(self.node_id.as_deref())
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(u64::try_from(count).unwrap_or(0))
     }
 
     /// Claims a file for GC. Returns `Some(GcClaim)` if this caller won the claim,
@@ -581,8 +657,12 @@ impl PartReplicationStore for Store {
         // false Ok. The claim_seq is what distinguishes "I still hold it" from "someone
         // re-won it and it's draining again under them" (F4).
         let part = claim.part();
+        // Reset corrupt_attempts on a genuine commit: the counter bounds re-drives for ONE
+        // corruption episode, so a part that recovered (corrupt→pending→replicated) must not
+        // carry a spent budget if the same row is ever corrupted again. Harmless on the common
+        // path (it is already 0).
         let affected = sqlx::query(
-            "UPDATE cephor_replication_status SET status = 'replicated', updated_at = now() \
+            "UPDATE cephor_replication_status SET status = 'replicated', corrupt_attempts = 0, updated_at = now() \
              WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining' AND claim_seq = $4",
         )
         .bind(part.object().as_str())
@@ -621,6 +701,46 @@ impl PartReplicationStore for Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn mark_corrupt(&self, claim: &ClaimedPart, _reason: &str) -> Result<()> {
+        // Same claim-fence + idempotency shape as mark_failed (a fenced stale claimant matches
+        // zero rows and must NOT touch the live re-claimed part; a second call finds 'corrupt',
+        // not 'draining'). Clears claimed_at like mark_failed. The corrupt_attempts counter is
+        // left as-is: a fresh corruption reuses whatever re-drive budget the row already spent.
+        let part = claim.part();
+        sqlx::query(
+            "UPDATE cephor_replication_status SET status = 'corrupt', updated_at = now(), claimed_at = NULL \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining' AND claim_seq = $4",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .bind(claim.claim_seq())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn is_version_servable(&self, part: &PartKey) -> Result<bool> {
+        // The exact inverse of janitor_part_terminally_abandoned.sql's unservable predicate and
+        // the reclaim gate's servable_parts: a version SERVES a GET if its address is set, OR it
+        // has a real size, OR an md5. address is written AFTER size/md5 in a separate step, so a
+        // fully-servable version briefly has address=NULL (the mid-finalize window); the size/md5
+        // disjuncts keep such a live version from reading as unservable. Do NOT reduce to
+        // address-only. A missing row (deleted object) is not servable.
+        let servable = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS ( \
+                SELECT 1 FROM object_versions ov \
+                WHERE ov.object_id = $1::uuid AND ov.object_version = $2 \
+                  AND (ov.address IS NOT NULL OR ov.size_bytes > 0 OR COALESCE(ov.md5_hash, '') <> '') \
+             )",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(servable)
     }
 }
 
@@ -753,6 +873,109 @@ impl ReclaimLog for Store {
                         state: state_from_db(&status)?,
                         age: age_from_secs(age_secs),
                     },
+                );
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// The reclaim worker's object-backing view: which scanned parts have no live
+/// `object_versions` row. Only the parts with no replication row reach this, so the batch
+/// is the reclaim's `skipped_absent` tail — usually small, empty on the steady state.
+impl BackingLog for Store {
+    type Error = StoreError;
+
+    async fn unbacked_parts(&self, parts: &[PartKey]) -> Result<HashSet<PartKey>> {
+        let mut out = HashSet::with_capacity(parts.len());
+        // Chunk the request so a pathological backlog never builds one giant array.
+        for batch in parts.chunks(RECLAIM_STATUS_BATCH) {
+            let mut object_ids: Vec<&str> = Vec::with_capacity(batch.len());
+            let mut versions: Vec<i64> = Vec::with_capacity(batch.len());
+            let mut part_numbers: Vec<i64> = Vec::with_capacity(batch.len());
+            for part in batch {
+                object_ids.push(part.object().as_str());
+                versions.push(i64::from(part.version().get()));
+                part_numbers.push(i64::from(part.part().get()));
+            }
+            // Echo back exactly the input parts whose (object_id, version) has NO
+            // object_versions row. NOT EXISTS against the ov PK stays index-only; the
+            // object_id is echoed from the input UNNEST (never read from object_versions),
+            // so the reconstructed PartKey matches the caller's key verbatim — no
+            // canonical-text round-trip to get wrong. Backing is ROW PRESENCE only: a
+            // present-but-unservable row (an aborted/abandoned or in-flight MPU) counts as
+            // backed and is NOT returned, so this never races the central `failed` sweep.
+            let rows = sqlx::query_as::<_, (String, i64, i64)>(
+                "SELECT t.object_id, t.version, t.part_number \
+                 FROM UNNEST($1::text[], $2::bigint[], $3::bigint[]) AS t(object_id, version, part_number) \
+                 WHERE NOT EXISTS ( \
+                    SELECT 1 FROM object_versions ov \
+                    WHERE ov.object_id = t.object_id::uuid AND ov.object_version = t.version \
+                 )",
+            )
+            .bind(&object_ids)
+            .bind(&versions)
+            .bind(&part_numbers)
+            .fetch_all(&self.pool)
+            .await?;
+            for (object_id, version, part_number) in rows {
+                out.insert(
+                    PartRow {
+                        object_id,
+                        version,
+                        part_number,
+                    }
+                    .into_part()?,
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    async fn servable_parts(&self, parts: &[PartKey]) -> Result<HashSet<PartKey>> {
+        let mut out = HashSet::with_capacity(parts.len());
+        // Chunk the request so a pathological backlog never builds one giant array.
+        for batch in parts.chunks(RECLAIM_STATUS_BATCH) {
+            let mut object_ids: Vec<&str> = Vec::with_capacity(batch.len());
+            let mut versions: Vec<i64> = Vec::with_capacity(batch.len());
+            let mut part_numbers: Vec<i64> = Vec::with_capacity(batch.len());
+            for part in batch {
+                object_ids.push(part.object().as_str());
+                versions.push(i64::from(part.version().get()));
+                part_numbers.push(i64::from(part.part().get()));
+            }
+            // Echo back exactly the input parts whose (object_id, version) row EXISTS and is
+            // SERVABLE — the exact inverse of janitor_part_terminally_abandoned.sql's
+            // unservable predicate. MUST stay in lockstep with that file (and the A21 sweep's
+            // list_orphan_replication_versions.sql): servable = address written, OR a real
+            // size, OR an md5 — the download filter `(size_bytes > 0 OR md5_hash <> '')` plus
+            // a set address. `address` is written AFTER size/md5 in a separate step, so a
+            // fully-servable version briefly has address=NULL (the mid-finalize window); the
+            // size/md5 disjuncts are what keep such a live version from being read as
+            // reclaimable. Do NOT "simplify" to address-only. The object_id is echoed from the
+            // input UNNEST so the reconstructed PartKey matches the caller's key verbatim.
+            let rows = sqlx::query_as::<_, (String, i64, i64)>(
+                "SELECT t.object_id, t.version, t.part_number \
+                 FROM UNNEST($1::text[], $2::bigint[], $3::bigint[]) AS t(object_id, version, part_number) \
+                 WHERE EXISTS ( \
+                    SELECT 1 FROM object_versions ov \
+                    WHERE ov.object_id = t.object_id::uuid AND ov.object_version = t.version \
+                      AND (ov.address IS NOT NULL OR ov.size_bytes > 0 OR COALESCE(ov.md5_hash, '') <> '') \
+                 )",
+            )
+            .bind(&object_ids)
+            .bind(&versions)
+            .bind(&part_numbers)
+            .fetch_all(&self.pool)
+            .await?;
+            for (object_id, version, part_number) in rows {
+                out.insert(
+                    PartRow {
+                        object_id,
+                        version,
+                        part_number,
+                    }
+                    .into_part()?,
                 );
             }
         }
@@ -899,6 +1122,7 @@ mod part_tests {
     use crate::state::ReplicationState;
     use core::str::FromStr;
     use sqlx::postgres::PgPool;
+    use std::collections::HashSet;
     use std::time::Duration;
 
     const UUID_A: &str = "466916c0-d61b-4518-b81b-9576b574270a";
@@ -1037,6 +1261,221 @@ mod part_tests {
     }
 
     #[sqlx::test]
+    async fn unbacked_parts_returns_only_parts_whose_object_version_row_is_gone(pool: PgPool) {
+        use crate::ssd_reclaim::BackingLog;
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone());
+
+        // A live object_versions row exists — the part is BACKED (mid-upload / live object).
+        let backed = part(UUID_A, 1, 1);
+        seed_object_version(&pool, UUID_A, 1, Some("5Faddr")).await;
+        // No object_versions row at all — the object was hard-deleted → UNBACKED.
+        let deleted = part(UUID_B, 2, 1);
+
+        let unbacked = store.unbacked_parts(&[backed, deleted.clone()]).await.unwrap();
+        assert_eq!(unbacked, HashSet::from([deleted]), "only the deleted object's part is unbacked");
+    }
+
+    #[sqlx::test]
+    async fn a_present_but_unservable_version_is_still_backed(pool: PgPool) {
+        // The load-bearing distinction from the WI-20a servability sweep: backing is ROW
+        // PRESENCE, not servability. An aborted/abandoned or in-flight MPU has a present
+        // object_versions row (address NULL, size 0) — it must NOT be reported unbacked,
+        // so the orphan reclaim never races the central `failed` path (or an in-flight MPU).
+        use crate::ssd_reclaim::BackingLog;
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone());
+
+        seed_object_version(&pool, UUID_A, 1, None).await; // present but address NULL (unservable)
+
+        let unbacked = store.unbacked_parts(&[part(UUID_A, 1, 1)]).await.unwrap();
+        assert!(unbacked.is_empty(), "a present-but-unservable version is backed, never orphan-reclaimed");
+    }
+
+    #[sqlx::test]
+    async fn every_part_of_a_deleted_version_is_unbacked_and_a_sibling_version_is_isolated(pool: PgPool) {
+        // All parts of a deleted version are unbacked; a live sibling version on the same
+        // object is untouched (version-scoped, so deleting v2's SSD cannot strand v1).
+        use crate::ssd_reclaim::BackingLog;
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone());
+
+        seed_object_version(&pool, UUID_A, 1, Some("5Flive")).await; // v1 live
+        let v1 = part(UUID_A, 1, 1);
+        // v2 has no object_versions row (deleted) with two parts.
+        let v2_p1 = part(UUID_A, 2, 1);
+        let v2_p2 = part(UUID_A, 2, 2);
+
+        let unbacked = store.unbacked_parts(&[v1, v2_p1.clone(), v2_p2.clone()]).await.unwrap();
+        assert_eq!(unbacked, HashSet::from([v2_p1, v2_p2]), "both v2 parts unbacked; live v1 protected");
+    }
+
+    #[sqlx::test]
+    async fn unbacked_parts_of_an_empty_request_is_empty(pool: PgPool) {
+        use crate::ssd_reclaim::BackingLog;
+        let store = Store::from_pool(pool);
+        let unbacked = store.unbacked_parts(&[]).await.unwrap();
+        assert!(unbacked.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn servable_parts_returns_each_servable_row_and_excludes_unservable_and_missing(pool: PgPool) {
+        // The corrupt-live guard's discriminator, exercising every disjunct of the servable
+        // predicate (address set / size>0 / md5 set) AND its two exclusions (unservable row,
+        // no row). Each disjunct is checked in isolation because `address` is written AFTER
+        // size/md5 in a separate step, so the size/md5-only rows are real mid-finalize states
+        // a servable object passes through — dropping them would strand a live GET.
+        use crate::ssd_reclaim::BackingLog;
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone());
+
+        // address set, size/md5 unset → servable.
+        seed_ov(&pool, UUID_A, 1, Some("5Faddr"), None, None).await;
+        // address NULL but size>0 → servable (the mid-finalize window: size written, address not yet).
+        seed_ov(&pool, UUID_A, 2, None, Some(4096), None).await;
+        // address NULL, size 0, md5 set → servable (md5 alone satisfies the download filter).
+        seed_ov(&pool, UUID_A, 3, None, Some(0), Some("d41d8cd9")).await;
+        // address NULL, size 0, md5 '' → UNSERVABLE (the abandoned-upload shape).
+        seed_ov(&pool, UUID_A, 4, None, Some(0), Some("")).await;
+        // address NULL, size NULL, md5 NULL → UNSERVABLE (bare reserved row).
+        seed_ov(&pool, UUID_A, 5, None, None, None).await;
+        // no object_versions row at all (v6) → UNSERVABLE (deleted object).
+
+        let addr = part(UUID_A, 1, 1);
+        let sized = part(UUID_A, 2, 1);
+        let md5 = part(UUID_A, 3, 1);
+        let empty = part(UUID_A, 4, 1);
+        let bare = part(UUID_A, 5, 1);
+        let missing = part(UUID_A, 6, 1);
+
+        let servable = store
+            .servable_parts(&[addr.clone(), sized.clone(), md5.clone(), empty, bare, missing])
+            .await
+            .unwrap();
+        assert_eq!(
+            servable,
+            HashSet::from([addr, sized, md5]),
+            "each servable disjunct is returned; unservable and missing rows are excluded"
+        );
+    }
+
+    #[sqlx::test]
+    async fn servable_parts_of_an_empty_request_is_empty(pool: PgPool) {
+        use crate::ssd_reclaim::BackingLog;
+        let store = Store::from_pool(pool);
+        assert!(store.servable_parts(&[]).await.unwrap().is_empty());
+    }
+
+    #[sqlx::test]
+    async fn is_version_servable_is_the_drain_time_corrupt_discriminator(pool: PgPool) {
+        // The R4 mark-path discriminator: same predicate as servable_parts, one part at a time.
+        // A servable version (any disjunct) -> Corrupt; an unservable/missing one -> Failed.
+        use crate::partdrain::PartReplicationStore;
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone());
+        seed_ov(&pool, UUID_A, 1, Some("5Faddr"), None, None).await; // address set -> servable
+        seed_ov(&pool, UUID_A, 2, None, Some(4096), None).await; // size>0 -> servable (mid-finalize)
+        seed_ov(&pool, UUID_A, 3, None, Some(0), Some("")).await; // abandoned-upload -> unservable
+        // no row for v4 -> unservable (deleted object)
+
+        assert!(store.is_version_servable(&part(UUID_A, 1, 1)).await.unwrap(), "address set is servable");
+        assert!(store.is_version_servable(&part(UUID_A, 2, 1)).await.unwrap(), "a real size is servable");
+        assert!(
+            !store.is_version_servable(&part(UUID_A, 3, 1)).await.unwrap(),
+            "the abandoned-upload shape is not"
+        );
+        assert!(
+            !store.is_version_servable(&part(UUID_A, 4, 1)).await.unwrap(),
+            "a missing row is not servable"
+        );
+    }
+
+    /// Inserts one `object_versions` row with explicit servability columns (address, size,
+    /// md5). Used by the `servable_parts` predicate tests where each disjunct matters.
+    async fn seed_ov(pool: &PgPool, object: &str, version: i64, address: Option<&str>, size_bytes: Option<i64>, md5: Option<&str>) {
+        sqlx::query("INSERT INTO buckets (bucket_id, bucket_name) VALUES ($1::uuid, 'b') ON CONFLICT DO NOTHING")
+            .bind(UUID_B)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO objects (object_id, bucket_id, object_key) VALUES ($1::uuid, $2::uuid, 'k') ON CONFLICT DO NOTHING")
+            .bind(object)
+            .bind(UUID_B)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO object_versions (object_id, object_version, address, size_bytes, md5_hash) VALUES ($1::uuid, $2, $3, $4, $5)")
+            .bind(object)
+            .bind(version)
+            .bind(address)
+            .bind(size_bytes)
+            .bind(md5)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// Inserts one `cephor_replication_status` row with an explicit node + status.
+    async fn seed_status_node(pool: &PgPool, object: &str, version: i64, number: i64, status: &str, node: &str) {
+        sqlx::query(
+            "INSERT INTO cephor_replication_status (object_id, version, part_number, status, node_id) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(object)
+        .bind(version)
+        .bind(number)
+        .bind(status)
+        .bind(node)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Inserts one `parts` row with an explicit `size_bytes`.
+    async fn seed_part_size(pool: &PgPool, object: &str, version: i64, number: i64, size_bytes: Option<i64>) {
+        sqlx::query("INSERT INTO parts (object_id, object_version, part_number, size_bytes) VALUES ($1::uuid, $2, $3, $4)")
+            .bind(object)
+            .bind(version)
+            .bind(number)
+            .bind(size_bytes)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn node_backlog_bytes_sums_only_this_nodes_pending_and_draining_parts(pool: PgPool) {
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone());
+
+        // node-a, undrained (pending+draining): counted -> 100 + 200 = 300.
+        seed_status_node(&pool, UUID_A, 1, 1, "pending", "node-a").await;
+        seed_part_size(&pool, UUID_A, 1, 1, Some(100)).await;
+        seed_status_node(&pool, UUID_A, 1, 2, "draining", "node-a").await;
+        seed_part_size(&pool, UUID_A, 1, 2, Some(200)).await;
+        // node-a terminal (replicated/failed): excluded — no longer undrained work.
+        seed_status_node(&pool, UUID_A, 1, 3, "replicated", "node-a").await;
+        seed_part_size(&pool, UUID_A, 1, 3, Some(999)).await;
+        seed_status_node(&pool, UUID_A, 1, 4, "failed", "node-a").await;
+        seed_part_size(&pool, UUID_A, 1, 4, Some(888)).await;
+        // A peer node's pending part: excluded (its bytes are its own node's backlog).
+        seed_status_node(&pool, UUID_B, 2, 1, "pending", "node-b").await;
+        seed_part_size(&pool, UUID_B, 2, 1, Some(500)).await;
+        // node-a pending with a NULL size and one with no parts row at all: both contribute 0.
+        seed_status_node(&pool, UUID_A, 1, 5, "pending", "node-a").await;
+        seed_part_size(&pool, UUID_A, 1, 5, None).await;
+        seed_status_node(&pool, UUID_A, 1, 6, "pending", "node-a").await; // no parts row
+
+        assert_eq!(store.node_backlog_bytes("node-a").await.unwrap(), 300);
+        assert_eq!(store.node_backlog_bytes("node-b").await.unwrap(), 500);
+        assert_eq!(
+            store.node_backlog_bytes("node-c").await.unwrap(),
+            0,
+            "a node with no rows has zero backlog"
+        );
+    }
+
+    #[sqlx::test]
     async fn claim_returns_none_when_nothing_is_pending(pool: PgPool) {
         let store = Store::from_pool(pool);
         assert!(store.claim_part().await.unwrap().is_none());
@@ -1128,6 +1567,67 @@ mod part_tests {
             store.claim_part().await.unwrap().is_none(),
             "a freshly-claimed draining part is still held, not re-claimable",
         );
+    }
+
+    #[sqlx::test]
+    async fn mark_corrupt_sets_the_corrupt_state_on_a_claimed_part(pool: PgPool) {
+        // R4: a servable object's persistent byte-mismatch is marked `corrupt` (held), distinct
+        // from `failed` (abandoned upload). Claim-fenced like mark_failed; clears claimed_at.
+        let store = Store::from_pool(pool);
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        let claimed = store.claim_part().await.unwrap().unwrap();
+        store
+            .mark_corrupt(&claimed, "chunk copy byte mismatch on a servable object")
+            .await
+            .unwrap();
+        assert_eq!(store.status(&p).await.unwrap(), Some(ReplicationState::Corrupt));
+    }
+
+    #[sqlx::test]
+    async fn redrive_resets_corrupt_parts_under_the_cap_and_holds_those_at_it(pool: PgPool) {
+        // The bounded re-drive: a `corrupt` part under the attempt cap is reset to `pending`
+        // (re-claimable, its attempt count bumped) so the drain re-copies from the intact SSD
+        // source; a part already at the cap is left `corrupt` (held + paged), never looping.
+        let store = Store::from_pool(pool.clone());
+        let under = part(UUID_A, 5, 1);
+        let at_cap = part(UUID_A, 5, 2);
+        seed_status_node(&pool, UUID_A, 5, 1, "corrupt", "test-node").await;
+        seed_status_node(&pool, UUID_A, 5, 2, "corrupt", "test-node").await;
+        sqlx::query("UPDATE cephor_replication_status SET corrupt_attempts = 3 WHERE object_id = $1 AND part_number = 2")
+            .bind(UUID_A)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let redriven = store.redrive_corrupt_parts(3).await.unwrap();
+        assert_eq!(redriven, 1, "only the under-cap corrupt part is re-driven");
+        assert_eq!(
+            store.status(&under).await.unwrap(),
+            Some(ReplicationState::Pending),
+            "re-driven back to pending"
+        );
+        assert_eq!(
+            store.status(&at_cap).await.unwrap(),
+            Some(ReplicationState::Corrupt),
+            "the capped part is held"
+        );
+        let bumped: i32 = sqlx::query_scalar("SELECT corrupt_attempts FROM cephor_replication_status WHERE object_id = $1 AND part_number = 1")
+            .bind(UUID_A)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(bumped, 1, "the re-drive increments the attempt counter");
+    }
+
+    #[sqlx::test]
+    async fn count_corrupt_parts_counts_only_this_nodes_corrupt_rows(pool: PgPool) {
+        let store = Store::from_pool(pool.clone());
+        seed_status_node(&pool, UUID_A, 5, 1, "corrupt", "test-node").await;
+        seed_status_node(&pool, UUID_A, 5, 2, "corrupt", "test-node").await;
+        seed_status_node(&pool, UUID_A, 5, 3, "failed", "test-node").await; // not corrupt
+        seed_status_node(&pool, UUID_B, 6, 1, "corrupt", "other-node").await; // a peer node
+        assert_eq!(store.count_corrupt_parts().await.unwrap(), 2, "counts only this node's corrupt rows");
     }
 
     #[sqlx::test]
@@ -1312,7 +1812,10 @@ mod part_tests {
         let p = part(UUID_A, 5, 1);
         assert!(store.claim_part().await.unwrap().is_none(), "no row exists before the reconcile");
 
-        let scanner = OnePart(DiscoveredPart { part: p.clone() });
+        let scanner = OnePart(DiscoveredPart {
+            part: p.clone(),
+            age: std::time::Duration::ZERO,
+        });
         let report = reconcile_parts(&scanner, &store).await.unwrap();
         assert_eq!(report.recovered, 1, "the dropped-trigger part was recovered to pending");
 
@@ -1355,7 +1858,10 @@ mod part_tests {
             "a NULL-node row is unclaimable by any node before adoption",
         );
 
-        let scanner = OnePart(DiscoveredPart { part: p.clone() });
+        let scanner = OnePart(DiscoveredPart {
+            part: p.clone(),
+            age: std::time::Duration::ZERO,
+        });
         let report = reconcile_parts(&scanner, &node_b).await.unwrap();
         assert_eq!(report.adopted, 1, "the legacy nodeless row was adopted by the scanning node");
 
@@ -1378,9 +1884,11 @@ mod part_tests {
             "CREATE TABLE buckets (bucket_id uuid PRIMARY KEY, bucket_name text NOT NULL)",
             "CREATE TABLE objects (object_id uuid PRIMARY KEY, bucket_id uuid NOT NULL, object_key text NOT NULL)",
             "CREATE TABLE object_versions (object_id uuid NOT NULL, object_version bigint NOT NULL, address text, \
+             size_bytes bigint, md5_hash text, \
              PRIMARY KEY (object_id, object_version))",
             "CREATE TABLE multipart_uploads (upload_id uuid PRIMARY KEY, object_id uuid, initiated_at timestamptz NOT NULL)",
-            "CREATE TABLE parts (object_id uuid NOT NULL, object_version bigint NOT NULL, part_number bigint NOT NULL, upload_id uuid)",
+            "CREATE TABLE parts (object_id uuid NOT NULL, object_version bigint NOT NULL, part_number bigint NOT NULL, \
+             size_bytes bigint, upload_id uuid)",
         ] {
             sqlx::query(ddl).execute(pool).await.unwrap();
         }

@@ -68,7 +68,9 @@ async def test_first_chunk_timeout_raises_download_not_ready() -> None:
         await asyncio.sleep(30)  # far longer than the 0.15s bound
         yield b"unreachable"
 
-    cfg = SimpleNamespace(stream_first_chunk_timeout_seconds=0.15, http_stream_prefetch_chunks=0)
+    cfg = SimpleNamespace(
+        stream_first_chunk_timeout_seconds=0.15, stream_chunk_timeout_seconds=300, http_stream_prefetch_chunks=0
+    )
     with _patched(cfg, _hanging):
         loop = asyncio.get_event_loop()
         t0 = loop.time()
@@ -87,7 +89,9 @@ async def test_warm_read_streams_all_chunks_including_the_peeked_first() -> None
         yield b"hello"
         yield b"world"
 
-    cfg = SimpleNamespace(stream_first_chunk_timeout_seconds=5, http_stream_prefetch_chunks=0)
+    cfg = SimpleNamespace(
+        stream_first_chunk_timeout_seconds=5, stream_chunk_timeout_seconds=300, http_stream_prefetch_chunks=0
+    )
     with _patched(cfg, _two):
         resp = await object_reader.read_response(
             db=None, redis=None, obj_cache=None, info=_info(), read_mode="auto", rng=None, address="a"
@@ -104,7 +108,9 @@ async def test_zero_byte_object_streams_empty_body() -> None:
         return
         yield b""  # pragma: no cover — makes this an async generator
 
-    cfg = SimpleNamespace(stream_first_chunk_timeout_seconds=5, http_stream_prefetch_chunks=0)
+    cfg = SimpleNamespace(
+        stream_first_chunk_timeout_seconds=5, stream_chunk_timeout_seconds=300, http_stream_prefetch_chunks=0
+    )
     with _patched(cfg, _empty):
         resp = await object_reader.read_response(
             db=None, redis=None, obj_cache=None, info=_info(), read_mode="auto", rng=None, address="a"

@@ -767,6 +767,23 @@ async def abort_multipart_upload(
                     async for key in redis_client.scan_iter(f"{base_key}:chunk:*"):
                         await redis_client.delete(key)
 
+        # Stop the drain churn BEFORE deleting the upload header. This aborted version's
+        # address will never be written, so its parts and the drain's
+        # cephor_replication_status rows would otherwise leak: the reconciler keeps
+        # re-recording them and the drain keeps re-claiming + re-copying + re-deferring the
+        # enqueue forever, on every node. Marking the version's replication rows terminal
+        # makes the reconciler skip them and claim_part never re-claim them, fleet-wide.
+        # Order matters: mark first so the churn-stop is durable even if we die before the
+        # delete below. The backstop for a thrown mark is the cephor-orphan SWEEP
+        # (list_orphan_replication_versions) — NOT the abandoned-upload reaper: the reaper
+        # keys on multipart_uploads, which the delete below removes, so it could never see
+        # this version again. The sweep keys on cephor_replication_status, which survives
+        # the delete, so it still finds and terminates the orphan.
+        # Skipped when the upload had no parts of its own (object_version is None).
+        if object_version is not None:
+            with contextlib.suppress(Exception):
+                await fail_version_replication(db, object_id=object_id, object_version=object_version)
+
         # Fully remove the multipart upload (and cascade parts) so it disappears from listings immediately
         async with db.transaction():
             await db.fetchrow(
@@ -774,18 +791,21 @@ async def abort_multipart_upload(
                 upload_id,
             )
 
-        # The aborted upload's version address will never be written, so its parts and
-        # the drain's cephor_replication_status rows would otherwise leak: the reconciler
-        # keeps re-recording them and the drain keeps re-claiming + re-copying +
-        # re-deferring the enqueue forever, on every node. Mark the version's replication
-        # rows terminal so the drain stops touching them fleet-wide, and best-effort
-        # delete the parts on THIS node's local cache (other nodes' copies are left to the
-        # orphan GC; the central mark already stopped their drain churn). Best-effort: a
-        # failure here is logged, not surfaced — the abandoned-upload reaper is the backstop.
-        # Skipped when the upload had no parts of its own (object_version is None).
+        # B5: drop the empty reserved object_versions row this aborted upload left behind and
+        # repoint current_object_version off it. Reads already fall back to the latest completed
+        # version, so this is DB hygiene (no data loss) — best-effort so a hiccup never fails the
+        # abort. Skipped when the upload had no version of its own.
         if object_version is not None:
             with contextlib.suppress(Exception):
-                await fail_version_replication(db, object_id=object_id, object_version=object_version)
+                await db.fetchrow(
+                    get_query("abort_cleanup_orphan_version"),
+                    object_id,
+                    object_version,
+                )
+
+        # Best-effort node-local cleanup: drop THIS node's cached parts (other nodes' copies
+        # are left to the orphan GC; the central mark above already stopped their churn).
+        if object_version is not None:
             with contextlib.suppress(Exception):
                 await request.app.state.fs_store.delete_object(str(object_id), int(object_version))
 
@@ -1095,6 +1115,9 @@ async def complete_multipart_upload(
             upload_id=str(upload_id),
             object_version=int(object_version),
             address=request.state.account.main_account,
+            # B1: the client's <Part> selection — the final object (bytes + ETag + size) reflects
+            # only these; a strict subset is recorded so the reader excludes the unlisted parts.
+            selected_parts=[pn for pn, _ in part_info],
         )
 
         # Drain-direct (s3-2.1 PR-11): the api does NOT enqueue the backend upload. It

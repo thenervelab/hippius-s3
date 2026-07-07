@@ -8,11 +8,14 @@ from datetime import timezone
 from fastapi import FastAPI
 from fastapi import File
 from fastapi import UploadFile
+from mock_faults import install_fault_controller
 from nacl.secret import SecretBox
 from pydantic import BaseModel
 
 
 app = FastAPI()
+# WI-19 §4.4: env/endpoint-toggled fault modes (500 / slow / fail-after-N). See mock_faults.py.
+fault = install_fault_controller(app, service="hippius-api")
 
 # Access key auth encryption setup
 # Uses the same test key as gateway: HIPPIUS_AUTH_ENCRYPTION_KEY
@@ -76,6 +79,7 @@ file_storage = {}
 
 @app.post("/storage-control/upload/", response_model=UploadResponse)
 async def upload_file(file: UploadFile = File(...), account_ss58: str = None):
+    await fault.gate("upload")
     content = await file.read()
     file_id = str(uuid.uuid4())
     size_bytes = len(content)
@@ -104,6 +108,7 @@ async def upload_file(file: UploadFile = File(...), account_ss58: str = None):
 
 @app.get("/storage-control/files/{file_id}/", response_model=FileStatusResponse)
 async def get_file_status(file_id: str):
+    await fault.gate("status")
     if file_id not in file_storage:
         upload_resp = file_storage.get(file_id)
         if not upload_resp:

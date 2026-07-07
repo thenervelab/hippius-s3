@@ -81,8 +81,8 @@ A **subsystem index** with links to per-directory `CLAUDE.md` files is in sectio
    - **Write FS meta** last ([object_writer.py:420](hippius_s3/writer/object_writer.py)) — `meta.json` is the "part complete" signal, so it must land after every chunk.
    - **Update object_versions** with final size/md5 ([object_writer.py:442](hippius_s3/writer/object_writer.py)). Until this runs, the download query skips the version — it's reserved but not serveable.
    - **Return**. Client sees 200 OK.
-9. **Enqueue upload** to `arion_upload_requests` Redis queue ([put_object_endpoint.py:162](hippius_s3/api/s3/objects/put_object_endpoint.py)).
-10. **Arion uploader worker** ([workers/run_arion_uploader_in_loop.py](workers/run_arion_uploader_in_loop.py)) picks up the request, reads chunks from FS, uploads to Arion, records `chunk_backend` rows, publishes to the Hippius chain via [hippius_s3/services/hippius_api_service.py](hippius_s3/services/hippius_api_service.py).
+9. **Persist the SSD address only** — the PUT path no longer enqueues an upload. Since the s3-2.1 drain-direct cutover the **Rust `hippius-drain` stack is the SOLE upload producer**: the API writes each part to node-local SSD + `object_versions.address`, and the drain enqueues an `UploadChainRequest` to `{backend}_upload_requests` only *after* it has replicated the part to the CephFS pool. (The old `hippius_s3/writer/queue.py:enqueue_upload` PUT-path producer was dead and has been removed.)
+10. **Arion uploader worker** ([workers/run_arion_uploader_in_loop.py](workers/run_arion_uploader_in_loop.py)) picks up the drain-produced request, reads chunks from FS, uploads to Arion, records `chunk_backend` rows, publishes to the Hippius chain via [hippius_s3/services/hippius_api_service.py](hippius_s3/services/hippius_api_service.py).
 
 ### 3.2 GET (full object or Range)
 

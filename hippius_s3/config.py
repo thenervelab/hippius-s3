@@ -203,6 +203,12 @@ class Config:
     # backend) from hanging the whole request up to cache_ttl_seconds (~1h). Later chunks keep the
     # full wait — once the first chunk lands the object is actively draining.
     stream_first_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS:90", convert=int)
+    # A3: bound on how long the streamer waits for EACH subsequent chunk (after the first). Without
+    # it a later chunk whose backend fetch permanently fails stalls the already-committed 200
+    # response up to cache_ttl_seconds (~1h) mid-stream; this caps that to a bounded fail (the
+    # stream breaks and the client retries). Generous (5 min) so a healthy-but-slow drain never
+    # trips it, but far below the 1h cache TTL.
+    stream_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_CHUNK_TIMEOUT_SECONDS:300", convert=int)
     # Hot-retention window for the FS cache: chunks read within this window
     # are protected from janitor deletion so frequently-accessed content
     # stays on NVMe. Touched on every read by the API/streamer.
@@ -234,9 +240,11 @@ class Config:
     # When multiple streamers hit a cache miss on the same part concurrently,
     # only one enqueues a DownloadChainRequest; the others wait via pub/sub.
     # The Redis lock that enforces this is cleared by the downloader on
-    # completion, and this TTL caps the worst-case hang if the downloader
-    # crashes mid-request.
-    download_coalesce_lock_ttl_seconds: int = env("DOWNLOAD_COALESCE_LOCK_TTL:120", convert=int)
+    # completion (compare-and-delete on the enqueuer's token, A5), and this TTL
+    # caps the worst-case hang if the downloader crashes mid-request. Raised to
+    # 600s (A5) so a legitimately slow multi-chunk part download does not expire
+    # the lock mid-flight and let a second streamer enqueue a duplicate DCR.
+    download_coalesce_lock_ttl_seconds: int = env("DOWNLOAD_COALESCE_LOCK_TTL:600", convert=int)
 
     # Crypto configuration
     # hip-enc/legacy: SecretBox per-chunk (legacy objects)
@@ -300,10 +308,33 @@ class Config:
     # initiation) — a user can pause a multipart upload and resume it, so the window must
     # exceed a realistic pause. 2 days gives leeway over a full-day pause + resume.
     mpu_stale_seconds: int = env("HIPPIUS_MPU_STALE_SECONDS:172800", convert=int)  # 2 days
+    # Idle grace before an orphaned cephor_replication_status version (pending/draining,
+    # unservable) is swept to `failed` AND counted by the janitor's aged-pending-orphan gauge.
+    # MUST be the same value for both so the gauge counts EXACTLY the population the sweep can
+    # clear (otherwise the gauge reads non-zero forever). Defaults to mpu_stale_seconds so the
+    # leak backstop can be tuned independently of the abandoned-MPU reaper's own window.
+    mpu_sweep_grace_seconds: int = env("HIPPIUS_MPU_SWEEP_GRACE_SECONDS:172800", convert=int)  # 2 days
     # How often the abandoned-multipart-upload reaper sweeps. The reaper auto-aborts
     # never-finalized uploads older than mpu_stale_seconds (address never written),
     # purging their SSD parts + drain replication rows so the drain stops re-deferring.
     mpu_reaper_interval_seconds: int = env("HIPPIUS_MPU_REAPER_INTERVAL_SECONDS:120", convert=int)  # every 2 min
+    # Replication SLA grace for the G2 under-replication sentinel. `address` is stamped at
+    # PUT completion but the chunk_backend coverage row is written much later by the async
+    # drain→pool→backend pipeline, so every servable chunk is briefly under-covered while it
+    # replicates NORMALLY. The sentinel only counts a servable, under-covered chunk once its
+    # part landed (parts.uploaded_at) longer ago than this window — comfortably above normal
+    # drain→backend replication latency — so in-flight replication is excluded and only
+    # genuinely-stuck chunks page. Default 15m as a wide margin over the sub-minute latency
+    # replication normally takes when the drain is not backlogged.
+    # CAVEAT: this is a fixed WALL-CLOCK window, so it cannot distinguish "stuck" from "slow
+    # under load" — under a sustained upload spike or a partial drain slowdown, NORMAL in-flight
+    # replication can legitimately exceed 15m and re-trip the false page this grace exists to
+    # remove (a queue-depth/backlog signal would; a clock cannot). It is env-tunable via
+    # HIPPIUS_REPLICATION_SLA_SECONDS precisely so an operator can widen it for a known-slow
+    # backlog rather than eat spurious pages. The resulting detection latency for a genuinely
+    # stuck chunk (~SLA + the alert's for:10m ≈ 25m) is a deliberate, acceptable tradeoff for a
+    # sentinel whose gap only bites under disk-pressure eviction, not at the moment of the stall.
+    replication_sla_seconds: int = env("HIPPIUS_REPLICATION_SLA_SECONDS:900", convert=int)  # 15 min
     # Bounded concurrency for the janitor's per-part DB checks + deletes. The
     # cleanup loops are DB-roundtrip bound; this is how many parts are processed
     # in parallel (each over its own pooled connection).

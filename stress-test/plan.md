@@ -237,7 +237,8 @@ these; it does not replace them.
   fault modes.** This must be built.
 - **Build (`tests/e2e/support/compose.py` + `compose/docker-compose.faults.yml`):**
   - `add_toxic()` / `_ensure_redis_proxy()` helpers; toxiproxy proxies fronting **redis-queues** and **Postgres**;
-    toxics: `latency`, `timeout`, `bandwidth/limit_data`, `reset_peer`, `slicer` (truncation for F8).
+    toxics: `latency`, `timeout`, `bandwidth`, `limit_data` (truncated body for F8), `reset_peer`
+    (`slicer` only fragments the TCP stream and preserves every byte — it does NOT corrupt/truncate).
   - **`noeviction` override overlay** for e2e redis-queues (flip from `allkeys-lru` → `noeviction` to match prod).
   - Mock fault modes on `Dockerfile.mock-{arion,kms,hippius-api}`: env/endpoint-toggled `500` / `slow` / truncated-body /
     fail-after-N / `can_upload=false`.
@@ -260,7 +261,7 @@ these; it does not replace them.
   | F5 SSD fill pressure/critical | clean 503 SlowDown; replication gate absolute | 503 ceases ≤ 2 min | `fallocate`/`dd`; Chaos Mesh disk-fill |
   | F6 postgres failover | leadership unaffected; breaker not tripped by PG-only fault | query ≤ 20 s; drain ≤ 10 min | toxiproxy PG proxy / CNPG switchover |
   | F7 clock skew (disposable pods only) | single-leader + epoch-mono | stable ≤ 2 min | Chaos Mesh TimeChaos (per-container) |
-  | F8 corrupt/partial chunk on SSD | never commit corrupt as `replicated`; blast-radius = 1 part | detect ≤ 5 s; reclaim ≤ 1 h | toxiproxy `slicer` / dm-flakey `corrupt_bio_byte` |
+  | F8 corrupt/partial chunk on SSD | never commit corrupt as `replicated`; blast-radius = 1 part | detect ≤ 5 s; reclaim ≤ 1 h | toxiproxy `limit_data` (truncated body) / Chaos Mesh IOChaos `mistake` |
 - **F2 is the headline** — 3 sub-injections: (a) clean SIGTERM → graceful relinquish; (b) NetworkPolicy partition-then-heal
   → forces a stale-epoch write, must be `Fenced`; (c) transient 2-replica race + optional toxiproxy Redis latency. Assert:
   `sum(drain_leader) ≤ 1` every sample, `cephor:epoch` strictly increasing, zero alloc keys below current epoch after a

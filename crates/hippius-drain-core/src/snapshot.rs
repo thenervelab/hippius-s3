@@ -92,6 +92,14 @@ pub struct AgentSnapshot {
     /// `failed` (broken/abandoned-upload) SSD parts the reclaim worker unlinked — the
     /// SSD-ingest tier's eviction throughput, distinct from the drain's `CephFS` work.
     pub reclaimed: u64,
+    /// Claims handed back un-drained because the breaker/throttle `Denied` the tick (the
+    /// pool is unhealthy or the write budget is spent). NOT a drain outcome — no part moved
+    /// — but the loop DID cycle, so the readiness tracker folds it into `processed`: a
+    /// pool-wide Ceph outage trips the breaker on every claim, and without this the agent
+    /// would record zero progress and flip `NotReady` even though it is healthily backing off
+    /// (a wedge, not an outage, is what readiness must catch). Kept out of `error_bps` (a
+    /// throttle is not a Ceph-write failure), exactly like `deferred`.
+    pub throttled: u64,
 }
 
 impl AgentSnapshot {
@@ -126,11 +134,25 @@ pub struct SnapshotCell {
     deferred: AtomicU64,
     reconciler_recovered: AtomicU64,
     reclaimed: AtomicU64,
+    throttled: AtomicU64,
     /// Current SSD backlog (undrained bytes) — a LEVEL, not a monotonic counter, so it
     /// has its own atomic (set, not accumulated) rather than living in [`AgentSnapshot`].
     /// The heartbeat worker writes it (`usage.used_bytes`) each tick; the metrics layer
     /// reads it as a gauge. Kept off the wait-free `load` path so a scrape never blocks.
     backlog_bytes: AtomicU64,
+    /// Current SSD disk saturation in basis points (`0..=10000` = `0.0..=1.0` full) — a
+    /// LEVEL like `backlog_bytes`, set each heartbeat from the same `statvfs` probe. This
+    /// is the fill fraction that 503s every PUT once it crosses the api's cutoff, so it is
+    /// the operational alert signal; distinct from `backlog_bytes` (undrained WORK), since
+    /// a leak can fill the disk without any drain demand. bps not f64 so the gauge stays a
+    /// plain atomic; the metrics layer scales it to a 0..1 fraction.
+    disk_pressure_bps: AtomicU64,
+    /// Count of parts currently held `corrupt` on this node — a LEVEL, set each cycle by the
+    /// re-drive pass from `Store::count_corrupt_parts`. A nonzero value is a live object whose
+    /// pool copy is corrupt, kept alive only by its SSD source: a durability incident (R4), so
+    /// it is exported as the `drain_corrupt_parts` gauge and alerted, distinct from the drain's
+    /// routine failure counters.
+    corrupt_parts: AtomicU64,
     /// Recent drain latencies, behind a `Mutex` because a percentile needs the
     /// whole window (no single atomic suffices). Off the wait-free `load` path.
     latency: Mutex<LatencyWindow>,
@@ -169,6 +191,13 @@ impl SnapshotCell {
         self.reclaimed.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Records `n` claims handed back because the breaker/throttle denied the tick. Counts
+    /// as liveness progress (the loop cycled) but is not a drain outcome — see
+    /// [`AgentSnapshot::throttled`].
+    pub fn record_throttled(&self, n: u64) {
+        self.throttled.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Records the current SSD backlog (undrained bytes). A gauge: `store`, not add.
     pub fn record_backlog(&self, bytes: u64) {
         self.backlog_bytes.store(bytes, Ordering::Relaxed);
@@ -178,6 +207,31 @@ impl SnapshotCell {
     #[must_use]
     pub fn backlog(&self) -> u64 {
         self.backlog_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Records the current SSD disk saturation in basis points (`0..=10000`). A gauge:
+    /// `store`, not add. The heartbeat writes it from the `statvfs` pressure each tick.
+    pub fn record_disk_pressure(&self, bps: u16) {
+        self.disk_pressure_bps.store(u64::from(bps), Ordering::Relaxed);
+    }
+
+    /// The last-recorded SSD disk saturation in basis points (the `drain_ssd_pressure`
+    /// gauge source). Clamped to `10000` should a wider value ever be stored.
+    #[must_use]
+    pub fn disk_pressure_bps(&self) -> u16 {
+        u16::try_from(self.disk_pressure_bps.load(Ordering::Relaxed)).unwrap_or(10_000)
+    }
+
+    /// Records the current count of parts held `corrupt` on this node. A gauge: `store`, not
+    /// add. The re-drive pass writes it each cycle from `Store::count_corrupt_parts`.
+    pub fn record_corrupt(&self, count: u64) {
+        self.corrupt_parts.store(count, Ordering::Relaxed);
+    }
+
+    /// The last-recorded count of `corrupt`-held parts (the `drain_corrupt_parts` gauge source).
+    #[must_use]
+    pub fn corrupt_parts(&self) -> u64 {
+        self.corrupt_parts.load(Ordering::Relaxed)
     }
 
     /// Records a completed drain's latency for the windowed p99 estimate.
@@ -205,6 +259,7 @@ impl SnapshotCell {
             deferred: self.deferred.load(Ordering::Relaxed),
             reconciler_recovered: self.reconciler_recovered.load(Ordering::Relaxed),
             reclaimed: self.reclaimed.load(Ordering::Relaxed),
+            throttled: self.throttled.load(Ordering::Relaxed),
         }
     }
 }
@@ -247,6 +302,16 @@ mod tests {
     }
 
     #[test]
+    fn disk_pressure_is_a_settable_gauge_in_basis_points() {
+        let cell = SnapshotCell::new();
+        assert_eq!(cell.disk_pressure_bps(), 0, "a fresh cell reports no disk pressure");
+        cell.record_disk_pressure(8500); // 85% full
+        assert_eq!(cell.disk_pressure_bps(), 8500);
+        cell.record_disk_pressure(200);
+        assert_eq!(cell.disk_pressure_bps(), 200, "disk pressure is a level: a later record replaces");
+    }
+
+    #[test]
     fn records_accumulate_per_counter() {
         let cell = SnapshotCell::new();
         cell.record_drained(3);
@@ -254,6 +319,7 @@ mod tests {
         cell.record_failed(1);
         cell.record_reconciled(4);
         cell.record_reclaimed(6);
+        cell.record_throttled(9);
         assert_eq!(
             cell.load(),
             AgentSnapshot {
@@ -262,8 +328,22 @@ mod tests {
                 deferred: 0,
                 reconciler_recovered: 4,
                 reclaimed: 6,
+                throttled: 9,
             },
         );
+    }
+
+    #[test]
+    fn throttled_records_accumulate_without_polluting_error_bps() {
+        // A breaker/throttle denial is liveness progress (the loop cycled) but not a
+        // Ceph-write failure, so — like `deferred` — it must stay out of error_bps.
+        let cell = SnapshotCell::new();
+        cell.record_drained(7);
+        cell.record_failed(3);
+        cell.record_throttled(40);
+        let snap = cell.load();
+        assert_eq!(snap.throttled, 40, "throttled ticks are counted for readiness/visibility");
+        assert_eq!(snap.error_bps(), 3000, "throttled ticks stay out of the Ceph failure rate");
     }
 
     #[test]
@@ -296,6 +376,7 @@ mod tests {
             deferred: 0,
             reconciler_recovered: 0,
             reclaimed: 0,
+            throttled: 0,
         };
         assert_eq!(snapshot.error_bps(), 10_000);
     }
@@ -308,6 +389,7 @@ mod tests {
             deferred: 0,
             reconciler_recovered: 0,
             reclaimed: 0,
+            throttled: 0,
         };
         // 3 failed attempts of 10 total attempts = 30%, i.e. 3000 basis points.
         assert_eq!(snapshot.error_bps(), 3000);

@@ -326,6 +326,15 @@ class ArionClient:
         )
 
         logger.info(f"Raw response content {response.content}")
+        # B3: a DELETE of an already-absent pin is a SUCCESS (idempotent). Without this, a 404
+        # raises → the unpinner (A9) re-raises → retries → re-DELETEs the now-gone object → 404
+        # again, looping to the DLQ while the chunk_backend row stays deleted=false forever
+        # (zombie). Returning success lets the unpinner proceed to soft-delete the row.
+        if response.status_code == 404:
+            logger.info(f"unpin_file: {file_id} already absent (404) — treating as deleted (idempotent)")
+            return DeleteSuccessResponse(
+                Success=DeleteResult(status="already_deleted", file_id=file_id, user_id=account_ss58)
+            )
         response.raise_for_status()
         response_json = response.json()
 

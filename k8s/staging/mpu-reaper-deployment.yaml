@@ -29,6 +29,41 @@ spec:
             - sh
             - -c
             - until nc -z postgres-rw 5432 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
+        # D1/A18: the reaper writes cephor_replication_status (Rust-owned, NOT in the Python
+        # migrations — the drain allocator owns those tables). The port-check above only proves
+        # postgres is reachable, so on a fresh-namespace `apply` the reaper would start against a
+        # missing table and CrashLoop until the allocator catches up. Gate on the actual schema,
+        # mirroring the drain-agent DaemonSet's initContainer (to_regclass is NULL, not an error,
+        # for an absent table).
+        - name: wait-for-cephor-schema
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h postgres-rw -p 5432; do echo "waiting for postgres"; sleep 3; done
+              until [ "$(psql "$CEPHOR_DATABASE_URL" -tAc "SELECT to_regclass('public.cephor_replication_status') IS NOT NULL")" = "t" ]; do
+                echo "waiting for the cephor schema (allocator migration)"; sleep 3
+              done
+          env:
+            - name: CEPHOR_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+        # D2: the cephor gate above covers only the Rust-owned schema; the reaper also reads the
+        # Python-migrated object_versions/parts/multipart_uploads. Wait for those migrations too.
+        - name: wait-for-migrations
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          command:
+            - python
+            - scripts/wait_for_migrations.py
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
       containers:
         - name: mpu-reaper
           image: ghcr.io/thenervelab/hippius-s3/workers:latest

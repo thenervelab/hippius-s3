@@ -1,0 +1,2 @@
+# harness runtime deps (the repo .venv already has boto3 + asyncpg; this pins the S3 client)
+boto3>=1.40

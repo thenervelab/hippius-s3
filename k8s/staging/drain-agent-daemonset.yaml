@@ -202,6 +202,21 @@ spec:
             periodSeconds: 20
             timeoutSeconds: 5
             failureThreshold: 3
+          # C8: NotReady when the drain is WEDGED — a hung CephFS write stalls draining while
+          # liveness (process-alive) stays fresh. The agent touches this file only while the drain
+          # is PROGRESSING (or idle); a wedged loop lets it go stale. Unlike liveness this does NOT
+          # restart the pod (a wedge is not a crash) — it marks the node NotReady so a rolling
+          # update does not step over stuck nodes and the wedge surfaces in pod status.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'f=/tmp/hippius-drain-agent.ready; test -f "$f" && [ $(( $(date +%s) - $(stat -c %Y "$f") )) -lt 45 ]'
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
       volumes:
         - name: local-ingest
           hostPath:

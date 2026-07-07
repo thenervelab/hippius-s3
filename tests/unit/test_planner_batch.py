@@ -125,6 +125,21 @@ async def test_plan_skips_zero_size_parts():
 
 
 @pytest.mark.asyncio
+async def test_plan_part_with_size_but_zero_chunk_size_uses_fallback():
+    # A6: a part with real bytes but a missing/zero chunk_size_bytes (DB inconsistency) must be
+    # PLANNED using the 4 MiB fallback (matching the downloader), not silently dropped — dropping
+    # it would truncate the response while Content-Length still counts its bytes.
+    db = FakeDB([{"part_number": 1, "size_bytes": 5_000_000, "chunk_size_bytes": 0}])
+    parts = [{"part_number": 1}]
+
+    plan = await build_chunk_plan(db, "obj1", parts, None, object_version=1)
+
+    # 5_000_000 bytes over a 4 MiB (4194304) fallback chunk = 2 chunks (not 0 = dropped).
+    assert len(plan) == 2
+    assert [p.chunk_index for p in plan] == [0, 1]
+
+
+@pytest.mark.asyncio
 async def test_plan_empty_parts():
     db = FakeDB([])
     plan = await build_chunk_plan(db, "obj1", [], None, object_version=1)

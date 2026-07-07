@@ -65,6 +65,9 @@ _KMS_CLIENT_LOCK = asyncio.Lock()
 # Table initialization tracking
 _TABLES_ENSURED = False
 _TABLES_LOCK = asyncio.Lock()
+# C3: transaction-scoped advisory-lock key that serializes the lazy bucket_keks DDL across pods.
+# Arbitrary stable constant ("bukek" as hex) — only has to be unique among this DB's advisory locks.
+_BUCKET_KEKS_DDL_ADVISORY_KEY = 0x62756B656B
 
 
 async def _get_pool(dsn: str) -> asyncpg.Pool:
@@ -278,6 +281,31 @@ async def _unwrap_kek(
             raise RuntimeError("kms_error") from e
 
 
+# A14: per-(bucket, kek) singleflight so N concurrent cold cache-misses (e.g. a burst of GETs
+# on one bucket right after a cache flush) coalesce into ONE KMS unwrap instead of N. The lock
+# only guards the unwrap; the cache read/write around it is unchanged. Process-local (one per
+# API pod), which is where the KMS-call fan-out is.
+_kek_unwrap_locks: dict[tuple[str, str], asyncio.Lock] = {}
+# Cap the map so it can't grow unbounded across the life of a pod fronting many buckets×KEKs.
+# When exceeded, drop the IDLE locks (nothing holding or awaiting them) — losing an idle lock is
+# harmless (it only optimizes a cache fill; at worst two cold misses race one extra KMS unwrap).
+_KEK_LOCK_MAP_MAX = 4096
+
+
+def _kek_unwrap_lock(bucket_id: str, kek_id: uuid.UUID) -> asyncio.Lock:
+    key = (str(bucket_id), str(kek_id))
+    lock = _kek_unwrap_locks.get(key)
+    if lock is None:
+        if len(_kek_unwrap_locks) >= _KEK_LOCK_MAP_MAX:
+            # asyncio is single-threaded, so a `locked()` lock is genuinely in use right now;
+            # rebuild keeping only those (plus, below, the fresh one for this key).
+            for k in [k for k, v in _kek_unwrap_locks.items() if not v.locked()]:
+                del _kek_unwrap_locks[k]
+        lock = asyncio.Lock()
+        _kek_unwrap_locks[key] = lock
+    return lock
+
+
 async def _get_cached_kek(bucket_id: str, kek_id: uuid.UUID) -> bytes | None:
     cfg = get_config()
     ttl = int(cfg.kek_cache_ttl_seconds)
@@ -342,9 +370,20 @@ async def _ensure_tables(conn: asyncpg.Connection) -> None:
     Schema:
     - wrapped_kek_bytes: Encrypted KEK bytes (NOT NULL)
     - kms_key_id: "local" or KMS key UUID (NOT NULL)
+
+    C3: `CREATE TABLE IF NOT EXISTS` is NOT race-free under concurrency — when several pods
+    cold-start together they can all observe the table missing and collide in pg_class/pg_type,
+    and one raises "duplicate key"/"relation already exists", surfacing as a transient 500 on the
+    first GET/PUT after a deploy. Postgres runs a multi-statement SIMPLE query as ONE implicit
+    transaction, so prefixing this DDL with `pg_advisory_xact_lock` makes the whole check-and-create
+    atomic fleet-wide — no explicit `conn.transaction()` needed. The lock key is inlined as a literal
+    because the simple-query protocol (multi-statement, no args) takes no parameters. The DDL stays
+    here (rather than a dbmate migration) because bucket_keks lives in the KEYSTORE database, which
+    the migrator (DATABASE_URL only) does not target when it is a separate DB.
     """
     await conn.execute(
-        """
+        f"""
+        SELECT pg_advisory_xact_lock({_BUCKET_KEKS_DDL_ADVISORY_KEY});
         CREATE TABLE IF NOT EXISTS bucket_keks (
             bucket_id UUID NOT NULL,
             kek_id UUID PRIMARY KEY,
@@ -427,13 +466,18 @@ async def get_or_create_active_bucket_kek(
             if cached is not None:
                 return kek_id, cached
 
-            # Unwrap the KEK
-            wrapped_kek_bytes = row["wrapped_kek_bytes"]
-            kms_key_id = row["kms_key_id"]
-            kek_bytes = await _unwrap_kek(bytes(wrapped_kek_bytes), kms_key_id, kek_id)
-
-            await _set_cached_kek(bucket_id, kek_id, kek_bytes)
-            return kek_id, kek_bytes
+            # A14 singleflight: coalesce concurrent cold misses. Hold the per-key lock, then
+            # RE-CHECK the cache — the first waiter's unwrap+cache means every later waiter hits
+            # the cache and skips its own KMS call.
+            async with _kek_unwrap_lock(bucket_id, kek_id):
+                cached = await _get_cached_kek(bucket_id, kek_id)
+                if cached is not None:
+                    return kek_id, cached
+                wrapped_kek_bytes = row["wrapped_kek_bytes"]
+                kms_key_id = row["kms_key_id"]
+                kek_bytes = await _unwrap_kek(bytes(wrapped_kek_bytes), kms_key_id, kek_id)
+                await _set_cached_kek(bucket_id, kek_id, kek_bytes)
+                return kek_id, kek_bytes
 
         # Create new KEK (KMS generates the key, or we generate locally)
         kek_id = uuid.uuid4()

@@ -14,6 +14,7 @@ import pytest
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from hippius_s3.cache.notifier import ChunkNotifier
+from hippius_s3.cache.notifier import ChunkNotReadyError
 from hippius_s3.cache.notifier import build_chunk_key
 
 
@@ -245,6 +246,6 @@ async def test_wait_gives_up_if_retry_also_misses() -> None:
         redis.pubsub_instance.inject_message(f"notify:{build_chunk_key(OBJ, 1, 1, 0)}")
 
     worker = asyncio.create_task(simulate_worker())
-    with pytest.raises(RuntimeError, match="missing after pub/sub"):
+    with pytest.raises(ChunkNotReadyError, match="missing after pub/sub"):
         await notifier.wait_for_chunk(OBJ, 1, 1, 0, fetch_fn=fetch, timeout=1.0)
     await worker

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import uuid
 from datetime import datetime
@@ -203,12 +204,29 @@ async def handle_put_object(
             "put_object.persist_upload_address",
             attributes={"upload_id": str(put_res.upload_id), "has_upload_id": True},
         ):
-            await set_object_version_address(
-                request.app.state.postgres_pool,
-                object_id=str(put_res.object_id),
-                object_version=int(put_res.object_version),
-                address=request.state.account.main_account,
-            )
+            try:
+                await set_object_version_address(
+                    request.app.state.postgres_pool,
+                    object_id=str(put_res.object_id),
+                    object_version=int(put_res.object_version),
+                    address=request.state.account.main_account,
+                )
+            except Exception:
+                # B4: the version was made serveable (size/md5 written) BEFORE the drain address
+                # landed. If the address write fails, a GET would serve an object the drain can
+                # never back (no address → never enqueued → never replicated) and the janitor can
+                # never evict (no chunk_backend). Mark it unserveable (the reserved-row shape) so
+                # reads skip it and the A21 sweep + SSD reclaim clean up its parts; then surface
+                # the failure (is_completed stays FALSE, so DELETE-cascade cleanup also applies).
+                with contextlib.suppress(Exception):
+                    async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
+                        await conn.execute(
+                            "UPDATE object_versions SET size_bytes = 0, md5_hash = '' "
+                            "WHERE object_id = $1 AND object_version = $2",
+                            str(put_res.object_id),
+                            int(put_res.object_version),
+                        )
+                raise
 
         # Mark upload completed only AFTER the address is persisted. If that fails above, this is
         # skipped so the row stays is_completed=FALSE and remains eligible for the DELETE cascade

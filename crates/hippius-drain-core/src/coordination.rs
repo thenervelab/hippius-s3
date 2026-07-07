@@ -10,10 +10,12 @@
 //! when Ceph degrades — the very scenario the drain exists for — PG's WAL fsync spikes, and
 //! the coordinator must not need PG to write down what it is doing.
 //!
-//! The F4 leader-epoch fence is preserved verbatim: the epoch lives in the lease value
-//! (bumped on every takeover via an `INCR` counter), and an allocation write is
-//! compare-and-set against each node's stored epoch in ONE atomic Lua `EVAL`, so a deposed
-//! or partitioned leader can never overwrite a live leader's budgets.
+//! The F4 leader-epoch fence: the epoch lives in the lease value (bumped on every takeover
+//! via an `INCR` counter), and an allocation write is a compare-and-set in ONE atomic Lua
+//! `EVAL` against BOTH the current-era counter (`cephor:epoch`, the R3 anchor — bumped at
+//! election before any slow tick work) AND each node's stored epoch, so a deposed or
+//! partitioned leader can never overwrite a live leader's budgets — including in the window
+//! after a successor is elected but before it has written any allocation.
 
 use crate::alloc::Allocation;
 use crate::alloc::FleetView;
@@ -75,15 +77,31 @@ end
 return 1
 ";
 
-/// Fenced per-node allocation write. `KEYS`=the alloc keys (one per node); `ARGV[1]`=epoch,
-/// `ARGV[2]`=ttl secs, `ARGV[3..]`=the budget for each key (parallel to `KEYS`). Returns 0 —
-/// writing NOTHING — if ANY node's stored epoch is higher (this leader is deposed), else
-/// writes every key and returns 1. The two passes (check all, then write all) make the
-/// fence plan-wide and atomic: a split-brain leader cannot partially overwrite budgets.
+/// Fenced per-node allocation write. `KEYS[1]`=the epoch counter (`cephor:epoch`);
+/// `KEYS[2..]`=the alloc keys (one per node); `ARGV[1]`=epoch, `ARGV[2]`=ttl secs,
+/// `ARGV[3..]`=the budget for each alloc key (parallel to `KEYS[2..]`). Returns 0 — writing
+/// NOTHING — if this leader is deposed, else writes every alloc key and returns 1.
+///
+/// The deposed test is TWO checks, both against `epoch`:
+/// 1. **Current-era fence (R3):** the counter at `KEYS[1]` is `INCR`'d to the new era the
+///    instant a successor wins the lease ([`LEASE_SCRIPT`]), BEFORE it does any slow work
+///    (`load_fleet`/`ceiling`) or writes any alloc key. So a deposed leader that finishes a
+///    slow tick and writes at its stale epoch is rejected here even when NO alloc key has
+///    been written at the new era yet — the window a per-alloc-key check alone misses.
+/// 2. **Per-alloc-key fence:** reject if any node's already-stored epoch is higher. Kept as
+///    a secondary guard (and the sole guard for a direct write made without a prior election,
+///    e.g. in tests, where `KEYS[1]` is absent).
+///
+/// The passes (check all, then write all) make the fence plan-wide and atomic: a split-brain
+/// leader cannot partially overwrite budgets.
 const WRITE_ALLOC_SCRIPT: &str = r"
 local epoch = tonumber(ARGV[1])
 local ttl = ARGV[2]
-for i = 1, #KEYS do
+local current = redis.call('GET', KEYS[1])
+if current and tonumber(current) > epoch then
+  return 0
+end
+for i = 2, #KEYS do
   local cur = redis.call('GET', KEYS[i])
   if cur then
     local v = cjson.decode(cur)
@@ -92,8 +110,8 @@ for i = 1, #KEYS do
     end
   end
 end
-for i = 1, #KEYS do
-  redis.call('SET', KEYS[i], cjson.encode({budget = ARGV[2 + i], epoch = epoch}), 'EX', ttl)
+for i = 2, #KEYS do
+  redis.call('SET', KEYS[i], cjson.encode({budget = ARGV[1 + i], epoch = epoch}), 'EX', ttl)
 end
 return 1
 ";
@@ -384,6 +402,8 @@ impl Coordinator {
         let mut conn = self.conn.clone();
         let script = redis::Script::new(WRITE_ALLOC_SCRIPT);
         let mut invocation = script.prepare_invoke();
+        // KEYS[1] is the epoch counter (the current-era fence anchor); the alloc keys follow.
+        invocation.key(self.epoch_key());
         for allocation in allocations {
             invocation.key(self.alloc_key(&allocation.node));
         }
@@ -629,6 +649,56 @@ mod tests {
             c.load_allocation(&node).await.unwrap().unwrap().budget,
             ByteRate::new(2_000),
             "only the new leader's budget stands after a lost-lease takeover",
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
+    async fn a_deposed_leaders_stale_write_is_fenced_before_the_successor_writes_any_alloc() {
+        // R3: the fence must reject a deposed leader's write even when the successor has NOT
+        // written any alloc key yet — the anchor is `cephor:epoch` (bumped at election), not a
+        // previously-written alloc value. Every OTHER fence test pre-seeds a higher-epoch alloc
+        // key before the stale write, so this exact window is otherwise never exercised.
+        let Some(c) = coord("cephor-test:r3-window:", Duration::from_secs(30), Duration::from_secs(30)).await else {
+            eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");
+            return;
+        };
+        let node = NodeId::from_str("n1").unwrap();
+        let alloc = |budget| Allocation {
+            node: node.clone(),
+            budget: ByteRate::new(budget),
+        };
+
+        // A wins a SHORT lease (epoch eA, which bumps cephor:epoch to eA) and writes a budget.
+        let a = c
+            .acquire_or_renew_leadership("a", Duration::from_secs(1))
+            .await
+            .unwrap()
+            .expect("a leads");
+        c.write_allocations(a.epoch, std::slice::from_ref(&alloc(1_000))).await.unwrap();
+
+        // A's lease lapses; B takes over — cephor:epoch is now eB > eA. Crucially B has done NO
+        // allocation write yet (it is mid-tick: load_fleet → ceiling → allocate). The alloc key
+        // therefore still carries eA, so the per-alloc-key check alone would NOT fence A.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let b = c
+            .acquire_or_renew_leadership("b", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .expect("b takes over");
+        assert!(b.epoch > a.epoch, "takeover bumps the epoch ({} > {})", b.epoch, a.epoch);
+
+        // The deposed A finishes its slow tick and writes at its stale epoch. PRE-FIX this
+        // slips through (alloc key holds eA, not > eA); the current-era fence rejects it.
+        let err = c.write_allocations(a.epoch, std::slice::from_ref(&alloc(9_999))).await.unwrap_err();
+        assert!(
+            matches!(err, super::CoordError::Fenced { epoch } if epoch == a.epoch),
+            "the deposed leader's stale write is fenced by the current era, got {err:?}"
+        );
+        assert_eq!(
+            c.load_allocation(&node).await.unwrap().unwrap().budget,
+            ByteRate::new(1_000),
+            "the fenced stale write did not overwrite the budget",
         );
     }
 }

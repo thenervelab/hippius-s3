@@ -381,3 +381,323 @@ groups:
           description: 'A DLQ hit HIPPIUS_DLQ_MAX_ENTRIES and is dropping failure records (drop-newest). This drops the failure record, not object data (janitor replication gate still protects chunks); durable trace is object_versions.status. Drain the DLQ immediately via scripts/dlq_requeue.py.'
         labels:
           severity: critical
+
+  - orgId: 1
+    name: hippius-s3-drain
+    folder: Hippius S3 Alerts
+    interval: 1m
+    rules:
+      # Pages BEFORE the api's fs_cache_pressure 90% cutoff (which 503s every PUT on the
+      # node), leaving runway to drain or reclaim. drain_ssd_pressure is a 0..1 fill
+      # fraction per node; max() catches the worst node. Unlike drain_ssd_backlog_bytes
+      # (undrained work), this rises with an SSD leak even at zero drain demand — so a
+      # stalled reclaim (WI-20a/b) surfaces here.
+      - uid: drain-ssd-pressure-high
+        title: Drain SSD Pressure - Node Near the PUT-shedding Cutoff
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(drain_ssd_pressure{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 0.85
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: 'Worst node SSD fill is {{ if $values.B }}{{ printf "%.0f" (mulf $values.B.Value 100) }}{{ else }}N/A{{ end }}% (pages at 85%; the api sheds PUTs with 503 at 90%)'
+          summary: A drain node''s ingest SSD is filling toward the PUT-shedding cutoff
+        labels:
+          severity: critical
+
+      # G2 replication-gate sentinel. janitor_underreplicated_live_chunks counts live,
+      # serveable chunks lacking full-union backend coverage — the exact chunks the janitor
+      # gate refuses to reclaim, so any nonzero value is a standing data-loss risk (a chunk
+      # one eviction away from loss) and surfaces the C10 divergence. Fires on ANY breach.
+      # The sentinel query applies a replication-SLA grace (HIPPIUS_REPLICATION_SLA_SECONDS,
+      # default 15m) so chunks still replicating NORMALLY are excluded and only genuinely-stuck
+      # coverage gaps reach this metric — every nonzero value here is already >=15m stale, so
+      # `for: 10m` below is just scrape-blip smoothing, not the in-flight filter.
+      - uid: replication-gate-coverage-gap
+        title: Replication Gate - Live Chunks Under-replicated
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(janitor_underreplicated_live_chunks{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        annotations:
+          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} live serveable chunk(s) lack full-union backend coverage — at data-loss risk if reclaimed. Check the janitor "REPLICATION-GATE SENTINEL" logs for samples.'
+          summary: Live objects have chunks the replication gate cannot safely retain
+        labels:
+          severity: critical
+
+      # A21 aged-pending orphan backlog. janitor_aged_pending_orphans counts unservable
+      # pending/draining versions idle past the grace — the leak the replicated-only soak
+      # gate is blind to. A sustained elevated value means orphans accrue faster than the
+      # sweep (list_orphan_replication_versions.sql) clears them: a re-introduced leak (e.g.
+      # the abort-path bug) or a stalled sweep. A long `for` tolerates the transient backlog
+      # between a leak and the next sweep, firing only on a standing, non-draining backlog.
+      - uid: aged-pending-orphan-backlog
+        title: Drain A21 - Aged Pending Orphans Not Draining
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(janitor_aged_pending_orphans{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 100
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 30m
+        annotations:
+          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} aged pending/draining orphan version(s) are not draining — the A21 sweep is not keeping up (re-introduced leak or stalled reaper). This population is invisible to the replicated-only soak gate.'
+          summary: A21 orphan backlog is standing above threshold and not draining
+        labels:
+          severity: warning
+
+      # Split-brain: two allocators leading at once. drain_leader is 0/1 per instance, so
+      # sum(drain_leader) > 1 means the single-leader lease/epoch fence has failed and two
+      # leaders may both be writing budgets — the drain's core coordination invariant broken.
+      # Short `for` because a split-brain is urgent (concurrent Ceph overrun risk), not a slow
+      # trend. Complements the R3 write-fence: the fence prevents a STALE leader's writes; this
+      # catches the fence itself failing open.
+      - uid: drain-split-brain-two-leaders
+        title: Drain Allocator - Split-Brain (more than one leader)
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'sum(drain_leader{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 1
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        annotations:
+          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} allocators are leading simultaneously (expected exactly 1). The leader lease/epoch fence has failed open — two leaders may be writing conflicting budgets. Investigate cephor:leader / cephor:epoch in redis-queues immediately.'
+          summary: More than one drain allocator is leading (split-brain)
+        labels:
+          severity: critical
+
+      # Epoch-counter reset. drain_leader_epoch is the monotonic leadership era; max() over the
+      # fleet only ever climbs BY CONSTRUCTION, so any decrease means the redis cephor:epoch
+      # counter was rewound (AOF reload / FLUSHALL / replica failover) — which silently degrades
+      # the R3 allocation write-fence OPEN (a legit leader can be fenced by cached higher-epoch
+      # alloc keys, or a stale writer slips through). The expr yields (epoch 5m ago − epoch now):
+      # positive only on a regression. This is the sole failure mode of the write-fence, so it
+      # pages critical even though no split-brain has occurred YET.
+      - uid: drain-leader-epoch-decrease
+        title: Drain Allocator - Leader Epoch Decreased (counter reset)
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(drain_leader_epoch{job="otel-collector"} offset 5m) - max(drain_leader_epoch{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 0m
+        annotations:
+          description: 'The drain leader epoch decreased (counter reset in redis-queues) — the R3 allocation write-fence is degraded open and split-brain is now possible. Confirm redis-queues persistence (noeviction + AOF) and the cephor:epoch value.'
+          summary: Drain leader epoch counter was reset (write-fence degraded)
+        labels:
+          severity: critical
+
+      # R4 corrupt-live durability incident. drain_corrupt_parts counts parts held `corrupt`:
+      # a live, servable object whose CephFS pool copy is corrupt (a persistent byte-mismatch on
+      # drain), kept alive ONLY by its intact SSD source. The re-drive worker re-copies from SSD,
+      # so a transient corruption clears on its own; a value that persists is a part stuck at the
+      # re-drive attempt cap — an unrecoverable pool copy needing an operator. Any nonzero value
+      # is a real durability risk (the last good copy is one SSD-node loss from gone), so this
+      # pages; a modest `for` lets a single re-drive cycle clear a transient blip first.
+      - uid: drain-corrupt-live-parts
+        title: Drain R4 - Corrupt-Live Parts (last good copy on SSD only)
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(drain_corrupt_parts{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        annotations:
+          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} part(s) held corrupt — a live object''s pool copy is corrupt and only its SSD source remains. If it persists, the re-drive has exhausted its attempts (unrecoverable pool copy); investigate the object and CephFS pool health.'
+          summary: Live objects have a corrupt pool copy and only an SSD source (R4)
+        labels:
+          severity: critical

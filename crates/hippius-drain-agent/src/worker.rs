@@ -142,6 +142,14 @@ pub async fn drain_next<E: UploadEnqueuer>(
             // No concurrency permit was taken on denial; hand the claim back so it
             // retries once the budget refills (the next wake re-claims it).
             store.release_part(claim.part()).await?;
+            // A denial is liveness progress: the loop DID cycle a claim, it just backed off
+            // (breaker open on a Ceph outage, or the write budget is spent). Recording it
+            // keeps the readiness tracker's `processed` count advancing so a pool-wide outage
+            // does not flip every node NotReady and wedge a rolling update (a wedge, not a
+            // healthy back-off, is what readiness must catch). Kept out of drain outcomes.
+            if let Some(snapshot) = snapshot {
+                snapshot.record_throttled(1);
+            }
             tracing::debug!(?reason, "drain throttled; part returned to pending");
             return Ok(None);
         }
@@ -510,13 +518,24 @@ mod tests {
 
         // A zero-budget enforcer: the rate gate denies any non-zero drain.
         let empty = enforcer_with(0);
-        assert_eq!(drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&empty), None).await.unwrap(), None);
+        let snapshot = SnapshotCell::new();
+        assert_eq!(
+            drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&empty), Some(&snapshot))
+                .await
+                .unwrap(),
+            None
+        );
         assert!(ssd_part.exists(), "a throttled drain leaves the SSD part untouched");
         assert_eq!(
             status_of(&store, &part).await,
             Some(ReplicationState::Pending),
             "the throttled part is returned to pending",
         );
+        // C8: a denial is recorded as a throttled tick (readiness progress), and — being a
+        // back-off, not a drain — leaves the drain outcomes and the Ceph error rate untouched.
+        let snap = snapshot.load();
+        assert_eq!(snap.throttled, 1, "the denied claim counts as a throttled tick");
+        assert_eq!((snap.drained, snap.failed, snap.deferred), (0, 0, 0), "a throttle is no drain outcome");
 
         // With an ample budget, the same part drains.
         let ample = enforcer_with(1_000_000);

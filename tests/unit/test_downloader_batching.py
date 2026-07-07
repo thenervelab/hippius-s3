@@ -84,11 +84,14 @@ def _make_mock_db_pool(
 
 
 def _make_mock_obj_cache():
-    """Cache stub that only needs notify_chunk + redis.delete (legacy flag clear)."""
+    """Cache stub: notify_chunk + redis.eval (A5 CAS release of the coalescing lock)."""
     cache = MagicMock()
     cache.notify_chunk = AsyncMock()
     cache.redis = MagicMock()
     cache.redis.delete = AsyncMock()
+    # A5: the downloader releases the coalescing lock via a compare-and-delete Lua (redis.eval),
+    # not an unconditional redis.delete, so the mock must make eval awaitable to record the call.
+    cache.redis.eval = AsyncMock(return_value=1)
     return cache
 
 
@@ -442,7 +445,9 @@ async def test_in_progress_flag_cleared_per_part(mock_metrics, mock_config, fs_s
         fs_store=fs_store,
     )
 
-    assert obj_cache.redis.delete.await_count == num_parts
+    # A5: the per-part coalescing lock is released via the compare-and-delete Lua (redis.eval),
+    # once per part, not via an unconditional redis.delete.
+    assert obj_cache.redis.eval.await_count == num_parts
 
 
 @pytest.mark.asyncio

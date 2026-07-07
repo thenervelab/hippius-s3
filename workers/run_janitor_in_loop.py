@@ -71,13 +71,26 @@ AGE_BUCKET_BOUNDARIES = [
 ]
 AGE_BUCKET_NAMES = [b[0] for b in AGE_BUCKET_BOUNDARIES] + ["7d+"]
 
-# Disk pressure thresholds (fraction of total disk used).
+# Disk pressure thresholds (fraction of total disk used). Enter thresholds are higher than exit
+# thresholds (hysteresis) so a disk hovering at a boundary doesn't flap the mode — and with it the
+# hot-retention window and loop-sleep — every cycle. C2.
 PRESSURE_ELEVATED = 0.85
+PRESSURE_ELEVATED_EXIT = 0.83
 PRESSURE_CRITICAL = 0.95
+PRESSURE_CRITICAL_EXIT = 0.93
 
 # Maximum age of an orphan `.tmp.*` file before we delete it. Atomic writes
 # finish in milliseconds; anything older than this is a crashed-write orphan.
 TMP_FILE_MAX_AGE_SECONDS = 3600  # 1h
+# Cap on the G2 sentinel scan: it needs only to DETECT a durability gap and sample a few
+# offenders, not enumerate every one, so a bounded page keeps the read-only query cheap.
+SENTINEL_SCAN_LIMIT = 500
+# The idle grace before a pending/draining orphan counts toward the aged-orphan gauge is
+# `config.mpu_sweep_grace_seconds` — the SAME window the reaper's orphan sweep
+# (list_orphan_replication_versions.sql) uses. They MUST match: the gauge is only meaningful
+# if it counts exactly the population the sweep can clear, otherwise it reads non-zero forever
+# (an orphan aged past the gauge grace but not yet past a larger sweep grace) and the soak
+# gate's slope≈0/bounded assertion watches a phantom backlog.
 
 _fs_parts_on_disk = 0
 _fs_oldest_age_seconds = 0.0
@@ -85,7 +98,16 @@ _fs_disk_used_bytes = 0
 _fs_disk_total_bytes = 0
 _fs_hot_parts = 0
 _fs_pressure_mode = 0  # 0 = normal, 1 = elevated, 2 = critical
+_prev_pressure_mode = 0  # C2: last mode returned by _pressure_mode, for hysteresis (single-instance janitor)
 _fs_age_buckets: dict[str, int] = dict.fromkeys(AGE_BUCKET_NAMES, 0)
+# G2 replication-gate sentinel: live/serveable chunks lacking full-union backend coverage
+# (the population the gate must never reclaim). Any nonzero value is a standing durability
+# alarm; sampled/capped by SENTINEL_SCAN_LIMIT, so a value at the cap means ">=".
+_replication_sentinel_violations = 0
+# Aged pending/draining orphan count (A21 leak backlog): the soak-gate feed the replicated-
+# only gate is blind to. A standing or rising value means orphans are accumulating faster
+# than the sweep clears them — a re-introduced leak.
+_aged_pending_orphans = 0
 
 _janitor_deleted_counter = None  # set by _setup_janitor_metrics
 _janitor_tmp_deleted_counter = None
@@ -120,6 +142,14 @@ def _obs_age_buckets(_: object) -> list[otel_metrics.Observation]:
     return [otel_metrics.Observation(count, {"age_bucket": bucket}) for bucket, count in _fs_age_buckets.items()]
 
 
+def _obs_replication_sentinel(_: object) -> list[otel_metrics.Observation]:
+    return [otel_metrics.Observation(_replication_sentinel_violations, {})]
+
+
+def _obs_aged_pending_orphans(_: object) -> list[otel_metrics.Observation]:
+    return [otel_metrics.Observation(_aged_pending_orphans, {})]
+
+
 def _classify_age_bucket(age_seconds: float) -> str:
     for name, upper in AGE_BUCKET_BOUNDARIES:
         if age_seconds < upper:
@@ -128,17 +158,29 @@ def _classify_age_bucket(age_seconds: float) -> str:
 
 
 def _pressure_mode(root: Path) -> int:
-    """Return the current disk-pressure mode (0/1/2)."""
+    """Return the current disk-pressure mode (0/1/2) with hysteresis.
+
+    C2: a mode is entered at its (higher) enter threshold and only released once the disk drops
+    below the (lower) exit threshold, using the previous mode. This stops a disk sitting right at
+    0.85 or 0.95 from oscillating the mode — and the hot-retention window and loop sleep that key
+    off it — on every cycle. The janitor is single-instance, so a module-global previous-mode is
+    safe. On a stat error we hold the previous mode rather than snapping to normal.
+    """
+    global _prev_pressure_mode
     try:
         usage = shutil.disk_usage(root)
         ratio = usage.used / usage.total if usage.total else 0.0
     except OSError:
-        return 0
-    if ratio >= PRESSURE_CRITICAL:
-        return 2
-    if ratio >= PRESSURE_ELEVATED:
-        return 1
-    return 0
+        return _prev_pressure_mode
+    prev = _prev_pressure_mode
+    if ratio >= PRESSURE_CRITICAL or (prev == 2 and ratio >= PRESSURE_CRITICAL_EXIT):
+        mode = 2
+    elif ratio >= PRESSURE_ELEVATED or (prev >= 1 and ratio >= PRESSURE_ELEVATED_EXIT):
+        mode = 1
+    else:
+        mode = 0
+    _prev_pressure_mode = mode
+    return mode
 
 
 def _effective_hot_retention(mode: int) -> float:
@@ -301,6 +343,16 @@ def _setup_janitor_metrics() -> None:
         callbacks=[_obs_age_buckets],
         description="Number of parts per age bucket",
     )
+    meter.create_observable_gauge(
+        name="janitor_underreplicated_live_chunks",
+        callbacks=[_obs_replication_sentinel],
+        description="Live serveable chunks lacking full-union backend coverage (G2 sentinel; nonzero = durability gap)",
+    )
+    meter.create_observable_gauge(
+        name="janitor_aged_pending_orphans",
+        callbacks=[_obs_aged_pending_orphans],
+        description="Aged pending/draining unservable orphan versions (A21 leak backlog; the soak gate asserts bounded / slope ~ 0)",
+    )
     _janitor_deleted_counter = meter.create_counter(
         name="fs_janitor_deleted_total",
         description="Total number of FS parts deleted by the janitor",
@@ -318,11 +370,18 @@ def _setup_janitor_metrics() -> None:
     )
 
 
+class DLQProtectionUnavailable(Exception):
+    """A15: a DLQ read failed, so the protection set is INCOMPLETE. Raised so the caller
+    fails CLOSED — skipping the destructive reap rather than running it with partial (or empty)
+    protection exactly when redis-queues is down and a DLQ'd object's data must NOT be reaped."""
+
+
 async def get_all_dlq_object_ids(redis_client: Redis) -> set[str]:
     """Fetch all object_ids currently in both upload and unpin DLQs.
 
-    Returns:
-        Set of object_id strings present in any DLQ
+    Returns the set of protected object_ids. Raises [`DLQProtectionUnavailable`] if ANY DLQ
+    list read fails — the janitor's reaps use this set to PROTECT in-flight DLQ objects from
+    eviction, so an incomplete set must never be treated as "nothing to protect" (fail-closed).
     """
     object_ids = set()
 
@@ -334,17 +393,18 @@ async def get_all_dlq_object_ids(redis_client: Redis) -> set[str]:
     for dlq_key in dlq_keys:
         try:
             dlq_entries = await asyncio.wait_for(redis_client.lrange(dlq_key, 0, -1), timeout=5.0)
-            for entry_json in dlq_entries:
-                try:
-                    entry = json.loads(entry_json)
-                    if obj_id := entry.get("object_id"):
-                        object_ids.add(str(obj_id))
-                except json.JSONDecodeError:
-                    logger.warning(f"Invalid JSON in {dlq_key}: {entry_json[:100]}")
-        except asyncio.TimeoutError:
-            logger.error(f"{dlq_key} fetch timeout (5s)")
-        except Exception as e:
-            logger.error(f"Failed to fetch {dlq_key} object_ids: {e}")
+        except asyncio.TimeoutError as exc:
+            raise DLQProtectionUnavailable(f"{dlq_key} fetch timeout (5s)") from exc
+        except Exception as exc:
+            raise DLQProtectionUnavailable(f"failed to fetch {dlq_key}: {exc}") from exc
+        for entry_json in dlq_entries:
+            try:
+                entry = json.loads(entry_json)
+                if obj_id := entry.get("object_id"):
+                    object_ids.add(str(obj_id))
+            except json.JSONDecodeError:
+                # A single malformed entry does not compromise the rest of the set — skip it.
+                logger.warning(f"Invalid JSON in {dlq_key}: {entry_json[:100]}")
 
     if object_ids:
         logger.info(f"Found {len(object_ids)} unique object_ids protected across all DLQs")
@@ -371,7 +431,14 @@ async def cleanup_stale_parts(
     stale_threshold_seconds = config.mpu_stale_seconds
     cutoff_sql = "NOW() - INTERVAL '1 second' * $4"
 
-    dlq_object_ids = await get_all_dlq_object_ids(redis_client)
+    try:
+        dlq_object_ids = await get_all_dlq_object_ids(redis_client)
+    except DLQProtectionUnavailable as exc:
+        # A15 fail-closed: without a complete DLQ protection set we cannot know which parts
+        # belong to in-flight DLQ operations, so skip this reap entirely rather than delete
+        # unprotected. Retry next cycle when redis-queues is back.
+        logger.error(f"Skipping stale-parts cleanup — DLQ protection unavailable: {exc}")
+        return 0
     if dlq_object_ids:
         logger.info(f"Protecting {len(dlq_object_ids)} DLQ objects from stale cleanup")
 
@@ -559,6 +626,77 @@ async def is_replicated_on_all_backends(
     return result["total_chunks"] == result["replicated_chunks"]
 
 
+async def check_replication_sentinel(db_pool: asyncpg.Pool, pressure: int) -> int:
+    """G2 read-only durability sentinel: count live/serveable chunks lacking full-union
+    backend coverage and publish the gauge.
+
+    This is the inverse of the janitor's reclaim gate: it finds the chunks the gate would
+    (correctly) refuse to reclaim because they are under-replicated — i.e. chunks at
+    data-loss risk the moment their SSD/pool copy is evicted. The required backend set
+    mirrors ``is_replicated_on_all_backends`` (per-version ∪ backup), so this also catches
+    the C10 divergence. A ``replication_sla_seconds`` grace excludes chunks whose part
+    landed recently (normal in-flight replication) so only GENUINELY-STUCK chunks are
+    counted — without it every servable upload trips the sentinel while it replicates and
+    the alarm pages continuously. Purely a SELECT — it never deletes — so it is safe to run
+    every cycle. A breach logs ERROR at critical disk pressure (a reclaim is imminent), WARN
+    otherwise; a clean scan logs nothing. Returns the number of violations found (capped
+    at ``SENTINEL_SCAN_LIMIT``).
+    """
+    global _replication_sentinel_violations
+    backup_backends = list(getattr(config, "backup_backends", []) or [])
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            get_query("find_underreplicated_live_chunks"),
+            backup_backends,
+            list(config.upload_backends),
+            SENTINEL_SCAN_LIMIT,
+            config.replication_sla_seconds,
+        )
+    violations = len(rows)
+    _replication_sentinel_violations = violations
+    if violations:
+        capped = ">=" if violations >= SENTINEL_SCAN_LIMIT else ""
+        sample = [(str(r["object_id"]), r["object_version"], r["chunk_id"]) for r in rows[:5]]
+        # Critical pressure = the janitor is actively evicting, so an under-replicated
+        # chunk is one reclaim away from loss: page it. Otherwise warn (a standing gap).
+        log = logger.error if pressure >= 2 else logger.warning
+        log(
+            "REPLICATION-GATE SENTINEL: %s%d live chunk(s) lack full-union backend coverage "
+            "(upload=%s backup=%s); sample=%s",
+            capped,
+            violations,
+            list(config.upload_backends),
+            backup_backends,
+            sample,
+        )
+    return violations
+
+
+async def check_aged_pending_orphans(db_pool: asyncpg.Pool) -> int:
+    """A21 soak-gate feed: count the standing aged pending/draining unservable orphan
+    versions and publish the gauge.
+
+    The 6h-soak gate asserts only the `replicated`-on-SSD count, so it is blind to A21
+    orphans (which never reach `replicated`). This publishes the population the sweep
+    (`list_orphan_replication_versions.sql`) exists to clear, so the soak gate can assert it
+    is bounded and its slope is ~ 0 — a rising value means orphans accrue faster than the
+    sweep drains them (a re-introduced leak). Purely a SELECT, safe every cycle.
+
+    Unlike the G2 sentinel this does NOT log on a nonzero value: a transient backlog between
+    a leak and the next sweep is normal, so alerting is left to the gauge's slope/sustained
+    threshold (see the ``aged-pending-orphan-backlog`` Grafana rule), not a per-cycle log.
+    Returns the count.
+    """
+    global _aged_pending_orphans
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval(
+            get_query("count_aged_pending_orphans"),
+            config.mpu_sweep_grace_seconds,
+        )
+    _aged_pending_orphans = int(count or 0)
+    return _aged_pending_orphans
+
+
 async def is_terminally_abandoned(
     db: asyncpg.Connection,
     object_id: str,
@@ -662,7 +800,19 @@ async def cleanup_old_parts_by_mtime(
     max_age_seconds = config.fs_cache_gc_max_age_seconds
     logger.info(f"Scanning FS parts eligible for GC (max_age={max_age_seconds}s, replication-gated)")
 
-    dlq_object_ids = await get_all_dlq_object_ids(redis_client)
+    try:
+        dlq_object_ids = await get_all_dlq_object_ids(redis_client)
+    except DLQProtectionUnavailable as exc:
+        # C1 (refines A15): do NOT skip the whole age-GC pass when the DLQ set is unavailable.
+        # This pass only ever deletes FULLY-REPLICATED parts (the replication gate below is the
+        # hard safety net), and a part that is live on every required backend is safe to evict
+        # from SSD regardless of any DLQ entry — its bytes can be re-fetched. Skipping entirely
+        # meant a redis-queues outage froze eviction at ANY disk level; combined with the drain
+        # (also on redis-queues) being down, that is a disk-fill spiral precisely when the janitor
+        # is the only thing that can free space. Fall back to replication-gate-only eviction (no
+        # DLQ dimension). The non-replication-gated cleanup_stale_parts pass stays fail-closed.
+        logger.error(f"DLQ protection unavailable — age-GC falling back to replication-gate-only eviction: {exc}")
+        dlq_object_ids = set()
     if dlq_object_ids:
         logger.info(f"Protecting {len(dlq_object_ids)} DLQ objects from GC")
 
@@ -875,6 +1025,7 @@ async def run_janitor_loop():
     logger.info("Starting janitor service...")
     logger.info(f"FS store root: {config.object_cache_dir}")
     logger.info(f"MPU stale threshold: {config.mpu_stale_seconds}s")
+    logger.info(f"Aged-pending-orphan gauge grace: {config.mpu_sweep_grace_seconds}s (matches the reaper sweep)")
     logger.info(f"FS GC max age: {config.fs_cache_gc_max_age_seconds}s")
     logger.info(f"FS hot retention: {getattr(config, 'fs_cache_hot_retention_seconds', 10800)}s")
     logger.info(f"Cleanup concurrency: {concurrency}")
@@ -919,12 +1070,29 @@ async def run_janitor_loop():
             except Exception as e:
                 logger.error(f"Phase 4 (hard delete) error: {e}", exc_info=True)
 
+            # Phase 5: read-only replication-gate sentinel (G2). Publishes the durability
+            # gauge and alarms on any live/serveable chunk lacking full-union coverage.
+            pressure = _pressure_mode(fs_store.root)
+            sentinel_violations = 0
+            try:
+                sentinel_violations = await check_replication_sentinel(db_pool, pressure)
+            except Exception as e:
+                logger.error(f"Phase 5 (replication sentinel) error: {e}", exc_info=True)
+
+            # Phase 6: read-only aged-pending orphan gauge (A21 soak-gate feed). Publishes the
+            # standing leak backlog the replicated-only soak gate cannot see.
+            aged_orphans = 0
+            try:
+                aged_orphans = await check_aged_pending_orphans(db_pool)
+            except Exception as e:
+                logger.error(f"Phase 6 (aged-pending orphan gauge) error: {e}", exc_info=True)
+
             logger.info(
-                f"Janitor cycle complete: stale={stale_count} gc={gc_count} tmp={tmp_count} hard_deleted={hard_deleted}"
+                f"Janitor cycle complete: stale={stale_count} gc={gc_count} tmp={tmp_count} "
+                f"hard_deleted={hard_deleted} sentinel_violations={sentinel_violations} aged_orphans={aged_orphans}"
             )
 
-            # Pick sleep interval based on current pressure
-            pressure = _pressure_mode(fs_store.root)
+            # Pick sleep interval based on current pressure (already probed for Phase 5)
             sleep_interval = sleep_pressure if pressure > 0 else sleep_normal
             logger.info(f"Janitor sleeping {sleep_interval}s (pressure={pressure})")
             await asyncio.sleep(sleep_interval)
