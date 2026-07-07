@@ -6,7 +6,7 @@
 -- catch) would therefore be invisible to the gate. This counts the standing population of
 -- that leak so the soak gate can assert it is bounded and its slope is ~ 0.
 --
--- It counts the EXACT population list_orphan_replication_versions.sql sweeps — an object
+-- It counts the same population SHAPE list_orphan_replication_versions.sql sweeps — an object
 -- version that is (a) still ACTIVE on the drain (status IN ('pending','draining')),
 -- (b) UNSERVABLE (the abandoned/leaked shape: address IS NULL AND size_bytes <= 0 AND
 -- md5_hash = ''), (c) idle past the grace (its most-recently-landed part older than
@@ -14,8 +14,11 @@
 -- churn), and (d) NOT DLQ-protected — the sweep skips any object_id parked in an upload/unpin
 -- DLQ (`sweep_orphan_replication_versions`: `if str(object_id) in dlq_object_ids: continue`),
 -- so a DLQ-parked orphan is one the sweep will never clear. Without $2 the pure-SQL gauge
--- would count it forever — a phantom backlog contradicting the "same population as the sweep"
--- claim and tripping the aged-pending-orphan-backlog alert on data that is not a leak. The
+-- would count it forever — a phantom backlog tripping the aged-pending-orphan-backlog alert on
+-- data that is not a leak. NOTE on the grace: $1 is the gauge's short LEAK-VISIBILITY window
+-- (default 1h), deliberately SMALLER than the sweep's 48h eligibility grace, so at any instant
+-- this set is a strict SUPERSET of what the sweep is currently eligible to clear (it also counts
+-- fresh 1h–48h orphans the sweep hasn't reached yet) — same shape, tighter grace, by design. The
 -- servability predicate MUST stay in lockstep with janitor_part_terminally_abandoned.sql (and
 -- the Rust reclaim gate's Store::servable_parts): all three encode the one definition of
 -- "servable". It returns a single count rather than a page to mark.
