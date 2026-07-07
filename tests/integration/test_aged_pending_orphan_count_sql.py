@@ -239,6 +239,30 @@ async def test_version_with_no_object_versions_row_is_not_counted(conn):
     assert await _count(conn) == 0
 
 
+async def test_gauge_grace_is_a_short_soak_window_not_the_48h_reaper_grace(conn):
+    # C3: the gauge grace ($1) is a leak-VISIBILITY window (config.aged_orphan_gauge_grace_seconds,
+    # default 1h), deliberately DECOUPLED from the reaper sweep's 48h eligibility grace. A ~2h-old
+    # orphan re-introduced during a 6h soak MUST register at the 1h gauge grace; fed the reaper's
+    # 48h grace instead, the same orphan hides (slope stays ~0, the soak gate passes vacuously).
+    # This pins both directions so the decoupling cannot silently regress back to 48h.
+    from hippius_s3.config import get_config
+
+    config = get_config()
+    assert config.aged_orphan_gauge_grace_seconds <= 3600  # soak-visibility window, not the reaper's
+    oid = _oid()
+    await _seed_version(conn, oid, 1, address=None, size_bytes=0, md5_hash="")
+    await _seed_status(conn, oid, 1, 1, status="pending", landed_age_seconds=7200)  # 2h idle
+
+    at_gauge_grace = await conn.fetchval(
+        get_query("count_aged_pending_orphans"), config.aged_orphan_gauge_grace_seconds, []
+    )
+    at_reaper_grace = await conn.fetchval(
+        get_query("count_aged_pending_orphans"), config.mpu_sweep_grace_seconds, []
+    )
+    assert int(at_gauge_grace or 0) == 1  # visible at the 1h gauge grace
+    assert int(at_reaper_grace or 0) == 0  # invisible at the 48h reaper grace — the blindness C3 removes
+
+
 async def test_mixed_population_counts_only_the_leak(conn):
     # An end-to-end tally: two genuine aged orphans among servable, fresh, terminal, and
     # deleted-object rows -> exactly 2.
