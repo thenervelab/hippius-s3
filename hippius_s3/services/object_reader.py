@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 
 from hippius_s3.api.s3.common import build_headers
 from hippius_s3.backend_routing import resolve_object_backends
+from hippius_s3.cache.notifier import ChunkNotReadyError
 from hippius_s3.config import get_config
 from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import PartChunkSpec
@@ -345,7 +346,9 @@ async def read_response(
         first_chunk = await asyncio.wait_for(gen.__anext__(), timeout=first_timeout)
     except StopAsyncIteration:
         first_chunk = None  # empty (zero-byte) object — nothing to stream
-    except (TimeoutError, asyncio.TimeoutError) as exc:
+    except (TimeoutError, asyncio.TimeoutError, ChunkNotReadyError) as exc:
+        # ChunkNotReadyError: the downloader gave up fast on a backend miss and notified anyway, so
+        # the peek woke to an empty cache. Same retryable outcome as a timeout — a 503, not a 500.
         await gen.aclose()
         raise DownloadNotReadyError(
             "Parts not ready: first chunk did not arrive within the initial stream timeout"
@@ -429,7 +432,8 @@ async def stream_object(
         first_chunk = await asyncio.wait_for(gen.__anext__(), timeout=float(cfg.stream_first_chunk_timeout_seconds))
     except StopAsyncIteration:
         first_chunk = None  # empty (zero-byte) source
-    except (TimeoutError, asyncio.TimeoutError) as exc:
+    except (TimeoutError, asyncio.TimeoutError, ChunkNotReadyError) as exc:
+        # See read_response: a terminal miss is retryable, so map it to 503 rather than a 500.
         await gen.aclose()
         raise DownloadNotReadyError(
             "Parts not ready: source first chunk did not arrive within the initial stream timeout"
