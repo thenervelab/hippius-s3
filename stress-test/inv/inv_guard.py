@@ -36,6 +36,27 @@ from inv.guards import GuardResult, make_guard, run_once  # noqa: E402
 
 DEFAULT_GUARDS = "G1,G2,G3,G4,G6,G9"
 
+# The load-bearing safety invariants: G1 (single-leader / split-brain) and G2 (replication-gate
+# coverage). If either was REQUESTED but returned `skip` on every poll it never once asserted —
+# prometheus/sentinel was unreachable the whole run — so the invariant was never actually checked
+# and the run must NOT read green (a `skip` is "could not evaluate", not "passed"). Operators who
+# genuinely run without one drop it from --guards; only requested required guards are enforced.
+REQUIRED_GUARDS = frozenset({"G1", "G2"})
+
+
+def required_never_asserted(
+    names: list[str], guard_asserts: dict[str, int], guard_polls: dict[str, int]
+) -> list[str]:
+    """Requested required guards that polled at least once but never once asserted (100% skip).
+
+    Pure so the verdict is unit-testable without a live cluster: `guard_asserts[g]` counts polls
+    where guard `g` returned ok/breach (actually evaluated), `guard_polls[g]` counts all its polls.
+    A required guard with polls but zero asserts is the silent-green case this guards against.
+    """
+    return sorted(
+        g for g in names if g in REQUIRED_GUARDS and guard_polls.get(g, 0) > 0 and guard_asserts.get(g, 0) == 0
+    )
+
 
 def _event(run_id: str, seq: int, result: GuardResult) -> dict:
     return {
@@ -54,7 +75,11 @@ def main() -> int:
     ap.add_argument("--guards", default=DEFAULT_GUARDS, help="comma list of G1..G9 (default: G1,G2,G3,G4,G6,G9)")
     ap.add_argument("--run-id", default=f"invguard-{int(time.time())}")
     ap.add_argument("--out", type=pathlib.Path, help="append JSONL events here (default: stdout only)")
-    ap.add_argument("--interval", type=float, default=10.0, help="seconds between polls")
+    # 2s (was 10s): G6 terminal-monotonicity is poll-sampled, so a fast replicated->pending->
+    # replicated round-trip inside one interval is invisible; the tighter cadence narrows that blind
+    # window. The pg claim query is a partial-index lookup and G1/G2 are prom scalars, so 2s polling
+    # is cheap. (The real fix for G6 is the WAL-tailed event guard, plan §4.2 — see guards.py.)
+    ap.add_argument("--interval", type=float, default=2.0, help="seconds between polls")
     ap.add_argument("--once", action="store_true", help="one poll then exit")
     ap.add_argument("--abort", action="store_true", help="exit non-zero on the first breach")
     ap.add_argument("--stall-secs", type=int, default=120, help="G3 stalled-part threshold")
@@ -87,11 +112,16 @@ def main() -> int:
     out = args.out.open("a") if args.out else None
     seq = 0
     total_breaches = 0
+    guard_polls: dict[str, int] = {}  # per-guard: total polls
+    guard_asserts: dict[str, int] = {}  # per-guard: polls that actually evaluated (ok/breach, not skip)
 
     def emit(result: GuardResult) -> None:
         nonlocal seq
         line = json.dumps(_event(args.run_id, seq, result))
         seq += 1
+        guard_polls[result.guard] = guard_polls.get(result.guard, 0) + 1
+        if result.status != "skip":
+            guard_asserts[result.guard] = guard_asserts.get(result.guard, 0) + 1
         if out:
             out.write(line + "\n")
             out.flush()
@@ -117,6 +147,15 @@ def main() -> int:
     finally:
         if out:
             out.close()
+
+    stuck = required_never_asserted(names, guard_asserts, guard_polls)
+    if stuck:
+        print(
+            f"\n🔴 inv-guard: required guard(s) {stuck} skipped on 100% of polls — never once asserted "
+            "(prometheus/sentinel unreachable all run). A required invariant that never ran is NOT green.",
+            file=sys.stderr,
+        )
+        return 3
 
     print(f"\n{'🔴' if total_breaches else '🟢'} inv-guard: {total_breaches} breach(es) over {seq} check(s)")
     return 1 if total_breaches else 0

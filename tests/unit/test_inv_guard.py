@@ -207,3 +207,44 @@ def test_make_guard_rejects_unknown():
 
     with pytest.raises(KeyError):
         guards.make_guard("G99")
+
+
+# ----------------------------------------------------------------- inv_guard all-skip verdict (A4)
+# A run where a REQUIRED guard (G1/G2) skipped EVERY poll never actually asserted the invariant, so
+# it must NOT read green. `required_never_asserted` is the pure verdict helper main() gates on.
+from inv import inv_guard  # noqa: E402
+
+
+def test_required_guard_all_skip_is_flagged():
+    # G1 requested, polled 5x, never once asserted (prometheus down all run) -> flagged as not-green.
+    flagged = inv_guard.required_never_asserted(
+        names=["G1", "G3"], guard_asserts={"G3": 5}, guard_polls={"G1": 5, "G3": 5}
+    )
+    assert flagged == ["G1"]
+
+
+def test_required_guard_that_asserted_once_is_not_flagged():
+    # A single real evaluation (ok or breach) means the guard ran — not the silent-green case.
+    flagged = inv_guard.required_never_asserted(
+        names=["G1"], guard_asserts={"G1": 1}, guard_polls={"G1": 5}
+    )
+    assert flagged == []
+
+
+def test_non_required_guard_all_skip_is_not_flagged():
+    # G3 is not load-bearing; an all-skip G3 (pg unreachable) does not by itself fail the run.
+    flagged = inv_guard.required_never_asserted(names=["G3"], guard_asserts={}, guard_polls={"G3": 5})
+    assert flagged == []
+
+
+def test_unrequested_required_guard_is_not_flagged():
+    # G2 not in --guards -> never polled -> not enforced (the operator opted out of it).
+    flagged = inv_guard.required_never_asserted(names=["G1"], guard_asserts={"G1": 3}, guard_polls={"G1": 3})
+    assert flagged == []
+
+
+def test_both_required_guards_all_skip_are_both_flagged():
+    flagged = inv_guard.required_never_asserted(
+        names=["G1", "G2", "G4"], guard_asserts={"G4": 4}, guard_polls={"G1": 4, "G2": 4, "G4": 4}
+    )
+    assert flagged == ["G1", "G2"]
