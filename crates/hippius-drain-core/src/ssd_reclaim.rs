@@ -131,12 +131,15 @@ pub trait BackingLog: Send + Sync {
     fn unbacked_parts(&self, parts: &[PartKey]) -> impl Future<Output = Result<HashSet<PartKey>, Self::Error>> + Send;
 
     /// The subset of `parts` whose `(object_id, version)` row EXISTS and is SERVABLE — the
-    /// exact inverse of `janitor_part_terminally_abandoned.sql`'s unservable predicate
-    /// (`address IS NULL AND size_bytes <= 0 AND COALESCE(md5_hash,'') = ''`), i.e. a row
-    /// with `address` set OR `size_bytes > 0` OR a non-empty `md5_hash`. A part with no row,
-    /// or with an unservable (abandoned-upload) row, is absent from the result — the
-    /// reclaim treats those as safe to delete. A returned part is the corrupt-live case the
-    /// `failed` reclaim must NOT delete.
+    /// inverse of `janitor_part_terminally_abandoned.sql`'s unservable predicate
+    /// (`address IS NULL AND size_bytes <= 0 AND COALESCE(md5_hash,'') = ''`) for the servable
+    /// disjuncts, i.e. a row with `address` set OR `size_bytes > 0` OR a non-empty `md5_hash`.
+    /// A part with no row, or with an unservable (abandoned-upload) row, is absent from the
+    /// result — the reclaim treats those as safe to delete. A returned part is the corrupt-live
+    /// case the `failed` reclaim must NOT delete. The two predicates are not bit-identical under
+    /// a NULL `size_bytes`: a bare all-NULL row is unservable here (so reclaimable) while the
+    /// janitor's `size_bytes <= 0` is NULL so it never sweeps it — both fail safe, since a
+    /// bare-NULL row can serve no GET.
     fn servable_parts(&self, parts: &[PartKey]) -> impl Future<Output = Result<HashSet<PartKey>, Self::Error>> + Send;
 }
 
