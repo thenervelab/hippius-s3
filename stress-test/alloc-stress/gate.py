@@ -39,12 +39,20 @@ def _samples(rows: list[dict]) -> list[dict]:
 
 def check_epoch_monotonic(rows: list[dict]) -> tuple[bool, str]:
     prev = 0
+    skipped = 0
     for r in rows:
         e = int(r.get("epoch", 0))
+        # cephor:epoch is a positive INCR counter; epoch<=0 means the sampler's GET returned None
+        # this tick (a transient redis blip / the key briefly absent), NOT a real regression to
+        # zero — skip it so a momentary None can't fail an otherwise-monotonic run.
+        if e <= 0:
+            skipped += 1
+            continue
         if e < prev:
             return False, f"epoch went backward: {prev} -> {e} at t={r.get('t')}"
         prev = max(prev, e)
-    return True, f"epoch monotonic (max {prev})"
+    note = f", {skipped} null-epoch tick(s) skipped" if skipped else ""
+    return True, f"epoch monotonic (max {prev}{note})"
 
 
 def check_epoch_bumps(rows: list[dict], max_bumps: int) -> tuple[bool, str]:
@@ -134,7 +142,7 @@ def evaluate(scenario: str, rows: list[dict], args: argparse.Namespace) -> list[
         results.append(("epoch-monotonic", *check_epoch_monotonic(s)))
         results.append(("leaderless-gap", *check_leaderless_gap(s, args.max_gap_s)))
         results.append(
-            ("epoch-progresses", (len({int(r.get("epoch", 0)) for r in s}) > 1, "leader churned ⇒ epoch advanced"))
+            ("epoch-progresses", len({int(r.get("epoch", 0)) for r in s}) > 1, "leader churned ⇒ epoch advanced")
         )
     elif scenario == "C":
         results.append(("stale-window", *check_stale_window(s, args.stale_window)))
@@ -144,14 +152,21 @@ def evaluate(scenario: str, rows: list[dict], args: argparse.Namespace) -> list[
         results.append(("epoch-monotonic", *check_epoch_monotonic(s)))
         results.append(("recovery", *check_recovery_after_gap(s, args.recovery_ticks, args.interval)))
         # noeviction-full must fail LOUDLY: the sampler surfaces Redis errors as {"error": ...}
-        # rather than a silent split — a run under noeviction that never errored under injected
-        # OOM is suspicious, but we only assert we did not observe an epoch regression here.
-        results.append(("redis-errors-visible", (True, f"{err_count} redis-error samples recorded (loud, not silent)")))
+        # rather than a silent split. A run under injected noeviction OOM that recorded ZERO error
+        # samples means the fault never actually fired — the scenario proved nothing — so require at
+        # least one visible error sample rather than hardcoding a pass. (epoch-monotonic above is a
+        # separate assertion; this one asserts the injected fault was real.)
+        results.append((
+            "redis-errors-visible",
+            err_count > 0,
+            f"{err_count} redis-error sample(s) recorded"
+            + (" (fault fired, loud not silent)" if err_count else " — NO error samples: fault never fired?"),
+        ))
     elif scenario == "E":
         results.append(("budget-ceiling", *check_budget_ceiling(s, args.ceiling)))
     elif scenario == "F":
         results.append(("epoch-monotonic", *check_epoch_monotonic(s)))
-        results.append(("leader-restored", (bool(s and s[-1].get("leader")), "a leader is held at end (post-restore)")))
+        results.append(("leader-restored", bool(s and s[-1].get("leader")), "a leader is held at end (post-restore)"))
     return results
 
 
@@ -159,7 +174,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("jsonl")
     ap.add_argument("--scenario", required=True, choices=sorted(SCENARIOS))
-    ap.add_argument("--ceiling", type=int, default=10_000_000_000, help="fleet write-budget ceiling (bytes/s)")
+    # No default: the fleet write-budget ceiling is a real, rig-specific number the sampler can't
+    # infer. A default (the old 10 GB/s) let the budget-ceiling scenarios (C, E) PASS vacuously
+    # against a made-up bound, so it is REQUIRED for those scenarios (enforced in main()).
+    ap.add_argument("--ceiling", type=int, default=None, help="fleet write-budget ceiling (bytes/s); REQUIRED for C & E")
     ap.add_argument("--stale-window", type=float, default=15.0, help="max stale-alloc persistence (alloc-TTL)")
     ap.add_argument("--max-epoch-bumps", type=int, default=3)
     ap.add_argument("--max-gap-s", type=float, default=10.0)
@@ -167,6 +185,13 @@ def main() -> int:
     ap.add_argument("--min-leader-fraction", type=float, default=0.95)
     ap.add_argument("--interval", type=float, default=0.25)
     args = ap.parse_args()
+
+    # Scenarios C and E gate on Σbudget <= ceiling; without a real ceiling that check is vacuous, so
+    # refuse to run rather than emit a hollow green.
+    if args.scenario in ("C", "E") and args.ceiling is None:
+        print(f"FAIL[{args.scenario}]: --ceiling is required for the budget-ceiling scenario "
+              "(a run without a real fleet ceiling passes vacuously)", file=sys.stderr)
+        return 2
 
     rows = _load(args.jsonl)
     if not rows:

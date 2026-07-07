@@ -150,6 +150,13 @@ class TerminalMonotonicity:
     `replicated->*` or `failed->*` transition is a breach (a terminal row must be inert). First
     poll only seeds the baseline.
 
+    CAVEAT (poll-sampled — parity with the note in scenarios.py `invariant_assert`): this only sees
+    state at each poll boundary (inv_guard --interval, default 2s), so a fast
+    `replicated->pending->replicated` round-trip that both leaves and re-enters the terminal state
+    inside ONE interval is invisible. The 2s cadence narrows that blind window but cannot close it;
+    the real fix is the WAL-tailed event-driven guard (plan §4.2) that sees every transition rather
+    than a sampled snapshot.
+
     NOTE: `corrupt` (R4) is deliberately NOT terminal — the bounded re-drive worker legitimately
     resets `corrupt->pending` to re-copy a live object's intact SSD source over its corrupt pool
     copy. Only `replicated`/`failed` are inert sinks, so `corrupt->pending` must not be flagged.
