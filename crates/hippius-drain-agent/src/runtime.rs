@@ -23,7 +23,8 @@ use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
     BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, NodeId, NodeObservation,
-    SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate, jittered, reclaim_ssd, reconcile_parts,
+    ReclaimError, SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate, jittered, reclaim_ssd,
+    reconcile_parts,
 };
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -314,6 +315,16 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
                     "corrupt-live SSD parts held (pool copy corrupt) — last good source preserved, awaiting re-drive (R4)"
                 );
             }
+        }
+        // A backing-read abort (`ReclaimError::Backing`: `object_versions` missing on a deploy, or
+        // a transient PG error) leaves the servability/orphan gate blind, so the `failed`-part GC
+        // ran and removed NOTHING — it is silently DISABLED, not merely retried. Count it (the
+        // drain_reclaim_backing_errors_total alert) and ERROR so a stuck reclaim pages instead of
+        // hiding in a warn; the pass is still fail-safe (nothing was unlinked). The other reclaim
+        // errors are transient-retryable — leave them at warn.
+        Err(ReclaimError::Backing(err)) => {
+            snapshot.record_reclaim_backing_error();
+            tracing::error!(error = %err, "ssd reclaim disabled: object-backing read failed; failed-part GC removed nothing");
         }
         Err(err) => tracing::warn!(error = ?err, "ssd reclaim cycle failed; will retry next poll"),
     }
@@ -1309,6 +1320,39 @@ mod tests {
             "a servable object's last good SSD copy is preserved even with a failed replication row",
         );
         assert_eq!(snapshot.load().reclaimed, 0, "the corrupt-live part is not counted as reclaimed");
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn reclaim_once_alerts_and_removes_nothing_when_the_backing_read_fails(pool: PgPool) {
+        // D4: the object-backing read (servability gate) fails because `object_versions` is missing
+        // — the exact "table absent on a deploy" case. The `failed`-part GC then runs but is
+        // silently DISABLED: it must remove NOTHING (fail-safe) and increment the backing-error
+        // counter so a log-blind operator still gets the drain_reclaim_backing_errors_total alert.
+        // No create_object_versions_table() here: that absence IS the fault under test.
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let store = Store::from_pool(pool.clone());
+        let snapshot = SnapshotCell::new();
+
+        // An aged `failed` part forces the servability read (over aged-failed parts) to run, which
+        // hits the missing table and surfaces ReclaimError::Backing before any unlink.
+        let failed = part_at(5, 1);
+        seed_ssd_dir(ssd_dir.path(), &failed);
+        store.record_landed_part(&failed).await.unwrap();
+        force_terminal_2h(&pool, &failed, "failed").await;
+
+        let ssd = LocalSsd::new(ssd_dir.path());
+        super::reclaim_once(&ssd, &store, &snapshot, Duration::from_secs(1), Duration::from_secs(1)).await;
+
+        assert!(
+            ssd_dir.path().join(failed.relative_dir()).exists(),
+            "a backing-read failure removes NOTHING — the reclaim fails safe",
+        );
+        assert_eq!(snapshot.load().reclaimed, 0, "nothing was reclaimed on the aborted cycle");
+        assert_eq!(
+            snapshot.load().reclaim_backing_errors,
+            1,
+            "the aborted cycle is counted so a disabled reclaim is alertable, not just logged",
+        );
     }
 
     /// Stands up the `object_versions` table the reclaim's backing/servability reads

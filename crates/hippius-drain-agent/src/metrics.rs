@@ -114,6 +114,19 @@ pub fn init(service_name: &'static str, snapshot: &Arc<SnapshotCell>, enforcer: 
             .build(),
     ));
 
+    // Reclaim-disabled alarm: cycles the `failed`-part SSD GC aborted on an object-backing read
+    // error (`object_versions` missing on a deploy, or a transient PG error). On this path the
+    // reclaim reads nothing and removes NOTHING — it is silently disabled while failing safe, so
+    // without a metric the GC stops and SSD debris accrues invisibly until drain_ssd_pressure trips
+    // the critical PUT-shedding alert. A monotonic counter: a sustained increase pages.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_reclaim_backing_errors_total")
+            .with_callback(move |observer| observer.observe(snap.load().reclaim_backing_errors, &[]))
+            .build(),
+    ));
+
     // Durability alarm: parts held `corrupt` (a live object whose pool copy is corrupt, kept
     // alive by its SSD source — R4). A gauge, not a counter: it falls when a re-drive recovers
     // a part. Any nonzero value pages (the alert), distinct from the drain's routine failures.
