@@ -746,12 +746,16 @@ impl PartReplicationStore for Store {
     }
 
     async fn is_version_servable(&self, part: &PartKey) -> Result<bool> {
-        // The exact inverse of janitor_part_terminally_abandoned.sql's unservable predicate and
-        // the reclaim gate's servable_parts: a version SERVES a GET if its address is set, OR it
-        // has a real size, OR an md5. address is written AFTER size/md5 in a separate step, so a
-        // fully-servable version briefly has address=NULL (the mid-finalize window); the size/md5
-        // disjuncts keep such a live version from reading as unservable. Do NOT reduce to
-        // address-only. A missing row (deleted object) is not servable.
+        // The inverse of janitor_part_terminally_abandoned.sql's unservable predicate for the
+        // servable disjuncts (address set / size>0 / md5 set), shared with the reclaim gate's
+        // servable_parts: a version SERVES a GET if its address is set, OR it has a real size,
+        // OR an md5. address is written AFTER size/md5 in a separate step, so a fully-servable
+        // version briefly has address=NULL (the mid-finalize window); the size/md5 disjuncts
+        // keep such a live version from reading as unservable. Do NOT reduce to address-only.
+        // A missing row (deleted object) is not servable. NB: not bit-identical to the janitor
+        // under a NULL size_bytes — a bare all-NULL row is unservable here (`size_bytes > 0` is
+        // NULL -> not servable) yet the janitor's `size_bytes <= 0` is also NULL so it does not
+        // sweep it; both are fail-safe (a bare-NULL row can serve no GET).
         let servable = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS ( \
                 SELECT 1 FROM object_versions ov \
@@ -968,15 +972,19 @@ impl BackingLog for Store {
                 part_numbers.push(i64::from(part.part().get()));
             }
             // Echo back exactly the input parts whose (object_id, version) row EXISTS and is
-            // SERVABLE — the exact inverse of janitor_part_terminally_abandoned.sql's
-            // unservable predicate. MUST stay in lockstep with that file (and the A21 sweep's
-            // list_orphan_replication_versions.sql): servable = address written, OR a real
-            // size, OR an md5 — the download filter `(size_bytes > 0 OR md5_hash <> '')` plus
-            // a set address. `address` is written AFTER size/md5 in a separate step, so a
-            // fully-servable version briefly has address=NULL (the mid-finalize window); the
-            // size/md5 disjuncts are what keep such a live version from being read as
-            // reclaimable. Do NOT "simplify" to address-only. The object_id is echoed from the
-            // input UNNEST so the reconstructed PartKey matches the caller's key verbatim.
+            // SERVABLE — the inverse of janitor_part_terminally_abandoned.sql's unservable
+            // predicate for the servable disjuncts. MUST stay in lockstep with that file (and
+            // the A21 sweep's list_orphan_replication_versions.sql): servable = address
+            // written, OR a real size, OR an md5 — the download filter `(size_bytes > 0 OR
+            // md5_hash <> '')` plus a set address. `address` is written AFTER size/md5 in a
+            // separate step, so a fully-servable version briefly has address=NULL (the
+            // mid-finalize window); the size/md5 disjuncts are what keep such a live version
+            // from being read as reclaimable. Do NOT "simplify" to address-only. The two
+            // predicates are NOT bit-identical under a NULL size_bytes: a bare all-NULL row is
+            // unservable here (so reclaimable) while the janitor's `size_bytes <= 0` is NULL so
+            // it never sweeps it — both fail safe, since a bare-NULL row can serve no GET. The
+            // object_id is echoed from the input UNNEST so the reconstructed PartKey matches
+            // the caller's key verbatim.
             let rows = sqlx::query_as::<_, (String, i64, i64)>(
                 "SELECT t.object_id, t.version, t.part_number \
                  FROM UNNEST($1::text[], $2::bigint[], $3::bigint[]) AS t(object_id, version, part_number) \
@@ -1360,7 +1368,11 @@ mod part_tests {
         seed_ov(&pool, UUID_A, 3, None, Some(0), Some("d41d8cd9")).await;
         // address NULL, size 0, md5 '' → UNSERVABLE (the abandoned-upload shape).
         seed_ov(&pool, UUID_A, 4, None, Some(0), Some("")).await;
-        // address NULL, size NULL, md5 NULL → UNSERVABLE (bare reserved row).
+        // address NULL, size NULL, md5 NULL → UNSERVABLE here, so RECLAIMABLE (bare reserved
+        // row). This is the one shape where reclaim and the janitor diverge: `size_bytes > 0`
+        // is NULL -> not servable -> reclaimable here, while the janitor's `size_bytes <= 0` is
+        // also NULL so it never sweeps it. Both fail safe (a bare-NULL row can serve no GET);
+        // this case pins that intentional, non-bit-identical behavior.
         seed_ov(&pool, UUID_A, 5, None, None, None).await;
         // no object_versions row at all (v6) → UNSERVABLE (deleted object).
 
