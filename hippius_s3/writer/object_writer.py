@@ -864,7 +864,9 @@ class ObjectWriter:
         # set — rather than deleting the unlisted parts (unsafe: multi-node SSD + in-flight drain +
         # chunk_backend/Arion pin leak via cascade). `selected_parts=None` (or the full set) →
         # every part, unchanged behaviour.
-        selected = sorted({int(pn) for pn in selected_parts}) if selected_parts else None
+        # `[]` is an explicit empty subset (complete zero parts), distinct from `None` (= all parts);
+        # test `is not None` so a falsy-but-present empty list is not collapsed into the all-parts sentinel.
+        selected = sorted({int(pn) for pn in selected_parts}) if selected_parts is not None else None
 
         # Compute combined ETag from part etags for this version (client-selected subset only).
         parts = await self.pool.fetch(
