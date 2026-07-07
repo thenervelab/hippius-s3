@@ -1,21 +1,29 @@
 # F8 — corrupt / partial chunk on SSD.
-# PRIMARY mechanism is the toxiproxy `slicer` toxic (a truncated backend body) — see
-# tests/e2e/support/compose.py:add_toxic("arion", "slicer", ...); that is deterministic and does NOT
-# risk the shared mount. This IOChaos is an OPT-IN, tightly-scoped alternative that flips a byte on
-# reads inside a SINGLE disposable drain-agent container's ingest path.
+# PRIMARY mechanism is the toxiproxy `limit_data` toxic (a truncated backend body — see
+# stress-test/faults/matrix.yaml F8 and tests/e2e/support/compose.py:add_toxic("arion","limit_data",...)):
+# deterministic, container-local, and never touches the shared mount. This IOChaos is an OPT-IN,
+# tightly-scoped alternative that corrupts REAL bytes on reads inside a SINGLE disposable
+# drain-agent container's ingest path.
 #
-# Gate: the agent's per-chunk verify catches the corruption and NEVER commits it as `replicated`;
-# blast radius = 1 part; detect ≤5s; reclaim ≤1h.
+# Gate: the agent's per-chunk verify re-hashes the copy, the hash mismatches, and the part is marked
+# Failed/Corrupt and NEVER committed as `replicated`; blast radius = 1 part; detect <=5s; reclaim <=1h.
+#
+# Why `action: mistake` (not the previous `attrOverride`): mistake actually alters the bytes returned
+# by read(2) — it overwrites up to `maxLength` bytes at up to `maxOccurrences` random offsets per
+# matched read with random fill, so a re-read hash differs from the source hash. `attrOverride` only
+# chmod'd the file (`perm: 0644`); it flipped ZERO bytes, so verify always passed and the
+# corrupt-detection path was never exercised — a no-op masquerading as corruption.
 #
 # DANGER: `volumePath`/`path` MUST point at a DISPOSABLE agent's local ingest dir, never the shared
-# CephFS pool mount. Confirm the target is a throwaway node before applying.
+# CephFS pool mount. `mistake` writes wrong bytes to whatever reads the path — confirm the target is a
+# throwaway node before applying.
 apiVersion: chaos-mesh.org/v1alpha1
 kind: IOChaos
 metadata:
   name: f8-corrupt-chunk
   namespace: hippius-s3-staging
 spec:
-  action: attrOverride  # placeholder-safe op; switch to `fault`/`mistake` only on a disposable node
+  action: mistake
   mode: one
   duration: 30s
   selector:
@@ -27,5 +35,10 @@ spec:
   path: /var/lib/hippius/local_object_cache/**
   containerNames:
     - agent
-  attr:
-    perm: 0644
+  methods:
+    - read
+  percent: 100
+  mistake:
+    filling: random # zero | random — random guarantees the re-read hash diverges
+    maxOccurrences: 1
+    maxLength: 16

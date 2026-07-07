@@ -63,6 +63,10 @@ cells:
     headline_gate: never commit corrupt as `replicated`; blast-radius = 1 part
     recovery: { detect_s: 5, reclaim_s: 3600 }
     guards: [G3, G6]
-    # PRIMARY = toxiproxy slicer (deterministic, safe); the CRD is the opt-in scoped IOChaos.
-    mechanism: { kind: toxiproxy, proxy: arion, toxic: slicer, attributes: { average_size: 64, size_variation: 8 } }
+    # PRIMARY = toxiproxy limit_data: cut the backend body off after 64 KiB and close the connection,
+    # so the agent obtains a SHORT/partial chunk whose content hash can't match the expected hash — the
+    # per-chunk verify mismatches and the part is marked Failed/Corrupt, NEVER `replicated` (G3/G6).
+    # NOT `slicer`: slicer only fragments the TCP stream into smaller writes — every byte still arrives,
+    # the chunk re-assembles intact, verify PASSES, and the corrupt-detection gate is never driven.
+    mechanism: { kind: toxiproxy, proxy: arion, toxic: limit_data, attributes: { bytes: 65536 } }
     extra: { crd: k8s/chaos/f8-corrupt-chunk.yaml }

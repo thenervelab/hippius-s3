@@ -17,14 +17,17 @@ recovery bound AND zero invariant break.
 | `f5-ssd-fill.yaml` | F5 SSD fill pressure/critical | fallocate Job on the ingest SSD | 503 ceases ≤2min |
 | `f6-postgres-failover.yaml` | F6 postgres failover | PodChaos kill CNPG primary | query ≤20s; drain ≤10min |
 | `f7-clock-skew.yaml` | F7 clock skew (disposable pods only) | TimeChaos per-container | stable ≤2min |
-| `f8-corrupt-chunk.yaml` | F8 corrupt/partial chunk | **toxiproxy slicer** (primary) / scoped IOChaos | detect ≤5s; reclaim ≤1h |
+| `f8-corrupt-chunk.yaml` | F8 corrupt/partial chunk | **toxiproxy limit_data** (primary, truncated body) / scoped IOChaos `mistake` | detect ≤5s; reclaim ≤1h |
 
 ## Safety rails (do not remove)
 
 - **Never `IOChaos` the shared CephFS mount.** F4 degrades Ceph via **NetworkChaos toward the
   OSD/MDS pods** on a disposable pool — an IOChaos fault on the shared object-cache mount would hit
-  every tenant. F8's real mechanism is the toxiproxy `slicer` toxic (truncated backend body); the
-  IOChaos in `f8-*.yaml` is scoped to a single disposable agent container and is opt-in.
+  every tenant. F8's real mechanism is the toxiproxy `limit_data` toxic — it cuts the backend body
+  off after N bytes so the agent gets a short/partial chunk that fails hash verify. (`slicer` only
+  fragments the stream and delivers every byte, so it does NOT drive corruption — do not use it here.)
+  The IOChaos in `f8-*.yaml` (`action: mistake`) corrupts real read bytes, is scoped to a single
+  disposable agent container, and is opt-in.
 - **F7 clock skew is disposable-pods only** (`clockIds: [CLOCK_MONOTONIC]` if the lease deadlines
   are monotonic) — never the API/gateway, whose auth depends on wall-clock.
 - Every CRD is a **one-shot** (has a `duration`, no `schedule`) so a forgotten object self-heals.
