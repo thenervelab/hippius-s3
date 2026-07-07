@@ -207,6 +207,27 @@ async fn run_drain<E: UploadEnqueuer>(token: CancellationToken, period: Duration
 /// Probes SSD disk pressure off the async runtime (statvfs blocks) and upserts
 /// this node's heartbeat. Probe or upsert failures are logged and skipped — the
 /// next tick retries; a missed heartbeat only ages the node out of the fleet.
+/// Refreshes this node's two DB-sourced drain-demand gauges: the byte backlog
+/// (`drain_ssd_backlog_bytes`) and the undrained-row COUNT (the C8 readiness wedge signal).
+///
+/// The byte backlog is the TRUE undrained-bytes gauge — the DB sum of this node's
+/// pending/draining part bytes — NOT raw disk occupancy (`usage.used_bytes`), which the
+/// A21/orphan leak overcounts by hundreds of GB with no drain demand (WI-20c). The COUNT is the
+/// signal readiness gates on, because the byte SUM joins `parts` and a missing/NULL-size row
+/// contributes zero: a wedged node's byte-backlog can read 0 while undrained rows remain, which
+/// readiness would misread as idle. On a query error, KEEP the last-recorded value rather than
+/// zeroing it (a transient blip must not read as "drained"); the next tick refreshes it.
+async fn record_drain_signals(store: &Store, node: &NodeId, snapshot: &SnapshotCell) {
+    match store.node_backlog_bytes(node.as_str()).await {
+        Ok(bytes) => snapshot.record_backlog(bytes),
+        Err(err) => tracing::warn!(error = %err, "backlog query failed; keeping the last value"),
+    }
+    match store.node_undrained_count(node.as_str()).await {
+        Ok(count) => snapshot.record_undrained_count(count),
+        Err(err) => tracing::warn!(error = %err, "undrained-count query failed; keeping the last value"),
+    }
+}
+
 async fn heartbeat_once(ssd: &LocalSsd, store: &Store, coord: &Coordinator, node: &NodeId, max_drain_rate: ByteRate, snapshot: &SnapshotCell) {
     let root = ssd.root().to_path_buf();
     // statvfs is a blocking syscall — never run it on an executor thread (axiom
@@ -232,15 +253,7 @@ async fn heartbeat_once(ssd: &LocalSsd, store: &Store, coord: &Coordinator, node
     // off the exporter thread and must never run statvfs itself.
     snapshot.record_disk_pressure(usage.pressure.bps());
 
-    // The drain_ssd_backlog_bytes gauge is the TRUE undrained work — the DB sum of this
-    // node's pending/draining part bytes — NOT raw disk occupancy (usage.used_bytes), which
-    // the A21/orphan leak overcounts by hundreds of GB with no drain demand (WI-20c). On a
-    // query error, leave the last-recorded backlog rather than zeroing it (a transient blip
-    // must not read as "drained"); the next tick refreshes it.
-    match store.node_backlog_bytes(node.as_str()).await {
-        Ok(bytes) => snapshot.record_backlog(bytes),
-        Err(err) => tracing::warn!(error = %err, "backlog query failed; keeping the last value"),
-    }
+    record_drain_signals(store, node, snapshot).await;
 
     // The allocator observation keeps SSD occupancy as its demand weight (a leak-inflated
     // value is a conservative over-demand, not a safety issue; refining it is coordination
@@ -616,14 +629,17 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
                             touch_liveness(path);
                         }
                         heartbeat_once(&ssd, &store, &coord, &node, max_drain_rate, &snapshot).await;
-                        // C8 readiness: heartbeat_once just refreshed the backlog. The drain is
-                        // PROGRESSING iff it cycled any claim (committed + failed + deferred +
+                        // C8 readiness: heartbeat_once just refreshed the drain signals. The drain
+                        // is PROGRESSING iff it cycled any claim (committed + failed + deferred +
                         // throttled) since the last tick; touch readiness only when progressing or
                         // idle, so a wedged loop (hung Ceph) lets the file go stale -> NotReady.
                         // `throttled` is included so a pool-wide Ceph outage — which trips the
                         // breaker and denies EVERY claim — reads as a healthy back-off, not a wedge:
                         // otherwise the whole DaemonSet flips NotReady at once and a rolling update
-                        // can never make progress over the outage.
+                        // can never make progress over the outage. The "is there work" signal is the
+                        // undrained-row COUNT, NOT the byte backlog: the byte sum can undercount a
+                        // wedged node to 0 (missing/NULL-size parts rows), which would falsely read
+                        // idle -> Ready — the exact wedge C8 exists to catch (PR #235 D1).
                         if let Some(path) = readiness.as_deref() {
                             let snap = snapshot.load();
                             let processed = snap
@@ -633,7 +649,7 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
                                 .saturating_add(snap.throttled);
                             let ready = readiness_tracker.lock().unwrap_or_else(PoisonError::into_inner).observe(
                                 processed,
-                                snapshot.backlog(),
+                                snapshot.undrained_count(),
                                 Instant::now(),
                             );
                             if ready {
@@ -661,7 +677,7 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr, reason = "tests")]
 mod tests {
-    use super::{AgentRuntime, HeartbeatConfig, PullAction, RateControl, RuntimeConfig, default_enforcer, pull_action};
+    use super::{AgentRuntime, HeartbeatConfig, PullAction, RateControl, RuntimeConfig, default_enforcer, pull_action, record_drain_signals};
     use crate::localfs::{LocalFs, LocalSsd};
     use crate::supervisor::ShutdownTrigger;
     use core::str::FromStr;
@@ -721,6 +737,55 @@ mod tests {
         // WI-6: an Err (e.g. a sustained redis-queues outage) must decay toward the floor
         // like silence, NOT hold the last budget and keep hammering a degraded Ceph.
         assert_eq!(pull_action(&Err(CoordError::Invalid { field: "test" })), PullAction::Decay);
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn a_wedged_node_with_zero_backlog_bytes_still_reports_undrained_work_to_readiness(pool: PgPool) {
+        // PR #235 D1 end-to-end: a `draining` replication row whose `parts` row is ABSENT is real
+        // undrained work, but node_backlog_bytes (an INNER JOIN to parts) sums it to 0. If readiness
+        // keyed on those 0 bytes it would read idle -> Ready and never catch this wedge. The signal
+        // recording must yield undrained_count == 1 while backlog bytes stay 0, and a readiness
+        // tracker fed that COUNT must go NotReady once the stall elapses with no drained progress.
+        use crate::readiness::ReadinessTracker;
+        use std::time::Instant;
+
+        let store = Store::from_pool(pool.clone());
+        // node_backlog_bytes joins `parts`, which the cephor-only migrations do not create.
+        sqlx::query(
+            "CREATE TABLE parts (object_id uuid NOT NULL, object_version bigint NOT NULL, part_number bigint NOT NULL, \
+             size_bytes bigint, upload_id uuid)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A draining row for node-x with NO parts row: 0 backlog bytes, 1 undrained row.
+        sqlx::query(
+            "INSERT INTO cephor_replication_status (object_id, version, part_number, status, node_id) \
+             VALUES ($1, 1, 1, 'draining', 'node-x')",
+        )
+        .bind(UUID)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let node = NodeId::from_str("node-x").unwrap();
+        let snapshot = SnapshotCell::new();
+        record_drain_signals(&store, &node, &snapshot).await;
+        assert_eq!(snapshot.backlog(), 0, "the wedged node's byte-backlog undercounts to 0");
+        assert_eq!(snapshot.undrained_count(), 1, "but one replication row is still undrained");
+
+        // Drive the readiness verdict exactly as the runtime wiring does — on the undrained COUNT.
+        let stall = Duration::from_mins(1);
+        let t0 = Instant::now();
+        let mut tracker = ReadinessTracker::new(t0, stall);
+        assert!(
+            tracker.observe(0, snapshot.undrained_count(), t0 + Duration::from_secs(5)),
+            "fresh window -> ready"
+        );
+        assert!(
+            !tracker.observe(0, snapshot.undrained_count(), t0 + Duration::from_mins(2)),
+            "undrained rows + no progress past the stall -> NotReady (keying on the 0-byte backlog would stay Ready)"
+        );
     }
 
     fn part_at(version: u32, number: u32) -> PartKey {

@@ -319,6 +319,29 @@ impl Store {
         Ok(u64::try_from(bytes).unwrap_or(0))
     }
 
+    /// The count of `node`'s undrained replication rows (`pending` + `draining`) — the C8
+    /// readiness wedge signal. Unlike [`node_backlog_bytes`](Self::node_backlog_bytes) this does
+    /// NOT join `parts`: a row whose `parts` row is absent or carries a NULL/0 `size_bytes`
+    /// contributes zero bytes to that SUM but is still undrained WORK, so the byte-backlog of a
+    /// wedged node can read 0 while rows remain — which readiness would misread as idle. Counting
+    /// the replication rows directly cannot be zeroed that way, so it is the signal readiness gates
+    /// on. Uses the node-scoped pending index. Mirrors the params of `node_backlog_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn node_undrained_count(&self, node: &str) -> Result<u64> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT count(*)::bigint FROM cephor_replication_status \
+             WHERE node_id = $1 AND status IN ('pending', 'draining')",
+        )
+        .bind(node)
+        .fetch_one(&self.pool)
+        .await?;
+        // count(*) is >= 0; the cast guards against an impossible negative for total-ness.
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
     /// R4 re-drive: reset this node's `corrupt` parts back to `pending` for a fresh SSD->pool
     /// copy (overwriting the corrupt pool copy from the intact SSD source), bounded by
     /// `max_attempts`. Only rows still under the cap are reset; each reset bumps
@@ -1473,6 +1496,39 @@ mod part_tests {
             0,
             "a node with no rows has zero backlog"
         );
+    }
+
+    #[sqlx::test]
+    async fn node_undrained_count_counts_every_undrained_row_even_when_backlog_bytes_is_zero(pool: PgPool) -> Result<(), Box<dyn std::error::Error>> {
+        // C8 wedge signal (PR #235 D1): a draining row whose `parts` row is missing or has a
+        // NULL/0 size contributes ZERO bytes to node_backlog_bytes (INNER JOIN + COALESCE), so a
+        // wedged node's byte-backlog can read 0 while real undrained work remains. The COUNT does
+        // NOT join `parts`, so those exact rows still register — that is why readiness keys on it.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone());
+
+        // node-a undrained rows that ALL contribute 0 bytes: a draining row with no parts row, a
+        // pending row with a NULL size, and a pending row with a 0 size. node_backlog_bytes == 0.
+        seed_status_node(&pool, UUID_A, 1, 1, "draining", "node-a").await; // no parts row
+        seed_status_node(&pool, UUID_A, 1, 2, "pending", "node-a").await;
+        seed_part_size(&pool, UUID_A, 1, 2, None).await; // NULL size
+        seed_status_node(&pool, UUID_A, 1, 3, "pending", "node-a").await;
+        seed_part_size(&pool, UUID_A, 1, 3, Some(0)).await; // zero size
+        // Terminal rows are drained work, excluded from the count.
+        seed_status_node(&pool, UUID_A, 1, 4, "replicated", "node-a").await;
+        seed_part_size(&pool, UUID_A, 1, 4, Some(999)).await;
+        // A peer node's pending row belongs to its own node's count.
+        seed_status_node(&pool, UUID_B, 2, 1, "pending", "node-b").await;
+
+        assert_eq!(store.node_backlog_bytes("node-a").await?, 0, "every undrained row contributes 0 bytes");
+        assert_eq!(
+            store.node_undrained_count("node-a").await?,
+            3,
+            "the wedged node's 3 undrained rows are counted despite the 0-byte backlog"
+        );
+        assert_eq!(store.node_undrained_count("node-b").await?, 1, "counts only this node's rows");
+        assert_eq!(store.node_undrained_count("node-c").await?, 0, "a node with no rows is idle");
+        Ok(())
     }
 
     #[sqlx::test]
