@@ -388,8 +388,10 @@ def _evict_ssd_before_reverify(probe: ClusterProbe | None, cfg: Config) -> tuple
     Deleting each object's parts from the WRITABLE SSD primary on every api pod makes chunks_exist_batch
     miss it, so the reader serves the read-only CephFS fallback (object_cache) — the drain's durable
     output. The CephFS mount is readOnly in the api pod, so eviction can never delete the drained copy.
-    Returns (authoritative, note): authoritative is True only when the SSD copy was actually evicted on
-    at least one pod, i.e. the re-verify genuinely tested the drained copy.
+    Returns (authoritative, note): authoritative is True only when EVERY running api pod's eviction
+    succeeded — a partial eviction is not trustworthy because the GET may route to the one un-evicted
+    pod still holding the intact SSD ingest copy (and rm -rf on an absent path returns 0, so a single
+    pod's success does not prove the copy-holding pod was the one that succeeded).
     """
     if probe is None:
         return (False, "no cluster access — SSD not evicted; reads may be served from the ingest cache "
@@ -397,10 +399,14 @@ def _evict_ssd_before_reverify(probe: ClusterProbe | None, cfg: Config) -> tuple
     oids = _our_object_ids(probe, cfg.bucket_prefix)
     if oids is None:
         return (False, "Postgres unreachable — could not resolve object_ids to evict; reads may be cache-served")
-    targeted, pods = probe.evict_ssd_parts(oids)
-    if pods == 0:
+    targeted, ok_pods, total_pods = probe.evict_ssd_parts(oids)
+    if total_pods == 0:
         return (False, "SSD eviction reached 0 api pods — reads may be cache-served (not authoritative)")
-    return (True, f"evicted {targeted} obj from the SSD ingest cache on {pods} api pod(s) → re-GET reads the drained CephFS copy")
+    if ok_pods != total_pods:
+        return (False, f"SSD eviction succeeded on only {ok_pods}/{total_pods} api pods — a GET routed to an "
+                       "un-evicted pod could read the intact ingest copy (not authoritative)")
+    return (True, f"evicted {targeted} obj from the SSD ingest cache on {ok_pods}/{total_pods} api pods "
+                  "→ re-GET reads the drained CephFS copy")
 
 
 def durability_reverify(client, cfg: Config, ledger: Ledger, report: Report,

@@ -68,20 +68,23 @@ class ClusterProbe:
             return []
         return proc.stdout.split()
 
-    def evict_ssd_parts(self, object_ids: list[str]) -> tuple[int, int]:
+    def evict_ssd_parts(self, object_ids: list[str]) -> tuple[int, int, int]:
         """Delete each object's part tree from the WRITABLE SSD primary cache on every api pod.
 
         The reader's chunks_exist_batch then misses the SSD ingest copy and serves the read-only
         CephFS fallback — the drain's durable output. The CephFS mount is readOnly inside the api
         pod, so this can never delete the drained copy itself; only the ephemeral ingest copy goes.
         An object is ingested on one node only, so its SSD copy lives on a single pod — but the GET
-        may be served by either pod, so we evict on ALL of them. Returns (objects_targeted, pods_hit).
+        may be served by either pod, so we evict on ALL of them. Returns
+        (objects_targeted, pods_ok, pods_total). pods_ok counts pods whose every rm exec returned 0;
+        the caller must require pods_ok == pods_total before trusting the re-verify (rm -rf on an
+        absent path also returns 0, so a per-pod success is only meaningful when EVERY pod succeeded).
         """
         if not object_ids:
-            return (0, 0)
+            return (0, 0, 0)
         pods = self.api_pods()
         dirs = [f"{self.cfg.ssd_cache_dir.rstrip('/')}/{oid}" for oid in object_ids]
-        hit = 0
+        ok_pods = 0
         for pod in pods:
             ok = True
             # Bound the arg vector: chunk the rm so a large corpus can't blow the exec argv limit.
@@ -93,8 +96,8 @@ class ClusterProbe:
                 )
                 ok = ok and proc.returncode == 0
             if ok:
-                hit += 1
-        return (len(object_ids), hit)
+                ok_pods += 1
+        return (len(object_ids), ok_pods, len(pods))
 
     # ---------------------------------------------------------------- prometheus (port-forward)
     def start_prometheus(self) -> bool:
