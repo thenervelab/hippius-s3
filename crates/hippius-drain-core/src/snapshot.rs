@@ -365,6 +365,25 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_parts_is_a_settable_gauge_not_a_counter() {
+        // D5: the R4 standing durability signal (the drain_corrupt_parts alert source). A LEVEL
+        // set each cycle from Store::count_corrupt_parts, so a later record REPLACES rather than
+        // accumulates — the page fires on this gauge staying nonzero ACROSS cycles (only at-cap
+        // unrecoverable parts sustain it), NOT on a single reclaim cycle's held count, which is
+        // logged at WARN and self-heals on the next re-drive.
+        let cell = SnapshotCell::new();
+        assert_eq!(cell.corrupt_parts(), 0, "a fresh cell reports no corrupt parts");
+        cell.record_corrupt(3);
+        assert_eq!(cell.corrupt_parts(), 3);
+        cell.record_corrupt(1);
+        assert_eq!(
+            cell.corrupt_parts(),
+            1,
+            "corrupt parts is a level: a later record replaces, not accumulates"
+        );
+    }
+
+    #[test]
     fn records_accumulate_per_counter() {
         let cell = SnapshotCell::new();
         cell.record_drained(3);
