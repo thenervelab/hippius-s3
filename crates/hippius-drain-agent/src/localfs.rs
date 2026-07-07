@@ -18,8 +18,10 @@ use hippius_drain_core::{
 };
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
+use std::hash::BuildHasher;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::fs;
@@ -258,15 +260,30 @@ async fn stream_copy_hash(source: &Path, dest: &Path) -> io::Result<String> {
     Ok(hex_lower(hasher.finalize().as_slice()))
 }
 
-/// A monotonic per-process counter that, with the pid, makes each write temp unique —
+/// A monotonic per-process counter that makes each write temp unique WITHIN a process —
 /// so two tasks persisting the SAME `name` concurrently never share a temp file (C11).
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// A per-process random nonce that makes write temps unique ACROSS processes. `pid` alone
+/// is not enough: two agent pods overlapping on one SSD mount during a rolling update
+/// commonly both run as pid 1, so both would emit `.tmp-<name>.1.0` for their first write
+/// and tear each other's copy (the post-copy SHA re-verify catches the tear, but this makes
+/// it impossible). Sourced from `RandomState`, whose `new()` is "initialized with random
+/// keys" and whose two instances are documented "unlikely to produce the same result for the
+/// same values" — process-unique entropy with no added dependency. Computed once on first use.
+static TEMP_NONCE: LazyLock<u64> = LazyLock::new(|| std::collections::hash_map::RandomState::new().hash_one(0u8));
+
 /// The write-temp name for `name`: the agent's `.tmp-` prefix (recognized by
-/// [`is_temp_name`] and the orphan sweep) plus a per-writer `pid.counter` suffix, so
-/// two concurrent persists of the same part write to DISTINCT temps.
+/// [`is_temp_name`] and the orphan sweep) plus a `pid.nonce.counter` suffix — the
+/// per-process [`TEMP_NONCE`] separates overlapping pods and the [`TEMP_SEQ`] counter
+/// separates concurrent writers in one process, so no two persists share a temp path.
 fn temp_name(name: &str) -> String {
-    format!(".tmp-{name}.{}.{}", std::process::id(), TEMP_SEQ.fetch_add(1, Ordering::Relaxed))
+    format!(
+        ".tmp-{name}.{}.{:x}.{}",
+        std::process::id(),
+        *TEMP_NONCE,
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Atomically place `source`'s bytes into `dir` as `name`, returning the lowercase-hex
@@ -585,7 +602,7 @@ impl PartRemover for LocalSsd {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::{LocalSsd, TmpGuard, hex_lower, is_temp_name, safe_component, temp_name};
+    use super::{LocalSsd, TEMP_NONCE, TmpGuard, hex_lower, is_temp_name, safe_component, temp_name};
     use core::str::FromStr;
     use hippius_drain_core::{FileId, SsdCache};
     use proptest::prelude::*;
@@ -609,6 +626,13 @@ mod tests {
             assert!(t.starts_with(".tmp-"), "keeps the agent temp prefix: {t}");
             assert!(is_temp_name(t), "the orphan sweep still recognizes it as a temp: {t}");
         }
+        // The process nonce is constant within a run (only the trailing counter advances), so
+        // the two names differ only in the final field — the cross-process separator is stable.
+        let nonce = format!(".{:x}.", *TEMP_NONCE);
+        assert!(
+            a.contains(&nonce) && b.contains(&nonce),
+            "both carry the stable per-process nonce: {a} {b}"
+        );
     }
 
     #[tokio::test]
