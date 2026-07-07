@@ -34,6 +34,12 @@ data:
   ORPHAN_CHECKER_LOOP_SLEEP: "7200"
   ORPHAN_CHECKER_BATCH_SIZE: "100"
   HIPPIUS_ORPHAN_WORKER_ACCOUNT_WHITELIST: ""
+  # Janitor stale-parts reap window and, where the mpu-reaper runs, the incomplete-MPU
+  # auto-abort window. Lowered from the 2-day code default to 1 day to reclaim NVMe cache
+  # faster (hard-deleted orphan residue dominates resident dirs). Do not shorten further
+  # without splitting the janitor knob from the MPU-abort knob: uploads open past this
+  # window get auto-aborted, and multi-GB backups can legitimately run for many hours.
+  HIPPIUS_MPU_STALE_SECONDS: "86400"
   HTTP_STREAM_INITIAL_TIMEOUT_SECONDS: "0.5"
   HIPPIUS_DLQ_DIR: "/tmp/hippius_dlq"
   HIPPIUS_DLQ_ARCHIVE_DIR: "/tmp/hippius_dlq_archive"
