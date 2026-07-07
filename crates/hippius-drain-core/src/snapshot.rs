@@ -256,10 +256,14 @@ impl SnapshotCell {
     }
 
     /// The last-recorded SSD disk saturation in basis points (the `drain_ssd_pressure`
-    /// gauge source). Clamped to `10000` should a wider value ever be stored.
+    /// gauge source). Clamped to `10000` on read so the value honors the `bps ∈ [0, 10000]`
+    /// contract even if a wider one was ever stored.
     #[must_use]
     pub fn disk_pressure_bps(&self) -> u16 {
-        u16::try_from(self.disk_pressure_bps.load(Ordering::Relaxed)).unwrap_or(10_000)
+        // Clamp on read: the setter widens u16 -> u64, so a stored bps in (10000, 65535]
+        // would otherwise round-trip un-clamped and break the [0, 10000] contract. The
+        // `.min` makes the value always fit u16, so the `try_from` fallback never fires.
+        u16::try_from(self.disk_pressure_bps.load(Ordering::Relaxed).min(10_000)).unwrap_or(10_000)
     }
 
     /// Records the current count of parts held `corrupt` on this node. A gauge: `store`, not
@@ -362,6 +366,12 @@ mod tests {
         assert_eq!(cell.disk_pressure_bps(), 8500);
         cell.record_disk_pressure(200);
         assert_eq!(cell.disk_pressure_bps(), 200, "disk pressure is a level: a later record replaces");
+        cell.record_disk_pressure(12_000); // a u16 wider than the bps ceiling
+        assert_eq!(
+            cell.disk_pressure_bps(),
+            10_000,
+            "a stored bps above 10000 reads back clamped to the ceiling"
+        );
     }
 
     #[test]
