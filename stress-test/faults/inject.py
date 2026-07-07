@@ -1,7 +1,7 @@
 """WI-19 §4.5 fault injector — apply/clean one F-cell from matrix.yaml.
 
 Thin wrapper over kubectl (Chaos Mesh CRDs + the F5 fill Job) and the toxiproxy control API (F8
-slicer + the redis/PG toxics). Deliberately dumb: it applies a fault and returns; run_chaos.sh owns
+limit_data body-truncation + the redis/PG toxics). Deliberately dumb: it applies a fault and returns; run_chaos.sh owns
 the timing, the inv-guard/ledger assertions, and cleanup ordering.
 
   python inject.py apply   F2 [--repo-root .] [--toxi http://localhost:8474]
