@@ -92,6 +92,14 @@ pub struct AgentSnapshot {
     /// `failed` (broken/abandoned-upload) SSD parts the reclaim worker unlinked — the
     /// SSD-ingest tier's eviction throughput, distinct from the drain's `CephFS` work.
     pub reclaimed: u64,
+    /// Reclaim cycles that aborted on an object-backing read error (`ReclaimError::Backing`):
+    /// the servability/orphan gate could not read `object_versions` (a missing table on some
+    /// deploy, or a transient PG error). A monotonic COUNT of aborted cycles — each removes
+    /// NOTHING (fail-safe), so a sustained rise means the `failed`-part SSD GC is silently
+    /// DISABLED and debris accrues, invisible outside logs. Deliberately kept OUT of
+    /// [`error_bps`](Self::error_bps): a reclaim stall is not a Ceph-write failure, exactly
+    /// like `deferred`/`throttled`.
+    pub reclaim_backing_errors: u64,
     /// Claims handed back un-drained because the breaker/throttle `Denied` the tick (the
     /// pool is unhealthy or the write budget is spent). NOT a drain outcome — no part moved
     /// — but the loop DID cycle, so the readiness tracker folds it into `processed`: a
@@ -134,6 +142,11 @@ pub struct SnapshotCell {
     deferred: AtomicU64,
     reconciler_recovered: AtomicU64,
     reclaimed: AtomicU64,
+    /// Aborted-reclaim counter mirroring `reclaimed`: bumped once per reclaim cycle that failed
+    /// its object-backing read (`ReclaimError::Backing`). Monotonic, `Relaxed` — a stat counter
+    /// with no cross-counter ordering dependency (axiom `rust_quality_92`). See
+    /// [`AgentSnapshot::reclaim_backing_errors`] for why it stays out of `error_bps`.
+    reclaim_backing_errors: AtomicU64,
     throttled: AtomicU64,
     /// Current SSD backlog (undrained bytes) — a LEVEL, not a monotonic counter, so it
     /// has its own atomic (set, not accumulated) rather than living in [`AgentSnapshot`].
@@ -196,6 +209,13 @@ impl SnapshotCell {
     /// Adds `n` to the SSD-reclaim total (terminal parts the reclaim worker unlinked).
     pub fn record_reclaimed(&self, n: u64) {
         self.reclaimed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Records one reclaim cycle aborted on an object-backing read error — a `failed`-part GC
+    /// pass that read nothing and removed nothing (the `drain_reclaim_backing_errors_total`
+    /// counter). One abort per cycle, so it bumps by one, not by a caller-supplied count.
+    pub fn record_reclaim_backing_error(&self) {
+        self.reclaim_backing_errors.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records `n` claims handed back because the breaker/throttle denied the tick. Counts
@@ -279,6 +299,7 @@ impl SnapshotCell {
             deferred: self.deferred.load(Ordering::Relaxed),
             reconciler_recovered: self.reconciler_recovered.load(Ordering::Relaxed),
             reclaimed: self.reclaimed.load(Ordering::Relaxed),
+            reclaim_backing_errors: self.reclaim_backing_errors.load(Ordering::Relaxed),
             throttled: self.throttled.load(Ordering::Relaxed),
         }
     }
@@ -360,6 +381,7 @@ mod tests {
                 deferred: 0,
                 reconciler_recovered: 4,
                 reclaimed: 6,
+                reclaim_backing_errors: 0,
                 throttled: 9,
             },
         );
@@ -376,6 +398,21 @@ mod tests {
         let snap = cell.load();
         assert_eq!(snap.throttled, 40, "throttled ticks are counted for readiness/visibility");
         assert_eq!(snap.error_bps(), 3000, "throttled ticks stay out of the Ceph failure rate");
+    }
+
+    #[test]
+    fn reclaim_backing_errors_accumulate_without_polluting_error_bps() {
+        // D4: a backing-read abort disables the `failed`-part SSD GC (the servability gate cannot
+        // read `object_versions`) but is NOT a Ceph-write failure, so — like `deferred`/`throttled`
+        // — it is counted for the alert yet kept out of the Ceph error rate.
+        let cell = SnapshotCell::new();
+        cell.record_drained(7);
+        cell.record_failed(3);
+        cell.record_reclaim_backing_error();
+        cell.record_reclaim_backing_error();
+        let snap = cell.load();
+        assert_eq!(snap.reclaim_backing_errors, 2, "each aborted reclaim cycle is counted");
+        assert_eq!(snap.error_bps(), 3000, "backing-read aborts stay out of the Ceph failure rate");
     }
 
     #[test]
@@ -408,6 +445,7 @@ mod tests {
             deferred: 0,
             reconciler_recovered: 0,
             reclaimed: 0,
+            reclaim_backing_errors: 0,
             throttled: 0,
         };
         assert_eq!(snapshot.error_bps(), 10_000);
@@ -421,6 +459,7 @@ mod tests {
             deferred: 0,
             reconciler_recovered: 0,
             reclaimed: 0,
+            reclaim_backing_errors: 0,
             throttled: 0,
         };
         // 3 failed attempts of 10 total attempts = 30%, i.e. 3000 basis points.
