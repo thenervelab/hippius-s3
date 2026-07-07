@@ -261,7 +261,7 @@ def add_toxic(
       add_toxic("redis_queues", "latency", {"latency": 800, "jitter": 100})   # +800±100ms
       add_toxic("redis_queues", "timeout", {"timeout": 0})                    # hang (F3)
       add_toxic("arion", "bandwidth", {"rate": 10})                           # 10 KB/s (F4)
-      add_toxic("arion", "limit_data", {"bytes": 65536})                      # truncate body (F8)
+      add_toxic("arion", "limit_data", {"bytes": 4096})                       # truncate body (F8)
       add_toxic("postgres", "reset_peer", {"timeout": 0})                     # RST (F6)
     """
     toxic_name = name or f"{toxic_type}_{stream}"

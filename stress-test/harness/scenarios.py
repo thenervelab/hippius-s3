@@ -56,6 +56,11 @@ def durability_corpus(client, cfg: Config, ledger: Ledger, report: Report, bucke
     b = _bucket(cfg, "durab")
     s3util.ensure_bucket(client, b)
     buckets["durability"] = b
+    # F8 chaos invariant: the F8 cell truncates fetched chunk bodies with toxiproxy limit_data
+    # (stress-test/faults/matrix.yaml, bytes=4096). Truncation only bites when a chunk body EXCEEDS
+    # that threshold — keep the smallest non-empty object here (8 KiB) safely above it, or F8 hands the
+    # drain a full body and its corrupt-detection gate silently regresses to a no-op. (zerobyte has no
+    # chunk to fetch, so it is exempt.)
     corpus = (
         [("small", 8 * 1024, False)] * 8
         + [("medium", 1024 * 1024, False)] * 4
