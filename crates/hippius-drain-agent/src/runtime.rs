@@ -303,16 +303,18 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
                     "replicated parts still on SSD — drain crash-orphans nothing currently reclaims"
                 );
             }
-            // Parts held because their live object's pool copy is corrupt (R4): a `corrupt`
-            // row, or the defense-in-depth `failed`+servable case not yet promoted. Their SSD
-            // copy is the last good source. This is LIVE, not hypothetical — the drain's
-            // ChunkMismatch path marks a servable part `corrupt` today — so a nonzero value is a
-            // real durability incident, not GC. ERROR so a log-based alert pages (the
-            // drain_corrupt_parts gauge + alert is the metric path).
+            // Parts held this cycle because their live object's pool copy is corrupt (R4): a
+            // `corrupt` row, or the defense-in-depth `failed`+servable case. Their SSD copy is the
+            // last good source. Reclaim runs BEFORE the corrupt re-drive in the poll cycle, so a
+            // TRANSIENT ChunkMismatch is counted here and then reset to `pending` and recovered on
+            // the very next re-drive — paging on this single-cycle held count would fire on
+            // self-healing corruption. WARN, not page: the STANDING incident signal is the
+            // drain_corrupt_parts gauge remaining nonzero across cycles (the drain-corrupt-live-parts
+            // alert, for:15m), which only at-cap unrecoverable parts sustain — see redrive_corrupt_once.
             if report.skipped_corrupt > 0 {
-                tracing::error!(
+                tracing::warn!(
                     skipped_corrupt = report.skipped_corrupt,
-                    "corrupt-live SSD parts held (pool copy corrupt) — last good source preserved, awaiting re-drive (R4)"
+                    "corrupt-live SSD parts held this cycle (pool copy corrupt) — last good source preserved, awaiting re-drive (R4)"
                 );
             }
         }
