@@ -107,8 +107,18 @@ async def _seed_status(
     )
 
 
-async def _count(conn: asyncpg.Connection) -> int:
-    return int(await conn.fetchval(get_query("count_aged_pending_orphans"), _STALE) or 0)
+async def _count(conn: asyncpg.Connection, *, dlq_object_ids: list[str] | None = None) -> int:
+    # $2 is the DLQ-protection array the janitor passes (the same set the reaper skips). Default
+    # to an empty array — the healthy no-DLQ case — so every pre-existing case exercises "exclude
+    # nothing" and only the DLQ test opts into a non-empty set.
+    return int(
+        await conn.fetchval(
+            get_query("count_aged_pending_orphans"),
+            _STALE,
+            dlq_object_ids or [],
+        )
+        or 0
+    )
 
 
 def _oid() -> str:
@@ -197,6 +207,28 @@ async def test_a_fresh_part_keeps_a_stale_sibling_uncounted(conn):
     await _seed_status(conn, oid, 1, 1, status="pending", landed_age_seconds=7200)
     await _seed_status(conn, oid, 1, 2, status="pending", landed_age_seconds=1)
     assert await _count(conn) == 0
+
+
+async def test_dlq_protected_orphan_is_not_counted(conn):
+    # C2: a DLQ-parked orphan is one the sweep SKIPS (`if str(object_id) in dlq_object_ids:
+    # continue`), so it is not a leak the sweep can clear — counting it would be a phantom
+    # backlog that reads non-zero forever. The gauge must exclude the same set via $2.
+    oid = _oid()
+    await _seed_version(conn, oid, 1, address=None, size_bytes=0, md5_hash="")
+    await _seed_status(conn, oid, 1, 1, status="pending")
+    assert await _count(conn) == 1  # without DLQ protection it is an ordinary aged orphan
+    assert await _count(conn, dlq_object_ids=[oid]) == 0  # in the DLQ set -> excluded
+
+
+async def test_dlq_set_only_excludes_its_own_members(conn):
+    # A DLQ entry for one object must not spare a different aged orphan: exclusion is per
+    # object_id, matching the reaper's membership test exactly.
+    parked, leaked = _oid(), _oid()
+    await _seed_version(conn, parked, 1, address=None, size_bytes=0, md5_hash="")
+    await _seed_status(conn, parked, 1, 1, status="pending")
+    await _seed_version(conn, leaked, 1, address=None, size_bytes=0, md5_hash="")
+    await _seed_status(conn, leaked, 1, 1, status="pending")
+    assert await _count(conn, dlq_object_ids=[parked]) == 1  # only `leaked` remains
 
 
 async def test_version_with_no_object_versions_row_is_not_counted(conn):

@@ -672,15 +672,20 @@ async def check_replication_sentinel(db_pool: asyncpg.Pool, pressure: int) -> in
     return violations
 
 
-async def check_aged_pending_orphans(db_pool: asyncpg.Pool) -> int:
+async def check_aged_pending_orphans(db_pool: asyncpg.Pool, dlq_object_ids: set[str]) -> int:
     """A21 soak-gate feed: count the standing aged pending/draining unservable orphan
     versions and publish the gauge.
 
     The 6h-soak gate asserts only the `replicated`-on-SSD count, so it is blind to A21
     orphans (which never reach `replicated`). This publishes the population the sweep
-    (`list_orphan_replication_versions.sql`) exists to clear, so the soak gate can assert it
+    (`sweep_orphan_replication_versions`) exists to clear, so the soak gate can assert it
     is bounded and its slope is ~ 0 — a rising value means orphans accrue faster than the
     sweep drains them (a re-introduced leak). Purely a SELECT, safe every cycle.
+
+    ``dlq_object_ids`` MUST be excluded to keep the gauge in lockstep with the sweep: the sweep
+    skips any object_id parked in a DLQ, so a DLQ-parked orphan is one it will never clear —
+    counting it here would be a permanent phantom backlog. Passed as $2 (text[]); the SQL matches
+    ``crs.object_id`` byte-for-byte against the reaper's ``str(object_id)`` membership test.
 
     Unlike the G2 sentinel this does NOT log on a nonzero value: a transient backlog between
     a leak and the next sweep is normal, so alerting is left to the gauge's slope/sustained
@@ -692,6 +697,7 @@ async def check_aged_pending_orphans(db_pool: asyncpg.Pool) -> int:
         count = await conn.fetchval(
             get_query("count_aged_pending_orphans"),
             config.mpu_sweep_grace_seconds,
+            list(dlq_object_ids),
         )
     _aged_pending_orphans = int(count or 0)
     return _aged_pending_orphans
@@ -1080,10 +1086,15 @@ async def run_janitor_loop():
                 logger.error(f"Phase 5 (replication sentinel) error: {e}", exc_info=True)
 
             # Phase 6: read-only aged-pending orphan gauge (A21 soak-gate feed). Publishes the
-            # standing leak backlog the replicated-only soak gate cannot see.
+            # standing leak backlog the replicated-only soak gate cannot see. The DLQ set is
+            # gathered fresh (same fail-closed helper the reaps use) and excluded so the gauge
+            # counts EXACTLY the population the sweep clears — a DLQ-parked orphan the sweep skips
+            # must not read as a phantom leak. On a DLQ-read failure the whole phase is skipped
+            # (gauge holds its prior value) rather than over-counting against an empty set.
             aged_orphans = 0
             try:
-                aged_orphans = await check_aged_pending_orphans(db_pool)
+                gauge_dlq_object_ids = await get_all_dlq_object_ids(redis_client)
+                aged_orphans = await check_aged_pending_orphans(db_pool, gauge_dlq_object_ids)
             except Exception as e:
                 logger.error(f"Phase 6 (aged-pending orphan gauge) error: {e}", exc_info=True)
 
