@@ -596,13 +596,19 @@ groups:
         labels:
           severity: critical
 
-      # Epoch-counter reset. drain_leader_epoch is the monotonic leadership era; max() over the
-      # fleet only ever climbs BY CONSTRUCTION, so any decrease means the redis cephor:epoch
-      # counter was rewound (AOF reload / FLUSHALL / replica failover) — which silently degrades
-      # the R3 allocation write-fence OPEN (a legit leader can be fenced by cached higher-epoch
-      # alloc keys, or a stale writer slips through). The expr yields (epoch 5m ago − epoch now):
-      # positive only on a regression. This is the sole failure mode of the write-fence, so it
-      # pages critical even though no split-brain has occurred YET.
+      # Epoch-counter reset. drain_leader_epoch is the leadership era; while a leader is LIVE the
+      # fleet max() only climbs, so a decrease means the redis cephor:epoch counter was rewound
+      # (AOF reload / FLUSHALL / replica failover) — which silently degrades the R3 allocation
+      # write-fence OPEN (a legit leader can be fenced by cached higher-epoch alloc keys, or a
+      # stale writer slips through). The expr yields (epoch 5m ago − epoch now), positive only on
+      # a regression. The `and max(...) > 0` guard is load-bearing: a deposed leader now resets its
+      # gauge to 0 on lease loss (so a real reset is actually detectable — see the allocator
+      # `record_not_leading`), which means during a leadership-handoff VACUUM the fleet max() dips
+      # to 0 for a scrape or two before the new leader publishes its (higher) epoch. Without the
+      # guard that transient 0 vs the 5m-ago nonzero would page a spurious critical on every
+      # deploy/lease-loss. A genuine counter reset leaves the LIVE new leader at a low-but-nonzero
+      # epoch, so `max > 0` holds and the alert still fires. This is the sole failure mode of the
+      # write-fence, so it pages critical even though no split-brain has occurred YET.
       - uid: drain-leader-epoch-decrease
         title: Drain Allocator - Leader Epoch Decreased (counter reset)
         condition: C
@@ -613,7 +619,7 @@ groups:
               to: 0
             datasourceUid: PBFA97CFB590B2093
             model:
-              expr: 'max(drain_leader_epoch{job="otel-collector"} offset 5m) - max(drain_leader_epoch{job="otel-collector"})'
+              expr: '(max(drain_leader_epoch{job="otel-collector"} offset 5m) - max(drain_leader_epoch{job="otel-collector"})) and (max(drain_leader_epoch{job="otel-collector"}) > 0)'
               refId: A
           - refId: B
             relativeTimeRange:
@@ -642,7 +648,9 @@ groups:
               refId: C
         noDataState: OK
         execErrState: Error
-        for: 0m
+        # 2m (well under the 5m offset): a genuine reset holds the decrease for ~5m, so 2m still
+        # pages promptly while absorbing any single-scrape handoff-vacuum blip the guard misses.
+        for: 2m
         annotations:
           description: 'The drain leader epoch decreased (counter reset in redis-queues) — the R3 allocation write-fence is degraded open and split-brain is now possible. Confirm redis-queues persistence (noeviction + AOF) and the cephor:epoch value.'
           summary: Drain leader epoch counter was reset (write-fence degraded)
