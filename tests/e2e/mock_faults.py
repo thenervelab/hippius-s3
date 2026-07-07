@@ -17,7 +17,13 @@ Configuration, two ways (runtime wins over env):
     MOCK_FAULT_MODE / MOCK_FAULT_OP / MOCK_FAULT_STATUS / MOCK_FAULT_DELAY_S /
     MOCK_FAULT_AFTER_N / MOCK_FAULT_TRUNCATE_BYTES knobs for a single rule.
   * runtime — the control API this module mounts: POST /_fault {rule|[rules]},
-    GET /_fault, DELETE /_fault (clear). Tests drive faults through these.
+    GET /_fault, DELETE /_fault (clear), POST /_fault/reset (zero the per-op counters WITHOUT
+    changing rules). Tests drive faults through these.
+
+Per-op call counters (which drive `fail_after_n`) reset on EVERY POST /_fault and on DELETE, so a
+test that (re-)POSTs its rules always starts from a fresh countdown and cannot inherit a prior
+test's count. POST /_fault/reset re-arms the countdown while keeping the same rules — for a test
+that wants several `fail_after_n` cycles without re-POSTing.
 
 Modes (matched by `op`, or "all"):
   off           no-op
@@ -101,6 +107,15 @@ class FaultController:
         self._rules = []
         self._counts.clear()
 
+    def reset_counts(self) -> None:
+        """Zero the per-op call counters WITHOUT touching the active rules.
+
+        `fail_after_n` counts up in `self._counts` and only ever resets on set_rules/clear, so a
+        second test reusing the SAME rules (without re-POSTing) would inherit the first test's count
+        and trip the fault early. This lets a test re-arm the countdown between phases explicitly.
+        """
+        self._counts.clear()
+
     def _match(self, op: str) -> FaultRule | None:
         for r in self._rules:
             if r.mode != "off" and r.op in (op, "all"):
@@ -147,6 +162,12 @@ def install_fault_controller(app: FastAPI, service: str) -> FaultController:
     @app.delete("/_fault")
     async def _clear_fault() -> dict:
         ctl.clear()
+        return {"ok": True}
+
+    @app.post("/_fault/reset")
+    async def _reset_counts() -> dict:
+        # Re-arm fail_after_n countdowns without disturbing the active rules.
+        ctl.reset_counts()
         return {"ok": True}
 
     return ctl

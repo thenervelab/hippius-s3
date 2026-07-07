@@ -16,6 +16,11 @@ import urllib.request
 
 from .config import Config
 
+# psql field separator: ASCII Unit Separator (0x1f), not '|'. A '|' in a cell value (a detail
+# string, a base64-ish identifier, a status message) would mis-split the row on a printable
+# delimiter; US never appears in our text columns, so splitting on it is unambiguous.
+_PSQL_FIELD_SEP = "\x1f"
+
 
 class ClusterProbe:
     def __init__(self, cfg: Config) -> None:
@@ -33,7 +38,7 @@ class ClusterProbe:
     def _pg_raw(self, sql: str) -> str | None:
         cmd = [
             "kubectl", "-n", self.cfg.namespace, "exec", self.cfg.pg_pod, "-c", "postgres",
-            "--", "psql", "-U", "postgres", "-d", self.cfg.pg_db, "-tAF|", "-c", sql,
+            "--", "psql", "-U", "postgres", "-d", self.cfg.pg_db, "-tAF" + _PSQL_FIELD_SEP, "-c", sql,
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if proc.returncode != 0:
@@ -41,13 +46,13 @@ class ClusterProbe:
         return proc.stdout.strip()
 
     def pg(self, sql: str) -> list[list[str]] | None:
-        """Run SQL; return rows as lists of string columns (| separated). None if unreachable."""
+        """Run SQL; return rows as lists of string columns (US-separated). None if unreachable."""
         out = self._pg_raw(sql)
         if out is None:
             return None
         if out == "":
             return []
-        return [line.split("|") for line in out.splitlines()]
+        return [line.split(_PSQL_FIELD_SEP) for line in out.splitlines()]
 
     def pg_scalar(self, sql: str) -> str | None:
         rows = self.pg(sql)
