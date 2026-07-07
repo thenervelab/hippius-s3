@@ -140,6 +140,13 @@ pub struct SnapshotCell {
     /// The heartbeat worker writes it (`usage.used_bytes`) each tick; the metrics layer
     /// reads it as a gauge. Kept off the wait-free `load` path so a scrape never blocks.
     backlog_bytes: AtomicU64,
+    /// Count of this node's undrained replication rows (`pending` + `draining`) — a LEVEL like
+    /// `backlog_bytes`, set each heartbeat from `Store::node_undrained_count`. This is the C8
+    /// wedge signal, kept SEPARATE from `backlog_bytes` on purpose: the byte sum joins `parts`
+    /// and a missing/NULL-size row contributes zero, so a wedged node's byte-backlog can read 0
+    /// while undrained rows remain — which readiness would misread as idle. The COUNT cannot be
+    /// zeroed that way, so readiness keys on it while the gauge keeps reporting bytes.
+    undrained_count: AtomicU64,
     /// Current SSD disk saturation in basis points (`0..=10000` = `0.0..=1.0` full) — a
     /// LEVEL like `backlog_bytes`, set each heartbeat from the same `statvfs` probe. This
     /// is the fill fraction that 503s every PUT once it crosses the api's cutoff, so it is
@@ -207,6 +214,19 @@ impl SnapshotCell {
     #[must_use]
     pub fn backlog(&self) -> u64 {
         self.backlog_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Records the current count of undrained replication rows (`pending` + `draining`). A gauge:
+    /// `store`, not add. The heartbeat writes it from `Store::node_undrained_count` each tick.
+    pub fn record_undrained_count(&self, count: u64) {
+        self.undrained_count.store(count, Ordering::Relaxed);
+    }
+
+    /// The last-recorded count of undrained replication rows — the C8 readiness wedge signal
+    /// (nonzero means real drain work remains, even when [`backlog`](Self::backlog) reads 0).
+    #[must_use]
+    pub fn undrained_count(&self) -> u64 {
+        self.undrained_count.load(Ordering::Relaxed)
     }
 
     /// Records the current SSD disk saturation in basis points (`0..=10000`). A gauge:
@@ -299,6 +319,18 @@ mod tests {
         assert_eq!(cell.backlog(), 4096);
         cell.record_backlog(100);
         assert_eq!(cell.backlog(), 100, "backlog is a level: a later record replaces, not accumulates");
+    }
+
+    #[test]
+    fn undrained_count_is_a_settable_gauge_not_a_counter() {
+        // The C8 wedge signal (PR #235 D1): a LEVEL sourced from a COUNT of undrained
+        // replication rows, so a later record replaces rather than accumulates — like backlog.
+        let cell = SnapshotCell::new();
+        assert_eq!(cell.undrained_count(), 0, "a fresh cell reports no undrained rows");
+        cell.record_undrained_count(4);
+        assert_eq!(cell.undrained_count(), 4);
+        cell.record_undrained_count(1);
+        assert_eq!(cell.undrained_count(), 1, "undrained count is a level: a later record replaces");
     }
 
     #[test]
