@@ -260,6 +260,8 @@ async def test_gauge_grace_is_a_short_soak_window_not_the_48h_reaper_grace(conn)
         get_query("count_aged_pending_orphans"), config.mpu_sweep_grace_seconds, []
     )
     assert int(at_gauge_grace or 0) == 1  # visible at the 1h gauge grace
+    # Assumes the shipped defaults: HIPPIUS_MPU_SWEEP_GRACE_SECONDS (172800s / 48h) ≫ the 7200s seed,
+    # so the same 2h orphan is still inside the reaper grace and therefore uncounted.
     assert int(at_reaper_grace or 0) == 0  # invisible at the 48h reaper grace — the blindness C3 removes
 
 
