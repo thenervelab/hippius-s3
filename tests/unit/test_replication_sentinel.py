@@ -100,6 +100,9 @@ async def test_the_query_is_bound_with_backup_upload_and_the_scan_limit():
         patch.object(janitor.config, "backup_backends", ["ipfs"], create=True),
     ):
         await janitor.check_replication_sentinel(pool, pressure=0)
-    assert conn.fetched_args == (["ipfs"], ["arion"], janitor.SENTINEL_SCAN_LIMIT), (
-        "bound as (backup_backends, config.upload_backends, scan_limit)"
-    )
+    assert conn.fetched_args == (
+        ["ipfs"],
+        ["arion"],
+        janitor.SENTINEL_SCAN_LIMIT,
+        janitor.config.replication_sla_seconds,
+    ), "bound as (backup_backends, config.upload_backends, scan_limit, replication_sla_seconds)"
