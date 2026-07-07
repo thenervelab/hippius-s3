@@ -63,7 +63,12 @@ class ClusterProbe:
             "-l", f"app={self.cfg.api_selector}", "--field-selector=status.phase=Running",
             "-o", "jsonpath={.items[*].metadata.name}",
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        # A kubectl hang or a missing binary is an environment fault, not a data-loss signal: return
+        # no pods so the caller downgrades the gate to non-authoritative rather than failing it red.
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return []
         if proc.returncode != 0:
             return []
         return proc.stdout.split()
@@ -89,11 +94,18 @@ class ClusterProbe:
             ok = True
             # Bound the arg vector: chunk the rm so a large corpus can't blow the exec argv limit.
             for i in range(0, len(dirs), 100):
-                proc = subprocess.run(  # noqa: S603 — fixed argv, oids are DB uuids
-                    ["kubectl", "-n", self.cfg.namespace, "exec", pod, "-c", "api",
-                     "--", "rm", "-rf", *dirs[i:i + 100]],
-                    capture_output=True, text=True, timeout=60,
-                )
+                try:
+                    proc = subprocess.run(  # noqa: S603 — fixed argv, oids are DB uuids
+                        ["kubectl", "-n", self.cfg.namespace, "exec", pod, "-c", "api",
+                         "--", "rm", "-rf", *dirs[i:i + 100]],
+                        capture_output=True, text=True, timeout=60,
+                    )
+                except (subprocess.TimeoutExpired, FileNotFoundError):
+                    # A kubectl hang / missing binary is an environment fault: mark this pod not-ok
+                    # so the gate downgrades to non-authoritative — same as a returncode!=0 failure —
+                    # rather than propagating and flipping the whole no-data-loss gate red.
+                    ok = False
+                    break
                 ok = ok and proc.returncode == 0
             if ok:
                 ok_pods += 1

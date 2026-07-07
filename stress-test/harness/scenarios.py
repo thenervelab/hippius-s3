@@ -383,11 +383,14 @@ def _evict_ssd_before_reverify(probe: ClusterProbe | None, cfg: Config) -> tuple
     cache proves NOTHING about the drained copy. Right after convergence the SSD part is still present
     (the drain/janitor keep it under replication-gate + hot-retention), so object_reader's
     chunks_exist_batch hits the SSD primary (HIPPIUS_OBJECT_CACHE_DIR=local_object_cache) and serves
-    source="cache" from it — the drained CephFS pool copy is never touched, so a corrupt or missing
-    drained copy would still re-GET byte-identical off the intact SSD copy and pass the gate green.
+    source="cache" from it — the drained copy is never touched, so a corrupt or missing drained copy
+    would still re-GET byte-identical off the intact SSD copy and pass the gate green.
     Deleting each object's parts from the WRITABLE SSD primary on every api pod makes chunks_exist_batch
-    miss it, so the reader serves the read-only CephFS fallback (object_cache) — the drain's durable
-    output. The CephFS mount is readOnly in the api pod, so eviction can never delete the drained copy.
+    miss it, so the reader now serves a DRAINED copy: the read-only CephFS fallback (object_cache) when
+    HIPPIUS_OBJECT_CACHE_FALLBACK_DIR is configured (DualFileSystemPartsStore), else source="pipeline"
+    and a DownloadChainRequest fetches from the backend (Arion) — either way a drained copy, never the
+    intact SSD ingest copy. Eviction only ever deletes the writable SSD primary, so it can never touch
+    a drained copy (the CephFS fallback is mounted readOnly; Arion is remote).
     Returns (authoritative, note): authoritative is True only when EVERY running api pod's eviction
     succeeded — a partial eviction is not trustworthy because the GET may route to the one un-evicted
     pod still holding the intact SSD ingest copy (and rm -rf on an absent path returns 0, so a single
@@ -406,7 +409,7 @@ def _evict_ssd_before_reverify(probe: ClusterProbe | None, cfg: Config) -> tuple
         return (False, f"SSD eviction succeeded on only {ok_pods}/{total_pods} api pods — a GET routed to an "
                        "un-evicted pod could read the intact ingest copy (not authoritative)")
     return (True, f"evicted {targeted} obj from the SSD ingest cache on {ok_pods}/{total_pods} api pods "
-                  "→ re-GET reads the drained CephFS copy")
+                  "→ re-GET reads a drained copy (CephFS fallback or Arion pipeline), not the ingest copy")
 
 
 def durability_reverify(client, cfg: Config, ledger: Ledger, report: Report,
