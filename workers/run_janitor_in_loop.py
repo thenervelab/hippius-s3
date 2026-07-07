@@ -696,7 +696,7 @@ async def check_aged_pending_orphans(db_pool: asyncpg.Pool, dlq_object_ids: set[
     async with db_pool.acquire() as conn:
         count = await conn.fetchval(
             get_query("count_aged_pending_orphans"),
-            config.mpu_sweep_grace_seconds,
+            config.aged_orphan_gauge_grace_seconds,
             list(dlq_object_ids),
         )
     _aged_pending_orphans = int(count or 0)
@@ -1031,7 +1031,10 @@ async def run_janitor_loop():
     logger.info("Starting janitor service...")
     logger.info(f"FS store root: {config.object_cache_dir}")
     logger.info(f"MPU stale threshold: {config.mpu_stale_seconds}s")
-    logger.info(f"Aged-pending-orphan gauge grace: {config.mpu_sweep_grace_seconds}s (matches the reaper sweep)")
+    logger.info(
+        f"Aged-pending-orphan gauge grace: {config.aged_orphan_gauge_grace_seconds}s "
+        f"(soak-visibility window, decoupled from the {config.mpu_sweep_grace_seconds}s reaper sweep grace)"
+    )
     logger.info(f"FS GC max age: {config.fs_cache_gc_max_age_seconds}s")
     logger.info(f"FS hot retention: {getattr(config, 'fs_cache_hot_retention_seconds', 10800)}s")
     logger.info(f"Cleanup concurrency: {concurrency}")
