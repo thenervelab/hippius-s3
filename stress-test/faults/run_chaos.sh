@@ -37,7 +37,10 @@ for cell in "$@"; do
   # breaks. Runs for the whole cell window in the background.
   guard_pid=""
   if [ -f "$INV_GUARD" ]; then
-    "$PY" "$INV_GUARD" --run-id "$run_id" --out "$out" &
+    # --abort makes the guard exit non-zero on the first breach, which is what the kill -0 poll
+    # below (and the post-hold wait) key off to fail the cell. Without it the guard loops forever
+    # and every cell reports PASS regardless of invariant state.
+    "$PY" "$INV_GUARD" --run-id "$run_id" --out "$out" --abort &
     guard_pid=$!
   else
     echo "  WARN: $INV_GUARD not found — running WITHOUT the continuous invariant guard" >&2
@@ -70,6 +73,13 @@ for cell in "$@"; do
       [ "$gexit" != "0" ] && rc=1
     fi
   fi
+  # Belt-and-suspenders: even if the guard's exit status is lost (killed, races), a breach is
+  # durably recorded in the JSONL. Grep it so a recorded breach fails the cell independently.
+  if [ -f "$out" ] && grep -q '"status": *"breach"' "$out"; then
+    echo "  inv-guard BREACH recorded in $cell — cell FAIL" >&2
+    rc=1
+  fi
+
   echo "  [$cell] events: $out"
 done
 
