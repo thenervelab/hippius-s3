@@ -387,22 +387,27 @@ impl Coordinator {
     }
 
     /// Writes per-node allocations stamped with `epoch`, fenced atomically so a lower epoch
-    /// cannot overwrite a higher one (the deposed-leader guard). An empty plan is a no-op —
-    /// a node dropped from the plan is conserved by its key's TTL expiring (no zeroing pass
-    /// needed, unlike the old PG path).
+    /// cannot overwrite a higher one (the deposed-leader guard). A node dropped from the plan
+    /// is conserved by its key's TTL expiring (no zeroing pass needed, unlike the old PG path).
+    ///
+    /// An empty plan writes nothing but is NOT a bare `Ok` short-circuit: it still runs the
+    /// current-era fence (the EVAL sees only `KEYS[1]` = `cephor:epoch`, so both of the
+    /// script's write loops — which start at `KEYS[2]` — are empty). This preserves the
+    /// split-brain invariant on the empty-plan path: a deposed leader whose tick allocated
+    /// nothing (no hungry nodes) still learns it lost via [`CoordError::Fenced`] rather than a
+    /// false `Ok` that `run_tick` would surface as a stale `Led`.
     ///
     /// # Errors
     ///
     /// [`CoordError::Fenced`] if a higher-epoch leader exists (nothing was written);
     /// [`CoordError::Redis`] on a command failure.
     pub async fn write_allocations(&self, epoch: u64, allocations: &[Allocation]) -> Result<()> {
-        if allocations.is_empty() {
-            return Ok(());
-        }
         let mut conn = self.conn.clone();
         let script = redis::Script::new(WRITE_ALLOC_SCRIPT);
         let mut invocation = script.prepare_invoke();
         // KEYS[1] is the epoch counter (the current-era fence anchor); the alloc keys follow.
+        // On an empty plan this is the only key, so the EVAL is a pure fence — reads
+        // `cephor:epoch`, mutates nothing, returns Fenced-or-ok.
         invocation.key(self.epoch_key());
         for allocation in allocations {
             invocation.key(self.alloc_key(&allocation.node));
@@ -699,6 +704,50 @@ mod tests {
             c.load_allocation(&node).await.unwrap().unwrap().budget,
             ByteRate::new(1_000),
             "the fenced stale write did not overwrite the budget",
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CEPHOR_TEST_REDIS_URL"]
+    async fn a_deposed_leader_with_an_empty_plan_is_still_fenced() {
+        // D3: an empty allocation plan must STILL run the current-era fence. Pre-fix,
+        // write_allocations short-circuited `Ok(())` on an empty slice and never consulted
+        // `cephor:epoch`, so a leader deposed between acquiring its lease and a tick that
+        // happened to allocate nothing (no hungry nodes) got a false `Ok` — run_tick then
+        // reported a stale `Led` instead of surfacing the fence. This exercises the empty
+        // slice directly; every other fence test passes at least one node.
+        let Some(c) = coord("cephor-test:empty-plan-fence:", Duration::from_secs(30), Duration::from_secs(30)).await else {
+            eprintln!("skipping: CEPHOR_TEST_REDIS_URL unset");
+            return;
+        };
+
+        // A wins a SHORT lease (epoch eA, which bumps cephor:epoch to eA).
+        let a = c
+            .acquire_or_renew_leadership("a", Duration::from_secs(1))
+            .await
+            .unwrap()
+            .expect("a leads");
+        // The CURRENT leader's empty plan is not a false positive: its epoch equals the era,
+        // so the fence passes and nothing is written.
+        c.write_allocations(a.epoch, &[])
+            .await
+            .expect("current leader's empty plan is not fenced");
+
+        // A's lease lapses; B takes over — cephor:epoch is now eB > eA.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let b = c
+            .acquire_or_renew_leadership("b", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .expect("b takes over");
+        assert!(b.epoch > a.epoch, "takeover bumps the epoch ({} > {})", b.epoch, a.epoch);
+
+        // The deposed A finishes a tick with an EMPTY plan and writes at its stale epoch. The
+        // current-era fence must reject it rather than returning a false `Ok`.
+        let err = c.write_allocations(a.epoch, &[]).await.unwrap_err();
+        assert!(
+            matches!(err, super::CoordError::Fenced { epoch } if epoch == a.epoch),
+            "an empty-plan write by a deposed leader is fenced, got {err:?}"
         );
     }
 }
