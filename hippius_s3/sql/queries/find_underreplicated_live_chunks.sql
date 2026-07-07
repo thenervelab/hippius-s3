@@ -8,8 +8,21 @@
 --     are meant to lose coverage as the unpinner clears them, so they are not at risk;
 --   * its version is SERVEABLE (object_versions.address IS NOT NULL) — a NULL-address
 --     version is mid-upload/aborted, not yet durable, and is the reaper's/orphan-GC's
---     concern, not a replication-gap; and
---   * some REQUIRED backend has no live (NOT deleted) chunk_backend row for the chunk.
+--     concern, not a replication-gap;
+--   * some REQUIRED backend has no live (NOT deleted) chunk_backend row for the chunk; AND
+--   * the part landed longer ago than the replication SLA ($4) — the grace valve. address
+--     is stamped at PUT completion, but the chunk_backend coverage row is written much later
+--     by the async drain→pool→backend pipeline, so EVERY servable chunk is briefly
+--     under-covered while it replicates NORMALLY. Without this window the sentinel counts
+--     that in-flight replication as a durability breach and pages continuously under upload
+--     traffic — defeating the one alarm that matters. parts.uploaded_at is the part's landing
+--     time (NOT NULL, so the interval compare has no three-valued-logic surprise; it is reset
+--     only by a fresh overwrite of the same part, which legitimately restarts replication —
+--     it is never bumped by drain re-claim/defer churn, unlike updated_at). Only a chunk still
+--     under-covered PAST the SLA is genuinely stuck. Chosen over cephor_replication_status
+--     .landed_at (the A21 sweep's idle signal) because uploaded_at is already joined here and
+--     is the same signal the sibling mtime-cleaner uses to protect recently-landed parts;
+--     keying on landed_at would require a new join and couple the sentinel to the drain schema.
 --
 -- The required set mirrors is_replicated_on_all_backends exactly: per-version
 -- upload_backends (or ['ipfs'] for a migration version, or the caller's config default
@@ -25,6 +38,8 @@
 --   $1 backup_backends          TEXT[]  — configured HIPPIUS_BACKUP_BACKENDS
 --   $2 default_upload_backends  TEXT[]  — config.upload_backends (fallback for legacy rows)
 --   $3 limit                    INT     — max violating chunks to return
+--   $4 replication_sla_seconds  INT     — grace window; only parts landed longer ago than
+--                                         this (normal replication latency + margin) count
 WITH live_versions AS (
     SELECT
         ov.object_id,
@@ -47,7 +62,8 @@ SELECT lv.object_id, lv.object_version, pc.id AS chunk_id
 FROM live_versions lv
 JOIN parts p ON p.object_id = lv.object_id AND p.object_version = lv.object_version
 JOIN part_chunks pc ON pc.part_id = p.part_id
-WHERE EXISTS (
+WHERE p.uploaded_at < now() - make_interval(secs => $4)
+  AND EXISTS (
     SELECT 1
     FROM unnest(lv.required) AS req(backend)
     WHERE NOT EXISTS (

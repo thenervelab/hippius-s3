@@ -634,8 +634,11 @@ async def check_replication_sentinel(db_pool: asyncpg.Pool, pressure: int) -> in
     (correctly) refuse to reclaim because they are under-replicated — i.e. chunks at
     data-loss risk the moment their SSD/pool copy is evicted. The required backend set
     mirrors ``is_replicated_on_all_backends`` (per-version ∪ backup), so this also catches
-    the C10 divergence. Purely a SELECT — it never deletes — so it is safe to run every
-    cycle. A breach logs ERROR at critical disk pressure (a reclaim is imminent), WARN
+    the C10 divergence. A ``replication_sla_seconds`` grace excludes chunks whose part
+    landed recently (normal in-flight replication) so only GENUINELY-STUCK chunks are
+    counted — without it every servable upload trips the sentinel while it replicates and
+    the alarm pages continuously. Purely a SELECT — it never deletes — so it is safe to run
+    every cycle. A breach logs ERROR at critical disk pressure (a reclaim is imminent), WARN
     otherwise; a clean scan logs nothing. Returns the number of violations found (capped
     at ``SENTINEL_SCAN_LIMIT``).
     """
@@ -647,6 +650,7 @@ async def check_replication_sentinel(db_pool: asyncpg.Pool, pressure: int) -> in
             backup_backends,
             list(config.upload_backends),
             SENTINEL_SCAN_LIMIT,
+            config.replication_sla_seconds,
         )
     violations = len(rows)
     _replication_sentinel_violations = violations

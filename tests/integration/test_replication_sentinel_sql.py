@@ -26,6 +26,15 @@ pytestmark = pytest.mark.asyncio
 
 _DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius?sslmode=disable")
 _DEFAULT_UPLOAD = ["arion"]  # config.upload_backends fallback for legacy (NULL) rows
+# The sentinel query carries a replication-SLA grace: a servable, under-covered chunk is only
+# flagged once its part landed (parts.uploaded_at) longer ago than this window — so in-flight
+# replication is not mistaken for a durability gap (see test_replication_gate_sql.py for the
+# recent-vs-stale grace cases). These 14 cases pin the required-set / coverage LOGIC, not the
+# grace, so every seeded part is aged well past the SLA (`_STALE_UPLOADED_SECS`) — otherwise a
+# genuinely-uncovered chunk would be (correctly) excluded as still-replicating and the coverage
+# assertions would no longer exercise what they mean.
+_SENTINEL_SLA_SECONDS = 900
+_STALE_UPLOADED_SECS = _SENTINEL_SLA_SECONDS * 4
 
 
 @pytest_asyncio.fixture
@@ -58,7 +67,11 @@ async def conn() -> AsyncGenerator[asyncpg.Connection, None]:
             part_id        uuid   NOT NULL PRIMARY KEY,
             object_id      uuid   NOT NULL,
             object_version bigint NOT NULL,
-            part_number    bigint NOT NULL
+            part_number    bigint NOT NULL,
+            -- prod parts.uploaded_at is NOT NULL (writer stamps it at landing); the sentinel
+            -- keys its SLA grace on it. DEFAULT now() mirrors that shape; seed helpers below
+            -- override it with an aged value so these coverage cases sit past the grace.
+            uploaded_at    timestamptz NOT NULL DEFAULT now()
         ) ON COMMIT PRESERVE ROWS;
 
         CREATE TEMP TABLE part_chunks (
@@ -112,9 +125,11 @@ async def _chunk(
     )
     part_id = _oid()
     await conn.execute(
-        "INSERT INTO parts (part_id, object_id, object_version, part_number) VALUES ($1::uuid, $2::uuid, 1, 1)",
+        "INSERT INTO parts (part_id, object_id, object_version, part_number, uploaded_at) "
+        "VALUES ($1::uuid, $2::uuid, 1, 1, now() - make_interval(secs => $3))",
         part_id,
         oid,
+        _STALE_UPLOADED_SECS,
     )
     chunk_id: int = await conn.fetchval(
         "INSERT INTO part_chunks (part_id) VALUES ($1::uuid) RETURNING id",
@@ -147,6 +162,7 @@ async def _violations(
         backup,
         default_upload if default_upload is not None else _DEFAULT_UPLOAD,
         limit,
+        _SENTINEL_SLA_SECONDS,
     )
     return {(str(r["object_id"]), r["object_version"], r["chunk_id"]) for r in rows}
 
@@ -265,10 +281,12 @@ async def _add_version(
     )
     part_id = _oid()
     await conn.execute(
-        "INSERT INTO parts (part_id, object_id, object_version, part_number) VALUES ($1::uuid, $2::uuid, $3, 1)",
+        "INSERT INTO parts (part_id, object_id, object_version, part_number, uploaded_at) "
+        "VALUES ($1::uuid, $2::uuid, $3, 1, now() - make_interval(secs => $4))",
         part_id,
         oid,
         version,
+        _STALE_UPLOADED_SECS,
     )
     chunk_id: int = await conn.fetchval("INSERT INTO part_chunks (part_id) VALUES ($1::uuid) RETURNING id", part_id)
     for backend in live_backends:

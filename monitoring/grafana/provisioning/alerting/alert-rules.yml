@@ -442,6 +442,10 @@ groups:
       # serveable chunks lacking full-union backend coverage — the exact chunks the janitor
       # gate refuses to reclaim, so any nonzero value is a standing data-loss risk (a chunk
       # one eviction away from loss) and surfaces the C10 divergence. Fires on ANY breach.
+      # The sentinel query applies a replication-SLA grace (HIPPIUS_REPLICATION_SLA_SECONDS,
+      # default 15m) so chunks still replicating NORMALLY are excluded and only genuinely-stuck
+      # coverage gaps reach this metric — every nonzero value here is already >=15m stale, so
+      # `for: 10m` below is just scrape-blip smoothing, not the in-flight filter.
       - uid: replication-gate-coverage-gap
         title: Replication Gate - Live Chunks Under-replicated
         condition: C
