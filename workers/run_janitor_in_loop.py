@@ -1090,10 +1090,14 @@ async def run_janitor_loop():
 
             # Phase 6: read-only aged-pending orphan gauge (A21 soak-gate feed). Publishes the
             # standing leak backlog the replicated-only soak gate cannot see. The DLQ set is
-            # gathered fresh (same fail-closed helper the reaps use) and excluded so the gauge
-            # counts EXACTLY the population the sweep clears — a DLQ-parked orphan the sweep skips
-            # must not read as a phantom leak. On a DLQ-read failure the whole phase is skipped
-            # (gauge holds its prior value) rather than over-counting against an empty set.
+            # gathered fresh via the janitor's fail-closed get_all_dlq_object_ids and excluded so
+            # the gauge counts EXACTLY the population the sweep clears — a DLQ-parked orphan the
+            # sweep skips must not read as a phantom leak. On a DLQ-read failure the whole phase is
+            # skipped (gauge holds its prior value) rather than over-counting against an empty set.
+            # Note: the sweep's own DLQ set comes from mpu_cleanup.gather_dlq_object_ids, which is
+            # BEST-EFFORT (a Redis read failure logs and skips that key rather than aborting), so
+            # under a partial Redis failure the two briefly diverge — the sweep proceeds with a
+            # smaller set (clears more) while this gauge deliberately fails closed and stalls.
             aged_orphans = 0
             try:
                 gauge_dlq_object_ids = await get_all_dlq_object_ids(redis_client)
