@@ -14,11 +14,21 @@
 -- PUT for minutes. CONCURRENTLY builds without the write lock, but Postgres forbids it inside a
 -- transaction block — hence dbmate's `transaction:false` directive on the migrate:up line.
 --
--- Recovery caveat: a CONCURRENTLY build that fails midway (crash, deadlock, cancelled deploy)
--- leaves an INVALID index of this name behind. `IF NOT EXISTS` then SKIPS it on the next run — it
--- will NOT rebuild an existing-but-invalid index. If this migration errors, drop the leftover
--- (`DROP INDEX CONCURRENTLY idx_parts_upload_uploaded_at;`) or `REINDEX INDEX CONCURRENTLY
--- idx_parts_upload_uploaded_at;` before re-running.
+-- Self-heal a failed build: a CONCURRENTLY build that fails midway (crash, deadlock, cancelled
+-- deploy) leaves an INVALID index of this name behind, and dbmate does NOT record a failed
+-- migration — so on retry a bare `CREATE ... IF NOT EXISTS` would SKIP the invalid index, record
+-- the migration as applied, and leave the reaper seq-scanning ~94M rows with no error. The
+-- `DROP INDEX CONCURRENTLY IF EXISTS` first removes any leftover so the CREATE always rebuilds a
+-- fresh valid index on retry. On the normal first run the index does not exist, so the DROP is a
+-- no-op; the migration runs once, so it never drops a good index in steady state. Both statements
+-- need `transaction:false` (set above) — CONCURRENTLY cannot run inside a transaction block.
+--
+-- NOTE (staging): version 20260706000000 was first added by an earlier commit as a NON-concurrent
+-- index and is already recorded in `schema_migrations` on staging; dbmate keys on the version
+-- number, not file content, so this edited body will NOT re-run there (staging already has the
+-- index, built the write-locking way — a one-time cost already paid). A fresh apply (prod) runs
+-- this final form and gets the CONCURRENTLY build. The resulting index is identical either way.
+DROP INDEX CONCURRENTLY IF EXISTS idx_parts_upload_uploaded_at;
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_parts_upload_uploaded_at
     ON parts (upload_id, uploaded_at);
 

@@ -309,10 +309,10 @@ class Config:
     # exceed a realistic pause. 2 days gives leeway over a full-day pause + resume.
     mpu_stale_seconds: int = env("HIPPIUS_MPU_STALE_SECONDS:172800", convert=int)  # 2 days
     # Idle grace before an orphaned cephor_replication_status version (pending/draining,
-    # unservable) is swept to `failed` AND counted by the janitor's aged-pending-orphan gauge.
-    # MUST be the same value for both so the gauge counts EXACTLY the population the sweep can
-    # clear (otherwise the gauge reads non-zero forever). Defaults to mpu_stale_seconds so the
-    # leak backstop can be tuned independently of the abandoned-MPU reaper's own window.
+    # unservable) is swept to `failed` by the A21 reaper sweep — the reaper's *eligibility* window.
+    # The janitor's aged-pending-orphan GAUGE is now DECOUPLED onto aged_orphan_gauge_grace_seconds
+    # (below), so this can stay the long (48h) leak backstop without making the leak-VISIBILITY gauge
+    # read non-zero forever. Defaults to mpu_stale_seconds (tunable independently of it).
     mpu_sweep_grace_seconds: int = env("HIPPIUS_MPU_SWEEP_GRACE_SECONDS:172800", convert=int)  # 2 days
     # Idle grace for the janitor's aged-pending-orphan GAUGE only — deliberately DECOUPLED from
     # mpu_sweep_grace_seconds. The sweep grace above is the reaper's *eligibility* window (48h);
