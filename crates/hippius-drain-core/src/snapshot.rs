@@ -92,6 +92,14 @@ pub struct AgentSnapshot {
     /// `failed` (broken/abandoned-upload) SSD parts the reclaim worker unlinked — the
     /// SSD-ingest tier's eviction throughput, distinct from the drain's `CephFS` work.
     pub reclaimed: u64,
+    /// Reclaim cycles that aborted on an object-backing read error (`ReclaimError::Backing`):
+    /// the servability/orphan gate could not read `object_versions` (a missing table on some
+    /// deploy, or a transient PG error). A monotonic COUNT of aborted cycles — each removes
+    /// NOTHING (fail-safe), so a sustained rise means the `failed`-part SSD GC is silently
+    /// DISABLED and debris accrues, invisible outside logs. Deliberately kept OUT of
+    /// [`error_bps`](Self::error_bps): a reclaim stall is not a Ceph-write failure, exactly
+    /// like `deferred`/`throttled`.
+    pub reclaim_backing_errors: u64,
     /// Claims handed back un-drained because the breaker/throttle `Denied` the tick (the
     /// pool is unhealthy or the write budget is spent). NOT a drain outcome — no part moved
     /// — but the loop DID cycle, so the readiness tracker folds it into `processed`: a
@@ -134,12 +142,24 @@ pub struct SnapshotCell {
     deferred: AtomicU64,
     reconciler_recovered: AtomicU64,
     reclaimed: AtomicU64,
+    /// Aborted-reclaim counter mirroring `reclaimed`: bumped once per reclaim cycle that failed
+    /// its object-backing read (`ReclaimError::Backing`). Monotonic, `Relaxed` — a stat counter
+    /// with no cross-counter ordering dependency (axiom `rust_quality_92`). See
+    /// [`AgentSnapshot::reclaim_backing_errors`] for why it stays out of `error_bps`.
+    reclaim_backing_errors: AtomicU64,
     throttled: AtomicU64,
     /// Current SSD backlog (undrained bytes) — a LEVEL, not a monotonic counter, so it
     /// has its own atomic (set, not accumulated) rather than living in [`AgentSnapshot`].
     /// The heartbeat worker writes it (`usage.used_bytes`) each tick; the metrics layer
     /// reads it as a gauge. Kept off the wait-free `load` path so a scrape never blocks.
     backlog_bytes: AtomicU64,
+    /// Count of this node's undrained replication rows (`pending` + `draining`) — a LEVEL like
+    /// `backlog_bytes`, set each heartbeat from `Store::node_undrained_count`. This is the C8
+    /// wedge signal, kept SEPARATE from `backlog_bytes` on purpose: the byte sum joins `parts`
+    /// and a missing/NULL-size row contributes zero, so a wedged node's byte-backlog can read 0
+    /// while undrained rows remain — which readiness would misread as idle. The COUNT cannot be
+    /// zeroed that way, so readiness keys on it while the gauge keeps reporting bytes.
+    undrained_count: AtomicU64,
     /// Current SSD disk saturation in basis points (`0..=10000` = `0.0..=1.0` full) — a
     /// LEVEL like `backlog_bytes`, set each heartbeat from the same `statvfs` probe. This
     /// is the fill fraction that 503s every PUT once it crosses the api's cutoff, so it is
@@ -191,6 +211,13 @@ impl SnapshotCell {
         self.reclaimed.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Records one reclaim cycle aborted on an object-backing read error — a `failed`-part GC
+    /// pass that read nothing and removed nothing (the `drain_reclaim_backing_errors_total`
+    /// counter). One abort per cycle, so it bumps by one, not by a caller-supplied count.
+    pub fn record_reclaim_backing_error(&self) {
+        self.reclaim_backing_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records `n` claims handed back because the breaker/throttle denied the tick. Counts
     /// as liveness progress (the loop cycled) but is not a drain outcome — see
     /// [`AgentSnapshot::throttled`].
@@ -209,6 +236,19 @@ impl SnapshotCell {
         self.backlog_bytes.load(Ordering::Relaxed)
     }
 
+    /// Records the current count of undrained replication rows (`pending` + `draining`). A gauge:
+    /// `store`, not add. The heartbeat writes it from `Store::node_undrained_count` each tick.
+    pub fn record_undrained_count(&self, count: u64) {
+        self.undrained_count.store(count, Ordering::Relaxed);
+    }
+
+    /// The last-recorded count of undrained replication rows — the C8 readiness wedge signal
+    /// (nonzero means real drain work remains, even when [`backlog`](Self::backlog) reads 0).
+    #[must_use]
+    pub fn undrained_count(&self) -> u64 {
+        self.undrained_count.load(Ordering::Relaxed)
+    }
+
     /// Records the current SSD disk saturation in basis points (`0..=10000`). A gauge:
     /// `store`, not add. The heartbeat writes it from the `statvfs` pressure each tick.
     pub fn record_disk_pressure(&self, bps: u16) {
@@ -216,10 +256,14 @@ impl SnapshotCell {
     }
 
     /// The last-recorded SSD disk saturation in basis points (the `drain_ssd_pressure`
-    /// gauge source). Clamped to `10000` should a wider value ever be stored.
+    /// gauge source). Clamped to `10000` on read so the value honors the `bps ∈ [0, 10000]`
+    /// contract even if a wider one was ever stored.
     #[must_use]
     pub fn disk_pressure_bps(&self) -> u16 {
-        u16::try_from(self.disk_pressure_bps.load(Ordering::Relaxed)).unwrap_or(10_000)
+        // Clamp on read: the setter widens u16 -> u64, so a stored bps in (10000, 65535]
+        // would otherwise round-trip un-clamped and break the [0, 10000] contract. The
+        // `.min` makes the value always fit u16, so the `try_from` fallback never fires.
+        u16::try_from(self.disk_pressure_bps.load(Ordering::Relaxed).min(10_000)).unwrap_or(10_000)
     }
 
     /// Records the current count of parts held `corrupt` on this node. A gauge: `store`, not
@@ -259,6 +303,7 @@ impl SnapshotCell {
             deferred: self.deferred.load(Ordering::Relaxed),
             reconciler_recovered: self.reconciler_recovered.load(Ordering::Relaxed),
             reclaimed: self.reclaimed.load(Ordering::Relaxed),
+            reclaim_backing_errors: self.reclaim_backing_errors.load(Ordering::Relaxed),
             throttled: self.throttled.load(Ordering::Relaxed),
         }
     }
@@ -302,6 +347,18 @@ mod tests {
     }
 
     #[test]
+    fn undrained_count_is_a_settable_gauge_not_a_counter() {
+        // The C8 wedge signal (PR #235 D1): a LEVEL sourced from a COUNT of undrained
+        // replication rows, so a later record replaces rather than accumulates — like backlog.
+        let cell = SnapshotCell::new();
+        assert_eq!(cell.undrained_count(), 0, "a fresh cell reports no undrained rows");
+        cell.record_undrained_count(4);
+        assert_eq!(cell.undrained_count(), 4);
+        cell.record_undrained_count(1);
+        assert_eq!(cell.undrained_count(), 1, "undrained count is a level: a later record replaces");
+    }
+
+    #[test]
     fn disk_pressure_is_a_settable_gauge_in_basis_points() {
         let cell = SnapshotCell::new();
         assert_eq!(cell.disk_pressure_bps(), 0, "a fresh cell reports no disk pressure");
@@ -309,6 +366,31 @@ mod tests {
         assert_eq!(cell.disk_pressure_bps(), 8500);
         cell.record_disk_pressure(200);
         assert_eq!(cell.disk_pressure_bps(), 200, "disk pressure is a level: a later record replaces");
+        cell.record_disk_pressure(12_000); // a u16 wider than the bps ceiling
+        assert_eq!(
+            cell.disk_pressure_bps(),
+            10_000,
+            "a stored bps above 10000 reads back clamped to the ceiling"
+        );
+    }
+
+    #[test]
+    fn corrupt_parts_is_a_settable_gauge_not_a_counter() {
+        // D5: the R4 standing durability signal (the drain_corrupt_parts alert source). A LEVEL
+        // set each cycle from Store::count_corrupt_parts, so a later record REPLACES rather than
+        // accumulates — the page fires on this gauge staying nonzero ACROSS cycles (only at-cap
+        // unrecoverable parts sustain it), NOT on a single reclaim cycle's held count, which is
+        // logged at WARN and self-heals on the next re-drive.
+        let cell = SnapshotCell::new();
+        assert_eq!(cell.corrupt_parts(), 0, "a fresh cell reports no corrupt parts");
+        cell.record_corrupt(3);
+        assert_eq!(cell.corrupt_parts(), 3);
+        cell.record_corrupt(1);
+        assert_eq!(
+            cell.corrupt_parts(),
+            1,
+            "corrupt parts is a level: a later record replaces, not accumulates"
+        );
     }
 
     #[test]
@@ -328,6 +410,7 @@ mod tests {
                 deferred: 0,
                 reconciler_recovered: 4,
                 reclaimed: 6,
+                reclaim_backing_errors: 0,
                 throttled: 9,
             },
         );
@@ -344,6 +427,21 @@ mod tests {
         let snap = cell.load();
         assert_eq!(snap.throttled, 40, "throttled ticks are counted for readiness/visibility");
         assert_eq!(snap.error_bps(), 3000, "throttled ticks stay out of the Ceph failure rate");
+    }
+
+    #[test]
+    fn reclaim_backing_errors_accumulate_without_polluting_error_bps() {
+        // D4: a backing-read abort disables the `failed`-part SSD GC (the servability gate cannot
+        // read `object_versions`) but is NOT a Ceph-write failure, so — like `deferred`/`throttled`
+        // — it is counted for the alert yet kept out of the Ceph error rate.
+        let cell = SnapshotCell::new();
+        cell.record_drained(7);
+        cell.record_failed(3);
+        cell.record_reclaim_backing_error();
+        cell.record_reclaim_backing_error();
+        let snap = cell.load();
+        assert_eq!(snap.reclaim_backing_errors, 2, "each aborted reclaim cycle is counted");
+        assert_eq!(snap.error_bps(), 3000, "backing-read aborts stay out of the Ceph failure rate");
     }
 
     #[test]
@@ -376,6 +474,7 @@ mod tests {
             deferred: 0,
             reconciler_recovered: 0,
             reclaimed: 0,
+            reclaim_backing_errors: 0,
             throttled: 0,
         };
         assert_eq!(snapshot.error_bps(), 10_000);
@@ -389,6 +488,7 @@ mod tests {
             deferred: 0,
             reconciler_recovered: 0,
             reclaimed: 0,
+            reclaim_backing_errors: 0,
             throttled: 0,
         };
         // 3 failed attempts of 10 total attempts = 30%, i.e. 3000 basis points.

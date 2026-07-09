@@ -319,6 +319,29 @@ impl Store {
         Ok(u64::try_from(bytes).unwrap_or(0))
     }
 
+    /// The count of `node`'s undrained replication rows (`pending` + `draining`) — the C8
+    /// readiness wedge signal. Unlike [`node_backlog_bytes`](Self::node_backlog_bytes) this does
+    /// NOT join `parts`: a row whose `parts` row is absent or carries a NULL/0 `size_bytes`
+    /// contributes zero bytes to that SUM but is still undrained WORK, so the byte-backlog of a
+    /// wedged node can read 0 while rows remain — which readiness would misread as idle. Counting
+    /// the replication rows directly cannot be zeroed that way, so it is the signal readiness gates
+    /// on. Uses the node-scoped pending index. Mirrors the params of `node_backlog_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn node_undrained_count(&self, node: &str) -> Result<u64> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT count(*)::bigint FROM cephor_replication_status \
+             WHERE node_id = $1 AND status IN ('pending', 'draining')",
+        )
+        .bind(node)
+        .fetch_one(&self.pool)
+        .await?;
+        // count(*) is >= 0; the cast guards against an impossible negative for total-ness.
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
     /// R4 re-drive: reset this node's `corrupt` parts back to `pending` for a fresh SSD->pool
     /// copy (overwriting the corrupt pool copy from the intact SSD source), bounded by
     /// `max_attempts`. Only rows still under the cap are reset; each reset bumps
@@ -723,12 +746,16 @@ impl PartReplicationStore for Store {
     }
 
     async fn is_version_servable(&self, part: &PartKey) -> Result<bool> {
-        // The exact inverse of janitor_part_terminally_abandoned.sql's unservable predicate and
-        // the reclaim gate's servable_parts: a version SERVES a GET if its address is set, OR it
-        // has a real size, OR an md5. address is written AFTER size/md5 in a separate step, so a
-        // fully-servable version briefly has address=NULL (the mid-finalize window); the size/md5
-        // disjuncts keep such a live version from reading as unservable. Do NOT reduce to
-        // address-only. A missing row (deleted object) is not servable.
+        // The inverse of janitor_part_terminally_abandoned.sql's unservable predicate for the
+        // servable disjuncts (address set / size>0 / md5 set), shared with the reclaim gate's
+        // servable_parts: a version SERVES a GET if its address is set, OR it has a real size,
+        // OR an md5. address is written AFTER size/md5 in a separate step, so a fully-servable
+        // version briefly has address=NULL (the mid-finalize window); the size/md5 disjuncts
+        // keep such a live version from reading as unservable. Do NOT reduce to address-only.
+        // A missing row (deleted object) is not servable. NB: not bit-identical to the janitor
+        // under a NULL size_bytes — a bare all-NULL row is unservable here (`size_bytes > 0` is
+        // NULL -> not servable) yet the janitor's `size_bytes <= 0` is also NULL so it does not
+        // sweep it; both are fail-safe (a bare-NULL row can serve no GET).
         let servable = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS ( \
                 SELECT 1 FROM object_versions ov \
@@ -945,15 +972,19 @@ impl BackingLog for Store {
                 part_numbers.push(i64::from(part.part().get()));
             }
             // Echo back exactly the input parts whose (object_id, version) row EXISTS and is
-            // SERVABLE — the exact inverse of janitor_part_terminally_abandoned.sql's
-            // unservable predicate. MUST stay in lockstep with that file (and the A21 sweep's
-            // list_orphan_replication_versions.sql): servable = address written, OR a real
-            // size, OR an md5 — the download filter `(size_bytes > 0 OR md5_hash <> '')` plus
-            // a set address. `address` is written AFTER size/md5 in a separate step, so a
-            // fully-servable version briefly has address=NULL (the mid-finalize window); the
-            // size/md5 disjuncts are what keep such a live version from being read as
-            // reclaimable. Do NOT "simplify" to address-only. The object_id is echoed from the
-            // input UNNEST so the reconstructed PartKey matches the caller's key verbatim.
+            // SERVABLE — the inverse of janitor_part_terminally_abandoned.sql's unservable
+            // predicate for the servable disjuncts. MUST stay in lockstep with that file (and
+            // the A21 sweep's list_orphan_replication_versions.sql): servable = address
+            // written, OR a real size, OR an md5 — the download filter `(size_bytes > 0 OR
+            // md5_hash <> '')` plus a set address. `address` is written AFTER size/md5 in a
+            // separate step, so a fully-servable version briefly has address=NULL (the
+            // mid-finalize window); the size/md5 disjuncts are what keep such a live version
+            // from being read as reclaimable. Do NOT "simplify" to address-only. The two
+            // predicates are NOT bit-identical under a NULL size_bytes: a bare all-NULL row is
+            // unservable here (so reclaimable) while the janitor's `size_bytes <= 0` is NULL so
+            // it never sweeps it — both fail safe, since a bare-NULL row can serve no GET. The
+            // object_id is echoed from the input UNNEST so the reconstructed PartKey matches
+            // the caller's key verbatim.
             let rows = sqlx::query_as::<_, (String, i64, i64)>(
                 "SELECT t.object_id, t.version, t.part_number \
                  FROM UNNEST($1::text[], $2::bigint[], $3::bigint[]) AS t(object_id, version, part_number) \
@@ -1337,7 +1368,11 @@ mod part_tests {
         seed_ov(&pool, UUID_A, 3, None, Some(0), Some("d41d8cd9")).await;
         // address NULL, size 0, md5 '' → UNSERVABLE (the abandoned-upload shape).
         seed_ov(&pool, UUID_A, 4, None, Some(0), Some("")).await;
-        // address NULL, size NULL, md5 NULL → UNSERVABLE (bare reserved row).
+        // address NULL, size NULL, md5 NULL → UNSERVABLE here, so RECLAIMABLE (bare reserved
+        // row). This is the one shape where reclaim and the janitor diverge: `size_bytes > 0`
+        // is NULL -> not servable -> reclaimable here, while the janitor's `size_bytes <= 0` is
+        // also NULL so it never sweeps it. Both fail safe (a bare-NULL row can serve no GET);
+        // this case pins that intentional, non-bit-identical behavior.
         seed_ov(&pool, UUID_A, 5, None, None, None).await;
         // no object_versions row at all (v6) → UNSERVABLE (deleted object).
 
@@ -1473,6 +1508,39 @@ mod part_tests {
             0,
             "a node with no rows has zero backlog"
         );
+    }
+
+    #[sqlx::test]
+    async fn node_undrained_count_counts_every_undrained_row_even_when_backlog_bytes_is_zero(pool: PgPool) -> Result<(), Box<dyn std::error::Error>> {
+        // C8 wedge signal (PR #235 D1): a draining row whose `parts` row is missing or has a
+        // NULL/0 size contributes ZERO bytes to node_backlog_bytes (INNER JOIN + COALESCE), so a
+        // wedged node's byte-backlog can read 0 while real undrained work remains. The COUNT does
+        // NOT join `parts`, so those exact rows still register — that is why readiness keys on it.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone());
+
+        // node-a undrained rows that ALL contribute 0 bytes: a draining row with no parts row, a
+        // pending row with a NULL size, and a pending row with a 0 size. node_backlog_bytes == 0.
+        seed_status_node(&pool, UUID_A, 1, 1, "draining", "node-a").await; // no parts row
+        seed_status_node(&pool, UUID_A, 1, 2, "pending", "node-a").await;
+        seed_part_size(&pool, UUID_A, 1, 2, None).await; // NULL size
+        seed_status_node(&pool, UUID_A, 1, 3, "pending", "node-a").await;
+        seed_part_size(&pool, UUID_A, 1, 3, Some(0)).await; // zero size
+        // Terminal rows are drained work, excluded from the count.
+        seed_status_node(&pool, UUID_A, 1, 4, "replicated", "node-a").await;
+        seed_part_size(&pool, UUID_A, 1, 4, Some(999)).await;
+        // A peer node's pending row belongs to its own node's count.
+        seed_status_node(&pool, UUID_B, 2, 1, "pending", "node-b").await;
+
+        assert_eq!(store.node_backlog_bytes("node-a").await?, 0, "every undrained row contributes 0 bytes");
+        assert_eq!(
+            store.node_undrained_count("node-a").await?,
+            3,
+            "the wedged node's 3 undrained rows are counted despite the 0-byte backlog"
+        );
+        assert_eq!(store.node_undrained_count("node-b").await?, 1, "counts only this node's rows");
+        assert_eq!(store.node_undrained_count("node-c").await?, 0, "a node with no rows is idle");
+        Ok(())
     }
 
     #[sqlx::test]

@@ -23,7 +23,8 @@ use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
     BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, NodeId, NodeObservation,
-    SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate, jittered, reclaim_ssd, reconcile_parts,
+    ReclaimError, SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate, jittered, reclaim_ssd,
+    reconcile_parts,
 };
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -207,6 +208,27 @@ async fn run_drain<E: UploadEnqueuer>(token: CancellationToken, period: Duration
 /// Probes SSD disk pressure off the async runtime (statvfs blocks) and upserts
 /// this node's heartbeat. Probe or upsert failures are logged and skipped — the
 /// next tick retries; a missed heartbeat only ages the node out of the fleet.
+/// Refreshes this node's two DB-sourced drain-demand gauges: the byte backlog
+/// (`drain_ssd_backlog_bytes`) and the undrained-row COUNT (the C8 readiness wedge signal).
+///
+/// The byte backlog is the TRUE undrained-bytes gauge — the DB sum of this node's
+/// pending/draining part bytes — NOT raw disk occupancy (`usage.used_bytes`), which the
+/// A21/orphan leak overcounts by hundreds of GB with no drain demand (WI-20c). The COUNT is the
+/// signal readiness gates on, because the byte SUM joins `parts` and a missing/NULL-size row
+/// contributes zero: a wedged node's byte-backlog can read 0 while undrained rows remain, which
+/// readiness would misread as idle. On a query error, KEEP the last-recorded value rather than
+/// zeroing it (a transient blip must not read as "drained"); the next tick refreshes it.
+async fn record_drain_signals(store: &Store, node: &NodeId, snapshot: &SnapshotCell) {
+    match store.node_backlog_bytes(node.as_str()).await {
+        Ok(bytes) => snapshot.record_backlog(bytes),
+        Err(err) => tracing::warn!(error = %err, "backlog query failed; keeping the last value"),
+    }
+    match store.node_undrained_count(node.as_str()).await {
+        Ok(count) => snapshot.record_undrained_count(count),
+        Err(err) => tracing::warn!(error = %err, "undrained-count query failed; keeping the last value"),
+    }
+}
+
 async fn heartbeat_once(ssd: &LocalSsd, store: &Store, coord: &Coordinator, node: &NodeId, max_drain_rate: ByteRate, snapshot: &SnapshotCell) {
     let root = ssd.root().to_path_buf();
     // statvfs is a blocking syscall — never run it on an executor thread (axiom
@@ -232,15 +254,7 @@ async fn heartbeat_once(ssd: &LocalSsd, store: &Store, coord: &Coordinator, node
     // off the exporter thread and must never run statvfs itself.
     snapshot.record_disk_pressure(usage.pressure.bps());
 
-    // The drain_ssd_backlog_bytes gauge is the TRUE undrained work — the DB sum of this
-    // node's pending/draining part bytes — NOT raw disk occupancy (usage.used_bytes), which
-    // the A21/orphan leak overcounts by hundreds of GB with no drain demand (WI-20c). On a
-    // query error, leave the last-recorded backlog rather than zeroing it (a transient blip
-    // must not read as "drained"); the next tick refreshes it.
-    match store.node_backlog_bytes(node.as_str()).await {
-        Ok(bytes) => snapshot.record_backlog(bytes),
-        Err(err) => tracing::warn!(error = %err, "backlog query failed; keeping the last value"),
-    }
+    record_drain_signals(store, node, snapshot).await;
 
     // The allocator observation keeps SSD occupancy as its demand weight (a leak-inflated
     // value is a conservative over-demand, not a safety issue; refining it is coordination
@@ -289,18 +303,30 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
                     "replicated parts still on SSD — drain crash-orphans nothing currently reclaims"
                 );
             }
-            // Parts held because their live object's pool copy is corrupt (R4): a `corrupt`
-            // row, or the defense-in-depth `failed`+servable case not yet promoted. Their SSD
-            // copy is the last good source. This is LIVE, not hypothetical — the drain's
-            // ChunkMismatch path marks a servable part `corrupt` today — so a nonzero value is a
-            // real durability incident, not GC. ERROR so a log-based alert pages (the
-            // drain_corrupt_parts gauge + alert is the metric path).
+            // Parts held this cycle because their live object's pool copy is corrupt (R4): a
+            // `corrupt` row, or the defense-in-depth `failed`+servable case. Their SSD copy is the
+            // last good source. Reclaim runs BEFORE the corrupt re-drive in the poll cycle, so a
+            // TRANSIENT ChunkMismatch is counted here and then reset to `pending` and recovered on
+            // the very next re-drive — paging on this single-cycle held count would fire on
+            // self-healing corruption. WARN, not page: the STANDING incident signal is the
+            // drain_corrupt_parts gauge remaining nonzero across cycles (the drain-corrupt-live-parts
+            // alert, for:15m), which only at-cap unrecoverable parts sustain — see redrive_corrupt_once.
             if report.skipped_corrupt > 0 {
-                tracing::error!(
+                tracing::warn!(
                     skipped_corrupt = report.skipped_corrupt,
-                    "corrupt-live SSD parts held (pool copy corrupt) — last good source preserved, awaiting re-drive (R4)"
+                    "corrupt-live SSD parts held this cycle (pool copy corrupt) — last good source preserved, awaiting re-drive (R4)"
                 );
             }
+        }
+        // A backing-read abort (`ReclaimError::Backing`: `object_versions` missing on a deploy, or
+        // a transient PG error) leaves the servability/orphan gate blind, so the `failed`-part GC
+        // ran and removed NOTHING — it is silently DISABLED, not merely retried. Count it (the
+        // drain_reclaim_backing_errors_total alert) and ERROR so a stuck reclaim pages instead of
+        // hiding in a warn; the pass is still fail-safe (nothing was unlinked). The other reclaim
+        // errors are transient-retryable — leave them at warn.
+        Err(ReclaimError::Backing(err)) => {
+            snapshot.record_reclaim_backing_error();
+            tracing::error!(error = %err, "ssd reclaim disabled: object-backing read failed; failed-part GC removed nothing");
         }
         Err(err) => tracing::warn!(error = ?err, "ssd reclaim cycle failed; will retry next poll"),
     }
@@ -616,14 +642,17 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
                             touch_liveness(path);
                         }
                         heartbeat_once(&ssd, &store, &coord, &node, max_drain_rate, &snapshot).await;
-                        // C8 readiness: heartbeat_once just refreshed the backlog. The drain is
-                        // PROGRESSING iff it cycled any claim (committed + failed + deferred +
+                        // C8 readiness: heartbeat_once just refreshed the drain signals. The drain
+                        // is PROGRESSING iff it cycled any claim (committed + failed + deferred +
                         // throttled) since the last tick; touch readiness only when progressing or
                         // idle, so a wedged loop (hung Ceph) lets the file go stale -> NotReady.
                         // `throttled` is included so a pool-wide Ceph outage — which trips the
                         // breaker and denies EVERY claim — reads as a healthy back-off, not a wedge:
                         // otherwise the whole DaemonSet flips NotReady at once and a rolling update
-                        // can never make progress over the outage.
+                        // can never make progress over the outage. The "is there work" signal is the
+                        // undrained-row COUNT, NOT the byte backlog: the byte sum can undercount a
+                        // wedged node to 0 (missing/NULL-size parts rows), which would falsely read
+                        // idle -> Ready — the exact wedge C8 exists to catch (PR #235 D1).
                         if let Some(path) = readiness.as_deref() {
                             let snap = snapshot.load();
                             let processed = snap
@@ -633,7 +662,7 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
                                 .saturating_add(snap.throttled);
                             let ready = readiness_tracker.lock().unwrap_or_else(PoisonError::into_inner).observe(
                                 processed,
-                                snapshot.backlog(),
+                                snapshot.undrained_count(),
                                 Instant::now(),
                             );
                             if ready {
@@ -661,7 +690,7 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr, reason = "tests")]
 mod tests {
-    use super::{AgentRuntime, HeartbeatConfig, PullAction, RateControl, RuntimeConfig, default_enforcer, pull_action};
+    use super::{AgentRuntime, HeartbeatConfig, PullAction, RateControl, RuntimeConfig, default_enforcer, pull_action, record_drain_signals};
     use crate::localfs::{LocalFs, LocalSsd};
     use crate::supervisor::ShutdownTrigger;
     use core::str::FromStr;
@@ -721,6 +750,55 @@ mod tests {
         // WI-6: an Err (e.g. a sustained redis-queues outage) must decay toward the floor
         // like silence, NOT hold the last budget and keep hammering a degraded Ceph.
         assert_eq!(pull_action(&Err(CoordError::Invalid { field: "test" })), PullAction::Decay);
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn a_wedged_node_with_zero_backlog_bytes_still_reports_undrained_work_to_readiness(pool: PgPool) {
+        // PR #235 D1 end-to-end: a `draining` replication row whose `parts` row is ABSENT is real
+        // undrained work, but node_backlog_bytes (an INNER JOIN to parts) sums it to 0. If readiness
+        // keyed on those 0 bytes it would read idle -> Ready and never catch this wedge. The signal
+        // recording must yield undrained_count == 1 while backlog bytes stay 0, and a readiness
+        // tracker fed that COUNT must go NotReady once the stall elapses with no drained progress.
+        use crate::readiness::ReadinessTracker;
+        use std::time::Instant;
+
+        let store = Store::from_pool(pool.clone());
+        // node_backlog_bytes joins `parts`, which the cephor-only migrations do not create.
+        sqlx::query(
+            "CREATE TABLE parts (object_id uuid NOT NULL, object_version bigint NOT NULL, part_number bigint NOT NULL, \
+             size_bytes bigint, upload_id uuid)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A draining row for node-x with NO parts row: 0 backlog bytes, 1 undrained row.
+        sqlx::query(
+            "INSERT INTO cephor_replication_status (object_id, version, part_number, status, node_id) \
+             VALUES ($1, 1, 1, 'draining', 'node-x')",
+        )
+        .bind(UUID)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let node = NodeId::from_str("node-x").unwrap();
+        let snapshot = SnapshotCell::new();
+        record_drain_signals(&store, &node, &snapshot).await;
+        assert_eq!(snapshot.backlog(), 0, "the wedged node's byte-backlog undercounts to 0");
+        assert_eq!(snapshot.undrained_count(), 1, "but one replication row is still undrained");
+
+        // Drive the readiness verdict exactly as the runtime wiring does — on the undrained COUNT.
+        let stall = Duration::from_mins(1);
+        let t0 = Instant::now();
+        let mut tracker = ReadinessTracker::new(t0, stall);
+        assert!(
+            tracker.observe(0, snapshot.undrained_count(), t0 + Duration::from_secs(5)),
+            "fresh window -> ready"
+        );
+        assert!(
+            !tracker.observe(0, snapshot.undrained_count(), t0 + Duration::from_mins(2)),
+            "undrained rows + no progress past the stall -> NotReady (keying on the 0-byte backlog would stay Ready)"
+        );
     }
 
     fn part_at(version: u32, number: u32) -> PartKey {
@@ -1244,6 +1322,39 @@ mod tests {
             "a servable object's last good SSD copy is preserved even with a failed replication row",
         );
         assert_eq!(snapshot.load().reclaimed, 0, "the corrupt-live part is not counted as reclaimed");
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn reclaim_once_alerts_and_removes_nothing_when_the_backing_read_fails(pool: PgPool) {
+        // D4: the object-backing read (servability gate) fails because `object_versions` is missing
+        // — the exact "table absent on a deploy" case. The `failed`-part GC then runs but is
+        // silently DISABLED: it must remove NOTHING (fail-safe) and increment the backing-error
+        // counter so a log-blind operator still gets the drain_reclaim_backing_errors_total alert.
+        // No create_object_versions_table() here: that absence IS the fault under test.
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let store = Store::from_pool(pool.clone());
+        let snapshot = SnapshotCell::new();
+
+        // An aged `failed` part forces the servability read (over aged-failed parts) to run, which
+        // hits the missing table and surfaces ReclaimError::Backing before any unlink.
+        let failed = part_at(5, 1);
+        seed_ssd_dir(ssd_dir.path(), &failed);
+        store.record_landed_part(&failed).await.unwrap();
+        force_terminal_2h(&pool, &failed, "failed").await;
+
+        let ssd = LocalSsd::new(ssd_dir.path());
+        super::reclaim_once(&ssd, &store, &snapshot, Duration::from_secs(1), Duration::from_secs(1)).await;
+
+        assert!(
+            ssd_dir.path().join(failed.relative_dir()).exists(),
+            "a backing-read failure removes NOTHING — the reclaim fails safe",
+        );
+        assert_eq!(snapshot.load().reclaimed, 0, "nothing was reclaimed on the aborted cycle");
+        assert_eq!(
+            snapshot.load().reclaim_backing_errors,
+            1,
+            "the aborted cycle is counted so a disabled reclaim is alertable, not just logged",
+        );
     }
 
     /// Stands up the `object_versions` table the reclaim's backing/servability reads

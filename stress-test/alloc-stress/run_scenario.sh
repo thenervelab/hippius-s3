@@ -17,9 +17,19 @@ TOXI="${TOXI:-http://localhost:8475}"
 REDIS_CLI=(redis-cli -u "${REDIS_URL:-redis://localhost:6390}")
 PY="${PYTHON:-python3}"
 INTERVAL="${INTERVAL:-0.25}"
-CEILING="${CEILING:-10000000000}"
+# CEILING is deliberately NOT defaulted: scenarios C and E gate on Σbudget <= ceiling, and a
+# made-up ceiling passes vacuously (the whole point of A5 removing gate.py's 10 GB/s default).
+# require_ceiling fails loudly if it's unset when running C or E.
 
 ts() { date +%Y%m%d-%H%M%S; }
+
+require_ceiling() { # scenario — the budget-ceiling scenarios need a real, operator-set fleet ceiling
+  if [ -z "${CEILING:-}" ]; then
+    echo "FATAL[$1]: CEILING is unset — scenario $1 gates on the fleet write-budget ceiling, and a" >&2
+    echo "  default would pass vacuously. Set it in bytes/s, e.g. CEILING=1000000000 bash $0 $1" >&2
+    return 1
+  fi
+}
 
 # --- toxiproxy helpers (redis_queues proxy fronting the coordinator Redis) ---
 toxic_add() { # name type json-attrs
@@ -44,7 +54,9 @@ print(json.loads(raw).get("instance","") if raw else "")' 2>/dev/null || true)"
 }
 
 run_monitor() { # scenario duration -> echoes jsonl path
-  local s="$1" dur="$2" out="$RESULTS/alloc-$s-$(ts).jsonl"
+  local s="$1" dur="$2"
+  local out
+  out="$RESULTS/alloc-$s-$(ts).jsonl"
   "$PY" "$HERE/monitor.py" --redis "${REDIS_URL:-redis://localhost:6390}" \
     --out "$out" --interval "$INTERVAL" --duration "$dur" &
   MON_PID=$!
@@ -68,6 +80,7 @@ scenario_B() { # forced leader churn: kill the leader every ~30s for ~5min
 }
 
 scenario_C() { # R3 gap approximation: latency during handover (deterministic version = Rig B)
+  require_ceiling C || return 1
   local out; out="$(run_monitor C 120)"
   sleep 20; toxic_add slow_lat latency '{"latency":1200,"jitter":300}'
   sleep 20; local c; c="$(leader_container || true)"; [ -n "$c" ] && { docker kill "$c" >/dev/null 2>&1 || true; docker start "$c" >/dev/null 2>&1 || true; }
@@ -88,6 +101,7 @@ scenario_D() { # redis pathology: latency -> timeout(hang) -> reset_peer, then c
 }
 
 scenario_E() { # budget fairness/ceiling under steady contention
+  require_ceiling E || return 1
   local out; out="$(run_monitor E 60)"; sleep 62; wait "$MON_PID" || true
   "$PY" "$HERE/gate.py" --scenario E "$out" --ceiling "$CEILING"
 }
