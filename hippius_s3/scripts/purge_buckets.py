@@ -343,7 +343,12 @@ async def main_async(args: argparse.Namespace) -> int:
 
         log.info(f"Successfully deleted buckets: {deleted_bucket_names_sorted}")
 
-        if args.unpin:
+        if args.no_unpin:
+            log.warning(
+                "--no-unpin: skipping unpins. The backend chunks are NOT reclaimed and the rows "
+                "stay un-unpinned, leaving a soft-delete backlog the janitor can never hard-delete."
+            )
+        else:
             redis_queues_client = async_redis.from_url(config.redis_queues_url)
             from hippius_s3.queue import initialize_queue_client
 
@@ -372,7 +377,11 @@ def main() -> None:
     ap.add_argument(
         "--dry-run", action="store_true", help="Preview and write CID list JSON, without deleting/unpinning"
     )
-    ap.add_argument("--unpin", action="store_true", help="Enqueue unpin requests after DB deletion")
+    ap.add_argument(
+        "--no-unpin",
+        action="store_true",
+        help="Skip enqueuing unpins (DANGEROUS: leaks backend chunks + leaves an un-drainable backlog)",
+    )
     ap.add_argument("--output-json", help="Where to write the CID list JSON (default: purge_buckets_<...>.json)")
     ap.add_argument("--yes", action="store_true", help="Required to actually delete")
     args = ap.parse_args()

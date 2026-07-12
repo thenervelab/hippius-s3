@@ -50,8 +50,6 @@ def _trusted_hippius_headers(request: Request) -> dict[str, str]:
     if bucket_id:
         headers["X-Hippius-Bucket-Id"] = str(bucket_id)
 
-    if hasattr(request.state, "seed_phrase"):
-        headers["X-Hippius-Seed"] = request.state.seed_phrase
     if hasattr(request.state, "account"):
         headers["X-Hippius-Has-Credits"] = str(request.state.account.has_credits)
         headers["X-Hippius-Can-Upload"] = str(request.state.account.upload)

@@ -4,7 +4,6 @@ import argparse
 import asyncio
 import contextlib
 import logging
-import os
 from typing import Any
 
 import asyncpg
@@ -44,12 +43,6 @@ async def fetch_failed_simple_objects(db: Any, hours: int, include_pinning: bool
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Resubmit failed simple uploads by re-enqueuing pin requests")
     parser.add_argument("--hours", type=int, default=72, help="Look back window in hours (default: 72)")
-    parser.add_argument(
-        "--seed",
-        type=str,
-        default=os.getenv("SEED_PHRASE") or "",
-        help="Seed phrase to use for encryption/pin (required for private buckets)",
-    )
     parser.add_argument("--dry-run", action="store_true", help="Print planned actions without enqueueing")
     parser.add_argument("--include-pinning", action="store_true", help="Include items currently in 'pinning' status")
     args = parser.parse_args()
@@ -74,13 +67,11 @@ async def main() -> None:
 
         enqueued = 0
         skipped_no_cache = 0
-        skipped_private_no_seed = 0
 
         for row in candidates:
             object_id = str(row["object_id"]) if row.get("object_id") is not None else ""
             object_key = str(row.get("object_key") or "")
             bucket_name = str(row.get("bucket_name") or "")
-            is_public = bool(row.get("is_public"))
             address = str(row.get("main_account_id") or "")
 
             if not object_id or not object_key or not bucket_name or not address:
@@ -89,12 +80,6 @@ async def main() -> None:
             # Ensure part 0 is still in cache (assume current version = 1 for legacy script)
             if not await obj_cache.exists(object_id, 1, 1):
                 skipped_no_cache += 1
-                continue
-
-            should_encrypt = not is_public
-            seed_phrase = args.seed if should_encrypt else ""
-            if should_encrypt and not seed_phrase:
-                skipped_private_no_seed += 1
                 continue
 
             payload = UploadChainRequest(
@@ -108,16 +93,14 @@ async def main() -> None:
             )
 
             if args.dry_run:
-                logger.info(f"DRY_RUN would enqueue: {address} {bucket_name}/{object_key} (encrypt={should_encrypt})")
+                logger.info(f"DRY_RUN would enqueue: {address} {bucket_name}/{object_key}")
             else:
                 # Mark as pinning and enqueue
                 await db.execute("UPDATE objects SET status = 'pinning' WHERE object_id = $1", object_id)
                 await enqueue_upload_request(payload=payload)
                 enqueued += 1
 
-        logger.info(
-            f"Done. enqueued={enqueued} skipped_no_cache={skipped_no_cache} skipped_private_no_seed={skipped_private_no_seed}"
-        )
+        logger.info(f"Done. enqueued={enqueued} skipped_no_cache={skipped_no_cache}")
 
     finally:
         with contextlib.suppress(Exception):

@@ -43,10 +43,14 @@ def configure_otel(service_name: str) -> None:
     endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
 
     # Resource.create() automatically merges OTEL_RESOURCE_ATTRIBUTES from env
+    # Keep service.instance.id at the (stable) pod hostname — never append os.getpid().
+    # The collector promotes this resource attr to the `instance` metric label, so a
+    # per-process value mints a fresh series set for every worker (re)spawn and blows
+    # up Prometheus head cardinality. Workers of one pod aggregate under one instance.
     resource = Resource.create(
         {
             "service.name": service_name,
-            "service.instance.id": f"{socket.gethostname()}-{os.getpid()}",
+            "service.instance.id": socket.gethostname(),
         }
     )
 

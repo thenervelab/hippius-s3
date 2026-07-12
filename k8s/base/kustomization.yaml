@@ -7,8 +7,6 @@ resources:
   - configmap-redis.yaml
   - configmap-environment.yaml
   - pvc-shared.yaml
-  - postgres-cluster.yaml
-  - postgres-scheduledbackup.yaml
   - redis-statefulsets.yaml
   - migration-job.yaml
   - api-deployment.yaml

@@ -306,7 +306,12 @@ async def main_async(args: argparse.Namespace) -> int:
 
         log.info(f"Successfully deleted user: {args.address}")
 
-        if args.unpin:
+        if args.no_unpin:
+            log.warning(
+                "--no-unpin: skipping unpins. Backend chunks are NOT reclaimed and the rows stay "
+                "un-unpinned, leaving a soft-delete backlog the janitor can never hard-delete."
+            )
+        else:
             log.info(f"Starting unpin operations for {len(cids)} CIDs...")
             unpin_results = await unpin_cids(cids, config, args.address)
             log.info(
@@ -336,7 +341,9 @@ def main() -> None:
     ap.add_argument("--address", help="User address (main_account_id) to delete")
     ap.add_argument("--dry-run", action="store_true", help="Preview deletions without executing")
     ap.add_argument(
-        "--unpin", action="store_true", help="Unpin CIDs from IPFS and enqueue unpin requests (ignored in dry-run)"
+        "--no-unpin",
+        action="store_true",
+        help="Skip unpins (DANGEROUS: leaks backend chunks + leaves an un-drainable backlog; ignored in dry-run)",
     )
     ap.add_argument(
         "--from-json",

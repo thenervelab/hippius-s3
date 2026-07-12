@@ -6,6 +6,8 @@ namespace: hippius-s3-staging
 resources:
   - ../base
   - gateway-nodeport.yaml
+  - postgres-cluster.yaml
+  - postgres-scheduledbackup.yaml
   - postgres-objectstore.yaml
 
 patches:

@@ -23,7 +23,6 @@ async def get_object_tags(
     bucket_name: str,
     object_key: str,
     db: Any,
-    _: str,
     main_account_id: str,
 ) -> Response:
     try:
@@ -81,7 +80,6 @@ async def set_object_tags(
     object_key: str,
     request: Request,
     db: Any,
-    _: str,
     main_account_id: str,
 ) -> Response:
     try:
@@ -151,7 +149,6 @@ async def delete_object_tags(
     bucket_name: str,
     object_key: str,
     db: Any,
-    _: str,
     main_account_id: str,
 ) -> Response:
     try:

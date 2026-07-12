@@ -231,20 +231,6 @@ class CryptoService:
             suite_id = cls.DEFAULT_SUITE_ID
         return cls._ADAPTERS[suite_id]
 
-    @staticmethod
-    def derive_key_from_seed(seed_phrase: str) -> bytes:
-        """Derive 32-byte encryption key from seed phrase.
-
-        Uses SHA-256 for backward compatibility.
-        Future: use HKDF with salt from bucket/object context.
-        """
-        return hashlib.sha256(seed_phrase.encode("utf-8")).digest()
-
-    # Legacy aliases for backward compatibility
-    @staticmethod
-    def _derive_key(seed_phrase: str) -> bytes:
-        return CryptoService.derive_key_from_seed(seed_phrase)
-
     @classmethod
     def encrypt_part_to_chunks(
         cls,
@@ -252,7 +238,6 @@ class CryptoService:
         *,
         object_id: str,
         part_number: int,
-        seed_phrase: str,
         chunk_size: int,
         bucket_id: str = "",
         upload_id: str = "",
@@ -265,7 +250,6 @@ class CryptoService:
             plaintext: Data to encrypt
             object_id: Object UUID
             part_number: Part number (1-based)
-            seed_phrase: Seed phrase for key derivation (ignored if key provided)
             chunk_size: Plaintext bytes per chunk
             bucket_id: Bucket UUID (for AAD)
             upload_id: Upload UUID (for AAD)
@@ -275,7 +259,9 @@ class CryptoService:
         Returns:
             List of ciphertext chunks (each chunk_size + overhead)
         """
-        key_bytes = key if key is not None else cls.derive_key_from_seed(seed_phrase)
+        if key is None:
+            raise ValueError("key parameter is required")
+        key_bytes = key
         adapter = cls.get_adapter(suite_id)
 
         chunks: List[bytes] = []
@@ -304,7 +290,6 @@ class CryptoService:
         cls,
         ciphertext_chunk: bytes,
         *,
-        seed_phrase: str,
         object_id: str,
         part_number: int,
         chunk_index: int,
@@ -314,7 +299,9 @@ class CryptoService:
         key: Optional[bytes] = None,
     ) -> bytes:
         """Decrypt a single chunk."""
-        key_bytes = key if key is not None else cls.derive_key_from_seed(seed_phrase)
+        if key is None:
+            raise ValueError("key parameter is required")
+        key_bytes = key
         adapter = cls.get_adapter(suite_id)
 
         return adapter.decrypt_chunk(
@@ -332,7 +319,6 @@ class CryptoService:
         cls,
         chunk_iterator: Iterator[Tuple[int, bytes]],
         *,
-        seed_phrase: str,
         object_id: str,
         part_number: int,
         bucket_id: str = "",
@@ -348,7 +334,6 @@ class CryptoService:
 
         Args:
             chunk_iterator: Iterator yielding (chunk_index, ciphertext) tuples
-            seed_phrase: Seed for key derivation
             object_id: Object UUID
             part_number: Part number
             bucket_id: Bucket UUID (for AAD)
@@ -367,7 +352,6 @@ class CryptoService:
             # Decrypt this chunk
             pt_chunk = cls.decrypt_chunk(
                 ct_chunk,
-                seed_phrase=seed_phrase,
                 object_id=object_id,
                 part_number=part_number,
                 chunk_index=chunk_index,
@@ -399,7 +383,6 @@ class CryptoService:
         cls,
         chunk_iterator: AsyncIterator[Tuple[int, bytes]],
         *,
-        seed_phrase: str,
         object_id: str,
         part_number: int,
         bucket_id: str = "",
@@ -416,7 +399,6 @@ class CryptoService:
             # Decrypt this chunk (CPU-bound, but fast enough for now)
             pt_chunk = cls.decrypt_chunk(
                 ct_chunk,
-                seed_phrase=seed_phrase,
                 object_id=object_id,
                 part_number=part_number,
                 chunk_index=chunk_index,

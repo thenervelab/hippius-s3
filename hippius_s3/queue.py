@@ -109,7 +109,6 @@ class DownloadChainRequest(RetryableRequest):
     object_storage_version: int | None = None
     address: str
     subaccount: str
-    subaccount_seed_phrase: str
     substrate_url: str
     size: int
     multipart: bool

@@ -49,12 +49,11 @@ RUN_REAL_AWS=1 AWS_REGION=us-east-1 pytest tests/e2e -v -m 'not local'
 ## Key Fixtures
 
 **Session-scoped (E2E)**:
-- `test_seed_phrase` - Fixed test seed phrase for auth
 - `test_access_key` / `test_access_key_secret` - `hip_*` access key credentials
 - `docker_services` - Docker Compose stack lifecycle
 
 **Per-test (E2E)**:
-- `boto3_client` - Boto3 S3 client (seed phrase auth)
+- `boto3_client` - Boto3 S3 client (access key auth)
 - `boto3_access_key_client` - Boto3 S3 client (access key auth)
 - `signed_http_get` - Helper for signed GET with Range headers
 - `unique_bucket_name` - Generates unique bucket names

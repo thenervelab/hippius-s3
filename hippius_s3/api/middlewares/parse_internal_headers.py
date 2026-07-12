@@ -25,9 +25,8 @@ async def parse_internal_headers_middleware(
 
     The gateway sets these headers after authenticating the request:
     - X-Hippius-Ray-ID: Request tracing ID
-    - X-Hippius-Account-Id: Subaccount ID from seed phrase
+    - X-Hippius-Account-Id: Account ID from access key
     - X-Hippius-Bucket-Id: Resolved bucket UUID (lets the API skip its own bucket lookup)
-    - X-Hippius-Seed: Seed phrase
     - X-Hippius-Main-Account: Main account ID
     - X-Hippius-Has-Credits: Boolean credit status
     - X-Hippius-Can-Upload: Boolean upload permission
@@ -48,7 +47,6 @@ async def parse_internal_headers_middleware(
     request.state.bucket_owner_id = request.headers.get("X-Hippius-Bucket-Owner", "")
     request.state.bucket_id = request.headers.get("X-Hippius-Bucket-Id", "")
     request.state.account_id = request.state.request_user_id
-    request.state.seed_phrase = request.headers.get("X-Hippius-Seed", "")
 
     main_account = request.state.bucket_owner_id or request.headers.get("X-Hippius-Main-Account", "")
 

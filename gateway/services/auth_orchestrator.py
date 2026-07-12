@@ -11,7 +11,6 @@ from gateway.middlewares.access_key_auth import AccessKeyAuthError
 from gateway.middlewares.access_key_auth import verify_access_key_presigned_url
 from gateway.middlewares.access_key_auth import verify_access_key_signature
 from gateway.middlewares.sigv4 import AuthParsingError
-from gateway.middlewares.sigv4 import SigV4Verifier
 from gateway.middlewares.sigv4 import extract_credential_from_auth_header
 from gateway.services.auth_cache import cached_auth
 from gateway.utils.errors import s3_error_response
@@ -21,7 +20,7 @@ from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 
 logger = logging.getLogger(__name__)
 
-AuthMethod = Literal["access_key", "seed_phrase", "anonymous", "bearer_access_key"]
+AuthMethod = Literal["access_key", "anonymous", "bearer_access_key"]
 
 
 @dataclass
@@ -31,7 +30,6 @@ class AuthResult:
     access_key: str | None = None
     account_address: str | None = None
     token_type: str | None = None
-    seed_phrase: str | None = None
     account_id: str | None = None
     error_response: Response | None = None
 
@@ -45,7 +43,7 @@ async def authenticate_request(request: Request) -> AuthResult:
     2. Check for Authorization Header
        - If starts with "Bearer " -> Bearer Access Key Auth
        - If starts with "hip_" -> Access Key Auth
-       - Else -> Seed Phrase Auth (SigV4)
+       - Else -> Invalid (seed phrase auth no longer supported)
     3. No credentials -> Anonymous (if GET/HEAD)
     """
     ray_id = getattr(request.state, "ray_id", "no-ray-id")
@@ -90,11 +88,21 @@ async def authenticate_request(request: Request) -> AuthResult:
             )
         )
 
-    # 4. Access Key vs Seed Phrase Branching
+    # 4. Access Key vs Invalid Credential
     if credential.startswith("hip_"):
         return await _authenticate_access_key_header(request, credential, logger)
 
-    return await _authenticate_seed_phrase(request, logger)
+    # A well-formed SigV4 header with a non-hip_ credential is the shape the removed
+    # seed-phrase auth used — surface a deprecation pointer to tokens rather than a bare
+    # "invalid key" so migrating users know what changed and where to go.
+    logger.warning(f"Seed-phrase / non-hip_ credential rejected: {credential[:8]}***")
+    return AuthResult(
+        error_response=s3_error_response(
+            code="InvalidAccessKeyId",
+            message="Seed phrase authentication is deprecated. Use https://docs.hippius.com/storage/s3/integration to get started using tokens.",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+    )
 
 
 async def _authenticate_presigned_url(request: Request, logger: Any) -> AuthResult:
@@ -268,38 +276,4 @@ async def _authenticate_access_key_header(request: Request, credential: str, log
         account_address=token_auth.account_address,
         account_id=token_auth.account_address,
         token_type=token_auth.token_type,
-    )
-
-
-async def _authenticate_seed_phrase(request: Request, logger: Any) -> AuthResult:
-    logger.debug("Attempting seed phrase authentication")
-
-    verifier = SigV4Verifier(request)
-    try:
-        is_valid = await verifier.verify_signature()
-    except Exception as e:
-        # Catch parsing errors that might slip through or other surprises
-        logger.warning(f"Seed phrase auth verification failed: {e}")
-        return AuthResult(
-            error_response=s3_error_response(
-                code="SignatureDoesNotMatch",
-                message="The request signature we calculated does not match the signature you provided",
-                status_code=status.HTTP_403_FORBIDDEN,
-            )
-        )
-
-    if not is_valid:
-        return AuthResult(
-            error_response=s3_error_response(
-                code="SignatureDoesNotMatch",
-                message="The request signature we calculated does not match the signature you provided",
-                status_code=status.HTTP_403_FORBIDDEN,
-            )
-        )
-
-    logger.info("Seed phrase auth successful")
-    return AuthResult(
-        is_valid=True,
-        auth_method="seed_phrase",
-        seed_phrase=verifier.seed_phrase,
     )
