@@ -11,11 +11,19 @@ the second one 500s with a duplicate-key violation. The fix allocates
 counter is re-read post-lock (EvalPlanQual), so it always reflects the sibling's
 committed bump.
 
+That GREATEST floor is NOT a full guarantee, though: create_migration_version.sql
+inserts a version WITHOUT bumping current_object_version, and the MAX() floor is
+itself snapshot-stale under READ COMMITTED, so a migrator racing a write to the
+same object can still collide. The writer retries on object_versions_pkey to
+cover that residual case; the second test below pins both the residual collision
+and that a fresh transaction (what the retry does) resolves it.
+
 Needs a live Postgres (DATABASE_URL); skips otherwise. The seed rows are
 committed (both connections must see them) and removed in a finally.
 """
 
 import asyncio
+import json
 import os
 import uuid
 from typing import Any
@@ -137,4 +145,58 @@ async def test_concurrent_same_key_write_does_not_collide_on_version_pk() -> Non
         await _cleanup(setup, bucket_id, acct)
         await conn_a.close()
         await conn_b.close()
+        await setup.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_version_race_collides_and_retry_resolves_it() -> None:
+    """A create_migration_version committed while an upsert is blocked still collides
+    (the GREATEST floor's MAX() is snapshot-stale), and a fresh transaction — what the
+    writer's retry-on-object_versions_pkey does — resolves it. Guards the writer retry."""
+    setup = await _connect_or_skip()
+    conn_m = await _connect_or_skip()
+    conn_p = await _connect_or_skip()
+    acct = f"5MIGRACE{uuid.uuid4().hex[:11]}"
+    bucket_id = uuid.uuid4()
+    key = f"migrace-{uuid.uuid4()}"
+    tr_m = conn_m.transaction()
+    task_p: asyncio.Task | None = None
+    try:
+        await _seed_bucket(setup, acct, bucket_id)
+        first = await _upsert(setup, bucket_id, key)
+        object_id = first["object_id"]
+        assert first["current_object_version"] == 1
+
+        # Migrator inserts version 2 but does NOT bump current_object_version (it holds the
+        # objects row via FOR UPDATE) — leaving current_object_version (1) behind MAX (2).
+        await tr_m.start()
+        migrated = await conn_m.fetchval(
+            get_query("create_migration_version"), str(object_id), "x", json.dumps({}), 5, ["arion"]
+        )
+        assert migrated == 2
+
+        # A concurrent write blocks on the migrator's row lock with a pre-commit snapshot.
+        task_p = asyncio.create_task(_upsert(conn_p, bucket_id, key))
+        await asyncio.sleep(0.5)
+        assert not task_p.done()
+
+        # Migrator commits v2. The blocked write unblocks and collides: current_object_version is
+        # a fresh 1, MAX() is snapshot-stale at 1, so GREATEST(1, 1)+1 = 2 == the migration version.
+        await tr_m.commit()
+        with pytest.raises(asyncpg.exceptions.UniqueViolationError):
+            await task_p
+
+        # The writer's retry re-runs in a fresh transaction: MAX() now sees the committed v2, so
+        # GREATEST(1, 2)+1 = 3 and the write succeeds.
+        retried = await _upsert(conn_p, bucket_id, key)
+        assert retried["current_object_version"] == 3
+        assert retried["object_id"] == object_id
+    finally:
+        if task_p is not None and not task_p.done():
+            task_p.cancel()
+        if conn_m.is_in_transaction():
+            await tr_m.rollback()
+        await _cleanup(setup, bucket_id, acct)
+        await conn_m.close()
+        await conn_p.close()
         await setup.close()
