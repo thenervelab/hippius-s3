@@ -21,14 +21,12 @@ class BackgroundMetricsCollector:
         metrics_collector: MetricsCollector,
         redis_client: Union[Redis, RedisCluster],
         redis_accounts_client: Redis,
-        redis_chain_client: Optional[Redis] = None,
         redis_rate_limiting_client: Optional[Redis] = None,
         redis_queues_client: Optional[Redis] = None,
     ):
         self.metrics_collector = metrics_collector
         self.redis_client = redis_client
         self.redis_accounts_client = redis_accounts_client
-        self.redis_chain_client = redis_chain_client
         self.redis_rate_limiting_client = redis_rate_limiting_client
         self.redis_queues_client = redis_queues_client
         self.running = False

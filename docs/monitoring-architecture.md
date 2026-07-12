@@ -24,7 +24,6 @@ graph TB
     subgraph "Infrastructure"
         Redis[(Redis Cache<br/>:6379)]
         RedisAccounts[(Redis Accounts<br/>:6380)]
-        RedisChain[(Redis Chain<br/>:6381)]
         Postgres[(PostgreSQL<br/>:5432)]
         Arion[Arion Service]
         DockerLogs[/var/lib/docker/containers]
@@ -33,7 +32,6 @@ graph TB
     subgraph "Metrics Exporters"
         RedisExp[Redis Exporter<br/>:9121]
         RedisAccExp[Redis Accounts Exporter<br/>:9122]
-        RedisChainExp[Redis Chain Exporter<br/>:9123]
         PostgresExp[Postgres Exporter<br/>:9187]
     end
 
@@ -53,7 +51,6 @@ graph TB
     %% Infrastructure to Exporters
     Redis -.->|queries| RedisExp
     RedisAccounts -.->|queries| RedisAccExp
-    RedisChain -.->|queries| RedisChainExp
     Postgres -.->|queries| PostgresExp
 
     %% Prometheus Scraping (Pull)
@@ -61,7 +58,6 @@ graph TB
     Prom -->|scrape :8889| OTEL
     Prom -->|scrape :9121| RedisExp
     Prom -->|scrape :9122| RedisAccExp
-    Prom -->|scrape :9123| RedisChainExp
     Prom -->|scrape :9187| PostgresExp
 
     %% Logs Flow
@@ -85,8 +81,8 @@ graph TB
     classDef observability fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px
 
     class API,Workers appLayer
-    class Redis,RedisAccounts,RedisChain,Postgres,Arion,DockerLogs infra
-    class RedisExp,RedisAccExp,RedisChainExp,PostgresExp exporter
+    class Redis,RedisAccounts,Postgres,Arion,DockerLogs infra
+    class RedisExp,RedisAccExp,PostgresExp exporter
     class OTEL,Prom,Loki,Tempo,Promtail,Grafana observability
 ```
 
@@ -180,7 +176,6 @@ Prometheus → Grafana Alert Rules → Alertmanager → Discord Webhook
 | Prometheus | 9090 | Metrics UI/API |
 | Redis Exporter | 9121 | Redis metrics |
 | Redis Accounts Exporter | 9122 | Redis accounts metrics |
-| Redis Chain Exporter | 9123 | Redis chain metrics |
 | Postgres Exporter | 9187 | Postgres metrics |
 
 ## Configuration Files
@@ -204,7 +199,7 @@ Prometheus → Grafana Alert Rules → Alertmanager → Discord Webhook
 
 ### Why Multiple Redis Exporters?
 
-Each Redis instance (main, accounts, chain) has separate concerns and is monitored independently to track:
+Each Redis instance (main, accounts) has separate concerns and is monitored independently to track:
 - Cache hit rates per instance
 - Memory usage per instance
 - Connection counts per workload
