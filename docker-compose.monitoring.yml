@@ -169,24 +169,6 @@ services:
     networks:
       - hippius_net
 
-  # Redis exporter for chain cache
-  redis-chain-exporter:
-    image: oliver006/redis_exporter:v1.80.2
-    container_name: hippius-redis-chain-exporter
-    ports:
-      - "127.0.0.1:9123:9121"
-    environment:
-      - REDIS_ADDR=redis://redis-chain:6379
-    command:
-      [
-        "/redis_exporter",
-        "-redis.addr=redis://redis-chain:6379",
-        "-log-format=txt",
-      ]
-    restart: unless-stopped
-    networks:
-      - hippius_net
-
   # Postgres exporter for database metrics
   postgres-exporter:
     image: prometheuscommunity/postgres-exporter:latest

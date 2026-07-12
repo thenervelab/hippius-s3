@@ -29,7 +29,6 @@ Step-by-step walkthrough of every code path a client object goes through, as of 
 | `redis_client`             | auth/ACL/banhammer/rate-limit; coalescing lock (`SET NX EX`). |
 | `redis_queues_client`      | upload/download queues + `notify:{chunk_key}` pub/sub.        |
 | `redis_accounts_client`    | account credits.                                              |
-| `redis_chain_client`       | substrate state.                                              |
 | `redis_rate_limiting_client` | gateway rate limiting.                                      |
 | `redis_acl_client`         | ACL cache.                                                    |
 

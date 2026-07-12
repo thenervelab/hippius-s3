@@ -102,7 +102,6 @@ Services that come up:
 | `postgres` | 5432 | Main DB + keystore. |
 | `redis` | 6379 | General cache. |
 | `redis-accounts` | 6380 | Account cache. |
-| `redis-chain` | 6381 | Chain cache. |
 | `redis-queues` | 6382 | Work queues + pub/sub. |
 | `redis-rate-limiting` | 6383 | Rate limit counters. |
 | `redis-acl` | 6384 | ACL cache. |

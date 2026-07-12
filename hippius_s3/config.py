@@ -104,9 +104,6 @@ class Config:
     # Redis for account caching (persistent)
     redis_accounts_url: str = env("REDIS_ACCOUNTS_URL:redis://127.0.0.1:6380/0")
 
-    # Redis for chain operations
-    redis_chain_url: str = env("REDIS_CHAIN_URL:redis://127.0.0.1:6381/0")
-
     # Redis for rate limiting and banhammer
     redis_rate_limiting_url: str = env("REDIS_RATE_LIMITING_URL:redis://127.0.0.1:6383/0")
 

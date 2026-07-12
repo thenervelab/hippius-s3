@@ -97,7 +97,7 @@ done
 
 # ── Standalone Redis Instances ──
 header "Redis Standalone Instances"
-for redis in redis-accounts redis-chain redis-queues redis-rate-limiting redis-acl; do
+for redis in redis-accounts redis-queues redis-rate-limiting redis-acl; do
     PONG=$(kubectl exec -n "$NAMESPACE" "${redis}-0" -- redis-cli ping 2>/dev/null || echo "FAIL")
     if [[ "$PONG" == *"PONG"* ]]; then
         pass "$redis: PONG"

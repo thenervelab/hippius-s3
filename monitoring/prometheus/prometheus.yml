@@ -30,12 +30,6 @@ scrape_configs:
       - targets: ['redis-accounts-exporter:9121']
     scrape_interval: 10s
 
-  # Redis chain cache metrics
-  - job_name: 'redis-chain'
-    static_configs:
-      - targets: ['redis-chain-exporter:9121']
-    scrape_interval: 10s
-
   # PostgreSQL metrics
   - job_name: 'postgres'
     static_configs:

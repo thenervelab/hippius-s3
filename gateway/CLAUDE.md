@@ -7,7 +7,7 @@ See [../CLAUDE.md](../CLAUDE.md) for the full architectural map. This file cover
 ## Entry
 
 - [gateway/main.py:35 `factory()`](main.py) — FastAPI factory. Launched by uvicorn with `factory=True`.
-- Startup ([main.py:52](main.py)) creates the Postgres pool, five Redis clients (general, accounts, chain, rate-limiting, ACL), the `ForwardService` / `ACLService` / `DocsProxyService` / `ArionClient`, and a background task that exports Postgres pool metrics every 60s.
+- Startup ([main.py:52](main.py)) creates the Postgres pool, four Redis clients (general, accounts, rate-limiting, ACL), the `ForwardService` / `ACLService` / `DocsProxyService` / `ArionClient`, and a background task that exports Postgres pool metrics every 60s.
 - Shutdown ([main.py:131](main.py)) closes all of them in reverse order.
 
 There is **no** business logic here — the gateway never touches chunk data. It proxies.
