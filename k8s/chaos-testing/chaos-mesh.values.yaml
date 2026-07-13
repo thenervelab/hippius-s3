@@ -11,14 +11,14 @@
 #                                         ClusterRole — verified in the rendered manifest). This is the
 #                                         guarantee that a PodChaos aimed at hippius-s3-prod is rejected.
 #
-# NOTE (chart 2.7.3 quirks): this chart IGNORES several of these values in its templates, so the
-# staging workflow patches the running controller after install (see staging-deploy.yaml):
-#   - enableFilterNamespace is left FALSE — it would need cluster-scoped namespace list/watch that
-#     namespaced mode doesn't grant; targetNamespace already confines injection to staging, so the
-#     filter is redundant here.
-#   - the webhook port is moved off 10250 (the firewalled kubelet port) to 9443.
-# Two companion manifests complete the working install: webhook-networkpolicy.yaml (apiserver ->
-# webhook) and remotecluster-rbac.yaml (the one cluster-scoped read the controller needs to start).
+# enableFilterNamespace is left FALSE on purpose: the namespace filter would need cluster-scoped
+# namespace list/watch that namespaced mode doesn't grant (it produces Selected=False on every
+# target), and targetNamespace already confines injection to staging, so the filter is redundant.
+# The chart DOES honour this value (unlike some others), so it takes effect from here — no Deployment
+# patch needed. Two companion manifests complete the working install: webhook-networkpolicy.yaml
+# (lets the apiserver reach the webhook on the chart-default port 10250, which the ns `allow-internal`
+# NetworkPolicy otherwise drops) and remotecluster-rbac.yaml (the one cluster-scoped read the
+# namespaced controller needs to start).
 
 clusterScoped: false
 
