@@ -51,17 +51,15 @@ Everything is idempotent (no `--wait`, no Deployment patches). **Why each object
 - **`enableFilterNamespace: false`** (in the values, not a patch) — the namespace filter needs
   cluster-scoped namespace list/watch that namespaced mode doesn't grant (→ `Selected=False`);
   `targetNamespace` already confines injection to staging, so the filter is redundant.
+- **`chaosDaemon.runtime: containerd` + the k3s socket** (in the values) — the nodes run k3s
+  (containerd), not docker; the chart's docker default made daemon-driven chaos (NetworkChaos /
+  TimeChaos / IOChaos) create-but-never-inject. Pointing the daemon at
+  `/run/k3s/containerd/containerd.sock` lets it nsenter the target and run `tc` / clock / io faults.
 
-## Known limitation on this cluster
-
-**Only controller-driven `PodChaos` (pod-kill / pod-failure) injects here.** Daemon-driven chaos —
-`NetworkChaos`, `TimeChaos`, `IOChaos`, `StressChaos` — is created but **never reaches
-`AllInjected=True`**: the chaos-daemon can't drive the node container-runtime to enter the target's
-namespaces (a CRI-socket / privilege gap on these nodes). So of the matrix, the pod-kill cells (F1
-agent-kill, F2 allocator-kill → the single-leader/epoch-fence headline) work; the network/time/io
-cells (F2 partition, F3, F4, F5, F8-IOChaos) need the chaos-daemon runtime wired up first. The
-hardened `inject.py` surfaces this correctly (it fails the cell on a non-injecting fault rather than
-holding through and reporting green).
+The full matrix (PodChaos + Network/Time/IO) injects on this cluster; verified live (F2 =
+PodChaos + NetworkChaos both reach `AllInjected=True`). The hardened `inject.py` fails a cell on a
+non-injecting fault rather than holding through and reporting green, so any future runtime regression
+surfaces immediately.
 
 ## Running the chaos matrix after it deploys
 
