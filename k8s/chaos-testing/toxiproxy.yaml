@@ -1,0 +1,82 @@
+# Toxiproxy — STAGING ONLY. A programmable TCP fault-proxy for the drain chaos cells that need a
+# transport-level toxic rather than a Chaos Mesh CRD: the F3 redis-queues pathology (latency / hang /
+# reset) in stress-test/faults/matrix.yaml.
+#
+# The harness drives it through the control API on :8474 (POST /proxies/<name>/toxics), reached via
+#   kubectl -n hippius-s3-staging port-forward svc/toxiproxy 8474:8474
+#
+# Only the in-cluster redis_queues proxy is pre-defined (a pass-through to the internal service). It
+# only affects traffic ROUTED through it, so deploying this changes nothing about live staging by
+# default — a cell that needs the redis path toxified repoints that one client for the experiment.
+# The F8 backend-truncation cell uses the IOChaos CRD (k8s/chaos/f8-corrupt-chunk.yaml) on staging, so
+# no external backend endpoint is baked in here; if a toxiproxy backend proxy is ever needed, add it
+# at run time via the control API (POST /proxies) with the endpoint supplied then — do NOT hardcode a
+# backend address in this committed manifest. Namespaced to hippius-s3-staging; prod never gets this.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: toxiproxy-config
+  namespace: hippius-s3-staging
+  labels:
+    app: toxiproxy
+    hippius.io/role: chaos-testing
+data:
+  toxiproxy.json: |
+    [
+      { "name": "redis_queues", "listen": "0.0.0.0:16379", "upstream": "redis-queues:6379", "enabled": true }
+    ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: toxiproxy
+  namespace: hippius-s3-staging
+  labels:
+    app: toxiproxy
+    hippius.io/role: chaos-testing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: toxiproxy
+  template:
+    metadata:
+      labels:
+        app: toxiproxy
+        hippius.io/role: chaos-testing
+    spec:
+      containers:
+        - name: toxiproxy
+          image: ghcr.io/shopify/toxiproxy:2.11.0
+          args: ["-host", "0.0.0.0", "-config", "/config/toxiproxy.json"]
+          ports:
+            - { name: control, containerPort: 8474 }
+            - { name: redis-proxy, containerPort: 16379 }
+          volumeMounts:
+            - { name: config, mountPath: /config, readOnly: true }
+          readinessProbe:
+            tcpSocket: { port: 8474 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+      volumes:
+        - name: config
+          configMap:
+            name: toxiproxy-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: toxiproxy
+  namespace: hippius-s3-staging
+  labels:
+    app: toxiproxy
+    hippius.io/role: chaos-testing
+spec:
+  selector:
+    app: toxiproxy
+  ports:
+    - { name: control, port: 8474, targetPort: 8474 }
+    - { name: redis-proxy, port: 16379, targetPort: 16379 }

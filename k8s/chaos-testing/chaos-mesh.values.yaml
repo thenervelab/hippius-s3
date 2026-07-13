@@ -1,0 +1,25 @@
+# Chaos Mesh Helm values — STAGING ONLY, namespace-scoped to hippius-s3-staging.
+#
+# Installed by .github/workflows/staging-deploy.yaml (the staging workflow ONLY — prod never
+# installs this). Pinned to chart 2.7.3. The drain chaos matrix (stress-test/faults/, k8s/chaos/*.yaml)
+# needs the PodChaos / NetworkChaos / IOChaos / TimeChaos CRDs + controller these values install.
+#
+# ── PROD-SAFETY (why this can never touch hippius-s3-prod on the shared cluster) ──
+#   clusterScoped: false                     -> controller runs in namespaced mode
+#   controllerManager.targetNamespace        -> it may ONLY inject faults into hippius-s3-staging
+#                                               (its fault-injection RBAC is a RoleBinding in that ns,
+#                                               not a ClusterRole — verified in the rendered manifest)
+#   controllerManager.enableFilterNamespace  -> belt-and-suspenders: only a namespace carrying the
+#                                               label chaos-mesh.org/inject=enabled can be injected,
+#                                               and the workflow labels ONLY hippius-s3-staging.
+# Together these mean a PodChaos/NetworkChaos aimed at hippius-s3-prod is rejected by the controller.
+
+clusterScoped: false
+
+controllerManager:
+  targetNamespace: hippius-s3-staging
+  enableFilterNamespace: true
+
+# No public dashboard/ingress — this is a test-tooling install, driven by kubectl + the harness.
+dashboard:
+  create: false

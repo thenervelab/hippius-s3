@@ -185,6 +185,9 @@ jobs:
       - name: Set up kubectl
         uses: azure/setup-kubectl@v3
 
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
       - name: Configure kubeconfig
         run: |
           mkdir -p $HOME/.kube
@@ -285,6 +288,22 @@ jobs:
       - name: Deploy to staging
         run: |
           kubectl apply -k k8s/staging
+
+      # STAGING ONLY — the drain chaos matrix (stress-test/faults/) needs Chaos Mesh + toxiproxy.
+      # Chaos Mesh is namespace-scoped to hippius-s3-staging (clusterScoped=false + targetNamespace),
+      # so it can never inject into hippius-s3-prod on the shared cluster. See k8s/chaos-testing/.
+      # This step exists ONLY in the staging workflow; production-deploy.yaml installs none of it.
+      - name: Deploy chaos-testing tooling (staging-only)
+        run: |
+          helm repo add chaos-mesh https://charts.chaos-mesh.org
+          helm repo update chaos-mesh
+          helm upgrade --install chaos-mesh chaos-mesh/chaos-mesh \
+            --namespace hippius-s3-staging --version 2.7.3 \
+            -f k8s/chaos-testing/chaos-mesh.values.yaml \
+            --wait --timeout 5m
+          # enableFilterNamespace gate: only this labelled namespace can be fault-injected.
+          kubectl label namespace hippius-s3-staging chaos-mesh.org/inject=enabled --overwrite
+          kubectl apply -f k8s/chaos-testing/toxiproxy.yaml
 
       - name: Wait for rollout
         run: |
