@@ -3,10 +3,10 @@
 # hippius-s3-staging has a default `allow-internal` NetworkPolicy (podSelector={}) that only permits
 # the apiserver's source on port 8080 — so admission-webhook calls to the chaos-controller-manager
 # pods (a new in-namespace webhook) are silently dropped and EVERY chaos CRD create fails fail-closed
-# with `context deadline exceeded`. This additive policy opens just the webhook port to the chaos
-# controller pods. Port 9443 is exclusively the chaos webhook (an authenticated TLS endpoint that only
-# validates chaos CRs), so allowing it from any source is low-risk; the apiserver's source IP on this
-# cluster is SNAT'd/proxied and not a fixed CIDR, hence 0.0.0.0/0.
+# with `context deadline exceeded`. This additive policy opens just the webhook port (chart default
+# 10250) to the chaos controller pods. That port is exclusively the chaos webhook (an authenticated
+# TLS endpoint that only validates chaos CRs), so allowing it from any source is low-risk; the
+# apiserver's source IP on this cluster is SNAT'd/proxied and not a fixed CIDR, hence 0.0.0.0/0.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -23,4 +23,4 @@ spec:
     - from:
         - ipBlock: { cidr: 0.0.0.0/0 }
       ports:
-        - { port: 9443, protocol: TCP }
+        - { port: 10250, protocol: TCP }

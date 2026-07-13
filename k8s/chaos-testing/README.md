@@ -25,11 +25,12 @@ Prod and staging share one cluster, so containment is the whole point:
   cluster-scoped object (`remotecluster-rbac.yaml`) is read-only on a chaos-mesh CRD type — no access
   over prod app workloads.
 
-## How it deploys (chart 2.7.3 needs post-install patches)
+## How it deploys
 
-chaos-mesh 2.7.3's namespaced mode is buggy — the chart **ignores several values** and the install
-does not work out of the box on this cluster. `.github/workflows/staging-deploy.yaml` (staging only)
-therefore does, after the helm install:
+chaos-mesh 2.7.3's namespaced mode needs two **standalone** companion objects to work on this cluster
+(the helm-managed Deployment itself is left untouched — patching it with kubectl would create a
+field-manager that conflicts with the next `helm upgrade`, since helm 4 uses server-side apply).
+`.github/workflows/staging-deploy.yaml` (staging only) runs, after the app apply:
 
 ```bash
 helm upgrade --install chaos-mesh chaos-mesh/chaos-mesh \
@@ -37,22 +38,18 @@ helm upgrade --install chaos-mesh chaos-mesh/chaos-mesh \
   -f k8s/chaos-testing/chaos-mesh.values.yaml --timeout 5m     # NO --wait (chaos-daemon is a DaemonSet)
 kubectl apply -f k8s/chaos-testing/webhook-networkpolicy.yaml  # apiserver -> webhook (allow-internal drops it)
 kubectl apply -f k8s/chaos-testing/remotecluster-rbac.yaml     # the one cluster-scoped read the controller needs
-kubectl -n hippius-s3-staging set env deploy/chaos-controller-manager \
-  WEBHOOK_PORT=9443 ENABLE_FILTER_NAMESPACE=false              # 10250 is firewalled; filter needs cluster ns-list
-kubectl -n hippius-s3-staging patch deploy chaos-controller-manager --type=json \
-  -p '[{"op":"replace","path":"/spec/template/spec/containers/0/ports/0/containerPort","value":9443}]'
 kubectl apply -f k8s/chaos-testing/toxiproxy.yaml
 ```
 
-Everything is idempotent. **Why each patch** (all discovered live — each failure was a silent
-`context deadline exceeded` / `Selected=False` / manager cache-sync abort):
+Everything is idempotent (no `--wait`, no Deployment patches). **Why each object** (all discovered live
+— each failure was a silent `context deadline exceeded` / `Selected=False` / manager cache-sync abort):
 - **webhook-networkpolicy** — the `allow-internal` NetworkPolicy only allows the apiserver on :8080, so
-  webhook calls to the chaos controller were dropped and every chaos CRD create failed fail-closed.
+  webhook calls to the chaos controller (chart-default port 10250) were dropped and every chaos CRD
+  create failed fail-closed. This was the ONLY thing blocking the webhook — the port itself is fine.
 - **remotecluster-rbac** — namespaced mode doesn't grant the cluster-scoped `remoteclusters` read the
   controller still requires; without it the manager aborts at startup and no reconcilers run.
-- **WEBHOOK_PORT=9443** — the chart serves the webhook on 10250 (the kubelet port), firewalled
-  apiserver→pod here; the Service targetPort is a named port so it follows the containerPort patch.
-- **ENABLE_FILTER_NAMESPACE=false** — the namespace filter needs cluster-scoped namespace list/watch;
+- **`enableFilterNamespace: false`** (in the values, not a patch) — the namespace filter needs
+  cluster-scoped namespace list/watch that namespaced mode doesn't grant (→ `Selected=False`);
   `targetNamespace` already confines injection to staging, so the filter is redundant.
 
 ## Known limitation on this cluster
