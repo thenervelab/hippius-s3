@@ -1,0 +1,36 @@
+# STAGING chaos tooling — narrow cluster-scoped read grant for chaos-mesh's own RemoteCluster CRD.
+#
+# In namespaced mode (clusterScoped=false) the chaos-mesh chart does NOT grant the controller the
+# cluster-scoped access it still tries to use for its multi-cluster RemoteCluster controller. Without
+# it the controller-manager fails cache-sync at startup ("remoteclusters.chaos-mesh.org is forbidden
+# ... at the cluster scope") and aborts — so NO reconcilers run and no fault is ever injected.
+#
+# This is the ONE cluster-scoped object the working install needs. It is read-only (get/list/watch)
+# and scoped to a chaos-mesh CRD type that only chaos-mesh uses — it grants zero access over prod
+# application workloads. (Approved as the "narrow cluster RBAC grant" over switching to a fully
+# cluster-scoped chaos-mesh install.)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: chaos-mesh-remotecluster-reader
+  labels:
+    hippius.io/role: chaos-testing
+rules:
+  - apiGroups: ["chaos-mesh.org"]
+    resources: ["remoteclusters", "remoteclusters/status"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: chaos-mesh-remotecluster-reader
+  labels:
+    hippius.io/role: chaos-testing
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: chaos-mesh-remotecluster-reader
+subjects:
+  - kind: ServiceAccount
+    name: chaos-controller-manager
+    namespace: hippius-s3-staging

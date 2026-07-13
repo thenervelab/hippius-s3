@@ -19,27 +19,52 @@ Prod and staging share one cluster, so containment is the whole point:
 - Chaos Mesh is installed with `clusterScoped: false` + `controllerManager.targetNamespace:
   hippius-s3-staging` (see `chaos-mesh.values.yaml`). Its fault-injection permission is a
   **RoleBinding in `hippius-s3-staging`**, not a ClusterRole — a `PodChaos`/`NetworkChaos` aimed at
-  `hippius-s3-prod` is rejected by the controller.
-- `enableFilterNamespace: true` adds a second gate: only a namespace labelled
-  `chaos-mesh.org/inject=enabled` can be injected, and the workflow labels **only**
-  `hippius-s3-staging`.
+  `hippius-s3-prod` is rejected by the controller. **This is the guarantee.**
 - Nothing here is referenced by any prod overlay (`k8s/production`) or by
-  `.github/workflows/production-deploy.yaml`. Only the **staging** workflow installs it.
+  `.github/workflows/production-deploy.yaml`. Only the **staging** workflow installs it. The one
+  cluster-scoped object (`remotecluster-rbac.yaml`) is read-only on a chaos-mesh CRD type — no access
+  over prod app workloads.
 
-## How it deploys
+## How it deploys (chart 2.7.3 needs post-install patches)
 
-`.github/workflows/staging-deploy.yaml` (staging only) runs, after the app apply:
+chaos-mesh 2.7.3's namespaced mode is buggy — the chart **ignores several values** and the install
+does not work out of the box on this cluster. `.github/workflows/staging-deploy.yaml` (staging only)
+therefore does, after the helm install:
 
 ```bash
-helm repo add chaos-mesh https://charts.chaos-mesh.org
 helm upgrade --install chaos-mesh chaos-mesh/chaos-mesh \
   --namespace hippius-s3-staging --version 2.7.3 \
-  -f k8s/chaos-testing/chaos-mesh.values.yaml --wait --timeout 5m
-kubectl label namespace hippius-s3-staging chaos-mesh.org/inject=enabled --overwrite
+  -f k8s/chaos-testing/chaos-mesh.values.yaml --timeout 5m     # NO --wait (chaos-daemon is a DaemonSet)
+kubectl apply -f k8s/chaos-testing/webhook-networkpolicy.yaml  # apiserver -> webhook (allow-internal drops it)
+kubectl apply -f k8s/chaos-testing/remotecluster-rbac.yaml     # the one cluster-scoped read the controller needs
+kubectl -n hippius-s3-staging set env deploy/chaos-controller-manager \
+  WEBHOOK_PORT=9443 ENABLE_FILTER_NAMESPACE=false              # 10250 is firewalled; filter needs cluster ns-list
+kubectl -n hippius-s3-staging patch deploy chaos-controller-manager --type=json \
+  -p '[{"op":"replace","path":"/spec/template/spec/containers/0/ports/0/containerPort","value":9443}]'
 kubectl apply -f k8s/chaos-testing/toxiproxy.yaml
 ```
 
-`helm upgrade --install` is idempotent, so re-running the deploy is a no-op when nothing changed.
+Everything is idempotent. **Why each patch** (all discovered live — each failure was a silent
+`context deadline exceeded` / `Selected=False` / manager cache-sync abort):
+- **webhook-networkpolicy** — the `allow-internal` NetworkPolicy only allows the apiserver on :8080, so
+  webhook calls to the chaos controller were dropped and every chaos CRD create failed fail-closed.
+- **remotecluster-rbac** — namespaced mode doesn't grant the cluster-scoped `remoteclusters` read the
+  controller still requires; without it the manager aborts at startup and no reconcilers run.
+- **WEBHOOK_PORT=9443** — the chart serves the webhook on 10250 (the kubelet port), firewalled
+  apiserver→pod here; the Service targetPort is a named port so it follows the containerPort patch.
+- **ENABLE_FILTER_NAMESPACE=false** — the namespace filter needs cluster-scoped namespace list/watch;
+  `targetNamespace` already confines injection to staging, so the filter is redundant.
+
+## Known limitation on this cluster
+
+**Only controller-driven `PodChaos` (pod-kill / pod-failure) injects here.** Daemon-driven chaos —
+`NetworkChaos`, `TimeChaos`, `IOChaos`, `StressChaos` — is created but **never reaches
+`AllInjected=True`**: the chaos-daemon can't drive the node container-runtime to enter the target's
+namespaces (a CRI-socket / privilege gap on these nodes). So of the matrix, the pod-kill cells (F1
+agent-kill, F2 allocator-kill → the single-leader/epoch-fence headline) work; the network/time/io
+cells (F2 partition, F3, F4, F5, F8-IOChaos) need the chaos-daemon runtime wired up first. The
+hardened `inject.py` surfaces this correctly (it fails the cell on a non-injecting fault rather than
+holding through and reporting green).
 
 ## Running the chaos matrix after it deploys
 
@@ -60,6 +85,7 @@ or inv-guard's `--abort` will trip on the standing condition instead of on the i
 
 ```bash
 kubectl delete -f k8s/chaos-testing/toxiproxy.yaml
+kubectl delete -f k8s/chaos-testing/webhook-networkpolicy.yaml
+kubectl delete -f k8s/chaos-testing/remotecluster-rbac.yaml
 helm uninstall chaos-mesh -n hippius-s3-staging
-kubectl label namespace hippius-s3-staging chaos-mesh.org/inject-
 ```
