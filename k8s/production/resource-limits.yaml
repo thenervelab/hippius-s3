@@ -50,7 +50,7 @@ spec:
               memory: 2Gi
             limits:
               cpu: 2000m
-              memory: 3Gi
+              memory: 4Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -119,7 +119,7 @@ spec:
               memory: 512Mi
             limits:
               cpu: 1000m
-              memory: 4Gi
+              memory: 3Gi
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
