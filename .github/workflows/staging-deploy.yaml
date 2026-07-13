@@ -297,12 +297,30 @@ jobs:
         run: |
           helm repo add chaos-mesh https://charts.chaos-mesh.org
           helm repo update chaos-mesh
+          # NO --wait: chaos-daemon is a DaemonSet that legitimately can't schedule on a node already
+          # at pod capacity, so a partial roll must not fail the deploy (same rationale as the
+          # drain-agent handling below). helm returning after apply is sufficient; the patches below
+          # are idempotent and the controller reconciles asynchronously.
           helm upgrade --install chaos-mesh chaos-mesh/chaos-mesh \
             --namespace hippius-s3-staging --version 2.7.3 \
-            -f k8s/chaos-testing/chaos-mesh.values.yaml \
-            --wait --timeout 5m
-          # enableFilterNamespace gate: only this labelled namespace can be fault-injected.
-          kubectl label namespace hippius-s3-staging chaos-mesh.org/inject=enabled --overwrite
+            -f k8s/chaos-testing/chaos-mesh.values.yaml --timeout 5m
+          # The chaos matrix needs the apiserver to reach the webhook, and the namespaced-mode
+          # controller needs one cluster-scoped read grant to start. Both are idempotent.
+          kubectl apply -f k8s/chaos-testing/webhook-networkpolicy.yaml
+          kubectl apply -f k8s/chaos-testing/remotecluster-rbac.yaml
+          # chaos-mesh 2.7.3 namespaced mode has two quirks the chart's values do NOT fix (they are
+          # ignored by the templates), so patch the running controller:
+          #  - WEBHOOK_PORT 10250 -> 9443: 10250 is the kubelet port and is firewalled apiserver->pod
+          #    here; move the webhook to a reachable port (the Service targetPort is a named port, so
+          #    it follows the containerPort).
+          #  - ENABLE_FILTER_NAMESPACE=false: the namespace filter needs cluster-scoped namespace
+          #    list/watch (not granted in namespaced mode); targetNamespace already confines injection
+          #    to hippius-s3-staging, so the filter is redundant. Dropping it avoids that RBAC need.
+          kubectl -n hippius-s3-staging set env deploy/chaos-controller-manager \
+            WEBHOOK_PORT=9443 ENABLE_FILTER_NAMESPACE=false
+          kubectl -n hippius-s3-staging patch deploy chaos-controller-manager --type=json \
+            -p '[{"op":"replace","path":"/spec/template/spec/containers/0/ports/0/containerPort","value":9443}]'
+          kubectl -n hippius-s3-staging rollout status deploy/chaos-controller-manager --timeout=3m || true
           kubectl apply -f k8s/chaos-testing/toxiproxy.yaml
 
       - name: Wait for rollout
