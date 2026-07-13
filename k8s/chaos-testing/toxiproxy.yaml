@@ -1,16 +1,17 @@
 # Toxiproxy — STAGING ONLY. A programmable TCP fault-proxy for the drain chaos cells that need a
 # transport-level toxic rather than a Chaos Mesh CRD: the F3 redis-queues pathology (latency / hang /
-# reset) and the F8 arion body-truncation (limit_data) in stress-test/faults/matrix.yaml.
+# reset) in stress-test/faults/matrix.yaml.
 #
 # The harness drives it through the control API on :8474 (POST /proxies/<name>/toxics), reached via
 #   kubectl -n hippius-s3-staging port-forward svc/toxiproxy 8474:8474
-# then `HIPPIUS_DRAIN_LIVE=1 TOXI=http://localhost:8474 bash stress-test/faults/run_chaos.sh F8`.
 #
-# The proxies below are defined as pass-throughs. They only affect traffic that is ROUTED through
-# them, so deploying this changes nothing about live staging by default — a cell that needs the
-# redis/arion path toxified repoints that one client for the experiment (or uses the F8 IOChaos CRD,
-# k8s/chaos/f8-corrupt-chunk.yaml, which needs no repointing). Namespaced to hippius-s3-staging; prod
-# never gets this (it is not referenced by any prod overlay or the production workflow).
+# Only the in-cluster redis_queues proxy is pre-defined (a pass-through to the internal service). It
+# only affects traffic ROUTED through it, so deploying this changes nothing about live staging by
+# default — a cell that needs the redis path toxified repoints that one client for the experiment.
+# The F8 backend-truncation cell uses the IOChaos CRD (k8s/chaos/f8-corrupt-chunk.yaml) on staging, so
+# no external backend endpoint is baked in here; if a toxiproxy backend proxy is ever needed, add it
+# at run time via the control API (POST /proxies) with the endpoint supplied then — do NOT hardcode a
+# backend address in this committed manifest. Namespaced to hippius-s3-staging; prod never gets this.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -22,8 +23,7 @@ metadata:
 data:
   toxiproxy.json: |
     [
-      { "name": "redis_queues", "listen": "0.0.0.0:16379", "upstream": "redis-queues:6379", "enabled": true },
-      { "name": "arion", "listen": "0.0.0.0:18443", "upstream": "arion.hippius.com:443", "enabled": true }
+      { "name": "redis_queues", "listen": "0.0.0.0:16379", "upstream": "redis-queues:6379", "enabled": true }
     ]
 ---
 apiVersion: apps/v1
@@ -52,7 +52,6 @@ spec:
           ports:
             - { name: control, containerPort: 8474 }
             - { name: redis-proxy, containerPort: 16379 }
-            - { name: arion-proxy, containerPort: 18443 }
           volumeMounts:
             - { name: config, mountPath: /config, readOnly: true }
           readinessProbe:
@@ -81,4 +80,3 @@ spec:
   ports:
     - { name: control, port: 8474, targetPort: 8474 }
     - { name: redis-proxy, port: 16379, targetPort: 16379 }
-    - { name: arion-proxy, port: 18443, targetPort: 18443 }
