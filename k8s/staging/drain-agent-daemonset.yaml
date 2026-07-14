@@ -139,7 +139,10 @@ spec:
             # overlap fsync latency across parts (the AIMD allocator only tunes bytes/s).
             # Safe code default (4); set here for per-node tuning.
             - name: CEPHOR_DRAIN_CONCURRENCY
-              value: "4"
+              value: "16"    # was 4 — overlap more per-part commit fsyncs (the drain is
+                             # commit-bound on the ceph-backed Postgres, ~0.68 parts/s at 4);
+                             # more concurrency is the main lever until the status DB moves off
+                             # ceph-backed storage. See drainer-optimisations.md.
             # Replication-lag tuning (measured 2026-07-02: p50 4.6s / p99 5.9s under the old 5s
             # poll). The lag was NOT the drain budget (unpinned to ~1 GB/s by the target_p99 fix)
             # — it was the poll floor. Lower ONLY the poll:
