@@ -88,3 +88,4 @@ stress-test/results/
 
 # hippius-mem embeddings model cache (local, never commit)
 .fastembed_cache/
+drainer-optimisations.md
