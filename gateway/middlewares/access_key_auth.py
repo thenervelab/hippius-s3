@@ -60,7 +60,7 @@ async def verify_access_key_signature(
     amz_date = request.headers.get("x-amz-date", "")
 
     if not auth_header or not amz_date:
-        logger.error("Missing required auth headers for access key verification")
+        logger.warning("Missing required auth headers for access key verification")
         raise AccessKeyAuthError("Missing required auth headers")
 
     provided_signature = extract_signature_from_auth_header(auth_header)
@@ -169,7 +169,7 @@ async def verify_access_key_presigned_url(
     provided_signature = query.get("X-Amz-Signature")
 
     if not all([algorithm, credential, amz_date, expires_str, signed_headers_str, provided_signature]):
-        logger.error("Missing required X-Amz-* query parameters for presigned URL verification")
+        logger.warning("Missing required X-Amz-* query parameters for presigned URL verification")
         raise AccessKeyAuthError("Missing required presigned URL parameters")
 
     assert credential is not None
@@ -177,13 +177,13 @@ async def verify_access_key_presigned_url(
     assert signed_headers_str is not None
 
     if algorithm != "AWS4-HMAC-SHA256":
-        logger.error(f"Unsupported X-Amz-Algorithm in presigned URL: {algorithm}")
+        logger.warning(f"Unsupported X-Amz-Algorithm in presigned URL: {algorithm}")
         raise AccessKeyAuthError("Unsupported signature algorithm")
 
     # Parse credential: <access_key>/<date>/<region>/<service>/aws4_request
     credential_parts = credential.split("/")
     if len(credential_parts) < 5:
-        logger.error(f"Invalid X-Amz-Credential format: {credential}")
+        logger.warning(f"Invalid X-Amz-Credential format: {credential}")
         raise AccessKeyAuthError("Invalid credential format")
 
     credential_id = credential_parts[0]
@@ -192,27 +192,29 @@ async def verify_access_key_presigned_url(
     service = credential_parts[3]
 
     if credential_id != access_key:
-        logger.error(f"Presigned URL credential ID mismatch: header={access_key[:8]}***, query={credential_id[:8]}***")
+        logger.warning(
+            f"Presigned URL credential ID mismatch: header={access_key[:8]}***, query={credential_id[:8]}***"
+        )
         raise AccessKeyAuthError("Credential does not match access key")
 
     if not amz_date or len(amz_date) < 8 or date_scope != amz_date[:8]:
-        logger.error(f"X-Amz-Date ({amz_date}) and credential scope date ({date_scope}) mismatch in presigned URL")
+        logger.warning(f"X-Amz-Date ({amz_date}) and credential scope date ({date_scope}) mismatch in presigned URL")
         raise AccessKeyAuthError("Invalid credential scope")
 
     try:
         expires = int(expires_str)
     except ValueError:
-        logger.error(f"Invalid X-Amz-Expires value: {expires_str}")
+        logger.warning(f"Invalid X-Amz-Expires value: {expires_str}")
         raise AccessKeyAuthError("Invalid expires value") from None
 
     if expires <= 0 or expires > 604800:
-        logger.error(f"X-Amz-Expires out of allowed range (1-604800): {expires}")
+        logger.warning(f"X-Amz-Expires out of allowed range (1-604800): {expires}")
         raise AccessKeyAuthError("Expires value out of range")
 
     try:
         signed_at = datetime.datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=datetime.timezone.utc)
     except ValueError:
-        logger.error(f"Invalid X-Amz-Date format: {amz_date}")
+        logger.warning(f"Invalid X-Amz-Date format: {amz_date}")
         raise AccessKeyAuthError("Invalid date format") from None
 
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -227,7 +229,7 @@ async def verify_access_key_presigned_url(
     signed_headers = signed_headers_str.split(";")
 
     if "host" not in signed_headers:
-        logger.error("Presigned URL missing required 'host' header in X-Amz-SignedHeaders")
+        logger.warning("Presigned URL missing required 'host' header in X-Amz-SignedHeaders")
         raise AccessKeyAuthError("Invalid signed headers")
 
     token_response = await cached_auth(access_key, redis_client)
