@@ -26,11 +26,14 @@ import asyncio
 import json
 import os
 import uuid
+from datetime import datetime
+from datetime import timezone
 from typing import Any
 
 import asyncpg
 import pytest
 
+from hippius_s3.db_retry import retry_on_object_version_conflict
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import upsert_object_basic
 
@@ -191,6 +194,71 @@ async def test_migration_version_race_collides_and_retry_resolves_it() -> None:
         retried = await _upsert(conn_p, bucket_id, key)
         assert retried["current_object_version"] == 3
         assert retried["object_id"] == object_id
+    finally:
+        if task_p is not None and not task_p.done():
+            task_p.cancel()
+        if conn_m.is_in_transaction():
+            await tr_m.rollback()
+        await _cleanup(setup, bucket_id, acct)
+        await conn_m.close()
+        await conn_p.close()
+        await setup.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_race_resolved_by_retry_helper_on_multipart_reserve() -> None:
+    """End-to-end wiring: retry_on_object_version_conflict wraps the multipart reserve, so a
+    migration-version collision that raises object_versions_pkey is retried in a fresh statement
+    and succeeds with v3 — no 500 reaches the caller. Mirrors the raw-collision test above but
+    exercises the helper on the (previously unguarded) multipart path."""
+    setup = await _connect_or_skip()
+    conn_m = await _connect_or_skip()
+    conn_p = await _connect_or_skip()  # autocommit — each helper retry is a fresh snapshot
+    acct = f"5MPRACE{uuid.uuid4().hex[:12]}"
+    bucket_id = uuid.uuid4()
+    key = f"mprace-{uuid.uuid4()}"
+    tr_m = conn_m.transaction()
+    task_p: asyncio.Task | None = None
+
+    async def _reserve_multipart() -> Any:
+        return await conn_p.fetchrow(
+            get_query("upsert_object_multipart"),
+            str(uuid.uuid4()),
+            str(bucket_id),
+            key,
+            "application/octet-stream",
+            json.dumps({}),
+            "",
+            0,
+            datetime.now(timezone.utc),
+            5,
+            ["arion"],
+        )
+
+    try:
+        await _seed_bucket(setup, acct, bucket_id)
+        first = await _upsert(setup, bucket_id, key)
+        object_id = first["object_id"]
+        assert first["current_object_version"] == 1
+
+        # Migrator inserts v2 without bumping current_object_version, holding the objects row.
+        await tr_m.start()
+        migrated = await conn_m.fetchval(
+            get_query("create_migration_version"), str(object_id), "x", json.dumps({}), 5, ["arion"]
+        )
+        assert migrated == 2
+
+        # The helper-wrapped multipart reserve blocks on the migrator's row lock (pre-commit snapshot).
+        task_p = asyncio.create_task(retry_on_object_version_conflict(_reserve_multipart))
+        await asyncio.sleep(0.5)
+        assert not task_p.done()
+
+        # Migrator commits v2: attempt 1 collides on object_versions_pkey, the helper retries in a
+        # fresh statement that sees the committed MAX and takes v3 — the caller never sees the error.
+        await tr_m.commit()
+        row_p = await task_p
+        assert row_p["object_id"] == object_id
+        assert row_p["current_object_version"] == 3
     finally:
         if task_p is not None and not task_p.done():
             task_p.cancel()

@@ -28,6 +28,7 @@ from hippius_s3.api.s3.common import format_s3_timestamp
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
+from hippius_s3.db_retry import retry_on_object_version_conflict
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
@@ -261,19 +262,23 @@ async def initiate_multipart_upload(
                 status_code=400,
             )
 
-        # Create initial objects row for this multipart upload
-        upsert_result = await db.fetchrow(
-            get_query("upsert_object_multipart"),
-            object_id,
-            bucket["bucket_id"],
-            object_key,
-            content_type,
-            json.dumps(metadata),
-            "",  # initial md5_hash (will be updated on completion)
-            0,  # initial size_bytes (will be updated on completion)
-            initiated_at,  # created_at
-            config.target_storage_version,
-            config.upload_backends,
+        # Create initial objects row for this multipart upload. The version allocation can collide
+        # with a concurrent create_migration_version on object_versions_pkey; retry re-reads the
+        # committed MAX in a fresh autocommit statement (see writer/db.py).
+        upsert_result = await retry_on_object_version_conflict(
+            lambda: db.fetchrow(
+                get_query("upsert_object_multipart"),
+                object_id,
+                bucket["bucket_id"],
+                object_key,
+                content_type,
+                json.dumps(metadata),
+                "",  # initial md5_hash (will be updated on completion)
+                0,  # initial size_bytes (will be updated on completion)
+                initiated_at,  # created_at
+                config.target_storage_version,
+                config.upload_backends,
+            )
         )
 
         # Use the returned object_id (will be existing one if conflict occurred)

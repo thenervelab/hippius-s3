@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 from typing import Optional
 
+from hippius_s3.db_retry import retry_on_object_version_conflict
 from hippius_s3.utils import get_query
 
 
@@ -47,17 +48,21 @@ class ObjectRepository:
         storage_version: int,
         upload_backends: list[str] | None = None,
     ) -> Any:
-        return await self._db.fetchrow(
-            get_query("upsert_object_with_cid"),
-            object_id,
-            bucket_id,
-            object_key,
-            cid_id,
-            size_bytes,
-            content_type,
-            created_at,
-            metadata_json,
-            md5_hash,
-            storage_version,
-            upload_backends,
+        # Version allocation can collide with a concurrent create_migration_version on
+        # object_versions_pkey; retry re-reads the committed MAX in a fresh autocommit statement.
+        return await retry_on_object_version_conflict(
+            lambda: self._db.fetchrow(
+                get_query("upsert_object_with_cid"),
+                object_id,
+                bucket_id,
+                object_key,
+                cid_id,
+                size_bytes,
+                content_type,
+                created_at,
+                metadata_json,
+                md5_hash,
+                storage_version,
+                upload_backends,
+            )
         )
