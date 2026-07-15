@@ -173,18 +173,17 @@ Chunk ciphertext     (AES-256-GCM per chunk; AAD binds bucket_id:object_id:versi
 
 ### 5.3 Redis instances
 
-Six separate services for blast-radius isolation:
+Five separate services for blast-radius isolation:
 
 | Service | Port | Purpose | Persistence |
 |---|---|---|---|
 | `redis` | 6379 | General cache / short-lived state | Ephemeral |
 | `redis-accounts` | 6380 | Account credit cache | Persistent (AOF) |
-| `redis-chain` | 6381 | Blockchain operation cache | Persistent (AOF) |
 | `redis-queues` | 6382 | Work queues + chunk pub/sub notifications | Persistent, 2GB, LRU |
 | `redis-rate-limiting` | 6383 | Rate limit counters | Ephemeral, 1GB |
 | `redis-acl` | 6384 | ACL cache | Ephemeral, 2GB, LRU |
 
-**Not in the table any more**: the old 32GB `redis-download-cache` (6385). Decommissioned 2026-04-21 with the FS-cache migration. If you spot a reference to `REDIS_DOWNLOAD_CACHE_URL`, it's stale.
+**Not in the table any more**: the old 32GB `redis-download-cache` (6385), decommissioned 2026-04-21 with the FS-cache migration; and `redis-chain` (6381), decommissioned 2026-06-30 — it was wired up but never read or written by any code path. If you spot a reference to `REDIS_DOWNLOAD_CACHE_URL` or `REDIS_CHAIN_URL`, it's stale.
 
 The `ChunkNotifier` pub/sub ([hippius_s3/cache/notifier.py:46-49](hippius_s3/cache/notifier.py)) publishes to `notify:{chunk_key}` on `redis-queues`. Streamers subscribe + re-check on each notification.
 
@@ -280,7 +279,6 @@ Config is a typed dataclass: [hippius_s3/config.py](hippius_s3/config.py). Value
 | `REDIS_URL` | — | Main Redis (:6379). |
 | `REDIS_QUEUES_URL` | `:6382` | Queue + pub/sub Redis. Persistent. |
 | `REDIS_ACCOUNTS_URL` | `:6380` | Account cache. Persistent. |
-| `REDIS_CHAIN_URL` | `:6381` | Chain cache. Persistent. |
 | `REDIS_RATE_LIMITING_URL` | `:6383` | Rate limit counters. |
 | `REDIS_ACL_URL` | `:6384` | ACL cache. |
 | `HIPPIUS_ARION_BASE_URL` | `https://arion.hippius.com/` | Arion endpoint. |

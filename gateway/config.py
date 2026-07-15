@@ -21,9 +21,6 @@ class GatewayConfig:
     redis_accounts_url: str = dataclasses.field(
         default_factory=lambda: os.getenv("REDIS_ACCOUNTS_URL", "redis://redis-accounts:6379/0")
     )
-    redis_chain_url: str = dataclasses.field(
-        default_factory=lambda: os.getenv("REDIS_CHAIN_URL", "redis://redis-chain:6379/0")
-    )
     redis_rate_limiting_url: str = dataclasses.field(
         default_factory=lambda: os.getenv("REDIS_RATE_LIMITING_URL", "redis://redis-rate-limiting:6379/0")
     )

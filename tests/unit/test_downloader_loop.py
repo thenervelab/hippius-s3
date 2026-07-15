@@ -37,7 +37,6 @@ def _make_request(name: str = "req") -> DownloadChainRequest:
         object_storage_version=5,
         address="5TestAddr",
         subaccount="5TestAddr",
-        subaccount_seed_phrase="",
         substrate_url="http://test",
         size=4096,
         multipart=False,

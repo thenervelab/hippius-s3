@@ -7,7 +7,7 @@ See [../CLAUDE.md](../CLAUDE.md) for the full architectural map. This file cover
 ## Entry
 
 - [gateway/main.py:35 `factory()`](main.py) — FastAPI factory. Launched by uvicorn with `factory=True`.
-- Startup ([main.py:52](main.py)) creates the Postgres pool, five Redis clients (general, accounts, chain, rate-limiting, ACL), the `ForwardService` / `ACLService` / `DocsProxyService` / `ArionClient`, and a background task that exports Postgres pool metrics every 60s.
+- Startup ([main.py:52](main.py)) creates the Postgres pool, four Redis clients (general, accounts, rate-limiting, ACL), the `ForwardService` / `ACLService` / `DocsProxyService` / `ArionClient`, and a background task that exports Postgres pool metrics every 60s.
 - Shutdown ([main.py:131](main.py)) closes all of them in reverse order.
 
 There is **no** business logic here — the gateway never touches chunk data. It proxies.
@@ -118,4 +118,10 @@ Unit tests for gateway-specific logic: [tests/unit/gateway/](../tests/unit/gatew
 |----|------|---|-------|------|
 | #7721 | 11:50 AM | 🔵 | Complete Sentry integration pattern documented for hippius-s3 | ~629 |
 | #7720 | 11:49 AM | 🔵 | Sentry configuration pattern in hippius-s3 repository | ~506 |
+
+### Jun 25, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #9377 | 9:07 PM | 🔵 | Application Pool Configuration Exceeds Database max_connections by 96 Connections | ~723 |
 </claude-mem-context>

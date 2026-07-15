@@ -12,7 +12,7 @@ Tests that exercise real DB + Redis via docker-compose, but mock external servic
 ## Prereqs
 
 ```bash
-docker compose up -d postgres redis redis-accounts redis-chain redis-queues redis-rate-limiting redis-acl
+docker compose up -d postgres redis redis-accounts redis-queues redis-rate-limiting redis-acl
 ```
 
 (The full stack isn't needed — just the data plane.)

@@ -1,6 +1,5 @@
 """Account verification and credit checking middleware for the gateway."""
 
-import hashlib
 import logging
 import re
 from typing import Callable
@@ -10,11 +9,7 @@ from fastapi import Response
 from starlette import status
 
 from gateway.config import get_config
-from gateway.services.account_service import BadAccount
-from gateway.services.account_service import InvalidSeedPhraseError
-from gateway.services.account_service import MainAccountError
 from gateway.services.account_service import fetch_account_by_main_address
-from gateway.services.auth_cache import cached_seed_auth
 from gateway.utils.errors import s3_error_response
 from hippius_s3.models.account import HippiusAccount
 from hippius_s3.services.arion_service import CanUploadResponse
@@ -86,6 +81,8 @@ async def account_middleware(
     the account has enough credit. If not, it returns a 402 Payment Required response.
 
     Read operations (GET, HEAD) get the account object but skip credit checks.
+
+    Only access key authentication is supported. Seed phrase authentication has been removed.
     """
     ray_id = getattr(request.state, "ray_id", "no-ray-id")
     logger = get_logger_with_ray_id(__name__, ray_id)
@@ -102,18 +99,6 @@ async def account_middleware(
             request.state.account = HippiusAccount(
                 id=account_address,
                 main_account=account_address,
-                has_credits=True,
-                upload=True,
-                delete=True,
-            )
-        elif hasattr(request.state, "seed_phrase"):
-            seed_phrase = request.state.seed_phrase
-            seed_hash = hashlib.sha256(seed_phrase.encode()).digest()
-            account_id = seed_hash.hex()
-            request.state.account_id = account_id
-            request.state.account = HippiusAccount(
-                id=account_id,
-                main_account=account_id,
                 has_credits=True,
                 upload=True,
                 delete=True,
@@ -182,74 +167,8 @@ async def account_middleware(
                 message="Something went wrong when verifying your account. Please try again later.",
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
-
-    elif hasattr(request.state, "seed_phrase"):
-        seed_phrase = request.state.seed_phrase
-
-        try:
-            redis_accounts_client = request.app.state.redis_accounts
-            redis_client = request.app.state.redis_client
-            request.state.account = await cached_seed_auth(
-                seed_phrase,
-                redis_client,
-                redis_accounts_client,
-                config.substrate_url,
-            )
-
-            request.state.account_id = request.state.account.main_account
-
-            # Only check permissions and credits for operations that modify state
-            if request.method in ["PUT", "POST", "DELETE"]:
-                logger.debug(f"Checking credit for {request.method} operation: {path}")
-
-                if not request.state.account.delete and request.method == "DELETE":
-                    raise BadAccount("This account does not have DELETE permissions")
-
-                if not request.state.account.has_credits:
-                    logger.warning(f"Account does not have credit for {request.method} operation: {path}")
-                    # Extract bucket name for better error response
-                    bucket_name = None
-                    bucket_match = re.match(r"^/([^/]+)", path)
-                    if bucket_match:
-                        bucket_name = bucket_match.group(1)
-
-                    return s3_error_response(
-                        code="InsufficientAccountCredit",
-                        message="The account does not have sufficient credit to perform this operation",
-                        status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                        BucketName=bucket_name if bucket_name else "",
-                    )
-
-                can_upload_error = await _check_can_upload(request, logger)
-                if can_upload_error is not None:
-                    return can_upload_error
-        except MainAccountError as e:
-            return s3_error_response(
-                code="InvalidAccessKeyId",
-                message=str(e),
-                status_code=status.HTTP_403_FORBIDDEN,
-            )
-        except InvalidSeedPhraseError:
-            return s3_error_response(
-                code="InvalidAccessKeyId",
-                message="The AWS Access Key Id you provided does not exist in our records.",
-                status_code=403,
-            )
-        except BadAccount as e:
-            return s3_error_response(
-                code="AccountVerificationError",
-                message=str(e),
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-        except Exception as e:
-            logger.exception(f"Error in account verification for {request.method} {path}: {e}")
-
-            return s3_error_response(
-                code="AccountVerificationError",
-                message="Something went wrong when verifying your account. Please try again later.",
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
     else:
+        # Anonymous access (no auth method)
         account_id = "anonymous"
         request.state.account_id = account_id
         request.state.account = HippiusAccount(

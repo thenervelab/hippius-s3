@@ -50,7 +50,8 @@ async def process_unpin_request(
     request: UnpinChainRequest,
     *,
     backend_name: str,
-    backend_client_factory: Any,
+    client: UnpinBackendClient | None = None,
+    backend_client_factory: Any = None,
     worker_logger: logging.LoggerAdapter,
     dlq_manager: UnpinDLQManager,
     db_pool: asyncpg.Pool,
@@ -61,6 +62,10 @@ async def process_unpin_request(
     A request expands to N chunk identifiers; their backend DELETEs run concurrently bounded by the
     shared per-pod `sem` (passed by the loop so all in-flight requests share one Arion-DELETE budget).
     Falls back to a per-request semaphore when called standalone (e.g. tests).
+
+    The loop passes its long-lived `client` so every request reuses one Arion connection pool (no TLS
+    handshake per request, which at high concurrency would storm ephemeral ports). When `client` is
+    None (standalone callers/tests) one is constructed from `backend_client_factory` for this request.
     """
     config = get_config()
     if sem is None:
@@ -121,16 +126,16 @@ async def process_unpin_request(
 
             span.set_attribute("num_identifiers", len(rows))
 
-            async with backend_client_factory() as client:
-                # Unpin each identifier concurrently, bounded by the shared per-pod `sem`. Each
-                # identifier is best-effort (a failed DELETE/soft-delete logs a warning but must not
-                # fail the whole request), mirroring the original serial behavior.
+            # Unpin each identifier concurrently, bounded by the shared per-pod `sem`. Each
+            # identifier is best-effort (a failed DELETE/soft-delete logs a warning but must not
+            # fail the whole request), mirroring the original serial behavior.
+            async def _unpin_all(active_client: Any) -> None:
                 async def _unpin_one(row: Any) -> None:
                     identifier = row["backend_identifier"]
                     chunk_id = row["chunk_id"]
                     async with sem:
                         try:
-                            await client.unpin_file(identifier, account_ss58=request.address)
+                            await active_client.unpin_file(identifier, account_ss58=request.address)
                             worker_logger.info(f"Unpinned {backend_name} identifier={identifier}")
                         except Exception as unpin_err:
                             worker_logger.warning(
@@ -150,6 +155,14 @@ async def process_unpin_request(
                             )
 
                 await asyncio.gather(*[_unpin_one(row) for row in rows])
+
+            # Reuse the loop's live client when supplied; only build (and close) a per-request client
+            # for standalone callers/tests that don't hand one in.
+            if client is not None:
+                await _unpin_all(client)
+            else:
+                async with backend_client_factory() as owned_client:
+                    await _unpin_all(owned_client)
 
             get_metrics_collector().record_unpinner_operation(
                 main_account=request.address,
@@ -219,11 +232,27 @@ async def run_unpinner_loop(
 
     delete_concurrency = max(1, int(config.unpinner_parallelism))
     max_inflight = max(1, int(config.unpinner_max_inflight))
-    # Peak concurrent pool acquires = up to `delete_concurrency` soft-deletes (each held inside
-    # delete_sem) + up to `max_inflight` per-request initial fetches. Floor the pool to that sum so
-    # scaling the concurrency knobs can never starve acquire() and silently wedge the pod (asyncpg
-    # acquire blocks indefinitely with no timeout).
-    pool_max = max(2, int(config.unpinner_db_pool_max), delete_concurrency + max_inflight)
+    # DB connection budget. A dispatched request briefly holds one pool conn for its initial
+    # chunk-identifier fetch (released before any DELETE), then in its gather phase holds up to
+    # `delete_concurrency` conns for concurrent soft-deletes (bounded by the shared per-pod
+    # `delete_sem`). So the throughput-optimal per-pod pool is ~ `max_inflight` (fetch conns) +
+    # `delete_concurrency` (soft-delete conns). We CAP that at HIPPIUS_UNPINNER_DB_POOL_MAX so raising
+    # max_inflight (an ops secret) can't balloon Postgres connections — per pod × replicas already
+    # runs close to the server's max_connections. The cap may trade throughput for connection count
+    # but is clamped up to the deadlock-safe floor: one request can hold up to `delete_concurrency`
+    # soft-delete conns at once, +1 so the next request's fetch always makes progress. (Nothing
+    # acquires a second conn while holding one and asyncpg acquire() has no timeout, so an undersized
+    # pool throttles rather than deadlocks — the floor just keeps liveness comfortable.)
+    ideal_pool = delete_concurrency + max_inflight
+    deadlock_floor = delete_concurrency + 1
+    capped_pool = min(ideal_pool, int(config.unpinner_db_pool_max))
+    if capped_pool < deadlock_floor:
+        logger.warning(
+            f"HIPPIUS_UNPINNER_DB_POOL_MAX={config.unpinner_db_pool_max} is below the deadlock-safe "
+            f"floor {deadlock_floor} (parallelism+1); honoring the floor instead"
+        )
+        capped_pool = deadlock_floor
+    pool_max = max(2, capped_pool)
     db_pool = await asyncpg.create_pool(
         dsn=config.database_url,
         min_size=2,
@@ -245,7 +274,7 @@ async def run_unpinner_loop(
         f"delete_concurrency={delete_concurrency} db_pool_max={pool_max})"
     )
 
-    async def _handle_unpin(request: UnpinChainRequest) -> None:
+    async def _handle_unpin(request: UnpinChainRequest, client: Any) -> None:
         ray_id = request.ray_id or "no-ray-id"
         ray_id_context.set(ray_id)
         worker_logger = get_logger_with_ray_id(__name__, ray_id)
@@ -262,7 +291,7 @@ async def run_unpinner_loop(
             await process_unpin_request(
                 request,
                 backend_name=backend_name,
-                backend_client_factory=backend_client_factory,
+                client=client,
                 worker_logger=worker_logger,
                 dlq_manager=dlq_manager,
                 db_pool=db_pool,
@@ -292,38 +321,50 @@ async def run_unpinner_loop(
 
     mover_task = asyncio.create_task(_retry_mover())
     try:
-        while True:
-            _reap({t for t in inflight if t.done()})
+        # One backend client for the whole loop — every dispatched request reuses this connection
+        # pool instead of re-handshaking TLS per request (a handshake/ephemeral-port storm at high
+        # inflight). Mirrors run_arion_uploader_in_loop's single ArionClient().
+        async with backend_client_factory() as client:
+            try:
+                while True:
+                    _reap({t for t in inflight if t.done()})
 
-            # Capacity gate — keep at most max_inflight requests processing at once.
-            if len(inflight) >= max_inflight:
-                done_wait, _ = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
-                _reap(done_wait)
-                continue
+                    # Capacity gate — keep at most max_inflight requests processing at once.
+                    if len(inflight) >= max_inflight:
+                        done_wait, _ = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+                        _reap(done_wait)
+                        continue
 
-            unpin_request, redis_queues_client = await with_redis_retry(
-                lambda rc: dequeue_unpin_request(queue_name),
-                redis_queues_client,
-                config.redis_queues_url,
-                f"dequeue {backend_name} unpin request",
-            )
+                    unpin_request, redis_queues_client = await with_redis_retry(
+                        lambda rc: dequeue_unpin_request(queue_name),
+                        redis_queues_client,
+                        config.redis_queues_url,
+                        f"dequeue {backend_name} unpin request",
+                    )
 
-            if not unpin_request:
-                if inflight:
-                    done_wait, _ = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED, timeout=0.5)
-                    _reap(done_wait)
-                else:
-                    await asyncio.sleep(0.1)
-                continue
+                    if not unpin_request:
+                        if inflight:
+                            done_wait, _ = await asyncio.wait(
+                                inflight, return_when=asyncio.FIRST_COMPLETED, timeout=0.5
+                            )
+                            _reap(done_wait)
+                        else:
+                            await asyncio.sleep(0.1)
+                        continue
 
-            inflight.add(asyncio.create_task(_handle_unpin(unpin_request)))
+                    inflight.add(asyncio.create_task(_handle_unpin(unpin_request, client)))
+            finally:
+                # Drain in-flight requests while the shared client is still open: they hold it for
+                # their Arion DELETEs, so the client must outlive them — closing it first (the
+                # `async with` __aexit__) would fail every in-flight unpin mid-request on shutdown.
+                for t in inflight:
+                    t.cancel()
+                await asyncio.gather(*inflight, return_exceptions=True)
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info(f"{backend_name} unpinner stopping…")
     finally:
         mover_task.cancel()
-        for t in inflight:
-            t.cancel()
-        # gather (not suppress) so cancelled tasks' CancelledError is absorbed here.
-        await asyncio.gather(mover_task, *inflight, return_exceptions=True)
+        # gather (not suppress) so the cancelled mover's CancelledError is absorbed here.
+        await asyncio.gather(mover_task, return_exceptions=True)
         if db_pool:
             await db_pool.close()

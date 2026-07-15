@@ -104,9 +104,6 @@ class Config:
     # Redis for account caching (persistent)
     redis_accounts_url: str = env("REDIS_ACCOUNTS_URL:redis://127.0.0.1:6380/0")
 
-    # Redis for chain operations
-    redis_chain_url: str = env("REDIS_CHAIN_URL:redis://127.0.0.1:6381/0")
-
     # Redis for rate limiting and banhammer
     redis_rate_limiting_url: str = env("REDIS_RATE_LIMITING_URL:redis://127.0.0.1:6383/0")
 
@@ -176,13 +173,15 @@ class Config:
     # Unpinner configuration
     # How many unpin requests one unpinner pod processes concurrently (outer bounded-dispatch,
     # mirroring the uploader). The old loop was a serial consumer.
-    unpinner_max_inflight: int = env("HIPPIUS_UNPINNER_MAX_INFLIGHT:4", convert=int)
+    unpinner_max_inflight: int = env("HIPPIUS_UNPINNER_MAX_INFLIGHT:8", convert=int)
     # Single shared per-pod bound on concurrent Arion DELETEs across ALL in-flight requests — one
     # fat request expands to ~N chunk identifiers, so this is what actually unlocks delete throughput.
     unpinner_parallelism: int = env("HIPPIUS_UNPINNER_PARALLELISM:5", convert=int)
-    # Per-pod unpinner DB pool size (concurrent soft-deletes). Multiplied by replica count against
-    # Postgres max_connections — keep modest and raise alongside parallelism.
-    unpinner_db_pool_max: int = env("HIPPIUS_UNPINNER_DB_POOL_MAX:12", convert=int)
+    # Explicit CAP on the per-pod unpinner DB pool. The loop sizes the pool to the throughput-optimal
+    # `max_inflight + parallelism` but never above this cap, so raising max_inflight (an ops secret)
+    # can't balloon Postgres connections (per pod × replicas runs close to server max_connections).
+    # The cap is clamped up to the deadlock-safe floor (parallelism + 1); see run_unpinner_loop.
+    unpinner_db_pool_max: int = env("HIPPIUS_UNPINNER_DB_POOL_MAX:16", convert=int)
     unpinner_max_attempts: int = env("HIPPIUS_UNPINNER_MAX_ATTEMPTS:5", convert=int)
     unpinner_backoff_base_ms: int = env("HIPPIUS_UNPINNER_BACKOFF_BASE_MS:1000", convert=int)
     unpinner_backoff_max_ms: int = env("HIPPIUS_UNPINNER_BACKOFF_MAX_MS:60000", convert=int)
@@ -273,7 +272,8 @@ class Config:
     # Object parts filesystem cache configuration
     object_cache_dir: str = env("HIPPIUS_OBJECT_CACHE_DIR:/var/lib/hippius/object_cache")
     object_cache_fallback_dir: str = env("HIPPIUS_OBJECT_CACHE_FALLBACK_DIR:", convert=str)
-    fs_cache_gc_max_age_seconds: int = env("HIPPIUS_FS_CACHE_GC_MAX_AGE_SECONDS:604800", convert=int)  # 7 days
+    # 24h since last access — reads bump mtime (os.utime sets both atime+mtime), so this gates on idle time.
+    fs_cache_gc_max_age_seconds: int = env("HIPPIUS_FS_CACHE_GC_MAX_AGE_SECONDS:86400", convert=int)
     mpu_stale_seconds: int = env("HIPPIUS_MPU_STALE_SECONDS:86400", convert=int)  # 1 day
     # Bounded concurrency for the janitor's per-part DB checks + deletes. The
     # cleanup loops are DB-roundtrip bound; this is how many parts are processed
