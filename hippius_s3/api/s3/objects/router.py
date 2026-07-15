@@ -20,9 +20,12 @@ from hippius_s3.api.s3.objects.put_object_endpoint import handle_put_object
 from hippius_s3.api.s3.objects.tagging_endpoint import delete_object_tags as tags_delete_object_tags
 from hippius_s3.api.s3.objects.tagging_endpoint import get_object_tags as tags_get_object_tags
 from hippius_s3.api.s3.objects.tagging_endpoint import set_object_tags as tags_set_object_tags
+from hippius_s3.config import get_config
+from hippius_s3.db_pool import acquire_with_timeout
 
 
 router = APIRouter()
+config = get_config()
 
 
 @router.head("/{bucket_name}/{object_key:path}", status_code=200)
@@ -90,5 +93,9 @@ async def delete_object(
     if "tagging" in request.query_params:
         async with pool.acquire() as conn:
             return await tags_delete_object_tags(bucket_name, object_key, conn, request.state.account.main_account)
-    async with pool.acquire() as conn:
+    # Bound the acquire: the delete handler holds this connection across the
+    # multipart_uploads cleanup, which can be a multi-second scan on large buckets.
+    # A bare pool.acquire() would block indefinitely and pin a pool slot under load;
+    # a timeout surfaces PoolAcquireTimeout -> 503 SlowDown via the global handler.
+    async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
         return await handle_delete_object(bucket_name, object_key, request, conn, redis_client)

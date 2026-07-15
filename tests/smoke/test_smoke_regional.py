@@ -62,13 +62,21 @@ def test_regional_upload_download_roundtrip(regional_s3_client, session_tracker,
     key = f"smoke-test/{session_tracker.session_id}/regional/{region}/{uuid.uuid4()}.bin"
 
     put_resp = regional_s3_client.put_object(Bucket=session_tracker.bucket, Key=key, Body=data)
-    assert put_resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert put_resp["ResponseMetadata"]["HTTPStatusCode"] == 200, (
+        f"[{region}] authenticated PUT returned HTTP {put_resp['ResponseMetadata']['HTTPStatusCode']} instead of 200 — the {region} regional cache is not accepting uploads."
+    )
 
     get_resp = regional_s3_client.get_object(Bucket=session_tracker.bucket, Key=key)
-    assert get_resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert get_resp["ResponseMetadata"]["HTTPStatusCode"] == 200, (
+        f"[{region}] authenticated GET returned HTTP {get_resp['ResponseMetadata']['HTTPStatusCode']} instead of 200 — the {region} regional cache is not serving reads."
+    )
     downloaded = get_resp["Body"].read()
-    assert hashlib.md5(downloaded).hexdigest() == expected_hash
-    assert len(downloaded) == size
+    assert hashlib.md5(downloaded).hexdigest() == expected_hash, (
+        f"[{region}] object read back from the regional cache does not match what was uploaded — data is corrupted through the {region} edge."
+    )
+    assert len(downloaded) == size, (
+        f"[{region}] object read back is {len(downloaded)} bytes but {size} were uploaded — the {region} regional cache is truncating objects."
+    )
 
     print(f"[{region}] upload/download roundtrip OK: {key}")
 
@@ -87,8 +95,12 @@ def test_regional_public_object_anonymous_download(regional_s3_client, session_t
     anon_url = f"{endpoint.rstrip('/')}/{session_tracker.bucket}/{key}"
     resp = httpx.get(anon_url, timeout=60)
     assert resp.status_code == 200, f"anonymous GET failed: status={resp.status_code} body={resp.text[:200]}"
-    assert hashlib.md5(resp.content).hexdigest() == expected_hash
-    assert len(resp.content) == size
+    assert hashlib.md5(resp.content).hexdigest() == expected_hash, (
+        f"[{region}] anonymously-downloaded public object does not match what was uploaded — public-read reads through the {region} edge are corrupting data."
+    )
+    assert len(resp.content) == size, (
+        f"[{region}] anonymous public download is {len(resp.content)} bytes but {size} were uploaded — the {region} edge is truncating public objects."
+    )
 
     cache_control = resp.headers.get("Cache-Control", "")
     assert "public" in cache_control.lower(), f"expected public Cache-Control, got: {cache_control!r}"
@@ -119,7 +131,9 @@ def test_regional_presigned_url_roundtrip(regional_s3_client, session_tracker, f
     )
     get_resp = httpx.get(get_url, timeout=60)
     assert get_resp.status_code == 200, f"[{region}] presigned GET failed: {get_resp.status_code} {get_resp.text[:200]}"
-    assert hashlib.md5(get_resp.content).hexdigest() == expected_hash
+    assert hashlib.md5(get_resp.content).hexdigest() == expected_hash, (
+        f"[{region}] object fetched via presigned URL does not match what was PUT via presigned URL — the {region} presigned round-trip is corrupting data."
+    )
 
     print(f"[{region}] presigned URL roundtrip OK: {key}")
 
