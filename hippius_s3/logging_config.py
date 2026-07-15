@@ -37,6 +37,23 @@ class HealthCheckFilter(logging.Filter):
         return "/health" not in message
 
 
+class OtelExporterBackpressureFilter(logging.Filter):
+    """Downgrade OTLP exporter backpressure ERRORs to WARNING (keep visible, off ERROR dashboards)."""
+
+    _LOGGER_PREFIX = "opentelemetry.exporter.otlp.proto.grpc"
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # The OTLP gRPC exporter logs "Failed to export ... StatusCode.UNAVAILABLE" at ERROR when the
+        # collector's memory_limiter sheds load — transient backpressure, not a service error. Scoped
+        # by record name because this filter is attached to the shared handlers (below), not to the
+        # exporter logger: a logger-level filter would NOT see records propagated from the exporter's
+        # child loggers (...grpc.trace_exporter / .metric_exporter / .exporter).
+        if record.name.startswith(self._LOGGER_PREFIX) and record.levelno >= logging.ERROR:
+            record.levelno = logging.WARNING
+            record.levelname = "WARNING"
+        return True
+
+
 def setup_loki_logging(config: LoggingConfig, service_name: str, include_ray_id: bool = True) -> logging.Logger:
     """
     Configure logging with optional Loki handler and ray ID support.
@@ -73,6 +90,12 @@ def setup_loki_logging(config: LoggingConfig, service_name: str, include_ray_id:
         log_format = "%(asctime)s - [%(ray_id)s] - %(name)s - %(levelname)s - %(message)s"
     else:
         log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+    # Attached to the handlers (like RayIDFilter) so it also catches records propagated up from the
+    # OTLP exporter's child loggers — a logger-level filter would miss those.
+    otel_backpressure_filter = OtelExporterBackpressureFilter()
+    for handler in handlers:
+        handler.addFilter(otel_backpressure_filter)
 
     logging.basicConfig(
         level=log_level,
