@@ -48,7 +48,16 @@ regression. The migrator intentionally keeps create and swap separate. Rejected.
 Generalize PR #243's approach into one shared helper and apply it to all four reserve
 callers (no duplicated retry loops):
 
-`hippius_s3/writer/db.py::retry_on_object_version_conflict(reserve, *, attempts=3)`
+`hippius_s3/db_retry.py::retry_on_object_version_conflict(reserve, *, attempts=3)`
+
+> The helper lives in a **lightweight top-level `hippius_s3/db_retry.py`** (only imports
+> `asyncpg`), NOT in `hippius_s3/writer/db.py`. One caller — `repositories/objects.py` — is
+> imported by the **gateway** (via `repositories/__init__.py`, which eagerly
+> `from .objects import ObjectRepository`). `hippius_s3/writer/__init__.py` in turn eagerly
+> `from .object_writer import ObjectWriter`, which drags in `cache`, `crypto_service`, and KMS.
+> So importing anything from `writer/*` into `objects.py` would load the whole write/crypto/KMS
+> stack into the gateway process at startup and make its container unhealthy (caught in E2E).
+> Keeping the helper out of the `writer` package avoids that.
 - Runs `reserve()`; on `asyncpg.UniqueViolationError` **scoped to `object_versions_pkey`**,
   retries. Each `reserve()` runs in its own autocommit statement / fresh transaction, so the
   retry re-reads the committed `MAX` and converges (typically attempt 2).

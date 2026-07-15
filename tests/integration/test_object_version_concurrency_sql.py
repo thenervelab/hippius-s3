@@ -33,8 +33,8 @@ from typing import Any
 import asyncpg
 import pytest
 
+from hippius_s3.db_retry import retry_on_object_version_conflict
 from hippius_s3.utils import get_query
-from hippius_s3.writer.db import retry_on_object_version_conflict
 from hippius_s3.writer.db import upsert_object_basic
 
 

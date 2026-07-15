@@ -3,8 +3,8 @@ from __future__ import annotations
 from typing import Any
 from typing import Optional
 
+from hippius_s3.db_retry import retry_on_object_version_conflict
 from hippius_s3.utils import get_query
-from hippius_s3.writer.db import retry_on_object_version_conflict
 
 
 class ObjectRepository:

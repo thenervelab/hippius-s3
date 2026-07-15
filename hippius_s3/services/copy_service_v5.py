@@ -11,11 +11,11 @@ from hippius_s3.api.s3.copy_helpers import build_copy_success_response
 from hippius_s3.api.s3.copy_helpers import parse_object_metadata
 from hippius_s3.api.s3.copy_helpers import resolve_chunk_size
 from hippius_s3.config import Config
+from hippius_s3.db_retry import retry_on_object_version_conflict
 from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import ensure_upload_row
-from hippius_s3.writer.db import retry_on_object_version_conflict
 from hippius_s3.writer.db import upsert_object_basic
 
 

@@ -14,8 +14,8 @@ retried in a fresh statement. These pin the branch logic without a DB:
 import asyncpg
 import pytest
 
-from hippius_s3.writer.db import OBJECT_VERSION_PK_CONSTRAINT
-from hippius_s3.writer.db import retry_on_object_version_conflict
+from hippius_s3.db_retry import OBJECT_VERSION_PK_CONSTRAINT
+from hippius_s3.db_retry import retry_on_object_version_conflict
 
 
 def _unique_violation(constraint: str) -> asyncpg.exceptions.UniqueViolationError:

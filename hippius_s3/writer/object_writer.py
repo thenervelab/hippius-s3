@@ -20,12 +20,12 @@ from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.cache import create_fs_store
 from hippius_s3.config import get_config
 from hippius_s3.db_pool import acquire_with_timeout
+from hippius_s3.db_retry import retry_on_object_version_conflict
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import ensure_upload_row
-from hippius_s3.writer.db import retry_on_object_version_conflict
 from hippius_s3.writer.db import upsert_object_basic
 from hippius_s3.writer.types import AppendPreconditionFailed
 from hippius_s3.writer.types import CompleteResult

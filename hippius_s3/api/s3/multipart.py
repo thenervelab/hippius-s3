@@ -28,13 +28,13 @@ from hippius_s3.api.s3.common import format_s3_timestamp
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
+from hippius_s3.db_retry import retry_on_object_version_conflict
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
-from hippius_s3.writer.db import retry_on_object_version_conflict
 from hippius_s3.writer.object_writer import ObjectWriter
 from hippius_s3.xml_helpers import add_subelement
 from hippius_s3.xml_helpers import create_element
