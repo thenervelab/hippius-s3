@@ -206,11 +206,15 @@ def test_default_deny_no_scope_installed(
 
     with pytest.raises(ClientError) as exc:
         sub_token_s3_client.get_object(Bucket=bucket_a, Key="missing.bin")
-    assert _http_status(exc.value) == 403
+    assert _http_status(exc.value) == 403, (
+        f"A sub-token with no scope installed was able to GET (got HTTP {_http_status(exc.value)}, expected 403) — default-deny is broken and unscoped tokens can read data."
+    )
 
     with pytest.raises(ClientError) as exc:
         sub_token_s3_client.put_object(Bucket=bucket_a, Key="x.bin", Body=data)
-    assert _http_status(exc.value) == 403
+    assert _http_status(exc.value) == 403, (
+        f"A sub-token with no scope installed was able to PUT (got HTTP {_http_status(exc.value)}, expected 403) — default-deny is broken and unscoped tokens can write data."
+    )
 
 
 def test_object_read_allows_get_denies_writes(
@@ -232,16 +236,22 @@ def test_object_read_allows_get_denies_writes(
     _install_scope(scope_http_client, access_key_id, hippius_master_account_ss58, "object_read", "specific", [bucket_a])
 
     got = sub_token_s3_client.get_object(Bucket=bucket_a, Key=key)
-    assert hashlib.md5(got["Body"].read()).hexdigest() == expected_md5
+    assert hashlib.md5(got["Body"].read()).hexdigest() == expected_md5, (
+        "An object_read sub-token read back the wrong content — a scoped read either served the wrong object or corrupted it."
+    )
 
     # DELETE first (no body) — body-bearing 403 corrupts boto3 keepalive on the next req.
     with pytest.raises(ClientError) as exc:
         sub_token_s3_client.delete_object(Bucket=bucket_a, Key=key)
-    assert _http_status(exc.value) == 403
+    assert _http_status(exc.value) == 403, (
+        f"An object_read (read-only) sub-token was allowed to DELETE (got HTTP {_http_status(exc.value)}, expected 403) — read-only scope is not blocking writes."
+    )
 
     with pytest.raises(ClientError) as exc:
         sub_token_s3_client.put_object(Bucket=bucket_a, Key="write.bin", Body=b"x")
-    assert _http_status(exc.value) == 403
+    assert _http_status(exc.value) == 403, (
+        f"An object_read (read-only) sub-token was allowed to PUT (got HTTP {_http_status(exc.value)}, expected 403) — read-only scope is not blocking writes."
+    )
 
 
 def test_object_read_write_full_object_crud(
@@ -264,7 +274,9 @@ def test_object_read_write_full_object_crud(
 
     sub_token_s3_client.put_object(Bucket=bucket_a, Key=key, Body=data)
     got = sub_token_s3_client.get_object(Bucket=bucket_a, Key=key)
-    assert hashlib.md5(got["Body"].read()).hexdigest() == expected_md5
+    assert hashlib.md5(got["Body"].read()).hexdigest() == expected_md5, (
+        "An object_read_write sub-token read back different content than it just wrote — the scoped write/read round-trip is corrupting data."
+    )
     sub_token_s3_client.delete_object(Bucket=bucket_a, Key=key)
 
 
@@ -287,11 +299,15 @@ def test_specific_bucket_scope_excludes_other_bucket(
 
     with pytest.raises(ClientError) as exc:
         sub_token_s3_client.get_object(Bucket=bucket_b, Key="other.bin")
-    assert _http_status(exc.value) == 403
+    assert _http_status(exc.value) == 403, (
+        f"A sub-token scoped only to bucket A was able to GET from bucket B (got HTTP {_http_status(exc.value)}, expected 403) — per-bucket scope isolation is broken, tokens can read buckets outside their scope."
+    )
 
     with pytest.raises(ClientError) as exc:
         sub_token_s3_client.put_object(Bucket=bucket_b, Key="x.bin", Body=b"y")
-    assert _http_status(exc.value) == 403
+    assert _http_status(exc.value) == 403, (
+        f"A sub-token scoped only to bucket A was able to PUT into bucket B (got HTTP {_http_status(exc.value)}, expected 403) — per-bucket scope isolation is broken, tokens can write buckets outside their scope."
+    )
 
 
 def test_scope_update_is_immediate(
@@ -311,7 +327,9 @@ def test_scope_update_is_immediate(
     _install_scope(scope_http_client, access_key_id, hippius_master_account_ss58, "object_read", "specific", [bucket_a])
     with pytest.raises(ClientError) as exc:
         sub_token_s3_client.delete_object(Bucket=bucket_a, Key="probe.bin")
-    assert _http_status(exc.value) == 403
+    assert _http_status(exc.value) == 403, (
+        f"Under a freshly-installed object_read scope, DELETE was allowed (got HTTP {_http_status(exc.value)}, expected 403) — read-only scope is not being enforced immediately after install."
+    )
 
     # Upgrade: subsequent PUT must succeed on the very next request.
     _install_scope(
@@ -337,11 +355,15 @@ def test_revoke_scope_resumes_default_deny(
     sub_token_s3_client.put_object(Bucket=bucket_a, Key="before-revoke.bin", Body=b"ok")
 
     delete_resp = scope_http_client.delete(access_key_id)
-    assert delete_resp.status_code == 204, delete_resp.text
+    assert delete_resp.status_code == 204, (
+        f"Deleting the sub-token's scope row returned HTTP {delete_resp.status_code}, expected 204 — the scope revocation endpoint is failing. Body: {delete_resp.text}"
+    )
 
     with pytest.raises(ClientError) as exc:
         sub_token_s3_client.put_object(Bucket=bucket_a, Key="after-revoke.bin", Body=b"no")
-    assert _http_status(exc.value) == 403
+    assert _http_status(exc.value) == 403, (
+        f"After the scope row was deleted, the sub-token could still PUT (got HTTP {_http_status(exc.value)}, expected 403) — revoking a scope does not take effect, so revoked tokens keep their access."
+    )
 
 
 def test_admin_read_allows_list_buckets(
@@ -355,7 +377,9 @@ def test_admin_read_allows_list_buckets(
     _install_scope(scope_http_client, access_key_id, hippius_master_account_ss58, "admin_read", "all", [])
 
     listing = sub_token_s3_client.list_buckets()
-    assert listing["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert listing["ResponseMetadata"]["HTTPStatusCode"] == 200, (
+        f"An admin_read sub-token was denied ListBuckets (got HTTP {listing['ResponseMetadata']['HTTPStatusCode']}, expected 200) — the admin_read tier is not granting account-wide bucket listing."
+    )
 
 
 def test_object_read_denies_list_buckets(
@@ -372,7 +396,9 @@ def test_object_read_denies_list_buckets(
 
     with pytest.raises(ClientError) as exc:
         sub_token_s3_client.list_buckets()
-    assert _http_status(exc.value) == 403
+    assert _http_status(exc.value) == 403, (
+        f"An object_read (object-tier) sub-token was allowed to ListBuckets (got HTTP {_http_status(exc.value)}, expected 403) — object-scoped tokens must not see the account's bucket list."
+    )
 
 
 def test_object_read_write_can_bulk_delete(
@@ -402,8 +428,12 @@ def test_object_read_write_can_bulk_delete(
         Bucket=bucket_a,
         Delete={"Objects": [{"Key": "bulk-1.bin"}, {"Key": "bulk-2.bin"}]},
     )
-    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
-    assert len(resp.get("Deleted", [])) == 2
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200, (
+        f"An object_read_write sub-token was denied bulk DeleteObjects (got HTTP {resp['ResponseMetadata']['HTTPStatusCode']}, expected 200) — POST /bucket?delete is mis-mapped to a bucket-meta permission instead of delete_object (resolver regression)."
+    )
+    assert len(resp.get("Deleted", [])) == 2, (
+        f"Bulk DeleteObjects reported {len(resp.get('Deleted', []))} deletions, expected 2 — not all objects in the batch were actually deleted."
+    )
 
 
 def test_copy_object_source_bucket_must_be_in_scope(
@@ -434,7 +464,9 @@ def test_copy_object_source_bucket_must_be_in_scope(
         sub_token_s3_client.copy_object(
             Bucket=bucket_b, Key="leaked.txt", CopySource={"Bucket": bucket_a, "Key": "secret.txt"}
         )
-    assert _http_status(exc.value) == 403
+    assert _http_status(exc.value) == 403, (
+        f"A sub-token scoped only to bucket B was able to CopyObject with a source in bucket A (got HTTP {_http_status(exc.value)}, expected 403) — CopyObject is not enforcing scope on the source bucket, so copy is a back-door to read out-of-scope buckets."
+    )
 
     # When scope covers BOTH buckets, the copy succeeds.
     _install_scope(
@@ -448,4 +480,6 @@ def test_copy_object_source_bucket_must_be_in_scope(
     resp = sub_token_s3_client.copy_object(
         Bucket=bucket_b, Key="legit.txt", CopySource={"Bucket": bucket_a, "Key": "secret.txt"}
     )
-    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200, (
+        f"A sub-token scoped to BOTH buckets was denied a cross-bucket CopyObject (got HTTP {resp['ResponseMetadata']['HTTPStatusCode']}, expected 200) — copy is over-restricting even when both source and destination are in scope."
+    )

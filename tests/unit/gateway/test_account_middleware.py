@@ -55,68 +55,8 @@ def account_app_bypass(mock_config_bypass: Any, monkeypatch: Any) -> Any:
 
 
 @pytest.mark.asyncio
-async def test_bypass_mode_derives_unique_id_from_seed_phrase(mock_config_bypass: Any, monkeypatch: Any) -> None:
-    """Test that bypass mode derives unique account IDs from different seed phrases."""
-    from gateway.middlewares.account import account_middleware
-
-    monkeypatch.setattr("gateway.middlewares.account.config", mock_config_bypass)
-
-    seed_phrase_a = "about acid actor absent action able actual abandon abstract above ability achieve"
-    seed_phrase_b = "dream letter onion wreck return glove canal easy letter render wear bright"
-
-    expected_id_a = hashlib.sha256(seed_phrase_a.encode()).digest().hex()
-    expected_id_b = hashlib.sha256(seed_phrase_b.encode()).digest().hex()
-
-    # Test with seed phrase A
-    app_a = FastAPI()
-
-    @app_a.get("/test")
-    async def test_endpoint(request: Request) -> dict[str, Any]:
-        account_id = request.state.account_id
-        return {"account_id": account_id}
-
-    # Inject seed phrase A before account middleware
-    async def inject_seed_a(request: Request, call_next: Any) -> Any:
-        request.state.seed_phrase = seed_phrase_a
-        return await call_next(request)
-
-    app_a.middleware("http")(account_middleware)
-    app_a.middleware("http")(inject_seed_a)
-
-    async with AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
-        response_a = await client.get("/test")
-
-    assert response_a.status_code == 200
-    assert response_a.json()["account_id"] == expected_id_a
-
-    # Test with seed phrase B
-    app_b = FastAPI()
-
-    @app_b.get("/test")
-    async def test_endpoint_b(request: Request) -> dict[str, Any]:
-        account_id = request.state.account_id
-        return {"account_id": account_id}
-
-    async def inject_seed_b(request: Request, call_next: Any) -> Any:
-        request.state.seed_phrase = seed_phrase_b
-        return await call_next(request)
-
-    app_b.middleware("http")(account_middleware)
-    app_b.middleware("http")(inject_seed_b)
-
-    async with AsyncClient(transport=ASGITransport(app=app_b), base_url="http://test") as client:
-        response_b = await client.get("/test")
-
-    assert response_b.status_code == 200
-    assert response_b.json()["account_id"] == expected_id_b
-
-    # Verify they're different
-    assert expected_id_a != expected_id_b
-
-
-@pytest.mark.asyncio
-async def test_bypass_mode_no_seed_phrase_returns_anonymous(mock_config_bypass: Any, monkeypatch: Any) -> None:
-    """Test that requests without seed phrase get anonymous account ID."""
+async def test_bypass_mode_no_auth_returns_anonymous(mock_config_bypass: Any, monkeypatch: Any) -> None:
+    """Test that requests without authentication get anonymous account ID."""
     from gateway.middlewares.account import account_middleware
 
     monkeypatch.setattr("gateway.middlewares.account.config", mock_config_bypass)
@@ -138,39 +78,6 @@ async def test_bypass_mode_no_seed_phrase_returns_anonymous(mock_config_bypass: 
     data = response.json()
     assert data["account_id"] == "anonymous"
     assert data["account"]["id"] == "anonymous"
-
-
-@pytest.mark.asyncio
-async def test_account_id_format_matches_ss58_pattern(mock_config_bypass: Any, monkeypatch: Any) -> None:
-    """Test that derived account IDs match AWS canonical ID format (64 hex chars)."""
-    from gateway.middlewares.account import account_middleware
-
-    monkeypatch.setattr("gateway.middlewares.account.config", mock_config_bypass)
-
-    seed_phrase = "about acid actor absent action able actual abandon abstract above ability achieve"
-
-    app = FastAPI()
-
-    @app.get("/test")
-    async def test_endpoint(request: Request) -> dict[str, Any]:
-        account_id = request.state.account_id
-        return {"account_id": account_id}
-
-    async def inject_seed(request: Request, call_next: Any) -> Any:
-        request.state.seed_phrase = seed_phrase
-        return await call_next(request)
-
-    app.middleware("http")(account_middleware)
-    app.middleware("http")(inject_seed)
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.get("/test")
-
-    data = response.json()
-    account_id = data["account_id"]
-
-    assert len(account_id) == 64  # Full SHA256 hex
-    assert all(c in "0123456789abcdef" for c in account_id)
 
 
 # ---------------------------------------------------------------------------

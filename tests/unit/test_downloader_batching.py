@@ -40,7 +40,6 @@ def _make_request(num_parts: int, chunks_per_part: int = 2) -> DownloadChainRequ
         object_storage_version=5,
         address="5TestAddr",
         subaccount="5TestAddr",
-        subaccount_seed_phrase="",
         substrate_url="http://test",
         size=num_parts * chunks_per_part * 4 * 1024 * 1024,
         multipart=num_parts > 1,

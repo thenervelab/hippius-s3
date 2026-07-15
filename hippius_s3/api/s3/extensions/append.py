@@ -110,7 +110,6 @@ async def handle_append(
             object_key=object_key,
             expected_version=int(expected_version),
             account_address=request.state.account.main_account,
-            seed_phrase=request.state.seed_phrase,
             body_iter=body_iter,
         )
     except AppendPreconditionFailed as exc:

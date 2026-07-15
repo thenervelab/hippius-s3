@@ -57,7 +57,7 @@ def _make_pool(
 
 
 def _ctx() -> RequestContext:
-    return RequestContext(main_account_id="5HWAJ-test-account", seed_phrase="")
+    return RequestContext(main_account_id="5HWAJ-test-account")
 
 
 def _parse(xml_bytes: bytes) -> ET._Element:
