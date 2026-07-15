@@ -157,6 +157,19 @@ spec:
             # not the common simple-PUT case the poll cut covers.
             - name: CEPHOR_DRAIN_POLL_SECS
               value: "1"
+            # Reconciler scan period (was the 60s code default). The reconciler is the SOLE
+            # drain trigger — a freshly-landed part is invisible until the next scan records its
+            # `pending` row — so this interval, not the 1s drain poll, is the dominant, jittery
+            # replication-sync tail (0–60s at the old default; ~30s avg). 15s cuts it to ~7.5s avg.
+            # Safe to lower: a scan is a walk of the node-local SSD ingest tree (undrained parts
+            # only — drained parts are unlinked; the Ceph pool and the 94M-row parts table are
+            # never walked) + ONE batched UNNEST status read. record_landed writes fire only for
+            # genuinely-new parts (a known part is seen as already_pending and skipped), so a
+            # faster poll adds NO extra write load — just the cheap walk + one read, jittered per
+            # node. The real fix (an api landing fast-path + mtime-incremental scan) collapses
+            # this to ~1s; 15s is the zero-code interim. See drainer-optimisations.md Tier 1.
+            - name: CEPHOR_RECONCILE_POLL_SECS
+              value: "15"
             - name: RUST_LOG
               value: "info"
             # OTLP metrics -> otel-collector -> Prometheus -> Grafana (feature `otel`, on by

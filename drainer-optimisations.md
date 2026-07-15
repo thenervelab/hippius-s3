@@ -130,6 +130,11 @@ copy. So the byte-budget is not the real ceiling; the **commit** is. Levers: rai
 **move `cephor_replication_status` off ceph-backed storage onto fast NVMe** (commits drop from ~seconds to
 ~ms, lifting parts/s by 10–50×).
 
+> **Prod note:** on prod the app DB (`postgres-nvme`) already runs on NVMe, so the commit fsync is ~ms and
+> this bottleneck is **largely a staging-only artifact** (staging's `postgres` is ceph-backed). The
+> concurrency bump still helps prod for large-object overlap, but the "move the status DB off ceph" lever
+> is a staging concern — do not size prod around the ~0.68 parts/s figure, which is the ceph-backed number.
+
 ### Tier 1 — kill the 0–60 s trigger latency (biggest, cheapest win)
 
 1. **Add a landing fast-path so the drain sees a part in ~1 s, not up to 60 s.**
@@ -140,9 +145,16 @@ copy. So the byte-budget is not the real ceiling; the **commit** is. Levers: rai
    reconciler as a **backstop** for any missed signal (crash between write and record). *This is the
    single highest-leverage change.*
 
-2. **Interim, zero-code:** set `CEPHOR_RECONCILE_POLL_SECS` from 60 s → **5–10 s** on staging/prod.
-   Immediate ~6–12× cut to the trigger tail. Caveat: the reconciler walks the whole SSD cache each scan,
-   so at large cache sizes a 5 s full walk is costly — pair with **(3)**.
+2. **Interim, zero-code — APPLIED (this PR, staging): `CEPHOR_RECONCILE_POLL_SECS` 60 s → 15 s.**
+   Cuts the dominant, jittery trigger tail from 0–60 s (~30 s avg) to 0–15 s (~7.5 s avg) — ~4×.
+   Safe because a scan is a walk of the node-local SSD ingest tree (undrained parts only — drained
+   parts are unlinked, and neither the Ceph pool nor the ~94M-row `parts` table is walked) plus ONE
+   batched `UNNEST` status read; `record_landed` writes fire only for genuinely-new parts (a known
+   part is seen as `already_pending` and skipped), so a faster poll adds **no** extra write load —
+   just the cheap walk + one read, jittered per node. 15 s (not the 5–10 s first floated) is the
+   deliberately-conservative first step on shared staging; it can go lower once **(3)** lands. Caveat:
+   the walk is O(parts-on-SSD), so under a very large undrained backlog a sub-scan-interval walk gets
+   costly — the reason to pair a further cut with the mtime-incremental scan below.
 
 3. **Make the reconciler scan incremental / mtime-indexed** instead of a full-tree walk: only descend
    into part dirs whose `meta.json` mtime is newer than the last scan cursor. This decouples scan
