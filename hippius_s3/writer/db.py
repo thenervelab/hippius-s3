@@ -30,7 +30,9 @@ async def retry_on_object_version_conflict(reserve: Callable[[], Awaitable[Any]]
         try:
             return await reserve()
         except asyncpg.exceptions.UniqueViolationError as exc:
-            if exc.constraint_name != OBJECT_VERSION_PK_CONSTRAINT or attempt == attempts - 1:
+            # asyncpg populates constraint_name dynamically from the error fields (not in the type
+            # stubs), so read it defensively — a missing/other constraint is not our race.
+            if getattr(exc, "constraint_name", None) != OBJECT_VERSION_PK_CONSTRAINT or attempt == attempts - 1:
                 raise
     raise RuntimeError("retry_on_object_version_conflict exhausted without returning")
 
