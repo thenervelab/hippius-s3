@@ -25,6 +25,7 @@ from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import ensure_upload_row
+from hippius_s3.writer.db import retry_on_object_version_conflict
 from hippius_s3.writer.db import upsert_object_basic
 from hippius_s3.writer.types import AppendPreconditionFailed
 from hippius_s3.writer.types import CompleteResult
@@ -194,7 +195,6 @@ class ObjectWriter:
         resolved_storage_version = require_supported_storage_version(resolved_storage_version)
         suite_id: str | None = None
         kek_id = None
-        wrapped_dek = None
 
         part_number = 1
 
@@ -229,62 +229,60 @@ class ObjectWriter:
             # closes the concurrent PUT-vs-PUT race, but the MAX() floor is snapshot-stale under
             # READ COMMITTED, so a concurrent create_migration_version (which inserts a version
             # WITHOUT bumping current_object_version) can still hand us a colliding version and
-            # raise object_versions_pkey. Retry on that specific violation: a fresh transaction
-            # re-reads the committed MAX and resolves it. Bounded — a persistent collision is a
-            # real error and must surface.
-            for reserve_attempt in range(3):
-                try:
-                    async with (
-                        acquire_with_timeout(self.pool, self.config.db_pool_acquire_timeout) as conn,
-                        conn.transaction(),
-                    ):
-                        reserve_row = await upsert_object_basic(
-                            conn,
-                            object_id=candidate_object_id,
-                            bucket_id=bucket_id,
-                            object_key=object_key,
-                            content_type=content_type,
-                            metadata=metadata,
-                            md5_hash="",
-                            size_bytes=0,
-                            storage_version=resolved_storage_version,
-                            upload_backends=self.config.upload_backends,
-                        )
-                        # IMPORTANT: `object_id` is authoritative from DB. Under concurrent creates,
-                        # our candidate UUID may conflict with an existing (bucket_id, object_key).
-                        # We must use the DB-returned object_id for cache keys, crypto binding, and enqueue.
-                        if reserve_row and reserve_row.get("object_id") is None:
-                            raise RuntimeError("reserve_version_missing_object_id")
-                        object_id = (
-                            str(reserve_row.get("object_id") or candidate_object_id)
-                            if reserve_row
-                            else str(candidate_object_id)
-                        )
-                        object_version = int(reserve_row.get("current_object_version") or 1) if reserve_row else 1
+            # raise object_versions_pkey. retry_on_object_version_conflict re-runs this reserve in a
+            # fresh transaction — a fresh snapshot re-reads the committed MAX and resolves it.
+            # Bounded — a persistent collision is a real error and must surface.
+            async def _reserve_version() -> tuple[str, int]:
+                async with (
+                    acquire_with_timeout(self.pool, self.config.db_pool_acquire_timeout) as conn,
+                    conn.transaction(),
+                ):
+                    reserve_row = await upsert_object_basic(
+                        conn,
+                        object_id=candidate_object_id,
+                        bucket_id=bucket_id,
+                        object_key=object_key,
+                        content_type=content_type,
+                        metadata=metadata,
+                        md5_hash="",
+                        size_bytes=0,
+                        storage_version=resolved_storage_version,
+                        upload_backends=self.config.upload_backends,
+                    )
+                    # IMPORTANT: `object_id` is authoritative from DB. Under concurrent creates,
+                    # our candidate UUID may conflict with an existing (bucket_id, object_key).
+                    # We must use the DB-returned object_id for cache keys, crypto binding, and enqueue.
+                    if reserve_row and reserve_row.get("object_id") is None:
+                        raise RuntimeError("reserve_version_missing_object_id")
+                    resolved_object_id = (
+                        str(reserve_row.get("object_id") or candidate_object_id)
+                        if reserve_row
+                        else str(candidate_object_id)
+                    )
+                    resolved_version = int(reserve_row.get("current_object_version") or 1) if reserve_row else 1
 
-                        aad = f"hippius-dek:{bucket_id}:{object_id}:{int(object_version)}".encode("utf-8")
-                        wrapped_dek = wrap_dek(kek=kek_bytes, dek=dek, aad=aad)
-                        await conn.execute(
-                            """
-                            UPDATE object_versions
-                               SET encryption_version = 5,
-                                   enc_suite_id = $1,
-                                   enc_chunk_size_bytes = $2,
-                                   kek_id = $3,
-                                   wrapped_dek = $4
-                             WHERE object_id = $5 AND object_version = $6
-                            """,
-                            str(suite_id),
-                            int(chunk_size),
-                            kek_id,
-                            wrapped_dek,
-                            object_id,
-                            int(object_version),
-                        )
-                    break
-                except asyncpg.exceptions.UniqueViolationError:
-                    if reserve_attempt == 2:
-                        raise
+                    aad = f"hippius-dek:{bucket_id}:{resolved_object_id}:{int(resolved_version)}".encode("utf-8")
+                    wrapped_dek = wrap_dek(kek=kek_bytes, dek=dek, aad=aad)
+                    await conn.execute(
+                        """
+                        UPDATE object_versions
+                           SET encryption_version = 5,
+                               enc_suite_id = $1,
+                               enc_chunk_size_bytes = $2,
+                               kek_id = $3,
+                               wrapped_dek = $4
+                         WHERE object_id = $5 AND object_version = $6
+                        """,
+                        str(suite_id),
+                        int(chunk_size),
+                        kek_id,
+                        wrapped_dek,
+                        resolved_object_id,
+                        int(resolved_version),
+                    )
+                    return resolved_object_id, resolved_version
+
+            object_id, object_version = await retry_on_object_version_conflict(_reserve_version)
 
         hasher = hashlib.md5()
         total_size = 0

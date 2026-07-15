@@ -15,6 +15,7 @@ from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import ensure_upload_row
+from hippius_s3.writer.db import retry_on_object_version_conflict
 from hippius_s3.writer.db import upsert_object_basic
 
 
@@ -90,17 +91,21 @@ async def create_destination_objects(
 ) -> int:
     src_storage_version = require_supported_storage_version(int(src_obj_row.get("storage_version")))
 
-    row = await upsert_object_basic(
-        db,
-        object_id=object_id,
-        bucket_id=str(dest_bucket["bucket_id"]),
-        object_key=object_key,
-        content_type=content_type,
-        metadata=metadata,
-        md5_hash=md5_hash,
-        size_bytes=size_bytes,
-        storage_version=src_storage_version,
-        upload_backends=config.upload_backends,
+    # Version allocation can collide with a concurrent create_migration_version on
+    # object_versions_pkey; retry re-reads the committed MAX in a fresh autocommit statement.
+    row = await retry_on_object_version_conflict(
+        lambda: upsert_object_basic(
+            db,
+            object_id=object_id,
+            bucket_id=str(dest_bucket["bucket_id"]),
+            object_key=object_key,
+            content_type=content_type,
+            metadata=metadata,
+            md5_hash=md5_hash,
+            size_bytes=size_bytes,
+            storage_version=src_storage_version,
+            upload_backends=config.upload_backends,
+        )
     )
     dest_object_version = int(row.get("current_object_version") or 1) if row else 1
 

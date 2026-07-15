@@ -34,6 +34,7 @@ from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
+from hippius_s3.writer.db import retry_on_object_version_conflict
 from hippius_s3.writer.object_writer import ObjectWriter
 from hippius_s3.xml_helpers import add_subelement
 from hippius_s3.xml_helpers import create_element
@@ -261,19 +262,23 @@ async def initiate_multipart_upload(
                 status_code=400,
             )
 
-        # Create initial objects row for this multipart upload
-        upsert_result = await db.fetchrow(
-            get_query("upsert_object_multipart"),
-            object_id,
-            bucket["bucket_id"],
-            object_key,
-            content_type,
-            json.dumps(metadata),
-            "",  # initial md5_hash (will be updated on completion)
-            0,  # initial size_bytes (will be updated on completion)
-            initiated_at,  # created_at
-            config.target_storage_version,
-            config.upload_backends,
+        # Create initial objects row for this multipart upload. The version allocation can collide
+        # with a concurrent create_migration_version on object_versions_pkey; retry re-reads the
+        # committed MAX in a fresh autocommit statement (see writer/db.py).
+        upsert_result = await retry_on_object_version_conflict(
+            lambda: db.fetchrow(
+                get_query("upsert_object_multipart"),
+                object_id,
+                bucket["bucket_id"],
+                object_key,
+                content_type,
+                json.dumps(metadata),
+                "",  # initial md5_hash (will be updated on completion)
+                0,  # initial size_bytes (will be updated on completion)
+                initiated_at,  # created_at
+                config.target_storage_version,
+                config.upload_backends,
+            )
         )
 
         # Use the returned object_id (will be existing one if conflict occurred)
