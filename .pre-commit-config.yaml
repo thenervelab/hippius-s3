@@ -46,9 +46,16 @@ repos:
       # Audit the project venv (which we control via uv.lock) — NOT pip-audit's
       # own tool env (which we don't). The `uv run` invocation ensures the
       # audited interpreter is `.venv/bin/python`.
+      #
+      # CVE-2024-23342 (Minerva timing attack on P-256 in python-ecdsa) has no
+      # fixed release — the maintainers consider side-channel resistance out of
+      # scope for the pure-Python implementation. ecdsa is a transitive dep of
+      # substrate-interface (Hippius chain), so we cannot drop it; we do not use
+      # it for local ECDSA signing over attacker-controlled timing, so we accept
+      # and pin-ignore this single advisory.
       - id: pip-audit
         name: pip-audit (dependency scan)
-        entry: uv run --extra dev pip-audit
+        entry: uv run --extra dev pip-audit --ignore-vuln CVE-2024-23342
         language: system
         stages: [pre-commit]
         pass_filenames: false
