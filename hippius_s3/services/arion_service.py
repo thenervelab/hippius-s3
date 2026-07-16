@@ -136,6 +136,27 @@ class DeleteSuccessResponse(BaseModel):
     Success: DeleteResult
 
 
+class BatchDeleteItem(BaseModel):
+    file_id: str
+    status: str  # "deleted" | "already_deleted"
+
+
+class BatchDeleteError(BaseModel):
+    file_id: str
+    code: str
+    message: str | None = None
+
+
+class BatchDeleteResult(BaseModel):
+    deleted: list[BatchDeleteItem] = []
+    errors: list[BatchDeleteError] = []
+    files_deleted: int = 0
+
+
+class BatchDeleteResponse(BaseModel):
+    Success: BatchDeleteResult
+
+
 class DownloadMetadata(BaseModel):
     file_id: str
     user_id: str
@@ -152,6 +173,16 @@ class HippiusAPIError(Exception):
 
 class HippiusAuthenticationError(HippiusAPIError):
     """Raised when there's an authentication issue with the API."""
+
+    pass
+
+
+# NOT a HippiusAPIError subclass on purpose: retry_on_error retries HippiusAPIError, but a 404 on
+# the batch endpoint means "old HCFS server without POST /delete_files" — the caller must fall back
+# to per-file DELETE immediately, not burn the retry budget. As a plain Exception it hits
+# retry_on_error's `except Exception: raise` and propagates on the first call.
+class BatchEndpointUnavailable(Exception):
+    """POST /delete_files returned 404 — the batch endpoint is not deployed on this HCFS server."""
 
     pass
 
@@ -330,6 +361,57 @@ class ArionClient:
         response_json = response.json()
 
         return DeleteSuccessResponse.model_validate(response_json)
+
+    @retry_on_error(retries=3, backoff=5.0)
+    async def unpin_files_batch(
+        self,
+        file_ids: list[str],
+        account_ss58: str,
+        folder_hash: str = "",
+    ) -> BatchDeleteResult:
+        """
+        Batch-delete up to 1000 files in one call (HCFS endpoint).
+
+        Maps to: POST /delete_files
+
+        Args:
+            file_ids: File identifiers (64-char hex path hashes), max 1000 per call.
+            account_ss58: Account SS58 address.
+            folder_hash: Folder the files live under. Our S3 objects are uploaded to HCFS with NO
+                folder, so this is "" (root) by default. MERGE-BLOCKER: HCFS must confirm
+                /delete_files accepts an empty folder_hash for root-folder objects before enabling
+                this in prod (see docs/issues/unpinner-batch-delete.md).
+
+        Returns:
+            BatchDeleteResult: per-item deleted/errors plus files_deleted count (HTTP 200 even on
+                partial failure).
+
+        Raises:
+            BatchEndpointUnavailable: the endpoint 404'd (old server) — caller falls back to per-file.
+            HippiusAPIError / httpx errors: whole-request failure (auth/500/network) after retries.
+        """
+        if len(file_ids) > 1000:
+            raise ValueError(f"unpin_files_batch called with {len(file_ids)} file_ids; HCFS caps at 1000 per call")
+
+        headers = self._get_headers(account_ss58)
+        body = {
+            "ss58_address": account_ss58,
+            "folder_hash": folder_hash,
+            "file_ids": file_ids,
+            "quiet": False,
+        }
+        response = await self._client.post(
+            "/delete_files",
+            json=body,
+            headers=headers,
+        )
+        logger.info(f"Batch delete response status {response.status_code} for {len(file_ids)} file_ids")
+        # Detect the missing endpoint BEFORE raise_for_status so the caller can fall back to per-file.
+        if response.status_code == 404:
+            raise BatchEndpointUnavailable("POST /delete_files returned 404 (batch endpoint not deployed)")
+        response.raise_for_status()
+
+        return BatchDeleteResponse.model_validate(response.json()).Success
 
     async def download_file(
         self,
