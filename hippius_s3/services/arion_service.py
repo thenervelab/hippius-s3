@@ -378,9 +378,9 @@ class ArionClient:
             file_ids: File identifiers (64-char hex path hashes), max 1000 per call.
             account_ss58: Account SS58 address.
             folder_hash: Folder the files live under. Our S3 objects are uploaded to HCFS with NO
-                folder, so this is "" (root) by default. MERGE-BLOCKER: HCFS must confirm
-                /delete_files accepts an empty folder_hash for root-folder objects before enabling
-                this in prod (see docs/issues/unpinner-batch-delete.md).
+                folder, so this is "" (root) by default. Confirmed by HCFS (2026-07-16):
+                /delete_files accepts an empty folder_hash for our root-folder objects, matching the
+                single-delete behavior (see docs/issues/unpinner-batch-delete.md).
 
         Returns:
             BatchDeleteResult: per-item deleted/errors plus files_deleted count (HTTP 200 even on

@@ -33,20 +33,22 @@ transparent per-file fallback so an old HCFS server (or a disabled flag) behaves
     `401` (auth), `500` (DB).
   - The endpoint may `404` on an old server → the client must fall back to per-file.
 
-## Open question / MERGE-BLOCKER: `folder_hash`
+## `folder_hash` — resolved (HCFS confirmed empty is accepted)
 
 Our S3 objects are uploaded to HCFS with **no folder** (`POST /upload` sends only `account_ss58`),
-and the current single-delete response returns `folder_hash: ""` (empty/root). We have **no
-per-file folder_hash** in our schema. So:
+and the current single-delete response returns `folder_hash: ""` (empty/root) — verified live in
+prod (5,310/5,310 single-delete responses in a 2-min sample returned `folder_hash: ""`). We have
+**no per-file folder_hash** in our schema. So:
 
 - `folder_hash` defaults to `""` (empty = root), configurable via `HIPPIUS_ARION_FOLDER_HASH`.
 - Batches are grouped by `(ss58, folder_hash)`; since `folder_hash` is a single config value it is
   effectively constant, so in practice all of one account's requests coalesce into one group.
 
-**Before enabling in prod, HCFS MUST confirm `POST /delete_files` accepts an empty `folder_hash`
-for our root-folder objects.** We deliberately do NOT invent a fake folder_hash. This is called out
-in code (`ArionClient.unpin_files_batch` docstring, config comment) and is the gate on the rollout
-plan below.
+**Resolved 2026-07-16:** HCFS (georgios_delkos) confirmed we can pass `folder_hash: ""` to
+`POST /delete_files`, matching what our single-delete already does. So sending `""` is the correct,
+confirmed behavior — no schema change and no folder derivation needed on our side. (Nice-to-have on
+HCFS's side, not blocking us: make `folder_hash` optional / server-derived per file, since their
+single-delete already resolves it.)
 
 ## Design: batch-of-requests
 
