@@ -106,24 +106,21 @@ Anchors to touch: [gateway/services/forward_service.py](gateway/services/forward
    CHECK (storage_version < 5 OR (kek_id IS NOT NULL AND wrapped_dek IS NOT NULL))
    ```
 
-### P1 — Double FS writes on every upload
+### RESOLVED — Double FS writes on every upload
 
-**What**: The upload path writes every chunk to FS twice.
+**Was**: the upload path was believed to write every chunk to FS twice — once directly via
+`fs_store.set_chunk` and again via an `obj_cache.set_chunks` mirror.
 
-- Path A: `put_simple_stream_full` consumer loop at [hippius_s3/writer/object_writer.py:308-333](hippius_s3/writer/object_writer.py) — calls `fs_store.set_chunk` directly (fatal).
-- Path B: the same method batches chunks and flushes via `obj_cache.set_chunks` at [hippius_s3/writer/object_writer.py:285-306](hippius_s3/writer/object_writer.py) — which then loops and calls `fs.set_chunk` again internally at [hippius_s3/cache/object_parts.py:159-160](hippius_s3/cache/object_parts.py).
+**Status (2026-07-17)**: fixed. The second write is gone — `put_simple_stream_full` and
+`mpu_upload_part_stream` write each chunk exactly once (guarded by
+`tests/unit/test_put_simple_stream_full.py`), and `RedisObjectPartsCache.set_chunks` had zero
+production callers and has been deleted. `WriteThroughPartsWriter.write_chunks` writes via
+`fs_store.set_chunk` only.
 
-Same pattern in [hippius_s3/writer/write_through_writer.py:83-108](hippius_s3/writer/write_through_writer.py): FS write first (fatal), then `redis_cache.set_chunks` — which is also now an FS write loop.
-
-**Why it's safe today**: chunk content is deterministic per `(object_id, version, part, chunk_index)` and writes are atomic-rename. Second write is a no-op at the byte level and can't corrupt.
-
-**Why it matters**: every upload doubles its FS I/O. For large-object PUTs this is measurable. The name `WriteThroughPartsWriter` is now misleading — the Redis layer is dead. The "best-effort" Redis flush *is* the second FS write, just with more log noise.
-
-**Proposed**:
-1. Drop the `obj_cache.set_chunks` call and the `_flush_redis_batch` helper from `put_simple_stream_full` ([object_writer.py:285-306](hippius_s3/writer/object_writer.py)). Same for `mpu_upload_part_stream` (same pattern later in the file).
-2. In `WriteThroughPartsWriter.write_chunks` ([write_through_writer.py:99-108](hippius_s3/writer/write_through_writer.py)), remove the `redis_cache.set_chunks` block.
-3. Consider renaming the class to `FSPartsWriter`. Keep the constructor signature for compat.
-4. Benchmark large-object PUTs before and after. Expect a measurable IOPS reduction on NVMe.
+**Follow-up (minor cleanup)**: `WriteThroughPartsWriter.__init__` still accepts a `redis_cache`
+param that is stored but never read (`hippius_s3/writer/write_through_writer.py:17-26`). Drop it and
+the `ExplodingCache` arg in `tests/unit/test_write_through_writer.py` in a dedicated cleanup;
+consider renaming the class to `FSPartsWriter`.
 
 ### P1 — Meta.json rewrites on concurrent upload + download
 
@@ -219,7 +216,7 @@ Two concurrent PUTs to the same (bucket, key) today both fetch the existing obje
 - **Readiness**: `get_chunk` returns None unless `meta.json` exists AND the chunk file exists ([fs_store.py:168-173](hippius_s3/cache/fs_store.py)). Eager meta from the downloader ([workers/downloader.py:49-91](hippius_s3/workers/downloader.py)) enables per-chunk visibility during partial fills.
 - **Hot retention**: every successful read calls `os.utime` on the chunk and the meta ([fs_store.py:183-186](hippius_s3/cache/fs_store.py)). Janitor's hot-retention check reads those mtimes.
 - **Coordination**: `ChunkNotifier` ([hippius_s3/cache/notifier.py](hippius_s3/cache/notifier.py)) publishes `notify:{chunk_key}` on `redis-queues` when a downloader lands a chunk. Streamers subscribe + re-check on each notification. Fast-path (FS hit) bypasses pub/sub entirely.
-- **Coalescing**: `build_stream_context` ([hippius_s3/services/object_reader.py:77-104](hippius_s3/services/object_reader.py)) uses `SET NX EX 120` on `download_in_progress:{object_id}:v:{ov}:part:{pn}` so N simultaneous readers of a cold object only cause one backend fetch. Lock is released by the downloader when the part lands ([workers/downloader.py:286-292](hippius_s3/workers/downloader.py)). TTL covers crashed-downloader case.
+- **Coalescing**: `build_stream_context` ([hippius_s3/services/object_reader.py:77-104](hippius_s3/services/object_reader.py)) uses `SET NX EX <DOWNLOAD_COALESCE_LOCK_TTL>` (default 600) on `download_in_progress:{object_id}:v:{ov}:part:{pn}` so N simultaneous readers of a cold object only cause one backend fetch. Lock is released by the downloader when the part lands ([workers/downloader.py:286-292](hippius_s3/workers/downloader.py)). TTL covers crashed-downloader case.
 
 ### 3.2 How the janitor works today (high level)
 
@@ -235,7 +232,7 @@ Two concurrent PUTs to the same (bucket, key) today both fetch the existing obje
 
 - **Range-aware backend fetch.** Client requests bytes 100–200 of a 1 GiB object. Planner picks one chunk; downloader fetches the **whole 4 MiB chunk** from Arion. For small Range reads this burns 4 MiB of backend bandwidth per 100 B of user data. Idea: add `BackendClient.download_range(identifier, offset, length)` and have the downloader use it when the plan specifies a single-chunk slice smaller than, say, 64 KiB. Risk: chunks are ciphertext and the streamer expects full ciphertext for AEAD verification — **this doesn't work** unless we also shift to per-sub-chunk nonces or accept that range-fetched bytes are verified during re-download. Start with a design doc before writing code.
 - **Stream-through for one-shot Range.** For Range reads tagged with `x-hippius-no-cache`, fetch Arion → decrypt → stream → do NOT persist to FS. Trades cold-re-read latency for NVMe preservation on rarely-revisited data.
-- **Lookahead prefetch.** `stream_plan` prefetches in-flight up to `prefetch_chunks` but the default is 0 for correctness ([reader/streamer.py:31-33](hippius_s3/reader/streamer.py)). For large sequential GETs, turning prefetch on (say, 4) would overlap Arion fetch with decrypt+IO. Verify the semantics — the scheduler at [streamer.py:82-88](hippius_s3/reader/streamer.py) requires care around exception propagation.
+- **Lookahead prefetch.** `stream_plan` prefetches in-flight up to `prefetch_chunks`. The streamer function-parameter fallback is 0, but the wired runtime default is **16** (`HTTP_STREAM_PREFETCH_CHUNKS`, [config.py:296](hippius_s3/config.py)) — so prod already runs the pipelined branch ([streamer.py:82-88](hippius_s3/reader/streamer.py)). Note (RD-2): prefetch currently overlaps only the FS/Arion fetch, not the on-loop decrypt, so deep prefetch mostly buffers memory until decrypt is offloaded.
 - **Keep-alive to Arion.** Confirm `arion_service.py` uses a shared `httpx.AsyncClient` per worker pod, not one-per-request. TCP setup dominates small-object latency per the postmortem (100 B PUT = 256 KB PUT ≈ 1.3 s). If already shared, good; otherwise that's a one-line fix.
 - **Regional cache.** [deploy-cache-production](.github/workflows/deploy.yaml) is disabled (`if: false` at line 373). Re-enabling would put a FS-cache-backed gateway/API/downloader stack in `us-0`/`eu-0`, cutting cold-read latency for geographically distributed clients. Blocker: NVMe PVC provisioning per region + deciding how cross-region invalidation works (probably: it doesn't; each region is an independent cache).
 

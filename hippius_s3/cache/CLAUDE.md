@@ -60,7 +60,6 @@ Every successful read calls `os.utime` on the chunk file AND the meta file ([fs_
 Key methods:
 
 - `get_chunk` / `set_chunk` / `chunks_exist_batch` → delegate to `self._fs`.
-- `set_chunks(..., start_index=N)` loops `set_chunk` ([object_parts.py:148-160](object_parts.py)). **This is the second FS write on upload** — see [todo.md](../../todo.md) P1.
 - `get_meta` / `set_meta` → delegate to `self._fs`.
 - `get(...)` / `set(...)` — whole-part legacy API, assembled from chunks ([object_parts.py:190-245](object_parts.py)).
 - `expire(...)` → `fs.touch_part` (was Redis TTL extension before the migration).
