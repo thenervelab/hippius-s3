@@ -265,12 +265,19 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes terminal (`replicated`/`failed`) replication rows older than `retention`,
-    /// returning how many were removed. Terminal rows are inert — nothing returns one to a
-    /// live state (`release_part`/`defer_part` are guarded on `status='draining'`) — so
-    /// aged ones are pure debris that bloat the hot `claim_part` / reconcile scans. NEVER
-    /// touches `pending`/`draining` (live) rows. Idempotent and safe to run concurrently:
-    /// a row deleted by one sweep simply is not matched by another.
+    /// Deletes terminal replication rows older than `retention`, returning how many were
+    /// removed. Terminal rows are inert — nothing returns one to a live state
+    /// (`release_part`/`defer_part` are guarded on `status='draining'`) — so aged ones are
+    /// pure debris that bloat the hot `claim_part` / reconcile scans. NEVER touches
+    /// `pending`/`draining` (live) rows. Idempotent and safe to run concurrently: a row
+    /// deleted by one sweep simply is not matched by another.
+    ///
+    /// "Terminal" here is `failed` OR a `replicated` row whose backend upload has ALREADY
+    /// been enqueued (`upload_enqueued_at IS NOT NULL`). A `replicated` row still awaiting its
+    /// enqueue (`upload_enqueued_at IS NULL` — an in-flight MPU part committed to Ceph but not
+    /// yet published) is the enqueue sweep's worklist, so deleting it would DROP the backend
+    /// upload; it is spared until the sweep stamps it (or the reaper flips it `failed` as an
+    /// abandoned orphan, which this then GCs).
     ///
     /// # Errors
     ///
@@ -278,7 +285,8 @@ impl Store {
     pub async fn gc_terminal_status_rows(&self, retention: Duration) -> Result<u64> {
         let affected = sqlx::query(
             "DELETE FROM cephor_replication_status \
-             WHERE status IN ('replicated', 'failed') AND updated_at < now() - (interval '1 second' * $1)",
+             WHERE (status = 'failed' OR (status = 'replicated' AND upload_enqueued_at IS NOT NULL)) \
+               AND updated_at < now() - (interval '1 second' * $1)",
         )
         .bind(retention.as_secs_f64())
         .execute(&self.pool)
@@ -572,6 +580,31 @@ impl Store {
         rows.into_iter().map(PartRow::into_pending).collect()
     }
 
+    /// The enqueue sweep's worklist: up to `limit` of THIS node's `replicated` parts whose
+    /// backend upload has not yet been published (`upload_enqueued_at IS NULL`), oldest-
+    /// committed first. These are parts drained to the pool before their object's address was
+    /// finalized (an in-flight MPU) — the sweep re-attempts `enqueue` for each and, on success,
+    /// stamps [`mark_upload_enqueued`](PartReplicationStore::mark_upload_enqueued). Node-scoped
+    /// like `claim_part` (a part's upload identity is loaded via `load_upload_context`, but the
+    /// worklist is this node's own committed parts). Uses the `cephor_replication_unenqueued_idx`
+    /// partial index, so the scan is proportional to the small outstanding set.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`]; [`StoreError::Invalid`] if a stored part is malformed.
+    pub async fn list_replicated_unenqueued_parts(&self, limit: u32) -> Result<Vec<PartKey>> {
+        let rows = sqlx::query_as::<_, PartRow>(
+            "SELECT object_id, version, part_number FROM cephor_replication_status \
+             WHERE node_id = $1 AND status = 'replicated' AND upload_enqueued_at IS NULL \
+             ORDER BY updated_at LIMIT $2",
+        )
+        .bind(self.node_id.as_deref())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(PartRow::into_part).collect()
+    }
+
     /// Loads the non-derivable fields the agent needs to build a part's backend
     /// `UploadChainRequest` (s3-2.1 PR-11, drain-direct enqueue): `bucket_name`,
     /// `object_key`, the main-account `address`, and the latest `upload_id` (MPU only).
@@ -700,6 +733,24 @@ impl PartReplicationStore for Store {
                 part: part.relative_dir().to_string_lossy().into_owned().into(),
             });
         }
+        Ok(())
+    }
+
+    async fn mark_upload_enqueued(&self, part: &PartKey) -> Result<()> {
+        // Stamp the backend-enqueue completion. Guarded on `status = 'replicated'` (never a
+        // claim, since the enqueue sweep holds none): only a Ceph-durable part can have its
+        // upload published. Idempotent — a re-stamp (inline enqueue racing the sweep, or a
+        // re-drive) just re-writes now(). Zero rows (the part left `replicated`, e.g. a reaper
+        // flipped it `failed`) is a harmless no-op: there is nothing to publish for it anymore.
+        sqlx::query(
+            "UPDATE cephor_replication_status SET upload_enqueued_at = now() \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'replicated'",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -1167,36 +1218,56 @@ mod part_tests {
     /// reclaim age reads deterministically older than any plausible grace.
     #[sqlx::test]
     async fn gc_terminal_status_rows_prunes_only_aged_terminal_rows(pool: PgPool) {
-        // WI-17: prune aged replicated/failed rows; keep a FRESH terminal row and any
-        // pending/draining (live) row regardless of age.
+        // WI-17 + Tier-2: prune aged `failed` rows and aged `replicated` rows whose backend
+        // upload was ALREADY enqueued (upload_enqueued_at set). Keep: a FRESH terminal row, any
+        // pending/draining (live) row, AND — the Tier-2 guard — an aged `replicated` row still
+        // awaiting its enqueue (upload_enqueued_at NULL), the enqueue sweep's worklist: pruning
+        // it would drop the backend upload.
         let store = Store::from_pool(pool.clone());
-        let fresh = part(UUID_A, 5, 1);
-        let old_replicated = part(UUID_A, 5, 2);
-        let old_failed = part(UUID_A, 5, 3);
-        let pending = part(UUID_A, 5, 4);
-        for p in [&fresh, &old_replicated, &old_failed, &pending] {
+        let fresh = part(UUID_A, 5, 1); // replicated + enqueued, young -> kept (age gate)
+        let old_replicated_enqueued = part(UUID_A, 5, 2); // aged + enqueued -> pruned
+        let old_replicated_unenqueued = part(UUID_A, 5, 5); // aged, NOT enqueued -> spared (worklist)
+        let old_failed = part(UUID_A, 5, 3); // aged failed -> pruned
+        let pending = part(UUID_A, 5, 4); // live -> kept
+        for p in [&fresh, &old_replicated_enqueued, &old_replicated_unenqueued, &old_failed, &pending] {
             store.record_landed_part(p).await.unwrap();
         }
-        // Fresh: replicated but updated_at ~now, so it is younger than the retention.
-        sqlx::query("UPDATE cephor_replication_status SET status = 'replicated' WHERE object_id = $1 AND version = $2 AND part_number = $3")
-            .bind(fresh.object().as_str())
-            .bind(i64::from(fresh.version().get()))
-            .bind(i64::from(fresh.part().get()))
-            .execute(&pool)
-            .await
-            .unwrap();
-        force_terminal(&pool, &old_replicated, "replicated").await; // backdated 2h
+        // Fresh: replicated + enqueued but updated_at ~now, so it is younger than the retention —
+        // isolating the age gate from the enqueue guard.
+        sqlx::query(
+            "UPDATE cephor_replication_status SET status = 'replicated', upload_enqueued_at = now() \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(fresh.object().as_str())
+        .bind(i64::from(fresh.version().get()))
+        .bind(i64::from(fresh.part().get()))
+        .execute(&pool)
+        .await
+        .unwrap();
+        force_terminal(&pool, &old_replicated_enqueued, "replicated").await; // backdated 2h
+        // mark_upload_enqueued leaves updated_at untouched, so the row stays aged AND enqueued.
+        store.mark_upload_enqueued(&old_replicated_enqueued).await.unwrap();
+        force_terminal(&pool, &old_replicated_unenqueued, "replicated").await; // backdated 2h, left unstamped
         force_terminal(&pool, &old_failed, "failed").await; // backdated 2h
 
         let pruned = store.gc_terminal_status_rows(Duration::from_hours(1)).await.unwrap();
 
-        assert_eq!(pruned, 2, "only the two aged terminal rows are pruned");
+        assert_eq!(pruned, 2, "only the aged failed + aged enqueued-replicated rows are pruned");
         assert_eq!(
             store.status(&fresh).await.unwrap(),
             Some(ReplicationState::Replicated),
             "a fresh terminal row is kept"
         );
-        assert_eq!(store.status(&old_replicated).await.unwrap(), None, "the aged replicated row was pruned");
+        assert_eq!(
+            store.status(&old_replicated_enqueued).await.unwrap(),
+            None,
+            "the aged, already-enqueued replicated row was pruned"
+        );
+        assert_eq!(
+            store.status(&old_replicated_unenqueued).await.unwrap(),
+            Some(ReplicationState::Replicated),
+            "an aged replicated row still awaiting its enqueue is SPARED (the sweep worklist)"
+        );
         assert_eq!(store.status(&old_failed).await.unwrap(), None, "the aged failed row was pruned");
         assert_eq!(
             store.status(&pending).await.unwrap(),
@@ -2123,6 +2194,65 @@ mod part_tests {
         assert!(
             store.claim_part().await.unwrap().is_some(),
             "release clears the backoff, so a Ceph-failed part retries immediately",
+        );
+    }
+
+    /// Drives one part `pending → draining → replicated` (the drain's commit path) and returns it.
+    async fn seed_replicated(store: &Store, uuid: &str, version: u32, part_number: u32) -> crate::apipart::PartKey {
+        use crate::apipart::{ObjectId, PartKey, PartNumber, Version};
+        use crate::partdrain::PartVerified;
+        use core::str::FromStr;
+        let part = PartKey::new(ObjectId::from_str(uuid).unwrap(), Version::new(version), PartNumber::new(part_number));
+        store.record_landed_part(&part).await.unwrap();
+        let claim = store.claim_part().await.unwrap().expect("claims the seeded pending part");
+        assert_eq!(claim.part(), &part);
+        store.mark_replicated(&claim, &PartVerified::for_test()).await.unwrap();
+        part
+    }
+
+    #[sqlx::test]
+    async fn the_enqueue_sweep_worklist_tracks_the_backend_publish(pool: PgPool) {
+        // Tier-2: a part committed `replicated` before its address landed is on the sweep
+        // worklist until mark_upload_enqueued stamps it (what the enqueue sweep does after a
+        // successful publish). The worklist is node-scoped and ordered by commit time.
+        let store = Store::from_pool(pool);
+        let part = seed_replicated(&store, "466916c0-d61b-4518-b81b-9576b574270a", 5, 1).await;
+
+        let before = store.list_replicated_unenqueued_parts(10).await.unwrap();
+        assert_eq!(before, vec![part.clone()], "a replicated, un-enqueued part is on the worklist");
+
+        store.mark_upload_enqueued(&part).await.unwrap();
+        assert!(
+            store.list_replicated_unenqueued_parts(10).await.unwrap().is_empty(),
+            "once stamped, the part drops off the sweep worklist",
+        );
+        // Idempotent: a second stamp (inline enqueue racing the sweep) is a harmless no-op.
+        store.mark_upload_enqueued(&part).await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn gc_spares_a_replicated_row_awaiting_enqueue_but_reaps_a_stamped_one(pool: PgPool) {
+        // The GC guard: gc_terminal_status_rows must NOT delete a `replicated` row whose backend
+        // upload is still outstanding (upload_enqueued_at IS NULL) — that would drop the enqueue
+        // sweep's worklist item and lose the backend upload. A stamped `replicated` row is
+        // genuinely terminal and IS reaped.
+        let store = Store::from_pool(pool);
+        let unenqueued = seed_replicated(&store, "466916c0-d61b-4518-b81b-9576b574270a", 5, 1).await;
+        let enqueued = seed_replicated(&store, "466916c0-d61b-4518-b81b-9576b574270a", 5, 2).await;
+        store.mark_upload_enqueued(&enqueued).await.unwrap();
+
+        // Retention ZERO makes every row "aged"; only the stamped one is eligible.
+        let removed = store.gc_terminal_status_rows(Duration::ZERO).await.unwrap();
+        assert_eq!(removed, 1, "only the stamped (fully terminal) replicated row is reaped");
+        assert_eq!(
+            <Store as PartReplicationStore>::status(&store, &unenqueued).await.unwrap(),
+            Some(crate::state::ReplicationState::Replicated),
+            "the un-enqueued row is spared so the enqueue sweep can still publish it",
+        );
+        assert_eq!(
+            <Store as PartReplicationStore>::status(&store, &enqueued).await.unwrap(),
+            None,
+            "the stamped row was GC'd",
         );
     }
 }

@@ -23,8 +23,8 @@ use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
     BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, NodeId, NodeObservation,
-    ReclaimError, SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate, jittered, reclaim_ssd,
-    reconcile_parts,
+    PartReplicationStore, ReclaimError, SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate, jittered,
+    reclaim_ssd, reconcile_parts,
 };
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -87,6 +87,10 @@ pub struct RuntimeConfig {
     pub reconcile_poll: Duration,
     /// How often the reclaim worker scans the SSD for `failed` (abandoned-upload) parts.
     pub reclaim_poll: Duration,
+    /// How often the enqueue sweep publishes the backend upload for `replicated` parts whose
+    /// address was not finalized at drain time (an in-flight MPU). Short, since a completed
+    /// MPU's parts should publish promptly — but off the read path, so seconds is fine.
+    pub enqueue_poll: Duration,
     /// How long a `failed` part (and an orphan write-temp) is kept before the reclaim
     /// worker unlinks it — a diagnosis / abort-settle window.
     pub reclaim_grace: Duration,
@@ -359,6 +363,47 @@ async fn redrive_corrupt_once(store: &Store, snapshot: &SnapshotCell, max_attemp
     }
 }
 
+/// How many replicated-but-unenqueued parts one enqueue-sweep pass publishes. Bounded so a
+/// large post-CompleteMPU burst is drained over a few passes rather than one giant query +
+/// Redis fan-out; the partial index keeps each scan cheap, and the leftover is picked up on
+/// the next tick.
+const ENQUEUE_SWEEP_BATCH: u32 = 512;
+
+/// One enqueue-sweep pass: publish the backend `UploadChainRequest` for this node's
+/// `replicated` parts whose upload was not enqueued at drain time (an in-flight MPU part whose
+/// `object_versions.address` was still NULL). For each, attempt the enqueue; on success stamp
+/// `upload_enqueued_at` so the part drops off the worklist. This is the decoupled counterpart
+/// to the drain's inline best-effort enqueue: it re-drives the publish once `CompleteMPU` lands
+/// the address, so the Ceph-commit never has to wait on it. A not-ready enqueue (address still
+/// NULL) is left for the next pass; a genuinely abandoned part is swept to `failed` by the
+/// mpu-reaper's orphan sweep, not here. Errors log and retry next poll (fail-safe: an
+/// un-stamped part is simply re-attempted).
+async fn enqueue_sweep_once<E: UploadEnqueuer>(store: &Store, enqueuer: &E) {
+    let parts = match store.list_replicated_unenqueued_parts(ENQUEUE_SWEEP_BATCH).await {
+        Ok(parts) => parts,
+        Err(err) => {
+            tracing::warn!(error = %err, "enqueue-sweep worklist query failed; will retry next poll");
+            return;
+        }
+    };
+    let mut published = 0u64;
+    for part in &parts {
+        // A failed enqueue is the common not-ready case (address still NULL) or a transient
+        // Redis blip: skip it, the next pass retries. The concrete enqueuer logs the not-ready
+        // case at debug. Only stamp AFTER a successful publish, so a crash between the two just
+        // re-publishes (idempotent at the consumer) on the next pass.
+        if enqueuer.enqueue(part).await.is_ok() {
+            match store.mark_upload_enqueued(part).await {
+                Ok(()) => published += 1,
+                Err(err) => tracing::warn!(error = %err, "enqueue-sweep stamp failed; will re-publish next poll"),
+            }
+        }
+    }
+    if published > 0 {
+        tracing::info!(published, "enqueue sweep published backend uploads for replicated parts");
+    }
+}
+
 /// Sets the enforcer's rate under its lock. The op is synchronous, so the guard
 /// never crosses an `.await` (axiom `rust_quality_74`); a poisoned lock recovers
 /// via `into_inner` — the `Enforcer` is a small `Copy` value left consistent.
@@ -549,6 +594,10 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
 
     /// Spawns the workers under a supervisor and runs until `shutdown` resolves
     /// (or a worker faults), returning how every worker wound down.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one linear block of worker-spawn wiring (drain, reconcile, ssd_reclaim, enqueue_sweep, heartbeat, allocation); splitting it would just scatter the topology"
+    )]
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> RunReport {
         let mut supervisor = Supervisor::new(self.config.grace);
 
@@ -600,6 +649,19 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
                     // node-local SSD lifecycle); errors log and retry next poll (fail-safe).
                     redrive_corrupt_once(&store, &snapshot, redrive_max_attempts).await;
                 }
+            })
+        });
+
+        // Enqueue-sweep worker: publish the backend upload for `replicated` parts whose
+        // address was NULL at drain time (an in-flight MPU) — the decoupled counterpart to the
+        // drain's inline best-effort enqueue. Uses only the Postgres store + the shared
+        // enqueuer, so it runs whenever the drain does (no coordinator needed).
+        let (store, enqueuer) = (Arc::clone(&self.store), Arc::clone(&self.enqueuer));
+        let enqueue_poll = self.config.enqueue_poll;
+        supervisor.spawn(WorkerName::new("enqueue_sweep"), move |token| {
+            run_periodic(token, enqueue_poll, move || {
+                let (store, enqueuer) = (Arc::clone(&store), Arc::clone(&enqueuer));
+                async move { enqueue_sweep_once(store.as_ref(), enqueuer.as_ref()).await }
             })
         });
 
@@ -883,6 +945,7 @@ mod tests {
             RuntimeConfig {
                 drain_poll: Duration::from_mins(1),
                 reconcile_poll: Duration::from_mins(1),
+                enqueue_poll: Duration::from_mins(1),
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
@@ -956,6 +1019,7 @@ mod tests {
             RuntimeConfig {
                 drain_poll: Duration::from_mins(1),
                 reconcile_poll: Duration::from_mins(1),
+                enqueue_poll: Duration::from_mins(1),
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
@@ -1047,6 +1111,7 @@ mod tests {
                 // Park drain/reconcile; this test exercises only the heartbeat.
                 drain_poll: Duration::from_mins(1),
                 reconcile_poll: Duration::from_mins(1),
+                enqueue_poll: Duration::from_mins(1),
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
@@ -1111,6 +1176,7 @@ mod tests {
             RuntimeConfig {
                 drain_poll: Duration::from_millis(20),
                 reconcile_poll: Duration::from_millis(20),
+                enqueue_poll: Duration::from_mins(1),
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
@@ -1158,6 +1224,7 @@ mod tests {
             RuntimeConfig {
                 drain_poll: Duration::from_millis(20),
                 reconcile_poll: Duration::from_millis(50),
+                enqueue_poll: Duration::from_mins(1),
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),

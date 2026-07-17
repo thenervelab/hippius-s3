@@ -665,15 +665,14 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
-    async fn an_enqueue_deferral_counts_as_deferred_not_failed_and_spares_the_breaker(pool: PgPool) {
-        // P1a end-to-end through drain_next: a part whose Ceph copy + verify succeed
-        // but whose post-write enqueue defers (address not finalized / Redis down)
-        // must (1) count as `deferred`, not `failed`, so error_bps stays a clean
-        // Ceph-write signal; (2) be returned to `pending` for a later re-drain; and
-        // (3) NOT signal the breaker. The enforcer's breaker trips on a single Ceph
-        // failure, so a subsequently-admitted drain is the proof the deferral never
-        // reached it — which is what kept an in-progress large MPU from wedging the
-        // whole node's drain.
+    async fn a_not_ready_enqueue_commits_replicated_and_lands_on_the_sweep_worklist(pool: PgPool) {
+        // Tier-2 decoupled commit end-to-end through drain_next: a part whose Ceph copy + verify
+        // succeed but whose backend enqueue is not ready (an in-flight MPU whose address is NULL)
+        // now (1) COMMITS Replicated and frees the SSD copy — it does NOT defer + re-copy as
+        // before; (2) counts as `drained`, not `deferred`/`failed`; (3) is left unstamped
+        // (upload_enqueued_at NULL) on the enqueue-sweep worklist so the publish is re-driven once
+        // the address lands. The enforcer's breaker trips on a single Ceph failure, so a
+        // subsequently-admitted drain proves a successful commit never signalled it.
         let ssd_dir = tempfile::tempdir().unwrap();
         let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
@@ -691,24 +690,30 @@ mod tests {
         let part = part_at(5, 1);
         seed_part(ssd_dir.path(), &store, &part, &[b"deferred part bytes"]).await;
 
-        let err = drain_next(&ceph, &ssd, &store, &DeferringEnqueuer, Some(&enforcer), Some(&snapshot))
+        let outcome = drain_next(&ceph, &ssd, &store, &DeferringEnqueuer, Some(&enforcer), Some(&snapshot))
             .await
-            .unwrap_err();
-        assert!(
-            matches!(err, super::DrainCycleError::Drain(_)),
-            "the deferral surfaces as a drain error, got {err:?}"
-        );
+            .unwrap();
+        assert_eq!(outcome, Some(DrainOutcome::Replicated), "a not-ready enqueue still commits Replicated");
 
         let counts = snapshot.load();
-        assert_eq!(counts.deferred, 1, "the enqueue deferral was counted as deferred");
-        assert_eq!(counts.failed, 0, "a deferral is not a Ceph-write failure");
-        assert_eq!(counts.drained, 0, "the part was not committed, so it is not drained");
-        assert_eq!(counts.error_bps(), 0, "deferrals stay out of the Ceph failure rate");
+        assert_eq!(counts.drained, 1, "the part was committed (Ceph-durable)");
+        assert_eq!(counts.deferred, 0, "a not-ready enqueue is no longer a deferral");
+        assert_eq!(counts.failed, 0, "and it is not a Ceph-write failure");
+        assert_eq!(counts.error_bps(), 0, "so it stays out of the Ceph failure rate");
 
         assert_eq!(
             status_of(&store, &part).await,
-            Some(ReplicationState::Pending),
-            "a deferred part is returned to pending for a later re-drain",
+            Some(ReplicationState::Replicated),
+            "the Ceph commit is decoupled from the address-gated enqueue",
+        );
+        assert!(
+            !ssd_dir.path().join(part.relative_dir()).exists(),
+            "the SSD copy is freed — the uploader reads the chunks from the shared pool",
+        );
+        let worklist = store.list_replicated_unenqueued_parts(10).await.unwrap();
+        assert!(
+            worklist.contains(&part),
+            "the un-enqueued replicated part is on the enqueue-sweep worklist",
         );
 
         // The breaker (threshold 1) never saw a failure, so a fresh drain is still
@@ -716,7 +721,7 @@ mod tests {
         assert_eq!(
             enforcer.lock().unwrap().try_drain(1, Instant::now()),
             DrainDecision::Allowed,
-            "the deferral neither tripped the breaker nor leaked the permit",
+            "a committed drain neither tripped the breaker nor leaked the permit",
         );
     }
 
@@ -758,13 +763,12 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
-    async fn a_deferred_part_does_not_starve_the_ready_parts_in_a_burst(pool: PgPool) {
-        // A not-ready part must not stop the burst: part 1 defers (backs off) but parts
-        // 2 and 3 are ready and must still replicate in the same run. concurrency=1
-        // forces serial claims so part 1 (the oldest) is reached first — without the
-        // skip-and-continue, its deferral would stop the burst before 2 and 3 drain.
-        // This is the starvation the e2e DLQ MPU hit: ready parts crowded out by
-        // not-ready ones (in-progress / abandoned MPUs).
+    async fn a_not_ready_enqueue_does_not_stall_the_burst_and_only_it_awaits_the_sweep(pool: PgPool) {
+        // Tier-2 decoupled commit: a not-ready enqueue no longer defers, so ALL three parts
+        // commit Replicated in one burst — part 1's backend enqueue is not ready (address NULL)
+        // but it still commits, and parts 2 and 3 enqueue inline. Only part 1 is left unstamped
+        // on the enqueue-sweep worklist; parts 2 and 3 are stamped and off it. concurrency=1
+        // forces serial claims so part 1 (the oldest) is reached first.
         let ssd_dir = tempfile::tempdir().unwrap();
         let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
@@ -775,26 +779,23 @@ mod tests {
         }
 
         let token = CancellationToken::new();
-        // A burst of only deferrals + successes is not a cycle error, so this is Ok.
         let drained = drain_until_empty(&ceph, &ssd, &store, &DeferPartOneEnqueuer, None, None, &token, 1)
             .await
             .unwrap();
-        assert_eq!(drained, 2, "the two ready parts drained despite part 1 deferring");
+        assert_eq!(drained, 3, "all three parts committed (a not-ready enqueue no longer defers)");
 
+        for number in 1..=3_u32 {
+            assert_eq!(
+                status_of(&store, &part_at(5, number)).await,
+                Some(ReplicationState::Replicated),
+                "part {number} committed Replicated",
+            );
+        }
+        let worklist = store.list_replicated_unenqueued_parts(10).await.unwrap();
         assert_eq!(
-            status_of(&store, &part_at(5, 2)).await,
-            Some(ReplicationState::Replicated),
-            "ready part 2 drained"
-        );
-        assert_eq!(
-            status_of(&store, &part_at(5, 3)).await,
-            Some(ReplicationState::Replicated),
-            "ready part 3 drained"
-        );
-        assert_eq!(
-            status_of(&store, &part_at(5, 1)).await,
-            Some(ReplicationState::Pending),
-            "the deferred part is backed off (pending), not replicated and not starving the rest",
+            worklist,
+            vec![part_at(5, 1)],
+            "only the not-ready part 1 awaits the enqueue sweep; parts 2 & 3 enqueued inline",
         );
     }
 

@@ -7,7 +7,9 @@
 -- that leak so the soak gate can assert it is bounded and its slope is ~ 0.
 --
 -- It counts the same population SHAPE list_orphan_replication_versions.sql sweeps — an object
--- version that is (a) still ACTIVE on the drain (status IN ('pending','draining')),
+-- version that is (a) still non-terminal + not-yet-uploaded on the drain (status IN
+-- ('pending','draining') OR 'replicated' with upload_enqueued_at IS NULL — the Tier-2
+-- decoupled-commit orphan the sweep also flips 'failed'),
 -- (b) UNSERVABLE (the abandoned/leaked shape: address IS NULL AND size_bytes <= 0 AND
 -- md5_hash = ''), (c) idle past the grace (its most-recently-landed part older than
 -- $1 seconds — landed_at is the true idle signal, never bumped by drain re-claim/defer
@@ -44,7 +46,8 @@ FROM (
     JOIN object_versions ov
            ON ov.object_id = crs.object_id::uuid
           AND ov.object_version = crs.version
-    WHERE crs.status IN ('pending', 'draining')
+    WHERE (crs.status IN ('pending', 'draining')
+           OR (crs.status = 'replicated' AND crs.upload_enqueued_at IS NULL))
       AND ov.address IS NULL
       AND ov.size_bytes <= 0
       AND COALESCE(ov.md5_hash, '') = ''
