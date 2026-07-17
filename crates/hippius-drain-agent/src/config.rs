@@ -18,6 +18,11 @@ use thiserror::Error;
 const DEFAULT_DRAIN_POLL: Duration = Duration::from_secs(5);
 /// Reconciler scan period when `CEPHOR_RECONCILE_POLL_SECS` is unset.
 const DEFAULT_RECONCILE_POLL: Duration = Duration::from_mins(1);
+/// Enqueue-sweep period when `CEPHOR_ENQUEUE_POLL_SECS` is unset. How often a `replicated`
+/// part whose address was not finalized at drain time (an in-flight MPU) is retried for its
+/// backend upload. Off the read path (the object serves from the pool), so a few seconds is
+/// ample; short enough that a completed MPU's parts publish promptly.
+const DEFAULT_ENQUEUE_POLL: Duration = Duration::from_secs(5);
 /// Shutdown grace when `CEPHOR_GRACE_SECS` is unset.
 const DEFAULT_GRACE: Duration = Duration::from_secs(30);
 /// Heartbeat period when `CEPHOR_HEARTBEAT_POLL_SECS` is unset.
@@ -89,6 +94,9 @@ pub struct Config {
     pub drain_poll: Duration,
     /// Reconciler scan period.
     pub reconcile_poll: Duration,
+    /// Enqueue-sweep period: how often a `replicated` part whose backend upload was not
+    /// enqueued at drain time (address not yet finalized) is retried.
+    pub enqueue_poll: Duration,
     /// Grace given to in-flight ticks on shutdown before a forced abort.
     pub grace: Duration,
     /// This node's identity in the fleet (the allocator keys heartbeats by it).
@@ -211,6 +219,7 @@ impl Config {
         RuntimeConfig {
             drain_poll: self.drain_poll,
             reconcile_poll: self.reconcile_poll,
+            enqueue_poll: self.enqueue_poll,
             reclaim_poll: self.reclaim_poll,
             reclaim_grace: self.reclaim_grace,
             orphan_reclaim_grace: self.orphan_reclaim_grace,
@@ -268,6 +277,7 @@ impl Config {
             ssd_root: required_path(&get, "CEPHOR_SSD_ROOT")?,
             drain_poll: duration_secs(&get, "CEPHOR_DRAIN_POLL_SECS", DEFAULT_DRAIN_POLL)?,
             reconcile_poll: duration_secs(&get, "CEPHOR_RECONCILE_POLL_SECS", DEFAULT_RECONCILE_POLL)?,
+            enqueue_poll: duration_secs(&get, "CEPHOR_ENQUEUE_POLL_SECS", DEFAULT_ENQUEUE_POLL)?,
             grace: duration_secs(&get, "CEPHOR_GRACE_SECS", DEFAULT_GRACE)?,
             node_id: required_node_id(&get, "CEPHOR_NODE_ID")?,
             heartbeat_poll: duration_secs(&get, "CEPHOR_HEARTBEAT_POLL_SECS", DEFAULT_HEARTBEAT_POLL)?,

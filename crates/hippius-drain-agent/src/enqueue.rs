@@ -106,14 +106,16 @@ impl UploadEnqueuer for RedisEnqueuer {
 
     async fn enqueue(&self, part: &PartKey) -> Result<(), EnqueueError> {
         let Some(ctx) = self.store.load_upload_context(part).await.map_err(EnqueueError::Store)? else {
-            // Diagnostic: name the part so a stuck/abandoned not-ready loop is traceable
-            // (the upload context is missing because object_versions.address is NULL or
-            // the version row is absent for this exact object_id/version).
-            tracing::warn!(
+            // Not-ready is now an EXPECTED, common outcome, not an anomaly: the drain commits
+            // `replicated` and enqueues best-effort, so an in-flight MPU part (address NULL until
+            // CompleteMultipartUpload) hits this on the inline attempt AND on each enqueue-sweep
+            // pass until the address lands. debug, not warn, so it does not spam; a genuinely
+            // abandoned part is surfaced by the aged-orphan gauge + the reaper, not by this line.
+            tracing::debug!(
                 object_id = %part.object().as_str(),
                 version = part.version().get(),
                 part = part.part().get(),
-                "upload context not ready (address NULL or version row absent)",
+                "upload context not ready (address NULL or version row absent); enqueue sweep will retry",
             );
             return Err(EnqueueError::NotReady);
         };

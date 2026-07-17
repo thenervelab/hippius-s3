@@ -801,6 +801,12 @@ mod part_tests {
             }
         }
 
+        async fn mark_upload_enqueued(&self, _part: &PartKey) -> Result<(), io::Error> {
+            // The localfs drain tests assert the SSD/pool copy + commit; the upload_enqueued_at
+            // stamp is exercised by the core partdrain tests + the store integration tests.
+            Ok(())
+        }
+
         fn mark_failed(&self, part: &ClaimedPart, _reason: &str) -> impl Future<Output = Result<(), io::Error>> + Send {
             let key = Self::key(part.part());
             async move {

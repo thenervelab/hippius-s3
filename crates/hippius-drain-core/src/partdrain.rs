@@ -11,11 +11,19 @@
 //! # The ordering that must not change
 //!
 //! `persist every chunk (copy+fsync+rename) → byte-verify each copy → persist
-//! meta.json LAST → commit Replicated → unlink the SSD part`. `meta.json` is the
-//! reader's readiness gate, so writing it last means a reader never sees a
-//! half-copied part on `CephFS`; and the SSD copy — the only durable one until the
-//! pool copy is complete and committed — is unlinked only on the post-commit `Ok`
-//! path. [`PartVerified`] makes "commit before verify" a compile error.
+//! meta.json LAST → commit Replicated → (best-effort) enqueue the backend upload →
+//! unlink the SSD part`. `meta.json` is the reader's readiness gate, so writing it
+//! last means a reader never sees a half-copied part on `CephFS`; and the SSD copy —
+//! the only durable one until the pool copy is complete and committed — is unlinked
+//! only on the post-commit `Ok` path. [`PartVerified`] makes "commit before verify" a
+//! compile error.
+//!
+//! The commit is DECOUPLED from the backend enqueue: `mark_replicated` fires as soon as
+//! the verified copy is durable on the pool, and the address-gated
+//! [`UploadEnqueuer::enqueue`] runs afterward, best-effort. An in-flight MPU part (address
+//! NULL until `CompleteMultipartUpload`) therefore reaches `Replicated` on the first drain
+//! instead of deferring + re-copying every poll; the agent's enqueue sweep publishes its
+//! backend upload once the address lands.
 
 use crate::apipart::{ChunkIndex, PartKey, PartMeta};
 use crate::enforce::BreakerSignal;
@@ -216,6 +224,13 @@ pub trait PartReplicationStore: Send + Sync {
     /// copy was verified, so this cannot be called before verification.
     fn mark_replicated(&self, part: &ClaimedPart, proof: &PartVerified) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Stamp that this part's backend `UploadChainRequest` has been published (sets
+    /// `upload_enqueued_at`). Called after a successful enqueue — inline in [`drain_part`]
+    /// for the common ready case, and by the agent's enqueue sweep for parts whose address
+    /// was not finalized at drain time. Keyed on `status = 'replicated'` and idempotent, so
+    /// a re-stamp (a re-drive or a sweep racing the inline enqueue) is a harmless no-op.
+    fn mark_upload_enqueued(&self, part: &PartKey) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
     /// Record that the part's drain failed (e.g. a byte-mismatch on copy).
     fn mark_failed(&self, part: &ClaimedPart, reason: &str) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
@@ -235,21 +250,28 @@ pub trait PartReplicationStore: Send + Sync {
 
 /// Publishes the per-part backend upload request once the part is durably on the pool.
 ///
-/// Called by [`drain_part`] **after** the verified copy + meta are persisted but
-/// **before** `mark_replicated` commits — so a crash between the enqueue and the commit
-/// leaves the part `draining`, which a later re-drain re-enqueues (a harmless duplicate;
-/// the backend uploader is idempotent). This is the at-least-once seam that lets the
-/// drain be the sole upload producer without a separate notify/sweep.
+/// Called by [`drain_part`] **after** `mark_replicated` commits (the Ceph copy is durable
+/// and the SSD source is about to be freed) — a **best-effort** publish that does NOT gate
+/// the commit. When the upload context is not ready yet (an in-progress MPU whose
+/// `object_versions.address` is still NULL) the impl returns an error and the part is left
+/// with `upload_enqueued_at` NULL; the agent's **enqueue sweep** re-publishes it once the
+/// address lands. Enqueue is idempotent at the consumer (the backend uploader dedups via
+/// `chunk_backend ON CONFLICT`), so the inline publish racing the sweep is harmless.
+///
+/// This decouples the Ceph-commit from the address-gated enqueue: an MPU part reaches
+/// `replicated` as soon as it is verified on the pool, instead of deferring + re-copying
+/// every poll until `CompleteMultipartUpload`.
 ///
 /// The trait is storage-generic (takes only a [`PartKey`]); the concrete impl lives in
 /// the agent, which loads the request fields from the store and pushes to Redis — so
 /// `hippius-drain-core` stays free of Redis and the app schema.
 pub trait UploadEnqueuer: Send + Sync {
-    /// Impl-specific failure, boxed into [`PartDrainError::Enqueue`].
+    /// Impl-specific failure. In [`drain_part`] it is logged and swallowed (the enqueue
+    /// sweep retries); it never fails the drain.
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Enqueue the part's backend upload request(s). Idempotent at the consumer, so a
-    /// retry after a transient failure (or a re-drain) is safe.
+    /// retry after a transient failure (or the sweep re-publishing) is safe.
     fn enqueue(&self, part: &PartKey) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
@@ -282,11 +304,6 @@ pub enum PartDrainError {
     /// The replication store rejected a state transition; nothing was unlinked.
     #[error("replication store rejected the drain")]
     Store(#[source] Box<dyn std::error::Error + Send + Sync>),
-    /// Enqueuing the backend upload request failed (e.g. Redis unavailable, or the
-    /// upload context isn't ready yet). The part is NOT committed, so it stays
-    /// `draining` and a later re-drain re-enqueues it — no upload is lost.
-    #[error("enqueuing the backend upload failed")]
-    Enqueue(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The SSD part's `meta.json` declares more (or different) chunks than are present on
     /// disk — the part is incomplete (its chunks were partly removed after meta landed, or
     /// an ingest crash left it torn). It is NOT committed and NOT unlinked; the SSD copy is
@@ -307,24 +324,22 @@ impl PartDrainError {
         Self::Store(Box::new(err))
     }
 
-    /// Box an enqueuer error into [`PartDrainError::Enqueue`].
-    fn enqueue<E: std::error::Error + Send + Sync + 'static>(err: E) -> Self {
-        Self::Enqueue(Box::new(err))
-    }
-
     /// Whether this failure is a benign deferral rather than a Ceph-write failure — the
     /// part could not be drained *right now* for a reason that is NOT evidence of `CephFS`
     /// unhealth, so the caller must neither trip the node-global Ceph breaker nor count
     /// it as a failure; the part is backed off and a later re-drain retries it.
     ///
     /// Two cases:
-    /// - [`Enqueue`](Self::Enqueue): the upload context isn't ready (an in-progress MPU
-    ///   whose `object_versions.address` is still NULL, or Redis briefly unreachable).
+    /// - [`IncompleteSource`](Self::IncompleteSource): the SSD part's chunks were partly
+    ///   removed after its meta landed (a torn/aborted ingest); it is not whole yet.
     /// - [`Io`](Self::Io) with [`ErrorKind::NotFound`](std::io::ErrorKind::NotFound): the
     ///   SSD source/part vanished mid-drain — an overwrite, a concurrent clean, or a part
     ///   another cycle already drained and unlinked. The pool is healthy; there is simply
     ///   nothing to copy. Any OTHER `Io` error (`EIO`, `ENOTCONN`, permission, no-space…)
     ///   is a genuine write failure and still trips the breaker.
+    ///
+    /// (A not-ready backend enqueue is no longer a deferral: the drain commits `Replicated`
+    /// first and the enqueue is best-effort, retried by the agent's enqueue sweep.)
     ///
     /// Scoped by `ErrorKind`, not by which side raised it: in principle a pool-side
     /// `ENOENT` (the pool dir removed between `create_dir_all` and the file write) would
@@ -337,7 +352,7 @@ impl PartDrainError {
     #[must_use]
     pub fn is_benign_deferral(&self) -> bool {
         match self {
-            Self::Enqueue(_) | Self::IncompleteSource { .. } => true,
+            Self::IncompleteSource { .. } => true,
             Self::Io { source, .. } => source.kind() == std::io::ErrorKind::NotFound,
             _ => false,
         }
@@ -353,22 +368,21 @@ impl PartDrainError {
     /// unhealth, so it must not halt draining of a healthy pool from every OTHER part on the
     /// node — it defers this part instead (`breaker_signal_for` maps a non-benign,
     /// non-Ceph error to [`BreakerSignal::Deferred`]). A `Store`/claim-coordination error
-    /// (Postgres-domain) is likewise excluded, and `Enqueue` / `IncompleteSource` are benign
-    /// deferrals (see [`is_benign_deferral`](Self::is_benign_deferral)).
+    /// (Postgres-domain) is likewise excluded, and `IncompleteSource` is a benign
+    /// deferral (see [`is_benign_deferral`](Self::is_benign_deferral)).
     #[must_use]
     pub fn is_ceph_write_failure(&self) -> bool {
         match self {
             // SSD-side step (local-disk unhealth, whatever the errno — the fix for the
             // `Persist`-overload where a local SSD-read EIO tripped the node-global Ceph
-            // breaker), plus the non-Ceph domains (Postgres store/claim, enqueue-not-ready,
-            // incomplete source): none is evidence of pool unhealth. Matched BEFORE the
-            // general `Io` arm so an SSD-side `Io` is caught here first.
+            // breaker), plus the non-Ceph domains (Postgres store/claim, incomplete
+            // source): none is evidence of pool unhealth. Matched BEFORE the general `Io`
+            // arm so an SSD-side `Io` is caught here first.
             Self::Io {
                 step: DrainStep::SsdRead | DrainStep::Unlink,
                 ..
             }
             | Self::Store(_)
-            | Self::Enqueue(_)
             | Self::IncompleteSource { .. } => false,
             // Any remaining `Io` is a Ceph-side step (`Persist`/`Hash`/`Cleanup`): a non-ENOENT
             // error is genuine pool unhealth.
@@ -384,11 +398,11 @@ impl PartDrainError {
 }
 
 /// The circuit-breaker signal for a completed drain outcome — the one place that decides
-/// which failures count as `CephFS` unhealth. `Ok` succeeds; a benign deferral (enqueue
-/// not ready / vanished source / incomplete part) AND a store/claim-coordination error
-/// both leave the breaker untouched ([`BreakerSignal::Deferred`]); only a genuine
-/// Ceph-write failure trips it. Lives with the error type (not the agent) so the policy is
-/// unit-testable and the agent worker is a thin caller.
+/// which failures count as `CephFS` unhealth. `Ok` succeeds; a benign deferral (vanished
+/// source / incomplete part) AND a store/claim-coordination error both leave the breaker
+/// untouched ([`BreakerSignal::Deferred`]); only a genuine Ceph-write failure trips it.
+/// Lives with the error type (not the agent) so the policy is unit-testable and the agent
+/// worker is a thin caller.
 #[must_use]
 pub fn breaker_signal_for(result: &Result<DrainOutcome, PartDrainError>) -> BreakerSignal {
     match result {
@@ -509,16 +523,23 @@ where
     ceph.finalize_part(part).await.map_err(PartDrainError::io(DrainStep::Persist))?;
     let verified = PartVerified(());
 
-    // Enqueue the backend upload BEFORE committing (at-least-once): the part is now
-    // durably on the pool and readable, so the uploader can serve it. If this fails the
-    // part stays `draining` and a re-drain re-enqueues — no upload is lost, and the dup
-    // is harmless (idempotent uploader). The drain is thus the sole upload producer with
-    // no separate notify/sweep.
-    enqueuer.enqueue(part).await.map_err(PartDrainError::enqueue)?;
-
-    // Commit Replicated. Only past this point — a durable, verified, committed copy
-    // exists AND its upload is enqueued — is removing the SSD part safe.
+    // Commit Replicated as soon as the verified copy is durable on the pool — the Ceph
+    // commit is DECOUPLED from the address-gated backend enqueue. Only past this point does a
+    // durable, verified, committed copy exist, so removing the SSD part is safe (the backend
+    // uploader reads the chunks from the shared pool, not this SSD source).
     store.mark_replicated(claim, &verified).await.map_err(PartDrainError::store)?;
+
+    // Best-effort backend enqueue, decoupled from the commit. For a simple PUT or a completed
+    // MPU the address is ready, so this publishes the UploadChainRequest and stamps
+    // `upload_enqueued_at` inline. For an in-flight MPU the address is still NULL and the enqueue
+    // errors — the part stays `replicated` with `upload_enqueued_at` NULL, and the agent's enqueue
+    // sweep re-publishes it once CompleteMultipartUpload writes the address (idempotent at the
+    // consumer). A not-ready/failed enqueue is intentionally swallowed here: it must NEVER
+    // un-commit the part or fail the drain. Before this change an MPU part deferred and re-copied
+    // its whole self to the pool on every poll until the object completed; now it copies once.
+    if enqueuer.enqueue(part).await.is_ok() {
+        store.mark_upload_enqueued(part).await.map_err(PartDrainError::store)?;
+    }
 
     ssd.remove_part(part).await.map_err(PartDrainError::io(DrainStep::Unlink))?;
     Ok(DrainOutcome::Replicated)
@@ -545,7 +566,7 @@ mod tests {
     const UUID: &str = "466916c0-d61b-4518-b81b-9576b574270a";
 
     #[test]
-    fn is_benign_deferral_spares_the_breaker_only_for_enqueue_and_vanished_source() {
+    fn is_benign_deferral_spares_the_breaker_only_for_incomplete_and_vanished_source() {
         // ENOENT reading the SSD source (overwrite / concurrent clean / already drained)
         // is benign — the pool is healthy, there is just nothing to copy. It must NOT trip
         // the node-global Ceph breaker.
@@ -554,10 +575,6 @@ mod tests {
             source: io::Error::from(io::ErrorKind::NotFound),
         };
         assert!(vanished.is_benign_deferral(), "a vanished SSD source (ENOENT) is a benign deferral");
-
-        // Not-ready upload context is likewise benign (in-progress MPU / Redis blip).
-        let not_ready = PartDrainError::enqueue(io::Error::from(io::ErrorKind::ConnectionRefused));
-        assert!(not_ready.is_benign_deferral(), "an enqueue failure is a benign deferral");
 
         // An incomplete SSD part (chunks removed after meta landed) is benign — the pool
         // is healthy; the part just isn't whole yet. It defers, not trips the breaker.
@@ -593,9 +610,8 @@ mod tests {
     #[test]
     fn is_ceph_write_failure_only_for_real_pool_io_and_mismatch() {
         // WI-10: only genuine Ceph-write faults trip the node-global breaker. A real pool
-        // I/O error and a byte-mismatch do; a store/claim error, an enqueue deferral, an
-        // ENOENT vanished source, and an incomplete SSD part do NOT (they are not evidence
-        // the pool is unhealthy).
+        // I/O error and a byte-mismatch do; a store/claim error, an ENOENT vanished source,
+        // and an incomplete SSD part do NOT (they are not evidence the pool is unhealthy).
         let real_io = PartDrainError::Io {
             step: DrainStep::Persist,
             source: io::Error::from(io::ErrorKind::Other),
@@ -618,8 +634,6 @@ mod tests {
             !store_err.is_ceph_write_failure(),
             "a store/claim error is a Postgres-domain fault, not Ceph"
         );
-        let enqueue = PartDrainError::enqueue(io::Error::from(io::ErrorKind::ConnectionRefused));
-        assert!(!enqueue.is_ceph_write_failure(), "an enqueue deferral is not a Ceph failure");
         let incomplete = PartDrainError::IncompleteSource { declared: 3, present: 2 };
         assert!(!incomplete.is_ceph_write_failure(), "an incomplete SSD part is not a Ceph failure");
 
@@ -659,9 +673,12 @@ mod tests {
         // (breaker untouched); only a genuine Ceph-write failure -> CephFailure.
         assert_eq!(breaker_signal_for(&Ok(DrainOutcome::Replicated)), BreakerSignal::CephSuccess);
         assert_eq!(
-            breaker_signal_for(&Err(PartDrainError::enqueue(io::Error::from(io::ErrorKind::ConnectionRefused)))),
+            breaker_signal_for(&Err(PartDrainError::Io {
+                step: DrainStep::SsdRead,
+                source: io::Error::from(io::ErrorKind::NotFound),
+            })),
             BreakerSignal::Deferred,
-            "an enqueue deferral does not trip the breaker",
+            "a vanished SSD source (ENOENT) does not trip the breaker",
         );
         assert_eq!(
             breaker_signal_for(&Err(PartDrainError::IncompleteSource { declared: 3, present: 2 })),
@@ -733,10 +750,14 @@ mod tests {
         /// Chunk index -> how many more persist attempts corrupt it, then succeed. Models a
         /// TRANSIENT torn write recovered by the bounded copy-retry (decremented per persist).
         corrupt_attempts: HashMap<u32, u32>,
-        /// When set, the upload enqueue fails (to test the at-least-once seam).
+        /// When set, the upload enqueue fails (address not ready / Redis blip) — the
+        /// decoupled enqueue is best-effort, so the drain still commits and the sweep retries.
         enqueue_fault: bool,
         /// Parts the enqueuer was asked to enqueue, in order.
         enqueued: Vec<String>,
+        /// Parts stamped `upload_enqueued_at` via `mark_upload_enqueued`, in order — set only
+        /// after a successful inline enqueue.
+        upload_stamped: Vec<String>,
         /// When set, `is_version_servable` returns true, so a persistent mismatch marks the
         /// part `Corrupt` (R4) instead of `Failed`. Default false = the abandoned-upload shape.
         servable: bool,
@@ -818,6 +839,10 @@ mod tests {
 
         fn enqueued(&self) -> Vec<String> {
             self.world.lock().unwrap().enqueued.clone()
+        }
+
+        fn upload_stamped(&self) -> Vec<String> {
+            self.world.lock().unwrap().upload_stamped.clone()
         }
 
         fn clear_faults(&self) {
@@ -1008,6 +1033,14 @@ mod tests {
             }
         }
 
+        fn mark_upload_enqueued(&self, part: &PartKey) -> impl Future<Output = Result<(), io::Error>> + Send {
+            let key = key_of(part);
+            async move {
+                self.world.lock().unwrap().upload_stamped.push(key);
+                Ok(())
+            }
+        }
+
         fn mark_failed(&self, part: &ClaimedPart, _reason: &str) -> impl Future<Output = Result<(), io::Error>> + Send {
             let key = key_of(part.part());
             async move {
@@ -1066,20 +1099,40 @@ mod tests {
         assert!(pooled.has_meta, "meta.json written");
         assert!(!fakes.ssd_has(&part), "SSD part unlinked only after commit");
         assert_eq!(fakes.enqueued(), vec![key_of(&part)], "the backend upload was enqueued");
+        assert_eq!(
+            fakes.upload_stamped(),
+            vec![key_of(&part)],
+            "a successful inline enqueue stamps upload_enqueued_at",
+        );
     }
 
     #[tokio::test]
-    async fn an_enqueue_failure_never_commits_and_preserves_the_ssd_copy() {
-        // At-least-once: if enqueuing the upload fails, the part is NOT committed and the
-        // SSD copy is kept, so a re-drain re-enqueues — no upload is lost.
+    async fn a_not_ready_enqueue_still_commits_replicated_and_leaves_it_unstamped() {
+        // Decoupled commit: if the backend enqueue is not ready (an in-flight MPU whose
+        // address is NULL) the drain STILL commits Replicated and unlinks the SSD copy — the
+        // part is Ceph-durable now, and the agent's enqueue sweep re-publishes the backend
+        // upload once the address lands. upload_enqueued_at stays unstamped so the sweep
+        // knows this part is still outstanding. (The old behavior deferred + re-copied here.)
         let part = part();
         let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]).enqueue_fault();
 
-        let err = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
+        let outcome = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
 
-        assert!(matches!(err, PartDrainError::Enqueue(_)), "got: {err:?}");
-        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Pending), "must NOT commit Replicated");
-        assert!(fakes.ssd_has(&part), "SSD copy kept for the re-drain");
+        assert_eq!(outcome, DrainOutcome::Replicated, "a not-ready enqueue does not fail the drain");
+        assert_eq!(
+            fakes.status_of(&part),
+            Some(ReplicationState::Replicated),
+            "the Ceph commit is decoupled from the enqueue",
+        );
+        assert!(!fakes.ssd_has(&part), "the SSD copy is freed (the uploader reads from the pool)");
+        assert!(
+            fakes.upload_stamped().is_empty(),
+            "a not-ready enqueue leaves upload_enqueued_at NULL for the sweep to pick up",
+        );
+        assert!(
+            fakes.pool_part(&part).is_some_and(|p| p.has_meta),
+            "the verified part is durable on the pool",
+        );
     }
 
     #[tokio::test]

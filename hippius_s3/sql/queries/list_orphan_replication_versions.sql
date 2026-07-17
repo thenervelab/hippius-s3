@@ -6,9 +6,20 @@
 -- is the true backstop: it finds the leaked version from the drain rows alone.
 --
 -- A version is selected to be marked 'failed' iff ALL hold:
---   (a) it still has an ACTIVE drain row (status IN ('pending','draining')) — a
---       'replicated' row is legitimately done and a 'failed' row is already terminal, so
---       touching either would only churn the sweep;
+--   (a) it still has a NON-TERMINAL, NOT-YET-UPLOADED drain row — status IN
+--       ('pending','draining'), OR status='replicated' with upload_enqueued_at IS NULL. The
+--       latter is the Tier-2 decoupled-commit class: a part that drained to the pool before its
+--       object's address was written (an in-flight MPU) commits 'replicated' immediately, and
+--       its backend upload is enqueued LATER by the enqueue sweep. If the object is then
+--       ABANDONED the address never lands, so the part sits 'replicated' + unenqueued forever —
+--       invisible to the old pending/draining-only sweep, its pool copy pinned by the janitor's
+--       replication gate (no chunk_backend rows are ever written). Including it flips it 'failed'
+--       so janitor_part_terminally_abandoned.sql can reclaim the pool copy. A 'replicated' row
+--       that WAS enqueued (upload_enqueued_at set) means the address existed → the object
+--       completed → legitimately done, so it is excluded; a 'failed' row is already terminal. The
+--       version-level UNSERVABLE gate (b) still protects a servable version whose part is only
+--       momentarily replicated+unenqueued (an inline enqueue that hit a transient Redis blip):
+--       such a version can serve a GET, so it is never selected;
 --   (b) the version is UNSERVABLE — address IS NULL AND size_bytes<=0 AND md5_hash='' —
 --       the exact download-servability predicate janitor_part_terminally_abandoned.sql
 --       uses. The size/md5 clauses are NON-redundant with address IS NULL: address is
@@ -36,7 +47,8 @@ FROM cephor_replication_status crs
 JOIN object_versions ov
        ON ov.object_id = crs.object_id::uuid
       AND ov.object_version = crs.version
-WHERE crs.status IN ('pending', 'draining')
+WHERE (crs.status IN ('pending', 'draining')
+       OR (crs.status = 'replicated' AND crs.upload_enqueued_at IS NULL))
   AND ov.address IS NULL
   AND ov.size_bytes <= 0
   AND COALESCE(ov.md5_hash, '') = ''
