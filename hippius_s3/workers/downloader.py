@@ -140,24 +140,20 @@ async def process_download_request(
         ttfb_ms = 0.0
         total_bytes_downloaded = 0
 
-        async def _fetch_chunk(part_number: int, spec: object, span: trace.Span) -> bool:
+        async def _fetch_chunk(part_number: int, spec: object, span: trace.Span, cached_indices: set[int]) -> bool:
             """Fetch and cache a single chunk, guarded by the semaphore."""
             nonlocal ttfb_recorded, ttfb_ms, total_bytes_downloaded
             chunk_index = int(spec.index)  # ty: ignore[unresolved-attribute]
 
-            async with semaphore:
-                # Check if already cached on FS (may have been filled by a
-                # concurrent request / worker)
-                cached = await fs_store.chunk_exists(
-                    download_request.object_id,
-                    int(download_request.object_version),
-                    part_number,
-                    chunk_index,
-                )
-                if cached:
-                    logger.debug(f"[{backend_name}] Skipping cached chunk part={part_number} ci={chunk_index}")
-                    return True
+            # RD-5: existence is resolved once per part via chunks_exist_batch (off-loop), so we read a
+            # precomputed set here instead of a synchronous per-chunk stat on the event loop. A chunk a
+            # concurrent worker fills after the snapshot is harmless — set_chunk is atomic/deterministic,
+            # so at worst we re-fetch identical bytes.
+            if chunk_index in cached_indices:
+                logger.debug(f"[{backend_name}] Skipping cached chunk part={part_number} ci={chunk_index}")
+                return True
 
+            async with semaphore:
                 # Look up backend_identifier (acquire connection from pool)
                 async with db_pool.acquire() as conn:
                     row = await conn.fetchrow(
@@ -283,6 +279,18 @@ async def process_download_request(
                     except Exception as meta_exc:
                         logger.warning(f"[{backend_name}] Failed to write eager meta part={part_number}: {meta_exc}")
 
+                # RD-5: resolve existence for the whole part in one off-loop batch (one meta stat +
+                # N chunk stats) instead of a synchronous stat per chunk on the event loop.
+                existence_checks = [(part_number, int(spec.index)) for spec in part.chunks]
+                exist_flags = await fs_store.chunks_exist_batch(
+                    download_request.object_id,
+                    int(download_request.object_version),
+                    existence_checks,
+                )
+                cached_indices = {
+                    int(spec.index) for spec, present in zip(part.chunks, exist_flags, strict=True) if present
+                }
+
                 # Batch chunks so a pathological single-part (up to ~1280
                 # chunks for a 5 GiB part at 4 MiB chunk size) doesn't create
                 # thousands of tasks parked on the semaphore. Matches the
@@ -292,7 +300,9 @@ async def process_download_request(
                 for i in range(0, len(part.chunks), chunk_batch_size):
                     batch = part.chunks[i : i + chunk_batch_size]
                     chunk_results.extend(
-                        await asyncio.gather(*[_fetch_chunk(part_number, spec, part_span) for spec in batch])
+                        await asyncio.gather(
+                            *[_fetch_chunk(part_number, spec, part_span, cached_indices) for spec in batch]
+                        )
                     )
 
                 # Release the coalescing lock (set by build_stream_context on enqueue). Key format
