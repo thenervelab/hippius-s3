@@ -580,26 +580,14 @@ async def upload_part(
     redis_client = request.app.state.redis_client
 
     try:
-        # Store in Redis via chunked cache API (encrypt for private, meta-first for readiness)
-        # Resolve destination bucket name for key lookup
-        try:
-            row = await pool.fetchrow(
-                """
-                SELECT b.bucket_name
-                FROM multipart_uploads mu
-                JOIN buckets b ON b.bucket_id = mu.bucket_id
-                WHERE mu.upload_id = $1
-                  AND b.deleted_at IS NULL
-                LIMIT 1
-                """,
-                upload_id,
-            )
-        except Exception:
-            row = None
-        if not row:
-            logger.error(f"Upload row not found for upload_id={upload_id}; refusing to cache part")
+        # Store in Redis via chunked cache API (encrypt for private, meta-first for readiness).
+        # MPU-2: bucket_name and bucket_id already came from get_multipart_upload above
+        # (it returns mu.* + b.bucket_name), so we don't re-run a multipart_uploads⋈buckets JOIN.
+        dest_bucket_name = ongoing_multipart_upload.get("bucket_name")
+        dest_bucket_id = ongoing_multipart_upload.get("bucket_id")
+        if not dest_bucket_name or not dest_bucket_id:
+            logger.error(f"Upload row missing bucket for upload_id={upload_id}; refusing to cache part")
             return s3_error_response("NoSuchUpload", "The specified upload does not exist.", status_code=404)
-        dest_bucket_name = row.get("bucket_name")
 
         redis_start = time.time()
         # Route through ObjectWriter for standardized behavior
@@ -610,6 +598,7 @@ async def upload_part(
                 object_id=str(object_id),
                 object_version=int(current_object_version),
                 bucket_name=str(dest_bucket_name or ""),
+                bucket_id=str(dest_bucket_id),
                 account_address=request.state.account.main_account,
                 part_number=int(part_number),
                 body_iter=body_iter,

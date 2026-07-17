@@ -643,6 +643,7 @@ class ObjectWriter:
         object_id: str,
         object_version: int,
         bucket_name: str,
+        bucket_id: str,
         account_address: str,
         part_number: int,
         body_iter: AsyncIterator[bytes],
@@ -656,19 +657,10 @@ class ObjectWriter:
         if max_size <= 0:
             max_size = 0
 
-        # Resolve bucket_id for this version
-        meta = await self.pool.fetchrow(
-            """
-            SELECT o.bucket_id, ov.storage_version
-              FROM objects o
-              JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = $2
-             WHERE o.object_id = $1
-             LIMIT 1
-            """,
-            object_id,
-            int(object_version),
-        )
-        bucket_id = str(meta["bucket_id"]) if meta and meta.get("bucket_id") else ""
+        # MPU-2: bucket_id is passed by the caller (from the already-fetched multipart_uploads row),
+        # so we no longer re-run an objects⋈object_versions JOIN per part (its storage_version was
+        # never used).
+        bucket_id = str(bucket_id)
         suite_id = "hip-enc/aes256gcm"
         key_bytes = await self._ensure_and_get_v5_dek(
             bucket_id=bucket_id,
@@ -1102,6 +1094,7 @@ class ObjectWriter:
                 object_id=str(object_id),
                 object_version=int(cov),
                 bucket_name=str(bucket_name),
+                bucket_id=str(bucket_id),
                 account_address=account_address,
                 part_number=int(next_part),
                 body_iter=body_iter,
