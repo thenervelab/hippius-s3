@@ -31,21 +31,22 @@ BACKEND_NAME = "arion"
 QUEUE_NAME = "arion_download_requests"
 
 
-async def arion_fetch(identifier: str, account_address: str) -> bytes:
-    """Download ciphertext from Arion by backend identifier."""
-    async with ArionClient() as client:
-        chunks: list[bytes] = []
-        async for chunk in client.download_file(identifier, account_address):
-            chunks.append(chunk)
-    return b"".join(chunks)
-
-
 async def main() -> None:
-    await run_downloader_loop(
-        backend_name=BACKEND_NAME,
-        queue_name=QUEUE_NAME,
-        fetch_fn=arion_fetch,
-    )
+    # One client for the whole loop — fetch_fn runs once per 4 MiB chunk (~1280 for a 5 GiB
+    # part), so a client per call would re-handshake TCP+TLS for every chunk and throw the
+    # keep-alive pool away. Mirrors run_arion_uploader_in_loop / run_arion_unpinner_in_loop.
+    async with ArionClient() as client:
+
+        async def arion_fetch(identifier: str, account_address: str) -> bytes:
+            """Download ciphertext from Arion by backend identifier."""
+            chunks = [chunk async for chunk in client.download_file(identifier, account_address)]
+            return b"".join(chunks)
+
+        await run_downloader_loop(
+            backend_name=BACKEND_NAME,
+            queue_name=QUEUE_NAME,
+            fetch_fn=arion_fetch,
+        )
 
 
 if __name__ == "__main__":
