@@ -34,18 +34,33 @@ def build_resource(service_name: str) -> Resource:
     rate(http_requests_total) reporting 14.5k/s against a true 138/s from the gateway
     audit log — ~105x.
 
-    There is no way to fix this from the collector side. Its accumulator enforces the
-    single-writer principle: the delta-to-cumulative path only accumulates points whose
-    timestamps chain from one stream, and the histogram path drops misaligned points
-    outright (accumulator.go:204 and :256-272, contrib v0.96.0). So delta temporality
-    does NOT help — the identity has to be unique per writer.
+    The collision is structural, not a setting: the exporter's timeseriesSignature()
+    derives job and instance from the resource unconditionally (accumulator.go:333,
+    collector.go:126,326), so identical resources mean one slot no matter how the
+    exporter is configured. In particular resource_to_telemetry_conversion is NOT the
+    cause and flipping it off changes nothing.
 
-    An earlier comment here forbade os.getpid() to protect cardinality. That reasoning
-    was wrong: this attribute is the POD NAME, which already churns completely on every
-    deploy, so a pid adds no new churn axis — only a bounded 4x, and only for as long as
-    a worker lives (UVICORN_MAX_REQUESTS=0 disables recycling, so workers respawn only
-    on crash). The same change removed the account labels, which were 87% of this
-    namespace's series, so cardinality drops sharply on net.
+    Nor is there a way out via delta temporality. The delta-to-cumulative path only
+    accumulates points whose timestamps chain from a single stream and otherwise
+    overwrites the counter with the raw delta, while the histogram path drops
+    misaligned points outright — the code names this "violation of the single-writer
+    principle" (accumulator.go:204 and :256-272, contrib v0.96.0). deltatocumulative
+    keys by identity too. The identity itself has to be unique per writer.
+
+    An earlier comment here forbade os.getpid() to protect cardinality. It was wrong in
+    the main: this attribute is the POD NAME, which already churns completely on every
+    deploy, so the pid mostly rides an axis that already churns, at a bounded 4x — and
+    the same change removed the account labels (87% of this namespace's series), so the
+    net is still a large reduction. But it was not baseless, and two things keep it
+    true rather than lucky:
+      - UVICORN_MAX_REQUESTS=0. It disables worker recycling, so pids turn over only on
+        crash. start-gateway.sh invites raising it if a leak ever appears; doing so
+        would recycle workers continuously and turn this 4x into genuine churn, because
+        a crash-respawn mints a new pid under a STABLE pod name — an axis the pod name
+        alone does not have.
+      - metric_expiration: 180m on the collector, which keeps every dead series
+        resident for 3h after its writer is gone.
+    If either changes, re-measure before assuming this is still cheap.
 
     Resource.create() merges OTEL_RESOURCE_ATTRIBUTES from env first and the dict passed
     here wins over it — which matters, because the deployments set

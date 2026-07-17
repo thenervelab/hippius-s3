@@ -1,6 +1,5 @@
 import logging
 import os
-import socket
 from typing import Optional
 from typing import Union
 
@@ -11,9 +10,10 @@ from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-from opentelemetry.sdk.resources import Resource
 from redis.asyncio import Redis
 from redis.asyncio.cluster import RedisCluster
+
+from hippius_s3.otel_setup import build_resource
 
 
 logger = logging.getLogger(__name__)
@@ -645,12 +645,17 @@ def initialize_metrics_collector(redis_client: Union[Redis, RedisCluster]) -> Me
         endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
         service_name = os.getenv("OTEL_SERVICE_NAME", "hippius-s3")
 
-        # Hostname alone, unlike otel_setup.configure_otel which appends the pid. This
-        # branch is only reached by processes that never called configure_otel — the
-        # workers, which are one process per pod and so already satisfy the exporter's
-        # single-writer principle. Adding a pid here would buy nothing and would mint a
-        # fresh series set on every in-place container restart.
-        resource = Resource.create({"service.name": service_name, "service.instance.id": socket.gethostname()})
+        # Same per-process identity as configure_otel. No deployed config reaches this
+        # branch — api/gateway call configure_otel, and workers run under
+        # opentelemetry-instrument, which sets a MeterProvider before the worker body
+        # runs, so the isinstance guard above short-circuits. It survives only for a
+        # bare `python workers/...` with monitoring on. Build the resource the one right
+        # way regardless: an earlier version of this line hardcoded the hostname on the
+        # reasoning that only single-process workers land here, which is exactly the kind
+        # of confident assumption about who-calls-what that produced the 105x in the
+        # first place. If init order ever changes and api/gateway fall through to here,
+        # this must not silently reintroduce it.
+        resource = build_resource(service_name)
 
         metric_reader = PeriodicExportingMetricReader(
             OTLPMetricExporter(endpoint=endpoint, insecure=True),
