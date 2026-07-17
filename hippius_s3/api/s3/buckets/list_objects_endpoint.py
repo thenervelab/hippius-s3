@@ -213,36 +213,38 @@ async def _collect_page(
     seen_prefixes: set[str] = set()
     query = get_query("list_objects")
 
-    while True:
-        batch = await pool.fetch(query, bucket_id, prefix, cursor, batch_limit)
-        if not batch:
-            return items, False, None
+    # LS-45: hold one pooled connection for the whole skip-scan instead of acquire/release per batch.
+    async with pool.acquire() as conn:
+        while True:
+            batch = await conn.fetch(query, bucket_id, prefix, cursor, batch_limit)
+            if not batch:
+                return items, False, None
 
-        for row in batch:
-            key = row["object_key"]
-            if cursor is not None and key < cursor:
-                # Row sorts before a collapsed-group boundary we already jumped — skip cheaply.
-                continue
-
-            di = key.find(delimiter, plen) if delimiter else -1
-            if di == -1:
-                items.append(("content", row))
-                cursor = _content_resume(key)
-            else:
-                common_prefix = key[: di + dlen]
-                cursor = _prefix_resume(common_prefix)
-                if common_prefix in seen_prefixes:
+            for row in batch:
+                key = row["object_key"]
+                if cursor is not None and key < cursor:
+                    # Row sorts before a collapsed-group boundary we already jumped — skip cheaply.
                     continue
-                seen_prefixes.add(common_prefix)
-                if cp_floor is not None and common_prefix <= cp_floor:
-                    continue
-                items.append(("prefix", common_prefix))
 
-            if len(items) > target:
-                # The (target+1)th item proves truncation; resume just past the last KEPT item.
-                kind, payload = items[target - 1]
-                next_cursor = _prefix_resume(payload) if kind == "prefix" else _content_resume(payload["object_key"])
-                return items[:target], True, next_cursor
+                di = key.find(delimiter, plen) if delimiter else -1
+                if di == -1:
+                    items.append(("content", row))
+                    cursor = _content_resume(key)
+                else:
+                    common_prefix = key[: di + dlen]
+                    cursor = _prefix_resume(common_prefix)
+                    if common_prefix in seen_prefixes:
+                        continue
+                    seen_prefixes.add(common_prefix)
+                    if cp_floor is not None and common_prefix <= cp_floor:
+                        continue
+                    items.append(("prefix", common_prefix))
 
-        if len(batch) < batch_limit:
-            return items, False, None
+                if len(items) > target:
+                    # The (target+1)th item proves truncation; resume just past the last KEPT item.
+                    kind, payload = items[target - 1]
+                    next_cursor = _prefix_resume(payload) if kind == "prefix" else _content_resume(payload["object_key"])
+                    return items[:target], True, next_cursor
+
+            if len(batch) < batch_limit:
+                return items, False, None
