@@ -369,6 +369,11 @@ async def _get_cached_active_kek_id(bucket_id: str) -> uuid.UUID | None:
         if expires_at <= now:
             _ACTIVE_KEK_CACHE.pop(str(bucket_id), None)
             return None
+        # KM-3: sliding window, symmetric with _get_cached_kek — refresh the TTL on read so a
+        # continuously-hot bucket doesn't re-SELECT the (unchanged) active kek_id every TTL. Reads
+        # stay correct regardless since decrypts key off the object row's stored kek_id; a future
+        # rotation feature must invalidate this entry when it flips the active KEK.
+        _ACTIVE_KEK_CACHE[str(bucket_id)] = (kek_id, now + ttl)
         return kek_id
 
 
