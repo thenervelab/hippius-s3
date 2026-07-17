@@ -210,9 +210,12 @@ async def handle_head_object(
         with tracer.start_as_current_span("head_object.check_cache_status") as span:
             source = "pipeline"
             try:
+                # HD-6: exists() takes (object_id, object_version, part_number); the old 2-arg call
+                # raised a TypeError swallowed below, so the header was always "pipeline". Pass the
+                # version + part 1 so the hint is truthful. Costs one meta stat per HEAD.
                 obj_id_str = str(row["object_id"])
                 oc = request.app.state.obj_cache
-                has1 = await oc.exists(obj_id_str, 1)
+                has1 = await oc.exists(obj_id_str, int(row["object_version"]), 1)
                 source = "cache" if has1 else "pipeline"
                 headers["x-hippius-source"] = source
             except Exception:
