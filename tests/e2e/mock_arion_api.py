@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi import File
 from fastapi import Form
 from fastapi import HTTPException
+from fastapi import Request
 from fastapi import UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -15,6 +16,37 @@ app = FastAPI()
 
 # In-memory store keyed by upload_id -> {"bytes": bytes, "account_ss58": str, "file_id": str}
 _store: dict[str, dict] = {}
+
+# Distinct peers seen on /download. A new TCP connection always arrives from a new ephemeral
+# source port, so len(_download_peers) counts connections while _download_requests counts
+# requests. The gap between them is what proves the downloader reuses a keep-alive pool
+# rather than handshaking per chunk — see test_Downloader_ConnectionReuse.py. Toxiproxy sits
+# in front of us but relays 1:1, so a per-request downstream connection still shows up here
+# as a distinct peer.
+_download_peers: set[tuple[str, int]] = set()
+_download_requests = 0
+
+
+@app.middleware("http")
+async def _track_download_connections(request: Request, call_next):
+    global _download_requests
+    if request.url.path.startswith("/download/") and request.client is not None:
+        _download_peers.add((request.client.host, request.client.port))
+        _download_requests += 1
+    return await call_next(request)
+
+
+@app.get("/debug/download_stats")
+async def download_stats() -> dict:
+    return {"connections": len(_download_peers), "requests": _download_requests}
+
+
+@app.post("/debug/reset_download_stats")
+async def reset_download_stats() -> dict:
+    global _download_requests
+    _download_peers.clear()
+    _download_requests = 0
+    return {"status": "reset"}
 
 
 class UploadResult(BaseModel):
@@ -72,7 +104,7 @@ async def can_upload(body: CanUploadRequest) -> CanUploadResult:
 
 @app.delete("/delete/{user_id}/{identifier}")
 async def delete(user_id: str, identifier: str) -> DeleteResult:
-    entry = _store.pop(identifier, None)
+    _store.pop(identifier, None)
     return DeleteResult(Success={"status": "deleted", "file_id": identifier, "user_id": user_id})
 
 
