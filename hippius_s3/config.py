@@ -185,6 +185,17 @@ class Config:
     unpinner_max_attempts: int = env("HIPPIUS_UNPINNER_MAX_ATTEMPTS:5", convert=int)
     unpinner_backoff_base_ms: int = env("HIPPIUS_UNPINNER_BACKOFF_BASE_MS:1000", convert=int)
     unpinner_backoff_max_ms: int = env("HIPPIUS_UNPINNER_BACKOFF_MAX_MS:60000", convert=int)
+    # Batch-delete via HCFS POST /delete_files (up to 1000 file deletes per HTTP call) instead of one
+    # DELETE per chunk. Feature-flagged OFF: prod stays per-file until the flag is flipped AND HCFS
+    # confirms /delete_files accepts our empty folder_hash. See docs/issues/unpinner-batch-delete.md.
+    unpinner_batch_delete_enabled: bool = env(
+        "HIPPIUS_UNPINNER_BATCH_DELETE:false", convert=lambda x: x.lower() == "true"
+    )
+    # Max file_ids per batch call — hard-capped at 1000 (HCFS limit) by the loop regardless of this.
+    unpinner_batch_max_files: int = env("HIPPIUS_UNPINNER_BATCH_MAX_FILES:1000", convert=int)
+    # folder_hash sent to /delete_files. Our S3 objects are uploaded with NO folder, so "" (root).
+    # MERGE-BLOCKER: HCFS must confirm empty folder_hash works before this is used in prod.
+    unpinner_folder_hash: str = env("HIPPIUS_ARION_FOLDER_HASH:", convert=str)
 
     # Per-operation backend lists (queue names derived as {backend}_{op}_requests)
     upload_backends: list[str] = env("HIPPIUS_UPLOAD_BACKENDS:arion", convert=_parse_backends)
