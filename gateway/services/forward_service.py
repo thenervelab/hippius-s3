@@ -92,7 +92,7 @@ class ForwardService:
         self.backend_url = backend_url
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(300.0, connect=10.0),
-            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=100, keepalive_expiry=30),
             follow_redirects=False,
         )
         logger.info(f"ForwardService initialized with backend: {backend_url}")
