@@ -195,7 +195,7 @@ async def test_returns_keys_within_max_keys_no_truncation() -> None:
     # SQL gets max_keys+1 to detect truncation
     pool.fetch.assert_awaited_once()
     call_args = pool.fetch.call_args.args
-    assert call_args[-1] == 51
+    assert call_args[4] == 51
 
 
 @pytest.mark.asyncio
@@ -340,7 +340,7 @@ async def test_max_keys_above_1000_is_clamped() -> None:
     root = _parse(resp.body)
     assert _text(root, "MaxKeys") == "1000"
     # SQL also called with the clamped value (+1 for truncation detection)
-    assert pool.fetch.call_args.args[-1] == 1001
+    assert pool.fetch.call_args.args[4] == 1001
 
 
 @pytest.mark.asyncio
@@ -821,9 +821,12 @@ async def test_prefix_is_passed_to_sql() -> None:
         encoding_type=None,
         delimiter=None,
     )
-    # SQL positional args: 0=SQL_text, 1=bucket_id, 2=prefix, 3=cursor, 4=limit
+    # SQL positional args: 0=SQL_text, 1=bucket_id, 2=prefix, 3=cursor, 4=limit, 5=prefix_upper
     call_args = pool.fetch.call_args.args
     assert call_args[2] == "genomes/HG001/"
+    # LS-2: an explicit exclusive upper bound (the prefix successor) is passed so the index range is
+    # bounded on both ends. "genomes/HG001/" → last code point '/' (0x2F) bumped to '0' (0x30).
+    assert call_args[5] == "genomes/HG001" + chr(0x30)
 
 
 @pytest.mark.asyncio

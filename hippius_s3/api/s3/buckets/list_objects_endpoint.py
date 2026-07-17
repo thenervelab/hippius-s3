@@ -212,11 +212,16 @@ async def _collect_page(
     items: list[tuple[str, Any]] = []
     seen_prefixes: set[str] = set()
     query = get_query("list_objects")
+    # LS-2: exclusive upper bound for the prefix range. Only pass it when _prefix_resume actually
+    # produced a successor (a pathological all-U+10FFFF prefix returns itself → keep NULL, LIKE guards).
+    prefix_upper = _prefix_resume(prefix) if prefix else None
+    if prefix_upper == prefix:
+        prefix_upper = None
 
     # LS-45: hold one pooled connection for the whole skip-scan instead of acquire/release per batch.
     async with pool.acquire() as conn:
         while True:
-            batch = await conn.fetch(query, bucket_id, prefix, cursor, batch_limit)
+            batch = await conn.fetch(query, bucket_id, prefix, cursor, batch_limit, prefix_upper)
             if not batch:
                 return items, False, None
 
