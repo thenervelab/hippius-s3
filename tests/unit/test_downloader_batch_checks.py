@@ -131,3 +131,56 @@ async def test_rd5_batches_existence_and_skips_cached(mock_metrics: Any, mock_co
     assert per_chunk_exist_calls["n"] == 0, "downloader must not call per-chunk chunk_exists during fetch"
     # Only the missing chunk (index 1) is fetched; the pre-cached one is skipped.
     assert fetch_fn.await_count == 1
+
+
+@pytest.mark.asyncio
+@patch("hippius_s3.workers.downloader.get_config")
+@patch("hippius_s3.workers.downloader.get_metrics_collector")
+async def test_rd1_resolves_identifier_via_one_batch_query(
+    mock_metrics: Any, mock_config: Any, fs_store: Any
+) -> None:
+    mock_config.return_value = _config()
+    mock_metrics.return_value = MagicMock()
+
+    singular_id_calls = {"n": 0}
+    batch_calls = {"n": 0}
+    conn = AsyncMock()
+
+    async def _fetchrow(sql: str, *args: Any) -> Any:
+        if "size_bytes" in sql:
+            return {"size_bytes": 4096, "chunk_size_bytes": 4 * 1024 * 1024}
+        if "backend_identifier" in sql or "chunk_backend" in sql:
+            singular_id_calls["n"] += 1
+            return {"backend_identifier": "arion-id"}
+        return None
+
+    async def _fetch(sql: str, *args: Any) -> Any:
+        if "backend_identifier" in sql or "chunk_backend" in sql:
+            batch_calls["n"] += 1
+            return [
+                {"part_number": 1, "chunk_index": 0, "backend_identifier": "arion-id"},
+                {"part_number": 1, "chunk_index": 1, "backend_identifier": "arion-id"},
+            ]
+        return []
+
+    conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+    conn.fetch = AsyncMock(side_effect=_fetch)
+    pool = MagicMock()
+    pool.acquire = MagicMock(
+        return_value=MagicMock(__aenter__=AsyncMock(return_value=conn), __aexit__=AsyncMock(return_value=False))
+    )
+
+    fetch_fn = AsyncMock(return_value=b"z" * 4096)
+    result = await process_download_request(
+        _request(1, 2),
+        backend_name="arion",
+        fetch_fn=fetch_fn,
+        db_pool=pool,
+        obj_cache=_obj_cache(),
+        fs_store=fs_store,
+    )
+
+    assert result is True
+    assert batch_calls["n"] == 1, "identifier must be resolved by one batch query per request"
+    assert singular_id_calls["n"] == 0, "no per-chunk identifier fetchrow when the batch map has the entry"
+    assert fetch_fn.await_count == 2

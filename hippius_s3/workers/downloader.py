@@ -135,6 +135,23 @@ async def process_download_request(
         base_sleep = config.downloader_retry_base_seconds
         jitter = config.downloader_retry_jitter_seconds
 
+        # RD-1: resolve every chunk's backend_identifier in one query per request instead of a
+        # pool-acquire + 3-table-join fetchrow per chunk. _fetch_chunk reads this map; on a miss it
+        # falls back to the singular lookup to close the window where a chunk's backend row landed
+        # after this snapshot (mid-upload race).
+        async with db_pool.acquire() as conn:
+            id_rows = await conn.fetch(
+                get_query("get_chunk_backend_identifiers_by_part"),
+                backend_name,
+                download_request.object_id,
+                int(download_request.object_version),
+            )
+        backend_id_map: dict[tuple[int, int], str] = {
+            (int(r["part_number"]), int(r["chunk_index"])): str(r["backend_identifier"])
+            for r in id_rows
+            if r["backend_identifier"]
+        }
+
         t_request_start = time.perf_counter()
         ttfb_recorded = False
         ttfb_ms = 0.0
@@ -154,21 +171,23 @@ async def process_download_request(
                 return True
 
             async with semaphore:
-                # Look up backend_identifier (acquire connection from pool)
-                async with db_pool.acquire() as conn:
-                    row = await conn.fetchrow(
-                        get_query("get_chunk_backend_identifier"),
-                        backend_name,
-                        download_request.object_id,
-                        int(download_request.object_version),
-                        part_number,
-                        chunk_index,
-                    )
-                if not row or not row["backend_identifier"]:
+                # RD-1: read the per-request identifier map; on a miss fall back to the singular
+                # lookup (a chunk's backend row may have landed after the batch snapshot).
+                identifier = backend_id_map.get((part_number, chunk_index))
+                if identifier is None:
+                    async with db_pool.acquire() as conn:
+                        row = await conn.fetchrow(
+                            get_query("get_chunk_backend_identifier"),
+                            backend_name,
+                            download_request.object_id,
+                            int(download_request.object_version),
+                            part_number,
+                            chunk_index,
+                        )
+                    identifier = str(row["backend_identifier"]) if row and row["backend_identifier"] else None
+                if not identifier:
                     logger.debug(f"[{backend_name}] No identifier for part={part_number} ci={chunk_index}, skipping")
                     return True
-
-                identifier = str(row["backend_identifier"])
 
                 # Fetch with retries
                 for attempt in range(1, max_attempts + 1):
