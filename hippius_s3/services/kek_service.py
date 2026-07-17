@@ -535,31 +535,39 @@ async def get_bucket_kek_bytes(*, bucket_id: str, kek_id: uuid.UUID) -> bytes:
     if not dsn:
         raise RuntimeError("kek_database_unavailable")
 
-    pool = await _get_pool(dsn)
-    async with pool.acquire() as conn:
-        await _maybe_ensure_tables(conn)
+    # KM-1: singleflight the cold unwrap so N concurrent GETs sharing a bucket's KEK collapse to one
+    # KMS round trip (mirrors the PUT path). The re-check inside the lock catches the fill by the
+    # winner; losers also stop competing for the keystore pool across the KMS call.
+    async with _kek_unwrap_lock(bucket_id, kek_id):
+        cached = await _get_cached_kek(bucket_id, kek_id)
+        if cached is not None:
+            return cached
 
-        row = await conn.fetchrow(
-            """
-            SELECT wrapped_kek_bytes, kms_key_id
-              FROM bucket_keks
-             WHERE bucket_id = $1
-               AND kek_id = $2
-             LIMIT 1
-            """,
-            uuid.UUID(str(bucket_id)),
-            uuid.UUID(str(kek_id)),
-        )
-        if row is None:
-            raise RuntimeError("kek_not_found")
+        pool = await _get_pool(dsn)
+        async with pool.acquire() as conn:
+            await _maybe_ensure_tables(conn)
 
-        # Unwrap the KEK
-        wrapped_kek_bytes = row["wrapped_kek_bytes"]
-        kms_key_id = row["kms_key_id"]
-        kek_bytes = await _unwrap_kek(bytes(wrapped_kek_bytes), kms_key_id, kek_id)
+            row = await conn.fetchrow(
+                """
+                SELECT wrapped_kek_bytes, kms_key_id
+                  FROM bucket_keks
+                 WHERE bucket_id = $1
+                   AND kek_id = $2
+                 LIMIT 1
+                """,
+                uuid.UUID(str(bucket_id)),
+                uuid.UUID(str(kek_id)),
+            )
+            if row is None:
+                raise RuntimeError("kek_not_found")
 
-        await _set_cached_kek(bucket_id, kek_id, kek_bytes)
-        return kek_bytes
+            # Unwrap the KEK
+            wrapped_kek_bytes = row["wrapped_kek_bytes"]
+            kms_key_id = row["kms_key_id"]
+            kek_bytes = await _unwrap_kek(bytes(wrapped_kek_bytes), kms_key_id, kek_id)
+
+            await _set_cached_kek(bucket_id, kek_id, kek_bytes)
+            return kek_bytes
 
 
 async def close_kek_pool() -> None:
