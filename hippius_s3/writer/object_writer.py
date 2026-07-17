@@ -21,6 +21,7 @@ from hippius_s3.cache import create_fs_store
 from hippius_s3.config import get_config
 from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.db_retry import retry_on_object_version_conflict
+from hippius_s3.services.crypto_pool import run_crypto
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.storage_version import require_supported_storage_version
@@ -342,7 +343,7 @@ class ObjectWriter:
                     # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
                     # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
                     t0 = time.monotonic()
-                    ct = adapter.encrypt_chunk(
+                    ct = await run_crypto(adapter.encrypt_chunk,
                         buf,
                         key=key_bytes,
                         bucket_id=str(bucket_id),
@@ -369,7 +370,7 @@ class ObjectWriter:
                 # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
                 # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
                 t0 = time.monotonic()
-                ct = adapter.encrypt_chunk(
+                ct = await run_crypto(adapter.encrypt_chunk,
                     buf,
                     key=key_bytes,
                     bucket_id=str(bucket_id),
@@ -787,7 +788,7 @@ class ObjectWriter:
                     # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
                     # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
                     t0 = time.monotonic()
-                    ct = adapter.encrypt_chunk(
+                    ct = await run_crypto(adapter.encrypt_chunk,
                         buf,
                         key=key_bytes,
                         bucket_id=bucket_id,
@@ -814,7 +815,7 @@ class ObjectWriter:
                 # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
                 # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
                 t0 = time.monotonic()
-                ct = adapter.encrypt_chunk(
+                ct = await run_crypto(adapter.encrypt_chunk,
                     buf,
                     key=key_bytes,
                     bucket_id=bucket_id,
