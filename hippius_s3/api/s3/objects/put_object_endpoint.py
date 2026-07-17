@@ -223,16 +223,12 @@ async def handle_put_object(
         get_metrics_collector().record_s3_operation(
             operation="put_object",
             bucket_name=bucket_name,
-            main_account=main_account_id,
-            subaccount_id=request.state.account.id,
             success=True,
         )
         get_metrics_collector().record_data_transfer(
             operation="put_object",
             bytes_transferred=int(put_res.size_bytes),
             bucket_name=bucket_name,
-            main_account=main_account_id,
-            subaccount_id=request.state.account.id,
         )
 
         # New or overwrite base object: expose append-version so clients can start append flow without HEAD
@@ -256,7 +252,6 @@ async def handle_put_object(
             error_type="internal_error",
             operation="put_object",
             bucket_name=bucket_name,
-            main_account=getattr(request.state, "account", None) and request.state.account.main_account,
         )
         return errors.s3_error_response(
             "InternalError",
