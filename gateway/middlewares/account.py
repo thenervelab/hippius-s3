@@ -185,15 +185,27 @@ async def account_middleware(
         account_address = request.state.account_address
 
         try:
-            redis_accounts_client = request.app.state.redis_accounts
-            request.state.account = await fetch_account_by_main_address(
-                account_address,
-                redis_accounts_client,
-                config.substrate_url,
-            )
             request.state.account_id = account_address
 
-            if request.method in ["PUT", "POST", "DELETE"]:
+            # GW-4: reads (GET/HEAD) carry no credit gate and the internal API never reads the credit
+            # fields, so skip the redis-accounts fetch on the hottest path and stamp a lightweight
+            # account (main_account is still needed for audit/header stamping). Only mutating methods
+            # fetch the real account and run the credit/can_upload checks.
+            if request.method not in ["PUT", "POST", "DELETE"]:
+                request.state.account = HippiusAccount(
+                    id=account_address,
+                    main_account=account_address,
+                    has_credits=False,
+                    upload=False,
+                    delete=False,
+                )
+            else:
+                redis_accounts_client = request.app.state.redis_accounts
+                request.state.account = await fetch_account_by_main_address(
+                    account_address,
+                    redis_accounts_client,
+                    config.substrate_url,
+                )
                 logger.debug(f"Checking credit for {request.method} operation: {path}")
 
                 if not request.state.account.has_credits:
