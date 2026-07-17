@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from dataclasses import dataclass
@@ -46,6 +47,31 @@ class StreamContext:
     suite_id: str | None
     bucket_id: str
     upload_id: str
+
+
+# RQ-4: compare-and-delete Lua — delete the coalesce lock only while it still holds our token, so we
+# never steal a lock a later streamer/downloader re-acquired. Fixed script (no user input in the body);
+# mirrors the downloader's release. The key format must match _enqueue_missing_downloads exactly.
+_COALESCE_LOCK_RELEASE_LUA = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
+
+
+async def _release_coalesce_locks(
+    redis: Any,
+    *,
+    object_id: str,
+    object_version: int,
+    part_numbers: set[int],
+    ray_token: str,
+) -> None:
+    """Best-effort CAD-release of this streamer's per-part coalesce locks (RQ-4).
+
+    Called when the first-chunk wait times out so the next GET re-enqueues immediately instead of
+    waiting out the lock TTL. CAD-on-token means locks we don't own (lost the coalesce race) no-op.
+    """
+    for pn in part_numbers:
+        lock_key = f"download_in_progress:{object_id}:v:{int(object_version)}:part:{int(pn)}"
+        with contextlib.suppress(Exception):
+            await redis.eval(_COALESCE_LOCK_RELEASE_LUA, 1, lock_key, ray_token)
 
 
 # RQ-3: backends whose downloader fetches by content id (CID) rather than a deterministic
@@ -359,6 +385,20 @@ async def read_response(
         # ChunkNotReadyError: the downloader gave up fast on a backend miss and notified anyway, so
         # the peek woke to an empty cache. Same retryable outcome as a timeout — a 503, not a 500.
         await gen.aclose()
+        # RQ-4: release the coalesce locks this streamer set (CAD on our ray token) so the client's
+        # retry re-enqueues immediately rather than waiting out the lock TTL (default 600s).
+        await _release_coalesce_locks(
+            redis,
+            object_id=str(info["object_id"]),
+            object_version=int(ctx.object_version),
+            # Best-effort on the error path: a malformed plan item must never turn the 503 into a 500.
+            part_numbers={
+                int(getattr(item, "part_number", 0))
+                for item in ctx.plan
+                if getattr(item, "part_number", None) is not None
+            },
+            ray_token=str(info.get("ray_id") or "anonymous"),
+        )
         raise DownloadNotReadyError(
             "Parts not ready: first chunk did not arrive within the initial stream timeout"
         ) from exc
