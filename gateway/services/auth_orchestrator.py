@@ -79,7 +79,7 @@ async def authenticate_request(request: Request) -> AuthResult:
     try:
         credential, _, _, _ = extract_credential_from_auth_header(auth_header)
     except AuthParsingError as e:
-        logger.error(f"Failed to extract credential: {e}")
+        logger.warning(f"Failed to extract credential: {e}")
         return AuthResult(
             error_response=s3_error_response(
                 code="InvalidAccessKeyId",

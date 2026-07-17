@@ -173,13 +173,15 @@ class Config:
     # Unpinner configuration
     # How many unpin requests one unpinner pod processes concurrently (outer bounded-dispatch,
     # mirroring the uploader). The old loop was a serial consumer.
-    unpinner_max_inflight: int = env("HIPPIUS_UNPINNER_MAX_INFLIGHT:4", convert=int)
+    unpinner_max_inflight: int = env("HIPPIUS_UNPINNER_MAX_INFLIGHT:8", convert=int)
     # Single shared per-pod bound on concurrent Arion DELETEs across ALL in-flight requests — one
     # fat request expands to ~N chunk identifiers, so this is what actually unlocks delete throughput.
     unpinner_parallelism: int = env("HIPPIUS_UNPINNER_PARALLELISM:5", convert=int)
-    # Per-pod unpinner DB pool size (concurrent soft-deletes). Multiplied by replica count against
-    # Postgres max_connections — keep modest and raise alongside parallelism.
-    unpinner_db_pool_max: int = env("HIPPIUS_UNPINNER_DB_POOL_MAX:12", convert=int)
+    # Explicit CAP on the per-pod unpinner DB pool. The loop sizes the pool to the throughput-optimal
+    # `max_inflight + parallelism` but never above this cap, so raising max_inflight (an ops secret)
+    # can't balloon Postgres connections (per pod × replicas runs close to server max_connections).
+    # The cap is clamped up to the deadlock-safe floor (parallelism + 1); see run_unpinner_loop.
+    unpinner_db_pool_max: int = env("HIPPIUS_UNPINNER_DB_POOL_MAX:16", convert=int)
     unpinner_max_attempts: int = env("HIPPIUS_UNPINNER_MAX_ATTEMPTS:5", convert=int)
     unpinner_backoff_base_ms: int = env("HIPPIUS_UNPINNER_BACKOFF_BASE_MS:1000", convert=int)
     unpinner_backoff_max_ms: int = env("HIPPIUS_UNPINNER_BACKOFF_MAX_MS:60000", convert=int)

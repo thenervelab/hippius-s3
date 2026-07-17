@@ -141,7 +141,7 @@ async def create_canonical_request(
             logger.debug("No payload hash header found; treating presigned request as UNSIGNED-PAYLOAD")
             payload_hash = "UNSIGNED-PAYLOAD"
         else:
-            logger.error("FAIL: Missing x-amz-content-sha256 header")
+            logger.warning("FAIL: Missing x-amz-content-sha256 header")
             raise AuthParsingError("Missing payload hash header")
     if payload_hash == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD":
         payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
