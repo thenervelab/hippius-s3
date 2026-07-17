@@ -510,6 +510,31 @@ class ObjectWriter:
         from hippius_s3.services.kek_service import get_bucket_kek_bytes
         from hippius_s3.services.kek_service import get_or_create_active_bucket_kek
 
+        # MPU-1: fast, non-locking read first. Parts 2..N of an MPU share one object_version row whose
+        # envelope the first part already populated, so they unwrap the DEK concurrently instead of
+        # serializing on that row's FOR UPDATE lock. Only the create/rotate case (envelope still NULL,
+        # or rotate) escalates to the locked path below, whose in-lock re-check keeps the first-part
+        # race idempotent.
+        if not rotate:
+            pre = await self.pool.fetchrow(
+                """
+                SELECT storage_version, kek_id, wrapped_dek
+                  FROM object_versions
+                 WHERE object_id = $1 AND object_version = $2
+                """,
+                object_id,
+                int(object_version),
+            )
+            if pre is not None:
+                if int(pre.get("storage_version") or 0) < 5:
+                    raise RuntimeError("not_v5_object_version")
+                pre_kek_id = pre.get("kek_id")
+                pre_wrapped = pre.get("wrapped_dek")
+                if pre_kek_id and pre_wrapped:
+                    kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=pre_kek_id)
+                    aad = f"hippius-dek:{bucket_id}:{object_id}:{int(object_version)}".encode("utf-8")
+                    return unwrap_dek(kek=kek_bytes, wrapped_dek=bytes(pre_wrapped), aad=aad)
+
         async with self.pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 """
