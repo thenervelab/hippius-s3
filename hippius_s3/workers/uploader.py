@@ -172,7 +172,6 @@ class Uploader:
             span.set_attribute("result.duration_s", total_duration)
 
             get_metrics_collector().record_uploader_operation(
-                main_account=payload.address,
                 success=True,
                 backend=self.backend_name,
                 num_chunks=len(payload.chunks),
@@ -403,7 +402,6 @@ class Uploader:
             etype = "transient" if etype else "permanent"
 
         get_metrics_collector().record_uploader_operation(
-            main_account=payload.address,
             success=False,
             backend=self.backend_name,
             error_type=etype,

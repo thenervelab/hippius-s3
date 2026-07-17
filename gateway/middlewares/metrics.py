@@ -47,8 +47,6 @@ async def metrics_middleware(
         request=request,
         response=response,
         duration=duration,
-        main_account=main_account,
-        subaccount_id=subaccount_id,
         handler=endpoint_name,
     )
 
@@ -61,7 +59,6 @@ async def metrics_middleware(
             method=request.method,
             status_code=response.status_code,
             handler=endpoint_name,
-            main_account=main_account,
         )
 
         span = trace.get_current_span()
@@ -76,7 +73,6 @@ async def metrics_middleware(
             error_type=error_type,
             operation=endpoint_name,
             bucket_name=None,
-            main_account=main_account,
         )
 
     return response

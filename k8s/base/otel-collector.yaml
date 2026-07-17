@@ -13,11 +13,16 @@ data:
             endpoint: 0.0.0.0:4318
 
     processors:
-      resource:
-        attributes:
-          - key: service.name
-            value: "hippius-s3"
-            action: upsert
+      # NOTE: there is deliberately no `resource` processor here any more. It used to
+      # upsert service.name: "hippius-s3" onto every metric and log, overwriting the
+      # name each service had already set for itself — configure_otel("hippius-s3-api")
+      # in hippius_s3/main.py, configure_otel("hippius-s3-gateway") in gateway/main.py,
+      # OTEL_SERVICE_NAME in start-worker.sh. The result was service_name="hippius-s3"
+      # and exported_job="hippius-s3-prod/hippius-s3" on EVERYTHING, so api, gateway and
+      # workers were indistinguishable in Prometheus and alert rules had to fall back to
+      # matching pod names (exported_instance=~"api-.*"), which breaks on any rename.
+      # The traces pipeline never had this processor, which is why Tempo has always shown
+      # the correct per-service names; removing it here brings metrics and logs in line.
       batch:
         timeout: 1s
         send_batch_size: 1024
@@ -57,7 +62,7 @@ data:
       pipelines:
         metrics:
           receivers: [otlp]
-          processors: [memory_limiter, resource, batch]
+          processors: [memory_limiter, batch]
           exporters: [prometheus]
         traces:
           receivers: [otlp]
@@ -65,7 +70,7 @@ data:
           exporters: [otlp/tempo]
         logs:
           receivers: [otlp]
-          processors: [memory_limiter, resource, batch]
+          processors: [memory_limiter, batch]
           exporters: [loki]
 ---
 apiVersion: apps/v1

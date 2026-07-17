@@ -22,6 +22,45 @@ logger = logging.getLogger(__name__)
 _otel_configured_pid: int | None = None
 
 
+def build_resource(service_name: str) -> Resource:
+    """Identify this PROCESS — not this pod — to the collector.
+
+    configure_otel runs once per forked uvicorn worker (see the pid guard below), so
+    with UVICORN_WORKERS=4 a pod holds four independent MeterProviders. If they share
+    one service.instance.id, their four cumulative counters collide in a single
+    accumulator slot in the collector's prometheus exporter: the exported value
+    flip-flops between workers and every downward step reads as a counter reset.
+    Measured on prod 2026-07-17 before this fix, 19 resets per series per 10m, and
+    rate(http_requests_total) reporting 14.5k/s against a true 138/s from the gateway
+    audit log — ~105x.
+
+    There is no way to fix this from the collector side. Its accumulator enforces the
+    single-writer principle: the delta-to-cumulative path only accumulates points whose
+    timestamps chain from one stream, and the histogram path drops misaligned points
+    outright (accumulator.go:204 and :256-272, contrib v0.96.0). So delta temporality
+    does NOT help — the identity has to be unique per writer.
+
+    An earlier comment here forbade os.getpid() to protect cardinality. That reasoning
+    was wrong: this attribute is the POD NAME, which already churns completely on every
+    deploy, so a pid adds no new churn axis — only a bounded 4x, and only for as long as
+    a worker lives (UVICORN_MAX_REQUESTS=0 disables recycling, so workers respawn only
+    on crash). The same change removed the account labels, which were 87% of this
+    namespace's series, so cardinality drops sharply on net.
+
+    Resource.create() merges OTEL_RESOURCE_ATTRIBUTES from env first and the dict passed
+    here wins over it — which matters, because the deployments set
+    service.instance.id=$(POD_NAME) there and that would otherwise undo this silently.
+    Everything else in that env var (service.namespace, deployment.environment) still
+    merges through.
+    """
+    return Resource.create(
+        {
+            "service.name": service_name,
+            "service.instance.id": f"{socket.gethostname()}:{os.getpid()}",
+        }
+    )
+
+
 def configure_otel(service_name: str) -> None:
     """Programmatic OTel initialization, safe to call per-worker after fork.
 
@@ -42,17 +81,7 @@ def configure_otel(service_name: str) -> None:
 
     endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
 
-    # Resource.create() automatically merges OTEL_RESOURCE_ATTRIBUTES from env
-    # Keep service.instance.id at the (stable) pod hostname — never append os.getpid().
-    # The collector promotes this resource attr to the `instance` metric label, so a
-    # per-process value mints a fresh series set for every worker (re)spawn and blows
-    # up Prometheus head cardinality. Workers of one pod aggregate under one instance.
-    resource = Resource.create(
-        {
-            "service.name": service_name,
-            "service.instance.id": socket.gethostname(),
-        }
-    )
+    resource = build_resource(service_name)
 
     # Traces
     tracer_provider = TracerProvider(resource=resource)

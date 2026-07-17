@@ -21,6 +21,21 @@ tracer = trace.get_tracer(__name__)
 
 
 class MetricsCollector:
+    """OTel metrics for the API, gateway and workers.
+
+    Every attribute passed here becomes a Prometheus label, so the value set of each
+    one must be BOUNDED and closed — methods, status codes, backends, named handlers.
+    Never add an attribute whose values are open-ended or chosen by a caller: account
+    ids, bucket names, object keys, request paths, error strings. Those axes grow
+    forever and each new value permanently costs a series.
+
+    This is not theoretical. main_account/subaccount_id were labels here until
+    2026-07-17 and had grown to 87% of the namespace's ~51k series (115 accounts, one
+    new axis value per customer) while no dashboard or alert ever read them. Send
+    per-account detail to the gateway audit log or to spans instead — both index
+    high-cardinality keys by design.
+    """
+
     def __init__(self, redis_client: Union[Redis, RedisCluster]):
         self.redis_client = redis_client
         self.meter = metrics.get_meter(__name__)
@@ -298,21 +313,16 @@ class MetricsCollector:
         request: Request,
         response: Response,
         duration: float,
-        main_account: Optional[str] = None,
-        subaccount_id: Optional[str] = None,
         handler: Optional[str] = None,
     ) -> None:
+        # handler falls back to "unknown", never to request.url.path: the path carries
+        # the object key, so one caller passing handler=None would mint a series per
+        # object and take Prometheus down.
         attributes = {
             "method": request.method,
-            "handler": handler or request.url.path,
+            "handler": handler or "unknown",
             "status_code": str(response.status_code),
         }
-
-        if main_account:
-            attributes["main_account"] = main_account
-
-        if subaccount_id:
-            attributes["subaccount_id"] = subaccount_id
 
         self.http_requests_total.add(1, attributes=attributes)
         self.http_request_duration.record(duration, attributes=attributes)
@@ -329,17 +339,9 @@ class MetricsCollector:
         self,
         operation: str,
         bucket_name: str,
-        main_account: Optional[str] = None,
-        subaccount_id: Optional[str] = None,
         success: bool = True,
     ) -> None:
         attributes = {"operation": operation, "success": str(success).lower()}
-
-        if main_account:
-            attributes["main_account"] = main_account
-
-        if subaccount_id:
-            attributes["subaccount_id"] = subaccount_id
 
         self.s3_operations_total.add(1, attributes=attributes)
 
@@ -348,18 +350,10 @@ class MetricsCollector:
         operation: str,
         bytes_transferred: int,
         bucket_name: str,
-        main_account: Optional[str] = None,
-        subaccount_id: Optional[str] = None,
     ) -> None:
         attributes = {
             "operation": operation,
         }
-
-        if main_account:
-            attributes["main_account"] = main_account
-
-        if subaccount_id:
-            attributes["subaccount_id"] = subaccount_id
 
         if operation in ["upload", "put_object", "post_object", "upload_part"]:
             self.s3_bytes_uploaded.add(bytes_transferred, attributes=attributes)
@@ -373,7 +367,6 @@ class MetricsCollector:
         error_type: str,
         operation: str,
         bucket_name: Optional[str] = None,
-        main_account: Optional[str] = None,
     ) -> None:
         """Record error metrics"""
         attributes = {
@@ -381,21 +374,14 @@ class MetricsCollector:
             "operation": operation,
         }
 
-        if main_account:
-            attributes["main_account"] = main_account
-
         self.s3_errors_total.add(1, attributes=attributes)
 
     def record_cache_operation(
         self,
         hit: bool,
         operation: str,
-        main_account: Optional[str] = None,
     ) -> None:
         attributes = {"operation": operation}
-
-        if main_account:
-            attributes["main_account"] = main_account
 
         if hit:
             self.cache_hits.add(1, attributes=attributes)
@@ -404,7 +390,6 @@ class MetricsCollector:
 
     def record_uploader_operation(
         self,
-        main_account: str,
         success: bool,
         backend: str = "",
         num_chunks: int = 0,
@@ -414,7 +399,6 @@ class MetricsCollector:
         status_code: str = "",
     ) -> None:
         attributes = {
-            "main_account": main_account,
             "success": str(success).lower(),
         }
         if backend:
@@ -426,7 +410,6 @@ class MetricsCollector:
 
         if attempt is not None:
             retry_attributes = {
-                "main_account": main_account,
                 "attempt": str(attempt),
             }
             if backend:
@@ -434,7 +417,6 @@ class MetricsCollector:
             self.uploader_requests_retried_total.add(1, attributes=retry_attributes)
         elif error_type is not None:
             dlq_attributes = {
-                "main_account": main_account,
                 "error_type": error_type,
             }
             if backend:
@@ -449,7 +431,6 @@ class MetricsCollector:
 
     def record_unpinner_operation(
         self,
-        main_account: str,
         success: bool,
         backend: str = "",
         num_files: int = 0,
@@ -458,7 +439,6 @@ class MetricsCollector:
         error_type: Optional[str] = None,
     ) -> None:
         attributes = {
-            "main_account": main_account,
             "success": str(success).lower(),
         }
         if backend:
@@ -466,7 +446,6 @@ class MetricsCollector:
 
         if attempt is not None:
             retry_attributes = {
-                "main_account": main_account,
                 "attempt": str(attempt),
             }
             if backend:
@@ -474,7 +453,6 @@ class MetricsCollector:
             self.unpinner_requests_retried_total.add(1, attributes=retry_attributes)
         elif error_type is not None:
             dlq_attributes = {
-                "main_account": main_account,
                 "error_type": error_type,
             }
             if backend:
@@ -492,14 +470,12 @@ class MetricsCollector:
     def record_downloader_operation(
         self,
         backend: str,
-        main_account: str,
         success: bool,
         duration: Optional[float] = None,
         num_chunks: int = 0,
     ) -> None:
         attributes = {
             "backend": backend,
-            "main_account": main_account,
             "success": str(success).lower(),
         }
 
@@ -517,7 +493,6 @@ class MetricsCollector:
         method: str,
         status_code: int,
         handler: Optional[str] = None,
-        main_account: Optional[str] = None,
     ) -> None:
         attributes: dict[str, str] = {
             "method": method,
@@ -525,8 +500,6 @@ class MetricsCollector:
         }
         if handler:
             attributes["handler"] = handler
-        if main_account:
-            attributes["main_account"] = main_account
 
         self.gateway_overhead_duration.record(duration, attributes=attributes)
 
@@ -672,6 +645,11 @@ def initialize_metrics_collector(redis_client: Union[Redis, RedisCluster]) -> Me
         endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
         service_name = os.getenv("OTEL_SERVICE_NAME", "hippius-s3")
 
+        # Hostname alone, unlike otel_setup.configure_otel which appends the pid. This
+        # branch is only reached by processes that never called configure_otel — the
+        # workers, which are one process per pod and so already satisfy the exporter's
+        # single-writer principle. Adding a pid here would buy nothing and would mint a
+        # fresh series set on every in-place container restart.
         resource = Resource.create({"service.name": service_name, "service.instance.id": socket.gethostname()})
 
         metric_reader = PeriodicExportingMetricReader(

@@ -373,16 +373,12 @@ async def handle_get_object(
             get_metrics_collector().record_s3_operation(
                 operation="get_object",
                 bucket_name=bucket_name,
-                main_account=account.main_account if account else None,
-                subaccount_id=account.id if account else None,
                 success=True,
             )
             get_metrics_collector().record_data_transfer(
                 operation="get_object",
                 bytes_transferred=bytes_transferred,
                 bucket_name=bucket_name,
-                main_account=account.main_account if account else None,
-                subaccount_id=account.id if account else None,
             )
 
         return response
@@ -394,7 +390,6 @@ async def handle_get_object(
             error_type=e.code,
             operation="get_object",
             bucket_name=bucket_name,
-            main_account=account.main_account if account else None,
         )
         return errors.s3_error_response(
             code=e.code,
@@ -413,7 +408,6 @@ async def handle_get_object(
             error_type="download_not_ready",
             operation="get_object",
             bucket_name=bucket_name,
-            main_account=account.main_account if account else None,
         )
         return errors.s3_error_response(
             code="SlowDown",
@@ -429,7 +423,6 @@ async def handle_get_object(
             error_type="internal_error",
             operation="get_object",
             bucket_name=bucket_name,
-            main_account=account.main_account if account else None,
         )
         return errors.s3_error_response(
             code="InternalError",
