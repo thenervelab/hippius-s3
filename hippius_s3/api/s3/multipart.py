@@ -862,16 +862,14 @@ async def list_multipart_uploads(
             get_query("list_multipart_uploads"), bucket["bucket_id"], request.query_params.get("prefix")
         )
 
-        # Filter out any uploads that were very recently aborted (defensive cache for race conditions)
+        # Filter out any uploads that were very recently aborted (defensive cache for race conditions).
+        # MPU-56: one MGET for all recently-aborted flags instead of a serial GET per upload.
         try:
             redis_client: Redis = request.app.state.redis_client
-            filtered_uploads = []
-            for upload in uploads:
-                aborted_flag = await redis_client.get(f"aborted_mpu:{str(upload['upload_id'])}")
-                if aborted_flag:
-                    continue
-                filtered_uploads.append(upload)
-            uploads = filtered_uploads
+            if uploads:
+                flag_keys = [f"aborted_mpu:{str(u['upload_id'])}" for u in uploads]
+                aborted_flags = await redis_client.mget(flag_keys)
+                uploads = [u for u, flag in zip(uploads, aborted_flags, strict=True) if not flag]
         except Exception as _:
             # If Redis not available, proceed with DB results
             pass
