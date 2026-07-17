@@ -13,8 +13,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
 
-/// Drain-poll floor when `CEPHOR_DRAIN_POLL_SECS` is unset (the `chunk_landed`
-/// trigger wakes the worker sooner; this is only the backstop).
+/// Drain-poll period when `CEPHOR_DRAIN_POLL_SECS` is unset. The drain is purely polling — there is
+/// no api NOTIFY / `chunk_landed` wake in the part model (the reconciler is the sole trigger, see
+/// `runtime.rs`), so a part landing just after a poll waits up to this interval to be claimed (DR-6).
 const DEFAULT_DRAIN_POLL: Duration = Duration::from_secs(5);
 /// Reconciler scan period when `CEPHOR_RECONCILE_POLL_SECS` is unset.
 const DEFAULT_RECONCILE_POLL: Duration = Duration::from_mins(1);

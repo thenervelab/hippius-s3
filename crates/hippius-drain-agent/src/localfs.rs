@@ -30,7 +30,10 @@ use tokio::io::AsyncWriteExt;
 
 /// Streaming hash read buffer. Bounds memory so multi-gigabyte chunks are never
 /// read whole into memory just to hash them.
-const HASH_BUF_BYTES: usize = 1 << 16;
+// DR-3: 1 MiB (was 64 KiB). tokio::fs dispatches each read/write to the blocking pool, so a small
+// buffer means ~128 dispatches per 4 MiB chunk copy + ~64 for the readback hash; 1 MiB cuts that
+// ~16x. Peak memory is bounded by drain concurrency × this buffer (a few MiB at the default).
+const HASH_BUF_BYTES: usize = 1 << 20;
 
 /// Confine an identifier to a single path component beneath a root.
 ///
