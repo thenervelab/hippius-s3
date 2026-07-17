@@ -757,10 +757,19 @@ async def abort_multipart_upload(
                 for part in parts:
                     part_num = int(part["part_number"])
                     meta_key = delegate.build_meta_key(str(object_id), object_version, part_num)
-                    await redis_client.delete(meta_key)
                     base_key = delegate.build_key(str(object_id), object_version, part_num)
-                    async for key in redis_client.scan_iter(f"{base_key}:chunk:*"):
-                        await redis_client.delete(key)
+                    # MPU-4: delete the meta + chunk keys by computed name in one pipelined UNLINK
+                    # instead of a per-part keyspace SCAN. num_chunks comes from the FS meta; if it's
+                    # absent (nothing to compute from), fall back to the SCAN.
+                    fs_meta = await request.app.state.fs_store.get_meta(str(object_id), int(object_version), part_num)
+                    num_chunks = int(fs_meta.get("num_chunks", 0)) if fs_meta else 0
+                    if num_chunks > 0:
+                        keys = [meta_key] + [f"{base_key}:chunk:{i}" for i in range(num_chunks)]
+                        await redis_client.unlink(*keys)
+                    else:
+                        await redis_client.delete(meta_key)
+                        async for key in redis_client.scan_iter(f"{base_key}:chunk:*"):
+                            await redis_client.delete(key)
 
         # Stop the drain churn BEFORE deleting the upload header. This aborted version's
         # address will never be written, so its parts and the drain's

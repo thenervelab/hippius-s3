@@ -37,6 +37,7 @@ from hippius_s3.monitoring import set_metrics_collector
 from hippius_s3.repositories.sub_token_scope_repository import SubTokenScopeRepository
 from hippius_s3.sentry import init_sentry
 from hippius_s3.services.arion_service import ArionClient
+from hippius_s3.services.hippius_api_service import HippiusApiClient
 
 
 def factory() -> FastAPI:
@@ -113,6 +114,11 @@ def factory() -> FastAPI:
         )
         logger.info("ArionClient initialized")
 
+        # NET-5: one long-lived HippiusApiClient so auth-cache misses reuse a warm connection pool
+        # instead of building and tearing down a client per miss.
+        app.state.hippius_api_client = HippiusApiClient()
+        logger.info("HippiusApiClient initialized")
+
         async def collect_pool_metrics() -> None:
             while True:
                 await asyncio.sleep(60)
@@ -135,6 +141,8 @@ def factory() -> FastAPI:
 
         if hasattr(app.state, "arion_client"):
             await app.state.arion_client.close()
+        if hasattr(app.state, "hippius_api_client"):
+            await app.state.hippius_api_client.close()
             logger.info("ArionClient closed")
 
         await ats_cache_client.close()

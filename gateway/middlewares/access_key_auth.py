@@ -41,6 +41,15 @@ class TokenAuth:
 ALLOWED_TOKEN_TYPES = {"master", "sub"}
 
 
+def _shared_api_client(request: Request) -> "object | None":
+    # NET-5: the long-lived gateway HippiusApiClient, if present. Best-effort — request.app is absent
+    # in some unit contexts, so cached_auth falls back to a per-miss client when this returns None.
+    try:
+        return request.app.state.hippius_api_client
+    except (KeyError, AttributeError):
+        return None
+
+
 async def verify_access_key_signature(
     request: Request,
     access_key: str,
@@ -66,7 +75,7 @@ async def verify_access_key_signature(
     provided_signature = extract_signature_from_auth_header(auth_header)
     signed_headers = extract_signed_headers(auth_header)
 
-    token_response = await cached_auth(access_key, redis_client)
+    token_response = await cached_auth(access_key, redis_client, _shared_api_client(request))
 
     if not token_response.valid or token_response.status != "active":
         logger.warning(f"Invalid or inactive access key: {access_key[:8]}***, status={token_response.status}")
@@ -232,7 +241,7 @@ async def verify_access_key_presigned_url(
         logger.warning("Presigned URL missing required 'host' header in X-Amz-SignedHeaders")
         raise AccessKeyAuthError("Invalid signed headers")
 
-    token_response = await cached_auth(access_key, redis_client)
+    token_response = await cached_auth(access_key, redis_client, _shared_api_client(request))
 
     if not token_response.valid or token_response.status != "active":
         logger.warning(
