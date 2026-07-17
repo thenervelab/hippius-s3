@@ -96,3 +96,55 @@ async def test_distinct_keks_do_not_collapse(monkeypatch: Any, kek_env: Any) -> 
         kek_service.get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=k2),
     )
     assert calls["n"] == 2, "distinct keks must each unwrap (no cross-key collapse)"
+
+
+class _NoActiveConn:
+    """Keystore conn for a brand-new bucket: no active KEK row; INSERT succeeds (no unique clash)."""
+
+    async def fetchrow(self, *_a: Any, **_k: Any) -> Any:
+        return None
+
+    async def execute(self, *_a: Any, **_k: Any) -> None:
+        return None
+
+
+class _NoActivePool:
+    def acquire(self) -> Any:
+        class _Ctx:
+            async def __aenter__(self_: Any) -> _NoActiveConn:
+                return _NoActiveConn()
+
+            async def __aexit__(self_: Any, *_a: Any) -> bool:
+                return False
+
+        return _Ctx()
+
+
+@pytest.mark.asyncio
+async def test_first_put_burst_creates_one_kek(monkeypatch: Any, kek_env: Any) -> None:
+    """KM-2: N concurrent first-PUTs on a bucket with no KEK must generate exactly one KEK."""
+
+    async def fake_get_pool(_dsn: str) -> _NoActivePool:
+        return _NoActivePool()
+
+    monkeypatch.setattr(kek_service, "_get_pool", fake_get_pool)
+    kek_service._ACTIVE_KEK_CACHE.clear()
+    kek_service._kek_create_locks.clear()
+
+    calls = {"n": 0}
+
+    async def counting_create(_desc: str) -> tuple[bytes, bytes, str]:
+        calls["n"] += 1
+        await asyncio.sleep(0.05)
+        return (b"\x44" * 32, b"wrapped", "local")
+
+    monkeypatch.setattr(kek_service, "_create_wrapped_kek", counting_create)
+
+    bucket_id = str(uuid.uuid4())
+    results = await asyncio.gather(
+        *[kek_service.get_or_create_active_bucket_kek(bucket_id=bucket_id) for _ in range(8)]
+    )
+
+    assert calls["n"] == 1, "a first-PUT burst must generate exactly one KEK"
+    kek_ids = {kid for kid, _ in results}
+    assert len(kek_ids) == 1, "all callers must converge on the same KEK"
