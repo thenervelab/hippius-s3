@@ -280,10 +280,16 @@ async def enqueue_unpin_request(payload: UnpinChainRequest, *, queue_name: str |
         logger.info(f"Enqueued unpin request {payload.name=} queues={queue_names}")
 
 
-async def dequeue_unpin_request(queue_name: str = "unpin_requests") -> UnpinChainRequest | None:
-    """Get the next unpin request from the Redis queue."""
+async def dequeue_unpin_request(
+    queue_name: str = "unpin_requests", block_timeout: float = 3
+) -> UnpinChainRequest | None:
+    """Get the next unpin request from the Redis queue.
+
+    ``block_timeout`` is the brpop block (seconds); the batch assembler passes a short value to
+    non-blockingly drain extra requests into one batch after the first blocking dequeue.
+    """
     client = get_queue_client()
-    result = await client.brpop(_normalize_queue_name(queue_name), timeout=3)  # ty: ignore[invalid-await, invalid-argument-type]
+    result = await client.brpop(_normalize_queue_name(queue_name), timeout=block_timeout)  # ty: ignore[invalid-await, invalid-argument-type]
     if result:
         _, queue_data = result
         return UnpinChainRequest.model_validate_json(queue_data)
