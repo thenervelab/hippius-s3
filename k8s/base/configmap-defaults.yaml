@@ -31,6 +31,10 @@ data:
   HIPPIUS_UNPINNER_MAX_ATTEMPTS: "5"
   HIPPIUS_UNPINNER_BACKOFF_BASE_MS: "1000"
   HIPPIUS_UNPINNER_BACKOFF_MAX_MS: "60000"
+  # Batch unpin deletes via HCFS POST /delete_files (up to 1000 file deletes per HTTP call) to drain
+  # the arion_unpin_requests backlog. Auto-falls back to per-file if the endpoint 404s. Verified on
+  # staging (see docs/issues/unpinner-batch-delete.md).
+  HIPPIUS_UNPINNER_BATCH_DELETE: "true"
   ORPHAN_CHECKER_LOOP_SLEEP: "7200"
   ORPHAN_CHECKER_BATCH_SIZE: "100"
   HIPPIUS_ORPHAN_WORKER_ACCOUNT_WHITELIST: ""
