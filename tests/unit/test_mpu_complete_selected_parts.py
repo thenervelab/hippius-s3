@@ -33,6 +33,13 @@ _SIZE_ROWS = [
 ]
 _FULL_SIZE = 300  # 100 + 200: the size an accidental "all parts" completion would produce.
 
+# MPU-3: `list_parts_for_version` is SELECT * — the endpoint's already-fetched rows carry BOTH etag
+# and size_bytes (ordered by part_number). Passing them lets mpu_complete skip its two re-reads.
+_DB_PARTS = [
+    {"etag": "aabbccdd-1", "part_number": 1, "size_bytes": 100},
+    {"etag": "11223344-1", "part_number": 2, "size_bytes": 200},
+]
+
 
 class _FakeTxn:
     async def __aenter__(self) -> None:
@@ -70,8 +77,10 @@ class _FakePool:
 
     def __init__(self) -> None:
         self.conn = _FakeConn()
+        self.fetch_calls = 0
 
     async def fetch(self, query: str, *_args: Any) -> list[dict[str, Any]]:
+        self.fetch_calls += 1
         if query == get_query("get_parts_etags_for_version"):
             return _ETAG_ROWS
         if query == get_query("list_parts_for_version"):
@@ -145,4 +154,41 @@ async def test_strict_subset_selects_only_named_parts(tmp_path: Any) -> None:
 
     assert res.size_bytes == 100
     assert res.etag.endswith("-1")
+    assert _persisted_completed_part_numbers(pool) == [1]
+
+
+@pytest.mark.asyncio
+async def test_db_parts_passthrough_skips_both_reads(tmp_path: Any) -> None:
+    """MPU-3: when the endpoint's parts rows are passed, mpu_complete issues zero parts fetches."""
+    writer, pool = _writer(tmp_path)
+
+    res = await _complete(writer, db_parts=_DB_PARTS)
+
+    assert res.size_bytes == _FULL_SIZE
+    assert res.etag.endswith("-2")
+    assert pool.fetch_calls == 0, "db_parts supplied — mpu_complete must not re-read the parts table"
+
+
+@pytest.mark.asyncio
+async def test_db_parts_result_matches_fallback(tmp_path: Any) -> None:
+    """The ETag/size computed from db_parts must be byte-identical to the DB-read fallback."""
+    w_fb, _ = _writer(tmp_path)
+    fallback = await _complete(w_fb)  # reads the two queries
+
+    w_db, _ = _writer(tmp_path)
+    passthrough = await _complete(w_db, db_parts=_DB_PARTS)
+
+    assert (passthrough.etag, passthrough.size_bytes) == (fallback.etag, fallback.size_bytes)
+
+
+@pytest.mark.asyncio
+async def test_db_parts_strict_subset(tmp_path: Any) -> None:
+    """Subset filtering works off db_parts too — only the named part's bytes/ETag/filter."""
+    writer, pool = _writer(tmp_path)
+
+    res = await _complete(writer, selected_parts=[1], db_parts=_DB_PARTS)
+
+    assert res.size_bytes == 100
+    assert res.etag.endswith("-1")
+    assert pool.fetch_calls == 0
     assert _persisted_completed_part_numbers(pool) == [1]
