@@ -23,6 +23,11 @@ from hippius_s3.utils import get_query
 logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
 
+# Distinguishes "the light HEAD query returned a (possibly NULL) arion_file_hash" from "the column
+# isn't in this row" (the versioned path's heavy query) — asyncpg Record.get returns this only when
+# the key is absent.
+_MISSING = object()
+
 
 async def _get_object_with_permissions_min(
     bucket_name: str,
@@ -73,7 +78,9 @@ async def _get_object_with_permissions_min(
                 message=f"The specified key {object_key} does not exist",
             )
     else:
-        row = await ObjectRepository(db).get_for_download_with_permissions(bucket_name, object_key, main_account_id)
+        # HD-4: HEAD uses the light by-path query (no download_chunks/mpu joins; carries append_version
+        # and the Arion hash). The versioned path above keeps the heavy query.
+        row = await ObjectRepository(db).get_head_by_path(bucket_name, object_key, main_account_id)
         if not row:
             bucket_exists = await db.fetchval(
                 "SELECT 1 FROM buckets WHERE bucket_name = $1 AND deleted_at IS NULL",
@@ -222,15 +229,19 @@ async def handle_head_object(
         object_version = int(row.get("object_version") or 1)
         headers["x-amz-version-id"] = str(object_version)
 
-        # Add Arion file hash (first chunk of first part)
-        arion_hash = await db.fetchval(
-            get_query("get_chunk_backend_identifier"),
-            "arion",
-            row["object_id"],
-            object_version,
-            1,  # part_number (1-based)
-            0,  # chunk_index (0-based)
-        )
+        # Add Arion file hash (first chunk of first part). HD-5: the light HEAD query returns it via a
+        # LATERAL join, so skip the extra fetchval when present; the versioned path still fetches it.
+        # Sentinel (not `in row`) because asyncpg Record membership tests values, not column names.
+        arion_hash = row.get("arion_file_hash", _MISSING)
+        if arion_hash is _MISSING:
+            arion_hash = await db.fetchval(
+                get_query("get_chunk_backend_identifier"),
+                "arion",
+                row["object_id"],
+                object_version,
+                1,  # part_number (1-based)
+                0,  # chunk_index (0-based)
+            )
         headers["X-Hippius-Arion-File-Hash"] = arion_hash or "pending"
 
         # Append version header if present
