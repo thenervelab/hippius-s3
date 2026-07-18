@@ -172,6 +172,66 @@ async def test_none_cached_sets_source_pipeline(
 @patch("hippius_s3.services.object_reader.unwrap_dek", return_value=b"\x01" * 32)
 @patch("hippius_s3.services.object_reader.get_bucket_kek_bytes", new_callable=AsyncMock, return_value=b"\x02" * 32)
 @patch("hippius_s3.services.object_reader.CryptoService")
+async def test_supplied_parts_skip_read_parts_list(
+    mock_crypto, mock_kek, mock_unwrap, mock_config, mock_storage, mock_read_parts, mock_plan
+):
+    """RD-3: a parts list passed by the caller is used directly — no second read_parts_list."""
+    plan_items = _make_plan_items(2)
+    mock_plan.return_value = plan_items
+    mock_crypto.is_supported_suite_id.return_value = True
+    mock_config.return_value = MagicMock()
+    supplied = [{"part_number": 1, "cid": None, "size_bytes": 8000, "chunk_size_bytes": 4096}]
+
+    obj_cache = FakeObjCache([True, True])
+    db = FakeDB()
+
+    from hippius_s3.services.object_reader import build_stream_context
+
+    ctx = await build_stream_context(
+        db, None, obj_cache, _make_info(), rng=None, address="addr1", parts=supplied
+    )
+
+    assert ctx.source == "cache"
+    mock_read_parts.assert_not_awaited()
+    # build_chunk_plan(db, object_id, parts, rng, object_version=...) — 3rd positional is parts.
+    assert mock_plan.call_args.args[2] is supplied
+
+
+@pytest.mark.asyncio
+@patch("hippius_s3.services.object_reader.build_chunk_plan")
+@patch("hippius_s3.services.object_reader.read_parts_list")
+@patch("hippius_s3.services.object_reader.require_supported_storage_version", return_value=5)
+@patch("hippius_s3.services.object_reader.get_config")
+@patch("hippius_s3.services.object_reader.unwrap_dek", return_value=b"\x01" * 32)
+@patch("hippius_s3.services.object_reader.get_bucket_kek_bytes", new_callable=AsyncMock, return_value=b"\x02" * 32)
+@patch("hippius_s3.services.object_reader.CryptoService")
+async def test_no_parts_supplied_reads_parts_list(
+    mock_crypto, mock_kek, mock_unwrap, mock_config, mock_storage, mock_read_parts, mock_plan
+):
+    """Default (parts=None) still reads the parts list — HEAD/copy callers are unchanged."""
+    mock_plan.return_value = _make_plan_items(1)
+    mock_read_parts.return_value = [{"part_number": 1, "cid": "cid1"}]
+    mock_crypto.is_supported_suite_id.return_value = True
+    mock_config.return_value = MagicMock()
+
+    obj_cache = FakeObjCache([True])
+    db = FakeDB()
+
+    from hippius_s3.services.object_reader import build_stream_context
+
+    await build_stream_context(db, None, obj_cache, _make_info(), rng=None, address="addr1")
+
+    mock_read_parts.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@patch("hippius_s3.services.object_reader.build_chunk_plan")
+@patch("hippius_s3.services.object_reader.read_parts_list")
+@patch("hippius_s3.services.object_reader.require_supported_storage_version", return_value=5)
+@patch("hippius_s3.services.object_reader.get_config")
+@patch("hippius_s3.services.object_reader.unwrap_dek", return_value=b"\x01" * 32)
+@patch("hippius_s3.services.object_reader.get_bucket_kek_bytes", new_callable=AsyncMock, return_value=b"\x02" * 32)
+@patch("hippius_s3.services.object_reader.CryptoService")
 async def test_empty_plan_is_cache_source(
     mock_crypto, mock_kek, mock_unwrap, mock_config, mock_storage, mock_read_parts, mock_plan
 ):

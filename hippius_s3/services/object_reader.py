@@ -177,13 +177,17 @@ async def build_stream_context(
     *,
     rng: RangeRequest | None,
     address: str,
+    parts: list[dict] | None = None,
 ) -> StreamContext:
     cfg = get_config()
     storage_version = require_supported_storage_version(int(info["storage_version"]))
     # v4-only policy: always decrypt at read time.
 
     ov = int(info.get("object_version") or info.get("current_object_version") or 1)
-    parts = await read_parts_list(db, info["object_id"], ov)
+    # RD-3: the GET endpoint already built the parts catalog; reuse it instead of re-reading. HEAD and
+    # copy callers pass nothing and keep the DB read.
+    if parts is None:
+        parts = await read_parts_list(db, info["object_id"], ov)
     plan = await build_chunk_plan(db, info["object_id"], parts, rng, object_version=ov)
 
     # Batch check all chunks in a single Redis pipeline round trip
@@ -308,8 +312,11 @@ async def read_response(
     rng: RangeRequest | None,
     address: str,
     range_was_invalid: bool = False,
+    parts: list[dict] | None = None,
 ) -> Response:
     cfg = get_config()
+    # RD-3: the endpoint already built the parts catalog; pass it through so build_stream_context and
+    # the planner don't re-read `parts`. None → they read it themselves (unchanged).
     ctx = await build_stream_context(
         db,
         redis,
@@ -317,6 +324,7 @@ async def read_response(
         info,
         rng=rng,
         address=address,
+        parts=parts,
     )
     gen = stream_plan(
         obj_cache=obj_cache,

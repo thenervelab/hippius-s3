@@ -34,7 +34,8 @@ class PartsCatalog:
                 """
                 SELECT p.part_number,
                        COALESCE(c.cid, p.ipfs_cid) AS cid,
-                       p.size_bytes::bigint AS size_bytes
+                       p.size_bytes::bigint AS size_bytes,
+                       p.chunk_size_bytes::bigint AS chunk_size_bytes
                 FROM objects o
                 JOIN parts p
                   ON p.object_id = o.object_id
@@ -71,7 +72,12 @@ class PartsCatalog:
                         cid = cid_str
 
                 size = int(r[2] or 0)
-                parts.append({"part_number": pn, "cid": cid, "size_bytes": size})
+                # RD-3: carry chunk_size_bytes so the read-path planner can size chunks without a
+                # second `parts` query. 0 when the row lacks it (legacy) → planner falls back.
+                chunk_size = int(r[3] or 0)
+                parts.append(
+                    {"part_number": pn, "cid": cid, "size_bytes": size, "chunk_size_bytes": chunk_size}
+                )
 
             logger.debug(f"Built parts catalog: {parts}")
             return parts
