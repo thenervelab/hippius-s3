@@ -291,6 +291,12 @@ class Config:
     # initial stream timeout (seconds) before sending first byte
     http_stream_initial_timeout_seconds: float = env("HTTP_STREAM_INITIAL_TIMEOUT_SECONDS:5", convert=float)
 
+    # RQ-1: use ONE pub/sub subscription per stream (demuxed to per-chunk events) instead of a fresh
+    # subscribe/unsubscribe per cold chunk. Correctness-sensitive (the demux + FS re-check race
+    # guard); opt-in with a per-chunk fallback so it can be rolled back without a redeploy.
+    stream_single_subscription: bool = env(
+        "HIPPIUS_STREAM_SINGLE_SUBSCRIPTION:false", convert=lambda x: x.lower() == "true"
+    )
     # Download streaming prefetch window (number of chunks to fetch concurrently).
     # Helps cache-hit throughput by reducing per-chunk Redis roundtrip stalls.
     http_stream_prefetch_chunks: int = env("HTTP_STREAM_PREFETCH_CHUNKS:16", convert=int)
