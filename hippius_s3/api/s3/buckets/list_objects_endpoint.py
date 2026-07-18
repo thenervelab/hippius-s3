@@ -127,7 +127,10 @@ async def handle_list_objects(
     # cursor jump already keeps it from recurring across continuation pages, so the floor is
     # only meaningful for an explicit start-after (ignored when a continuation token resumes).
     cp_floor = None if continuation_token else start_after
-    items, is_truncated, next_cursor = await _collect_page(
+    # LS-1: the SQL skip-scan and the Python collapse produce byte-identical pages (proven by the
+    # differential test); the flag picks which runs, defaulting to the Python path.
+    collect = _collect_page_sql if _sql_rollup_enabled() else _collect_page
+    items, is_truncated, next_cursor = await collect(
         pool,
         bucket_id,
         prefix=prefix,
@@ -180,6 +183,56 @@ async def handle_list_objects(
         media_type="application/xml",
         status_code=200,
     )
+
+
+def _sql_rollup_enabled() -> bool:
+    try:
+        from hippius_s3.config import get_config
+
+        return bool(get_config().list_objects_sql_rollup)
+    except Exception:
+        return False
+
+
+async def _collect_page_sql(
+    pool: asyncpg.Pool,
+    bucket_id: Any,
+    *,
+    prefix: str | None,
+    delimiter: str | None,
+    cursor: str | None,
+    target: int,
+    cp_floor: str | None,
+) -> tuple[list[tuple[str, Any]], bool, str | None]:
+    """LS-1: same page contract as `_collect_page`, but the delimiter rollup runs in SQL.
+
+    The recursive `list_objects_delimited` query returns the already-collapsed, cp_floor-suppressed
+    items in key order (up to target+1 to probe truncation), so this only shapes them into the
+    ``("content", row)`` / ``("prefix", str)`` tuples the endpoint expects.
+    """
+    if target == 0:
+        # AWS returns an empty, non-truncated page for max-keys=0 (degenerate probe).
+        return [], False, None
+
+    rows = await pool.fetch(
+        get_query("list_objects_delimited"),
+        bucket_id,
+        prefix,
+        cursor,
+        delimiter,
+        target,
+        cp_floor,
+    )
+    items: list[tuple[str, Any]] = []
+    for row in rows[:target]:
+        if row["is_prefix"]:
+            items.append(("prefix", row["group_key"]))
+        else:
+            items.append(("content", row))
+    is_truncated = len(rows) > target
+    # Resume just past the last KEPT item — the query already computed its inclusive successor.
+    next_cursor = rows[target - 1]["next_boundary"] if is_truncated else None
+    return items, is_truncated, next_cursor
 
 
 async def _collect_page(

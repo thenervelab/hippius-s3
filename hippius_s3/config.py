@@ -77,6 +77,10 @@ class Config:
     public_bucket_cache_ttl_seconds: int = env("PUBLIC_BUCKET_CACHE_TTL_SECONDS:60", convert=int)
     enable_bypass_credit_check: bool = env("HIPPIUS_BYPASS_CREDIT_CHECK:false", convert=lambda x: x.lower() == "true")
     read_only_mode: bool = env("HIPPIUS_READ_ONLY_MODE:false", convert=lambda x: x.lower() == "true")
+    # LS-1: do the ListObjectsV2 delimiter rollup in SQL (a loose-index skip-scan) instead of the
+    # Python collapse. Opt-in — the CommonPrefixes/pagination contract is client-facing; a differential
+    # test proves byte-identical output, and the Python path stays as the default rollback.
+    list_objects_sql_rollup: bool = env("HIPPIUS_LIST_OBJECTS_SQL_ROLLUP:false", convert=lambda x: x.lower() == "true")
 
     # S3 Validation Limits
     min_bucket_name_length: int = env("MIN_BUCKET_NAME_LENGTH", convert=int)
