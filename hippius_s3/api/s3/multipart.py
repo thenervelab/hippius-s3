@@ -672,6 +672,11 @@ async def upload_part(
         total_time = time.time() - start_time
         logger.debug(f"Part {part_number}: TOTAL processing time: {total_time:.3f}s")
 
+        get_metrics_collector().record_s3_operation(
+            operation="upload_part",
+            bucket_name=ongoing_multipart_upload.get("bucket_name", ""),
+            success=True,
+        )
         get_metrics_collector().record_data_transfer(
             operation="upload_part",
             bytes_transferred=file_size,
