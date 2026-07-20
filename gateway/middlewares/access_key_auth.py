@@ -6,6 +6,7 @@ import hmac
 import logging
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from fastapi import Request
 from redis.asyncio import Redis
@@ -21,6 +22,10 @@ from gateway.services.auth_cache import cached_auth
 from gateway.services.auth_service import decrypt_secret
 from hippius_s3.models.sub_token import ACCESS_KEY_PATTERN
 from hippius_s3.models.sub_token import SS58_PATTERN
+
+
+if TYPE_CHECKING:
+    from hippius_s3.services.hippius_api_service import HippiusApiClient
 
 
 logger = logging.getLogger(__name__)
@@ -41,7 +46,7 @@ class TokenAuth:
 ALLOWED_TOKEN_TYPES = {"master", "sub"}
 
 
-def _shared_api_client(request: Request) -> "object | None":
+def _shared_api_client(request: Request) -> "HippiusApiClient | None":
     # NET-5: the long-lived gateway HippiusApiClient, if present. Best-effort — request.app is absent
     # in some unit contexts, so cached_auth falls back to a per-miss client when this returns None.
     try:

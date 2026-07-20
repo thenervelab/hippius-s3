@@ -108,7 +108,7 @@ def _mock_access_key_auth(
     box = SecretBox(bytes.fromhex(key_hex))
     encrypted_secret = base64.b64encode(box.encrypt(test_access_key_secret.encode())).decode()
 
-    async def _fake_cached_auth(access_key: str, redis_client: Any) -> TokenAuthResponse:
+    async def _fake_cached_auth(access_key: str, redis_client: Any, api_client: Any = None) -> TokenAuthResponse:
         if access_key != test_access_key:
             return TokenAuthResponse(valid=False, status="invalid")
         return TokenAuthResponse(

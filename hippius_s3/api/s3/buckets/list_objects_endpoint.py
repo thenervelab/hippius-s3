@@ -248,7 +248,9 @@ async def _collect_page(
                 if len(items) > target:
                     # The (target+1)th item proves truncation; resume just past the last KEPT item.
                     kind, payload = items[target - 1]
-                    next_cursor = _prefix_resume(payload) if kind == "prefix" else _content_resume(payload["object_key"])
+                    next_cursor = (
+                        _prefix_resume(payload) if kind == "prefix" else _content_resume(payload["object_key"])
+                    )
                     return items[:target], True, next_cursor
 
             if len(batch) < batch_limit:
