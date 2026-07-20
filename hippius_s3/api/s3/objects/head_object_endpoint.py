@@ -234,22 +234,11 @@ async def handle_head_object(
         )
         headers["X-Hippius-Arion-File-Hash"] = arion_hash or "pending"
 
-        # Append version header if present
+        # Append version header if present. HD-3: the download query's outer SELECT now returns
+        # append_version, so no fallback JOIN is needed.
         with tracer.start_as_current_span("head_object.fetch_append_version") as span:
             try:
                 append_version = row.get("append_version")
-                if append_version is None:
-                    append_version = await db.fetchval(
-                        """
-                        SELECT ov.append_version
-                        FROM objects o
-                        JOIN object_versions ov
-                          ON ov.object_id = o.object_id
-                         AND ov.object_version = o.current_object_version
-                        WHERE o.object_id = $1
-                        """,
-                        row["object_id"],
-                    )
                 if append_version is not None:
                     headers["x-amz-meta-append-version"] = str(int(append_version))
                     set_span_attributes(span, {"append_version": int(append_version)})

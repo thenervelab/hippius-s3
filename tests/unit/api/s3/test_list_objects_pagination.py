@@ -7,6 +7,7 @@ from datetime import datetime
 from datetime import timezone
 from typing import Any
 from unittest.mock import AsyncMock
+from unittest.mock import MagicMock
 
 import pytest
 from lxml import etree as ET  # ty: ignore[unresolved-import]
@@ -53,6 +54,17 @@ def _make_pool(
         pool.fetch = AsyncMock(side_effect=fetch_batches)
     else:
         pool.fetch = AsyncMock(return_value=list_rows or [])
+
+    # LS-45: _collect_page now holds one connection (`async with pool.acquire() as conn`) and calls
+    # conn.fetch. Make acquire() yield the pool itself so conn.fetch is the same mock the tests assert on.
+    class _Acq:
+        async def __aenter__(self_: Any) -> Any:
+            return pool
+
+        async def __aexit__(self_: Any, *_a: Any) -> bool:
+            return False
+
+    pool.acquire = MagicMock(return_value=_Acq())
     return pool
 
 

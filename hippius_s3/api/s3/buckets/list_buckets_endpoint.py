@@ -28,7 +28,7 @@ async def handle_list_buckets(ctx: RequestContext, db: Any) -> Response:
             bucket = ET.SubElement(buckets, "Bucket")
             ET.SubElement(bucket, "Name").text = row["bucket_name"]
             ET.SubElement(bucket, "CreationDate").text = format_s3_timestamp(row["created_at"])
-        xml_content = ET.tostring(root, encoding="UTF-8", xml_declaration=True, pretty_print=True)
+        xml_content = ET.tostring(root, encoding="UTF-8", xml_declaration=True, pretty_print=False)
         return Response(content=xml_content, media_type="application/xml")
     except Exception:
         logger.exception("Error listing buckets via S3 protocol")

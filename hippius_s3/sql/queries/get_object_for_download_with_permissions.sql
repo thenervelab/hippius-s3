@@ -75,6 +75,7 @@ SELECT
     oi.is_public,
     oi.bucket_owner_id,
     oi.object_version,
+    oi.append_version,
     oi.encryption_version,
     oi.enc_suite_id,
     oi.enc_chunk_size_bytes,

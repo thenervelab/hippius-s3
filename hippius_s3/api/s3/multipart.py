@@ -468,14 +468,15 @@ async def upload_part(
             rng = RangeRequest(start=int(range_start), end=int(range_end))
         plan = await build_chunk_plan(pool, object_id_str, parts, rng, object_version=src_ver)
 
-        # Enqueue downloader for any missing chunk indices in cache
+        # Enqueue downloader for any missing chunk indices in cache. CP-2: one batched existence
+        # check (off-loop, meta-gated) instead of a serial per-chunk stat, matching the GET path.
         obj_cache = RedisObjectPartsCache(request.app.state.redis_client)
+        checks = [(int(it.part_number), int(it.chunk_index)) for it in plan]
+        exist_flags = await obj_cache.chunks_exist_batch(object_id_str, src_ver, checks)
         indices_by_part: dict[int, list[int]] = {}
-        for it in plan:
-            exists = await obj_cache.chunk_exists(object_id_str, src_ver, int(it.part_number), int(it.chunk_index))
-            if not exists:
-                arr = indices_by_part.setdefault(int(it.part_number), [])
-                arr.append(int(it.chunk_index))
+        for it, present in zip(plan, exist_flags, strict=True):
+            if not present:
+                indices_by_part.setdefault(int(it.part_number), []).append(int(it.chunk_index))
         if indices_by_part:
             dl_parts: list[PartToDownload] = []
             for pn, idxs in indices_by_part.items():
