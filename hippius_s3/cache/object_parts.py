@@ -303,6 +303,4 @@ class RedisObjectPartsCache:
         Returns an async context manager; inside it call
         `sub.wait_for_chunk(part_number, chunk_index, timeout=...)`.
         """
-        return self._notifier.stream_subscription(
-            object_id, int(object_version), fetch_fn=self.fs.get_chunk
-        )
+        return self._notifier.stream_subscription(object_id, int(object_version), fetch_fn=self.fs.get_chunk)
