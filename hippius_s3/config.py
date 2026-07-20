@@ -262,6 +262,8 @@ class Config:
     # CF-3: depth of the encrypt producer/consumer queue per streaming write. Peak buffered memory
     # per PUT ≈ chunk_size × this. Exposed so it can move with chunk size (CF-1).
     write_queue_maxsize: int = env("HIPPIUS_WRITE_QUEUE_MAXSIZE:16", convert=int)
+    # RD-2 / WU-1: worker threads for the dedicated AES-GCM encrypt/decrypt pool (off the event loop).
+    crypto_pool_workers: int = env("HIPPIUS_CRYPTO_POOL_WORKERS:4", convert=int)
     # NET-3: keep the expensive mTLS KMS connection warm across sparse/bursty calls.
     ovh_kms_keepalive_expiry_seconds: int = env("HIPPIUS_OVH_KMS_KEEPALIVE_EXPIRY:300", convert=int)
 
