@@ -19,6 +19,8 @@ from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.queue import enqueue_unpin_retry_request
 from hippius_s3.queue import initialize_queue_client
+from hippius_s3.queue import move_due_download_retries
+from hippius_s3.queue import move_due_unpin_retries
 from hippius_s3.queue import move_due_upload_retries
 
 
@@ -104,6 +106,44 @@ async def test_move_due_upload_retries_pushes_each_member_exactly_once(real_redi
 
     assert await real_redis.llen("arion_upload_requests") == 1
     assert await real_redis.zcard("arion_upload_retries") == 0
+    assert sum(results) == 1
+
+
+@pytest.mark.asyncio
+async def test_move_due_unpin_retries_pushes_each_member_exactly_once(real_redis: async_redis.Redis) -> None:
+    """Concurrent movers on the 3 unpinner replicas must not re-enqueue the same due member 3 times."""
+    movers = 6
+    member = json.dumps({"object_id": "obj-unpin-race", "attempts": 1})
+    await real_redis.zadd("arion_unpin_retries", {member: time.time() - 10})
+
+    barrier = asyncio.Barrier(movers)
+    initialize_queue_client(_BarrierClient(real_redis, barrier))  # type: ignore[arg-type]
+
+    results = await asyncio.gather(
+        *(move_due_unpin_retries(backend_name="arion", now_ts=time.time()) for _ in range(movers))
+    )
+
+    assert await real_redis.llen("arion_unpin_requests") == 1
+    assert await real_redis.zcard("arion_unpin_retries") == 0
+    assert sum(results) == 1
+
+
+@pytest.mark.asyncio
+async def test_move_due_download_retries_pushes_each_member_exactly_once(real_redis: async_redis.Redis) -> None:
+    """Concurrent movers on the 10 downloader replicas must not re-enqueue the same due member 10 times."""
+    movers = 6
+    member = json.dumps({"object_id": "obj-download-race", "attempts": 1})
+    await real_redis.zadd("arion_download_retries", {member: time.time() - 10})
+
+    barrier = asyncio.Barrier(movers)
+    initialize_queue_client(_BarrierClient(real_redis, barrier))  # type: ignore[arg-type]
+
+    results = await asyncio.gather(
+        *(move_due_download_retries(backend_name="arion", now_ts=time.time()) for _ in range(movers))
+    )
+
+    assert await real_redis.llen("arion_download_requests") == 1
+    assert await real_redis.zcard("arion_download_retries") == 0
     assert sum(results) == 1
 
 
