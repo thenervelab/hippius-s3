@@ -351,6 +351,11 @@ class MetricsCollector:
         bytes_transferred: int,
         bucket_name: str,
     ) -> None:
+        # BYTES ONLY. The operation COUNT is owned solely by record_s3_operation — this
+        # method must not also bump s3_operations_total, or every data op (put_object,
+        # get_object, upload_part, CompleteMPU calls BOTH) double-counts, split across two
+        # label shapes ({operation} here vs {operation, success} there). That inflated
+        # s3_operations_total 2x. Any op that should be counted calls record_s3_operation.
         attributes = {
             "operation": operation,
         }
@@ -359,8 +364,6 @@ class MetricsCollector:
             self.s3_bytes_uploaded.add(bytes_transferred, attributes=attributes)
         elif operation in ["download", "get_object"]:
             self.s3_bytes_downloaded.add(bytes_transferred, attributes=attributes)
-
-        self.s3_operations_total.add(1, attributes=attributes)
 
     def record_error(
         self,

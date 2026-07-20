@@ -226,3 +226,43 @@ class TestNoUnboundedLabels:
         assert called, "no record_* methods were exercised — the reflection broke"
         assert emitted, "no attributes captured — the instrument mocking broke"
         assert emitted <= BOUNDED_LABELS, f"unbounded label(s) emitted: {sorted(emitted - BOUNDED_LABELS)}"
+
+
+class TestOperationCountedExactlyOnce:
+    """s3_operations_total is owned by record_s3_operation ALONE.
+
+    Every data op (put_object, get_object, upload_part, CompleteMPU) calls BOTH
+    record_s3_operation and record_data_transfer. When record_data_transfer also bumped
+    s3_operations_total, each such op counted twice — split across two label shapes
+    ({operation} vs {operation, success}) — inflating the counter 2x. Lock the split of
+    responsibilities: record_data_transfer records BYTES ONLY.
+    """
+
+    def _counting_collector(self) -> tuple[MetricsCollector, MagicMock, MagicMock, MagicMock]:
+        c = MetricsCollector(redis_client=MagicMock())
+        c.s3_operations_total = MagicMock()
+        c.s3_bytes_uploaded = MagicMock()
+        c.s3_bytes_downloaded = MagicMock()
+        return c, c.s3_operations_total, c.s3_bytes_uploaded, c.s3_bytes_downloaded
+
+    def test_record_data_transfer_records_bytes_only_not_the_op_count(self) -> None:
+        c, ops, up, _down = self._counting_collector()
+        c.record_data_transfer(operation="put_object", bytes_transferred=1234, bucket_name="b")
+
+        ops.add.assert_not_called()  # the double-count that inflated s3_operations_total 2x
+        up.add.assert_called_once()
+        assert up.add.call_args.args[0] == 1234
+
+    def test_record_s3_operation_is_the_sole_counter(self) -> None:
+        c, ops, _up, _down = self._counting_collector()
+        c.record_s3_operation(operation="put_object", bucket_name="b", success=True)
+
+        ops.add.assert_called_once_with(1, attributes={"operation": "put_object", "success": "true"})
+
+    def test_a_data_op_calling_both_increments_the_count_exactly_once(self) -> None:
+        # Mirrors the put_object/get_object/upload_part/CompleteMPU call pattern.
+        c, ops, _up, _down = self._counting_collector()
+        c.record_s3_operation(operation="get_object", bucket_name="b", success=True)
+        c.record_data_transfer(operation="get_object", bytes_transferred=10, bucket_name="b")
+
+        assert ops.add.call_count == 1, "a data op must count once, not twice"
