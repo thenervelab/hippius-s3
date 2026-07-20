@@ -117,16 +117,21 @@ async def _enqueue_missing_downloads(
     # cases — on TTL expiry, the next miss re-enqueues.
     lock_ttl = int(getattr(cfg, "download_coalesce_lock_ttl_seconds", 120))
     ray_token = str(info.get("ray_id") or "anonymous")
+    # RD-6: acquire every part's coalesce lock in one pipelined round trip instead of one SET NX per
+    # part. Fail-open on a Redis hiccup (treat all as acquired) so the download still happens — a
+    # duplicate enqueue is deduped by the downloader via chunk_exists.
+    parts = list(indices_by_part.keys())
+    lock_keys = [f"download_in_progress:{object_id}:v:{object_version}:part:{pn}" for pn in parts]
+    try:
+        pipe = redis.pipeline(transaction=False)
+        for lk in lock_keys:
+            pipe.set(lk, ray_token, nx=True, ex=lock_ttl)
+        set_results = await pipe.execute()
+    except Exception:
+        set_results = [True] * len(parts)
+
     acquired_parts: set[int] = set()
-    for pn in list(indices_by_part.keys()):
-        lock_key = f"download_in_progress:{object_id}:v:{object_version}:part:{pn}"
-        try:
-            acquired = await redis.set(lock_key, ray_token, nx=True, ex=lock_ttl)
-        except Exception:
-            # Redis hiccup — fail open: behave as if we acquired the lock
-            # so the download still happens. Worst case is a duplicate
-            # enqueue, which the downloader deduplicates via chunk_exists.
-            acquired = True
+    for pn, acquired in zip(parts, set_results, strict=True):
         if acquired:
             acquired_parts.add(pn)
         else:

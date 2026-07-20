@@ -41,6 +41,32 @@ class _RedisStub:
         self.deleted.append(key)
         return 1
 
+    def pipeline(self, transaction: bool = False) -> "_RedisPipelineStub":
+        # RD-6: the coalesce lock is now acquired via a pipeline. The stub records each queued set
+        # into set_calls (so existing assertions hold) and applies NX on execute().
+        return _RedisPipelineStub(self)
+
+
+class _RedisPipelineStub:
+    def __init__(self, parent: "_RedisStub") -> None:
+        self._parent = parent
+        self._ops: list[tuple[str, Any, bool, int | None]] = []
+
+    def set(self, key: str, value: Any, *, nx: bool = False, ex: int | None = None) -> "_RedisPipelineStub":
+        self._ops.append((key, value, nx, ex))
+        return self
+
+    async def execute(self) -> list[Any]:
+        results: list[Any] = []
+        for key, value, nx, ex in self._ops:
+            self._parent.set_calls.append((key, value, nx, ex))
+            if nx and key in self._parent._held:
+                results.append(None)
+            else:
+                self._parent._held.add(key)
+                results.append(True)
+        return results
+
 
 def _stub_config():
     cfg = MagicMock()

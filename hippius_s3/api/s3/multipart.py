@@ -757,10 +757,19 @@ async def abort_multipart_upload(
                 for part in parts:
                     part_num = int(part["part_number"])
                     meta_key = delegate.build_meta_key(str(object_id), object_version, part_num)
-                    await redis_client.delete(meta_key)
                     base_key = delegate.build_key(str(object_id), object_version, part_num)
-                    async for key in redis_client.scan_iter(f"{base_key}:chunk:*"):
-                        await redis_client.delete(key)
+                    # MPU-4: delete the meta + chunk keys by computed name in one pipelined UNLINK
+                    # instead of a per-part keyspace SCAN. num_chunks comes from the FS meta; if it's
+                    # absent (nothing to compute from), fall back to the SCAN.
+                    fs_meta = await request.app.state.fs_store.get_meta(str(object_id), int(object_version), part_num)
+                    num_chunks = int(fs_meta.get("num_chunks", 0)) if fs_meta else 0
+                    if num_chunks > 0:
+                        keys = [meta_key] + [f"{base_key}:chunk:{i}" for i in range(num_chunks)]
+                        await redis_client.unlink(*keys)
+                    else:
+                        await redis_client.delete(meta_key)
+                        async for key in redis_client.scan_iter(f"{base_key}:chunk:*"):
+                            await redis_client.delete(key)
 
         # Stop the drain churn BEFORE deleting the upload header. This aborted version's
         # address will never be written, so its parts and the drain's
@@ -853,16 +862,14 @@ async def list_multipart_uploads(
             get_query("list_multipart_uploads"), bucket["bucket_id"], request.query_params.get("prefix")
         )
 
-        # Filter out any uploads that were very recently aborted (defensive cache for race conditions)
+        # Filter out any uploads that were very recently aborted (defensive cache for race conditions).
+        # MPU-56: one MGET for all recently-aborted flags instead of a serial GET per upload.
         try:
             redis_client: Redis = request.app.state.redis_client
-            filtered_uploads = []
-            for upload in uploads:
-                aborted_flag = await redis_client.get(f"aborted_mpu:{str(upload['upload_id'])}")
-                if aborted_flag:
-                    continue
-                filtered_uploads.append(upload)
-            uploads = filtered_uploads
+            if uploads:
+                flag_keys = [f"aborted_mpu:{str(u['upload_id'])}" for u in uploads]
+                aborted_flags = await redis_client.mget(flag_keys)
+                uploads = [u for u, flag in zip(uploads, aborted_flags, strict=True) if not flag]
         except Exception as _:
             # If Redis not available, proceed with DB results
             pass
