@@ -25,6 +25,17 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 
 logger = logging.getLogger(__name__)
 
+# How often `wait_for_chunk` re-reads the FS while blocked, INDEPENDENT of pub/sub
+# notifications. A chunk can become readable from a producer that does NOT publish a
+# chunk-ready notification — notably the Rust drain, which lands a part in the CephFS pool
+# (making it readable via the pool fallback) WITHOUT publishing `notify:`. Without this
+# periodic re-read, a reader blocked on a fresh cross-node object waits out the whole caller
+# `timeout` (up to the 90s first-chunk bound → a client-visible ~35s+ hang) even though the
+# chunk is already in the pool. One poll interval bounds that to ~1s. The queues pub/sub
+# client is built without a socket_timeout, so the RedisTimeoutError re-poll path never fires
+# on its own — this tick is the primary FS re-read while waiting.
+_FS_REPOLL_INTERVAL_SECONDS = 1.0
+
 
 class ChunkNotReadyError(Exception):
     """A chunk is still absent after a pub/sub notification woke the waiter.
@@ -137,9 +148,19 @@ class ChunkNotifier:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     raise asyncio.TimeoutError(f"timed out waiting for chunk {chunk_key}")
+                # Cap each listen to a short poll so we ALSO re-read the FS on every tick, not
+                # only when a notification arrives — see `_FS_REPOLL_INTERVAL_SECONDS`. This is
+                # what lets a reader pick up a chunk landed by a non-notifying producer (the
+                # drain) within ~1 poll interval instead of blocking to `timeout`.
                 try:
-                    await asyncio.wait_for(_listen(), timeout=remaining)
+                    await asyncio.wait_for(_listen(), timeout=min(_FS_REPOLL_INTERVAL_SECONDS, remaining))
                     break
+                except asyncio.TimeoutError:
+                    # Poll tick (no notification this interval): the chunk may have been landed
+                    # by the drain without a notify:. Re-read; keep waiting up to the deadline.
+                    data = await fetch_fn(object_id, int(object_version), int(part_number), int(chunk_index))
+                    if data is not None:
+                        return data
                 except (RedisTimeoutError, RedisConnectionError) as exc:
                     data = await fetch_fn(object_id, int(object_version), int(part_number), int(chunk_index))
                     if data is not None:
