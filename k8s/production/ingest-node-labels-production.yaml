@@ -1,0 +1,52 @@
+# Declarative source of truth for the PROD local-ingest node set.
+#
+# This is the ONE list. `kubectl apply -k k8s/production` applies the
+# `s3-prod-local-ingest=true` label to these nodes; the api-local Deployment and the
+# drain-agent DaemonSet both select on that label, so they stay in lockstep. Both ALSO
+# carry a required nodeAffinity hostname allow-list — keep it in sync with the stanzas
+# below (edit the Node names here AND both allow-lists together).
+#
+# SHARED CLUSTER: staging and prod run on the same physical nodes, so their ingest sets
+# MUST be DISJOINT. Staging uses `s3-staging-local-ingest` on node2/node3 writing to
+# /var/lib/hippius/local_ingest_staging; prod uses THIS label on DIFFERENT nodes writing
+# to /var/lib/hippius/local_ingest_prod. Never put a prod ingest label on a staging
+# ingest node (or vice-versa).
+#
+# ⚠️ PLACEHOLDERS. The names below are placeholders — replace them with the actual prod
+# ingest nodes you prepared. Preparing a node = repurpose one Ceph OSD's NVMe into a local
+# ingest disk (the cluster's OSD disks are 3.84 TB enterprise NVMe; Ceph is only ~29% full
+# so it can spare a few). Full runbook: s3-2.1-todo.md → "Prod logistics". The capacity
+# plan (s3-prod-drain-capacity-plan.md) recommends 3–4 such nodes.
+#
+# CAVEAT: `apply` adds labels but does not PRUNE them. To retire an ingest node, delete its
+# stanza here AND run: kubectl label node <name> s3-prod-local-ingest-
+#
+# (Partial Node objects: apply merges only metadata.labels, leaving all other node fields
+# untouched. Requires the deploy identity to be able to patch nodes.)
+apiVersion: v1
+kind: Node
+metadata:
+  name: REPLACE-prod-ingest-node-a
+  labels:
+    s3-prod-local-ingest: "true"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: REPLACE-prod-ingest-node-b
+  labels:
+    s3-prod-local-ingest: "true"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: REPLACE-prod-ingest-node-c
+  labels:
+    s3-prod-local-ingest: "true"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: REPLACE-prod-ingest-node-d
+  labels:
+    s3-prod-local-ingest: "true"
