@@ -380,8 +380,25 @@ class Config:
     cachet_component_id: int = env("CACHET_COMPONENT_ID:0", convert=int)
 
 
+_config_singleton: "Config | None" = None
+
+
+def reset_config() -> None:
+    """Drop the memoized config so the next get_config() rebuilds it.
+
+    Config is immutable after startup, so get_config() memoizes a single instance. Tests that mutate
+    the environment between cases call this to force a rebuild.
+    """
+    global _config_singleton
+    _config_singleton = None
+
+
 def get_config() -> Config:
-    """Get application configuration."""
+    """Get application configuration (memoized; immutable after startup)."""
+    global _config_singleton
+    if _config_singleton is not None:
+        return _config_singleton
+
     try:
         cfg = Config()
     except KeyError as e:
@@ -432,4 +449,6 @@ def get_config() -> Config:
             "HIPPIUS_AUTH_ENCRYPTION_KEY is required when HIPPIUS_KMS_MODE=disabled (used for local KEK wrapping)"
         )
 
+    # Cache only after successful validation so a bad config never poisons the singleton.
+    _config_singleton = cfg
     return cfg

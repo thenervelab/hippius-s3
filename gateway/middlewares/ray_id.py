@@ -23,8 +23,10 @@ async def ray_id_middleware(
     4. Creates a logger adapter with ray_id for request-scoped logging
     5. Adds X-Hippius-Ray-ID response header for client visibility
 
-    IMPORTANT: This middleware should be registered LAST in gateway/main.py
-    so it executes FIRST, ensuring ray_id is available to all other middlewares.
+    IMPORTANT: This middleware must be registered second-outermost in gateway/main.py
+    (just inside cors_middleware) so it executes near-first — stamping ray_id and
+    gateway_start_time before auth/acl/account run — while CORS stays outermost to wrap
+    error responses. See the registration block in gateway/main.py.
     """
     ray_id = generate_ray_id()
     ray_id_context.set(ray_id)

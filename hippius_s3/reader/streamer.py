@@ -28,6 +28,7 @@ async def stream_plan(
     upload_id: str,
     address: str = "",
     bucket_name: str = "",
+    # Fallback only; object_reader passes the wired default HTTP_STREAM_PREFETCH_CHUNKS (16 in prod).
     prefetch_chunks: int = 0,
     chunk_timeout: float | None = None,
 ) -> AsyncGenerator[bytes, None]:

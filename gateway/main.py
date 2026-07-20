@@ -201,7 +201,6 @@ def factory() -> FastAPI:
     # makes it OUTER to auth_router/acl, which would let unauthenticated
     # callers short-circuit with 200 OK.
     app.middleware("http")(auth_probe_middleware)
-    app.middleware("http")(ray_id_middleware)
     if config.enable_audit_logging:
         app.middleware("http")(audit_log_middleware)
     app.middleware("http")(metrics_middleware)
@@ -218,6 +217,10 @@ def factory() -> FastAPI:
     app.middleware("http")(cache_invalidation_middleware)
     app.middleware("http")(ats_purge_middleware)
     app.middleware("http")(cache_control_middleware)
+    # Second-outermost: stamp ray_id + gateway_start_time before auth/acl/account/validation run,
+    # so gateway_overhead_ms spans the whole chain and every inner middleware logs a real ray_id
+    # (GW-2). Kept inside CORS so CORS still wraps error responses, including the ray_id header.
+    app.middleware("http")(ray_id_middleware)
     # Outermost: CORS must wrap everything so error responses get CORS headers
     app.middleware("http")(cors_middleware)
 
