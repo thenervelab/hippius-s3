@@ -912,9 +912,7 @@ class ObjectWriter:
 
         # Compute combined ETag from part etags for this version (client-selected subset only).
         etag_parts = (
-            [p for p in etag_rows if int(p["part_number"]) in selected_set]
-            if selected_set is not None
-            else etag_rows
+            [p for p in etag_rows if int(p["part_number"]) in selected_set] if selected_set is not None else etag_rows
         )
         etags = [p["etag"].split("-")[0] for p in etag_parts]
         binary = b"".join(bytes.fromhex(e) for e in etags) if etags else b""
@@ -923,9 +921,7 @@ class ObjectWriter:
         # Total size (client-selected subset only).
         all_pns = {int(p["part_number"]) for p in size_rows}
         size_parts = (
-            [p for p in size_rows if int(p["part_number"]) in selected_set]
-            if selected_set is not None
-            else size_rows
+            [p for p in size_rows if int(p["part_number"]) in selected_set] if selected_set is not None else size_rows
         )
         total_size = sum(int(p["size_bytes"]) for p in size_parts)
 
