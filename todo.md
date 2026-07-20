@@ -61,7 +61,34 @@ For detail: [CLAUDE.md section 3](CLAUDE.md) (request lifecycle).
 
 ---
 
-## 2. Pitfalls & known rough edges
+## 2. Settled decisions — not open work
+
+Audits keep re-raising these as findings. They are decided. Reopen only with new evidence, and loop in Radu.
+
+### The Arion circuit breaker was removed on purpose
+
+A working breaker shipped in [0de0fe9](https://github.com/thenervelab/hippius-s3/commit/0de0fe9) and was deleted again inside the same PR (#183) by [be8c76a](https://github.com/thenervelab/hippius-s3/commit/be8c76a) (radu.mutilica, 2026-06-10). Rationale, verbatim from the commit: *"The circuit breaker added state-machine complexity (half-open gating, failure classification, per-pod shared state) and several subtle edge cases for a secondary safety concern. The performance win is the bounded-dispatch loop + the single shared per-pod Arion semaphore + larger DB pool — those stay. … Transient Arion errors fall back to the existing per-request exponential-backoff retry; ramp concurrency cautiously instead."*
+
+Honest nuance:
+
+- The fallback that rationale leans on was **not actually working** when it was written. The deployed uploader budget was 2 attempts / ~300ms of backoff, so a brief Arion blip DLQ'd the in-flight backlog rather than riding it out. PR #288 raised it to 7 attempts / ~63s (`HIPPIUS_UPLOADER_MAX_ATTEMPTS: "7"`, base 500ms, max 60s in [k8s/base/configmap-defaults.yaml](k8s/base/configmap-defaults.yaml)). The reasoning holds better today than on the day it was recorded.
+- Counter-argument, for whoever reopens this: 7 attempts × 10 replicas is more load on a degraded backend than 2 × 10 was. A breaker is the standard answer to that. Measure before arguing.
+- A breaker would **not** have helped the 2026-07-19 incident. Those were 401s, which [arion_service.py:218-220](hippius_s3/services/arion_service.py) classifies as permanent — they bypass retry entirely and go straight to the DLQ. No amount of failure-rate tripping changes that path.
+
+If it is ever revisited, recover from `be8c76a^` (= fc2068f), the last commit that still had the breaker: `git show be8c76a^:hippius_s3/services/circuit_breaker.py` (94 lines) and `git show be8c76a^:tests/unit/test_circuit_breaker.py` (168 lines). Not from 0de0fe9 — that holds the earlier 72/103-line draft, before fc2068f folded in the PR #183 review fixes.
+
+### Sub-token scope enforcement is live, not dead code
+
+Recurring audit finding: "`gateway/services/sub_token_scope.py` imports a nonexistent `TokenAcl` and is wired nowhere." Both halves are false.
+
+- There is no `TokenAcl` symbol anywhere in the repo (`rg TokenAcl` hits only prose). The module imports `BucketScope`, `Op`, `Permission`, `SubTokenScope` from [hippius_s3/models/sub_token.py](hippius_s3/models/sub_token.py) — all real.
+- It is on the live ACL path: [gateway/middlewares/acl.py:9-14](gateway/middlewares/acl.py) imports it and the sub-token branch at [acl.py:164](gateway/middlewares/acl.py) calls `evaluate` at [acl.py:190](gateway/middlewares/acl.py), backed by the `sub_token_scopes` table and its cache.
+
+The claim propagates from [gateway/CLAUDE.md:75,82](gateway/CLAUDE.md) and [gateway/services/CLAUDE.md:53-68](gateway/services/CLAUDE.md), which are auto-loaded into every agent session — which is why it resurfaces every audit. **Fixing those two files is the actual fix**; correcting this backlog only stops the symptom.
+
+---
+
+## 3. Pitfalls & known rough edges
 
 ### P0 — Silent PUT connection-close on Arion placement stall (postmortem 2026-04-21)
 
@@ -81,7 +108,7 @@ For detail: [CLAUDE.md section 3](CLAUDE.md) (request lifecycle).
 
 **Longer-term ideas** (open for discussion):
 - Small-object fast-path: commit FS cache + DB row + queue, return 200 before Arion acks. Durability tradeoff; needs Radu's call.
-- Per-backend circuit breaker (see P1 below): open-circuit fail-fast to 503 when Arion latency blows up, instead of timing out every request individually.
+- ~~Per-backend circuit breaker~~ — decided against, see [section 2](#2-settled-decisions--not-open-work).
 
 Anchors to touch: [gateway/services/forward_service.py](gateway/services/forward_service.py), [hippius_s3/services/arion_service.py](hippius_s3/services/arion_service.py), [hippius_s3/monitoring.py](hippius_s3/monitoring.py), [gateway/main.py:94](gateway/main.py) (currently-disabled rate limit — may tie in).
 
@@ -161,18 +188,6 @@ Fast-path copy: rewraps the DEK under the destination's AAD, copies `chunk_backe
 
 No strong opinion here — needs a benchmark before we touch anything.
 
-### P2 — Sub-token scope evaluator is defined but broken and dormant
-
-**File**: [gateway/services/sub_token_scope.py](gateway/services/sub_token_scope.py). Implements `evaluate_sub_token()` over a `TokenAcl` dataclass.
-
-Two problems:
-1. The `from hippius_s3.services.hippius_api_service import TokenAcl` at [sub_token_scope.py:3](gateway/services/sub_token_scope.py) references a symbol that **does not exist** in that module. The only reason this hasn't blown up is that the module is imported nowhere in the production graph — only [tests/unit/gateway/test_acl_scope.py](tests/unit/gateway/test_acl_scope.py) imports it, and it presumably mocks `TokenAcl`.
-2. Even if `TokenAcl` existed, no production code calls `evaluate_sub_token`. Sub-token enforcement currently relies on Arion returning `token_type="master"` vs `"sub"` and the gateway ACL middleware bypassing only for masters.
-
-**Proposed**: either
-- (a) **Wire it up**: define `TokenAcl` in `hippius_s3.services.hippius_api_service` with fields `(scope_type, bucket_names, actions, allowed_prefixes, ip_allowlist)`, populate it from the Arion token auth response, and call `evaluate_sub_token` from [gateway/middlewares/acl.py](gateway/middlewares/acl.py) for sub-token requests; or
-- (b) **Delete the file** and the corresponding test, pending product decisions on sub-token scoping.
-
 ### P2 — `CreateBucket` lifecycle XML is parsed then discarded
 
 **File**: [hippius_s3/api/s3/buckets/bucket_create_endpoint.py:78](hippius_s3/api/s3/buckets/bucket_create_endpoint.py). Explicit `# todo: For now, just acknowledge receipt` — the endpoint parses the XML and logs the rule IDs but doesn't persist them. Client sees 200 OK and believes its lifecycle config was saved.
@@ -207,9 +222,9 @@ Two concurrent PUTs to the same (bucket, key) today both fetch the existing obje
 
 ---
 
-## 3. Download / range / bandwidth optimizations
+## 4. Download / range / bandwidth optimizations
 
-### 3.1 How the FS cache works today (recap)
+### 4.1 How the FS cache works today (recap)
 
 - **Storage**: one file per chunk on the shared cache volume (`/var/lib/hippius/object_cache/<object_id>/v<ver>/part_<n>/chunk_<i>.bin`), plus a `meta.json` per part that acts as the "this part is known" signal. See [hippius_s3/cache/fs_store.py](hippius_s3/cache/fs_store.py).
 - **Atomicity**: writes go to `.tmp.<uuid>` and `os.replace` to final ([fs_store.py:92, 123-131](hippius_s3/cache/fs_store.py)). No locks needed; content is deterministic.
@@ -218,7 +233,7 @@ Two concurrent PUTs to the same (bucket, key) today both fetch the existing obje
 - **Coordination**: `ChunkNotifier` ([hippius_s3/cache/notifier.py](hippius_s3/cache/notifier.py)) publishes `notify:{chunk_key}` on `redis-queues` when a downloader lands a chunk. Streamers subscribe + re-check on each notification. Fast-path (FS hit) bypasses pub/sub entirely.
 - **Coalescing**: `build_stream_context` ([hippius_s3/services/object_reader.py:77-104](hippius_s3/services/object_reader.py)) uses `SET NX EX <DOWNLOAD_COALESCE_LOCK_TTL>` (default 600) on `download_in_progress:{object_id}:v:{ov}:part:{pn}` so N simultaneous readers of a cold object only cause one backend fetch. Lock is released by the downloader when the part lands ([workers/downloader.py:286-292](hippius_s3/workers/downloader.py)). TTL covers crashed-downloader case.
 
-### 3.2 How the janitor works today (high level)
+### 4.2 How the janitor works today (high level)
 
 - Scans `<root>/<object_id>/v<ver>/part_<n>/` trees periodically.
 - Classifies each part by age → bucket gauge.
@@ -228,7 +243,7 @@ Two concurrent PUTs to the same (bucket, key) today both fetch the existing obje
 - Under critical pressure with nothing replicated, logs ERROR and refuses — intentional deadlock-detection over silent data loss. See [workers/run_janitor_in_loop.py:1-22](workers/run_janitor_in_loop.py).
 - Dedicated cleanup for orphan `.tmp.*` files older than 1h.
 
-### 3.3 Cold-download bandwidth ideas
+### 4.3 Cold-download bandwidth ideas
 
 - **Range-aware backend fetch.** Client requests bytes 100–200 of a 1 GiB object. Planner picks one chunk; downloader fetches the **whole 4 MiB chunk** from Arion. For small Range reads this burns 4 MiB of backend bandwidth per 100 B of user data. Idea: add `BackendClient.download_range(identifier, offset, length)` and have the downloader use it when the plan specifies a single-chunk slice smaller than, say, 64 KiB. Risk: chunks are ciphertext and the streamer expects full ciphertext for AEAD verification — **this doesn't work** unless we also shift to per-sub-chunk nonces or accept that range-fetched bytes are verified during re-download. Start with a design doc before writing code.
 - **Stream-through for one-shot Range.** For Range reads tagged with `x-hippius-no-cache`, fetch Arion → decrypt → stream → do NOT persist to FS. Trades cold-re-read latency for NVMe preservation on rarely-revisited data.
@@ -238,7 +253,7 @@ Two concurrent PUTs to the same (bucket, key) today both fetch the existing obje
 
 ---
 
-## 4. Cache invalidation proposals
+## 5. Cache invalidation proposals
 
 Current state: the FS cache is content-addressed by `(object_id, version, part, chunk_index)`. Writes are immutable per that key. "Invalidation" only happens implicitly via:
 - Janitor age-out.
@@ -246,56 +261,54 @@ Current state: the FS cache is content-addressed by `(object_id, version, part, 
 
 Known gaps:
 
-### 4.1 Object overwrite doesn't free old version's FS bytes
+### 5.1 Object overwrite doesn't free old version's FS bytes
 
 Overwriting an object creates a new `object_version` with a new DEK, a new object_id is NOT created (same object_id, higher version). The old version's chunks stay on FS under `v<old>/` until janitor ages them out. For large, frequently-overwritten objects this wastes disk.
 
 **Proposed**: on successful `update_object_version_metadata` for a new version (see [hippius_s3/writer/db.py](hippius_s3/writer/db.py)), schedule a targeted `fs_store.delete_object(object_id, object_version=prev_version)` once we've confirmed the new version is serving. Has to wait for any in-flight reads against the old version (check by stat-ing atime recency, or just let janitor handle the wind-down).
 
-### 4.2 Soft-deleted objects linger in cache
+### 5.2 Soft-deleted objects linger in cache
 
 `chunk_backend.deleted_at` is set on DELETE but the FS copy stays. The ACL/existence check in the read path (`get_object_for_download_with_permissions`) should filter these out before reaching the streamer, but if any legacy path doesn't filter, a stale GET could 200 on data the user believes they deleted.
 
 **Action**: audit every SQL query that feeds `build_stream_context` for a `deleted_at IS NULL` predicate. Anchor: [hippius_s3/sql/queries/](hippius_s3/sql/queries/).
 
-### 4.3 Partial-fill meta consistency
+### 5.3 Partial-fill meta consistency
 
 The downloader writes `meta.json` before the chunks land ([downloader.py:49-91](hippius_s3/workers/downloader.py)). A reader seeing `meta.json` cannot assume "part is complete" on the download path — only on the upload path. `wait_for_chunk` ([cache/notifier.py:61](hippius_s3/cache/notifier.py)) handles this correctly by re-checking after subscribe, but any new code should **not** gate on `meta.json` presence alone.
 
 **Proposed**: document this invariant explicitly in [hippius_s3/cache/CLAUDE.md](hippius_s3/cache/CLAUDE.md) (already in the rewrite list). Consider a small marker like `.complete` for the upload path only, so a downstream tool can distinguish.
 
-### 4.4 Mixed-deploy window after a cache refactor
+### 5.4 Mixed-deploy window after a cache refactor
 
 During any future change to the cache layout (not planned right now, but e.g. if we add a content-hash index), a rolling deploy will have old pods reading old layout and new pods reading new. Janitor races especially bad. Checklist: always provide a read-fallback (see `DualFileSystemPartsStore` at [hippius_s3/cache/dual_fs_store.py](hippius_s3/cache/dual_fs_store.py)) and migrate with a flag-gated single rollout.
 
 ---
 
-## 5. Retry-mechanism hardening (postmortem followups)
+## 6. Retry-mechanism hardening (postmortem followups)
 
 Checklist derived from the 2026-04-21 postmortem. Each item is a small-medium PR.
 
 1. **503 + Retry-After on upstream timeout in forward_service.** Today the gateway closes the connection after ~300s if the upstream API never responds ([forward_service.py:61](gateway/services/forward_service.py)). A deadline of ~45s with a synthesized 503 response would let AWS SDKs retry. Make the deadline configurable per-method (PUT tighter than GET).
 2. **Surface Retry-After from internal API to client.** If the API itself returns 503 with Retry-After (e.g. `fs_cache_pressure_middleware` already does), the gateway must forward that header unmodified. Verify in [forward_service.py:130-146](gateway/services/forward_service.py).
-3. **Per-backend circuit breaker in `arion_service.py`.** Today [arion_service.py](hippius_s3/services/arion_service.py) uses `@retry_on_error(retries=3, backoff=5.0)`. No circuit breaker — every in-flight request individually waits out the 3×5s window on a fully-broken backend. Add a rolling failure-rate breaker (open for 30s after >50% failures in a 60s window). Either roll your own or use `aiobreaker`/`purgatory`.
-4. **Small-object fast-path** (postmortem §6 long-term). Return 200 after FS write + queue, before Arion ack. Durability tradeoff; needs Radu's decision.
-5. **Status-page PUT success gauge**. Expose p1m PUT success rate on `/metrics` and ship a Cachet component for it. The postmortem explicitly calls this out as a user-facing need.
-6. **DLQ retry ergonomics**. The DLQ exists ([hippius_s3/dlq/base.py](hippius_s3/dlq/base.py)) and `scripts/dlq_requeue.py` works, but there's no dashboard panel for DLQ depth per-backend. Add one.
+3. **Small-object fast-path** (postmortem §6 long-term). Return 200 after FS write + queue, before Arion ack. Durability tradeoff; needs Radu's decision.
+4. **Status-page PUT success gauge**. Expose p1m PUT success rate on `/metrics` and ship a Cachet component for it. The postmortem explicitly calls this out as a user-facing need.
+5. **DLQ retry ergonomics**. The DLQ exists ([hippius_s3/dlq/base.py](hippius_s3/dlq/base.py)) and `scripts/dlq_requeue.py` works, but there's no dashboard panel for DLQ depth per-backend. Add one.
 
 ---
 
-## 6. Dead code and cleanup candidates
+## 7. Dead code and cleanup candidates
 
 Low-risk deletions; each one should be a one-PR cleanup:
 
 1. **[hippius_s3/writer/cache_writer.py](hippius_s3/writer/cache_writer.py)** — `CacheWriter` class. Not referenced anywhere in the main code graph except the module itself. `WriteThroughPartsWriter` superseded it. Confirm with `rg '\bcache_writer\b|\bCacheWriter\b'` (only self-reference expected) and delete.
-2. **[gateway/services/sub_token_scope.py](gateway/services/sub_token_scope.py)** — imports `TokenAcl` which doesn't exist. Either wire it up (see P2 pitfalls above) or delete the module plus [tests/unit/gateway/test_acl_scope.py](tests/unit/gateway/test_acl_scope.py).
-3. **Redis download-cache residue**. Grep for `REDIS_DOWNLOAD_CACHE_URL`, `redis_download_cache_url`, `DOWNLOAD_CACHE_TTL`, `redis-download-cache`. Should all be gone after the FS migration. Patch any stragglers in docker-compose files and k8s manifests.
-4. **`set_download_chunk`** shim in [hippius_s3/cache/object_parts.py](hippius_s3/cache/object_parts.py) — if still present (prior memory says it was removed), verify. Old download-cache API.
-5. **Any references to `manifest_cid` or `manifest_service`**. Replaced by `chunk_backend` tracking long ago.
+2. **Redis download-cache residue**. Grep for `REDIS_DOWNLOAD_CACHE_URL`, `redis_download_cache_url`, `DOWNLOAD_CACHE_TTL`, `redis-download-cache`. Should all be gone after the FS migration. Patch any stragglers in docker-compose files and k8s manifests.
+3. **`set_download_chunk`** shim in [hippius_s3/cache/object_parts.py](hippius_s3/cache/object_parts.py) — if still present (prior memory says it was removed), verify. Old download-cache API.
+4. **Any references to `manifest_cid` or `manifest_service`**. Replaced by `chunk_backend` tracking long ago.
 
 ---
 
-## 7. Getting started as a new contributor
+## 8. Getting started as a new contributor
 
 1. Clone the repo. You need Python 3.10+, Docker (with compose v2), and `uv`.
 2. Create a venv: `python3 -m venv .venv && source .venv/bin/activate && uv pip install -e ".[dev]"`.

@@ -143,7 +143,7 @@ class Config:
     orphan_checker_account_whitelist: list[str] = dataclasses.field(default_factory=_parse_account_whitelist)
 
     # Uploader configuration (supersedes legacy pinner config)
-    uploader_max_attempts: int = env("HIPPIUS_UPLOADER_MAX_ATTEMPTS:5", convert=int)
+    uploader_max_attempts: int = env("HIPPIUS_UPLOADER_MAX_ATTEMPTS:7", convert=int)
     uploader_backoff_base_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_BASE_MS:500", convert=int)
     uploader_backoff_max_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_MAX_MS:60000", convert=int)
     uploader_multipart_max_concurrency: int = env("HIPPIUS_UPLOADER_MULTIPART_MAX_CONCURRENCY:5", convert=int)

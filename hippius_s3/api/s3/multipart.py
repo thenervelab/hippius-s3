@@ -30,6 +30,9 @@ from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.db_retry import retry_on_object_version_conflict
 from hippius_s3.monitoring import get_metrics_collector
+from hippius_s3.services.envelope_service import generate_dek
+from hippius_s3.services.envelope_service import wrap_dek
+from hippius_s3.services.kek_service import get_or_create_active_bucket_kek
 from hippius_s3.services.mpu_cleanup import fail_version_replication
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
@@ -196,6 +199,44 @@ async def list_parts_internal(
     )
 
 
+async def _write_v5_envelope(
+    db: Any,
+    *,
+    bucket_id: str,
+    reserve_row: Any,
+    kek_id: uuid.UUID,
+    kek_bytes: bytes,
+    dek: bytes,
+) -> None:
+    """Write the DEK envelope for a freshly reserved MPU version. MUST run in the reserve's own
+    transaction.
+
+    upsert_object_multipart bumps objects.current_object_version, so the new v5 row becomes the LIVE
+    version the instant it commits. Deferring the envelope to the first UploadPart (where
+    ObjectWriter._ensure_and_get_v5_dek used to create it) left that live row with a NULL
+    kek_id/wrapped_dek for the whole initiate→first-part gap — unbounded, and permanent for an MPU
+    that is never continued. A GET in that gap 500s on v5_missing_envelope_metadata. Same invariant
+    the simple-PUT path enforces in writer/object_writer.py `_reserve_version`.
+
+    _ensure_and_get_v5_dek(rotate=False) finds this envelope on the first UploadPart and unwraps it,
+    so parts still encrypt under one DEK per version.
+    """
+    # AAD binds the DB-returned object_id/version, not the locally generated candidate: a concurrent
+    # create can hand back a different object_id, and a DEK wrapped under the wrong AAD never unwraps.
+    resolved_object_id = str(reserve_row["object_id"])
+    resolved_version = int(reserve_row["current_object_version"])
+    aad = f"hippius-dek:{bucket_id}:{resolved_object_id}:{resolved_version}".encode()
+    await db.execute(
+        get_query("update_object_version_envelope"),
+        "hip-enc/aes256gcm",
+        int(config.object_chunk_size_bytes),
+        kek_id,
+        wrap_dek(kek=kek_bytes, dek=dek, aad=aad),
+        resolved_object_id,
+        resolved_version,
+    )
+
+
 async def initiate_multipart_upload(
     bucket_name: str,
     object_key: str,
@@ -264,21 +305,40 @@ async def initiate_multipart_upload(
         # Create initial objects row for this multipart upload. The version allocation can collide
         # with a concurrent create_migration_version on object_versions_pkey; retry re-reads the
         # committed MAX in a fresh autocommit statement (see writer/db.py).
-        upsert_result = await retry_on_object_version_conflict(
-            lambda: db.fetchrow(
-                get_query("upsert_object_multipart"),
-                object_id,
-                bucket["bucket_id"],
-                object_key,
-                content_type,
-                json.dumps(metadata),
-                "",  # initial md5_hash (will be updated on completion)
-                0,  # initial size_bytes (will be updated on completion)
-                initiated_at,  # created_at
-                config.target_storage_version,
-                config.upload_backends,
-            )
-        )
+        # KEK lookup + DEK generation run OUTSIDE the reserve transaction: the KEK lives on a
+        # separate keystore pool and may make a KMS round-trip on cache miss, so we must not hold a
+        # main-pool connection open across it (mirrors writer/object_writer.py).
+        dek = generate_dek()
+        kek_id, kek_bytes = await get_or_create_active_bucket_kek(bucket_id=str(bucket["bucket_id"]))
+
+        async def _reserve_version_with_envelope() -> Any:
+            async with db.transaction():
+                row = await db.fetchrow(
+                    get_query("upsert_object_multipart"),
+                    object_id,
+                    bucket["bucket_id"],
+                    object_key,
+                    content_type,
+                    json.dumps(metadata),
+                    "",  # initial md5_hash (will be updated on completion)
+                    0,  # initial size_bytes (will be updated on completion)
+                    initiated_at,  # created_at
+                    config.target_storage_version,
+                    config.upload_backends,
+                )
+                if not row:
+                    raise RuntimeError("initiate_reserve_missing_row")
+                await _write_v5_envelope(
+                    db,
+                    bucket_id=str(bucket["bucket_id"]),
+                    reserve_row=row,
+                    kek_id=kek_id,
+                    kek_bytes=kek_bytes,
+                    dek=dek,
+                )
+                return row
+
+        upsert_result = await retry_on_object_version_conflict(_reserve_version_with_envelope)
 
         # Use the returned object_id (will be existing one if conflict occurred)
         object_id = str(upsert_result["object_id"])

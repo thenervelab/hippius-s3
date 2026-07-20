@@ -13,6 +13,7 @@ This test verifies both layers by:
 - Verifying GET still succeeds (serves previous version via fallback)
 - Verifying GET returns correct data after the envelope is restored
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -26,8 +27,10 @@ import pytest
 from tests.e2e.support.cache import clear_object_cache
 from tests.e2e.support.cache import get_object_id_and_version
 
+from .support.dsn import DEFAULT_DSN
 
-DB_DSN = "postgresql://postgres:postgres@localhost:5432/hippius"
+
+DB_DSN = DEFAULT_DSN
 
 
 def _null_envelope(object_id: str, object_version: int) -> None:
@@ -120,8 +123,7 @@ def test_get_falls_back_to_previous_version_when_envelope_missing(
     data = resp["Body"].read()
     fallback_md5 = hashlib.md5(data).hexdigest()
     assert fallback_md5 == md5_v1, (
-        f"Expected fallback to v{current_version - 1} (md5={md5_v1[:8]}), "
-        f"got md5={fallback_md5[:8]}"
+        f"Expected fallback to v{current_version - 1} (md5={md5_v1[:8]}), got md5={fallback_md5[:8]}"
     )
 
     # Restore the envelope so cleanup can delete the object
