@@ -82,6 +82,7 @@ async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redi
         None,
         None,
         1,
+        None,
     )
     if objects:
         return errors.s3_error_response(
