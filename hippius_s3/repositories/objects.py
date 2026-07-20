@@ -30,6 +30,14 @@ class ObjectRepository:
             version,
         )
 
+    async def get_head_by_path(self, bucket_name: str, object_key: str, main_account_id: Optional[str]) -> Any:
+        """HD-4: light HEAD metadata by path — no download_chunks/mpu joins; carries the Arion hash."""
+        return await self._db.fetchrow(
+            get_query("get_object_head_by_path"),
+            bucket_name,
+            object_key,
+        )
+
     async def get_by_path(self, bucket_id: str, object_key: str) -> Any:
         return await self._db.fetchrow(get_query("get_object_by_path"), bucket_id, object_key)
 
