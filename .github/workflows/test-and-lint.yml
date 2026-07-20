@@ -133,6 +133,14 @@ jobs:
           source .venv/bin/activate
           uv pip install -e ".[dev]"
 
+      # The retry-mover tests spawn a throwaway redis-server because fakeredis cannot run Lua,
+      # and they self-skip when the binary is absent. The runner image does not ship it, so
+      # without this the atomic-claim regression guard silently never executes in CI.
+      - name: Install redis-server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server
+
       - name: Run unit tests
         run: |
           mkdir -p reports
