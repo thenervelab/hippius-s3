@@ -906,6 +906,7 @@ class ObjectWriter:
         object_version: int,
         address: str,
         selected_parts: list[int] | None = None,
+        db_parts: list[Any] | None = None,
     ) -> CompleteResult:
         # B1: S3 allows completing with a SUBSET of the uploaded parts. `selected_parts` is the
         # client's <Part> list (already validated exists+ETag-matches by the endpoint); the final
@@ -918,29 +919,41 @@ class ObjectWriter:
         # test `is not None` so a falsy-but-present empty list is not collapsed into the all-parts sentinel.
         selected = sorted({int(pn) for pn in selected_parts}) if selected_parts is not None else None
 
+        # MPU-3: `list_parts_for_version` (SELECT *) carries etag AND size_bytes ordered by
+        # part_number, so the endpoint's already-fetched rows serve both the combined ETag and the
+        # total size — no re-reads. When not supplied (migrate script), fall back to the original two
+        # queries so behaviour is byte-identical.
+        if db_parts is not None:
+            etag_rows: list[Any] = db_parts
+            size_rows: list[Any] = db_parts
+        else:
+            etag_rows = await self.pool.fetch(
+                get_query("get_parts_etags_for_version"),
+                object_id,
+                int(object_version),
+            )
+            size_rows = await self.pool.fetch(
+                get_query("list_parts_for_version"),
+                object_id,
+                int(object_version),
+            )
+
+        selected_set = set(selected) if selected is not None else None
+
         # Compute combined ETag from part etags for this version (client-selected subset only).
-        parts = await self.pool.fetch(
-            get_query("get_parts_etags_for_version"),
-            object_id,
-            int(object_version),
+        etag_parts = (
+            [p for p in etag_rows if int(p["part_number"]) in selected_set] if selected_set is not None else etag_rows
         )
-        if selected is not None:
-            selected_set = set(selected)
-            parts = [p for p in parts if int(p["part_number"]) in selected_set]
-        etags = [p["etag"].split("-")[0] for p in parts]
+        etags = [p["etag"].split("-")[0] for p in etag_parts]
         binary = b"".join(bytes.fromhex(e) for e in etags) if etags else b""
         final_md5 = hashlib.md5(binary).hexdigest() + f"-{len(etags)}"
 
         # Total size (client-selected subset only).
-        all_parts = await self.pool.fetch(
-            get_query("list_parts_for_version"),
-            object_id,
-            int(object_version),
+        all_pns = {int(p["part_number"]) for p in size_rows}
+        size_parts = (
+            [p for p in size_rows if int(p["part_number"]) in selected_set] if selected_set is not None else size_rows
         )
-        all_pns = {int(p["part_number"]) for p in all_parts}
-        if selected is not None:
-            all_parts = [p for p in all_parts if int(p["part_number"]) in set(selected)]
-        total_size = sum(int(p["size_bytes"]) for p in all_parts)
+        total_size = sum(int(p["size_bytes"]) for p in size_parts)
 
         # Only persist the filter when the client named a STRICT subset — a full-set completion
         # (the overwhelming common case) leaves the column NULL so no per-read filter/array is
