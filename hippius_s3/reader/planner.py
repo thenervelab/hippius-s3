@@ -29,9 +29,14 @@ async def build_chunk_plan(
     # Normalize and sort parts
     ordered = sorted(parts, key=lambda x: int(x.get("part_number", 0)))
 
-    # Batch-load all part sizes in a single DB query instead of N sequential calls
     part_numbers = [int(p.get("part_number", 0)) for p in ordered]
-    size_map = await read_parts_plain_and_chunk_sizes_batch(db, object_id, part_numbers, int(object_version))
+    # RD-3: the GET path already carries size_bytes + chunk_size_bytes on each part (from the parts
+    # catalog), so size the plan from them and skip the query. Fall back to the batch query when any
+    # part lacks them — copy/UploadPartCopy callers and the envelope-race re-read pass thinner lists.
+    if ordered and all("size_bytes" in p and int(p.get("chunk_size_bytes") or 0) > 0 for p in ordered):
+        size_map = {int(p["part_number"]): (int(p.get("size_bytes") or 0), int(p["chunk_size_bytes"])) for p in ordered}
+    else:
+        size_map = await read_parts_plain_and_chunk_sizes_batch(db, object_id, part_numbers, int(object_version))
 
     sizes: list[tuple[int, int, int]] = []  # (part_number, plain_size, chunk_size)
     for pn in part_numbers:

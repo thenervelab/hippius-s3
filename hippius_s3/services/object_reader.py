@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from dataclasses import dataclass
@@ -48,6 +49,39 @@ class StreamContext:
     upload_id: str
 
 
+# RQ-4: compare-and-delete Lua — delete the coalesce lock only while it still holds our token, so we
+# never steal a lock a later streamer/downloader re-acquired. Fixed script (no user input in the body);
+# mirrors the downloader's release. The key format must match _enqueue_missing_downloads exactly.
+_COALESCE_LOCK_RELEASE_LUA = (
+    "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
+)
+
+
+async def _release_coalesce_locks(
+    redis: Any,
+    *,
+    object_id: str,
+    object_version: int,
+    part_numbers: set[int],
+    ray_token: str,
+) -> None:
+    """Best-effort CAD-release of this streamer's per-part coalesce locks (RQ-4).
+
+    Called when the first-chunk wait times out so the next GET re-enqueues immediately instead of
+    waiting out the lock TTL. CAD-on-token means locks we don't own (lost the coalesce race) no-op.
+    """
+    for pn in part_numbers:
+        lock_key = f"download_in_progress:{object_id}:v:{int(object_version)}:part:{int(pn)}"
+        with contextlib.suppress(Exception):
+            await redis.eval(_COALESCE_LOCK_RELEASE_LUA, 1, lock_key, ray_token)
+
+
+# RQ-3: backends whose downloader fetches by content id (CID) rather than a deterministic
+# backend_identifier. Only for these does the per-part CID resolution matter; Arion (the production
+# backend) is deterministically addressed and its downloader ignores spec.cid entirely.
+_CID_ADDRESSED_BACKENDS: frozenset[str] = frozenset({"ipfs"})
+
+
 async def _enqueue_missing_downloads(
     db: Any,
     redis: Any,
@@ -83,16 +117,21 @@ async def _enqueue_missing_downloads(
     # cases — on TTL expiry, the next miss re-enqueues.
     lock_ttl = int(getattr(cfg, "download_coalesce_lock_ttl_seconds", 120))
     ray_token = str(info.get("ray_id") or "anonymous")
+    # RD-6: acquire every part's coalesce lock in one pipelined round trip instead of one SET NX per
+    # part. Fail-open on a Redis hiccup (treat all as acquired) so the download still happens — a
+    # duplicate enqueue is deduped by the downloader via chunk_exists.
+    parts = list(indices_by_part.keys())
+    lock_keys = [f"download_in_progress:{object_id}:v:{object_version}:part:{pn}" for pn in parts]
+    try:
+        pipe = redis.pipeline(transaction=False)
+        for lk in lock_keys:
+            pipe.set(lk, ray_token, nx=True, ex=lock_ttl)
+        set_results = await pipe.execute()
+    except Exception:
+        set_results = [True] * len(parts)
+
     acquired_parts: set[int] = set()
-    for pn in list(indices_by_part.keys()):
-        lock_key = f"download_in_progress:{object_id}:v:{object_version}:part:{pn}"
-        try:
-            acquired = await redis.set(lock_key, ray_token, nx=True, ex=lock_ttl)
-        except Exception:
-            # Redis hiccup — fail open: behave as if we acquired the lock
-            # so the download still happens. Worst case is a duplicate
-            # enqueue, which the downloader deduplicates via chunk_exists.
-            acquired = True
+    for pn, acquired in zip(parts, set_results, strict=True):
         if acquired:
             acquired_parts.add(pn)
         else:
@@ -106,37 +145,41 @@ async def _enqueue_missing_downloads(
     # If every missing part is already being fetched by someone else,
     # we don't enqueue anything — we just fall through to stream_plan,
     # which will wait on pub/sub for each chunk.
+    # RQ-3: the downloader resolves each chunk's location from chunk_backend itself and never reads
+    # spec.cid — CIDs only matter to a content-addressed backend. Resolve the object's backends once
+    # and skip the per-part CID query entirely unless a CID-addressed backend actually serves it.
+    db_backends = await resolve_object_backends(db, object_id, object_version)
+    needs_cid = bool(set(db_backends) & _CID_ADDRESSED_BACKENDS)
+
     dl_parts: list[PartToDownload] = []
-    # CIDs are optional.
-    # - If per-chunk CIDs exist in part_chunks, include them so the IPFS downloader can fetch from IPFS.
-    # - Otherwise, keep cid=None so other backends (deterministic addressing) can handle it.
     for pn, idxs in indices_by_part.items():
         if pn not in acquired_parts:
             continue
         include = {int(i) for i in idxs}
         by_index: dict[int, tuple[str | None, int | None]] = {}
-        try:
-            from hippius_s3.utils import get_query  # local import
+        if needs_cid:
+            try:
+                from hippius_s3.utils import get_query  # local import
 
-            rows = await db.fetch(
-                get_query("get_part_chunks_by_object_and_number"),
-                object_id,
-                object_version,
-                int(pn),
-            )
-            for r in rows or []:
-                ci = int(r[0])
-                if ci not in include:
-                    continue
-                cid_raw = r[1]
-                cid_val = str(cid_raw).strip() if cid_raw is not None else None
-                if cid_val and cid_val.lower() in {"", "none", "pending"}:
-                    cid_val = None
-                clen = int(r[2]) if (len(r) > 2 and r[2] is not None) else None
-                by_index[ci] = (cid_val, clen)
-        except Exception:
-            # If chunk metadata isn't present (common for CID-less objects), keep cid=None
-            by_index = {}
+                rows = await db.fetch(
+                    get_query("get_part_chunks_by_object_and_number"),
+                    object_id,
+                    object_version,
+                    int(pn),
+                )
+                for r in rows or []:
+                    ci = int(r[0])
+                    if ci not in include:
+                        continue
+                    cid_raw = r[1]
+                    cid_val = str(cid_raw).strip() if cid_raw is not None else None
+                    if cid_val and cid_val.lower() in {"", "none", "pending"}:
+                        cid_val = None
+                    clen = int(r[2]) if (len(r) > 2 and r[2] is not None) else None
+                    by_index[ci] = (cid_val, clen)
+            except Exception:
+                # If chunk metadata isn't present (common for CID-less objects), keep cid=None
+                by_index = {}
 
         specs: list[PartChunkSpec] = []
         for ci in sorted(include):
@@ -145,7 +188,6 @@ async def _enqueue_missing_downloads(
 
         dl_parts.append(PartToDownload(part_number=int(pn), chunks=specs))
     if dl_parts:
-        db_backends = await resolve_object_backends(db, object_id, object_version)
         req = DownloadChainRequest(
             request_id=f"{object_id}::shared",
             object_id=object_id,
@@ -177,13 +219,17 @@ async def build_stream_context(
     *,
     rng: RangeRequest | None,
     address: str,
+    parts: list[dict] | None = None,
 ) -> StreamContext:
     cfg = get_config()
     storage_version = require_supported_storage_version(int(info["storage_version"]))
     # v4-only policy: always decrypt at read time.
 
     ov = int(info.get("object_version") or info.get("current_object_version") or 1)
-    parts = await read_parts_list(db, info["object_id"], ov)
+    # RD-3: the GET endpoint already built the parts catalog; reuse it instead of re-reading. HEAD and
+    # copy callers pass nothing and keep the DB read.
+    if parts is None:
+        parts = await read_parts_list(db, info["object_id"], ov)
     plan = await build_chunk_plan(db, info["object_id"], parts, rng, object_version=ov)
 
     # Batch check all chunks in a single Redis pipeline round trip
@@ -308,8 +354,11 @@ async def read_response(
     rng: RangeRequest | None,
     address: str,
     range_was_invalid: bool = False,
+    parts: list[dict] | None = None,
 ) -> Response:
     cfg = get_config()
+    # RD-3: the endpoint already built the parts catalog; pass it through so build_stream_context and
+    # the planner don't re-read `parts`. None → they read it themselves (unchanged).
     ctx = await build_stream_context(
         db,
         redis,
@@ -317,6 +366,7 @@ async def read_response(
         info,
         rng=rng,
         address=address,
+        parts=parts,
     )
     gen = stream_plan(
         obj_cache=obj_cache,
@@ -350,6 +400,20 @@ async def read_response(
         # ChunkNotReadyError: the downloader gave up fast on a backend miss and notified anyway, so
         # the peek woke to an empty cache. Same retryable outcome as a timeout — a 503, not a 500.
         await gen.aclose()
+        # RQ-4: release the coalesce locks this streamer set (CAD on our ray token) so the client's
+        # retry re-enqueues immediately rather than waiting out the lock TTL (default 600s).
+        await _release_coalesce_locks(
+            redis,
+            object_id=str(info["object_id"]),
+            object_version=int(ctx.object_version),
+            # Best-effort on the error path: a malformed plan item must never turn the 503 into a 500.
+            part_numbers={
+                int(getattr(item, "part_number", 0))
+                for item in ctx.plan
+                if getattr(item, "part_number", None) is not None
+            },
+            ray_token=str(info.get("ray_id") or "anonymous"),
+        )
         raise DownloadNotReadyError(
             "Parts not ready: first chunk did not arrive within the initial stream timeout"
         ) from exc

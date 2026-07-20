@@ -358,6 +358,10 @@ async def handle_get_object(
                 rng=v2_rng,
                 address=resolved_address,
                 range_was_invalid=range_was_invalid,
+                # RD-3: reuse the parts catalog built above only when it came from the DB (carries
+                # chunk_size_bytes + the completed-parts filter). "cached"/fallback → None so the
+                # reader re-reads authoritatively.
+                parts=download_chunks if parts_source == "db" else None,
             )
             set_span_attributes(span, {"http.status_code": int(response.status_code)})
 

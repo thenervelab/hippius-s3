@@ -455,3 +455,48 @@ async def test_can_upload_cache_key_is_per_account(mock_config_no_bypass: Any, m
         await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
 
     mock_redis.get.assert_called_with("can_upload:5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY")
+
+
+@pytest.mark.asyncio
+async def test_gw4_get_skips_account_fetch_but_put_fetches(
+    mock_config_no_bypass: Any, monkeypatch: Any
+) -> None:
+    """GW-4: access-key GET/HEAD carry no credit gate and the API ignores the credit fields, so the
+    redis-accounts fetch is skipped on reads; mutating methods still fetch and gate."""
+    from gateway.middlewares import account as account_mod
+
+    monkeypatch.setattr("gateway.middlewares.account.config", mock_config_no_bypass)
+    addr = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+    calls = {"n": 0}
+
+    async def spy_fetch(address: str, redis_client: Any, substrate_url: str) -> HippiusAccount:
+        calls["n"] += 1
+        return HippiusAccount(id=addr, main_account=addr, has_credits=True, upload=True, delete=True)
+
+    monkeypatch.setattr("gateway.middlewares.account.fetch_account_by_main_address", spy_fetch)
+    monkeypatch.setattr(account_mod, "_check_can_upload", AsyncMock(return_value=None))
+
+    app = FastAPI()
+    app.state.redis_accounts = AsyncMock()
+
+    @app.api_route("/b/k", methods=["GET", "PUT"])
+    async def ep(request: Request) -> dict[str, str]:
+        return {"account_id": request.state.account_id}
+
+    async def inject(request: Request, call_next: Any) -> Any:
+        request.state.auth_method = "access_key"
+        request.state.account_address = addr
+        return await call_next(request)
+
+    app.middleware("http")(account_mod.account_middleware)
+    app.middleware("http")(inject)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r_get = await client.get("/b/k")
+        assert r_get.status_code == 200
+        assert r_get.json()["account_id"] == addr
+        assert calls["n"] == 0, "GET must not fetch the account (GW-4)"
+
+        r_put = await client.put("/b/k", content=b"x", headers={"content-length": "1"})
+        assert r_put.status_code == 200
+        assert calls["n"] == 1, "PUT must still fetch the account for the credit gate"

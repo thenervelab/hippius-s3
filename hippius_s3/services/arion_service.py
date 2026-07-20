@@ -193,6 +193,12 @@ def retry_on_error(
     """
     Decorator to retry HTTP requests on 4xx/5xx errors.
 
+    Transport failures (httpx.ConnectError et al) are deliberately NOT retried here. They are
+    already classified `transient` by `classify_upload_error`, so the worker loops re-drive them
+    through the Redis retry ZSET, which — unlike this decorator — backs off exponentially with
+    jitter, survives a pod restart, and releases `_put_semaphore` between attempts. Retrying in
+    both layers multiplies into ~24 requests against a backend that is already failing.
+
     Args:
         retries: Number of retry attempts (default: 3)
         backoff: Seconds to wait between retries (default: 5.0)

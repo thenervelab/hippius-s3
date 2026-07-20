@@ -77,6 +77,10 @@ class Config:
     public_bucket_cache_ttl_seconds: int = env("PUBLIC_BUCKET_CACHE_TTL_SECONDS:60", convert=int)
     enable_bypass_credit_check: bool = env("HIPPIUS_BYPASS_CREDIT_CHECK:false", convert=lambda x: x.lower() == "true")
     read_only_mode: bool = env("HIPPIUS_READ_ONLY_MODE:false", convert=lambda x: x.lower() == "true")
+    # LS-1: do the ListObjectsV2 delimiter rollup in SQL (a loose-index skip-scan) instead of the
+    # Python collapse. Opt-in — the CommonPrefixes/pagination contract is client-facing; a differential
+    # test proves byte-identical output, and the Python path stays as the default rollback.
+    list_objects_sql_rollup: bool = env("HIPPIUS_LIST_OBJECTS_SQL_ROLLUP:false", convert=lambda x: x.lower() == "true")
 
     # S3 Validation Limits
     min_bucket_name_length: int = env("MIN_BUCKET_NAME_LENGTH", convert=int)
@@ -139,7 +143,7 @@ class Config:
     orphan_checker_account_whitelist: list[str] = dataclasses.field(default_factory=_parse_account_whitelist)
 
     # Uploader configuration (supersedes legacy pinner config)
-    uploader_max_attempts: int = env("HIPPIUS_UPLOADER_MAX_ATTEMPTS:5", convert=int)
+    uploader_max_attempts: int = env("HIPPIUS_UPLOADER_MAX_ATTEMPTS:7", convert=int)
     uploader_backoff_base_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_BASE_MS:500", convert=int)
     uploader_backoff_max_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_MAX_MS:60000", convert=int)
     uploader_multipart_max_concurrency: int = env("HIPPIUS_UPLOADER_MULTIPART_MAX_CONCURRENCY:5", convert=int)
@@ -255,6 +259,17 @@ class Config:
     # 600s (A5) so a legitimately slow multi-chunk part download does not expire
     # the lock mid-flight and let a second streamer enqueue a duplicate DCR.
     download_coalesce_lock_ttl_seconds: int = env("DOWNLOAD_COALESCE_LOCK_TTL:600", convert=int)
+    # DB-1: config-driven downloader Postgres pool (was hardcoded min=2/max=20). Audit
+    # Σ(replicas × pool_max) across roles against Postgres max_connections before raising.
+    downloader_db_pool_min: int = env("HIPPIUS_DOWNLOADER_DB_POOL_MIN:2", convert=int)
+    downloader_db_pool_max: int = env("HIPPIUS_DOWNLOADER_DB_POOL_MAX:20", convert=int)
+    # CF-3: depth of the encrypt producer/consumer queue per streaming write. Peak buffered memory
+    # per PUT ≈ chunk_size × this. Exposed so it can move with chunk size (CF-1).
+    write_queue_maxsize: int = env("HIPPIUS_WRITE_QUEUE_MAXSIZE:16", convert=int)
+    # RD-2 / WU-1: worker threads for the dedicated AES-GCM encrypt/decrypt pool (off the event loop).
+    crypto_pool_workers: int = env("HIPPIUS_CRYPTO_POOL_WORKERS:4", convert=int)
+    # NET-3: keep the expensive mTLS KMS connection warm across sparse/bursty calls.
+    ovh_kms_keepalive_expiry_seconds: int = env("HIPPIUS_OVH_KMS_KEEPALIVE_EXPIRY:300", convert=int)
 
     # Crypto configuration
     # hip-enc/legacy: SecretBox per-chunk (legacy objects)
@@ -386,8 +401,25 @@ class Config:
     cachet_component_id: int = env("CACHET_COMPONENT_ID:0", convert=int)
 
 
+_config_singleton: "Config | None" = None
+
+
+def reset_config() -> None:
+    """Drop the memoized config so the next get_config() rebuilds it.
+
+    Config is immutable after startup, so get_config() memoizes a single instance. Tests that mutate
+    the environment between cases call this to force a rebuild.
+    """
+    global _config_singleton
+    _config_singleton = None
+
+
 def get_config() -> Config:
-    """Get application configuration."""
+    """Get application configuration (memoized; immutable after startup)."""
+    global _config_singleton
+    if _config_singleton is not None:
+        return _config_singleton
+
     try:
         cfg = Config()
     except KeyError as e:
@@ -438,4 +470,6 @@ def get_config() -> Config:
             "HIPPIUS_AUTH_ENCRYPTION_KEY is required when HIPPIUS_KMS_MODE=disabled (used for local KEK wrapping)"
         )
 
+    # Cache only after successful validation so a bad config never poisons the singleton.
+    _config_singleton = cfg
     return cfg

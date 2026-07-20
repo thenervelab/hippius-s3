@@ -5,9 +5,11 @@ from typing import Optional
 
 import psycopg
 
+from .dsn import DEFAULT_DSN
+
 
 def _get_db_url() -> str:
-    return os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius")
+    return os.getenv("DATABASE_URL", DEFAULT_DSN)
 
 
 def get_object_row(bucket: str, key: str) -> Optional[dict[str, Any]]:

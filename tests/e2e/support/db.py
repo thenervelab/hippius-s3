@@ -7,12 +7,14 @@ from typing import Any
 
 import psycopg  # type: ignore[import-untyped]
 
+from .dsn import DEFAULT_DSN
+
 
 def get_keystore_dsn() -> str:
     """Get the keystore database DSN from environment."""
     return os.environ.get(
         "HIPPIUS_KEYSTORE_DATABASE_URL",
-        "postgresql://postgres:postgres@localhost:5432/hippius",
+        DEFAULT_DSN,
     )
 
 
@@ -20,7 +22,7 @@ def get_main_dsn() -> str:
     """Get the main database DSN from environment."""
     return os.environ.get(
         "DATABASE_URL",
-        "postgresql://postgres:postgres@localhost:5432/hippius",
+        DEFAULT_DSN,
     )
 
 

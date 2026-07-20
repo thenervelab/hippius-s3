@@ -178,7 +178,9 @@ async def _authenticate_bearer(request: Request, auth_header: str, logger: Any) 
         )
 
     try:
-        token_response = await cached_auth(token, request.app.state.redis_client)
+        token_response = await cached_auth(
+            token, request.app.state.redis_client, getattr(request.app.state, "hippius_api_client", None)
+        )
 
         if not token_response.valid or token_response.status != "active":
             logger.warning(f"Invalid or inactive Bearer access key: {token[:8]}***, status={token_response.status}")

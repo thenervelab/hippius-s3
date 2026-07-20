@@ -24,7 +24,11 @@ Chunk size is read per-part from the DB (`parts.chunk_size_bytes`), not from con
 
 [streamer.py:18](streamer.py). Two modes:
 
-### `prefetch_chunks=0` (sequential, default)
+> **Runtime default is 16, not 0.** `prefetch_chunks=0` is only the `stream_plan` function-parameter
+> fallback. The wired config default is `HTTP_STREAM_PREFETCH_CHUNKS=16` ([config.py:296](../config.py)),
+> so production runs the pipelined branch below. The `=0` mode is what the sequential tests exercise.
+
+### `prefetch_chunks=0` (sequential; function-param fallback, not the runtime default)
 
 Trivial loop: for each item, `await obj_cache.wait_for_chunk(...)` → `decrypt_chunk_if_needed(...)` → `yield maybe_slice(pt, slice_start, slice_end_excl)`. Preserves strict ordering and back-pressure.
 
@@ -36,7 +40,7 @@ Scheduling loop ([streamer.py:74-144](streamer.py)):
 - Pop the next pending task, await its bytes, schedule one more to keep the pipeline full, decrypt, slice, yield.
 - On client disconnect or early exit, cancel any pending tasks in `finally`.
 
-**Why default is 0**: prefetch=0 preserves the original sequential behavior exactly. Any prefetch >0 must handle async exception propagation carefully — a failing prefetch task shouldn't kill the stream until we actually reach it. The current scheduler does this correctly (each task's exception is re-raised when it's `await`ed), but the "default 0" is a conservative guard.
+**Why the function-param fallback is 0**: it preserves the original sequential behavior exactly for callers that don't pass a value. Any prefetch >0 must handle async exception propagation carefully — a failing prefetch task shouldn't kill the stream until we actually reach it. The current scheduler does this correctly (each task's exception is re-raised when it's `await`ed). Callers in `object_reader.py` pass the config value (16), so prod uses the pipelined path.
 
 Opportunity: for large sequential GETs, enabling prefetch=4 or so would overlap FS fetch (or Arion fetch for cold chunks) with decrypt+IO. Measure before committing. Listed as P2 in [todo.md](../../todo.md).
 

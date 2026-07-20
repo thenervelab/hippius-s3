@@ -107,11 +107,17 @@ class OVHKMSClient:
                 missing.append(f"ca: {ca_path}")
             raise ValueError(f"KMS certificate files not found: {', '.join(missing)}")
 
+        # NET-3: KMS calls are sparse/bursty and mTLS is the most expensive handshake; keep a small
+        # pool warm well past httpx's 5s default so cold-envelope reads don't redo the full handshake.
         self._client = httpx.AsyncClient(
             base_url=self._endpoint,
             cert=(cert_path, key_path),
             verify=ca_path,
             timeout=httpx.Timeout(self._timeout),
+            limits=httpx.Limits(
+                max_keepalive_connections=10,
+                keepalive_expiry=float(config.ovh_kms_keepalive_expiry_seconds),
+            ),
         )
 
     @staticmethod

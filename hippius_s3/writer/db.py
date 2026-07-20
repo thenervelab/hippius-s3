@@ -15,14 +15,19 @@ async def set_object_version_address(
     object_id: str,
     object_version: int,
     address: str,
+    only_if_null: bool = False,
 ) -> None:
     """Persist the main-account address on an object version (s3-2.1).
 
     Written by the api in place of the PUT-time enqueue, so the Rust drain can rebuild
     the UploadChainRequest by object_id and enqueue it once the part replicates to ceph.
+
+    only_if_null (AP-2): gate the UPDATE on `address IS NULL` so a caller whose version already
+    carries an address (e.g. the append hot path) issues a no-op instead of a redundant write.
     """
+    query = "set_object_version_address_if_null" if only_if_null else "set_object_version_address"
     await db.execute(
-        get_query("set_object_version_address"),
+        get_query(query),
         object_id,
         int(object_version),
         address,

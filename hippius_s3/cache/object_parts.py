@@ -145,20 +145,6 @@ class RedisObjectPartsCache:
     ) -> list[bool]:
         return await self.fs.chunks_exist_batch(object_id, int(object_version), checks)
 
-    async def set_chunks(
-        self,
-        object_id: str,
-        object_version: int,
-        part_number: int,
-        chunks: list[bytes],
-        *,
-        ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
-        start_index: int = 0,
-    ) -> None:
-        del ttl
-        for i, data in enumerate(chunks, start=start_index):
-            await self.fs.set_chunk(object_id, int(object_version), int(part_number), int(i), data)
-
     # ---- metadata API (FS-backed) ----
 
     async def set_meta(

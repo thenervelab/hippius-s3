@@ -306,6 +306,24 @@ def _kek_unwrap_lock(bucket_id: str, kek_id: uuid.UUID) -> asyncio.Lock:
     return lock
 
 
+# KM-2: per-bucket lock coalescing the fetch-or-create of a bucket's active KEK, so a first-PUT
+# burst on a new bucket does one KMS generate rather than N generates + (N-1) decrypts. Same
+# idle-eviction discipline as the unwrap-lock map.
+_kek_create_locks: dict[str, asyncio.Lock] = {}
+
+
+def _kek_create_lock(bucket_id: str) -> asyncio.Lock:
+    key = str(bucket_id)
+    lock = _kek_create_locks.get(key)
+    if lock is None:
+        if len(_kek_create_locks) >= _KEK_LOCK_MAP_MAX:
+            for k in [k for k, v in _kek_create_locks.items() if not v.locked()]:
+                del _kek_create_locks[k]
+        lock = asyncio.Lock()
+        _kek_create_locks[key] = lock
+    return lock
+
+
 async def _get_cached_kek(bucket_id: str, kek_id: uuid.UUID) -> bytes | None:
     cfg = get_config()
     ttl = int(cfg.kek_cache_ttl_seconds)
@@ -351,6 +369,11 @@ async def _get_cached_active_kek_id(bucket_id: str) -> uuid.UUID | None:
         if expires_at <= now:
             _ACTIVE_KEK_CACHE.pop(str(bucket_id), None)
             return None
+        # KM-3: sliding window, symmetric with _get_cached_kek — refresh the TTL on read so a
+        # continuously-hot bucket doesn't re-SELECT the (unchanged) active kek_id every TTL. Reads
+        # stay correct regardless since decrypts key off the object row's stored kek_id; a future
+        # rotation feature must invalidate this entry when it flips the active KEK.
+        _ACTIVE_KEK_CACHE[str(bucket_id)] = (kek_id, now + ttl)
         return kek_id
 
 
@@ -438,87 +461,97 @@ async def get_or_create_active_bucket_kek(
         if cached_bytes is not None:
             return cached_active_kek_id, cached_bytes
 
-    pool = await _get_pool(dsn)
-    async with pool.acquire() as conn:
-        await _maybe_ensure_tables(conn)
+    # KM-2: singleflight the cold fetch-or-create per bucket (outside the pool so waiters don't hold
+    # a keystore connection), re-checking the cache inside the lock so a first-PUT burst on a new
+    # bucket resolves to one KMS generate. The 23505 handler below stays as the cross-pod backstop.
+    async with _kek_create_lock(bucket_id):
+        cached_active_kek_id = await _get_cached_active_kek_id(bucket_id)
+        if cached_active_kek_id is not None:
+            cached_bytes = await _get_cached_kek(bucket_id, cached_active_kek_id)
+            if cached_bytes is not None:
+                return cached_active_kek_id, cached_bytes
 
-        async def _fetch_active() -> asyncpg.Record | None:
-            return await conn.fetchrow(
-                """
-                SELECT kek_id, wrapped_kek_bytes, kms_key_id
-                  FROM bucket_keks
-                 WHERE bucket_id = $1
-                   AND status = 'active'
-                 ORDER BY created_at DESC
-                 LIMIT 1
-                """,
-                uuid.UUID(str(bucket_id)),
-            )
+        pool = await _get_pool(dsn)
+        async with pool.acquire() as conn:
+            await _maybe_ensure_tables(conn)
 
-        row = await _fetch_active()
+            async def _fetch_active() -> asyncpg.Record | None:
+                return await conn.fetchrow(
+                    """
+                    SELECT kek_id, wrapped_kek_bytes, kms_key_id
+                      FROM bucket_keks
+                     WHERE bucket_id = $1
+                       AND status = 'active'
+                     ORDER BY created_at DESC
+                     LIMIT 1
+                    """,
+                    uuid.UUID(str(bucket_id)),
+                )
 
-        if row is not None:
-            kek_id = uuid.UUID(str(row["kek_id"]))
-            await _set_cached_active_kek_id(bucket_id, kek_id)
+            row = await _fetch_active()
 
-            # Check for cached KEK first
-            cached = await _get_cached_kek(bucket_id, kek_id)
-            if cached is not None:
-                return kek_id, cached
+            if row is not None:
+                kek_id = uuid.UUID(str(row["kek_id"]))
+                await _set_cached_active_kek_id(bucket_id, kek_id)
 
-            # A14 singleflight: coalesce concurrent cold misses. Hold the per-key lock, then
-            # RE-CHECK the cache — the first waiter's unwrap+cache means every later waiter hits
-            # the cache and skips its own KMS call.
-            async with _kek_unwrap_lock(bucket_id, kek_id):
+                # Check for cached KEK first
                 cached = await _get_cached_kek(bucket_id, kek_id)
                 if cached is not None:
                     return kek_id, cached
-                wrapped_kek_bytes = row["wrapped_kek_bytes"]
-                kms_key_id = row["kms_key_id"]
-                kek_bytes = await _unwrap_kek(bytes(wrapped_kek_bytes), kms_key_id, kek_id)
-                await _set_cached_kek(bucket_id, kek_id, kek_bytes)
-                return kek_id, kek_bytes
 
-        # Create new KEK (KMS generates the key, or we generate locally)
-        kek_id = uuid.uuid4()
-        kek_bytes, wrapped_kek_bytes, kms_key_id = await _create_wrapped_kek(f"new KEK for bucket {bucket_id}")
-
-        try:
-            await conn.execute(
-                """
-                INSERT INTO bucket_keks (bucket_id, kek_id, wrapped_kek_bytes, kms_key_id, status)
-                VALUES ($1, $2, $3, $4, 'active')
-                """,
-                uuid.UUID(str(bucket_id)),
-                kek_id,
-                wrapped_kek_bytes,
-                kms_key_id,
-            )
-        except Exception as e:
-            # Handle race condition: another process created the KEK
-            if getattr(e, "sqlstate", "") == "23505":
-                row = await _fetch_active()
-                if row is not None:
-                    kek_id = uuid.UUID(str(row["kek_id"]))
-                    await _set_cached_active_kek_id(bucket_id, kek_id)
-
-                    # Check cache first
+                # A14 singleflight: coalesce concurrent cold misses. Hold the per-key lock, then
+                # RE-CHECK the cache — the first waiter's unwrap+cache means every later waiter hits
+                # the cache and skips its own KMS call.
+                async with _kek_unwrap_lock(bucket_id, kek_id):
                     cached = await _get_cached_kek(bucket_id, kek_id)
                     if cached is not None:
                         return kek_id, cached
-
-                    # Unwrap the KEK
-                    wrapped = row["wrapped_kek_bytes"]
-                    key_id = row["kms_key_id"]
-                    kek_bytes = await _unwrap_kek(bytes(wrapped), key_id, kek_id)
-
+                    wrapped_kek_bytes = row["wrapped_kek_bytes"]
+                    kms_key_id = row["kms_key_id"]
+                    kek_bytes = await _unwrap_kek(bytes(wrapped_kek_bytes), kms_key_id, kek_id)
                     await _set_cached_kek(bucket_id, kek_id, kek_bytes)
                     return kek_id, kek_bytes
-            raise
 
-        await _set_cached_active_kek_id(bucket_id, kek_id)
-        await _set_cached_kek(bucket_id, kek_id, kek_bytes)
-        return kek_id, kek_bytes
+            # Create new KEK (KMS generates the key, or we generate locally)
+            kek_id = uuid.uuid4()
+            kek_bytes, wrapped_kek_bytes, kms_key_id = await _create_wrapped_kek(f"new KEK for bucket {bucket_id}")
+
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO bucket_keks (bucket_id, kek_id, wrapped_kek_bytes, kms_key_id, status)
+                    VALUES ($1, $2, $3, $4, 'active')
+                    """,
+                    uuid.UUID(str(bucket_id)),
+                    kek_id,
+                    wrapped_kek_bytes,
+                    kms_key_id,
+                )
+            except Exception as e:
+                # Handle race condition: another process created the KEK
+                if getattr(e, "sqlstate", "") == "23505":
+                    row = await _fetch_active()
+                    if row is not None:
+                        kek_id = uuid.UUID(str(row["kek_id"]))
+                        await _set_cached_active_kek_id(bucket_id, kek_id)
+
+                        # Check cache first
+                        cached = await _get_cached_kek(bucket_id, kek_id)
+                        if cached is not None:
+                            return kek_id, cached
+
+                        # Unwrap the KEK
+                        wrapped = row["wrapped_kek_bytes"]
+                        key_id = row["kms_key_id"]
+                        kek_bytes = await _unwrap_kek(bytes(wrapped), key_id, kek_id)
+
+                        await _set_cached_kek(bucket_id, kek_id, kek_bytes)
+                        return kek_id, kek_bytes
+                raise
+
+            await _set_cached_active_kek_id(bucket_id, kek_id)
+            await _set_cached_kek(bucket_id, kek_id, kek_bytes)
+            return kek_id, kek_bytes
 
 
 async def get_bucket_kek_bytes(*, bucket_id: str, kek_id: uuid.UUID) -> bytes:
@@ -535,31 +568,39 @@ async def get_bucket_kek_bytes(*, bucket_id: str, kek_id: uuid.UUID) -> bytes:
     if not dsn:
         raise RuntimeError("kek_database_unavailable")
 
-    pool = await _get_pool(dsn)
-    async with pool.acquire() as conn:
-        await _maybe_ensure_tables(conn)
+    # KM-1: singleflight the cold unwrap so N concurrent GETs sharing a bucket's KEK collapse to one
+    # KMS round trip (mirrors the PUT path). The re-check inside the lock catches the fill by the
+    # winner; losers also stop competing for the keystore pool across the KMS call.
+    async with _kek_unwrap_lock(bucket_id, kek_id):
+        cached = await _get_cached_kek(bucket_id, kek_id)
+        if cached is not None:
+            return cached
 
-        row = await conn.fetchrow(
-            """
-            SELECT wrapped_kek_bytes, kms_key_id
-              FROM bucket_keks
-             WHERE bucket_id = $1
-               AND kek_id = $2
-             LIMIT 1
-            """,
-            uuid.UUID(str(bucket_id)),
-            uuid.UUID(str(kek_id)),
-        )
-        if row is None:
-            raise RuntimeError("kek_not_found")
+        pool = await _get_pool(dsn)
+        async with pool.acquire() as conn:
+            await _maybe_ensure_tables(conn)
 
-        # Unwrap the KEK
-        wrapped_kek_bytes = row["wrapped_kek_bytes"]
-        kms_key_id = row["kms_key_id"]
-        kek_bytes = await _unwrap_kek(bytes(wrapped_kek_bytes), kms_key_id, kek_id)
+            row = await conn.fetchrow(
+                """
+                SELECT wrapped_kek_bytes, kms_key_id
+                  FROM bucket_keks
+                 WHERE bucket_id = $1
+                   AND kek_id = $2
+                 LIMIT 1
+                """,
+                uuid.UUID(str(bucket_id)),
+                uuid.UUID(str(kek_id)),
+            )
+            if row is None:
+                raise RuntimeError("kek_not_found")
 
-        await _set_cached_kek(bucket_id, kek_id, kek_bytes)
-        return kek_bytes
+            # Unwrap the KEK
+            wrapped_kek_bytes = row["wrapped_kek_bytes"]
+            kms_key_id = row["kms_key_id"]
+            kek_bytes = await _unwrap_kek(bytes(wrapped_kek_bytes), kms_key_id, kek_id)
+
+            await _set_cached_kek(bucket_id, kek_id, kek_bytes)
+            return kek_bytes
 
 
 async def close_kek_pool() -> None:

@@ -6,6 +6,8 @@ from typing import Optional
 
 import psycopg  # type: ignore[import-untyped]
 
+from .dsn import DEFAULT_DSN
+
 
 @dataclass
 class ChunkRow:
@@ -20,7 +22,7 @@ def get_part_chunks(
     object_key: str,
     part_number: int = 1,
     *,
-    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+    dsn: str = DEFAULT_DSN,
     backend: str = "arion",
 ) -> List[ChunkRow]:
     """Return chunk rows for a given object's part, ordered by chunk_index.
@@ -56,7 +58,7 @@ def get_first_chunk_cid(
     bucket_name: str,
     object_key: str,
     *,
-    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+    dsn: str = DEFAULT_DSN,
 ) -> Optional[str]:
     """Return the first chunk CID for part 1, or None if not available."""
     rows = get_part_chunks(bucket_name, object_key, part_number=1, dsn=dsn)

@@ -1,5 +1,6 @@
 -- List objects in a bucket with optional prefix and keyset pagination.
--- Parameters: $1: bucket_id, $2: prefix (optional), $3: inclusive cursor / boundary key (optional), $4: limit
+-- Parameters: $1: bucket_id, $2: prefix (optional), $3: inclusive cursor / boundary key (optional),
+--             $4: limit, $5: exclusive prefix upper bound (successor of prefix, optional)
 -- $3 is an INCLUSIVE lower bound: the endpoint computes the boundary (content key + '\x01', or the
 -- lexicographic successor of a delimiter common-prefix) so a single >= predicate expresses both
 -- "resume after a content key" and "skip the whole collapsed directory group".
@@ -33,6 +34,9 @@ FROM objects o,
 WHERE o.bucket_id = $1
   AND ($2::text IS NULL OR o.object_key LIKE $2::text || '%')
   AND ($3::text IS NULL OR o.object_key >= $3::text)
+  -- LS-2: explicit exclusive upper bound so the (bucket_id, object_key) index range is bounded on
+  -- both ends even under a generic prepared plan (a sparse prefix no longer scans to partition end).
+  AND ($5::text IS NULL OR o.object_key < $5::text COLLATE "C")
   AND o.deleted_at IS NULL
 -- DB is C-collation; an explicit COLLATE here would defeat the (bucket_id, object_key) index ordered scan.
 ORDER BY o.object_key
