@@ -255,6 +255,15 @@ class Config:
     # 600s (A5) so a legitimately slow multi-chunk part download does not expire
     # the lock mid-flight and let a second streamer enqueue a duplicate DCR.
     download_coalesce_lock_ttl_seconds: int = env("DOWNLOAD_COALESCE_LOCK_TTL:600", convert=int)
+    # DB-1: config-driven downloader Postgres pool (was hardcoded min=2/max=20). Audit
+    # Σ(replicas × pool_max) across roles against Postgres max_connections before raising.
+    downloader_db_pool_min: int = env("HIPPIUS_DOWNLOADER_DB_POOL_MIN:2", convert=int)
+    downloader_db_pool_max: int = env("HIPPIUS_DOWNLOADER_DB_POOL_MAX:20", convert=int)
+    # CF-3: depth of the encrypt producer/consumer queue per streaming write. Peak buffered memory
+    # per PUT ≈ chunk_size × this. Exposed so it can move with chunk size (CF-1).
+    write_queue_maxsize: int = env("HIPPIUS_WRITE_QUEUE_MAXSIZE:16", convert=int)
+    # NET-3: keep the expensive mTLS KMS connection warm across sparse/bursty calls.
+    ovh_kms_keepalive_expiry_seconds: int = env("HIPPIUS_OVH_KMS_KEEPALIVE_EXPIRY:300", convert=int)
 
     # Crypto configuration
     # hip-enc/legacy: SecretBox per-chunk (legacy objects)

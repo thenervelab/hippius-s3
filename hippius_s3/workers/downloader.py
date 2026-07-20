@@ -415,7 +415,9 @@ async def run_downloader_loop(
 
     redis_client: async_redis.Redis = create_redis_client(config.redis_url)  # ty: ignore[invalid-assignment]
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
-    db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=20)
+    db_pool = await asyncpg.create_pool(
+        config.database_url, min_size=config.downloader_db_pool_min, max_size=config.downloader_db_pool_max
+    )
     fs_store = create_fs_store(config)
 
     initialize_queue_client(redis_queues_client)
@@ -559,7 +561,9 @@ async def run_downloader_loop(
                 logger.warning(f"[{backend_name}] Recreating DB pool after task error")
                 with contextlib.suppress(Exception):
                     await db_pool.close()
-                db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=20)
+                db_pool = await asyncpg.create_pool(
+                    config.database_url, min_size=config.downloader_db_pool_min, max_size=config.downloader_db_pool_max
+                )
                 needs_db_reconnect = False
 
             if len(inflight) >= max_inflight:

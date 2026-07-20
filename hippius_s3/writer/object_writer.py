@@ -298,7 +298,7 @@ class ObjectWriter:
         perf_stream_start = time.monotonic()
 
         adapter = CryptoService.get_adapter(suite_id)
-        write_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(maxsize=16)
+        write_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(maxsize=self.config.write_queue_maxsize)
         consumer_error: BaseException | None = None
 
         async def _consumer() -> None:
@@ -712,7 +712,7 @@ class ObjectWriter:
         perf_queue_wait_ms = 0.0
         perf_stream_start = time.monotonic()
 
-        write_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(maxsize=16)
+        write_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(maxsize=self.config.write_queue_maxsize)
         consumer_error: BaseException | None = None
 
         async def _cleanup_partial() -> None:
