@@ -41,6 +41,14 @@ tracer = trace.get_tracer(__name__)
 logger = logging.getLogger(__name__)
 
 
+def _append_version_conflict(current: int | None, expected: int) -> bool:
+    """AP-1: True when a re-read append_version proves a concurrent append already advanced it.
+
+    A missing row (None) is not a conflict here — the reservation/finalize path handles that case.
+    """
+    return current is not None and int(current) != int(expected)
+
+
 class ObjectWriter:
     def __init__(self, *, pool: asyncpg.Pool, redis_client: Any, fs_store: FileSystemPartsStore | None = None) -> None:
         self.pool = pool
@@ -1117,6 +1125,19 @@ class ObjectWriter:
                     int(cov),
                     int(next_part),
                 )
+
+        # AP-1 (cheap interim): re-check the append version right before the expensive encrypt+FS
+        # write. When K appends share an expected_version, whichever finalizes first bumps it; any
+        # loser that hasn't started its write yet is rejected here instead of wasting the full write.
+        # The finalize CAS below remains the authoritative guard for writes that fully overlap.
+        precheck = await self.pool.fetchval(
+            "SELECT append_version FROM object_versions WHERE object_id = $1 AND object_version = $2",
+            object_id,
+            int(cov),
+        )
+        if _append_version_conflict(precheck, expected_version):
+            await _delete_part_row()
+            raise AppendPreconditionFailed(int(precheck))
 
         try:
             part_res = await self.mpu_upload_part_stream(
