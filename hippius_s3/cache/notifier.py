@@ -12,6 +12,7 @@ dependency) and the pub/sub concern is isolated.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
@@ -35,6 +36,11 @@ logger = logging.getLogger(__name__)
 # client is built without a socket_timeout, so the RedisTimeoutError re-poll path never fires
 # on its own — this tick is the primary FS re-read while waiting.
 _FS_REPOLL_INTERVAL_SECONDS = 1.0
+
+# RQ-1: with one subscription per stream the demux is event-driven, but a missed wakeup (listener
+# socket hiccup, a publish that raced the subscribe) must not hang the stream. Each waiter also
+# re-checks the FS on this cadence as a safety net, bounding worst-case latency to this interval.
+_STREAM_RECHECK_INTERVAL_SECONDS = 1.0
 
 
 class ChunkNotReadyError(Exception):
@@ -71,6 +77,22 @@ class ChunkNotifier:
         """Publish a chunk-ready notification."""
         chunk_key = build_chunk_key(object_id, object_version, part_number, chunk_index)
         await self._redis.publish(f"notify:{chunk_key}", "1")
+
+    def stream_subscription(
+        self,
+        object_id: str,
+        object_version: int,
+        *,
+        fetch_fn: Callable[[str, int, int, int], Awaitable[bytes | None]],
+    ) -> _StreamSubscription:
+        """Open ONE pattern subscription covering every chunk of `(object_id, object_version)`.
+
+        Use as `async with notifier.stream_subscription(...) as sub:` for the lifetime of a stream,
+        then call `sub.wait_for_chunk(part_number, chunk_index, timeout=...)` per chunk. Replaces the
+        per-chunk subscribe/unsubscribe churn of `wait_for_chunk` with a single subscription and a
+        listener that demuxes notifications to per-chunk events.
+        """
+        return _StreamSubscription(self._redis, object_id, int(object_version), fetch_fn)
 
     @asynccontextmanager
     async def _subscribe(self, channel: str) -> AsyncIterator[Any]:
@@ -177,3 +199,130 @@ class ChunkNotifier:
         if data is None:
             raise ChunkNotReadyError(f"Chunk missing after pub/sub notification: {chunk_key}")
         return data
+
+
+class _StreamSubscription:
+    """One pattern subscription for a whole `(object_id, object_version)`, demuxed to per-chunk events.
+
+    A single background listener reads `pmessage`s off the pattern and sets the `asyncio.Event` for
+    the notified chunk; `wait_for_chunk` waits on its chunk's event. Correctness rests on two things
+    carried over from the per-chunk `wait_for_chunk`:
+
+    - **Race guard**: the event is created (so any concurrent notification is captured) *before* the
+      post-subscribe FS re-check, so a chunk that lands between subscribe and wait is never missed.
+    - **Safety net**: each waiter also re-checks the FS every `_STREAM_RECHECK_INTERVAL_SECONDS`, so a
+      dropped notification (listener socket hiccup, publish that raced the subscribe) degrades to a
+      bounded poll instead of hanging the stream.
+    """
+
+    def __init__(
+        self,
+        redis_client: Any,
+        object_id: str,
+        object_version: int,
+        fetch_fn: Callable[[str, int, int, int], Awaitable[bytes | None]],
+    ) -> None:
+        self._redis = redis_client
+        self._object_id = object_id
+        self._object_version = int(object_version)
+        self._fetch_fn = fetch_fn
+        self._pattern = f"notify:obj:{object_id}:v:{self._object_version}:part:*:chunk:*"
+        self._events: dict[str, asyncio.Event] = {}
+        self._pubsub: Any = None
+        self._listener: asyncio.Task[None] | None = None
+
+    def _event_for(self, chunk_key: str) -> asyncio.Event:
+        ev = self._events.get(chunk_key)
+        if ev is None:
+            ev = asyncio.Event()
+            self._events[chunk_key] = ev
+        return ev
+
+    async def __aenter__(self) -> _StreamSubscription:
+        self._pubsub = self._redis.pubsub()
+        await self._pubsub.psubscribe(self._pattern)
+        self._listener = asyncio.create_task(self._run_listener())
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> bool:
+        if self._listener is not None:
+            self._listener.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._listener
+        with contextlib.suppress(Exception):
+            await self._pubsub.punsubscribe(self._pattern)
+        with contextlib.suppress(Exception):
+            await self._pubsub.aclose()
+        return False
+
+    async def _run_listener(self) -> None:
+        """Demux pattern messages to per-chunk events, surviving transient socket errors.
+
+        A `TimeoutError` is just the socket read window elapsing — re-listen. A `ConnectionError`
+        drops the subscription, so re-`psubscribe` before re-listening. Any missed wakeup in the gap
+        is covered by each waiter's periodic FS re-check.
+        """
+        while True:
+            try:
+                async for msg in self._pubsub.listen():
+                    if msg.get("type") != "pmessage":
+                        continue
+                    channel = msg.get("channel")
+                    if isinstance(channel, (bytes, bytearray)):
+                        channel = channel.decode()
+                    if not isinstance(channel, str) or not channel.startswith("notify:"):
+                        continue
+                    self._event_for(channel[len("notify:") :]).set()
+            except RedisTimeoutError:
+                continue
+            except RedisConnectionError as exc:
+                logger.debug("stream pubsub connection dropped (%s); re-subscribing", exc)
+                with contextlib.suppress(Exception):
+                    await self._pubsub.psubscribe(self._pattern)
+                continue
+
+    async def _fetch(self, part_number: int, chunk_index: int) -> bytes | None:
+        return await self._fetch_fn(self._object_id, self._object_version, int(part_number), int(chunk_index))
+
+    async def wait_for_chunk(
+        self,
+        part_number: int,
+        chunk_index: int,
+        *,
+        timeout: float,  # noqa: ASYNC109
+    ) -> bytes:
+        """Return chunk bytes, waiting on this stream's shared subscription if not yet present."""
+        data = await self._fetch(part_number, chunk_index)
+        if data is not None:
+            return data
+
+        chunk_key = build_chunk_key(self._object_id, self._object_version, int(part_number), int(chunk_index))
+        # Create the event BEFORE the re-check so a notification racing the subscribe is not lost.
+        event = self._event_for(chunk_key)
+        data = await self._fetch(part_number, chunk_index)
+        if data is not None:
+            return data
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError(f"timed out waiting for chunk {chunk_key}")
+            try:
+                await asyncio.wait_for(event.wait(), timeout=min(remaining, _STREAM_RECHECK_INTERVAL_SECONDS))
+                fired = True
+            except asyncio.TimeoutError:
+                fired = False  # periodic re-check tick, not the real deadline
+
+            data = await self._fetch(part_number, chunk_index)
+            if data is not None:
+                return data
+            if fired:
+                # Notified but the chunk is missing (janitor delete / replication lag). Re-arm and
+                # retry once quickly before falling back to the periodic re-check.
+                event.clear()
+                await asyncio.sleep(0.1)
+                data = await self._fetch(part_number, chunk_index)
+                if data is not None:
+                    return data

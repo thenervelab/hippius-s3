@@ -282,3 +282,11 @@ class RedisObjectPartsCache:
 
     async def notify_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> None:
         await self._notifier.notify(object_id, int(object_version), int(part_number), int(chunk_index))
+
+    def stream_subscription(self, object_id: str, object_version: int) -> Any:
+        """One pub/sub subscription for the whole stream (RQ-1), wired to this cache's FS fetch.
+
+        Returns an async context manager; inside it call
+        `sub.wait_for_chunk(part_number, chunk_index, timeout=...)`.
+        """
+        return self._notifier.stream_subscription(object_id, int(object_version), fetch_fn=self.fs.get_chunk)
