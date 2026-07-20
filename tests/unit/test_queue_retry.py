@@ -1,9 +1,16 @@
 """Unit tests for queue retry functionality."""
 
+import asyncio
 import json
+import shutil
+import socket
 import time
+from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
+import pytest_asyncio
+import redis.asyncio as async_redis
 from fakeredis.aioredis import FakeRedis
 
 from hippius_s3.queue import Chunk
@@ -13,6 +20,91 @@ from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.queue import enqueue_unpin_retry_request
 from hippius_s3.queue import initialize_queue_client
 from hippius_s3.queue import move_due_upload_retries
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+@pytest_asyncio.fixture
+async def real_redis() -> AsyncIterator[async_redis.Redis]:
+    """A throwaway redis-server. The retry mover runs a Lua script, which fakeredis cannot execute."""
+    binary = shutil.which("redis-server")
+    if binary is None:
+        pytest.skip("redis-server not installed; the atomic retry-mover needs real Lua")
+
+    port = _free_port()
+    proc = await asyncio.create_subprocess_exec(
+        binary,
+        "--port",
+        str(port),
+        "--save",
+        "",
+        "--appendonly",
+        "no",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    client = async_redis.Redis(host="127.0.0.1", port=port, decode_responses=True)
+    try:
+        for _ in range(100):
+            try:
+                await client.ping()
+                break
+            except Exception:  # noqa: BLE001 — server is still booting
+                await asyncio.sleep(0.05)
+        else:
+            pytest.fail("redis-server did not come up")
+        yield client
+    finally:
+        await client.aclose()
+        proc.terminate()
+        await proc.wait()
+
+
+class _BarrierClient:
+    """Forces every concurrent mover to reach the claim step before any of them claims.
+
+    Without this the race is scheduling-dependent and the test passes against a racy
+    implementation by luck.
+    """
+
+    def __init__(self, inner: async_redis.Redis, barrier: asyncio.Barrier) -> None:
+        self._inner = inner
+        self._barrier = barrier
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def zrangebyscore(self, *args: Any, **kwargs: Any) -> Any:
+        result = await self._inner.zrangebyscore(*args, **kwargs)
+        await self._barrier.wait()
+        return result
+
+    async def eval(self, *args: Any, **kwargs: Any) -> Any:
+        await self._barrier.wait()
+        return await self._inner.eval(*args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_move_due_upload_retries_pushes_each_member_exactly_once(real_redis: async_redis.Redis) -> None:
+    """Concurrent movers on N replicas must not re-enqueue the same due member N times."""
+    movers = 6
+    member = json.dumps({"object_id": "obj-race", "attempts": 1})
+    await real_redis.zadd("arion_upload_retries", {member: time.time() - 10})
+
+    barrier = asyncio.Barrier(movers)
+    initialize_queue_client(_BarrierClient(real_redis, barrier))  # type: ignore[arg-type]
+
+    results = await asyncio.gather(
+        *(move_due_upload_retries(backend_name="arion", now_ts=time.time()) for _ in range(movers))
+    )
+
+    assert await real_redis.llen("arion_upload_requests") == 1
+    assert await real_redis.zcard("arion_upload_retries") == 0
+    assert sum(results) == 1
 
 
 @pytest.mark.asyncio
@@ -58,9 +150,9 @@ async def test_enqueue_retry_request_sets_attempts_and_schedules() -> None:
 
 
 @pytest.mark.asyncio
-async def test_move_due_upload_retries() -> None:
+async def test_move_due_upload_retries(real_redis: async_redis.Redis) -> None:
     """Test that due retries are moved to the backend's upload queue."""
-    redis = FakeRedis()
+    redis = real_redis
     initialize_queue_client(redis)
 
     # Add a due retry (score = past time)
@@ -86,9 +178,9 @@ async def test_move_due_upload_retries() -> None:
 
 
 @pytest.mark.asyncio
-async def test_move_due_upload_retries_respects_max_items() -> None:
+async def test_move_due_upload_retries_respects_max_items(real_redis: async_redis.Redis) -> None:
     """Test that move_due_upload_retries respects max_items limit."""
-    redis = FakeRedis()
+    redis = real_redis
     initialize_queue_client(redis)
 
     # Add multiple due retries
