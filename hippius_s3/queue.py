@@ -204,6 +204,26 @@ async def enqueue_retry_request(
     )
 
 
+# Every uploader replica runs its own retry mover. ZRANGEBYSCORE is non-destructive and the
+# old MULTI[ZREM, LPUSH] never inspected the ZREM result, so all N pods that saw the same due
+# member re-enqueued it — N-fold retry amplification exactly when the backend is degraded.
+# Claiming server-side makes ZREM the compare-and-swap: only the pod whose ZREM returns 1
+# pushes. Lua rather than a Python-side conditional ZREM-then-LPUSH because the latter drops
+# the member permanently if the pod is cancelled (rolling deploy) between the two commands —
+# this ZSET is the only record that the retry exists.
+_CLAIM_DUE_RETRIES_LUA = """
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+local moved = 0
+for i = 1, #due do
+  if redis.call('ZREM', KEYS[1], due[i]) == 1 then
+    redis.call('LPUSH', KEYS[2], due[i])
+    moved = moved + 1
+  end
+end
+return moved
+"""
+
+
 async def move_due_upload_retries(
     *,
     backend_name: str,
@@ -212,22 +232,16 @@ async def move_due_upload_retries(
 ) -> int:
     """Move due retry items back to the backend's upload queue. Returns number moved."""
     client = get_queue_client()
-    target_queue = f"{backend_name}_upload_requests"
-    zset_key = _upload_retry_zset(backend_name)
-
     now_ts = time.time() if now_ts is None else now_ts
-    members = await client.zrangebyscore(zset_key, min="-inf", max=now_ts, start=0, num=max_items)
-    moved = 0
-    for m in members:
-        try:
-            async with client.pipeline(transaction=True) as pipe:
-                pipe.zrem(zset_key, m)
-                pipe.lpush(target_queue, m)
-                await pipe.execute()
-            moved += 1
-        except Exception:
-            logger.exception(f"Failed to move retry item back to {target_queue}")
-    return moved
+    moved = await client.eval(  # ty: ignore[invalid-await]
+        _CLAIM_DUE_RETRIES_LUA,
+        2,
+        _upload_retry_zset(backend_name),
+        f"{backend_name}_upload_requests",
+        str(now_ts),
+        str(max_items),
+    )
+    return int(moved)
 
 
 async def enqueue_unpin_request(payload: UnpinChainRequest, *, queue_name: str | None = None) -> None:
