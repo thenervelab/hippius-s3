@@ -52,7 +52,9 @@ class StreamContext:
 # RQ-4: compare-and-delete Lua — delete the coalesce lock only while it still holds our token, so we
 # never steal a lock a later streamer/downloader re-acquired. Fixed script (no user input in the body);
 # mirrors the downloader's release. The key format must match _enqueue_missing_downloads exactly.
-_COALESCE_LOCK_RELEASE_LUA = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
+_COALESCE_LOCK_RELEASE_LUA = (
+    "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
+)
 
 
 async def _release_coalesce_locks(
