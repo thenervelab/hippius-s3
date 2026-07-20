@@ -343,7 +343,8 @@ class ObjectWriter:
                     # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
                     # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
                     t0 = time.monotonic()
-                    ct = await run_crypto(adapter.encrypt_chunk,
+                    ct = await run_crypto(
+                        adapter.encrypt_chunk,
                         buf,
                         key=key_bytes,
                         bucket_id=str(bucket_id),
@@ -370,7 +371,8 @@ class ObjectWriter:
                 # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
                 # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
                 t0 = time.monotonic()
-                ct = await run_crypto(adapter.encrypt_chunk,
+                ct = await run_crypto(
+                    adapter.encrypt_chunk,
                     buf,
                     key=key_bytes,
                     bucket_id=str(bucket_id),
@@ -788,7 +790,8 @@ class ObjectWriter:
                     # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
                     # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
                     t0 = time.monotonic()
-                    ct = await run_crypto(adapter.encrypt_chunk,
+                    ct = await run_crypto(
+                        adapter.encrypt_chunk,
                         buf,
                         key=key_bytes,
                         bucket_id=bucket_id,
@@ -815,7 +818,8 @@ class ObjectWriter:
                 # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
                 # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
                 t0 = time.monotonic()
-                ct = await run_crypto(adapter.encrypt_chunk,
+                ct = await run_crypto(
+                    adapter.encrypt_chunk,
                     buf,
                     key=key_bytes,
                     bucket_id=bucket_id,
