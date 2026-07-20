@@ -32,9 +32,10 @@ async def _get_object_with_permissions_min(
     version: Optional[int] = None,
 ) -> Any:
     """Lightweight existence and metadata check (HEAD). Gateway handles permissions."""
-    # Ensure user exists
-    if main_account_id:
-        await UserRepository(db).ensure_by_main_account(main_account_id)
+    # Ensure user exists — read-first (HD-2) so the common case stays off the write path, and skip
+    # anonymous (mirrors the GET guard; avoids creating a bogus "anonymous" user row).
+    if main_account_id and main_account_id != "anonymous":
+        await UserRepository(db).ensure_by_main_account_read_first(main_account_id)
 
     # Gateway already checked permissions, just fetch the object
     if version is not None:

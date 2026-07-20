@@ -134,25 +134,12 @@ async def handle_put_object(
                 if meta_key not in {"append", "append-id", "append-if-version"}:
                     metadata[meta_key] = value
 
-        # Capture previous object (to clean up multipart parts if overwriting)
-        with tracer.start_as_current_span("put_object.check_existing_object") as span:
-            async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
-                prev = await conn.fetchrow(
-                    get_query("get_object_by_path"),
-                    bucket_id,
-                    object_key,
-                )
-            set_span_attributes(span, {"is_overwrite": prev is not None})
-
-        # Candidate object_id: DB may override on (bucket_id, object_key) conflict
-        # TODO: Make object identity/version allocation fully DB-atomic by removing this
-        #       pre-check and always passing a generated candidate UUID. The writer already
-        #       treats the DB-returned object_id/object_version as authoritative.
-        if prev:
-            candidate_object_id = str(prev["object_id"])
-            logger.debug(f"Reusing existing object_id {candidate_object_id} for overwrite")
-        else:
-            candidate_object_id = str(uuid.uuid4())
+        # Object identity/version allocation is DB-atomic: upsert_object_basic's
+        # `ON CONFLICT (bucket_id, object_key) ... RETURNING object_id` resolves the authoritative
+        # id, so we always pass a fresh candidate and use put_res.object_id downstream. Skipping the
+        # old get_object_by_path pre-check removes a DB round trip per PUT and closes a TOCTOU window
+        # (WU-3). Overwrites are handled by the upsert; nothing keys off the previous row here.
+        candidate_object_id = str(uuid.uuid4())
 
         # Use ObjectWriter streaming upsert/write (single-part)
         # Note: No transaction wrapper needed here. The upsert_object_basic query is atomic
