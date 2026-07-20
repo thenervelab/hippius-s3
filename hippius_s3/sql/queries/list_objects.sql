@@ -36,7 +36,7 @@ WHERE o.bucket_id = $1
   AND ($3::text IS NULL OR o.object_key >= $3::text)
   -- LS-2: explicit exclusive upper bound so the (bucket_id, object_key) index range is bounded on
   -- both ends even under a generic prepared plan (a sparse prefix no longer scans to partition end).
-  AND ($5::text IS NULL OR o.object_key < $5::text)
+  AND ($5::text IS NULL OR o.object_key < $5::text COLLATE "C")
   AND o.deleted_at IS NULL
 -- DB is C-collation; an explicit COLLATE here would defeat the (bucket_id, object_key) index ordered scan.
 ORDER BY o.object_key
