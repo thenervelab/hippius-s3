@@ -233,6 +233,50 @@ async def test_wait_survives_transient_redis_read_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_wait_repolls_fs_for_a_chunk_landed_without_notification(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A chunk made readable by a NON-notifying producer must be picked up via the periodic FS
+    re-poll, not block until the caller `timeout`.
+
+    Reproduces the fresh-object cross-node read hang: the Rust drain lands a part in the CephFS
+    pool (readable via the pool fallback) WITHOUT publishing `notify:`, and the queues pub/sub
+    client has no socket read timeout. So no notification ever arrives and the socket-timeout
+    re-poll never fires — the wait is driven purely by the periodic FS re-read. Before the fix
+    (notification-only wait) this blocked the full `timeout` (up to the 90s first-chunk bound →
+    a client-visible ~35s hang) even though the chunk was already in the pool.
+    """
+    import hippius_s3.cache.notifier as notifier_mod
+
+    monkeypatch.setattr(notifier_mod, "_FS_REPOLL_INTERVAL_SECONDS", 0.02)
+
+    redis = FakeRedis()
+    notifier = ChunkNotifier(redis)
+
+    available = False
+
+    async def fetch(oid: str, v: int, pn: int, ci: int) -> bytes | None:
+        return b"drained-copy" if available else None
+
+    async def drain_lands_it_without_notifying() -> None:
+        await asyncio.sleep(0.1)  # the drain copies the part to the pool a bit later
+        nonlocal available
+        available = True
+        # DELIBERATELY no inject_message — the drain does not publish a chunk-ready notification.
+
+    worker = asyncio.create_task(drain_lands_it_without_notifying())
+    loop = asyncio.get_event_loop()
+    t0 = loop.time()
+    # A large timeout: without the re-poll this blocks the full 30s (nothing wakes the waiter),
+    # so returning quickly is the proof the FS re-poll works.
+    result = await notifier.wait_for_chunk(OBJ, 1, 1, 0, fetch_fn=fetch, timeout=30.0)
+    elapsed = loop.time() - t0
+    await worker
+
+    assert result == b"drained-copy"
+    assert elapsed < 2.0, f"re-poll should return ~1 interval after the chunk lands, not block; took {elapsed:.2f}s"
+    assert redis.published == [], "no notification was published — pickup was via the FS re-poll"
+
+
+@pytest.mark.asyncio
 async def test_wait_gives_up_if_retry_also_misses() -> None:
     """If even the retry fails, wait_for_chunk raises RuntimeError."""
     redis = FakeRedis()
