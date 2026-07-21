@@ -9,18 +9,15 @@ resources:
   - postgres-nvme-cluster.yaml
   - postgres-nvme-scheduledbackup.yaml
   - gateway-nodeport.yaml
-  # --- hippius-drain (s3-2.1) SSD-ingest tier — DELIBERATELY COMMENTED OUT. ---
-  # Ingest nodes node1..node5 are prepared: each has a dedicated 3.84 TB NVMe mounted at
-  # /s3-data, and ingest-node-labels-production.yaml labels them s3-prod-local-ingest=true
-  # (both nodeAffinity allow-lists list node1..node5). Runbook: path-to-prod.md; sizing:
-  # s3-prod-drain-capacity-plan.md. Before uncommenting: confirm the label is applied on all
-  # five nodes, then also uncomment the `drain` image below, and (cutover) scale base `api`
-  # to 0 + point the `api` Service selector at app: api-local, as k8s/staging/kustomization.yaml does.
-  # - ingest-node-labels-production.yaml
-  # - api-local-deployments-production.yaml
-  # - drain-allocator-deployment.yaml   # singleton; owns the cephor_* schema (deploy first)
-  # - drain-agent-daemonset.yaml        # one per labelled ingest node
-  # - mpu-reaper-deployment.yaml
+  # --- hippius-drain (s3-2.1) SSD-ingest tier — ENABLED for the cutover. ---
+  # Ingest nodes node1..node5 are prepared (dedicated 3.84 TB /s3-data NVMe, labeled
+  # s3-prod-local-ingest=true). Allocator-first ordering is handled by the agent/reaper
+  # initContainers. Runbook: path-to-prod.md; gated execution: rollout.sh.
+  - ingest-node-labels-production.yaml
+  - api-local-deployments-production.yaml
+  - drain-allocator-deployment.yaml   # singleton; owns the cephor_* schema (deploy first)
+  - drain-agent-daemonset.yaml        # one per labelled ingest node
+  - mpu-reaper-deployment.yaml
 
 patches:
   - path: namespace-patch.yaml
@@ -30,6 +27,19 @@ patches:
   - path: ingress-patch.yaml
   - path: services-patch.yaml
   - path: postgres-nvme-initwait-patch.yaml
+  # Cutover routing (full-swap): point the existing `api` Service — the gateway's
+  # GATEWAY_BACKEND_URL=http://api:8000 upstream — at the drain-direct api-local fleet, so
+  # traffic goes through the normal front door. Base `api` is scaled to 0 in resource-limits.yaml.
+  # (Mirrors k8s/staging/kustomization.yaml. For a gated/hybrid shift instead, keep base api and
+  # drive the incremental scale + Service repoint with rollout.sh.)
+  - target:
+      kind: Service
+      name: api
+    patch: |-
+      - op: replace
+        path: /spec/selector
+        value:
+          app: api-local
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api
@@ -38,6 +48,5 @@ images:
     newTag: latest
   - name: ghcr.io/thenervelab/hippius-s3/workers
     newTag: latest
-  # Uncomment with the drain resources above (the allocator + agent use the `drain` image):
-  # - name: ghcr.io/thenervelab/hippius-s3/drain
-  #   newTag: latest
+  - name: ghcr.io/thenervelab/hippius-s3/drain
+    newTag: latest
