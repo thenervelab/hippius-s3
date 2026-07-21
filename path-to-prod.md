@@ -23,7 +23,7 @@ follow-up.
 
 | | **Today (prod)** | **After cutover** |
 |---|---|---|
-| Where the api stages a PUT | **node6-local** cache PV (`local-cache-pvc`, 40 TB ZFS on `node6-cache`) | node-local **SSD** per ingest node (`/var/lib/hippius/local_ingest_prod`) |
+| Where the api stages a PUT | **node6-local** cache PV (`local-cache-pvc`, 40 TB ZFS on `node6-cache`) | dedicated **NVMe** per ingest node (host `/s3-data`) |
 | Write-path placement | `api` + workers **pinned to node6-cache** (SPOF) | `api-local` 1/ingest-node; workers un-pinned onto Ceph |
 | Who enqueues the backend upload | **the api itself** (`enqueue_upload_to_backends`) | **the drain-agent** (sole producer, after SSD→CephFS replication) |
 | Upload queue + payload | `{backend}_upload_requests`, `UploadChainRequest` | **identical** — only the producer moved |
@@ -72,11 +72,11 @@ gateway URL.
 ### The rollout, in increments
 | Phase | base `api` (old img, ceph) | `api-local` (new img, SSD) | ~ new-traffic share | Gate to advance |
 |---|---|---|---|---|
-| 0 (today) | 5 | 0 | 0% | drain stack healthy, `leader_count=1`, 1 ingest node prepped |
+| 0 (today) | 5 | 0 | 0% | drain stack healthy, `leader_count=1`, all 5 ingest nodes prepped + labeled (done, #292) |
 | 1 canary | 5 | 1 | ~17% | new uploads drain (`replicated`), reads OK, `corrupt=0`, no DLQ growth |
-| 2 | 5 | 2–3 | ~30–40% | replication-lag p99 within SLO, SSD backlog bounded |
-| 3 | 2 | 4 | ~65% | error rate flat, smoke green |
-| 4 full | 0 | 4 | 100% | soak clean → optionally repoint Service to `app: api-local` and drop the shared label |
+| 2 | 5 | 3 | ~38% | replication-lag p99 within SLO, SSD backlog bounded |
+| 3 | 2 | 4 | ~67% | error rate flat, smoke green |
+| 4 full | 0 | 5 | 100% | soak clean → optionally repoint Service to `app: api-local` and drop the shared label |
 
 Rollback at any phase: **scale `api-local`→0** (or scale base `api` back up). Acked bytes on SSD are
 never lost — the janitor's replication gate never evicts an un-replicated chunk. Fully drained SSD
@@ -111,11 +111,10 @@ new-only exposure is acceptable; the hybrid above is strictly safer for a first 
       add `ttlSecondsAfterFinished` to the TTL-less Jobs.
 
 **Data plane + nodes:**
-- [ ] **Prepare ≥1 (target 3–4) ingest node.** node6's freed 40 TB NVMe is the natural ingest #1; for more,
-      repurpose one Ceph OSD's NVMe → mount at
-      `/var/lib/hippius/local_ingest_prod` → label `s3-prod-local-ingest=true`. Runbook +
-      one-at-a-time script: `s3-2.1-todo.md` → "PROD LOGISTICS". Nodes MUST be **disjoint** from
-      staging's ingest set (`node2`/`node3`).
+- [x] **Ingest nodes prepped (done, #292).** `k8s-v3-node1..5` each have a dedicated 3.84 TB NVMe mounted at
+      host `/s3-data` and are labeled `s3-prod-local-ingest=true` on the live cluster; the manifests point at
+      `/s3-data`, replicas=5. (No Ceph-OSD repurpose was needed — the disks were already there.) staging's
+      ingest on node2/node3 uses a different disk (node-root `local_ingest_staging`), so they don't collide.
 - [ ] **App image ≥ #265** (metrics-collision + double-count fix, PR #284) — else OTel metrics are
       inflated ~100–650× and the drain dashboards/alerts lie.
 - [ ] **Run the Python migrations** (`db-migrations` Job): `object_versions.completed_part_numbers`
@@ -136,19 +135,15 @@ new-only exposure is acceptable; the hybrid above is strictly safer for a first 
 
 ---
 
-## 3. Placeholders to replace in `k8s/production/`
+## 3. Manifest wiring — done in #292; one uncomment remains
 
-| File | Placeholder | Replace with |
-|---|---|---|
-| `ingest-node-labels-production.yaml` | `REPLACE-prod-ingest-node-{a,b,c,d}` (4 Node stanzas) | real prepped node names (one stanza per node) |
-| `api-local-deployments-production.yaml` | `REPLACE-prod-ingest-node-{a..d}` in the nodeAffinity allow-list | **same** node names |
-| `api-local-deployments-production.yaml` | `replicas: 4` | the prepped-node count |
-| `drain-agent-daemonset.yaml` | `REPLACE-prod-ingest-node-{a..d}` in the nodeAffinity allow-list | **same** node names |
-| `kustomization.yaml` | the commented-out `# - ingest-node-labels…/api-local…/drain-…/mpu-reaper…` block **and** the `# - name: …/drain` image | uncomment all |
+The node names + path are already wired (PR #292): `ingest-node-labels-production.yaml`, both nodeAffinity
+allow-lists (`api-local`, `drain-agent`), and `hostPath: /s3-data` all list `k8s-v3-node1..5`; `api-local`
+`replicas: 5`. The node list is identical across the three files. Path/label deltas vs staging (`/s3-data`,
+`s3-prod-local-ingest`, `postgres-nvme-rw`, `ENVIRONMENT=production`, `hostPath type: Directory`) are baked in.
 
-Keep the node list identical in all three files (labels file + both nodeAffinity allow-lists) — they
-must not drift. Path/label deltas vs staging (`local_ingest_prod`, `s3-prod-local-ingest`,
-`postgres-nvme-rw`, `ENVIRONMENT=production`, `hostPath type: Directory`) are already baked in.
+**The only remaining manifest step (at cutover):** uncomment the drain block **and** the `# - name: …/drain`
+image in `k8s/production/kustomization.yaml`.
 
 ---
 
@@ -172,7 +167,7 @@ To decide / tune at cutover:
 | Var | Note |
 |---|---|
 | `HIPPIUS_UPLOAD_BACKENDS` | drain sources this from the secret; if a backup backend is added it MUST be here or the janitor gate never clears → unbounded SSD growth |
-| `CEPHOR_MAX_DRAIN_RATE_BPS` | default 100 MB/s/node; with only 3 nodes consider 150–200 — validate against the Ceph pool first |
+| `CEPHOR_MAX_DRAIN_RATE_BPS` | default 100 MB/s/node × 5 nodes ≈ 870 MB/s fleet — ample over the ~573 MB/s peak; no raise needed |
 | `HIPPIUS_MPU_REAPER_INTERVAL_SECONDS` | raise off the 120 s drain-down value once the reaper indexes are confirmed applied |
 | `CEPHOR_CEPH_MGR_METRICS_URL` | leave unset for first bring-up (static ceiling); enable once cross-ns reach to `rook-ceph-mgr` is confirmed |
 
@@ -180,8 +175,8 @@ To decide / tune at cutover:
 
 ## 5. Cutover steps (ordered)
 
-1. **Prep node(s)** + replace placeholders (§3). Do **not** uncomment the drain block yet if you want
-   to stage it; `apply -k` with placeholders won't schedule (nodes unlabeled).
+1. **Nodes are prepped + labeled** (done, #292). At cutover, uncomment the drain block + `drain` image in
+   `k8s/production/kustomization.yaml` (§3).
 2. **Migrations Job** → wait green.
 3. **`noeviction`** on redis-queues + restart (§2).
 4. **Deploy the drain-allocator first** (owns the `cephor_*` schema; the agent + reaper init-gate on
