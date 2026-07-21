@@ -76,7 +76,7 @@ def main() -> int:
         with probe.prometheus() as prom_ok:
             guarded("invariants (cluster)", lambda: scenarios.invariant_assert(probe, cfg, report, prom_ok))
             guarded(f"drain convergence (≤{cfg.drain_convergence_timeout_s}s)",
-                    lambda: scenarios.replication_convergence(probe, cfg, report, prom_ok))
+                    lambda: scenarios.replication_convergence(probe, cfg, report, prom_ok, ledger))
     else:
         print("-- invariants + convergence: skipped (no cluster) --")
         # give the drain a moment before the durability re-verify even without cluster probes

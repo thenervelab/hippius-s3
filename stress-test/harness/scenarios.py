@@ -247,19 +247,36 @@ _PREFIX_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
 def _safe_prefix(prefix: str) -> str:
-    """Constrain the bucket prefix before it goes into a SQL LIKE — it's operator-set, but we build
+    """Constrain a bucket prefix/name before it goes into a SQL LIKE/IN — it's ours, but we build
     raw SQL from it, so reject anything outside the S3 bucket-name charset rather than interpolate it."""
     if not _PREFIX_RE.match(prefix):
-        raise ValueError(f"unsafe bucket prefix for SQL LIKE: {prefix!r}")
+        raise ValueError(f"unsafe bucket name for SQL: {prefix!r}")
     return prefix
 
 
-def _our_repl_counts(probe: ClusterProbe, prefix: str) -> dict[str, int] | None:
+def _ledger_buckets(ledger: Ledger) -> list[str]:
+    """The distinct buckets that hold acked, should-fully-replicate objects (the durability corpus +
+    the concurrency-ramp load bucket). The functional/adversarial objects (aborted MPU, wrong-ETag
+    parts) are NEVER recorded to the ledger, so scoping to these buckets excludes exactly the objects
+    the harness deliberately breaks — which must not count against drain convergence or the durability gate."""
+    return sorted({a.bucket for a in ledger.all()})
+
+
+def _bucket_filter(prefix: str, buckets: list[str] | None) -> str:
+    """SQL predicate for 'our objects': an exact-bucket IN-list when given (the ledger's clean set),
+    else the prefix LIKE (whole-run scope). Every name is charset-validated before it hits raw SQL."""
+    if buckets:
+        names = ", ".join("'" + _safe_prefix(b) + "'" for b in buckets)
+        return f"b.bucket_name in ({names})"
+    return f"b.bucket_name like '{_safe_prefix(prefix)}-%'"
+
+
+def _our_repl_counts(probe: ClusterProbe, prefix: str, buckets: list[str] | None = None) -> dict[str, int] | None:
     rows = probe.pg(
         "select crs.status, count(*) from cephor_replication_status crs "
         "join objects o on o.object_id::text = crs.object_id::text "
         "join buckets b on b.bucket_id = o.bucket_id "
-        f"where b.bucket_name like '{_safe_prefix(prefix)}-%' group by crs.status")
+        f"where {_bucket_filter(prefix, buckets)} group by crs.status")
     if rows is None:
         return None
     return {r[0]: int(r[1]) for r in rows}
@@ -279,13 +296,14 @@ def _our_repl_rows(probe: ClusterProbe, prefix: str) -> dict[tuple[str, str, str
     return {(r[0], r[1], r[2]): r[3] for r in rows}
 
 
-def _our_object_ids(probe: ClusterProbe, prefix: str) -> list[str] | None:
+def _our_object_ids(probe: ClusterProbe, prefix: str, buckets: list[str] | None = None) -> list[str] | None:
     """object_ids of every object in our test buckets — the set the durability gate must force off
-    the SSD ingest cache before re-GETting. None if Postgres is unreachable."""
+    the SSD ingest cache before re-GETting. Pass `buckets` (the ledger set) to scope to the objects the
+    gate actually re-verifies, which also keeps the eviction arg-vector small. None if Postgres is unreachable."""
     rows = probe.pg(
         "select distinct o.object_id::text from objects o "
         "join buckets b on b.bucket_id = o.bucket_id "
-        f"where b.bucket_name like '{_safe_prefix(prefix)}-%'")
+        f"where {_bucket_filter(prefix, buckets)}")
     if rows is None:
         return None
     return [r[0] for r in rows]
@@ -342,14 +360,25 @@ def invariant_assert(probe: ClusterProbe, cfg: Config, report: Report, prom_ok: 
 
 
 # ---------------------------------------------------------------- 5. REPLICATION CONVERGENCE (cluster)
-def replication_convergence(probe: ClusterProbe, cfg: Config, report: Report, prom_ok: bool) -> None:
+def replication_convergence(probe: ClusterProbe, cfg: Config, report: Report, prom_ok: bool, ledger: Ledger) -> None:
+    # Scope to the ledger's buckets (durability corpus + concurrency-ramp load) — the objects that are
+    # SUPPOSED to fully replicate. The functional/adversarial scenario deliberately leaves objects
+    # non-terminal (an aborted MPU strands a `pending` cephor orphan; a rejected wrong-ETag MPU leaves
+    # `failed` parts) and never records them to the ledger — counting those against the drain is a
+    # false NO-GO, not a real lag signal.
+    corpus_buckets = _ledger_buckets(ledger)
+    # Floor: how many replicated rows we must SEE before "0 non-terminal" means converged rather than
+    # "the drain hasn't created our rows yet". Each non-empty acked object contributes ≥1 chunk/part, so
+    # our replicated-part count must reach at least the non-empty object count — otherwise a poll taken
+    # before the reconciler has recorded our objects would read 0 pending and declare a false convergence.
+    expected = sum(1 for a in ledger.all() if a.size > 0)
     before = probe.prom_scalar(
         'sum(drain_parts_replicated_total{service_namespace="hippius-s3-staging"})') if prom_ok else None
     deadline = time.time() + cfg.drain_convergence_timeout_s
     converged = False
     last: dict[str, int] | None = None
     while time.time() < deadline:
-        our = _our_repl_counts(probe, cfg.bucket_prefix)
+        our = _our_repl_counts(probe, cfg.bucket_prefix, buckets=corpus_buckets)
         if our is None:
             report.add(Result("drain-convergence", "drain replicates", passed=True, skipped=True,
                               detail="Postgres not reachable — skipped",
@@ -357,7 +386,10 @@ def replication_convergence(probe: ClusterProbe, cfg: Config, report: Report, pr
             return
         last = our
         non_terminal = our.get("pending", 0) + our.get("draining", 0)
-        if non_terminal == 0:
+        replicated = our.get("replicated", 0)
+        # Converged only when NONE of our parts are still draining AND we have actually seen our objects
+        # replicate (guards against declaring victory before the reconciler recorded them).
+        if non_terminal == 0 and replicated >= expected:
             converged = True
             break
         time.sleep(5)
@@ -369,14 +401,16 @@ def replication_convergence(probe: ClusterProbe, cfg: Config, report: Report, pr
         name="drain-convergence",
         invariant="drain actually replicates (lag proxy)",
         passed=converged,
-        detail=f"our repl rows={last}; drain_parts_replicated Δ={delta}; "
-               f"{'converged' if converged else 'STILL non-terminal'} in ≤{elapsed:.0f}s",
-        criteria=f"0 pending/draining rows for our objects within {cfg.drain_convergence_timeout_s}s",
+        detail=f"corpus repl rows={last} (buckets={len(corpus_buckets)}, expected≥{expected} replicated); "
+               f"drain_parts_replicated Δ={delta}; {'converged' if converged else 'STILL non-terminal/incomplete'} "
+               f"in ≤{elapsed:.0f}s",
+        criteria=f"0 pending/draining AND ≥{expected} replicated for our durability/load objects "
+                 f"within {cfg.drain_convergence_timeout_s}s",
     ))
 
 
 # ---------------------------------------------------------------- 6. DURABILITY RE-VERIFY (the gate)
-def _evict_ssd_before_reverify(probe: ClusterProbe | None, cfg: Config) -> tuple[bool, str]:
+def _evict_ssd_before_reverify(probe: ClusterProbe | None, cfg: Config, ledger: Ledger) -> tuple[bool, str]:
     """Force the re-GETs off the SSD ingest cache and onto the drained copy.
 
     THIS is the whole point of the no-data-loss gate: a re-GET that reads the node-local SSD ingest
@@ -399,7 +433,9 @@ def _evict_ssd_before_reverify(probe: ClusterProbe | None, cfg: Config) -> tuple
     if probe is None:
         return (False, "no cluster access — SSD not evicted; reads may be served from the ingest cache "
                        "(NOT an authoritative drained-copy proof)")
-    oids = _our_object_ids(probe, cfg.bucket_prefix)
+    # Scope to the ledger's objects (the ones we re-verify) rather than every prodgate object — this is
+    # both correct (we only need to force THESE off the cache) and keeps the eviction arg-vector small.
+    oids = _our_object_ids(probe, cfg.bucket_prefix, buckets=_ledger_buckets(ledger))
     if oids is None:
         return (False, "Postgres unreachable — could not resolve object_ids to evict; reads may be cache-served")
     targeted, ok_pods, total_pods = probe.evict_ssd_parts(oids)
@@ -415,7 +451,7 @@ def _evict_ssd_before_reverify(probe: ClusterProbe | None, cfg: Config) -> tuple
 def durability_reverify(client, cfg: Config, ledger: Ledger, report: Report,
                         probe: ClusterProbe | None = None) -> None:
     items = ledger.all()
-    authoritative, evict_note = _evict_ssd_before_reverify(probe, cfg)
+    authoritative, evict_note = _evict_ssd_before_reverify(probe, cfg, ledger)
     mismatches: list[str] = []
     missing: list[str] = []
 
