@@ -128,7 +128,12 @@ metadata:
 spec:
   resources:
     requests:
-      storage: 9728Gi
+      # Grown 9728Gi -> 16Ti for the s3-2.1 cutover: this CephFS RWX pool becomes the shared
+      # READ cache once the node6 40 TB local cache (9.1 TB hot working set) is retired — the
+      # write-hot set moves to per-node /s3-data NVMe, but the read-hot 24 h retention lands here.
+      # Online expansion (ceph-filesystem allowVolumeExpansion=true); actual usage stays bounded by
+      # the janitor GC, so this is headroom. Pool has ~14 TiB MAX AVAIL, Ceph ~34% used. Never shrink.
+      storage: 16384Gi
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
