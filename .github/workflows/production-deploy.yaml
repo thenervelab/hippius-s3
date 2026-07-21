@@ -310,21 +310,23 @@ jobs:
           # only once the drain block is uncommented in kustomization.yaml (at cutover).
           wait_deploy drain-allocator 5m
           wait_deploy mpu-reaper 5m
-          # drain-agent is a DaemonSet: a labeled node at pod capacity legitimately can't host its
-          # pod, which must not fail the deploy. Require >= 1 Ready; warn on a partial roll, fail on
-          # zero. Skip entirely if the DaemonSet isn't deployed yet.
+          # drain-agent is a DaemonSet that MUST cover every node running api-local: a node with
+          # api-local but no drain-agent silently drops that node's uploads (never drained) — peer
+          # review B3. A partial roll is therefore a FAILURE, not a warning. The s3-ingest-priority
+          # class ensures the agent can preempt for a slot, so a partial roll is a real problem now.
+          # Require drain-agent numberReady == desiredNumberScheduled AND >= the api-local node count.
           if kubectl get ds/drain-agent -n "$ns" >/dev/null 2>&1; then
-            if ! kubectl rollout status daemonset/drain-agent -n "$ns" --timeout=5m; then
-              ready=$(kubectl get ds drain-agent -n "$ns" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
-              desired=$(kubectl get ds drain-agent -n "$ns" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
-              if [ "${ready:-0}" -ge 1 ]; then
-                echo "::warning::drain-agent rolled ${ready}/${desired} (a labeled node likely at pod capacity); proceeding"
-              else
-                echo "::error::drain-agent has 0 Ready pods after 5m — rollout genuinely failed"
-                kubectl get pods -l app=drain-agent -n "$ns" -o wide || true
-                exit 1
-              fi
+            kubectl rollout status daemonset/drain-agent -n "$ns" --timeout=10m || true
+            ready=$(kubectl get ds drain-agent -n "$ns" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+            desired=$(kubectl get ds drain-agent -n "$ns" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
+            apiloc=$(kubectl get pods -l app=api-local -n "$ns" --field-selector=status.phase=Running -o json 2>/dev/null | jq -r '[.items[].spec.nodeName]|unique|length' 2>/dev/null || echo 0)
+            echo "drain-agent ready=${ready}/${desired}; api-local nodes=${apiloc}"
+            if [ "${ready:-0}" -lt "${desired:-1}" ] || [ "${ready:-0}" -lt "${apiloc:-0}" ]; then
+              echo "::error::drain-agent partial (${ready}/${desired}, api-local on ${apiloc} nodes) — a node runs api-local with NO drain-agent (dark uploads). FAILING the deploy."
+              kubectl get pods -l app=drain-agent -n "$ns" -o wide || true
+              exit 1
             fi
+            echo "drain-agent covers every api-local node ✅"
           else
             echo "daemonset/drain-agent absent — drain block not yet enabled; skipping"
           fi

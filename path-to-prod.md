@@ -125,9 +125,14 @@ new-only exposure is acceptable; the hybrid above is strictly safer for a first 
       `kubectl patch pvc object-cache-pvc -n hippius-s3-prod -p '{"spec":{"resources":{"requests":{"storage":"20480Gi"}}}}'`.
 - [ ] **App image ≥ #265** (metrics-collision + double-count fix, PR #284) — else OTel metrics are
       inflated ~100–650× and the drain dashboards/alerts lie.
-- [ ] **Run the Python migrations** (`db-migrations` Job): `object_versions.completed_part_numbers`
-      (`20260706130000`), the reaper indexes (`20260702000000_multipart_uploads_initiated_at`,
-      `20260706000000_parts_upload_uploaded_at`). Workers init-gate on `schema_migrations`.
+- [ ] **Run the Python migrations** (`db-migrations` Job + every api pod self-migrates via `start-api.sh`).
+      All 4 that prod is missing: **`20260622122700_object_versions_address`** (the `address` column —
+      **every PUT 500s without it**), `20260706130000_object_versions_completed_parts`,
+      `20260702000000_multipart_uploads_initiated_at`, `20260706000000_parts_upload_uploaded_at`. Workers
+      init-gate on `schema_migrations`. **Build the two `CONCURRENTLY` indexes** (`20260706000000` +
+      `20260718000000`) **out-of-band first** (no statement timeout), verify `indisvalid=true`, then dbmate
+      no-ops them — else an api pod running the build can be killed by its startup probe, leaving a silent
+      INVALID index (`rollout.sh preflight` hard-fails on that). See the REVIEW BLOCKERS in `s3-2.1-todo.md`.
 - [ ] **`redis-queues` = `noeviction`, then restart it** (the policy is inert until restart); confirm
       `CONFIG GET maxmemory-policy`. It holds the work queues + pub/sub + `cephor:*` lease/fence keys —
       a full instance must reject writes loudly, never evict. Sequence in a window (AOF reload blips `cephor:*`).

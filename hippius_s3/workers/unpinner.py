@@ -231,6 +231,10 @@ async def process_unpin_batch(
 
         seen: set[str] = set()
         for item in result.deleted:
+            # Ignore a file_id HCFS echoes that we did NOT send (defensive: avoids a KeyError in the
+            # fan-out and never soft-deletes a chunk we don't own).
+            if item.file_id not in group.file_id_chunk_ids:
+                continue
             resolved_ok.add(item.file_id)
             seen.add(item.file_id)
         for err in result.errors:
@@ -248,22 +252,26 @@ async def process_unpin_batch(
     # A9 gate: soft-delete only file_ids whose backend delete succeeded. A file_id counts as fully
     # cleared only if EVERY one of its chunk_ids soft-deleted without a DB error.
     soft_deleted_ok: set[str] = set()
+    # Bound concurrent soft-deletes to the DB pool size: a large batch (up to 1000 file_ids) would
+    # otherwise spawn that many gather tasks all contending for the ~pool_max connections at once.
+    soft_delete_sem = asyncio.Semaphore(max(1, int(config.unpinner_db_pool_max)))
 
     async def _soft_delete_file(file_id: str) -> None:
         ok = True
-        for chunk_id in group.file_id_chunk_ids[file_id]:
-            try:
-                async with db_pool.acquire() as conn:
-                    await conn.fetchval(
-                        get_query("soft_delete_chunk_backend_by_chunk_id"),
-                        backend_name,
-                        chunk_id,
+        for chunk_id in group.file_id_chunk_ids.get(file_id, set()):
+            async with soft_delete_sem:
+                try:
+                    async with db_pool.acquire() as conn:
+                        await conn.fetchval(
+                            get_query("soft_delete_chunk_backend_by_chunk_id"),
+                            backend_name,
+                            chunk_id,
+                        )
+                except Exception as db_err:
+                    ok = False
+                    worker_logger.warning(
+                        f"Failed to soft-delete chunk_backend row chunk_id={chunk_id} (file_id={file_id}): {db_err}"
                     )
-            except Exception as db_err:
-                ok = False
-                worker_logger.warning(
-                    f"Failed to soft-delete chunk_backend row chunk_id={chunk_id} (file_id={file_id}): {db_err}"
-                )
         if ok:
             soft_deleted_ok.add(file_id)
 
@@ -634,22 +642,42 @@ async def run_unpinner_loop(
         while req is not None:
             ray_id = req.ray_id or "no-ray-id"
             req_logger = get_logger_with_ray_id(__name__, ray_id)
-            async with db_pool.acquire() as conn:
-                rows = await conn.fetch(
-                    get_query("get_chunk_backend_identifiers"),
-                    backend_name,
-                    req.object_id,
-                    req.object_version,
-                )
-            if not rows:
-                await _handle_no_identifiers(req, req_logger)
-            else:
-                key = (req.address, folder_hash)
-                group = groups.get(key)
-                if group is None:
-                    group = _BatchGroup(req.address, folder_hash)
-                    groups[key] = group
-                group.add(req, rows)
+            # The request is already destructively brpop'd off Redis, so it must never be lost: any
+            # error handling it here (a DB blip on the identifier fetch, a redis hiccup enqueuing a
+            # no-rows retry) routes it to retry instead of propagating out and crashing the loop —
+            # matching the per-file path's resilience. Losing the whole in-flight assembly window on
+            # a transient DB error would strand those pins forever.
+            try:
+                async with db_pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        get_query("get_chunk_backend_identifiers"),
+                        backend_name,
+                        req.object_id,
+                        req.object_version,
+                    )
+                if not rows:
+                    await _handle_no_identifiers(req, req_logger)
+                else:
+                    key = (req.address, folder_hash)
+                    group = groups.get(key)
+                    if group is None:
+                        group = _BatchGroup(req.address, folder_hash)
+                        groups[key] = group
+                    group.add(req, rows)
+            except Exception as assemble_err:
+                req_logger.warning(f"Error assembling unpin {req.name}, routing to retry: {assemble_err}")
+                try:
+                    await _route_failed_request(
+                        req,
+                        backend_name=backend_name,
+                        error_class="transient",
+                        last_error=f"assembly error: {assemble_err}",
+                        worker_logger=req_logger,
+                        dlq_manager=dlq_manager,
+                        config=config,
+                    )
+                except Exception as route_err:
+                    req_logger.error(f"Failed to route unpin {req.name} after assembly error: {route_err}")
 
             if any(len(g.file_id_chunk_ids) >= batch_max_files for g in groups.values()):
                 break
