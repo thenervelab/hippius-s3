@@ -9,6 +9,9 @@ resources:
   - postgres-nvme-cluster.yaml
   - postgres-nvme-scheduledbackup.yaml
   - gateway-nodeport.yaml
+  # Scheduling priority for the ingest tier (used by api-local + drain-agent; harmless before they
+  # deploy). Created here so it exists ahead of the ingest pods that reference it. See peer-review B3.
+  - s3-ingest-priorityclass.yaml
   # --- hippius-drain (s3-2.1) SSD-ingest tier — DELIBERATELY COMMENTED OUT. ---
   # Ingest nodes node1..node5 are prepared: each has a dedicated 3.84 TB NVMe mounted at
   # /s3-data, and ingest-node-labels-production.yaml labels them s3-prod-local-ingest=true
