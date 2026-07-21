@@ -12,13 +12,12 @@ resources:
   - pv-local-cache.yaml
   - pvc-local-cache.yaml
   # --- hippius-drain (s3-2.1) SSD-ingest tier — DELIBERATELY COMMENTED OUT. ---
-  # Do NOT uncomment until the prod ingest nodes are prepared: repurpose one Ceph OSD's
-  # NVMe per node -> mount it at /var/lib/hippius/local_ingest_prod -> label the node
-  # s3-prod-local-ingest=true, and replace the REPLACE-prod-ingest-node-* placeholders in
-  # ingest-node-labels-production.yaml + both nodeAffinity allow-lists. Runbook:
-  # s3-2.1-todo.md -> "Prod logistics"; sizing: s3-prod-drain-capacity-plan.md.
-  # Also uncomment the `drain` image below, and (cutover) scale base `api` to 0 + point the
-  # `api` Service selector at app: api-local, as k8s/staging/kustomization.yaml does.
+  # Ingest nodes node1..node5 are prepared: each has a dedicated 3.84 TB NVMe mounted at
+  # /s3-data, and ingest-node-labels-production.yaml labels them s3-prod-local-ingest=true
+  # (both nodeAffinity allow-lists list node1..node5). Runbook: path-to-prod.md; sizing:
+  # s3-prod-drain-capacity-plan.md. Before uncommenting: confirm the label is applied on all
+  # five nodes, then also uncomment the `drain` image below, and (cutover) scale base `api`
+  # to 0 + point the `api` Service selector at app: api-local, as k8s/staging/kustomization.yaml does.
   # - ingest-node-labels-production.yaml
   # - api-local-deployments-production.yaml
   # - drain-allocator-deployment.yaml   # singleton; owns the cephor_* schema (deploy first)

@@ -12,10 +12,10 @@
 # duplicated hostname list to drift, and off the cache/psql/master nodes.
 #
 # == Volumes ==
-#  * SSD source: the SAME hostPath the api pods write to,
-#    /var/lib/hippius/local_ingest_prod (the `_staging` suffix keeps it disjoint
-#    from prod on a shared node). RW so the agent can unlink a part after a verified,
-#    committed pool copy.
+#  * SSD source: the SAME hostPath the api pods write to — the dedicated /s3-data NVMe
+#    on each ingest node (staging uses a different path/disk, local_ingest_staging on the
+#    node root, so they don't collide on shared node2/node3). RW so the agent can unlink a
+#    part after a verified, committed pool copy.
 #  * CephFS pool: object-cache-pvc — ReadWriteMany ceph-filesystem, mounted RW (the api
 #    pods mount it read-only; the agent is the writer into ceph).
 apiVersion: apps/v1
@@ -49,16 +49,16 @@ spec:
                   - key: kubernetes.io/hostname
                     operator: In
                     values:
-                      # PLACEHOLDER — replace with the prod ingest nodes you prepared: each must
-                      # have a repurposed local NVMe mounted at /var/lib/hippius/local_ingest_prod
-                      # and be labeled s3-prod-local-ingest=true. Keep this list in sync with
+                      # The prod ingest nodes: dedicated /s3-data NVMe, labeled
+                      # s3-prod-local-ingest=true. Keep in sync with
                       # ingest-node-labels-production.yaml + api-local-deployments-production.yaml.
-                      # MUST be DISJOINT from staging's ingest set (node2/node3) on this shared
-                      # cluster. See s3-2.1-todo.md → "Prod logistics" for the prep runbook.
-                      - REPLACE-prod-ingest-node-a
-                      - REPLACE-prod-ingest-node-b
-                      - REPLACE-prod-ingest-node-c
-                      - REPLACE-prod-ingest-node-d
+                      # Overlaps staging's node2/node3 but on a different disk (staging uses the
+                      # node-root local_ingest_staging path). See s3-2.1-todo.md.
+                      - k8s-v3-node1
+                      - k8s-v3-node2
+                      - k8s-v3-node3
+                      - k8s-v3-node4
+                      - k8s-v3-node5
       # > the agent's shutdown grace (CEPHOR_GRACE_SECS default 30s): a burst winds
       # down before the kubelet force-kills, so no in-flight part is stranded draining.
       terminationGracePeriodSeconds: 40
@@ -244,12 +244,11 @@ spec:
       volumes:
         - name: local-ingest
           hostPath:
-            # PLACEHOLDER PATH — this MUST be the mount point of the repurposed local NVMe on
-            # each ingest node (see s3-2.1-todo.md → "Prod logistics"). type: Directory (NOT
-            # DirectoryOrCreate as on staging) is deliberate: if the NVMe is not mounted here the
-            # pod stays ContainerCreating instead of silently writing the ingest churn onto the
-            # node root disk and filling it. Prep the node (mount + label) before scheduling here.
-            path: /var/lib/hippius/local_ingest_prod
+            # The dedicated 3.84 TB NVMe mounted at /s3-data on each ingest node (node1..node5).
+            # type: Directory (NOT DirectoryOrCreate as on staging) is deliberate: if the NVMe is
+            # not mounted at /s3-data the pod stays ContainerCreating instead of silently writing
+            # the ingest churn onto the node root disk and filling it.
+            path: /s3-data
             type: Directory
         - name: object-cache
           persistentVolumeClaim:
