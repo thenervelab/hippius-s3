@@ -1,0 +1,65 @@
+# WI-19 §4.4 fault substrate overlay.
+#
+# Layer on top of the e2e stack:
+#   docker compose -f docker-compose.yml -f docker-compose.e2e.yml \
+#                  -f stress-test/compose/docker-compose.faults.yml up -d --wait
+#
+# What it changes vs. plain e2e:
+#   1. redis-queues -> `noeviction` (prod parity). Plain e2e uses `allkeys-lru`, which SILENTLY
+#      evicts under memory pressure and so MASKS the prod failure mode (a full instance must reject
+#      writes loudly). Needed for F3-full / T4-D.
+#   2. toxiproxy pre-declares `redis_queues` (:16379 -> redis-queues:6379) and `postgres`
+#      (:15432 -> db:5432) proxies via a mounted config, so toxics can be injected in front of the
+#      coordinator's Redis + Postgres without patching the drain binary (plan.md §4.6 Rig A).
+#   3. The drain-allocator + drain-agent are rerouted THROUGH those proxies. Only the drain is
+#      rerouted — the API/worker queue + DB paths stay direct, so a coordinator-path fault (F3/F6)
+#      is isolated to the coordinator and doesn't tear down the whole stack.
+#
+# Inject toxics at runtime with tests/e2e/support/compose.py:add_toxic("redis_queues", ...).
+services:
+  toxiproxy:
+    volumes:
+      - ./stress-test/compose/toxiproxy-faults.json:/config/toxiproxy.json:ro
+    command: ["-host", "0.0.0.0", "-config", "/config/toxiproxy.json"]
+
+  redis-queues:
+    command:
+      [
+        "redis-server",
+        "--maxmemory",
+        "2gb",
+        "--maxmemory-policy",
+        "noeviction",
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+      ]
+
+  drain-allocator:
+    environment:
+      - CEPHOR_DATABASE_URL=postgresql://postgres:postgres@toxiproxy:15432/hippius?sslmode=disable
+      - CEPHOR_ALLOCATOR_INSTANCE_ID=e2e-allocator
+      - REDIS_QUEUES_URL=redis://toxiproxy:16379
+      - RUST_LOG=info
+    depends_on:
+      toxiproxy:
+        condition: service_started
+
+  drain-agent:
+    environment:
+      - CEPHOR_DATABASE_URL=postgresql://postgres:postgres@toxiproxy:15432/hippius?sslmode=disable
+      - CEPHOR_NODE_ID=e2e-node
+      - CEPHOR_SSD_ROOT=/var/lib/hippius/local_object_cache
+      - CEPHOR_POOL_ROOT=/var/lib/hippius/object_cache
+      - REDIS_QUEUES_URL=redis://toxiproxy:16379
+      - HIPPIUS_UPLOAD_BACKENDS=arion
+      - CEPHOR_RECONCILE_POLL_SECS=2
+      - CEPHOR_DRAIN_POLL_SECS=1
+      - CEPHOR_DEFER_BACKOFF_SECS=2
+      - CEPHOR_FLOOR_RATE_BPS=10000000000
+      - CEPHOR_MAX_DRAIN_RATE_BPS=10000000000
+      - RUST_LOG=hippius_drain_agent=debug,info
+    depends_on:
+      toxiproxy:
+        condition: service_started

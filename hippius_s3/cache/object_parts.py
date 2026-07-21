@@ -145,20 +145,6 @@ class RedisObjectPartsCache:
     ) -> list[bool]:
         return await self.fs.chunks_exist_batch(object_id, int(object_version), checks)
 
-    async def set_chunks(
-        self,
-        object_id: str,
-        object_version: int,
-        part_number: int,
-        chunks: list[bytes],
-        *,
-        ttl: int = DEFAULT_OBJ_PART_TTL_SECONDS,
-        start_index: int = 0,
-    ) -> None:
-        del ttl
-        for i, data in enumerate(chunks, start=start_index):
-            await self.fs.set_chunk(object_id, int(object_version), int(part_number), int(i), data)
-
     # ---- metadata API (FS-backed) ----
 
     async def set_meta(
@@ -272,8 +258,19 @@ class RedisObjectPartsCache:
 
     # ---- pub/sub API ----
 
-    async def wait_for_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> bytes:
-        timeout = _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS)
+    async def wait_for_chunk(
+        self,
+        object_id: str,
+        object_version: int,
+        part_number: int,
+        chunk_index: int,
+        *,
+        timeout: float | None = None,  # noqa: ASYNC109
+    ) -> bytes:
+        # A3: callers (the streamer) can pass a per-chunk bound; default to the full cache TTL so
+        # existing callers are unchanged.
+        if timeout is None:
+            timeout = _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS)
         return await self._notifier.wait_for_chunk(
             object_id,
             int(object_version),
@@ -285,3 +282,11 @@ class RedisObjectPartsCache:
 
     async def notify_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> None:
         await self._notifier.notify(object_id, int(object_version), int(part_number), int(chunk_index))
+
+    def stream_subscription(self, object_id: str, object_version: int) -> Any:
+        """One pub/sub subscription for the whole stream (RQ-1), wired to this cache's FS fetch.
+
+        Returns an async context manager; inside it call
+        `sub.wait_for_chunk(part_number, chunk_index, timeout=...)`.
+        """
+        return self._notifier.stream_subscription(object_id, int(object_version), fetch_fn=self.fs.get_chunk)

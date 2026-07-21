@@ -100,7 +100,7 @@ cases (500 / timeout / network) all classify transient as required. Flag for rev
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `HIPPIUS_UNPINNER_BATCH_DELETE` | `false` (code) / **`true`** (prod configmap) | Feature flag; enabled in k8s/base/configmap-defaults.yaml. Auto-falls back to per-file on 404. |
+| `HIPPIUS_UNPINNER_BATCH_DELETE` | `false` | Feature flag. OFF = per-file (prod default). |
 | `HIPPIUS_UNPINNER_BATCH_MAX_FILES` | `1000` | Max file_ids per batch call; hard-clamped ≤1000. |
 | `HIPPIUS_ARION_FOLDER_HASH` | `""` | folder_hash sent to `/delete_files` (root by default). |
 

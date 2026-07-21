@@ -13,8 +13,9 @@ Entry point is [`ObjectWriter`](object_writer.py); the heavy lifting is in [`put
 | [write_through_writer.py](write_through_writer.py) | `WriteThroughPartsWriter` — FS writes (fatal), Redis writes (best-effort). |
 | [cache_writer.py](cache_writer.py) | **Dead code** — `CacheWriter` not referenced anywhere. Delete candidate in [todo.md](../../todo.md). |
 | [db.py](db.py) | `upsert_object_basic`, `ensure_upload_row` — atomic DB reserves. |
-| [queue.py](queue.py) | `enqueue_upload` — write chunks to `{backend}_upload_requests` Redis queue. |
 | [types.py](types.py) | Dataclasses: `PutResult`, `PartResult`, `CompleteResult`, `AppendPreconditionFailed`, etc. |
+
+_(`queue.py` was removed: its `enqueue_upload` was the dead PUT-path upload producer. Since the s3-2.1 drain-direct cutover the Rust drain is the sole producer — it enqueues to `{backend}_upload_requests` only after replicating a part to the pool.)_
 
 ## The core path: `put_simple_stream_full`
 

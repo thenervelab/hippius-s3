@@ -37,6 +37,7 @@ from hippius_s3.monitoring import set_metrics_collector
 from hippius_s3.repositories.sub_token_scope_repository import SubTokenScopeRepository
 from hippius_s3.sentry import init_sentry
 from hippius_s3.services.arion_service import ArionClient
+from hippius_s3.services.hippius_api_service import HippiusApiClient
 
 
 def factory() -> FastAPI:
@@ -113,6 +114,11 @@ def factory() -> FastAPI:
         )
         logger.info("ArionClient initialized")
 
+        # NET-5: one long-lived HippiusApiClient so auth-cache misses reuse a warm connection pool
+        # instead of building and tearing down a client per miss.
+        app.state.hippius_api_client = HippiusApiClient()
+        logger.info("HippiusApiClient initialized")
+
         async def collect_pool_metrics() -> None:
             while True:
                 await asyncio.sleep(60)
@@ -135,6 +141,8 @@ def factory() -> FastAPI:
 
         if hasattr(app.state, "arion_client"):
             await app.state.arion_client.close()
+        if hasattr(app.state, "hippius_api_client"):
+            await app.state.hippius_api_client.close()
             logger.info("ArionClient closed")
 
         await ats_cache_client.close()
@@ -201,7 +209,6 @@ def factory() -> FastAPI:
     # makes it OUTER to auth_router/acl, which would let unauthenticated
     # callers short-circuit with 200 OK.
     app.middleware("http")(auth_probe_middleware)
-    app.middleware("http")(ray_id_middleware)
     if config.enable_audit_logging:
         app.middleware("http")(audit_log_middleware)
     app.middleware("http")(metrics_middleware)
@@ -218,6 +225,10 @@ def factory() -> FastAPI:
     app.middleware("http")(cache_invalidation_middleware)
     app.middleware("http")(ats_purge_middleware)
     app.middleware("http")(cache_control_middleware)
+    # Second-outermost: stamp ray_id + gateway_start_time before auth/acl/account/validation run,
+    # so gateway_overhead_ms spans the whole chain and every inner middleware logs a real ray_id
+    # (GW-2). Kept inside CORS so CORS still wraps error responses, including the ray_id header.
+    app.middleware("http")(ray_id_middleware)
     # Outermost: CORS must wrap everything so error responses get CORS headers
     app.middleware("http")(cors_middleware)
 

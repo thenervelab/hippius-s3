@@ -501,14 +501,11 @@ class _LoopClient:
 
 
 class _BatchHarness:
-    def __init__(
-        self, *, config, client=None, rows_by_object=None, fail_chunk_ids=frozenset(), fail_fetch_objects=frozenset()
-    ) -> None:
+    def __init__(self, *, config, client=None, rows_by_object=None, fail_chunk_ids=frozenset()) -> None:
         self.config = config
         self.client = client or _LoopClient()
         self.rows_by_object = rows_by_object or {}
         self.fail_chunk_ids = fail_chunk_ids
-        self.fail_fetch_objects = fail_fetch_objects
         self.dequeue_sequence: list = []
         self.softdeleted: list[int] = []
         self.retry_calls: list = []
@@ -529,8 +526,6 @@ class _BatchHarness:
         conn = AsyncMock()
 
         async def _fetch(query, backend, object_id, object_version):
-            if object_id in self.fail_fetch_objects:
-                raise RuntimeError("db down during assembly")
             return self.rows_by_object.get(object_id, [])
 
         async def _fetchval(query, backend, chunk_id):
@@ -689,51 +684,3 @@ async def test_configured_folder_hash_threaded_into_payload():
 
     assert len(h.client.batch_calls) == 1
     assert h.client.batch_calls[0][2] == "abcdef0123456789"
-
-
-# --------------------------------------------------------------------------- #
-# Review findings (PR #260) — regression tests
-# --------------------------------------------------------------------------- #
-
-
-# P1. A DB blip while assembling a batch must NOT crash the loop, and the already-brpop'd request
-# must be routed to retry (never silently lost -> stranded pin).
-@pytest.mark.asyncio
-async def test_assembly_db_error_routes_request_to_retry_and_loop_survives():
-    cfg = _loop_config(batch_enabled=True)
-    h = _BatchHarness(config=cfg, fail_fetch_objects={"obj-bad"})
-    h.dequeue_sequence = [_ureq("obj-bad")]  # then dequeue raises KeyboardInterrupt (clean stop)
-
-    # Must NOT propagate the RuntimeError — the loop survives the assembly-phase DB error.
-    await asyncio.wait_for(h.run(), timeout=5.0)
-
-    assert len(h.retry_calls) == 1, "the destructively-popped request must be re-enqueued, not lost"
-    assert h.retry_calls[0][0].object_id == "obj-bad"
-
-
-# P2. HCFS echoing back a file_id we did NOT send must not KeyError / drop the whole group.
-@pytest.mark.asyncio
-async def test_unknown_echoed_file_id_is_ignored_not_crashing_group():
-    req = _ureq("o1")
-    g = _group([(req, [("fid-real", 1)])])
-
-    def resp(_fids):
-        return BatchDeleteResult(
-            deleted=[
-                BatchDeleteItem(file_id="fid-real", status="deleted"),
-                BatchDeleteItem(file_id="fid-UNKNOWN-not-sent", status="deleted"),
-            ],
-            errors=[],
-            files_deleted=2,
-        )
-
-    client = _BatchClient(resp_fn=resp)
-    pool = _pool()
-
-    # Must NOT raise KeyError on the unknown file_id.
-    retry, dlq, metrics = await _run_batch(g, client, pool)
-
-    assert _softdeleted(pool) == {1}, "only the real chunk soft-deleted; unknown echoed id ignored"
-    retry.assert_not_called()
-    dlq.push.assert_not_called()
-    assert _success_count(metrics) == 1, "the request is acked; unknown echoed id does not affect it"

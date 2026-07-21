@@ -1,0 +1,24 @@
+# F7 — clock skew (DISPOSABLE PODS ONLY).
+# Shifts a single drain-allocator replica's clock forward 120s to probe lease-deadline handling.
+# Gate: single-leader holds and cephor:epoch stays monotonic — a skewed clock must not let a
+# replica believe a lease is still valid past its real expiry, nor bump the epoch backward.
+#
+# SAFETY: never apply TimeChaos to the API/gateway (their SigV4 auth is wall-clock sensitive). If
+# the lease deadlines are computed from a monotonic clock, set clockIds: [CLOCK_MONOTONIC]; if they
+# use wall-clock (CLOCK_REALTIME), skew that instead — match this to the coordinator's clock source.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: TimeChaos
+metadata:
+  name: f7-allocator-clock-skew
+  namespace: hippius-s3-staging
+spec:
+  mode: one
+  duration: 120s
+  timeOffset: "+120s"
+  clockIds:
+    - CLOCK_MONOTONIC
+  selector:
+    namespaces:
+      - hippius-s3-staging
+    labelSelectors:
+      app: drain-allocator

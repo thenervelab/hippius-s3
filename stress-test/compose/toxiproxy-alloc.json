@@ -1,0 +1,8 @@
+[
+  {
+    "name": "redis_queues",
+    "listen": "0.0.0.0:16379",
+    "upstream": "redis-queues:6379",
+    "enabled": true
+  }
+]

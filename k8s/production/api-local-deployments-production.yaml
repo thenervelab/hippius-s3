@@ -1,0 +1,185 @@
+# PROD api-local fleet: the api on node-local SSD ingest (s3-2.1 drain-direct).
+#
+# One `api-local` Deployment, 5 replicas (one per ingest node, node1..node5). At cutover the
+# base (ceph) `api` deployment scales to 0 and the `api` Service selector points here, so ALL
+# api pods run on local SSD. Each pod writes to its node's /s3-data NVMe and read-falls-back
+# to the shared CephFS pool. Workers run on ceph. The drain-agent DaemonSet (sole upload
+# producer) replicates each node's /s3-data → CephFS and enqueues the backend upload.
+#
+# Volume: a `hostPath` at /s3-data with `type: Directory` — the dedicated 3.84 TB NVMe is
+# mounted there out-of-band (node prep, not CI). Directory (not DirectoryOrCreate) is the
+# safety latch: if the NVMe isn't mounted the pod won't start, rather than staging uploads
+# onto the node root disk. A root initContainer chmods the mount so the (non-root) api can write.
+#
+# staging + prod share nodes node2/node3, but prod uses this dedicated /s3-data disk while
+# staging uses the node-root local_ingest_staging path — different disks, no collision.
+#
+# Scheduling: pinned to nodes labeled `s3-prod-local-ingest=true` (the ONE list lives in
+# ingest-node-labels-production.yaml). The drain-agent DaemonSet selects the SAME label, so
+# they stay in lockstep. Preferred pod anti-affinity spreads the replicas one-per-node. A
+# required nodeAffinity hostname allow-list (node1..node5) is belt-and-suspenders WITH the
+# label: a stray/mislabeled node alone can't place ingest on a psql/cache node.
+#
+# Routing: the existing `api` Service (the gateway's GATEWAY_BACKEND_URL=http://api:8000
+# upstream) is patched to select `app: api-local` (kustomization.yaml), so the gateway routes
+# here through the normal front door.
+#
+# IMPORTANT: with no ceph api pods, every upload stages locally and stays `pending` until the
+# drain replicates local->ceph. The drain stack (allocator + agent) MUST be up first.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-local
+  labels:
+    app: api-local
+spec:
+  # One per prod ingest node — node1..node5 each have a dedicated /s3-data NVMe.
+  # podAntiAffinity below spreads replicas one-per-node across the labelled nodes.
+  replicas: 5
+  selector:
+    matchLabels:
+      app: api-local
+  template:
+    metadata:
+      labels:
+        app: api-local
+    spec:
+      nodeSelector:
+        s3-prod-local-ingest: "true"
+      affinity:
+        # Belt-and-suspenders with the nodeSelector label: even a mislabeled node
+        # can't host ingest unless its hostname is ALSO on this allow-list. Keep in
+        # sync with ingest-node-labels-production.yaml (the label list).
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      # The prod ingest nodes: dedicated /s3-data NVMe, labeled
+                      # s3-prod-local-ingest=true. Keep in sync with
+                      # ingest-node-labels-production.yaml + the drain-agent DaemonSet.
+                      # Overlaps staging's node2/node3 but on a different disk (staging uses
+                      # the node-root local_ingest_staging path). See s3-2.1-todo.md.
+                      - k8s-v3-node1
+                      - k8s-v3-node2
+                      - k8s-v3-node3
+                      - k8s-v3-node4
+                      - k8s-v3-node5
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: api-local
+                topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:15
+          command:
+            - sh
+            - -c
+            - until pg_isready -h postgres-nvme-rw -p 5432 -U postgres; do echo waiting for postgres; sleep 5; done
+        - name: prepare-ingest-dir
+          image: busybox
+          command:
+            - sh
+            - -c
+            - mkdir -p /var/lib/hippius/local_object_cache && chmod 0777 /var/lib/hippius/local_object_cache
+          volumeMounts:
+            - name: local-ingest
+              mountPath: /var/lib/hippius/local_object_cache
+      containers:
+        - name: api
+          image: ghcr.io/thenervelab/hippius-s3/api:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: hippius-s3-defaults
+            - configMapRef:
+                name: hippius-s3-environment
+            - secretRef:
+                name: hippius-s3-secrets
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
+            - name: HIPPIUS_OBJECT_CACHE_DIR
+              value: /var/lib/hippius/local_object_cache
+            - name: HIPPIUS_OBJECT_CACHE_FALLBACK_DIR
+              value: /var/lib/hippius/object_cache
+          volumeMounts:
+            - name: local-ingest
+              mountPath: /var/lib/hippius/local_object_cache
+            - name: object-cache
+              mountPath: /var/lib/hippius/object_cache
+              readOnly: true
+            - name: persist
+              mountPath: /var/lib/hippius/persist
+            - name: dlq
+              mountPath: /tmp/hippius_dlq
+            - name: kms-certs
+              mountPath: /kms_certs
+              readOnly: true
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 20
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 1000m
+              memory: 2Gi
+            limits:
+              cpu: 4000m
+              memory: 8Gi
+      volumes:
+        - name: local-ingest
+          hostPath:
+            # The dedicated 3.84 TB NVMe mounted at /s3-data on each ingest node (node1..node5).
+            # type: Directory (not DirectoryOrCreate): if the NVMe is not mounted at /s3-data the
+            # pod won't start, rather than staging uploads onto the node root disk. The
+            # prepare-ingest-dir initContainer chmods the mount so the (non-root) api can write.
+            path: /s3-data
+            type: Directory
+        - name: object-cache
+          persistentVolumeClaim:
+            claimName: object-cache-pvc
+        - name: persist
+          persistentVolumeClaim:
+            claimName: persist-pvc
+        - name: dlq
+          persistentVolumeClaim:
+            claimName: dlq-pvc
+        - name: kms-certs
+          secret:
+            secretName: ovh-kms-certs
+            defaultMode: 0400

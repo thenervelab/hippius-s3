@@ -13,10 +13,14 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi import HTTPException
+from mock_faults import install_fault_controller
 from pydantic import BaseModel
 
 
 app = FastAPI()
+# WI-19 §4.4: env/endpoint-toggled fault modes (500 / slow). Lets F-cells brown-out the KMS
+# without tearing the proxy down (the on/off proxy already covers a hard outage). See mock_faults.py.
+fault = install_fault_controller(app, service="kms")
 
 # Mock "HSM" master key - XOR-based wrap for testing only
 MOCK_MASTER_KEY = os.environ.get("MOCK_KMS_MASTER_KEY", "test-master-key-0123456789abcdef").encode()
@@ -56,6 +60,7 @@ async def generate_data_key(okms_id: str, key_id: str, request: GenerateDataKeyR
     Mimics OVH KMS datakey endpoint - generates a random key and returns
     both the plaintext (for immediate use) and wrapped version (for storage).
     """
+    await fault.gate("generate")
     # Validate OKMS ID to catch path construction bugs in client
     if okms_id != MOCK_OKMS_ID:
         raise HTTPException(status_code=404, detail=f"Unknown OKMS ID: {okms_id}")
@@ -85,6 +90,7 @@ async def decrypt_data_key(okms_id: str, key_id: str, request: DecryptDataKeyReq
 
     Mimics OVH KMS datakey/decrypt endpoint.
     """
+    await fault.gate("decrypt")
     # Validate OKMS ID to catch path construction bugs in client
     if okms_id != MOCK_OKMS_ID:
         raise HTTPException(status_code=404, detail=f"Unknown OKMS ID: {okms_id}")

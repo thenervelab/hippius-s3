@@ -1,0 +1,19 @@
+# F1 — agent-node kill mid-replication.
+# Kills a drain-agent pod while it is copying SSD->pool. Gate (G5/G6): no false-commit under a
+# stale claim_seq; a killed claim is resumed by another agent ≤60s, a stuck claim reclaimed ≤6min.
+# One-shot (duration-bounded); Chaos Mesh restarts the DaemonSet pod after the kill.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: f1-agent-kill
+  namespace: hippius-s3-staging
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces:
+      - hippius-s3-staging
+    labelSelectors:
+      app: drain-agent
+  # pod-kill is instantaneous; the recovery bound is asserted by the harness, not Chaos Mesh.
+  gracePeriod: 0

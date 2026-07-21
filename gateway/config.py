@@ -86,6 +86,16 @@ class GatewayConfig:
     can_upload_cache_ttl_seconds: int = dataclasses.field(
         default_factory=lambda: int(os.getenv("CAN_UPLOAD_CACHE_TTL_SECONDS", "10"))
     )
+    # A transient billing-service failure (the upstream balance lookup blipped) comes back as
+    # result=False with a distinct error string, NOT a genuine "out of credit" denial. Retry the
+    # can_upload call this many times before surfacing anything; if it still fails, we return a
+    # retryable 503 SlowDown rather than a hard 402 that clients read as "insufficient funds".
+    can_upload_transient_retries: int = dataclasses.field(
+        default_factory=lambda: int(os.getenv("CAN_UPLOAD_TRANSIENT_RETRIES", "2"))
+    )
+    can_upload_transient_retry_delay_seconds: float = dataclasses.field(
+        default_factory=lambda: float(os.getenv("CAN_UPLOAD_TRANSIENT_RETRY_DELAY_SECONDS", "0.4"))
+    )
     public_bucket_cache_ttl_seconds: int = dataclasses.field(
         default_factory=lambda: int(os.getenv("PUBLIC_BUCKET_CACHE_TTL_SECONDS", "300"))
     )
@@ -140,6 +150,15 @@ class GatewayConfig:
     ats_cache_endpoints: list[str] = dataclasses.field(
         default_factory=lambda: _parse_csv(os.getenv("ATS_CACHE_ENDPOINT", ""))
     )
+
+    # Host sent on PURGE requests. ATS keys its cache on the remapped upstream
+    # (cachekey.so), so the key is identical for every public alias — any host
+    # ATS can remap to this gateway's pool works. Must match the pool: the
+    # cache boxes also serve staging on a different upstream, so a staging
+    # gateway sets this to its own public host. NOT derived from the request:
+    # internal callers (JuiceFS service DNS, NodePort writers) carry an
+    # unmappable Host that ATS rejects as ERR_INVALID_URL.
+    ats_purge_host: str = dataclasses.field(default_factory=lambda: os.getenv("ATS_PURGE_HOST", "s3.hippius.com"))
 
     # Shared secret stamped on the X-Hippius-Auth-Probe header by an ATS header_rewrite
     # rule on the auth-host remap. The gateway short-circuits with 200 OK when the

@@ -51,6 +51,9 @@ def _make_loop_config(*, max_inflight: int = 10, semaphore: int = 4, sleep_loop:
     cfg.downloader_chunk_retries = 1
     cfg.downloader_retry_base_seconds = 0.0
     cfg.downloader_retry_jitter_seconds = 0.0
+    cfg.downloader_max_attempts = 5
+    cfg.downloader_backoff_base_ms = 1
+    cfg.downloader_backoff_max_ms = 10
     cfg.downloader_sleep_loop = sleep_loop
     cfg.redis_url = "redis://localhost:6379"
     cfg.redis_queues_url = "redis://localhost:6382"
@@ -81,6 +84,10 @@ class _LoopHarness:
         self.redis_create_count = 0
         self.redis_queues_create_count = 0
         self.db_pool_create_count = 0
+
+        # Retry-path observation (A12)
+        self.retry_calls: list = []  # (request, kwargs) captured from enqueue_download_retry_request
+        self.move_calls = 0  # times the retry-mover invoked move_due_download_retries
 
     async def _dequeue(self, queue_name: str):
         # Yield the event loop so spawned _run_job tasks get scheduled.
@@ -118,6 +125,13 @@ class _LoopHarness:
         pool.close = AsyncMock()
         return pool
 
+    async def _enqueue_download_retry(self, request, **kwargs):
+        self.retry_calls.append((request, kwargs))
+
+    async def _move_due_download_retries(self, **kwargs):
+        self.move_calls += 1
+        return 0
+
     async def run(self) -> None:
         """Execute run_downloader_loop under the harness' patches."""
         with (
@@ -135,6 +149,8 @@ class _LoopHarness:
             patch("hippius_s3.workers.downloader.RedisObjectPartsCache", return_value=MagicMock()),
             patch("hippius_s3.workers.downloader.process_download_request", side_effect=self._process_download_request),
             patch("hippius_s3.queue.dequeue_download_request", side_effect=self._dequeue),
+            patch("hippius_s3.queue.enqueue_download_retry_request", side_effect=self._enqueue_download_retry),
+            patch("hippius_s3.queue.move_due_download_retries", side_effect=self._move_due_download_retries),
             patch("hippius_s3.queue.initialize_queue_client"),
             patch("hippius_s3.redis_cache.initialize_cache_client"),
             patch("hippius_s3.monitoring.initialize_metrics_collector"),
@@ -300,3 +316,80 @@ async def test_loop_ignores_generic_task_exceptions_without_reconnect():
     assert harness.redis_create_count == 1
     assert harness.db_pool_create_count == 1
     assert len(harness.process_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_partial_failure_requeues_the_request():
+    """ok=False (partial failure, no exception) must requeue the DCR via the retry
+    ZSET instead of silently dropping it (A12)."""
+    harness = _LoopHarness(max_inflight=2)
+    # trailing success gives the partial task a scheduling slot to finish its requeue
+    harness.dequeue_sequence = [_make_request("partial"), _make_request("ok2")]
+
+    async def _process(req):
+        return not req.object_key.endswith("partial.bin")
+
+    harness.process_fn = _process
+
+    await harness.run()
+
+    assert len(harness.retry_calls) == 1, "partial failure should requeue exactly once"
+    req, kwargs = harness.retry_calls[0]
+    assert req.object_key.endswith("partial.bin")
+    assert kwargs["backend_name"] == "arion"
+    assert kwargs["last_error"] == "partial failure"
+
+
+@pytest.mark.asyncio
+async def test_exception_requeues_and_still_reconnects():
+    """A task exception must requeue the DCR AND still propagate to _reap so an
+    infra error rebuilds the stale client (requeue-then-raise)."""
+    harness = _LoopHarness(max_inflight=2)
+    harness.dequeue_sequence = [_make_request("bad"), _make_request("good")]
+
+    async def _process(req):
+        if req.object_key.endswith("bad.bin"):
+            raise RedisConnectionError("connection reset")
+        return True
+
+    harness.process_fn = _process
+
+    await harness.run()
+
+    # requeued before the raise
+    assert len(harness.retry_calls) == 1
+    assert harness.retry_calls[0][0].object_key.endswith("bad.bin")
+    # raise still triggered the redis rebuild
+    assert harness.redis_create_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_request_dropped_at_attempts_cap():
+    """At the attempts cap the DCR is dropped (not re-added to the retry ZSET)."""
+    harness = _LoopHarness(max_inflight=2)
+    capped = _make_request("capped")
+    capped.attempts = harness.config.downloader_max_attempts  # attempts_next exceeds the cap
+    harness.dequeue_sequence = [capped, _make_request("ok2")]
+
+    async def _process(req):
+        return not req.object_key.endswith("capped.bin")
+
+    harness.process_fn = _process
+
+    await harness.run()
+
+    assert harness.retry_calls == [], "a request at the attempts cap must be dropped, not requeued"
+
+
+@pytest.mark.asyncio
+async def test_retry_mover_starts_and_is_cancelled_on_shutdown():
+    """The retry-mover runs at least once on startup and the loop shuts down cleanly
+    (mover cancelled in finally — no hang)."""
+    harness = _LoopHarness(max_inflight=2)
+    harness.dequeue_sequence = [_make_request("a")]
+    harness.process_fn = AsyncMock(return_value=True)
+
+    await asyncio.wait_for(harness.run(), timeout=5.0)
+
+    # move_due_download_retries is called once before the mover's first 2s sleep.
+    assert harness.move_calls >= 1

@@ -11,6 +11,7 @@ from .support.cache import clear_object_cache
 from .support.cache import get_object_id
 from .support.cache import make_all_object_parts_pending
 from .support.cache import wait_for_all_backends_ready
+from .support.dsn import DEFAULT_DSN
 
 
 def test_get_object_downloads_and_matches_headers(
@@ -125,7 +126,7 @@ def test_get_object_eventual_consistency(
 
     import psycopg  # type: ignore[import-untyped]
 
-    with psycopg.connect("postgresql://postgres:postgres@localhost:5432/hippius") as conn, conn.cursor() as cur:
+    with psycopg.connect(DEFAULT_DSN) as conn, conn.cursor() as cur:
         cur.execute(
             """
             SELECT DISTINCT part_number

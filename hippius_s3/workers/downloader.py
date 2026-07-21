@@ -135,44 +135,59 @@ async def process_download_request(
         base_sleep = config.downloader_retry_base_seconds
         jitter = config.downloader_retry_jitter_seconds
 
+        # RD-1: resolve every chunk's backend_identifier in one query per request instead of a
+        # pool-acquire + 3-table-join fetchrow per chunk. _fetch_chunk reads this map; on a miss it
+        # falls back to the singular lookup to close the window where a chunk's backend row landed
+        # after this snapshot (mid-upload race).
+        async with db_pool.acquire() as conn:
+            id_rows = await conn.fetch(
+                get_query("get_chunk_backend_identifiers_by_part"),
+                backend_name,
+                download_request.object_id,
+                int(download_request.object_version),
+            )
+        backend_id_map: dict[tuple[int, int], str] = {
+            (int(r["part_number"]), int(r["chunk_index"])): str(r["backend_identifier"])
+            for r in id_rows
+            if r["backend_identifier"]
+        }
+
         t_request_start = time.perf_counter()
         ttfb_recorded = False
         ttfb_ms = 0.0
         total_bytes_downloaded = 0
 
-        async def _fetch_chunk(part_number: int, spec: object, span: trace.Span) -> bool:
+        async def _fetch_chunk(part_number: int, spec: object, span: trace.Span, cached_indices: set[int]) -> bool:
             """Fetch and cache a single chunk, guarded by the semaphore."""
             nonlocal ttfb_recorded, ttfb_ms, total_bytes_downloaded
             chunk_index = int(spec.index)  # ty: ignore[unresolved-attribute]
 
-            async with semaphore:
-                # Check if already cached on FS (may have been filled by a
-                # concurrent request / worker)
-                cached = await fs_store.chunk_exists(
-                    download_request.object_id,
-                    int(download_request.object_version),
-                    part_number,
-                    chunk_index,
-                )
-                if cached:
-                    logger.debug(f"[{backend_name}] Skipping cached chunk part={part_number} ci={chunk_index}")
-                    return True
+            # RD-5: existence is resolved once per part via chunks_exist_batch (off-loop), so we read a
+            # precomputed set here instead of a synchronous per-chunk stat on the event loop. A chunk a
+            # concurrent worker fills after the snapshot is harmless — set_chunk is atomic/deterministic,
+            # so at worst we re-fetch identical bytes.
+            if chunk_index in cached_indices:
+                logger.debug(f"[{backend_name}] Skipping cached chunk part={part_number} ci={chunk_index}")
+                return True
 
-                # Look up backend_identifier (acquire connection from pool)
-                async with db_pool.acquire() as conn:
-                    row = await conn.fetchrow(
-                        get_query("get_chunk_backend_identifier"),
-                        backend_name,
-                        download_request.object_id,
-                        int(download_request.object_version),
-                        part_number,
-                        chunk_index,
-                    )
-                if not row or not row["backend_identifier"]:
+            async with semaphore:
+                # RD-1: read the per-request identifier map; on a miss fall back to the singular
+                # lookup (a chunk's backend row may have landed after the batch snapshot).
+                identifier = backend_id_map.get((part_number, chunk_index))
+                if identifier is None:
+                    async with db_pool.acquire() as conn:
+                        row = await conn.fetchrow(
+                            get_query("get_chunk_backend_identifier"),
+                            backend_name,
+                            download_request.object_id,
+                            int(download_request.object_version),
+                            part_number,
+                            chunk_index,
+                        )
+                    identifier = str(row["backend_identifier"]) if row and row["backend_identifier"] else None
+                if not identifier:
                     logger.debug(f"[{backend_name}] No identifier for part={part_number} ci={chunk_index}, skipping")
                     return True
-
-                identifier = str(row["backend_identifier"])
 
                 # Fetch with retries
                 for attempt in range(1, max_attempts + 1):
@@ -231,6 +246,19 @@ async def process_download_request(
                                 f"part={part_number} ci={chunk_index} "
                                 f"after {max_attempts} attempts: {exc}"
                             )
+                            # A4: wake any waiting readers. notify_chunk is a "readiness changed,
+                            # re-check" signal — on a terminal failure the woken streamer re-fetches,
+                            # finds nothing, and raises promptly instead of riding the full
+                            # per-chunk wait (stream_chunk_timeout) / cache_ttl. Request-level
+                            # retry (#237) may still re-drive the whole DCR later; a client GET that
+                            # failed fast simply re-reads and picks up the eventual success.
+                            with contextlib.suppress(Exception):
+                                await obj_cache.notify_chunk(
+                                    download_request.object_id,
+                                    int(download_request.object_version),
+                                    part_number,
+                                    chunk_index,
+                                )
                             return False
                         sleep_for = base_sleep * attempt + random.uniform(0, jitter)
                         logger.warning(
@@ -270,6 +298,18 @@ async def process_download_request(
                     except Exception as meta_exc:
                         logger.warning(f"[{backend_name}] Failed to write eager meta part={part_number}: {meta_exc}")
 
+                # RD-5: resolve existence for the whole part in one off-loop batch (one meta stat +
+                # N chunk stats) instead of a synchronous stat per chunk on the event loop.
+                existence_checks = [(part_number, int(spec.index)) for spec in part.chunks]
+                exist_flags = await fs_store.chunks_exist_batch(
+                    download_request.object_id,
+                    int(download_request.object_version),
+                    existence_checks,
+                )
+                cached_indices = {
+                    int(spec.index) for spec, present in zip(part.chunks, exist_flags, strict=True) if present
+                }
+
                 # Batch chunks so a pathological single-part (up to ~1280
                 # chunks for a 5 GiB part at 4 MiB chunk size) doesn't create
                 # thousands of tasks parked on the semaphore. Matches the
@@ -279,17 +319,25 @@ async def process_download_request(
                 for i in range(0, len(part.chunks), chunk_batch_size):
                     batch = part.chunks[i : i + chunk_batch_size]
                     chunk_results.extend(
-                        await asyncio.gather(*[_fetch_chunk(part_number, spec, part_span) for spec in batch])
+                        await asyncio.gather(
+                            *[_fetch_chunk(part_number, spec, part_span, cached_indices) for spec in batch]
+                        )
                     )
 
-                # Release the coalescing lock (set by build_stream_context on
-                # enqueue). Key format must match that callsite exactly.
+                # Release the coalescing lock (set by build_stream_context on enqueue). Key format
+                # must match that callsite exactly. A5: compare-and-delete on the lock's token so a
+                # slow part that outlived the lock TTL — after which ANOTHER streamer re-acquired it
+                # — doesn't have its lock stolen out from under it. The token is the enqueuing
+                # streamer's ray_id (build_stream_context sets the lock value to it); mirror the DLQ
+                # release Lua (dlq/base.py). Best-effort: a failed release just lets the TTL expire.
                 with contextlib.suppress(Exception):
                     lock_key = (
                         f"download_in_progress:{download_request.object_id}"
                         f":v:{int(download_request.object_version)}:part:{part_number}"
                     )
-                    await obj_cache.redis.delete(lock_key)
+                    token = str(getattr(download_request, "ray_id", None) or "anonymous")
+                    release_lua = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
+                    await obj_cache.redis.eval(release_lua, 1, lock_key, token)
                 return all(chunk_results)
 
         try:
@@ -355,16 +403,21 @@ async def run_downloader_loop(
 
     from hippius_s3.monitoring import initialize_metrics_collector
     from hippius_s3.queue import dequeue_download_request
+    from hippius_s3.queue import enqueue_download_retry_request
     from hippius_s3.queue import initialize_queue_client
+    from hippius_s3.queue import move_due_download_retries
     from hippius_s3.redis_cache import initialize_cache_client
     from hippius_s3.services.ray_id_service import get_logger_with_ray_id
     from hippius_s3.services.ray_id_service import ray_id_context
+    from hippius_s3.workers.errors import compute_backoff_ms
 
     config = get_config()
 
     redis_client: async_redis.Redis = create_redis_client(config.redis_url)  # ty: ignore[invalid-assignment]
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
-    db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=20)
+    db_pool = await asyncpg.create_pool(
+        config.database_url, min_size=config.downloader_db_pool_min, max_size=config.downloader_db_pool_max
+    )
     fs_store = create_fs_store(config)
 
     initialize_queue_client(redis_queues_client)
@@ -376,6 +429,41 @@ async def run_downloader_loop(
     if backend_name == "arion":
         backend_info = f" base_url={config.arion_base_url} verify_ssl={config.arion_verify_ssl}"
         logger.info(f"[{backend_name}] Starting downloader, queue={queue_name}{backend_info}")
+
+    async def _requeue_or_drop(
+        request: DownloadChainRequest, worker_logger: logging.LoggerAdapter, err_str: str
+    ) -> None:
+        """Requeue a failed DownloadChainRequest via the retry ZSET, or drop it at the attempts cap.
+
+        No download DLQ: chunks are re-derivable and a reader re-enqueues on the next cache-miss,
+        so a dropped request is recoverable — we only bound the server-side retry effort.
+
+        This reuses the uploader's retry PLUMBING (per-backend ZSET + 2s mover) but NOT its
+        transient/permanent classification. process_download_request swallows every per-chunk error
+        and returns ok=False (the terminal error class never reaches here), so we cannot cheaply tell
+        a permanent 404 from a transient 5xx without threading error types out of that hot path. We
+        therefore retry ALL failures up to the cap — a bounded, deliberate trade-off: a genuine
+        permanent failure costs at most downloader_max_attempts extra idempotent Arion GETs before
+        being dropped, no worse in kind than the pre-existing reader-driven re-enqueue that re-drives
+        permanents on every cache-miss regardless.
+        """
+        attempts_next = (request.attempts or 0) + 1
+        if attempts_next <= config.downloader_max_attempts:
+            delay_ms = compute_backoff_ms(
+                attempts_next, config.downloader_backoff_base_ms, config.downloader_backoff_max_ms
+            )
+            await enqueue_download_retry_request(
+                request, backend_name=backend_name, delay_seconds=delay_ms / 1000.0, last_error=err_str
+            )
+            worker_logger.warning(
+                f"[{backend_name}] Requeued {request.bucket_name}/{request.object_key} "
+                f"attempt={attempts_next}/{config.downloader_max_attempts} err={err_str}"
+            )
+        else:
+            worker_logger.error(
+                f"[{backend_name}] Dropping {request.bucket_name}/{request.object_key} after "
+                f"{attempts_next - 1} attempts (readers re-enqueue on demand) err={err_str}"
+            )
 
     async def _run_job(request: DownloadChainRequest) -> None:
         ray_id = request.ray_id or "no-ray-id"
@@ -405,10 +493,17 @@ async def run_downloader_loop(
                 else:
                     job_span.set_status(trace.StatusCode.ERROR, "partial failure")
                     worker_logger.error(f"[{backend_name}] Failed: {request.bucket_name}/{request.object_key}")
+                    await _requeue_or_drop(request, worker_logger, "partial failure")
             except Exception as exc:
                 job_span.record_exception(exc)
                 job_span.set_status(trace.StatusCode.ERROR, str(exc))
                 worker_logger.error(f"[{backend_name}] job error: {exc}", exc_info=True)
+                # Requeue before re-raising so the request survives a process/infra error. The raise
+                # still propagates to _reap so an infra failure rebuilds the stale client. If redis is
+                # the thing that's down the requeue can't land — suppress so the original error wins;
+                # the reader re-enqueues on the next miss regardless.
+                with contextlib.suppress(Exception):
+                    await _requeue_or_drop(request, worker_logger, str(exc))
                 raise
 
     max_inflight = max(1, config.downloader_max_inflight)
@@ -435,6 +530,20 @@ async def run_downloader_loop(
 
     logger.info(f"[{backend_name}] Inflight pool size: {max_inflight}")
 
+    # Periodic retry-mover — one per pod, off the per-request hot path. Moves due items from
+    # the retry ZSET back onto the download queue (mirrors the uploader's _retry_mover).
+    async def _retry_mover() -> None:
+        while True:
+            try:
+                moved = await move_due_download_retries(backend_name=backend_name, now_ts=time.time(), max_items=256)
+                if moved:
+                    logger.info(f"[{backend_name}] Moved {moved} due download retries back to queue")
+            except Exception as e:
+                logger.error(f"[{backend_name}] Error moving download retries: {e}")
+            await asyncio.sleep(2.0)
+
+    mover_task = asyncio.create_task(_retry_mover())
+
     try:
         while True:
             _reap({t for t in inflight if t.done()})
@@ -452,7 +561,9 @@ async def run_downloader_loop(
                 logger.warning(f"[{backend_name}] Recreating DB pool after task error")
                 with contextlib.suppress(Exception):
                     await db_pool.close()
-                db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=20)
+                db_pool = await asyncpg.create_pool(
+                    config.database_url, min_size=config.downloader_db_pool_min, max_size=config.downloader_db_pool_max
+                )
                 needs_db_reconnect = False
 
             if len(inflight) >= max_inflight:
@@ -503,6 +614,8 @@ async def run_downloader_loop(
         logger.error(f"[{backend_name}] Fatal loop error: {exc}", exc_info=True)
         raise
     finally:
+        mover_task.cancel()
+        await asyncio.gather(mover_task, return_exceptions=True)
         await redis_client.aclose()
         await redis_queues_client.aclose()
         await db_pool.close()

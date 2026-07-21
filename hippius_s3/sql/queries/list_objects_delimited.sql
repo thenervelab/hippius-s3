@@ -1,0 +1,134 @@
+-- LS-1: delimiter rollup as a loose-index skip-scan, entirely in SQL.
+-- Each recursive step fetches the next serveable key with a SCALAR subquery (reliably correlated to
+-- the prior row's next_boundary), classifies it (content vs delimiter group), and advances: a content
+-- key to key || chr(1); a group to the lexicographic successor of its common prefix. `kept` counts
+-- only non-suppressed items so cp_floor-suppressed groups still advance the scan without consuming a
+-- slot; recursion stops once kept reaches target+1. Mirrors Python _collect_page exactly — hence
+-- gated behind HIPPIUS_LIST_OBJECTS_SQL_ROLLUP with a differential test proving equivalence.
+--
+-- Parameters: $1 bucket_id (uuid), $2 prefix (text|null), $3 cursor (text|null, inclusive lower
+--             bound), $4 delimiter (text|null), $5 target (int, max-keys), $6 cp_floor (text|null)
+WITH RECURSIVE p AS (
+    SELECT
+        $1::uuid AS bucket_id,
+        $2::text AS prefix,
+        $4::text AS delim,
+        $6::text AS cp_floor,
+        COALESCE(length($2::text), 0) AS plen,
+        COALESCE(length($4::text), 0) AS dlen,
+        $5::int AS target
+),
+walk AS (
+    -- SEED: the first serveable object at or after the cursor.
+    SELECT
+        s.object_key, c.is_prefix, c.group_key, c.next_boundary, c.suppressed,
+        (CASE WHEN c.suppressed THEN 0 ELSE 1 END)::int AS kept
+    FROM p
+    CROSS JOIN LATERAL (
+        SELECT (
+            SELECT o.object_key
+            FROM objects o
+            WHERE o.bucket_id = p.bucket_id
+              AND o.deleted_at IS NULL
+              AND (p.prefix IS NULL OR o.object_key LIKE p.prefix || '%')
+              AND ($3::text IS NULL OR o.object_key >= $3::text)
+              AND EXISTS (
+                  SELECT 1 FROM object_versions v
+                  WHERE v.object_id = o.object_id
+                    AND v.object_version <= o.current_object_version
+                    AND (v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
+              )
+            ORDER BY o.object_key
+            LIMIT 1
+        ) AS object_key
+    ) s
+    CROSS JOIN LATERAL (
+        SELECT
+            (p.dlen > 0 AND strpos(substr(s.object_key, p.plen + 1), p.delim) > 0) AS is_prefix,
+            CASE WHEN (p.dlen > 0 AND strpos(substr(s.object_key, p.plen + 1), p.delim) > 0)
+                 THEN left(s.object_key, p.plen + strpos(substr(s.object_key, p.plen + 1), p.delim) - 1 + p.dlen)
+                 END AS cpref
+    ) cp
+    CROSS JOIN LATERAL (
+        SELECT
+            cp.is_prefix,
+            COALESCE(cp.cpref, s.object_key) AS group_key,
+            CASE WHEN cp.is_prefix
+                 THEN substr(cp.cpref, 1, length(cp.cpref) - 1) || chr(ascii(right(cp.cpref, 1)) + 1)
+                 ELSE s.object_key || chr(1) END AS next_boundary,
+            (cp.is_prefix AND p.cp_floor IS NOT NULL AND cp.cpref <= p.cp_floor) AS suppressed
+    ) c
+    WHERE s.object_key IS NOT NULL
+
+    UNION ALL
+
+    -- STEP: from the prior row's next_boundary, seek the next serveable object.
+    SELECT
+        s.object_key, c.is_prefix, c.group_key, c.next_boundary, c.suppressed,
+        (w.kept + CASE WHEN c.suppressed THEN 0 ELSE 1 END)::int AS kept
+    FROM walk w
+    CROSS JOIN p
+    CROSS JOIN LATERAL (
+        SELECT (
+            SELECT o.object_key
+            FROM objects o
+            WHERE o.bucket_id = p.bucket_id
+              AND o.deleted_at IS NULL
+              AND (p.prefix IS NULL OR o.object_key LIKE p.prefix || '%')
+              AND o.object_key >= w.next_boundary
+              AND EXISTS (
+                  SELECT 1 FROM object_versions v
+                  WHERE v.object_id = o.object_id
+                    AND v.object_version <= o.current_object_version
+                    AND (v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
+              )
+            ORDER BY o.object_key
+            LIMIT 1
+        ) AS object_key
+    ) s
+    CROSS JOIN LATERAL (
+        SELECT
+            (p.dlen > 0 AND strpos(substr(s.object_key, p.plen + 1), p.delim) > 0) AS is_prefix,
+            CASE WHEN (p.dlen > 0 AND strpos(substr(s.object_key, p.plen + 1), p.delim) > 0)
+                 THEN left(s.object_key, p.plen + strpos(substr(s.object_key, p.plen + 1), p.delim) - 1 + p.dlen)
+                 END AS cpref
+    ) cp
+    CROSS JOIN LATERAL (
+        SELECT
+            cp.is_prefix,
+            COALESCE(cp.cpref, s.object_key) AS group_key,
+            CASE WHEN cp.is_prefix
+                 THEN substr(cp.cpref, 1, length(cp.cpref) - 1) || chr(ascii(right(cp.cpref, 1)) + 1)
+                 ELSE s.object_key || chr(1) END AS next_boundary,
+            (cp.is_prefix AND p.cp_floor IS NOT NULL AND cp.cpref <= p.cp_floor) AS suppressed
+    ) c
+    WHERE w.kept <= p.target AND s.object_key IS NOT NULL
+)
+SELECT
+    w.is_prefix,
+    w.group_key,
+    w.object_key,
+    m.size_bytes,
+    m.md5_hash,
+    m.created_at,
+    w.next_boundary
+FROM walk w
+LEFT JOIN LATERAL (
+    SELECT o.created_at, ov.size_bytes, ov.md5_hash
+    FROM objects o
+    CROSS JOIN LATERAL (
+        SELECT v.size_bytes, v.md5_hash
+        FROM object_versions v
+        WHERE v.object_id = o.object_id
+          AND v.object_version <= o.current_object_version
+          AND (v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
+        ORDER BY v.object_version DESC
+        LIMIT 1
+    ) ov
+    WHERE o.bucket_id = (SELECT bucket_id FROM p)
+      AND o.deleted_at IS NULL
+      AND o.object_key = w.object_key
+) m ON NOT w.is_prefix
+WHERE NOT w.suppressed
+ORDER BY w.kept
+LIMIT $5::int + 1;

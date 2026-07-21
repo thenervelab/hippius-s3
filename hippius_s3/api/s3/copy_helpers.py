@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from datetime import datetime
@@ -14,11 +15,13 @@ from lxml import etree as ET  # ty: ignore[unresolved-import]
 from hippius_s3.api.s3 import errors
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import Config
+from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.repositories.buckets import BucketRepository
 from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
 from hippius_s3.services.object_reader import stream_object
 from hippius_s3.storage_version import require_supported_storage_version
+from hippius_s3.writer.db import set_object_version_address
 from hippius_s3.writer.object_writer import ObjectWriter
 
 
@@ -204,6 +207,7 @@ async def handle_streaming_copy(
         },
         rng=None,
         address=request.state.account.main_account,
+        bound_first_chunk=True,  # A2: fail fast (503) if the source is still draining, before writing the destination
     )
 
     content_type = str(source_object["content_type"])
@@ -219,5 +223,38 @@ async def handle_streaming_copy(
         storage_version=config.target_storage_version,
         body_iter=chunks_iter,
     )
+
+    # Drain-direct (s3-2.1 PR-11): same contract as PutObject. Without the address the Rust drain
+    # never rebuilds an UploadChainRequest for the destination, so the copy would live only in the
+    # FS cache — no chunk_backend rows, never replicated, never evictable.
+    try:
+        await set_object_version_address(
+            pool,
+            object_id=str(put_res.object_id),
+            object_version=int(put_res.object_version),
+            address=request.state.account.main_account,
+        )
+    except Exception:
+        # B4: put_simple_stream_full already made the version serveable (size/md5 written). If the
+        # address never lands, a GET would serve bytes the drain can never back. Revert to the
+        # reserved-row shape so reads skip it and the sweep reclaims its parts, then surface.
+        with contextlib.suppress(Exception):
+            async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
+                await conn.execute(
+                    "UPDATE object_versions SET size_bytes = 0, md5_hash = '' "
+                    "WHERE object_id = $1 AND object_version = $2",
+                    str(put_res.object_id),
+                    int(put_res.object_version),
+                )
+        raise
+
+    # put_simple_stream_full creates the multipart_uploads row (ensure_upload_row) but deliberately
+    # leaves is_completed=FALSE; flipping it only after the address lands keeps a failed copy
+    # eligible for the DELETE-cascade cleanup.
+    async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
+        await conn.execute(
+            "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
+            str(put_res.upload_id),
+        )
 
     return build_copy_success_response(put_res.etag, copy_created_at)

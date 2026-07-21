@@ -21,6 +21,7 @@ from hippius_s3.cache import create_fs_store
 from hippius_s3.config import get_config
 from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.db_retry import retry_on_object_version_conflict
+from hippius_s3.services.crypto_pool import run_crypto
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.storage_version import require_supported_storage_version
@@ -38,6 +39,14 @@ from hippius_s3.writer.write_through_writer import WriteThroughPartsWriter
 
 tracer = trace.get_tracer(__name__)
 logger = logging.getLogger(__name__)
+
+
+def _append_version_conflict(current: int | None, expected: int) -> bool:
+    """AP-1: True when a re-read append_version proves a concurrent append already advanced it.
+
+    A missing row (None) is not a conflict here — the reservation/finalize path handles that case.
+    """
+    return current is not None and int(current) != int(expected)
 
 
 class ObjectWriter:
@@ -298,7 +307,7 @@ class ObjectWriter:
         perf_stream_start = time.monotonic()
 
         adapter = CryptoService.get_adapter(suite_id)
-        write_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(maxsize=16)
+        write_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(maxsize=self.config.write_queue_maxsize)
         consumer_error: BaseException | None = None
 
         async def _consumer() -> None:
@@ -342,7 +351,8 @@ class ObjectWriter:
                     # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
                     # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
                     t0 = time.monotonic()
-                    ct = adapter.encrypt_chunk(
+                    ct = await run_crypto(
+                        adapter.encrypt_chunk,
                         buf,
                         key=key_bytes,
                         bucket_id=str(bucket_id),
@@ -369,7 +379,8 @@ class ObjectWriter:
                 # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
                 # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
                 t0 = time.monotonic()
-                ct = adapter.encrypt_chunk(
+                ct = await run_crypto(
+                    adapter.encrypt_chunk,
                     buf,
                     key=key_bytes,
                     bucket_id=str(bucket_id),
@@ -510,6 +521,31 @@ class ObjectWriter:
         from hippius_s3.services.kek_service import get_bucket_kek_bytes
         from hippius_s3.services.kek_service import get_or_create_active_bucket_kek
 
+        # MPU-1: fast, non-locking read first. Parts 2..N of an MPU share one object_version row whose
+        # envelope the first part already populated, so they unwrap the DEK concurrently instead of
+        # serializing on that row's FOR UPDATE lock. Only the create/rotate case (envelope still NULL,
+        # or rotate) escalates to the locked path below, whose in-lock re-check keeps the first-part
+        # race idempotent.
+        if not rotate:
+            pre = await self.pool.fetchrow(
+                """
+                SELECT storage_version, kek_id, wrapped_dek
+                  FROM object_versions
+                 WHERE object_id = $1 AND object_version = $2
+                """,
+                object_id,
+                int(object_version),
+            )
+            if pre is not None:
+                if int(pre.get("storage_version") or 0) < 5:
+                    raise RuntimeError("not_v5_object_version")
+                pre_kek_id = pre.get("kek_id")
+                pre_wrapped = pre.get("wrapped_dek")
+                if pre_kek_id and pre_wrapped:
+                    kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=pre_kek_id)
+                    aad = f"hippius-dek:{bucket_id}:{object_id}:{int(object_version)}".encode("utf-8")
+                    return unwrap_dek(kek=kek_bytes, wrapped_dek=bytes(pre_wrapped), aad=aad)
+
         async with self.pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 """
@@ -643,6 +679,7 @@ class ObjectWriter:
         object_id: str,
         object_version: int,
         bucket_name: str,
+        bucket_id: str,
         account_address: str,
         part_number: int,
         body_iter: AsyncIterator[bytes],
@@ -656,19 +693,10 @@ class ObjectWriter:
         if max_size <= 0:
             max_size = 0
 
-        # Resolve bucket_id for this version
-        meta = await self.pool.fetchrow(
-            """
-            SELECT o.bucket_id, ov.storage_version
-              FROM objects o
-              JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = $2
-             WHERE o.object_id = $1
-             LIMIT 1
-            """,
-            object_id,
-            int(object_version),
-        )
-        bucket_id = str(meta["bucket_id"]) if meta and meta.get("bucket_id") else ""
+        # MPU-2: bucket_id is passed by the caller (from the already-fetched multipart_uploads row),
+        # so we no longer re-run an objects⋈object_versions JOIN per part (its storage_version was
+        # never used).
+        bucket_id = str(bucket_id)
         suite_id = "hip-enc/aes256gcm"
         key_bytes = await self._ensure_and_get_v5_dek(
             bucket_id=bucket_id,
@@ -695,7 +723,7 @@ class ObjectWriter:
         perf_queue_wait_ms = 0.0
         perf_stream_start = time.monotonic()
 
-        write_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(maxsize=16)
+        write_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(maxsize=self.config.write_queue_maxsize)
         consumer_error: BaseException | None = None
 
         async def _cleanup_partial() -> None:
@@ -770,7 +798,8 @@ class ObjectWriter:
                     # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
                     # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
                     t0 = time.monotonic()
-                    ct = adapter.encrypt_chunk(
+                    ct = await run_crypto(
+                        adapter.encrypt_chunk,
                         buf,
                         key=key_bytes,
                         bucket_id=bucket_id,
@@ -797,7 +826,8 @@ class ObjectWriter:
                 # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
                 # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
                 t0 = time.monotonic()
-                ct = adapter.encrypt_chunk(
+                ct = await run_crypto(
+                    adapter.encrypt_chunk,
                     buf,
                     key=key_bytes,
                     bucket_id=bucket_id,
@@ -875,40 +905,86 @@ class ObjectWriter:
         upload_id: str,
         object_version: int,
         address: str,
+        selected_parts: list[int] | None = None,
+        db_parts: list[Any] | None = None,
     ) -> CompleteResult:
-        # Compute combined ETag from part etags for this version
-        parts = await self.pool.fetch(
-            get_query("get_parts_etags_for_version"),
-            object_id,
-            int(object_version),
+        # B1: S3 allows completing with a SUBSET of the uploaded parts. `selected_parts` is the
+        # client's <Part> list (already validated exists+ETag-matches by the endpoint); the final
+        # ETag, size, AND the served bytes must reflect ONLY those parts. We filter the ETag/size
+        # here and persist `completed_part_numbers` so the reader (parts_catalog) serves the same
+        # set — rather than deleting the unlisted parts (unsafe: multi-node SSD + in-flight drain +
+        # chunk_backend/Arion pin leak via cascade). `selected_parts=None` (or the full set) →
+        # every part, unchanged behaviour.
+        # `[]` is an explicit empty subset (complete zero parts), distinct from `None` (= all parts);
+        # test `is not None` so a falsy-but-present empty list is not collapsed into the all-parts sentinel.
+        selected = sorted({int(pn) for pn in selected_parts}) if selected_parts is not None else None
+
+        # MPU-3: `list_parts_for_version` (SELECT *) carries etag AND size_bytes ordered by
+        # part_number, so the endpoint's already-fetched rows serve both the combined ETag and the
+        # total size — no re-reads. When not supplied (migrate script), fall back to the original two
+        # queries so behaviour is byte-identical.
+        if db_parts is not None:
+            etag_rows: list[Any] = db_parts
+            size_rows: list[Any] = db_parts
+        else:
+            etag_rows = await self.pool.fetch(
+                get_query("get_parts_etags_for_version"),
+                object_id,
+                int(object_version),
+            )
+            size_rows = await self.pool.fetch(
+                get_query("list_parts_for_version"),
+                object_id,
+                int(object_version),
+            )
+
+        selected_set = set(selected) if selected is not None else None
+
+        # Compute combined ETag from part etags for this version (client-selected subset only).
+        etag_parts = (
+            [p for p in etag_rows if int(p["part_number"]) in selected_set] if selected_set is not None else etag_rows
         )
-        etags = [p["etag"].split("-")[0] for p in parts]
+        etags = [p["etag"].split("-")[0] for p in etag_parts]
         binary = b"".join(bytes.fromhex(e) for e in etags) if etags else b""
         final_md5 = hashlib.md5(binary).hexdigest() + f"-{len(etags)}"
 
-        # Total size
-        all_parts = await self.pool.fetch(
-            get_query("list_parts_for_version"),
-            object_id,
-            int(object_version),
+        # Total size (client-selected subset only).
+        all_pns = {int(p["part_number"]) for p in size_rows}
+        size_parts = (
+            [p for p in size_rows if int(p["part_number"]) in selected_set] if selected_set is not None else size_rows
         )
-        total_size = sum(int(p["size_bytes"]) for p in all_parts)
+        total_size = sum(int(p["size_bytes"]) for p in size_parts)
+
+        # Only persist the filter when the client named a STRICT subset — a full-set completion
+        # (the overwhelming common case) leaves the column NULL so no per-read filter/array is
+        # stored (matters for MPUs with thousands of parts).
+        subset_to_store = selected if (selected is not None and set(selected) != all_pns) else None
+        if subset_to_store is not None:
+            logger.info(
+                "mpu_complete: object_id=%s v=%s completed with a %d-of-%d part SUBSET; unlisted parts excluded from reads",
+                object_id,
+                object_version,
+                len(subset_to_store),
+                len(all_pns),
+            )
 
         async with self.pool.acquire() as conn, conn.transaction():
-            # Update object_versions
+            # Update object_versions (record the completed subset so the reader filters to it).
             await conn.execute(
                 """
                 UPDATE object_versions ov
                 SET md5_hash = $1,
                     size_bytes = $2,
                     last_modified = NOW(),
-                    status = 'publishing'
+                    status = 'publishing',
+                    completed_part_numbers = $5
                 WHERE ov.object_id = $3 AND ov.object_version = $4
                 """,
                 final_md5,
                 int(total_size),
                 object_id,
                 int(object_version),
+                subset_to_store,
             )
 
             # Mark MPU completed
@@ -1063,12 +1139,26 @@ class ObjectWriter:
                     int(next_part),
                 )
 
+        # AP-1 (cheap interim): re-check the append version right before the expensive encrypt+FS
+        # write. When K appends share an expected_version, whichever finalizes first bumps it; any
+        # loser that hasn't started its write yet is rejected here instead of wasting the full write.
+        # The finalize CAS below remains the authoritative guard for writes that fully overlap.
+        precheck = await self.pool.fetchval(
+            "SELECT append_version FROM object_versions WHERE object_id = $1 AND object_version = $2",
+            object_id,
+            int(cov),
+        )
+        if _append_version_conflict(precheck, expected_version):
+            await _delete_part_row()
+            raise AppendPreconditionFailed(int(precheck))
+
         try:
             part_res = await self.mpu_upload_part_stream(
                 upload_id=str(upload_id),
                 object_id=str(object_id),
                 object_version=int(cov),
                 bucket_name=str(bucket_name),
+                bucket_id=str(bucket_id),
                 account_address=account_address,
                 part_number=int(next_part),
                 body_iter=body_iter,

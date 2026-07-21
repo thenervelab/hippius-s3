@@ -1,0 +1,59 @@
+# Declarative source of truth for the PROD local-ingest node set.
+#
+# This is the ONE list. `kubectl apply -k k8s/production` applies the
+# `s3-prod-local-ingest=true` label to these nodes; the api-local Deployment and the
+# drain-agent DaemonSet both select on that label, so they stay in lockstep. Both ALSO
+# carry a required nodeAffinity hostname allow-list — keep it in sync with the stanzas
+# below (edit the Node names here AND both allow-lists together).
+#
+# THE NODES: k8s-v3-node1..node5, each with a dedicated 3.84 TB enterprise NVMe (Gen4
+# datacenter U.2/U.3: WD Ultrastar DC / Micron 7450 PRO / Intel-Solidigm D7-P5520)
+# mounted at /var/lib/hippius/... via the host path /s3-data (ext4). The api-local +
+# drain-agent hostPath points at /s3-data.
+#
+# SHARED CLUSTER — no collision by design: staging's ingest also runs on node2/node3, but
+# on a DIFFERENT disk/path (`s3-staging-local-ingest` → /var/lib/hippius/local_ingest_staging
+# on the node root disk), while prod uses THIS label → the dedicated /s3-data NVMe. So a
+# staging and a prod ingest pod can co-reside on node2/node3 without sharing a disk. (If you
+# want the nodes prod-exclusive — nothing else scheduled — that needs a TAINT + tolerations,
+# which would evict the general worker pool currently on node1-5; decide separately.)
+#
+# CAVEAT: `apply` adds labels but does not PRUNE them. To retire an ingest node, delete its
+# stanza here AND run: kubectl label node <name> s3-prod-local-ingest-
+#
+# (Partial Node objects: apply merges only metadata.labels, leaving all other node fields
+# untouched. Requires the deploy identity to be able to patch nodes.)
+apiVersion: v1
+kind: Node
+metadata:
+  name: k8s-v3-node1
+  labels:
+    s3-prod-local-ingest: "true"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: k8s-v3-node2
+  labels:
+    s3-prod-local-ingest: "true"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: k8s-v3-node3
+  labels:
+    s3-prod-local-ingest: "true"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: k8s-v3-node4
+  labels:
+    s3-prod-local-ingest: "true"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: k8s-v3-node5
+  labels:
+    s3-prod-local-ingest: "true"

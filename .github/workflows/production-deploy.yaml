@@ -110,9 +110,74 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  rust-gate:
+    # Block the drain image build (and thus the deploy) on the Rust quality gates
+    # (audit F2). Fast checks only -- fmt + clippy + supply chain; the full
+    # Postgres-backed test suite runs in the PR workflow (test-and-lint.yml).
+    name: Rust gate (fmt, clippy, cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo-deny check
+        run: cargo deny check
+
+  build-drain:
+    # The hippius-drain Rust binaries (agent + allocator) ship as one `drain` image.
+    # It is a self-contained Cargo workspace, so it needs no base image. Gated on
+    # rust-gate so a clippy/fmt/advisory failure blocks building+deploying the drain.
+    # (Prod parity with staging-deploy.yaml; no chaos-mesh/toxiproxy here — that is staging-only.)
+    needs: rust-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/drain
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=latest
+
+      - name: Build and push drain image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.drain
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   deploy-production:
     runs-on: ubuntu-latest
-    needs: build-images
+    needs: [build-images, build-drain]
     environment: production
     steps:
       - name: Checkout code
@@ -207,7 +272,8 @@ jobs:
           kustomize edit set image \
             ghcr.io/thenervelab/hippius-s3/api:${SHORT_SHA} \
             ghcr.io/thenervelab/hippius-s3/gateway:${SHORT_SHA} \
-            ghcr.io/thenervelab/hippius-s3/workers:${SHORT_SHA}
+            ghcr.io/thenervelab/hippius-s3/workers:${SHORT_SHA} \
+            ghcr.io/thenervelab/hippius-s3/drain:${SHORT_SHA}
 
       - name: Delete old migration job
         run: |
@@ -223,10 +289,45 @@ jobs:
 
       - name: Wait for rollout
         run: |
-          kubectl rollout status deployment/gateway -n hippius-s3-prod --timeout=10m
-          kubectl rollout status deployment/api -n hippius-s3-prod --timeout=10m
-          kubectl rollout status deployment/arion-downloader -n hippius-s3-prod --timeout=10m
-          kubectl rollout status deployment/arion-uploader -n hippius-s3-prod --timeout=10m
+          ns=hippius-s3-prod
+          # Wait on a Deployment only if it exists — the overlay changes shape across the cutover
+          # (monolith `api` only → hybrid `api`+`api-local` → drain-direct `api-local`+drain stack),
+          # so a hard wait on a not-yet-present Deployment would fail an otherwise-good deploy.
+          wait_deploy() {
+            if kubectl get deployment/"$1" -n "$ns" >/dev/null 2>&1; then
+              kubectl rollout status deployment/"$1" -n "$ns" --timeout="${2:-10m}"
+            else
+              echo "deployment/$1 absent — skipping"
+            fi
+          }
+          kubectl rollout status deployment/gateway -n "$ns" --timeout=10m
+          # api (monolith / hybrid base) and api-local (drain-direct) — whichever exist.
+          wait_deploy api 10m
+          wait_deploy api-local 10m
+          kubectl rollout status deployment/arion-downloader -n "$ns" --timeout=10m
+          kubectl rollout status deployment/arion-uploader -n "$ns" --timeout=10m
+          # Drain stack (allocator-first: it applies the cephor_* migrations on startup). Present
+          # only once the drain block is uncommented in kustomization.yaml (at cutover).
+          wait_deploy drain-allocator 5m
+          wait_deploy mpu-reaper 5m
+          # drain-agent is a DaemonSet: a labeled node at pod capacity legitimately can't host its
+          # pod, which must not fail the deploy. Require >= 1 Ready; warn on a partial roll, fail on
+          # zero. Skip entirely if the DaemonSet isn't deployed yet.
+          if kubectl get ds/drain-agent -n "$ns" >/dev/null 2>&1; then
+            if ! kubectl rollout status daemonset/drain-agent -n "$ns" --timeout=5m; then
+              ready=$(kubectl get ds drain-agent -n "$ns" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+              desired=$(kubectl get ds drain-agent -n "$ns" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
+              if [ "${ready:-0}" -ge 1 ]; then
+                echo "::warning::drain-agent rolled ${ready}/${desired} (a labeled node likely at pod capacity); proceeding"
+              else
+                echo "::error::drain-agent has 0 Ready pods after 5m — rollout genuinely failed"
+                kubectl get pods -l app=drain-agent -n "$ns" -o wide || true
+                exit 1
+              fi
+            fi
+          else
+            echo "daemonset/drain-agent absent — drain block not yet enabled; skipping"
+          fi
 
       - name: Restart external deployments
         run: |

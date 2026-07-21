@@ -2,6 +2,8 @@ import asyncio
 import uuid
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
+from unittest.mock import MagicMock
 
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -22,7 +24,11 @@ def _fake_request(headers: dict[str, str] | None = None) -> Any:
         headers=Headers(headers or {}),
         # ObjectWriter is constructed with request.app.state.fs_store; put_simple_stream_full is
         # patched in these tests so the store is never exercised — a sentinel avoids create_fs_store.
-        app=SimpleNamespace(state=SimpleNamespace(fs_store=SimpleNamespace())),
+        # postgres_pool backs set_object_version_address (drain-direct address write); its execute is
+        # a no-op AsyncMock so the address persist neither hits a real DB nor perturbs `pool` acquires.
+        app=SimpleNamespace(
+            state=SimpleNamespace(fs_store=SimpleNamespace(), postgres_pool=MagicMock(execute=AsyncMock()))
+        ),
     )
 
 
@@ -69,11 +75,11 @@ def _patch_writer(monkeypatch: Any, captured: dict[str, Any]) -> None:
             object_version=1,
         )
 
-    async def fake_enqueue(**_kw: Any) -> None:
+    async def fake_persist_address(*_a: Any, **_kw: Any) -> None:
         return None
 
     monkeypatch.setattr(put_object_endpoint.ObjectWriter, "put_simple_stream_full", fake_put)
-    monkeypatch.setattr(put_object_endpoint, "writer_enqueue_upload", fake_enqueue)
+    monkeypatch.setattr(put_object_endpoint, "set_object_version_address", fake_persist_address)
 
 
 @pytest.mark.asyncio
@@ -96,8 +102,8 @@ async def test_missing_bucket_404_inside_scope() -> None:
 
 @pytest.mark.asyncio
 async def test_head_lookups_single_acquire(monkeypatch: Any) -> None:
-    """user + bucket reads share ONE acquired connection; the existing-object check uses a
-    second acquire. Total endpoint acquires for the head = 2 (was 3)."""
+    """user + bucket reads share ONE acquired connection. With the existing-object pre-check
+    removed (WU-3), total endpoint acquires = 2 (user+bucket, then is_completed-after-enqueue)."""
     pool = make_fake_pool(_bucket_present_router)
 
     async def fake_put(self: Any, **kw: Any) -> PutResult:
@@ -109,11 +115,11 @@ async def test_head_lookups_single_acquire(monkeypatch: Any) -> None:
             object_version=1,
         )
 
-    async def fake_enqueue(**_kw: Any) -> None:
+    async def fake_persist_address(*_a: Any, **_kw: Any) -> None:
         return None
 
     monkeypatch.setattr(put_object_endpoint.ObjectWriter, "put_simple_stream_full", fake_put)
-    monkeypatch.setattr(put_object_endpoint, "writer_enqueue_upload", fake_enqueue)
+    monkeypatch.setattr(put_object_endpoint, "set_object_version_address", fake_persist_address)
 
     resp = await handle_put_object(
         bucket_name="bkt",
@@ -132,9 +138,27 @@ async def test_head_lookups_single_acquire(monkeypatch: Any) -> None:
     bucket_evt = next(e for e in fetchrows if "Get bucket by name" in (e["query"] or ""))
     assert user_evt["conn"] == bucket_evt["conn"], "user + bucket did not share one connection"
 
-    # Endpoint acquires (writer is patched out here): user+bucket (1) + existing-object (1)
-    # + is_completed-after-enqueue (1) = 3.
-    assert pool.acquire_count == 3
+    # Endpoint acquires (writer is patched out here): user+bucket (1) + is_completed-after-enqueue (1) = 2.
+    assert pool.acquire_count == 2
+
+
+@pytest.mark.asyncio
+async def test_no_existing_object_precheck_query(monkeypatch: Any) -> None:
+    """WU-3: PUT no longer issues the get_object_by_path existing-object pre-check. It always passes
+    a fresh candidate UUID and trusts upsert_object_basic's `ON CONFLICT ... RETURNING object_id`."""
+    pool = make_fake_pool(_bucket_present_router)
+    captured: dict[str, Any] = {}
+    _patch_writer(monkeypatch, captured)
+
+    resp = await handle_put_object(
+        bucket_name="bkt",
+        object_key="k/o.json",
+        request=_fake_request({"Content-Type": "application/json"}),
+        pool=pool,
+        redis_client=_FakeRedis(nx_result=True),
+    )
+    assert resp.status_code == 200
+    assert not _has_query(pool, "Get object by bucket and key path"), "existing-object pre-check must be gone"
 
 
 @pytest.mark.asyncio
@@ -246,7 +270,7 @@ async def test_user_upsert_runs_when_redis_errors(monkeypatch: Any) -> None:
 @pytest.mark.asyncio
 async def test_no_head_acquire_when_user_cached_and_bucket_forwarded(monkeypatch: Any) -> None:
     """Fix 2 + Fix 5 compose: a known account on a forwarded-bucket PUT does zero head-scope DB
-    work. Only the existing-object check and the post-enqueue is_completed update acquire."""
+    work. With the existing-object pre-check gone (WU-3), only the post-enqueue is_completed update acquires."""
     pool = make_fake_pool(_bucket_present_router)
     captured: dict[str, Any] = {}
     _patch_writer(monkeypatch, captured)
@@ -264,5 +288,6 @@ async def test_no_head_acquire_when_user_cached_and_bucket_forwarded(monkeypatch
     assert resp.status_code == 200
     assert not _has_query(pool, "Get or create")
     assert not _has_query(pool, "Get bucket by name")
-    # existing-object check (1) + is_completed-after-enqueue (1); the head user+bucket acquire is gone.
-    assert pool.acquire_count == 2
+    # Only is_completed-after-enqueue (1); the head user+bucket acquire and the existing-object
+    # pre-check acquire are both gone.
+    assert pool.acquire_count == 1

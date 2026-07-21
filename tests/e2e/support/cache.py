@@ -7,10 +7,10 @@ from typing import Optional
 import psycopg  # type: ignore[import-untyped]
 import redis  # type: ignore[import-untyped]
 
+from .dsn import DEFAULT_DSN
 
-def get_object_id_and_version(
-    bucket_name: str, object_key: str, *, dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius"
-) -> tuple[str, int]:
+
+def get_object_id_and_version(bucket_name: str, object_key: str, *, dsn: str = DEFAULT_DSN) -> tuple[str, int]:
     """Fetch (object_id, current_object_version) for a (bucket_name, object_key)."""
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
         cur.execute(
@@ -30,9 +30,7 @@ def get_object_id_and_version(
         return str(row[0]), int(row[1] or 1)
 
 
-def get_object_id(
-    bucket_name: str, object_key: str, *, dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius"
-) -> str:
+def get_object_id(bucket_name: str, object_key: str, *, dsn: str = DEFAULT_DSN) -> str:
     """Back-compat helper: return only object_id."""
     oid, _ver = get_object_id_and_version(bucket_name, object_key, dsn=dsn)
     return oid
@@ -42,7 +40,7 @@ def get_object_cids(
     bucket_name: str,
     object_key: str,
     *,
-    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+    dsn: str = DEFAULT_DSN,
 ) -> tuple[str, int, str, list[str], Optional[str]]:
     """Get all CIDs for an object including parts, chunks, and object-level CID.
 
@@ -116,7 +114,7 @@ def clear_object_cache(
     parts: Iterable[int] | None = None,
     *,
     redis_url: str = "redis://localhost:6379/0",
-    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+    dsn: str = DEFAULT_DSN,
 ) -> None:
     """Clear FS cache entries for `object_id` so the next GET is a cache miss.
 
@@ -208,7 +206,7 @@ def read_part_from_cache(
     object_id: str,
     part_number: int,
     *,
-    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+    dsn: str = DEFAULT_DSN,
 ) -> Optional[bytes]:
     """Assemble part bytes from the FS cache if fully present; otherwise None.
 
@@ -265,7 +263,7 @@ def wait_for_parts_cids(
     backend: str = "arion",
     timeout_seconds: float = 20.0,
     deadline: float | None = None,
-    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+    dsn: str = DEFAULT_DSN,
 ) -> bool:
     """Wait until at least min_count parts for the object have backend identifiers in chunk_backend.
 
@@ -340,7 +338,7 @@ def wait_for_all_backends_ready(
     min_count: int,
     backends: list[str] | None = None,
     timeout_seconds: float = 30.0,
-    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+    dsn: str = DEFAULT_DSN,
 ) -> bool:
     """Wait until min_count parts are fully backed on ALL specified backends.
 
@@ -366,7 +364,7 @@ def make_all_object_parts_pending(
     bucket_name: str,
     object_key: str,
     *,
-    dsn: str = "postgresql://postgres:postgres@localhost:5432/hippius",
+    dsn: str = DEFAULT_DSN,
 ) -> str:
     """Simulate "not yet processed by workers" by clearing backend registrations.
 

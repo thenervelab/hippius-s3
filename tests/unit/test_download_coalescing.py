@@ -41,6 +41,32 @@ class _RedisStub:
         self.deleted.append(key)
         return 1
 
+    def pipeline(self, transaction: bool = False) -> "_RedisPipelineStub":
+        # RD-6: the coalesce lock is now acquired via a pipeline. The stub records each queued set
+        # into set_calls (so existing assertions hold) and applies NX on execute().
+        return _RedisPipelineStub(self)
+
+
+class _RedisPipelineStub:
+    def __init__(self, parent: "_RedisStub") -> None:
+        self._parent = parent
+        self._ops: list[tuple[str, Any, bool, int | None]] = []
+
+    def set(self, key: str, value: Any, *, nx: bool = False, ex: int | None = None) -> "_RedisPipelineStub":
+        self._ops.append((key, value, nx, ex))
+        return self
+
+    async def execute(self) -> list[Any]:
+        results: list[Any] = []
+        for key, value, nx, ex in self._ops:
+            self._parent.set_calls.append((key, value, nx, ex))
+            if nx and key in self._parent._held:
+                results.append(None)
+            else:
+                self._parent._held.add(key)
+                results.append(True)
+        return results
+
 
 def _stub_config():
     cfg = MagicMock()
@@ -208,3 +234,49 @@ async def test_cache_hit_skips_lock_entirely(
     assert ctx.source == "cache"
     assert redis.set_calls == []
     mock_enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@patch("hippius_s3.services.object_reader.get_bucket_kek_bytes", new=AsyncMock(return_value=b"k" * 32))
+@patch("hippius_s3.services.object_reader.unwrap_dek", new=MagicMock(return_value=b"d" * 32))
+@patch("hippius_s3.services.object_reader.CryptoService.is_supported_suite_id", new=MagicMock(return_value=True))
+@patch("hippius_s3.services.object_reader.resolve_object_backends", new=AsyncMock(return_value=["arion"]))
+@patch("hippius_s3.services.object_reader.enqueue_download_request", new_callable=AsyncMock)
+@patch("hippius_s3.services.object_reader.build_chunk_plan", new_callable=AsyncMock)
+@patch("hippius_s3.services.object_reader.read_parts_list", new_callable=AsyncMock)
+@patch("hippius_s3.services.object_reader.get_config")
+async def test_arion_object_skips_per_part_cid_query(
+    mock_cfg,
+    mock_parts,
+    mock_plan,
+    mock_enqueue,
+):
+    """RQ-3: for a deterministically-addressed (Arion) object the downloader never reads spec.cid, so
+    the per-part get_part_chunks_by_object_and_number query is skipped and specs are indices-only."""
+    from hippius_s3.services.object_reader import build_stream_context
+
+    mock_cfg.return_value = _stub_config()
+    mock_parts.return_value = [{"part_number": 1, "plain_size": 4096, "cid": None}]
+    mock_plan.return_value = _mock_plan(2)
+
+    redis = _RedisStub()
+    obj_cache = _mock_obj_cache([False, False])
+    db = _mock_db_pool()  # db.fetch would serve the CID query; assert it is never awaited.
+
+    ctx = await build_stream_context(
+        db=db,
+        redis=redis,
+        obj_cache=obj_cache,
+        info=_info(),
+        rng=None,
+        address="addr",
+    )
+
+    assert ctx.source == "pipeline"
+    mock_enqueue.assert_awaited_once()
+    db.fetch.assert_not_awaited()
+
+    dcr = mock_enqueue.call_args.args[0]
+    all_specs = [spec for part in dcr.chunks for spec in part.chunks]
+    assert all_specs, "expected chunk specs on the enqueued request"
+    assert all(spec.cid is None for spec in all_specs), "Arion specs must be indices-only (cid=None)"

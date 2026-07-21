@@ -93,11 +93,11 @@ A **subsystem index** with links to per-directory `CLAUDE.md` files is in sectio
    - **Batch-check** every needed chunk on FS in one pass ([object_reader.py:67](hippius_s3/services/object_reader.py) via `chunks_exist_batch`).
    - If all present → `source="cache"`; stream directly.
    - If any missing → `source="pipeline"`:
-     - **Coalesce**: per (object, version, part), try `SET NX EX 120` on `download_in_progress:{object_id}:v:{ov}:part:{pn}` ([object_reader.py:87-104](hippius_s3/services/object_reader.py)). If you lose the race, skip the enqueue; another streamer is already fetching and you'll wait on pub/sub.
+     - **Coalesce**: per (object, version, part), try `SET NX EX <DOWNLOAD_COALESCE_LOCK_TTL>` (default 600) on `download_in_progress:{object_id}:v:{ov}:part:{pn}` ([object_reader.py:87-104](hippius_s3/services/object_reader.py)). If you lose the race, skip the enqueue; another streamer is already fetching and you'll wait on pub/sub.
      - If you won, build a `DownloadChainRequest` with optional per-chunk CIDs and enqueue to `arion_download_requests` ([object_reader.py:146-165](hippius_s3/services/object_reader.py)).
    - **Unwrap DEK** from DB (`kek_id`, `wrapped_dek`) via [hippius_s3/services/envelope_service.py](hippius_s3/services/envelope_service.py). If the current version is mid-write (envelope missing), fall back to version-1 ([object_reader.py:177-220](hippius_s3/services/object_reader.py)).
 3. **Stream plan** ([hippius_s3/reader/streamer.py:18](hippius_s3/reader/streamer.py)):
-   - Configurable prefetch depth (default 0 for correctness) overlaps FS fetch with decrypt+IO.
+   - Configurable prefetch depth (runtime default **16** via `HTTP_STREAM_PREFETCH_CHUNKS`; the streamer function-param fallback is 0) overlaps FS/Arion fetch with IO. Note: it does not yet overlap the on-loop decrypt (RD-2).
    - For each chunk: `obj_cache.wait_for_chunk` → fast path reads from FS; slow path subscribes to `notify:{chunk_key}` pub/sub and re-reads on notification ([hippius_s3/cache/notifier.py:61](hippius_s3/cache/notifier.py)).
    - Decrypt ([reader/decrypter.py](hippius_s3/reader/decrypter.py)), optionally slice for Range, yield.
 4. **Downloader worker** ([hippius_s3/workers/downloader.py:94](hippius_s3/workers/downloader.py)) handles `DownloadChainRequest`:
@@ -179,7 +179,7 @@ Five separate services for blast-radius isolation:
 |---|---|---|---|
 | `redis` | 6379 | General cache / short-lived state | Ephemeral |
 | `redis-accounts` | 6380 | Account credit cache | Persistent (AOF) |
-| `redis-queues` | 6382 | Work queues + chunk pub/sub notifications + drain coordination (`cephor:*`) | Persistent, 4GB, **noeviction** (holds queue + coordination data — must not evict; a full instance fails writes loudly. Pod mem limit 6Gi > maxmemory so Redis rejects writes before k8s OOM-kills) |
+| `redis-queues` | 6382 | Work queues + chunk pub/sub notifications | Persistent, 2GB, LRU |
 | `redis-rate-limiting` | 6383 | Rate limit counters | Ephemeral, 1GB |
 | `redis-acl` | 6384 | ACL cache | Ephemeral, 2GB, LRU |
 
@@ -296,7 +296,7 @@ Config is a typed dataclass: [hippius_s3/config.py](hippius_s3/config.py). Value
 | `HIPPIUS_CHUNK_SIZE_BYTES` | `4194304` (4 MiB) | Must be consistent across upload/download code paths. |
 | `HIPPIUS_CACHE_TTL` | `3600` | Pub/sub wait timeout. |
 | `HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS` | `10800` (3h) | Janitor keeps recently-read parts. |
-| `DOWNLOAD_COALESCE_LOCK_TTL` | `120` | Lock expiry guards downloader crashes. |
+| `DOWNLOAD_COALESCE_LOCK_TTL` | `600` | Lock expiry guards downloader crashes. |
 | `DOWNLOADER_SEMAPHORE` | `20` | Concurrent chunk fetches per DCR. |
 | `DOWNLOADER_MAX_INFLIGHT` | `10` | Concurrent `DownloadChainRequest`s per pod. |
 | `DOWNLOADER_CHUNK_RETRIES` | `3` | Per-chunk retry attempts. |

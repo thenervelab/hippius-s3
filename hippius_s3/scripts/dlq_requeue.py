@@ -111,7 +111,13 @@ class DLQManager:
         return target_entry
 
     async def requeue(self, object_id: str, force: bool = False) -> bool:
-        """Requeue a specific entry by object_id with DLQ hydration."""
+        """Requeue ALL DLQ entries for an object_id.
+
+        The drain enqueues one UploadChainRequest per part, so a multi-part object has
+        one DLQ entry per failed part. Requeue every matching entry, not just the first,
+        or some parts would never be reprocessed. Returns True if at least one entry was
+        requeued.
+        """
         # Acquire per-object lock to serialize requeues
         token = await self._acquire_lock(object_id)
         if not token:
@@ -119,40 +125,41 @@ class DLQManager:
             return False
 
         try:
-            entry = await self._find_and_remove_entry(object_id)
-            if not entry:
+            requeued = 0
+            while True:
+                entry = await self._find_and_remove_entry(object_id)
+                if not entry:
+                    break
+
+                # Check if it's a permanent error and force is not set
+                if entry.get("error_type") == "permanent" and not force:
+                    logger.error(
+                        f"Refusing to requeue permanent error for object_id: {object_id}. Use --force to override."
+                    )
+                    # Put it back and stop — the operator must opt in with --force.
+                    await self.redis_client.lpush(self.dlq_key, json.dumps(entry))
+                    break
+
+                try:
+                    payload = UploadChainRequest.model_validate(entry["payload"])
+                    # Reset attempts if not forcing
+                    if not force:
+                        payload.attempts = 0
+                    # Directly requeue the payload (no DLQ filesystem hydration)
+                    await enqueue_upload_request(payload)
+                    requeued += 1
+                except Exception as e:
+                    logger.error(f"Failed to requeue one entry for object_id: {object_id}, error: {e}")
+                    # Put the failed entry back (best-effort); keep going for the rest.
+                    with contextlib.suppress(Exception):
+                        await self.redis_client.lpush(self.dlq_key, json.dumps(entry))
+
+            if requeued == 0:
                 logger.error(f"No DLQ entry found for object_id: {object_id}")
                 return False
-
-            # Check if it's a permanent error and force is not set
-            if entry.get("error_type") == "permanent" and not force:
-                logger.error(
-                    f"Refusing to requeue permanent error for object_id: {object_id}. Use --force to override."
-                )
-                # Put it back
-                await self.redis_client.lpush(self.dlq_key, json.dumps(entry))
-                return False
-
-            # Reconstruct the payload
-            payload_data = entry["payload"]
-            payload = UploadChainRequest.model_validate(payload_data)
-
-            # Reset attempts if not forcing
-            if not force:
-                payload.attempts = 0
-
-            # Directly requeue the payload (no DLQ filesystem hydration)
-            await enqueue_upload_request(payload)
-            logger.info(f"Successfully requeued object_id: {object_id}")
+            logger.info(f"Successfully requeued object_id: {object_id} ({requeued} part(s))")
             return True
 
-        except Exception as e:
-            logger.error(f"Failed to requeue object_id: {object_id}, error: {e}")
-            # Put it back on failure (best-effort)
-            with contextlib.suppress(Exception):
-                if "entry" in locals() and entry:
-                    await self.redis_client.lpush(self.dlq_key, json.dumps(entry))
-            return False
         finally:
             # Always release the lock
             with contextlib.suppress(Exception):
