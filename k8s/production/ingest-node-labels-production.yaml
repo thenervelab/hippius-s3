@@ -6,17 +6,17 @@
 # carry a required nodeAffinity hostname allow-list — keep it in sync with the stanzas
 # below (edit the Node names here AND both allow-lists together).
 #
-# SHARED CLUSTER: staging and prod run on the same physical nodes, so their ingest sets
-# MUST be DISJOINT. Staging uses `s3-staging-local-ingest` on node2/node3 writing to
-# /var/lib/hippius/local_ingest_staging; prod uses THIS label on DIFFERENT nodes writing
-# to /var/lib/hippius/local_ingest_prod. Never put a prod ingest label on a staging
-# ingest node (or vice-versa).
+# THE NODES: k8s-v3-node1..node5, each with a dedicated 3.84 TB enterprise NVMe (Gen4
+# datacenter U.2/U.3: WD Ultrastar DC / Micron 7450 PRO / Intel-Solidigm D7-P5520)
+# mounted at /var/lib/hippius/... via the host path /s3-data (ext4). The api-local +
+# drain-agent hostPath points at /s3-data.
 #
-# ⚠️ PLACEHOLDERS. The names below are placeholders — replace them with the actual prod
-# ingest nodes you prepared. Preparing a node = repurpose one Ceph OSD's NVMe into a local
-# ingest disk (the cluster's OSD disks are 3.84 TB enterprise NVMe; Ceph is only ~29% full
-# so it can spare a few). Full runbook: s3-2.1-todo.md → "Prod logistics". The capacity
-# plan (s3-prod-drain-capacity-plan.md) recommends 3–4 such nodes.
+# SHARED CLUSTER — no collision by design: staging's ingest also runs on node2/node3, but
+# on a DIFFERENT disk/path (`s3-staging-local-ingest` → /var/lib/hippius/local_ingest_staging
+# on the node root disk), while prod uses THIS label → the dedicated /s3-data NVMe. So a
+# staging and a prod ingest pod can co-reside on node2/node3 without sharing a disk. (If you
+# want the nodes prod-exclusive — nothing else scheduled — that needs a TAINT + tolerations,
+# which would evict the general worker pool currently on node1-5; decide separately.)
 #
 # CAVEAT: `apply` adds labels but does not PRUNE them. To retire an ingest node, delete its
 # stanza here AND run: kubectl label node <name> s3-prod-local-ingest-
@@ -26,27 +26,34 @@
 apiVersion: v1
 kind: Node
 metadata:
-  name: REPLACE-prod-ingest-node-a
+  name: k8s-v3-node1
   labels:
     s3-prod-local-ingest: "true"
 ---
 apiVersion: v1
 kind: Node
 metadata:
-  name: REPLACE-prod-ingest-node-b
+  name: k8s-v3-node2
   labels:
     s3-prod-local-ingest: "true"
 ---
 apiVersion: v1
 kind: Node
 metadata:
-  name: REPLACE-prod-ingest-node-c
+  name: k8s-v3-node3
   labels:
     s3-prod-local-ingest: "true"
 ---
 apiVersion: v1
 kind: Node
 metadata:
-  name: REPLACE-prod-ingest-node-d
+  name: k8s-v3-node4
+  labels:
+    s3-prod-local-ingest: "true"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: k8s-v3-node5
   labels:
     s3-prod-local-ingest: "true"
