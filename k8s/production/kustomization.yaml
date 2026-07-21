@@ -30,10 +30,12 @@ patches:
   - path: ingress-patch.yaml
   - path: services-patch.yaml
   - path: postgres-nvme-initwait-patch.yaml
-  # Cutover full-swap routing: point the existing `api` Service (the gateway's
-  # GATEWAY_BACKEND_URL=http://api:8000 upstream) at the drain-direct api-local fleet.
-  # Base `api` is scaled to 0 in resource-limits.yaml. Mirrors k8s/staging/kustomization.yaml.
-  # (Gated/hybrid alternative: don't merge this overlay — drive the shift with rollout.sh.)
+  # Cutover routing: point the existing `api` Service (the gateway's GATEWAY_BACKEND_URL=
+  # http://api:8000 upstream) at the drain-direct api-local fleet. Base `api` is scaled to 0 in
+  # resource-limits.yaml. Mirrors k8s/staging/kustomization.yaml. This is a FULL SWAP — there is no
+  # safe incremental hybrid (peer review B2: a base-api pod on the new image writes to CephFS, which
+  # the drain never scans → dark uploads). The operator-driven `rollout.sh cutover` does the same
+  # full swap with gates + a dark-upload check; it is NOT an incremental base-api-serving alternative.
   - target:
       kind: Service
       name: api
