@@ -115,12 +115,14 @@ new-only exposure is acceptable; the hybrid above is strictly safer for a first 
       host `/s3-data` and are labeled `s3-prod-local-ingest=true` on the live cluster; the manifests point at
       `/s3-data`, replicas=5. (No Ceph-OSD repurpose was needed — the disks were already there.) staging's
       ingest on node2/node3 uses a different disk (node-root `local_ingest_staging`), so they don't collide.
-- [ ] **Grow the CephFS shared cache** — bump `object-cache-pvc` **9.5 TiB → 16 TiB** (in
+- [ ] **Grow the CephFS shared cache** — bump `object-cache-pvc` **9.5 TiB → 20 TiB** (in
       `resource-limits.yaml`). Retiring the node6 40 TB local cache (**9.1 TB hot working set**) makes this
       CephFS RWX pool the shared *read* cache; 9.5 TiB has no headroom for it. Online-expandable
-      (`ceph-filesystem allowVolumeExpansion=true`), pool has ~14 TiB MAX AVAIL, Ceph ~34% used — non-disruptive,
-      so do it **early** (safe on the current monolith too). Actual usage stays janitor-GC-bounded. Imperative
-      alternative: `kubectl patch pvc object-cache-pvc -n hippius-s3-prod -p '{"spec":{"resources":{"requests":{"storage":"16384Gi"}}}}'`.
+      (`ceph-filesystem allowVolumeExpansion=true`) — non-disruptive, so do it **early** (safe on the current
+      monolith too). Actual usage stays janitor-GC-bounded to ~9–10 TB. **Overcommit caveat:** the pool
+      backs ~16 TiB of *actual* data today (MAX AVAIL ~14 TiB); 20 TiB is a quota ceiling, not fully
+      backable until Ceph OSDs are added (e.g. fold in node6's freed disk). Imperative alternative:
+      `kubectl patch pvc object-cache-pvc -n hippius-s3-prod -p '{"spec":{"resources":{"requests":{"storage":"20480Gi"}}}}'`.
 - [ ] **App image ≥ #265** (metrics-collision + double-count fix, PR #284) — else OTel metrics are
       inflated ~100–650× and the drain dashboards/alerts lie.
 - [ ] **Run the Python migrations** (`db-migrations` Job): `object_versions.completed_part_numbers`
