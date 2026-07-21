@@ -1,0 +1,17 @@
+# Scheduling priority for the s3-2.1 ingest tier (api-local + drain-agent).
+#
+# Peer review B3: api-local + drain-agent are constrained to node1..node5, which are near the pod
+# cap. Without a priority they compete with general workloads for the last free slots — and if a
+# drain-agent can't schedule, its node runs api-local with NO drain (uploads stage locally and are
+# never replicated). This class lets the ingest pods PREEMPT lower-priority (general, priority 0)
+# pods for a slot. It is deliberately BELOW system-*-critical (~2e9), so it never preempts Ceph
+# OSDs / mons or any system-critical pod — it only outranks ordinary workloads. It does NOT taint
+# or reserve the nodes; anything else may still schedule there when there's room.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: s3-ingest-priority
+value: 1000000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "s3-2.1 ingest tier (api-local + drain-agent): outranks general workloads for node1-5 slots; below system-*-critical (never preempts Ceph/system)."

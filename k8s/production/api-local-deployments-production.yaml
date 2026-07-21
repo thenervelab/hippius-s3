@@ -44,6 +44,9 @@ spec:
       labels:
         app: api-local
     spec:
+      # Outrank general workloads for the node1-5 slots (below system-*-critical; never preempts
+      # Ceph/system). See s3-ingest-priorityclass.yaml + peer-review B3.
+      priorityClassName: s3-ingest-priority
       nodeSelector:
         s3-prod-local-ingest: "true"
       affinity:
