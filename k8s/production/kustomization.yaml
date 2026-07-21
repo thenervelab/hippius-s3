@@ -27,6 +27,18 @@ patches:
   - path: ingress-patch.yaml
   - path: services-patch.yaml
   - path: postgres-nvme-initwait-patch.yaml
+  # Cutover full-swap routing: point the existing `api` Service (the gateway's
+  # GATEWAY_BACKEND_URL=http://api:8000 upstream) at the drain-direct api-local fleet.
+  # Base `api` is scaled to 0 in resource-limits.yaml. Mirrors k8s/staging/kustomization.yaml.
+  # (Gated/hybrid alternative: don't merge this overlay — drive the shift with rollout.sh.)
+  - target:
+      kind: Service
+      name: api
+    patch: |-
+      - op: replace
+        path: /spec/selector
+        value:
+          app: api-local
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api
