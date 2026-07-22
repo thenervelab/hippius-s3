@@ -300,6 +300,25 @@ jobs:
               echo "deployment/$1 absent — skipping"
             fi
           }
+          # Absolute size of the ingest tier, from the Node stanzas in the label file — the
+          # declarative source of truth for `s3-prod-local-ingest=true`. Both api-local and
+          # drain-agent are DaemonSets over that label, so a Ready count below it means the tier
+          # is serving degraded. This is deliberately an ABSOLUTE check: the drain-agent-vs-api-local
+          # test below only catches ASYMMETRY, and on 2026-07-22 the label was pulled from two nodes,
+          # shrinking BOTH DaemonSets to 3 together — that test passed (3==3, 3>=3) while the tier
+          # ran at 60% capacity for two hours with nothing alerting.
+          ingest_expected=$(grep -c '^kind: Node' k8s/production/ingest-node-labels-production.yaml 2>/dev/null || true)
+          ingest_expected=${ingest_expected:-0}
+          assert_ingest_tier() {
+            ready=$(kubectl get ds "$1" -n "$ns" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+            echo "$1 Ready=${ready:-0}/${ingest_expected} labelled ingest nodes"
+            if [ "${ingest_expected:-0}" -gt 0 ] && [ "${ready:-0}" -lt "${ingest_expected}" ]; then
+              echo "::error::$1 Ready ${ready:-0}/${ingest_expected} — ingest tier degraded. Verify every node in ingest-node-labels-production.yaml still carries s3-prod-local-ingest=true."
+              kubectl get nodes -l s3-prod-local-ingest=true || true
+              kubectl get pods -l app="$1" -n "$ns" -o wide || true
+              exit 1
+            fi
+          }
           kubectl rollout status deployment/gateway -n "$ns" --timeout=10m
           # api (monolith / hybrid base) and api-local (drain-direct) — whichever exist.
           wait_deploy api 10m
@@ -311,6 +330,7 @@ jobs:
           if kubectl get daemonset/api-local -n "$ns" >/dev/null 2>&1; then
             kubectl rollout status daemonset/api-local -n "$ns" --timeout=10m
             kubectl delete deployment/api-local -n "$ns" --ignore-not-found=true
+            assert_ingest_tier api-local
           else
             wait_deploy api-local 10m
           fi
@@ -337,6 +357,7 @@ jobs:
               exit 1
             fi
             echo "drain-agent covers every api-local node ✅"
+            assert_ingest_tier drain-agent
           else
             echo "daemonset/drain-agent absent — drain block not yet enabled; skipping"
           fi
