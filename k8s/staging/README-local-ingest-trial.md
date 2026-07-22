@@ -10,7 +10,7 @@ and draining local→ceph** — uploads complete e2e (see the drain-gating cavea
 
 | File | What |
 |---|---|
-| `api-local-deployments-staging.yaml` | `api-local` Deployment (**2 replicas**, one per ingest node) writing local (`HIPPIUS_OBJECT_CACHE_DIR=local_object_cache`) with ceph read-fallback. **This is the whole api fleet.** |
+| `api-local-deployments-staging.yaml` | `api-local` **DaemonSet** (exactly one pod per ingest node) writing local (`HIPPIUS_OBJECT_CACHE_DIR=local_object_cache`) with ceph read-fallback. **This is the whole api fleet.** |
 | `resource-limits.yaml` (modified) | Base (ceph) `api` deployment scaled to **0** — no ceph api pods. |
 | `kustomization.yaml` (inline patch) | `api` Service selector switched `app: api` → `app: api-local`, so the gateway routes to the local pods. |
 | `ingest-node-labels-staging.yaml` | **The ONE list** of staging ingest nodes — applying it labels them `s3-staging-local-ingest=true`. |
@@ -40,14 +40,14 @@ deploys cleanly via CI.**
 
 Ingest nodes are declared **once** in `ingest-node-labels-staging.yaml` (partial `Node` objects that
 carry `s3-staging-local-ingest=true`). Deploying applies that label; **both** the `api-local`
-Deployment and the `drain-agent` DaemonSet select on it (`nodeSelector`), so they always target
+DaemonSet and the `drain-agent` DaemonSet select on it (`nodeSelector`), so they always target
 the identical node set — no duplicated hostname list to drift. The DaemonSet (one pod per labeled
 node) therefore covers every node an api pod can land on. Current staging set: **node2, node3** (node1 is
 excluded — it runs at its pod cap, so the agent can't schedule there and would block the DaemonSet roll)
-(node4/5 are near pod-cap and left for prod). `api-local` also uses preferred pod anti-affinity to
-spread its 2 replicas across the labeled nodes.
+(node4/5 are near pod-cap and left for prod). Being a DaemonSet, `api-local` gets exactly one pod
+per labeled node — no soft anti-affinity that lets replicas cluster onto a subset of nodes.
 
-**Belt-and-suspenders:** both the `api-local` Deployment and the `drain-agent` DaemonSet ALSO carry a
+**Belt-and-suspenders:** both the `api-local` DaemonSet and the `drain-agent` DaemonSet ALSO carry a
 **required `nodeAffinity` hostname allow-list** (`kubernetes.io/hostname In [node2, node3]`) on top of
 the label. So a node that gets the ingest label by mistake still won't host ingest unless its hostname
 is on the allow-list — a single misconfiguration can't leak ingest onto a psql/cache node. The label
@@ -87,14 +87,14 @@ throughput (measured ~2.5 min for a 1GB / 128-part object on staging, fsync-boun
 ```bash
 kubectl kustomize k8s/staging | less          # review first
 kubectl apply -k k8s/staging                  # or via the staging-deploy pipeline
-kubectl -n hippius-s3-staging rollout status deploy/api-local --timeout=5m   # 2/2 Ready
+kubectl -n hippius-s3-staging rollout status ds/api-local --timeout=5m      # 2/2 Ready
 kubectl -n hippius-s3-staging get pods -l app=api-local -o wide              # 2 pods, one per ingest node
 kubectl -n hippius-s3-staging get deploy api                                 # base api 0/0
 kubectl -n hippius-s3-staging get endpoints api                              # 2 endpoint IPs (local pods)
 kubectl -n hippius-s3-staging get ds drain-agent                            # 2/2 ready (node2, node3)
 
 # watch a local pod's ingest dir fill on PUT; the object appears on ceph once the drain-agent copies it
-kubectl -n hippius-s3-staging exec deploy/api-local -c api -- sh -c 'ls -R /var/lib/hippius/local_object_cache | head'
+kubectl -n hippius-s3-staging exec ds/api-local -c api -- sh -c 'ls -R /var/lib/hippius/local_object_cache | head'
 # watch replication progress (pending→replicated) in the cephor table:
 kubectl -n hippius-s3-staging exec postgres-1 -c postgres -- psql -U postgres -d hippius -tAc \
   "SELECT status, node_id, count(*) FROM cephor_replication_status GROUP BY 1,2 ORDER BY 1;"

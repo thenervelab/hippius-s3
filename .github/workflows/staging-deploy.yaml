@@ -320,6 +320,15 @@ jobs:
         run: |
           kubectl rollout status deployment/gateway -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/api -n hippius-s3-staging --timeout=10m
+          # api-local is a DaemonSet (one pod per ingest node). Wait on it, then prune the
+          # pre-DaemonSet Deployment of the same name: kustomize can't change a resource's kind
+          # in place, so the old Deployment/api-local lingers after the first DaemonSet apply and
+          # both would serve behind app=api-local. Delete AFTER the DaemonSet is Ready (no capacity
+          # dip); idempotent — a no-op on every deploy after the conversion lands.
+          if kubectl get daemonset/api-local -n hippius-s3-staging >/dev/null 2>&1; then
+            kubectl rollout status daemonset/api-local -n hippius-s3-staging --timeout=10m
+            kubectl delete deployment/api-local -n hippius-s3-staging --ignore-not-found=true
+          fi
           kubectl rollout status deployment/arion-downloader -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/arion-uploader -n hippius-s3-staging --timeout=10m
           # Drain stack, allocator-first: the allocator applies the cephor_* migrations
