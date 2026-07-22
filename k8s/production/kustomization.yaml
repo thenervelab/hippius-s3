@@ -12,18 +12,15 @@ resources:
   # Scheduling priority for the ingest tier (used by api-local + drain-agent; harmless before they
   # deploy). Created here so it exists ahead of the ingest pods that reference it. See peer-review B3.
   - s3-ingest-priorityclass.yaml
-  # --- hippius-drain (s3-2.1) SSD-ingest tier — DELIBERATELY COMMENTED OUT. ---
-  # Ingest nodes node1..node5 are prepared: each has a dedicated 3.84 TB NVMe mounted at
-  # /s3-data, and ingest-node-labels-production.yaml labels them s3-prod-local-ingest=true
-  # (both nodeAffinity allow-lists list node1..node5). Runbook: path-to-prod.md; sizing:
-  # s3-prod-drain-capacity-plan.md. Before uncommenting: confirm the label is applied on all
-  # five nodes, then also uncomment the `drain` image below, and (cutover) scale base `api`
-  # to 0 + point the `api` Service selector at app: api-local, as k8s/staging/kustomization.yaml does.
-  # - ingest-node-labels-production.yaml
-  # - api-local-deployments-production.yaml
-  # - drain-allocator-deployment.yaml   # singleton; owns the cephor_* schema (deploy first)
-  # - drain-agent-daemonset.yaml        # one per labelled ingest node
-  # - mpu-reaper-deployment.yaml
+  # --- hippius-drain (s3-2.1) SSD-ingest tier — ENABLED (overlay 2/3). ---
+  # Ingest nodes node1..node5 are prepared (dedicated 3.84 TB /s3-data NVMe, labeled
+  # s3-prod-local-ingest=true). allocator-first ordering is handled by the agent/reaper
+  # initContainers. Routing is NOT flipped here — that's the full-swap overlay (3/3).
+  - ingest-node-labels-production.yaml
+  - api-local-deployments-production.yaml
+  - drain-allocator-deployment.yaml   # singleton; owns the cephor_* schema (deploy first)
+  - drain-agent-daemonset.yaml        # one per labelled ingest node
+  - mpu-reaper-deployment.yaml
 
 patches:
   - path: namespace-patch.yaml
@@ -33,6 +30,20 @@ patches:
   - path: ingress-patch.yaml
   - path: services-patch.yaml
   - path: postgres-nvme-initwait-patch.yaml
+  # Cutover routing: point the existing `api` Service (the gateway's GATEWAY_BACKEND_URL=
+  # http://api:8000 upstream) at the drain-direct api-local fleet. Base `api` is scaled to 0 in
+  # resource-limits.yaml. Mirrors k8s/staging/kustomization.yaml. This is a FULL SWAP — there is no
+  # safe incremental hybrid (peer review B2: a base-api pod on the new image writes to CephFS, which
+  # the drain never scans → dark uploads). The operator-driven `rollout.sh cutover` does the same
+  # full swap with gates + a dark-upload check; it is NOT an incremental base-api-serving alternative.
+  - target:
+      kind: Service
+      name: api
+    patch: |-
+      - op: replace
+        path: /spec/selector
+        value:
+          app: api-local
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api
@@ -41,6 +52,5 @@ images:
     newTag: latest
   - name: ghcr.io/thenervelab/hippius-s3/workers
     newTag: latest
-  # Uncomment with the drain resources above (the allocator + agent use the `drain` image):
-  # - name: ghcr.io/thenervelab/hippius-s3/drain
-  #   newTag: latest
+  - name: ghcr.io/thenervelab/hippius-s3/drain
+    newTag: latest
