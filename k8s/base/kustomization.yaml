@@ -17,3 +17,18 @@ resources:
   - networkpolicy.yaml
   - otel-collector.yaml
   - servicemonitor.yaml
+
+# Generated, not a plain resource, so the name carries a content hash. The collector reads
+# its config once at startup: under a fixed name, `kubectl apply -k` updates the ConfigMap
+# and the running pod keeps the old copy indefinitely. Prod ran 37 days that way (pod
+# started 2026-06-15, ConfigMap last applied 2026-07-22) still applying `action: upsert` to
+# service.name, which stamped service.name=hippius-s3 over drain-agent, drain-allocator and
+# every worker — making them indistinguishable in Prometheus. The hash renames the ConfigMap
+# on any content change, which changes the Deployment's volume reference, which rolls the pod.
+#
+# The key MUST stay otel-config.yaml: the container runs
+# --config=/etc/otelcol-contrib/otel-config.yaml against this volume.
+configMapGenerator:
+  - name: otel-collector-config
+    files:
+      - otel-config.yaml
