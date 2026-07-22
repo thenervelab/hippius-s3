@@ -54,6 +54,8 @@ spec:
       labels:
         app: api-local
     spec:
+      # 10s preStop + up to 25s uvicorn drain, with headroom before the kubelet SIGKILLs.
+      terminationGracePeriodSeconds: 45
       nodeSelector:
         s3-staging-local-ingest: "true"
       affinity:
@@ -143,6 +145,12 @@ spec:
             periodSeconds: 60
             timeoutSeconds: 10
             failureThreshold: 5
+          # See the note in k8s/base/api-deployment.yaml: keeps this pod serving while
+          # endpoint removal propagates, so SIGTERM lands only after traffic has moved off.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "10"]
           readinessProbe:
             httpGet:
               path: /health
