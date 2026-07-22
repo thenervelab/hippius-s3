@@ -1,0 +1,142 @@
+{
+  "target": "https://s3-staging.hippius.com",
+  "go": false,
+  "summary": "13 pass, 1 fail, 0 skip",
+  "results": [
+    {
+      "name": "func-range-get",
+      "invariant": "T1 range",
+      "passed": true,
+      "detail": "got 1048576 B, match=True",
+      "criteria": "Range bytes=0-1048575 returns exactly the first 1 MiB",
+      "skipped": false,
+      "metrics": {}
+    },
+    {
+      "name": "func-overwrite-latest",
+      "invariant": "T1 overwrite",
+      "passed": true,
+      "detail": "GET-after-overwrite md5=e4ea09b5 want=e4ea09b5",
+      "criteria": "GET after overwrite returns the latest bytes",
+      "skipped": false,
+      "metrics": {}
+    },
+    {
+      "name": "func-mpu-wrong-etag",
+      "invariant": "T1 MPU integrity",
+      "passed": true,
+      "detail": "wrong-ETag complete was rejected",
+      "criteria": "CompleteMultipartUpload with a mismatched part ETag is rejected",
+      "skipped": false,
+      "metrics": {}
+    },
+    {
+      "name": "func-mpu-abort",
+      "invariant": "T1 MPU abort",
+      "passed": true,
+      "detail": "aborted MPU object is absent",
+      "criteria": "An aborted MPU leaves no readable object",
+      "skipped": false,
+      "metrics": {}
+    },
+    {
+      "name": "func-acl-anon",
+      "invariant": "T1 ACL",
+      "passed": true,
+      "detail": "anon public=200 (want 200), private=403 (want 403)",
+      "criteria": "Anon GET: public-read \u2192 200, private \u2192 403",
+      "skipped": false,
+      "metrics": {}
+    },
+    {
+      "name": "func-listv2-delimiter",
+      "invariant": "T1 ListObjectsV2",
+      "passed": true,
+      "detail": "CommonPrefixes=['a/', 'c/']",
+      "criteria": "delimiter '/' groups a/ and c/",
+      "skipped": false,
+      "metrics": {}
+    },
+    {
+      "name": "func-zero-byte",
+      "invariant": "T1 zero-byte",
+      "passed": true,
+      "detail": "zero-byte GET len=0",
+      "criteria": "A zero-byte object round-trips as empty",
+      "skipped": false,
+      "metrics": {}
+    },
+    {
+      "name": "durability-corpus-upload",
+      "invariant": "S8/G3 setup",
+      "passed": true,
+      "detail": "uploaded 15 objects (2 multipart) in 31.5s to prodgate-durab-1783024415",
+      "criteria": "corpus PUTs succeed (verified for real in durability-reverify)",
+      "skipped": false,
+      "metrics": {}
+    },
+    {
+      "name": "concurrency-ramp",
+      "invariant": "S5/S6 (backpressure) + throughput",
+      "passed": true,
+      "detail": "90 ok, 0 503-backpressure(retried), 0 non-503-5xx; worst non-503 5xx rate=0.0%; 94 MB",
+      "criteria": "non-503 5xx rate < 1% and no hangs; 503 SlowDown is correct backpressure (informational)",
+      "skipped": false,
+      "metrics": {
+        "ok": 90,
+        "slowdown": 0,
+        "non_503_5xx": 0
+      }
+    },
+    {
+      "name": "inv-G1-single-leader",
+      "invariant": "G1 single-leader",
+      "passed": true,
+      "detail": "sum(drain_leader)=1",
+      "criteria": "sum(drain_leader) \u2264 1 (no split-brain)",
+      "skipped": false,
+      "metrics": {}
+    },
+    {
+      "name": "inv-G6-terminal-monotonic",
+      "invariant": "G6 terminal monotonicity",
+      "passed": true,
+      "detail": "global terminal rows 442\u2192442; our objects: {'pending': 1, 'replicated': 189}",
+      "criteria": "observed replicated/failed rows never regress (our objects tracked)",
+      "skipped": false,
+      "metrics": {}
+    },
+    {
+      "name": "inv-S4-backlog",
+      "invariant": "S4 backlog gauge",
+      "passed": true,
+      "detail": "max drain_ssd_backlog_bytes = 735.5 GB (informational)",
+      "criteria": "backlog exported + bounded (absolute ceiling is a RATIFY item)",
+      "skipped": false,
+      "metrics": {}
+    },
+    {
+      "name": "drain-convergence",
+      "invariant": "drain actually replicates (lag proxy)",
+      "passed": false,
+      "detail": "our repl rows={'pending': 1, 'replicated': 231}; drain_parts_replicated \u0394=42.0; STILL non-terminal in \u2264300s",
+      "criteria": "0 pending/draining rows for our objects within 300s",
+      "skipped": false,
+      "metrics": {}
+    },
+    {
+      "name": "durability-reverify",
+      "invariant": "S8/G3 no-data-loss (NON-OVERRIDABLE)",
+      "passed": true,
+      "detail": "105/105 byte-identical; 0 corrupt, 0 missing",
+      "criteria": "every acked object re-GETs byte-identical (plaintext md5 + size)",
+      "skipped": false,
+      "metrics": {
+        "total": 105,
+        "ok": 105,
+        "corrupt": 0,
+        "missing": 0
+      }
+    }
+  ]
+}

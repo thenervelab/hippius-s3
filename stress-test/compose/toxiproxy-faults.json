@@ -1,0 +1,14 @@
+[
+  {
+    "name": "redis_queues",
+    "listen": "0.0.0.0:16379",
+    "upstream": "redis-queues:6379",
+    "enabled": true
+  },
+  {
+    "name": "postgres",
+    "listen": "0.0.0.0:15432",
+    "upstream": "db:5432",
+    "enabled": true
+  }
+]

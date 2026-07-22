@@ -11,16 +11,23 @@ class MockArionService:
         allow_upload: bool = True,
         upload_error: str | None = None,
         raise_on_can_upload: Exception | None = None,
+        can_upload_results: list[CanUploadResponse] | None = None,
     ) -> None:
         self.allow_upload = allow_upload
         self.upload_error = upload_error
         self.raise_on_can_upload = raise_on_can_upload
+        # When set, each can_upload call returns the next entry (clamped to the last), so a
+        # test can model "transient failure then success" across retries.
+        self.can_upload_results = can_upload_results
         self.can_upload_calls: list[tuple[str, int]] = []
 
     async def can_upload(self, account_ss58: str, size_bytes: int) -> CanUploadResponse:
         self.can_upload_calls.append((account_ss58, size_bytes))
         if self.raise_on_can_upload is not None:
             raise self.raise_on_can_upload
+        if self.can_upload_results:
+            idx = min(len(self.can_upload_calls), len(self.can_upload_results)) - 1
+            return self.can_upload_results[idx]
         return CanUploadResponse(result=self.allow_upload, error=self.upload_error)
 
     async def upload_file_and_get_cid(self, *args: Any, **kwargs: Any) -> None:

@@ -1,0 +1,48 @@
+# F2 — allocator failover + epoch fence (THE HEADLINE cell).
+# Two of the three sub-injections live here (the third — a clean SIGTERM graceful relinquish — is a
+# `kubectl delete pod` in run_chaos.sh). Gate (G1): sum(drain_leader) ≤ 1 every sample; cephor:epoch
+# strictly increasing; zero alloc key below the current epoch after a tick; the deposed write logs
+# `Fenced`, not applied; Σbudget ≤ ceiling.
+#
+# (a) pod-kill the current leader -> a successor must take over and BUMP the epoch.
+---
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: f2-allocator-kill
+  namespace: hippius-s3-staging
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces:
+      - hippius-s3-staging
+    labelSelectors:
+      app: drain-allocator
+  gracePeriod: 0
+---
+# (b) partition-then-heal: fully isolate an allocator replica from the coordinator Redis for 45s so
+# it believes it may still be leader, then heal — its stale-epoch write MUST be fenced. Requires >1
+# allocator replica for the partition to produce a contender. Bound: ≤45s partition; ≤10s clean.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: f2-allocator-partition
+  namespace: hippius-s3-staging
+spec:
+  action: partition
+  mode: one
+  duration: 45s
+  direction: both
+  selector:
+    namespaces:
+      - hippius-s3-staging
+    labelSelectors:
+      app: drain-allocator
+  target:
+    mode: all
+    selector:
+      namespaces:
+        - hippius-s3-staging
+      labelSelectors:
+        app: redis-queues

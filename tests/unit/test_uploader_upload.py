@@ -87,7 +87,10 @@ async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock
         return_value=MockRow({"part_id": "part-uuid"}),
     )
     # First fetchval call returns chunk_id (UUID), second is insert_chunk_backend
-    mock_conn.fetchval = AsyncMock(side_effect=[chunk_uuid, 1])
+    mock_conn.fetch = AsyncMock(
+        return_value=[MockRow({"chunk_index": i, "id": chunk_uuid}) for i in range(64)]
+    )
+    mock_conn.fetchval = AsyncMock(return_value=1)
 
     mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
 
@@ -114,7 +117,7 @@ async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock
     assert call_args.kwargs["content_type"] == "application/octet-stream"
     assert call_args.kwargs["account_ss58"] == "5FakeTestAccountAddress123456789012345678901234"
 
-    assert mock_conn.fetchval.call_count == 2
+    assert mock_conn.fetchval.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -148,7 +151,10 @@ async def test_upload_stores_backend_identifier_in_chunk_backend(mock_config, mo
         return_value=MockRow({"part_id": "part-uuid"}),
     )
     # First fetchval call returns chunk_id (UUID), second is insert_chunk_backend
-    mock_conn.fetchval = AsyncMock(side_effect=[chunk_uuid, 1])
+    mock_conn.fetch = AsyncMock(
+        return_value=[MockRow({"chunk_index": i, "id": chunk_uuid}) for i in range(64)]
+    )
+    mock_conn.fetchval = AsyncMock(return_value=1)
 
     mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
 
@@ -290,7 +296,10 @@ async def test_upload_passes_extra_headers_when_bypass_billing(mock_config, mock
 
     mock_conn = AsyncMock()
     mock_conn.fetchrow = AsyncMock(return_value=MockRow({"part_id": "part-uuid"}))
-    mock_conn.fetchval = AsyncMock(side_effect=[chunk_uuid, 1])
+    mock_conn.fetch = AsyncMock(
+        return_value=[MockRow({"chunk_index": i, "id": chunk_uuid}) for i in range(64)]
+    )
+    mock_conn.fetchval = AsyncMock(return_value=1)
     mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
 
     mock_api_instance = AsyncMock()
@@ -532,7 +541,10 @@ async def test_uploader_does_not_raise_when_meta_lands_within_deadline(mock_conf
     chunk_uuid = "aaaabbbb-cccc-dddd-eeee-ffffffffffff"
     mock_conn = AsyncMock()
     mock_conn.fetchrow = AsyncMock(return_value=MockRow({"part_id": "part-uuid"}))
-    mock_conn.fetchval = AsyncMock(side_effect=[chunk_uuid, 1])
+    mock_conn.fetch = AsyncMock(
+        return_value=[MockRow({"chunk_index": i, "id": chunk_uuid}) for i in range(64)]
+    )
+    mock_conn.fetchval = AsyncMock(return_value=1)
     mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
 
     mock_upload_response = UploadResponse(
@@ -614,6 +626,7 @@ async def test_part_chunks_upload_concurrently_bounded_by_arion_concurrency(mock
 
     mock_conn = AsyncMock()
     mock_conn.fetchrow = AsyncMock(return_value=MockRow({"part_id": "part-uuid"}))
+    mock_conn.fetch = AsyncMock(return_value=[MockRow({"chunk_index": i, "id": f"chunk-{i}"}) for i in range(64)])
 
     def fake_fetchval(sql, *args):
         if sql == "INSERT_SENTINEL":
@@ -685,6 +698,7 @@ async def test_put_semaphore_bounds_arion_posts_across_concurrent_requests(mock_
 
     mock_conn = AsyncMock()
     mock_conn.fetchrow = AsyncMock(return_value=MockRow({"part_id": "p"}))
+    mock_conn.fetch = AsyncMock(return_value=[MockRow({"chunk_index": i, "id": f"chunk-{i}"}) for i in range(64)])
     mock_conn.fetchval = AsyncMock(side_effect=lambda sql, *a: 1 if sql == "INSERT_SENTINEL" else f"c-{a[1]}")
     mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
 
@@ -742,6 +756,7 @@ async def test_part_chunk_upload_failure_propagates(mock_config, mock_db_pool, m
 
     mock_conn = AsyncMock()
     mock_conn.fetchrow = AsyncMock(return_value=MockRow({"part_id": "part-uuid"}))
+    mock_conn.fetch = AsyncMock(return_value=[MockRow({"chunk_index": i, "id": f"chunk-{i}"}) for i in range(64)])
     mock_conn.fetchval = AsyncMock(side_effect=lambda sql, *a: 1 if sql == "INSERT_SENTINEL" else f"chunk-{a[1]}")
     mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
 

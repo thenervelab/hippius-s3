@@ -1,0 +1,243 @@
+# The hippius-drain agent: the per-node drain daemon.
+# One pod per ingest node, draining that node's local-SSD ingest dir to
+# the shared CephFS pool, path-preservingly per the api part layout
+# (<object_id>/v<version>/part_<n>/). The reconciler is the sole trigger — it scans the
+# SSD for complete parts (a meta.json marker) with no replication row and records them,
+# so the api needs no change.
+#
+# == Node alignment ==
+# Selects the SAME node label `s3-staging-local-ingest=true` as the api-local
+# Deployment (the one list lives in ingest-node-labels-staging.yaml), so a DaemonSet
+# runs exactly one drain pod per node an api pod can land on — in lockstep, no
+# duplicated hostname list to drift, and off the cache/psql/master nodes.
+#
+# == Volumes ==
+#  * SSD source: the SAME hostPath the api pods write to,
+#    /var/lib/hippius/local_ingest_staging (the `_staging` suffix keeps it disjoint
+#    from prod on a shared node). RW so the agent can unlink a part after a verified,
+#    committed pool copy.
+#  * CephFS pool: object-cache-pvc — ReadWriteMany ceph-filesystem, mounted RW (the api
+#    pods mount it read-only; the agent is the writer into ceph).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: drain-agent
+  labels:
+    app: drain-agent
+spec:
+  selector:
+    matchLabels:
+      app: drain-agent
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: drain-agent
+    spec:
+      # Same label as api-local — keeps them in lockstep (see header).
+      nodeSelector:
+        s3-staging-local-ingest: "true"
+      affinity:
+        # Belt-and-suspenders with the nodeSelector label, identical to api-local's
+        # allow-list: a drain-agent only runs where an api-local pod can land. Keep in
+        # sync with ingest-node-labels-staging.yaml + api-local-deployments-staging.yaml.
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - k8s-v3-node2
+                      - k8s-v3-node3
+      # > the agent's shutdown grace (CEPHOR_GRACE_SECS default 30s): a burst winds
+      # down before the kubelet force-kills, so no in-flight part is stranded draining.
+      terminationGracePeriodSeconds: 40
+      initContainers:
+        - name: prepare-ingest-dir
+          image: busybox
+          command:
+            - sh
+            - -c
+            - mkdir -p /var/lib/hippius/local_object_cache && chmod 0777 /var/lib/hippius/local_object_cache
+          volumeMounts:
+            - name: local-ingest
+              mountPath: /var/lib/hippius/local_object_cache
+        # Block until the allocator has provisioned the cephor_* schema (it owns the
+        # migrations). Without this gate a fresh-namespace `apply` lets the agent start
+        # against missing tables and CrashLoop until the allocator catches up. Strengthens
+        # mpu-reaper's port-check to an actual schema check (to_regclass is NULL, not an
+        # error, for an absent table).
+        - name: wait-for-cephor-schema
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h postgres-rw -p 5432; do echo "waiting for postgres"; sleep 3; done
+              until [ "$(psql "$CEPHOR_DATABASE_URL" -tAc "SELECT to_regclass('public.cephor_replication_status') IS NOT NULL")" = "t" ]; do
+                echo "waiting for the cephor schema (allocator migration)"; sleep 3
+              done
+          env:
+            - name: CEPHOR_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+      containers:
+        - name: agent
+          image: ghcr.io/thenervelab/hippius-s3/drain:latest
+          imagePullPolicy: Always
+          command: ["/usr/local/bin/hippius-drain-agent"]
+          env:
+            # NodeId keys this node's heartbeat in the fleet; the k8s node name is
+            # stable and unique per node.
+            - name: CEPHOR_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Reuse the api's DATABASE_URL secret (cephor_* tables share the `hippius` DB).
+            - name: CEPHOR_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+            # Source (node-local SSD ingest) and destination (shared ceph pool) —
+            # mounted at the same paths the api uses, so the relative part dirs line up.
+            - name: CEPHOR_SSD_ROOT
+              value: /var/lib/hippius/local_object_cache
+            - name: CEPHOR_POOL_ROOT
+              value: /var/lib/hippius/object_cache
+            # The drain is the sole upload producer (s3-2.1 drain-direct): once a part is
+            # replicated to ceph it pushes an UploadChainRequest to {backend}_upload_requests
+            # for each configured backend. Reuse the api's queue-Redis + upload-backend list.
+            - name: REDIS_QUEUES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_QUEUES_URL
+            # Sourced from the shared secret (like every Python worker), NOT a literal:
+            # the drain is the sole upload producer, so if a backup backend is added to the
+            # secret the drain must fan out to it too — a hardcoded "arion" would silently
+            # under-replicate (never enqueue the new backend, so the janitor replication gate
+            # never clears -> unbounded cache growth).
+            - name: HIPPIUS_UPLOAD_BACKENDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_UPLOAD_BACKENDS
+            # SSD-ingest reclaim worker: clean up broken/abandoned uploads (failed parts
+            # the drain skips forever) + orphan write-temps, once aged, so abandoned-upload
+            # junk does not accumulate on the node-local disk. Both have safe code defaults
+            # (300s poll / 1h grace); set here for visibility + per-node tuning.
+            - name: CEPHOR_RECLAIM_POLL_SECS
+              value: "300"
+            - name: CEPHOR_RECLAIM_GRACE_SECS
+              value: "3600"
+            # Max parts drained concurrently — the in-flight gate that lets the node
+            # overlap fsync latency across parts (the AIMD allocator only tunes bytes/s).
+            # Safe code default (4); set here for per-node tuning.
+            - name: CEPHOR_DRAIN_CONCURRENCY
+              value: "16"    # was 4 — overlap more per-part commit fsyncs (the drain is
+                             # commit-bound on the ceph-backed Postgres, ~0.68 parts/s at 4);
+                             # more concurrency is the main lever until the status DB moves off
+                             # ceph-backed storage. See drainer-optimisations.md.
+            # Replication-lag tuning (measured 2026-07-02: p50 4.6s / p99 5.9s under the old 5s
+            # poll). The lag was NOT the drain budget (unpinned to ~1 GB/s by the target_p99 fix)
+            # — it was the poll floor. Lower ONLY the poll:
+            #   the claim query is a partial-index (node_id, landed_at) WHERE status='pending'
+            #   lookup, so 1s polling scans only the small active-pending set, not the ~94M-row
+            #   parts table — unconditionally cheap even at prod scale.
+            # CEPHOR_DEFER_BACKOFF_SECS is deliberately left at its 5s code default: a
+            # not-yet-drainable part (MPU whose Complete hasn't written object_versions.address,
+            # or a stuck A21 orphan) re-parks for that long, so lowering it to 1s would make those
+            # parts retry the claim 5x more often — pure churn at prod cardinality with the A21
+            # orphan leak unfixed. It only affects the tail (MPU parts already wait for Complete),
+            # not the common simple-PUT case the poll cut covers.
+            - name: CEPHOR_DRAIN_POLL_SECS
+              value: "1"
+            # Reconciler scan period (was the 60s code default). The reconciler is the SOLE
+            # drain trigger — a freshly-landed part is invisible until the next scan records its
+            # `pending` row — so this interval, not the 1s drain poll, is the dominant, jittery
+            # replication-sync tail (0–60s at the old default; ~30s avg). 15s cuts it to ~7.5s avg.
+            # Safe to lower: a scan is a walk of the node-local SSD ingest tree (undrained parts
+            # only — drained parts are unlinked; the Ceph pool and the 94M-row parts table are
+            # never walked) + ONE batched UNNEST status read. record_landed writes fire only for
+            # genuinely-new parts (a known part is seen as already_pending and skipped), so a
+            # faster poll adds NO extra write load — just the cheap walk + one read, jittered per
+            # node. The real fix (an api landing fast-path + mtime-incremental scan) collapses
+            # this to ~1s; 15s is the zero-code interim. See drainer-optimisations.md Tier 1.
+            - name: CEPHOR_RECONCILE_POLL_SECS
+              value: "15"
+            - name: RUST_LOG
+              value: "info"
+            # OTLP metrics -> otel-collector -> Prometheus -> Grafana (feature `otel`, on by
+            # default). The collector turns these resource attrs into Prometheus labels; the
+            # dashboard's var-namespace filters on service_namespace, so drain_* series land
+            # under the staging namespace. Mirrors the janitor deployment's env.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ENVIRONMENT
+              value: "staging"
+            - name: ENABLE_MONITORING
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector:4317"
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
+          volumeMounts:
+            - name: local-ingest
+              mountPath: /var/lib/hippius/local_object_cache
+            - name: object-cache
+              mountPath: /var/lib/hippius/object_cache
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          # The agent touches this file each heartbeat tick (~10s); a stale file means a
+          # wedged (not crashed) runtime — e.g. a broken redis ConnectionManager — so k8s
+          # restarts the pod. The agent is the sole upload producer, so a silent hang would
+          # otherwise stop this node's uploads with no recovery.
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'f=/tmp/hippius-drain-agent.alive; test -f "$f" && [ $(( $(date +%s) - $(stat -c %Y "$f") )) -lt 40 ]'
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # C8: NotReady when the drain is WEDGED — a hung CephFS write stalls draining while
+          # liveness (process-alive) stays fresh. The agent touches this file only while the drain
+          # is PROGRESSING (or idle); a wedged loop lets it go stale. Unlike liveness this does NOT
+          # restart the pod (a wedge is not a crash) — it marks the node NotReady so a rolling
+          # update does not step over stuck nodes and the wedge surfaces in pod status.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'f=/tmp/hippius-drain-agent.ready; test -f "$f" && [ $(( $(date +%s) - $(stat -c %Y "$f") )) -lt 45 ]'
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: local-ingest
+          hostPath:
+            path: /var/lib/hippius/local_ingest_staging
+            type: DirectoryOrCreate
+        - name: object-cache
+          persistentVolumeClaim:
+            claimName: object-cache-pvc

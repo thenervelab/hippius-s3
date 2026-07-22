@@ -14,7 +14,6 @@ from hippius_s3.config import get_config
 from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import enqueue_unpin_request
 from hippius_s3.repositories.buckets import BucketRepository
-from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
 from hippius_s3.utils import get_query
 
@@ -49,13 +48,8 @@ async def handle_delete_object(
             bucket_id = bucket["bucket_id"]
             set_span_attributes(span, {"bucket_id": str(bucket_id)})
 
-        with tracer.start_as_current_span("delete_object.check_object_exists") as span:
-            result = await ObjectRepository(db).get_by_path(bucket_id, object_key)
-            object_exists = result is not None
-            set_span_attributes(span, {"object_exists": object_exists})
-            if not result:
-                return Response(status_code=204)
-
+        # HD-78: no existence pre-check — soft_delete_object's RETURNING already distinguishes
+        # absent/already-deleted (both → idempotent 204 below), so the pre-check was a wasted read.
         # Soft-delete the object (sets deleted_at, does NOT cascade-delete rows)
         with tracer.start_as_current_span("delete_object.soft_delete") as span:
             deleted = await db.fetchrow(get_query("soft_delete_object"), bucket_id, object_key)

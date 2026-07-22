@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import shutil
 from dataclasses import dataclass
 
@@ -34,6 +35,11 @@ def should_reject_fs_cache_write(
         config.fs_cache_min_free_ratio
     )
     if threshold_hit:
-        return True, float(config.fs_cache_retry_after_seconds), pressure, "threshold"
+        # C2: jitter Retry-After ±25% so a fleet of throttled clients doesn't retry in a
+        # synchronized wave (thundering herd) the instant a shared window elapses — which would
+        # re-spike disk pressure and re-trigger the gate. Floor at 1s.
+        base = float(config.fs_cache_retry_after_seconds)
+        jittered = max(1.0, base * random.uniform(0.75, 1.25))
+        return True, jittered, pressure, "threshold"
 
     return False, 0.0, pressure, "ok"

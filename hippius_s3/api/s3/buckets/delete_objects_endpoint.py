@@ -141,7 +141,7 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
             ET.SubElement(e, "Code").text = err.get("Code", "")
             ET.SubElement(e, "Message").text = err.get("Message", "")
 
-        xml_content = ET.tostring(resp_root, encoding="UTF-8", xml_declaration=True, pretty_print=True)
+        xml_content = ET.tostring(resp_root, encoding="UTF-8", xml_declaration=True, pretty_print=False)
         return Response(content=xml_content, media_type="application/xml", status_code=200)
 
     except Exception:

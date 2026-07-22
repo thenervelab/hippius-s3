@@ -31,6 +31,8 @@ def mock_config_no_bypass() -> Any:
     config.bypass_credit_check = False
     config.substrate_url = "ws://localhost:9944"
     config.can_upload_cache_ttl_seconds = 10
+    config.can_upload_transient_retries = 2
+    config.can_upload_transient_retry_delay_seconds = 0.0
     return config
 
 
@@ -209,6 +211,61 @@ async def test_can_upload_fails_closed_on_arion_error(mock_config_no_bypass: Any
         response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
 
     assert response.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_can_upload_retries_transient_billing_then_succeeds(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    """A transient billing-service failure ('Failed to fetch billing balance') is retried; if a
+    subsequent attempt succeeds the request proceeds (200), not a spurious 402."""
+    from hippius_s3.services.arion_service import CanUploadResponse
+
+    mock_arion = MockArionService(
+        can_upload_results=[
+            CanUploadResponse(result=False, error="Failed to fetch billing balance"),
+            CanUploadResponse(result=True, error=None),
+        ]
+    )
+    app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert response.status_code == 200
+    assert len(mock_arion.can_upload_calls) == 2, "must retry the transient billing failure"
+
+
+@pytest.mark.asyncio
+async def test_can_upload_transient_billing_returns_503_not_402(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    """A persistent transient billing failure surfaces a retryable 503 SlowDown, never a hard 402
+    that a client reads as 'insufficient funds'."""
+    mock_arion = MockArionService(allow_upload=False, upload_error="Failed to fetch billing balance")
+    app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert response.status_code == 503
+    assert b"SlowDown" in response.content
+    # initial attempt + can_upload_transient_retries
+    assert len(mock_arion.can_upload_calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_can_upload_genuine_denial_stays_402_and_is_not_retried(
+    mock_config_no_bypass: Any, monkeypatch: Any
+) -> None:
+    """A genuine out-of-credit denial must return 402 and must NOT be retried — even when the
+    message contains the words 'billing balance' (e.g. 'Insufficient billing balance'). Guards
+    against widening the transient classifier into silently converting real 402s into 503s."""
+    mock_arion = MockArionService(allow_upload=False, upload_error="Insufficient billing balance")
+    app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert response.status_code == 402
+    assert b"UploadNotPermitted" in response.content
+    assert len(mock_arion.can_upload_calls) == 1, "a genuine denial must not be retried"
 
 
 @pytest.mark.asyncio
@@ -398,3 +455,48 @@ async def test_can_upload_cache_key_is_per_account(mock_config_no_bypass: Any, m
         await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
 
     mock_redis.get.assert_called_with("can_upload:5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY")
+
+
+@pytest.mark.asyncio
+async def test_gw4_get_skips_account_fetch_but_put_fetches(
+    mock_config_no_bypass: Any, monkeypatch: Any
+) -> None:
+    """GW-4: access-key GET/HEAD carry no credit gate and the API ignores the credit fields, so the
+    redis-accounts fetch is skipped on reads; mutating methods still fetch and gate."""
+    from gateway.middlewares import account as account_mod
+
+    monkeypatch.setattr("gateway.middlewares.account.config", mock_config_no_bypass)
+    addr = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+    calls = {"n": 0}
+
+    async def spy_fetch(address: str, redis_client: Any, substrate_url: str) -> HippiusAccount:
+        calls["n"] += 1
+        return HippiusAccount(id=addr, main_account=addr, has_credits=True, upload=True, delete=True)
+
+    monkeypatch.setattr("gateway.middlewares.account.fetch_account_by_main_address", spy_fetch)
+    monkeypatch.setattr(account_mod, "_check_can_upload", AsyncMock(return_value=None))
+
+    app = FastAPI()
+    app.state.redis_accounts = AsyncMock()
+
+    @app.api_route("/b/k", methods=["GET", "PUT"])
+    async def ep(request: Request) -> dict[str, str]:
+        return {"account_id": request.state.account_id}
+
+    async def inject(request: Request, call_next: Any) -> Any:
+        request.state.auth_method = "access_key"
+        request.state.account_address = addr
+        return await call_next(request)
+
+    app.middleware("http")(account_mod.account_middleware)
+    app.middleware("http")(inject)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r_get = await client.get("/b/k")
+        assert r_get.status_code == 200
+        assert r_get.json()["account_id"] == addr
+        assert calls["n"] == 0, "GET must not fetch the account (GW-4)"
+
+        r_put = await client.put("/b/k", content=b"x", headers={"content-length": "1"})
+        assert r_put.status_code == 200
+        assert calls["n"] == 1, "PUT must still fetch the account for the credit gate"

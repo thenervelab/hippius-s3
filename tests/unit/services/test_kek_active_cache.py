@@ -1,3 +1,4 @@
+import time
 import uuid
 from types import SimpleNamespace
 from typing import Any
@@ -104,3 +105,39 @@ async def test_requery_after_active_cache_eviction(monkeypatch: Any, kek_env: An
 
     await kek_service.get_or_create_active_bucket_kek(bucket_id=bucket_id)
     assert conn.fetchrow_calls == 2, "eviction must force a fresh active-kek lookup"
+
+
+@pytest.mark.asyncio
+async def test_active_kek_id_cache_slides_on_read(monkeypatch: Any) -> None:
+    """KM-3: reading the active-kek-id refreshes its TTL (sliding), like the plaintext KEK cache, so
+    a continuously-hot bucket doesn't pay a keystore SELECT every TTL to re-learn an unchanged id."""
+    cfg = SimpleNamespace(kek_cache_ttl_seconds=100, encryption_database_url="postgres://x")
+    monkeypatch.setattr(kek_service, "get_config", lambda: cfg)
+    kek_service._ACTIVE_KEK_CACHE.clear()
+
+    bucket_id = str(uuid.uuid4())
+    kek_id = uuid.uuid4()
+    # Entry about to expire (1s left) — a read must slide it to ~now+ttl.
+    kek_service._ACTIVE_KEK_CACHE[bucket_id] = (kek_id, time.monotonic() + 1)
+    aged_expiry = kek_service._ACTIVE_KEK_CACHE[bucket_id][1]
+
+    got = await kek_service._get_cached_active_kek_id(bucket_id)
+    slid_expiry = kek_service._ACTIVE_KEK_CACHE[bucket_id][1]
+
+    assert got == kek_id
+    assert slid_expiry > aged_expiry + 50, "read must slide the TTL forward to ~now+ttl"
+
+    kek_service._ACTIVE_KEK_CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_active_kek_id_expired_entry_not_resurrected(monkeypatch: Any) -> None:
+    cfg = SimpleNamespace(kek_cache_ttl_seconds=100, encryption_database_url="postgres://x")
+    monkeypatch.setattr(kek_service, "get_config", lambda: cfg)
+    kek_service._ACTIVE_KEK_CACHE.clear()
+
+    bucket_id = str(uuid.uuid4())
+    kek_service._ACTIVE_KEK_CACHE[bucket_id] = (uuid.uuid4(), time.monotonic() - 1)  # already expired
+    assert await kek_service._get_cached_active_kek_id(bucket_id) is None
+    assert bucket_id not in kek_service._ACTIVE_KEK_CACHE
+    kek_service._ACTIVE_KEK_CACHE.clear()

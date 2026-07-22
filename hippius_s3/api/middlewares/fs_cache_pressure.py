@@ -73,5 +73,5 @@ async def fs_cache_pressure_middleware(
         code="SlowDown",
         message="Upload temporarily throttled due to filesystem cache pressure. Please retry.",
         status_code=503,
-        extra_headers={"Retry-After": str(retry_after)},
+        extra_headers={"Retry-After": str(max(1, round(retry_after)))},
     )

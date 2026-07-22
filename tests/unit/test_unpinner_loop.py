@@ -337,29 +337,38 @@ async def test_delete_semaphore_bounds_arion_deletes_across_requests():
 
 
 @pytest.mark.asyncio
-async def test_failing_identifier_does_not_fail_request():
-    """A single identifier's DELETE failure is best-effort (logged) — it must not fail the whole
-    request, and the other identifiers still get processed."""
+async def test_failing_identifier_fails_the_request_for_retry():
+    """A9: a single identifier's DELETE failure now FAILS the whole request so it is retried/DLQ'd
+    — the old best-effort path soft-deleted the other rows and reported success, stranding the
+    still-pinned failed identifier forever. All identifiers are still ATTEMPTED (they run
+    concurrently), but the request is surfaced as failed via the retry/DLQ route rather than a
+    silent success."""
     tracker = _DeleteTracker()
     rows = [{"backend_identifier": f"id-{i}", "chunk_id": i} for i in range(4)]
+    dlq_manager = AsyncMock()
 
     with (
         patch.object(un, "get_config", return_value=_make_config(max_inflight=4, parallelism=4)),
         patch.object(un, "get_query", return_value="SQL"),
         patch.object(un, "get_metrics_collector", return_value=MagicMock()),
+        patch.object(un, "enqueue_unpin_retry_request", new=AsyncMock()) as retry_mock,
     ):
-        # Must not raise even though id-2's DELETE blows up.
+        # process_unpin_request catches the failure internally and routes it to retry/DLQ,
+        # so it does NOT re-raise — but it must NOT report a silent success.
         await un.process_unpin_request(
             _req("o"),
             backend_name="arion",
             backend_client_factory=_client_factory(tracker, fail_on="id-2"),
             worker_logger=MagicMock(),
-            dlq_manager=MagicMock(),
+            dlq_manager=dlq_manager,
             db_pool=_fake_db_pool(rows),
             sem=asyncio.Semaphore(4),
         )
 
     assert len(tracker.calls) == 4, "all identifiers attempted despite one failing"
+    # The request was surfaced as failed via exactly one of the two terminal routes (retry or DLQ).
+    routed = retry_mock.await_count + dlq_manager.push.await_count
+    assert routed >= 1, "a failed unpin must route the request to retry or DLQ, not silently succeed"
 
 
 # --------------------------------------------------------------------------- #

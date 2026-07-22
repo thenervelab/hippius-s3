@@ -110,9 +110,73 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  rust-gate:
+    # Block the drain image build (and thus the deploy) on the Rust quality gates
+    # (audit F2). Fast checks only -- fmt + clippy + supply chain; the full
+    # Postgres-backed test suite runs in the PR workflow (test-and-lint.yml).
+    name: Rust gate (fmt, clippy, cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo-deny check
+        run: cargo deny check
+
+  build-drain:
+    # The hippius-drain Rust binaries (agent + allocator) ship as one `drain` image.
+    # It is a self-contained Cargo workspace, so it needs no base image. Gated on
+    # rust-gate so a clippy/fmt/advisory failure blocks building+deploying the drain.
+    needs: rust-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/drain
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=latest
+
+      - name: Build and push drain image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.drain
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   deploy-staging:
     runs-on: ubuntu-latest
-    needs: build-images
+    needs: [build-images, build-drain]
     environment: staging
     steps:
       - name: Checkout code
@@ -120,6 +184,9 @@ jobs:
 
       - name: Set up kubectl
         uses: azure/setup-kubectl@v3
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
 
       - name: Configure kubeconfig
         run: |
@@ -207,7 +274,8 @@ jobs:
           kustomize edit set image \
             ghcr.io/thenervelab/hippius-s3/api:${SHORT_SHA} \
             ghcr.io/thenervelab/hippius-s3/gateway:${SHORT_SHA} \
-            ghcr.io/thenervelab/hippius-s3/workers:${SHORT_SHA}
+            ghcr.io/thenervelab/hippius-s3/workers:${SHORT_SHA} \
+            ghcr.io/thenervelab/hippius-s3/drain:${SHORT_SHA}
 
       - name: Delete old migration job
         run: |
@@ -221,12 +289,58 @@ jobs:
         run: |
           kubectl apply -k k8s/staging
 
+      # STAGING ONLY — the drain chaos matrix (stress-test/faults/) needs Chaos Mesh + toxiproxy.
+      # Chaos Mesh is namespace-scoped to hippius-s3-staging (clusterScoped=false + targetNamespace),
+      # so it can never inject into hippius-s3-prod on the shared cluster. See k8s/chaos-testing/.
+      # This step exists ONLY in the staging workflow; production-deploy.yaml installs none of it.
+      - name: Deploy chaos-testing tooling (staging-only)
+        run: |
+          helm repo add chaos-mesh https://charts.chaos-mesh.org
+          helm repo update chaos-mesh
+          # NO --wait: chaos-daemon is a DaemonSet that legitimately can't schedule on a node already
+          # at pod capacity, so a partial roll must not fail the deploy (same rationale as the
+          # drain-agent handling below). helm returning after apply is sufficient; the patches below
+          # are idempotent and the controller reconciles asynchronously.
+          # ENABLE_FILTER_NAMESPACE=false is set via the values file (the chart honours it), so no
+          # kubectl patch of the chart-managed Deployment is needed — that is deliberate: patching the
+          # Deployment with kubectl creates a field-manager that conflicts with the next helm upgrade
+          # (helm 4 uses server-side apply). Only standalone resources are applied alongside helm.
+          helm upgrade --install chaos-mesh chaos-mesh/chaos-mesh \
+            --namespace hippius-s3-staging --version 2.7.3 \
+            -f k8s/chaos-testing/chaos-mesh.values.yaml --timeout 5m
+          # Two standalone objects complete the working install (both idempotent, neither touches the
+          # helm-managed Deployment): (1) allow the apiserver to reach the webhook — the ns
+          # `allow-internal` NetworkPolicy otherwise drops it and every chaos CRD create fails
+          # fail-closed; (2) the one cluster-scoped read the namespaced controller needs to start.
+          kubectl apply -f k8s/chaos-testing/webhook-networkpolicy.yaml
+          kubectl apply -f k8s/chaos-testing/remotecluster-rbac.yaml
+          kubectl apply -f k8s/chaos-testing/toxiproxy.yaml
+
       - name: Wait for rollout
         run: |
           kubectl rollout status deployment/gateway -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/api -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/arion-downloader -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/arion-uploader -n hippius-s3-staging --timeout=10m
+          # Drain stack, allocator-first: the allocator applies the cephor_* migrations
+          # on startup, so confirm it is Ready (strict) before the per-node agent DaemonSet.
+          kubectl rollout status deployment/drain-allocator -n hippius-s3-staging --timeout=5m
+          # The agent is a DaemonSet: a labeled node at pod capacity legitimately cannot
+          # host its pod, which must not fail the whole deploy. But a blanket `|| echo`
+          # swallowed *every* failure (image pull, CrashLoop, bad config) and reported
+          # green (audit F8). Instead: require >= 1 agent Ready; warn only when it's a
+          # partial roll (some labeled node unschedulable), fail when zero are Ready.
+          if ! kubectl rollout status daemonset/drain-agent -n hippius-s3-staging --timeout=5m; then
+            ready=$(kubectl get ds drain-agent -n hippius-s3-staging -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+            desired=$(kubectl get ds drain-agent -n hippius-s3-staging -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
+            if [ "${ready:-0}" -ge 1 ]; then
+              echo "::warning::drain-agent rolled ${ready}/${desired} (a labeled node is likely at pod capacity); proceeding"
+            else
+              echo "::error::drain-agent has 0 Ready pods after 5m — rollout genuinely failed"
+              kubectl get pods -l app=drain-agent -n hippius-s3-staging -o wide || true
+              exit 1
+            fi
+          fi
 
       - name: Restart external deployments
         run: |

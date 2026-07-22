@@ -6,3 +6,10 @@ data:
   ENVIRONMENT: "production"
   OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=production,service.namespace=hippius-s3-prod"
   SENTRY_DSN: "SENTRY_DSN_PLACEHOLDER"
+  # RQ-1 trial: one pub/sub subscription per stream instead of per-chunk (PR #279).
+  # Only the internal `api` pods read this (streamer/object_reader). It is a
+  # correctness-sensitive flag (the demux + FS re-check race guard) and ships default-false.
+  # Kept "false" for the s3-2.1 promotion (peer review #11): do not flip a correctness flag
+  # in the same change as a 396-commit cutover — it is rollback-without-redeploy, so enable it
+  # as a separate change AFTER the cutover has soaked.
+  HIPPIUS_STREAM_SINGLE_SUBSCRIPTION: "false"

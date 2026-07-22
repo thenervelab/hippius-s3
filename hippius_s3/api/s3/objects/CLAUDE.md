@@ -23,7 +23,7 @@ Full detail in [../../../CLAUDE.md section 3.1](../../../../CLAUDE.md). Summary 
 3. Build metadata dict from `x-amz-meta-*` headers (stripping append control keys).
 4. Pre-check existing object to reuse its `object_id` on overwrite ([put_object_endpoint.py:96-113](put_object_endpoint.py)).
 5. Call [ObjectWriter.put_simple_stream_full](../../../writer/object_writer.py) with a streaming body iterator.
-6. Enqueue upload request via [writer_enqueue_upload](../../../writer/queue.py).
+6. Persist the SSD address only — **no upload enqueue on the write path** (drain-direct cutover: the Rust drain is the sole producer, enqueuing after it replicates the part to the pool). The old `writer.queue.enqueue_upload` producer was removed.
 7. Mark `multipart_uploads.is_completed = TRUE` so DELETE doesn't cascade the chunk_backend rows before the worker has had a chance to upload.
 8. Return 200 with `ETag` and `x-amz-meta-append-version: 0`.
 

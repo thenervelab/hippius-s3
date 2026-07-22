@@ -30,11 +30,13 @@ from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.db_retry import retry_on_object_version_conflict
 from hippius_s3.monitoring import get_metrics_collector
-from hippius_s3.queue import Chunk
-from hippius_s3.queue import UploadChainRequest
-from hippius_s3.queue import enqueue_upload_request
+from hippius_s3.services.envelope_service import generate_dek
+from hippius_s3.services.envelope_service import wrap_dek
+from hippius_s3.services.kek_service import get_or_create_active_bucket_kek
+from hippius_s3.services.mpu_cleanup import fail_version_replication
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
+from hippius_s3.writer.db import set_object_version_address
 from hippius_s3.writer.object_writer import ObjectWriter
 from hippius_s3.xml_helpers import add_subelement
 from hippius_s3.xml_helpers import create_element
@@ -197,6 +199,44 @@ async def list_parts_internal(
     )
 
 
+async def _write_v5_envelope(
+    db: Any,
+    *,
+    bucket_id: str,
+    reserve_row: Any,
+    kek_id: uuid.UUID,
+    kek_bytes: bytes,
+    dek: bytes,
+) -> None:
+    """Write the DEK envelope for a freshly reserved MPU version. MUST run in the reserve's own
+    transaction.
+
+    upsert_object_multipart bumps objects.current_object_version, so the new v5 row becomes the LIVE
+    version the instant it commits. Deferring the envelope to the first UploadPart (where
+    ObjectWriter._ensure_and_get_v5_dek used to create it) left that live row with a NULL
+    kek_id/wrapped_dek for the whole initiate→first-part gap — unbounded, and permanent for an MPU
+    that is never continued. A GET in that gap 500s on v5_missing_envelope_metadata. Same invariant
+    the simple-PUT path enforces in writer/object_writer.py `_reserve_version`.
+
+    _ensure_and_get_v5_dek(rotate=False) finds this envelope on the first UploadPart and unwraps it,
+    so parts still encrypt under one DEK per version.
+    """
+    # AAD binds the DB-returned object_id/version, not the locally generated candidate: a concurrent
+    # create can hand back a different object_id, and a DEK wrapped under the wrong AAD never unwraps.
+    resolved_object_id = str(reserve_row["object_id"])
+    resolved_version = int(reserve_row["current_object_version"])
+    aad = f"hippius-dek:{bucket_id}:{resolved_object_id}:{resolved_version}".encode()
+    await db.execute(
+        get_query("update_object_version_envelope"),
+        "hip-enc/aes256gcm",
+        int(config.object_chunk_size_bytes),
+        kek_id,
+        wrap_dek(kek=kek_bytes, dek=dek, aad=aad),
+        resolved_object_id,
+        resolved_version,
+    )
+
+
 async def initiate_multipart_upload(
     bucket_name: str,
     object_key: str,
@@ -265,21 +305,40 @@ async def initiate_multipart_upload(
         # Create initial objects row for this multipart upload. The version allocation can collide
         # with a concurrent create_migration_version on object_versions_pkey; retry re-reads the
         # committed MAX in a fresh autocommit statement (see writer/db.py).
-        upsert_result = await retry_on_object_version_conflict(
-            lambda: db.fetchrow(
-                get_query("upsert_object_multipart"),
-                object_id,
-                bucket["bucket_id"],
-                object_key,
-                content_type,
-                json.dumps(metadata),
-                "",  # initial md5_hash (will be updated on completion)
-                0,  # initial size_bytes (will be updated on completion)
-                initiated_at,  # created_at
-                config.target_storage_version,
-                config.upload_backends,
-            )
-        )
+        # KEK lookup + DEK generation run OUTSIDE the reserve transaction: the KEK lives on a
+        # separate keystore pool and may make a KMS round-trip on cache miss, so we must not hold a
+        # main-pool connection open across it (mirrors writer/object_writer.py).
+        dek = generate_dek()
+        kek_id, kek_bytes = await get_or_create_active_bucket_kek(bucket_id=str(bucket["bucket_id"]))
+
+        async def _reserve_version_with_envelope() -> Any:
+            async with db.transaction():
+                row = await db.fetchrow(
+                    get_query("upsert_object_multipart"),
+                    object_id,
+                    bucket["bucket_id"],
+                    object_key,
+                    content_type,
+                    json.dumps(metadata),
+                    "",  # initial md5_hash (will be updated on completion)
+                    0,  # initial size_bytes (will be updated on completion)
+                    initiated_at,  # created_at
+                    config.target_storage_version,
+                    config.upload_backends,
+                )
+                if not row:
+                    raise RuntimeError("initiate_reserve_missing_row")
+                await _write_v5_envelope(
+                    db,
+                    bucket_id=str(bucket["bucket_id"]),
+                    reserve_row=row,
+                    kek_id=kek_id,
+                    kek_bytes=kek_bytes,
+                    dek=dek,
+                )
+                return row
+
+        upsert_result = await retry_on_object_version_conflict(_reserve_version_with_envelope)
 
         # Use the returned object_id (will be existing one if conflict occurred)
         object_id = str(upsert_result["object_id"])
@@ -469,14 +528,15 @@ async def upload_part(
             rng = RangeRequest(start=int(range_start), end=int(range_end))
         plan = await build_chunk_plan(pool, object_id_str, parts, rng, object_version=src_ver)
 
-        # Enqueue downloader for any missing chunk indices in cache
+        # Enqueue downloader for any missing chunk indices in cache. CP-2: one batched existence
+        # check (off-loop, meta-gated) instead of a serial per-chunk stat, matching the GET path.
         obj_cache = RedisObjectPartsCache(request.app.state.redis_client)
+        checks = [(int(it.part_number), int(it.chunk_index)) for it in plan]
+        exist_flags = await obj_cache.chunks_exist_batch(object_id_str, src_ver, checks)
         indices_by_part: dict[int, list[int]] = {}
-        for it in plan:
-            exists = await obj_cache.chunk_exists(object_id_str, src_ver, int(it.part_number), int(it.chunk_index))
-            if not exists:
-                arr = indices_by_part.setdefault(int(it.part_number), [])
-                arr.append(int(it.chunk_index))
+        for it, present in zip(plan, exist_flags, strict=True):
+            if not present:
+                indices_by_part.setdefault(int(it.part_number), []).append(int(it.chunk_index))
         if indices_by_part:
             dl_parts: list[PartToDownload] = []
             for pn, idxs in indices_by_part.items():
@@ -581,26 +641,14 @@ async def upload_part(
     redis_client = request.app.state.redis_client
 
     try:
-        # Store in Redis via chunked cache API (encrypt for private, meta-first for readiness)
-        # Resolve destination bucket name for key lookup
-        try:
-            row = await pool.fetchrow(
-                """
-                SELECT b.bucket_name
-                FROM multipart_uploads mu
-                JOIN buckets b ON b.bucket_id = mu.bucket_id
-                WHERE mu.upload_id = $1
-                  AND b.deleted_at IS NULL
-                LIMIT 1
-                """,
-                upload_id,
-            )
-        except Exception:
-            row = None
-        if not row:
-            logger.error(f"Upload row not found for upload_id={upload_id}; refusing to cache part")
+        # Store in Redis via chunked cache API (encrypt for private, meta-first for readiness).
+        # MPU-2: bucket_name and bucket_id already came from get_multipart_upload above
+        # (it returns mu.* + b.bucket_name), so we don't re-run a multipart_uploads⋈buckets JOIN.
+        dest_bucket_name = ongoing_multipart_upload.get("bucket_name")
+        dest_bucket_id = ongoing_multipart_upload.get("bucket_id")
+        if not dest_bucket_name or not dest_bucket_id:
+            logger.error(f"Upload row missing bucket for upload_id={upload_id}; refusing to cache part")
             return s3_error_response("NoSuchUpload", "The specified upload does not exist.", status_code=404)
-        dest_bucket_name = row.get("bucket_name")
 
         redis_start = time.time()
         # Route through ObjectWriter for standardized behavior
@@ -611,6 +659,7 @@ async def upload_part(
                 object_id=str(object_id),
                 object_version=int(current_object_version),
                 bucket_name=str(dest_bucket_name or ""),
+                bucket_id=str(dest_bucket_id),
                 account_address=request.state.account.main_account,
                 part_number=int(part_number),
                 body_iter=body_iter,
@@ -747,23 +796,57 @@ async def abort_multipart_upload(
         # Get object_id from multipart upload
         object_id = multipart_upload["object_id"]
 
-        # Clean up Redis keys for cached parts (meta + chunks)
-        object_version = int(multipart_upload.get("current_object_version") or 1)
-        parts = await db.fetch(
-            get_query("list_parts_for_version"),
-            object_id,
-            object_version,
-        )
-        if parts:
-            redis_client = request.app.state.redis_client
-            delegate = RedisObjectPartsCache(redis_client)
-            for part in parts:
-                part_num = int(part["part_number"])
-                meta_key = delegate.build_meta_key(str(object_id), object_version, part_num)
-                await redis_client.delete(meta_key)
-                base_key = delegate.build_key(str(object_id), object_version, part_num)
-                async for key in redis_client.scan_iter(f"{base_key}:chunk:*"):
-                    await redis_client.delete(key)
+        # Resolve THIS upload's version from its own parts, not objects.current_object_version.
+        # A simple PUT or another MPU on the same key advances that pointer, so acting on it would
+        # fail-replicate + delete an innocent NEWER version's data. No parts for this upload_id =>
+        # nothing of ours to clean: skip the version-scoped cleanup entirely (do NOT fall back to
+        # the pointer), and just remove the upload row + aborted marker below.
+        version_row = await db.fetchrow(get_query("get_multipart_version_by_upload"), upload_id)
+        object_version = int(version_row["object_version"]) if version_row else None
+
+        # Clean up Redis keys for cached parts (meta + chunks) — only for our own version.
+        if object_version is not None:
+            parts = await db.fetch(
+                get_query("list_parts_for_version"),
+                object_id,
+                object_version,
+            )
+            if parts:
+                redis_client = request.app.state.redis_client
+                delegate = RedisObjectPartsCache(redis_client)
+                for part in parts:
+                    part_num = int(part["part_number"])
+                    meta_key = delegate.build_meta_key(str(object_id), object_version, part_num)
+                    base_key = delegate.build_key(str(object_id), object_version, part_num)
+                    # MPU-4: delete the meta + chunk keys by computed name in one pipelined UNLINK
+                    # instead of a per-part keyspace SCAN. num_chunks comes from the FS meta; if it's
+                    # absent (nothing to compute from), fall back to the SCAN.
+                    fs_meta = await request.app.state.fs_store.get_meta(str(object_id), int(object_version), part_num)
+                    num_chunks = int(fs_meta.get("num_chunks", 0)) if fs_meta else 0
+                    if num_chunks > 0:
+                        keys = [meta_key] + [f"{base_key}:chunk:{i}" for i in range(num_chunks)]
+                        await redis_client.unlink(*keys)
+                    else:
+                        await redis_client.delete(meta_key)
+                        async for key in redis_client.scan_iter(f"{base_key}:chunk:*"):
+                            await redis_client.delete(key)
+
+        # Stop the drain churn BEFORE deleting the upload header. This aborted version's
+        # address will never be written, so its parts and the drain's
+        # cephor_replication_status rows would otherwise leak: the reconciler keeps
+        # re-recording them and the drain keeps re-claiming + re-copying + re-deferring the
+        # enqueue forever, on every node. Marking the version's replication rows terminal
+        # makes the reconciler skip them and claim_part never re-claim them, fleet-wide.
+        # Order matters: mark first so the churn-stop is durable even if we die before the
+        # delete below. The backstop for a thrown mark is the cephor-orphan SWEEP
+        # (list_orphan_replication_versions) — NOT the abandoned-upload reaper: the reaper
+        # keys on multipart_uploads, which the delete below removes, so it could never see
+        # this version again. The sweep keys on cephor_replication_status, which survives
+        # the delete, so it still finds and terminates the orphan.
+        # Skipped when the upload had no parts of its own (object_version is None).
+        if object_version is not None:
+            with contextlib.suppress(Exception):
+                await fail_version_replication(db, object_id=object_id, object_version=object_version)
 
         # Fully remove the multipart upload (and cascade parts) so it disappears from listings immediately
         async with db.transaction():
@@ -771,6 +854,25 @@ async def abort_multipart_upload(
                 get_query("abort_multipart_upload"),
                 upload_id,
             )
+
+        # B5: drop the empty reserved object_versions row this aborted upload left behind and
+        # repoint current_object_version off it. Reads already fall back to the latest completed
+        # version, so this is DB hygiene (no data loss) — best-effort so a hiccup never fails the
+        # abort. Skipped when the upload had no version of its own.
+        if object_version is not None:
+            with contextlib.suppress(Exception):
+                await db.fetchrow(
+                    get_query("abort_cleanup_orphan_version"),
+                    object_id,
+                    object_version,
+                )
+
+        # Best-effort node-local cleanup: drop THIS node's cached parts (other nodes' copies
+        # are left to the orphan GC; the central mark above already stopped their churn).
+        if object_version is not None:
+            with contextlib.suppress(Exception):
+                await request.app.state.fs_store.delete_object(str(object_id), int(object_version))
+
         # Mark aborted in Redis so listings immediately hide this upload (defensive against read lag)
         with contextlib.suppress(Exception):
             await request.app.state.redis_client.setex(f"aborted_mpu:{upload_id}", 300, "1")
@@ -820,16 +922,14 @@ async def list_multipart_uploads(
             get_query("list_multipart_uploads"), bucket["bucket_id"], request.query_params.get("prefix")
         )
 
-        # Filter out any uploads that were very recently aborted (defensive cache for race conditions)
+        # Filter out any uploads that were very recently aborted (defensive cache for race conditions).
+        # MPU-56: one MGET for all recently-aborted flags instead of a serial GET per upload.
         try:
             redis_client: Redis = request.app.state.redis_client
-            filtered_uploads = []
-            for upload in uploads:
-                aborted_flag = await redis_client.get(f"aborted_mpu:{str(upload['upload_id'])}")
-                if aborted_flag:
-                    continue
-                filtered_uploads.append(upload)
-            uploads = filtered_uploads
+            if uploads:
+                flag_keys = [f"aborted_mpu:{str(u['upload_id'])}" for u in uploads]
+                aborted_flags = await redis_client.mget(flag_keys)
+                uploads = [u for u, flag in zip(uploads, aborted_flags, strict=True) if not flag]
         except Exception as _:
             # If Redis not available, proceed with DB results
             pass
@@ -993,10 +1093,33 @@ async def complete_multipart_upload(
                     tag.replace('"', "").strip(),
                 ),
             )
-        part_info.sort(key=lambda x: x[0])
+        # S3 requires the parts to be listed in strictly ascending part-number order.
+        # We used to silently sort here, which masked a malformed part list; reject it
+        # (InvalidPartOrder) instead so a client cannot depend on undefined assembly order.
+        last_seen_pn = 0
+        for pn, _ in part_info:
+            if pn <= last_seen_pn:
+                return s3_error_response(
+                    "InvalidPartOrder",
+                    "The list of parts was not in ascending order. Parts must be ordered by part number.",
+                    status_code=400,
+                )
+            last_seen_pn = pn
 
-        # Get the parts from the database for the version captured on MPU initiation
-        object_version = int(multipart_upload.get("current_object_version") or 1)
+        # Resolve THIS upload's version from its own parts (keyed by upload_id), not
+        # objects.current_object_version — a simple PUT or another MPU on the same key advances that
+        # pointer, and completing/writing the address against it would target a different upload's
+        # version (and, with no parts of our own, would pull THAT version's parts). No parts for this
+        # upload_id => genuinely nothing to complete; do not fall back to the pointer.
+        version_row = await db.fetchrow(get_query("get_multipart_version_by_upload"), upload_id)
+        if not version_row:
+            logger.error(f"No parts found for multipart upload {upload_id}")
+            return s3_error_response(
+                "InvalidRequest",
+                "No parts found for this multipart upload",
+                status_code=400,
+            )
+        object_version = int(version_row["object_version"])
         db_parts = await db.fetch(
             get_query("list_parts_for_version"),
             object_id,
@@ -1013,12 +1136,32 @@ async def complete_multipart_upload(
                 status_code=400,
             )
 
-        # Check that all parts exist
-        missing_parts = [pn for pn, _ in part_info if pn not in db_parts_dict]
+        # Validate each part exists AND the client-asserted ETag matches the stored part.
+        # A CompleteMultipartUpload names, per part, the ETag the client believes it
+        # uploaded; S3 rejects the completion (InvalidPart) if the part is missing OR the
+        # ETag does not match. Without the ETag check a client could assemble the object
+        # from the wrong part bytes and still receive a 200 — a silent data-integrity hole.
+        missing_parts = []
+        mismatched_parts = []
+        for pn, client_etag in part_info:
+            db_part = db_parts_dict.get(pn)
+            if db_part is None:
+                missing_parts.append(pn)
+                continue
+            stored_etag = str(db_part["etag"]).replace('"', "").strip()
+            if client_etag and client_etag.lower() != stored_etag.lower():
+                mismatched_parts.append(pn)
         if missing_parts:
             return s3_error_response(
                 "InvalidPart",
                 f"One or more parts could not be found: {', '.join(map(str, missing_parts))}",
+                status_code=400,
+            )
+        if mismatched_parts:
+            return s3_error_response(
+                "InvalidPart",
+                "The ETag supplied for one or more parts did not match the uploaded part: "
+                f"{', '.join(map(str, mismatched_parts))}",
                 status_code=400,
             )
 
@@ -1034,32 +1177,23 @@ async def complete_multipart_upload(
             upload_id=str(upload_id),
             object_version=int(object_version),
             address=request.state.account.main_account,
+            # B1: the client's <Part> selection — the final object (bytes + ETag + size) reflects
+            # only these; a strict subset is recorded so the reader excludes the unlisted parts.
+            selected_parts=[pn for pn, _ in part_info],
+            # MPU-3: reuse the parts rows already fetched (and ETag-validated) above so mpu_complete
+            # doesn't re-read the parts table for the combined ETag and total size.
+            db_parts=db_parts,
         )
 
-        # After commit, enqueue background publish
-        parts = await db.fetch(
-            get_query("list_parts_for_version"),
-            object_id,
-            object_version,
-        )
-        ray_id = getattr(request.state, "ray_id", None)
-        await enqueue_upload_request(
-            UploadChainRequest(
-                address=request.state.account.id,
-                bucket_name=bucket_name,
-                object_key=object_key,
-                object_id=str(object_id),
-                object_version=int(object_version),
-                chunks=[
-                    Chunk(
-                        id=part["part_number"],
-                    )
-                    for part in parts
-                ],
-                upload_id=upload_id,
-                ray_id=ray_id,
-                upload_backends=get_config().upload_backends,
-            ),
+        # Drain-direct (s3-2.1 PR-11): the api does NOT enqueue the backend upload. It
+        # persists the main-account address (the upload identity); the Rust drain reads
+        # it and LPUSHes each part's UploadChainRequest itself, per part, as the part
+        # replicates to ceph. The drain is the sole upload producer.
+        await set_object_version_address(
+            request.app.state.postgres_pool,
+            object_id=str(object_id),
+            object_version=int(object_version),
+            address=request.state.account.main_account,
         )
 
         # Create XML response

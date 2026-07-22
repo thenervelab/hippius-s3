@@ -29,9 +29,21 @@ Concrete: `ArionClient` ([../services/arion_service.py](../services/arion_servic
 
 `Uploader` processes `UploadChainRequest` from `arion_upload_requests`. Reads chunks from FS, uploads to Arion, records the returned identifier in `chunk_backend`. Retry config ([../config.py](../config.py)):
 
-- `HIPPIUS_UPLOADER_MAX_ATTEMPTS=5`
+- `HIPPIUS_UPLOADER_MAX_ATTEMPTS=7`
 - `HIPPIUS_UPLOADER_BACKOFF_BASE_MS=500`, `_MAX_MS=60000`
 - `HIPPIUS_UPLOADER_MULTIPART_MAX_CONCURRENCY=5` (per-part parallelism within an upload)
+
+These are the values shipped in both [.env.defaults](../../.env.defaults) and
+[k8s/base/configmap-defaults.yaml](../../k8s/base/configmap-defaults.yaml); the code defaults in
+[../config.py](../config.py) match, so a pod with no overrides behaves the same. 7 attempts at
+`500ms · 2^(n-1)` is ~63s of tolerance (0.5, 1, 2, 4, 8, 16, 32s) before the DLQ.
+
+**This queue is the only retry layer for transport failures.** `retry_on_error` in
+[../services/arion_service.py](../services/arion_service.py) deliberately does not catch
+`httpx.ConnectError` and friends: they are classified `transient`, so re-driving them here gives
+exponential backoff with jitter, durability across pod restarts, and — unlike the decorator, whose
+sleep is held inside `_put_semaphore` — no cost to upload concurrency while waiting. Adding them to
+both layers multiplies the budgets (7 × 4 ≈ 24 requests) at a backend that is already failing.
 
 Per-pod request concurrency and the shared Arion-POST ceiling are covered under **Concurrency model** below.
 
