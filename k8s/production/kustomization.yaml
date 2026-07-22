@@ -11,12 +11,18 @@ resources:
   - gateway-nodeport.yaml
   # --- hippius-drain (s3-2.1) SSD-ingest tier — DELIBERATELY COMMENTED OUT. ---
   # Ingest nodes node1..node5 are prepared: each has a dedicated 3.84 TB NVMe mounted at
-  # /s3-data, and ingest-node-labels-production.yaml labels them s3-prod-local-ingest=true
-  # (both nodeAffinity allow-lists list node1..node5). Runbook: path-to-prod.md; sizing:
-  # s3-prod-drain-capacity-plan.md. Before uncommenting: confirm the label is applied on all
-  # five nodes, then also uncomment the `drain` image below, and (cutover) scale base `api`
-  # to 0 + point the `api` Service selector at app: api-local, as k8s/staging/kustomization.yaml does.
-  # - ingest-node-labels-production.yaml
+  # /s3-data (both nodeAffinity allow-lists list node1..node5). Runbook: path-to-prod.md;
+  # sizing: s3-prod-drain-capacity-plan.md. Before uncommenting: also uncomment the `drain`
+  # image below, and (cutover) scale base `api` to 0 + point the `api` Service selector at
+  # app: api-local, as k8s/staging/kustomization.yaml does.
+  #
+  # ingest-node-labels-production.yaml is NOT listed here and must not be added. This
+  # overlay is applied client-side, which prunes any label absent from the manifest — and
+  # staging declares the same Node objects (node2/node3), so the two deploys deleted each
+  # other's ingest label (2026-07-22: cost prod 243 stranded parts). The workflow applies
+  # that file in its own server-side step with a dedicated --field-manager, which scopes
+  # ownership to our label key. That step is UNCONDITIONAL: the labels are applied on every
+  # prod deploy regardless of whether the drain resources below are enabled.
   # - api-local-deployments-production.yaml
   # - drain-allocator-deployment.yaml   # singleton; owns the cephor_* schema (deploy first)
   # - drain-agent-daemonset.yaml        # one per labelled ingest node

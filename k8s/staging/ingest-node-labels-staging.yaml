@@ -1,25 +1,48 @@
 # Declarative source of truth for the STAGING local-ingest node set.
 #
-# This is the ONE list. `kubectl apply -k k8s/staging` (the deploy) applies the
-# `s3-staging-local-ingest=true` label to these nodes; the api-local Deployment and
-# the drain-agent DaemonSet both select on that label, so they stay in lockstep
-# automatically. Both ALSO carry a required nodeAffinity hostname allow-list (node2,
-# node3) — keep that allow-list in sync with the stanzas below. To change the set,
-# edit the Node stanzas here AND both allow-lists.
+# This is the ONE list. The api-local DaemonSet and the drain-agent DaemonSet both
+# select `s3-staging-local-ingest=true`, so they stay in lockstep automatically. Both
+# ALSO carry a required nodeAffinity hostname allow-list (node2, node3) — keep that
+# allow-list in sync with the stanzas below. To change the set, edit the Node stanzas
+# here AND both allow-lists.
 #
-# SHARED CLUSTER: staging and prod run on the same physical nodes, so their ingest
-# sets MUST be disjoint — prod uses a different label (s3-local-ingest) on DIFFERENT
-# nodes, so a staging and a prod api pod never share a node's /var/lib/hippius/local_ingest.
+# APPLIED SEPARATELY, SERVER-SIDE — NOT via `kubectl apply -k k8s/staging`.
+# This file is deliberately absent from kustomization.yaml's `resources:`. The deploy
+# runs it as its own step:
+#   kubectl apply --server-side --force-conflicts \
+#     --field-manager=hippius-s3-staging-ingest-labels -f <this file>
 #
-# CAVEAT: `apply` adds labels but does not PRUNE them. Removing a node here does not
-# clear its label — to retire an ingest node, delete its stanza AND run:
-#   kubectl label node <name> s3-staging-local-ingest-
+# WHY (incident 2026-07-22): staging and prod BOTH declare partial Node objects for
+# k8s-v3-node2/node3, each carrying its own label key. Client-side apply prunes any
+# key that was in the object's last-applied-configuration but is absent from the
+# manifest being applied — so each environment's deploy DELETED the other's label.
+# Every push to `staging` silently stripped `s3-prod-local-ingest` from node2/node3,
+# which deleted prod's drain-agent there and stranded 243 prod parts in
+# `cephor_replication_status` (node-scoped: a pending row for a node with no agent is
+# unclaimable forever). Server-side apply tracks ownership per field-manager, so each
+# environment owns only the label key it declares and cannot touch the other's.
+# `--force-conflicts` is safe here precisely because this manager declares exactly one
+# label key and can never prune a key it does not list.
 #
-# (These are partial Node objects: apply merges only metadata.labels and leaves all
-# other node fields untouched. Requires the deploy identity to be able to patch nodes.)
-# node1 is intentionally NOT an ingest node: it runs at its ~110-pod cap, so the
+# SHARED CLUSTER: staging and prod ingest sets OVERLAP on node2/node3 by design. Both
+# labels coexist on those nodes; the two stacks use different disks (staging →
+# /var/lib/hippius/local_ingest_staging on the root disk, prod → the dedicated /s3-data
+# NVMe), so co-resident ingest pods never share storage.
+#
+# RETIRING A NODE — read this first. Under server-side apply, deleting a stanza here
+# DOES remove the label on the next deploy (unlike the old client-side behaviour). That
+# deletes the node's drain-agent, and any non-terminal `cephor_replication_status` row
+# stamped with that node_id becomes unclaimable — its parts sit on the node-local SSD,
+# unreplicated and unreadable. Always drain first:
+#   1. confirm 0 rows: SELECT count(*) FROM cephor_replication_status
+#        WHERE node_id = '<node>' AND status IN ('pending','draining');
+#   2. THEN delete the stanza here.
+#
+# (These are partial Node objects: the apply owns only metadata.labels.<our key> and
+# leaves all other node fields untouched. Requires the deploy identity to patch nodes.)
+# node1 is intentionally NOT a staging ingest node: it runs at its ~110-pod cap, so the
 # per-node drain-agent can't schedule there (Pending), which blocks the DaemonSet's
-# rolling update of the other nodes. Ingest set = node2, node3.
+# rolling update of the other nodes. Staging ingest set = node2, node3.
 apiVersion: v1
 kind: Node
 metadata:
