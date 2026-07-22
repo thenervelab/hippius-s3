@@ -11,9 +11,13 @@ resources:
   - postgres-objectstore.yaml
   # s3-2.0 trial: node-local-SSD ingest tier (see README-local-ingest-trial.md).
   # Uses a hostPath (DirectoryOrCreate) volume — no PV/PVC, no manual node prep.
-  # ingest-node-labels-staging.yaml is the ONE list of ingest nodes: applying it
-  # labels them s3-staging-local-ingest=true, which api-local + the drain agent select.
-  - ingest-node-labels-staging.yaml
+  #
+  # ingest-node-labels-staging.yaml is the ONE list of ingest nodes, but it is
+  # DELIBERATELY NOT listed here. This overlay is applied client-side, which prunes any
+  # label absent from the manifest — and prod declares the same Node objects, so the two
+  # deploys deleted each other's ingest label (2026-07-22: cost prod 243 stranded parts).
+  # The workflow applies that file in its own server-side step with a dedicated
+  # --field-manager, which scopes ownership to our label key. Do not re-add it here.
   - api-local-deployments-staging.yaml
   # The hippius-drain stack: the singleton allocator (also the cephor_* schema owner)
   # and the per-ingest-node drain agent DaemonSet. Both use the `drain` image.
