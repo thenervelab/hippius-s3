@@ -133,11 +133,15 @@ spec:
             - name: kms-certs
               mountPath: /kms_certs
               readOnly: true
+          # This DaemonSet rolls strictly serially (maxSurge 0 / maxUnavailable 1), so every
+          # second of startup gating is multiplied by the ingest node count. failureThreshold
+          # x periodSeconds already grants 200s for a slow start; a long initialDelay adds
+          # nothing but dead time and blew the deploy's rollout timeout at 5 nodes.
           startupProbe:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 120
+            initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 20

@@ -179,6 +179,26 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build-images, build-drain]
     environment: production
+    # Serialize against the staging deploy: both target the SAME cluster and the same
+    # shared ingest nodes. On 2026-07-22 they ran simultaneously and collided twice — the
+    # ingest-label flap that stranded 243 parts, and a db-migrations "field is immutable"
+    # race when one run recreated the Job between the other's delete and apply. Server-side
+    # apply fixes the label symptom; this fixes the cause.
+    #
+    # The group string is REPO-SCOPED and must stay byte-identical to the one in
+    # staging-deploy.yaml — that shared string is the whole mechanism. Changing it in one
+    # file silently un-serializes the two environments.
+    #
+    # queue: max (GA 2026-05-07) is load-bearing, not decoration. The default queue:single
+    # allows only ONE pending run per group and CANCELS it when a third arrives — a prod
+    # deploy would be silently dropped. queue:max queues up to 100 FIFO instead. It cannot
+    # be combined with cancel-in-progress: true (workflow validation error).
+    #
+    # Cost: an urgent prod deploy can now wait behind a staging run. Keep deploys short.
+    concurrency:
+      group: hippius-s3-cluster-deploy
+      cancel-in-progress: false
+      queue: max
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -283,6 +303,25 @@ jobs:
         run: |
           kubectl apply -f k8s/redis-cluster/production.yaml
 
+      # Applied server-side in its own step — NOT folded into `apply -k` below — so prod
+      # and staging cannot prune each other's node label. Client-side apply does prune it:
+      # on 2026-07-22 a staging deploy stripped s3-prod-local-ingest from node2/node3 and
+      # stranded 243 prod parts, then a prod deploy stripped s3-staging-local-ingest back
+      # and took staging's ingest tier to 0. Full rationale + the retire-a-node checklist
+      # live in the manifest header.
+      - name: Label ingest nodes (server-side)
+        run: |
+          kubectl apply --server-side --force-conflicts \
+            --field-manager=hippius-s3-prod-ingest-labels \
+            -f k8s/production/ingest-node-labels-production.yaml
+          # Drop the pre-SSA client-side-apply record. Server-side apply does NOT clear it,
+          # and node1/node4/node5 still carry one listing s3-prod-local-ingest. While it
+          # survives, a stray `kubectl apply -f` on this file WITHOUT --server-side (old
+          # runbook, muscle memory) would resurrect the exact prune-on-apply behaviour this
+          # step exists to prevent. Idempotent: a no-op on every deploy once it is gone.
+          kubectl annotate node -l s3-prod-local-ingest=true \
+            kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
+
       - name: Deploy to production
         run: |
           kubectl apply -k k8s/production
@@ -309,8 +348,21 @@ jobs:
           # ran at 60% capacity for two hours with nothing alerting.
           ingest_expected=$(grep -c '^kind: Node' k8s/production/ingest-node-labels-production.yaml 2>/dev/null || true)
           ingest_expected=${ingest_expected:-0}
+          # Poll, don't sample once: `rollout status` can return before the final pod flips
+          # Ready, and a single instantaneous read would then fail an otherwise-good deploy.
+          # This is NOT a weakening — the absolute threshold below is unchanged, the check
+          # just gets up to 60s to be satisfied. (For the record: this guard has never
+          # false-positived. On 2026-07-22 it correctly caught a real 3/5 after staging's
+          # deploy stripped the label from two nodes. Do not relax the threshold itself.)
           assert_ingest_tier() {
             ready=$(kubectl get ds "$1" -n "$ns" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+            if [ "${ingest_expected:-0}" -gt 0 ]; then
+              for _ in $(seq 1 12); do
+                [ "${ready:-0}" -ge "${ingest_expected}" ] && break
+                sleep 5
+                ready=$(kubectl get ds "$1" -n "$ns" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+              done
+            fi
             echo "$1 Ready=${ready:-0}/${ingest_expected} labelled ingest nodes"
             if [ "${ingest_expected:-0}" -gt 0 ] && [ "${ready:-0}" -lt "${ingest_expected}" ]; then
               echo "::error::$1 Ready ${ready:-0}/${ingest_expected} — ingest tier degraded. Verify every node in ingest-node-labels-production.yaml still carries s3-prod-local-ingest=true."
@@ -327,8 +379,12 @@ jobs:
           # in place, so the old Deployment/api-local lingers after the first DaemonSet apply and
           # both would serve behind app=api-local. Delete AFTER the DaemonSet is Ready (no capacity
           # dip); idempotent — a no-op on every deploy after the conversion lands.
+          # 20m, not 10m: this DaemonSet rolls one node at a time (maxSurge 0), so the wall clock
+          # is per-pod startup x ingest node count and grows every time the tier does. 10m was
+          # already marginal at 5 nodes and timed out mid-roll on 2026-07-22 with the deploy
+          # otherwise healthy.
           if kubectl get daemonset/api-local -n "$ns" >/dev/null 2>&1; then
-            kubectl rollout status daemonset/api-local -n "$ns" --timeout=10m
+            kubectl rollout status daemonset/api-local -n "$ns" --timeout=20m
             kubectl delete deployment/api-local -n "$ns" --ignore-not-found=true
             assert_ingest_tier api-local
           else
@@ -346,7 +402,10 @@ jobs:
           # class ensures the agent can preempt for a slot, so a partial roll is a real problem now.
           # Require drain-agent numberReady == desiredNumberScheduled AND >= the api-local node count.
           if kubectl get ds/drain-agent -n "$ns" >/dev/null 2>&1; then
-            kubectl rollout status daemonset/drain-agent -n "$ns" --timeout=10m || true
+            # 20m for the same per-node-serial reason as api-local. The `|| true` means a timeout
+            # here does not fail directly — it falls through to the ready-count check below, which
+            # would then report a "partial roll" that is really just a roll still in progress.
+            kubectl rollout status daemonset/drain-agent -n "$ns" --timeout=20m || true
             ready=$(kubectl get ds drain-agent -n "$ns" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
             desired=$(kubectl get ds drain-agent -n "$ns" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
             apiloc=$(kubectl get pods -l app=api-local -n "$ns" --field-selector=status.phase=Running -o json 2>/dev/null | jq -r '[.items[].spec.nodeName]|unique|length' 2>/dev/null || echo 0)
