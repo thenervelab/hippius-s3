@@ -300,31 +300,64 @@ jobs:
               echo "deployment/$1 absent — skipping"
             fi
           }
+          # Absolute size of the ingest tier, from the Node stanzas in the label file — the
+          # declarative source of truth for `s3-prod-local-ingest=true`. Both api-local and
+          # drain-agent are DaemonSets over that label, so a Ready count below it means the tier
+          # is serving degraded. This is deliberately an ABSOLUTE check: the drain-agent-vs-api-local
+          # test below only catches ASYMMETRY, and on 2026-07-22 the label was pulled from two nodes,
+          # shrinking BOTH DaemonSets to 3 together — that test passed (3==3, 3>=3) while the tier
+          # ran at 60% capacity for two hours with nothing alerting.
+          ingest_expected=$(grep -c '^kind: Node' k8s/production/ingest-node-labels-production.yaml 2>/dev/null || true)
+          ingest_expected=${ingest_expected:-0}
+          assert_ingest_tier() {
+            ready=$(kubectl get ds "$1" -n "$ns" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+            echo "$1 Ready=${ready:-0}/${ingest_expected} labelled ingest nodes"
+            if [ "${ingest_expected:-0}" -gt 0 ] && [ "${ready:-0}" -lt "${ingest_expected}" ]; then
+              echo "::error::$1 Ready ${ready:-0}/${ingest_expected} — ingest tier degraded. Verify every node in ingest-node-labels-production.yaml still carries s3-prod-local-ingest=true."
+              kubectl get nodes -l s3-prod-local-ingest=true || true
+              kubectl get pods -l app="$1" -n "$ns" -o wide || true
+              exit 1
+            fi
+          }
           kubectl rollout status deployment/gateway -n "$ns" --timeout=10m
           # api (monolith / hybrid base) and api-local (drain-direct) — whichever exist.
           wait_deploy api 10m
-          wait_deploy api-local 10m
+          # api-local is a DaemonSet (one pod per ingest node). Wait on it, then prune the
+          # pre-DaemonSet Deployment of the same name: kustomize can't change a resource's kind
+          # in place, so the old Deployment/api-local lingers after the first DaemonSet apply and
+          # both would serve behind app=api-local. Delete AFTER the DaemonSet is Ready (no capacity
+          # dip); idempotent — a no-op on every deploy after the conversion lands.
+          if kubectl get daemonset/api-local -n "$ns" >/dev/null 2>&1; then
+            kubectl rollout status daemonset/api-local -n "$ns" --timeout=10m
+            kubectl delete deployment/api-local -n "$ns" --ignore-not-found=true
+            assert_ingest_tier api-local
+          else
+            wait_deploy api-local 10m
+          fi
           kubectl rollout status deployment/arion-downloader -n "$ns" --timeout=10m
           kubectl rollout status deployment/arion-uploader -n "$ns" --timeout=10m
           # Drain stack (allocator-first: it applies the cephor_* migrations on startup). Present
           # only once the drain block is uncommented in kustomization.yaml (at cutover).
           wait_deploy drain-allocator 5m
           wait_deploy mpu-reaper 5m
-          # drain-agent is a DaemonSet: a labeled node at pod capacity legitimately can't host its
-          # pod, which must not fail the deploy. Require >= 1 Ready; warn on a partial roll, fail on
-          # zero. Skip entirely if the DaemonSet isn't deployed yet.
+          # drain-agent is a DaemonSet that MUST cover every node running api-local: a node with
+          # api-local but no drain-agent silently drops that node's uploads (never drained) — peer
+          # review B3. A partial roll is therefore a FAILURE, not a warning. The s3-ingest-priority
+          # class ensures the agent can preempt for a slot, so a partial roll is a real problem now.
+          # Require drain-agent numberReady == desiredNumberScheduled AND >= the api-local node count.
           if kubectl get ds/drain-agent -n "$ns" >/dev/null 2>&1; then
-            if ! kubectl rollout status daemonset/drain-agent -n "$ns" --timeout=5m; then
-              ready=$(kubectl get ds drain-agent -n "$ns" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
-              desired=$(kubectl get ds drain-agent -n "$ns" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
-              if [ "${ready:-0}" -ge 1 ]; then
-                echo "::warning::drain-agent rolled ${ready}/${desired} (a labeled node likely at pod capacity); proceeding"
-              else
-                echo "::error::drain-agent has 0 Ready pods after 5m — rollout genuinely failed"
-                kubectl get pods -l app=drain-agent -n "$ns" -o wide || true
-                exit 1
-              fi
+            kubectl rollout status daemonset/drain-agent -n "$ns" --timeout=10m || true
+            ready=$(kubectl get ds drain-agent -n "$ns" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+            desired=$(kubectl get ds drain-agent -n "$ns" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
+            apiloc=$(kubectl get pods -l app=api-local -n "$ns" --field-selector=status.phase=Running -o json 2>/dev/null | jq -r '[.items[].spec.nodeName]|unique|length' 2>/dev/null || echo 0)
+            echo "drain-agent ready=${ready}/${desired}; api-local nodes=${apiloc}"
+            if [ "${ready:-0}" -lt "${desired:-1}" ] || [ "${ready:-0}" -lt "${apiloc:-0}" ]; then
+              echo "::error::drain-agent partial (${ready}/${desired}, api-local on ${apiloc} nodes) — a node runs api-local with NO drain-agent (dark uploads). FAILING the deploy."
+              kubectl get pods -l app=drain-agent -n "$ns" -o wide || true
+              exit 1
             fi
+            echo "drain-agent covers every api-local node ✅"
+            assert_ingest_tier drain-agent
           else
             echo "daemonset/drain-agent absent — drain block not yet enabled; skipping"
           fi
