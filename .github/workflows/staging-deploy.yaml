@@ -279,7 +279,13 @@ jobs:
 
       - name: Delete old migration job
         run: |
-          kubectl delete job db-migrations -n hippius-s3-staging --ignore-not-found=true
+          # A Job's spec.template is immutable, so `apply -k` re-creating db-migrations with a new image
+          # tag over an existing (or still-terminating) Job fails with "spec.template ... field is
+          # immutable". Plain `kubectl delete` can return while the Job is still terminating (its pods
+          # carry the batch.kubernetes.io/job-tracking finalizer), so the very next `apply` races it.
+          # Delete AND wait for the object to be fully gone before applying.
+          kubectl delete job db-migrations -n hippius-s3-staging --ignore-not-found=true --wait=true --timeout=120s
+          kubectl wait --for=delete job/db-migrations -n hippius-s3-staging --timeout=120s 2>/dev/null || true
 
       - name: Deploy Redis cluster
         run: |
