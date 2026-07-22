@@ -23,8 +23,8 @@ use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
     BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, NodeId, NodeObservation,
-    PartReplicationStore, ReclaimError, SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate, jittered,
-    reclaim_ssd, reconcile_parts,
+    PartReplicationStore, ReclaimError, ReclaimGraces, SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate,
+    jittered, reclaim_ssd, reconcile_parts,
 };
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -287,8 +287,8 @@ async fn heartbeat_once(ssd: &LocalSsd, store: &Store, coord: &Coordinator, node
 /// Reclaim and sweep errors are logged and skipped; the next tick retries, and no part
 /// is ever removed without a successful status read (fail-safe). The store is both the
 /// replication log and the object-backing log for the reclaim.
-async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, grace: Duration, orphan_grace: Duration, replicated_grace: Duration) {
-    match reclaim_ssd(ssd, ssd, store, store, grace, orphan_grace, replicated_grace).await {
+async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, graces: ReclaimGraces) {
+    match reclaim_ssd(ssd, ssd, store, store, graces).await {
         Ok(report) => {
             // All three dispositions free SSD bytes, so the reclaimed gauge counts their sum.
             snapshot.record_reclaimed(report.reclaimed + report.reclaimed_orphan + report.reclaimed_replicated);
@@ -346,7 +346,7 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
         Err(err) => tracing::warn!(error = ?err, "ssd reclaim cycle failed; will retry next poll"),
     }
 
-    match ssd.sweep_orphan_tmp(grace).await {
+    match ssd.sweep_orphan_tmp(graces.failed).await {
         Ok(0) => {}
         Ok(removed) => tracing::info!(removed, "swept orphan SSD write-temps"),
         Err(err) => tracing::warn!(error = %err, "orphan-temp sweep failed; will retry next poll"),
@@ -647,15 +647,17 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
         // abandoned-upload junk does not accumulate on the node-local disk.
         let (ssd, store, snapshot) = (Arc::clone(&self.ssd), Arc::clone(&self.store), Arc::clone(&self.snapshot));
         let reclaim_poll = self.config.reclaim_poll;
-        let reclaim_grace = self.config.reclaim_grace;
-        let orphan_reclaim_grace = self.config.orphan_reclaim_grace;
-        let replicated_reclaim_grace = self.config.replicated_reclaim_grace;
+        let reclaim_graces = ReclaimGraces {
+            failed: self.config.reclaim_grace,
+            orphan: self.config.orphan_reclaim_grace,
+            replicated: self.config.replicated_reclaim_grace,
+        };
         let redrive_max_attempts = self.config.redrive_max_attempts;
         supervisor.spawn(WorkerName::new("ssd_reclaim"), move |token| {
             run_periodic(token, reclaim_poll, move || {
                 let (ssd, store, snapshot) = (Arc::clone(&ssd), Arc::clone(&store), Arc::clone(&snapshot));
                 async move {
-                    reclaim_once(&ssd, &store, &snapshot, reclaim_grace, orphan_reclaim_grace, replicated_reclaim_grace).await;
+                    reclaim_once(&ssd, &store, &snapshot, reclaim_graces).await;
                     // R4 re-drive: reset bounded `corrupt` parts to `pending` for a fresh copy,
                     // then publish the held-corrupt gauge. Same cadence as reclaim (both are the
                     // node-local SSD lifecycle); errors log and retry next poll (fail-safe).
@@ -769,8 +771,8 @@ mod tests {
     use crate::supervisor::ShutdownTrigger;
     use core::str::FromStr;
     use hippius_drain_core::{
-        Allocation, ByteRate, Bytes, Clock, CoordError, Coordinator, NodeId, ObjectId, PartKey, PartNumber, PartReplicationStore, ReplicationState,
-        SnapshotCell, Store, StoredAllocation, TestClock, UploadEnqueuer, Version,
+        Allocation, ByteRate, Bytes, Clock, CoordError, Coordinator, NodeId, ObjectId, PartKey, PartNumber, PartReplicationStore, ReclaimGraces,
+        ReplicationState, SnapshotCell, Store, StoredAllocation, TestClock, UploadEnqueuer, Version,
     };
 
     /// A coordinator on the test Redis under a per-test prefix, or `None` to skip the
@@ -1306,9 +1308,11 @@ mod tests {
             &ssd,
             &store,
             &snapshot,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            Duration::from_hours(24),
+            ReclaimGraces {
+                failed: Duration::from_secs(1),
+                orphan: Duration::from_secs(1),
+                replicated: Duration::from_hours(24),
+            },
         )
         .await;
 
@@ -1350,9 +1354,11 @@ mod tests {
             &ssd,
             &store,
             &snapshot,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            Duration::from_secs(1),
+            ReclaimGraces {
+                failed: Duration::from_secs(1),
+                orphan: Duration::from_secs(1),
+                replicated: Duration::from_secs(1),
+            },
         )
         .await;
 
@@ -1385,7 +1391,17 @@ mod tests {
 
         let ssd = LocalSsd::new(ssd_dir.path());
         // Zero grace so the just-written temp is past the (no-)window.
-        super::reclaim_once(&ssd, &store, &snapshot, Duration::ZERO, Duration::ZERO, Duration::from_hours(24)).await;
+        super::reclaim_once(
+            &ssd,
+            &store,
+            &snapshot,
+            ReclaimGraces {
+                failed: Duration::ZERO,
+                orphan: Duration::ZERO,
+                replicated: Duration::from_hours(24),
+            },
+        )
+        .await;
 
         assert!(!orphan.exists(), "reclaim_once swept the orphan temp");
         assert_eq!(snapshot.load().reclaimed, 0, "no failed part -> nothing reclaimed, only the temp swept");
@@ -1419,9 +1435,11 @@ mod tests {
             &ssd,
             &store,
             &snapshot,
-            Duration::from_secs(1),
-            Duration::from_hours(1),
-            Duration::from_hours(24),
+            ReclaimGraces {
+                failed: Duration::from_secs(1),
+                orphan: Duration::from_hours(1),
+                replicated: Duration::from_hours(24),
+            },
         )
         .await;
 
@@ -1459,9 +1477,11 @@ mod tests {
             &ssd,
             &store,
             &snapshot,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            Duration::from_hours(24),
+            ReclaimGraces {
+                failed: Duration::from_secs(1),
+                orphan: Duration::from_secs(1),
+                replicated: Duration::from_hours(24),
+            },
         )
         .await;
 
@@ -1495,9 +1515,11 @@ mod tests {
             &ssd,
             &store,
             &snapshot,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            Duration::from_hours(24),
+            ReclaimGraces {
+                failed: Duration::from_secs(1),
+                orphan: Duration::from_secs(1),
+                replicated: Duration::from_hours(24),
+            },
         )
         .await;
 
