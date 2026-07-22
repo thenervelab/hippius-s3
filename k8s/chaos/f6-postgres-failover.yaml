@@ -1,0 +1,20 @@
+# F6 — Postgres failover.
+# Kills the CNPG primary so the cluster promotes a replica. Gate: allocator LEADERSHIP is unaffected
+# (coordination is Redis, not PG) and the Ceph breaker is NOT tripped by a PG-only fault (the fix
+# must not conflate a PG error with a pool-write fault); queries recover ≤20s, backlog drains ≤10min.
+# CNPG labels the primary pod `cnpg.io/instanceRole: primary` in cluster `postgres`.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: f6-postgres-primary-kill
+  namespace: hippius-s3-staging
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces:
+      - hippius-s3-staging
+    labelSelectors:
+      cnpg.io/cluster: postgres
+      cnpg.io/instanceRole: primary
+  gracePeriod: 0

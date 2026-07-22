@@ -29,6 +29,17 @@ os.environ["HIPPIUS_BYPASS_CREDIT_CHECK"] = "true"
 os.environ["ENABLE_BANHAMMER"] = "false"
 
 
+@pytest.fixture(autouse=True)
+def _reset_config_singleton() -> Any:
+    # get_config() is memoized; drop the cached instance around every test so env mutations
+    # don't leak across cases (see hippius_s3/config.reset_config).
+    from hippius_s3 import config as _config
+
+    _config.reset_config()
+    yield
+    _config.reset_config()
+
+
 @pytest.fixture
 def test_run_id() -> str:
     """Short unique ID for this integration test run (mirrors e2e semantics)."""
@@ -97,7 +108,7 @@ def _mock_access_key_auth(
     box = SecretBox(bytes.fromhex(key_hex))
     encrypted_secret = base64.b64encode(box.encrypt(test_access_key_secret.encode())).decode()
 
-    async def _fake_cached_auth(access_key: str, redis_client: Any) -> TokenAuthResponse:
+    async def _fake_cached_auth(access_key: str, redis_client: Any, api_client: Any = None) -> TokenAuthResponse:
         if access_key != test_access_key:
             return TokenAuthResponse(valid=False, status="invalid")
         return TokenAuthResponse(
@@ -397,3 +408,30 @@ async def gateway_client_no_auth(gateway_app_no_auth: Any) -> AsyncGenerator[Asy
     transport = ASGITransport(app=gateway_app_no_auth)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
+
+
+@pytest_asyncio.fixture
+async def pg_conn() -> AsyncGenerator[asyncpg.Connection, None]:
+    """A live Postgres connection on DATABASE_URL; skips the test if none is reachable."""
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        pytest.skip("DATABASE_URL not set; skipping live-schema check")
+    try:
+        conn = await asyncpg.connect(dsn=dsn)
+    except (OSError, asyncpg.PostgresError) as exc:
+        pytest.skip(f"Postgres unreachable on DATABASE_URL: {exc}")
+    try:
+        yield conn
+    finally:
+        await conn.close()
+
+
+@pytest_asyncio.fixture
+async def pg_tx(pg_conn: asyncpg.Connection) -> AsyncGenerator[asyncpg.Connection, None]:
+    """A pg_conn wrapped in a transaction that is always rolled back, so seeded rows never persist."""
+    tr = pg_conn.transaction()
+    await tr.start()
+    try:
+        yield pg_conn
+    finally:
+        await tr.rollback()

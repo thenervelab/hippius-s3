@@ -84,3 +84,8 @@ CLAUDE.md
 
 # Rust (workspace at repo root; Cargo.lock is committed for the binary crates)
 /target/
+stress-test/results/
+
+# hippius-mem embeddings model cache (local, never commit)
+.fastembed_cache/
+drainer-optimisations.md

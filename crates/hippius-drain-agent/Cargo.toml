@@ -1,0 +1,44 @@
+[package]
+name = "hippius-drain-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "cephor per-node drain daemon (runs as a DaemonSet on each ingest SSD node)"
+
+# `otel` (on by default) exports drain metrics via OTLP; `--no-default-features` yields a
+# dependency-light build with no exporter.
+[features]
+default = ["otel"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+
+# The daemon talks to Postgres for the durable drain state (`pg`) and to the
+# Redis-backed coordinator for heartbeats + allocation pulls (`coord`).
+[dependencies]
+hippius-drain-core = { workspace = true, features = ["pg", "coord"] }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tokio-util = { workspace = true }
+redis = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+nix = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# `test-util` brings in hippius-drain-core's TestClock for the clock-injection tests
+# (Cargo unifies this with the normal `pg` dependency above).
+hippius-drain-core = { workspace = true, features = ["pg", "coord", "test-util"] }
+tempfile = { workspace = true }
+proptest = { workspace = true }
+# For `#[sqlx::test]` against a real Postgres (migrations come from hippius-drain-core).
+sqlx = { workspace = true }
+
+[lints]
+workspace = true

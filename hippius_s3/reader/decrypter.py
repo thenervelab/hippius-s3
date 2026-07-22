@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from hippius_s3.services.crypto_pool import run_crypto
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.storage_version import require_supported_storage_version
 
@@ -24,7 +25,12 @@ async def decrypt_chunk_if_needed(
     if key_bytes is None:
         raise RuntimeError("decrypt_key_missing")
 
-    return CryptoService.decrypt_chunk(
+    # RD-2: offload the AES-GCM decrypt to the dedicated crypto pool so a ~4 MiB decrypt doesn't
+    # head-of-line-block every other request on this worker. cryptography releases the GIL, so this
+    # yields real parallelism; the streamer still awaits chunks in plan order, so emit order is
+    # unchanged and an auth-tag failure still propagates to break the stream.
+    return await run_crypto(
+        CryptoService.decrypt_chunk,
         cbytes,
         object_id=object_id,
         part_number=int(part_number),

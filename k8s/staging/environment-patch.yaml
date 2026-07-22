@@ -6,3 +6,8 @@ data:
   ENVIRONMENT: "staging"
   OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=staging,service.namespace=hippius-s3-staging"
   SENTRY_DSN: "SENTRY_DSN_PLACEHOLDER"
+  # RQ-1 trial: one pub/sub subscription per stream instead of per-chunk (PR #279).
+  # Only the internal `api` pods read this (streamer/object_reader). No effect until
+  # #279's code lands. Flip to "false" to disable before this promotes to prod if the
+  # staging trial regresses (see the lost fast-fail-503 caveat in the #279 review).
+  HIPPIUS_STREAM_SINGLE_SUBSCRIPTION: "true"

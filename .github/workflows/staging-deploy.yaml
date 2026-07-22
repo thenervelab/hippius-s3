@@ -110,16 +110,101 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  rust-gate:
+    # Block the drain image build (and thus the deploy) on the Rust quality gates
+    # (audit F2). Fast checks only -- fmt + clippy + supply chain; the full
+    # Postgres-backed test suite runs in the PR workflow (test-and-lint.yml).
+    name: Rust gate (fmt, clippy, cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo-deny check
+        run: cargo deny check
+
+  build-drain:
+    # The hippius-drain Rust binaries (agent + allocator) ship as one `drain` image.
+    # It is a self-contained Cargo workspace, so it needs no base image. Gated on
+    # rust-gate so a clippy/fmt/advisory failure blocks building+deploying the drain.
+    needs: rust-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/drain
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=latest
+
+      - name: Build and push drain image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.drain
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   deploy-staging:
     runs-on: ubuntu-latest
-    needs: build-images
+    needs: [build-images, build-drain]
     environment: staging
+    # Serialize against the production deploy: both target the SAME cluster and share
+    # ingest nodes node2/node3. On 2026-07-22 they ran simultaneously and collided twice —
+    # the ingest-label flap that stranded 243 prod parts, and a db-migrations "field is
+    # immutable" race when one run recreated the Job between the other's delete and apply.
+    # Server-side apply fixes the label symptom; this fixes the cause.
+    #
+    # The group string is REPO-SCOPED and must stay byte-identical to the one in
+    # production-deploy.yaml — that shared string is the whole mechanism. Changing it in
+    # one file silently un-serializes the two environments.
+    #
+    # queue: max (GA 2026-05-07) is load-bearing, not decoration. The default queue:single
+    # allows only ONE pending run per group and CANCELS it when a third arrives — a deploy
+    # would be silently dropped. queue:max queues up to 100 FIFO instead. It cannot be
+    # combined with cancel-in-progress: true (workflow validation error).
+    concurrency:
+      group: hippius-s3-cluster-deploy
+      cancel-in-progress: false
+      queue: max
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up kubectl
         uses: azure/setup-kubectl@v3
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
 
       - name: Configure kubeconfig
         run: |
@@ -207,26 +292,106 @@ jobs:
           kustomize edit set image \
             ghcr.io/thenervelab/hippius-s3/api:${SHORT_SHA} \
             ghcr.io/thenervelab/hippius-s3/gateway:${SHORT_SHA} \
-            ghcr.io/thenervelab/hippius-s3/workers:${SHORT_SHA}
+            ghcr.io/thenervelab/hippius-s3/workers:${SHORT_SHA} \
+            ghcr.io/thenervelab/hippius-s3/drain:${SHORT_SHA}
 
       - name: Delete old migration job
         run: |
-          kubectl delete job db-migrations -n hippius-s3-staging --ignore-not-found=true
+          # A Job's spec.template is immutable, so `apply -k` re-creating db-migrations with a new image
+          # tag over an existing (or still-terminating) Job fails with "spec.template ... field is
+          # immutable". Plain `kubectl delete` can return while the Job is still terminating (its pods
+          # carry the batch.kubernetes.io/job-tracking finalizer), so the very next `apply` races it.
+          # Delete AND wait for the object to be fully gone before applying.
+          kubectl delete job db-migrations -n hippius-s3-staging --ignore-not-found=true --wait=true --timeout=120s
+          kubectl wait --for=delete job/db-migrations -n hippius-s3-staging --timeout=120s 2>/dev/null || true
 
       - name: Deploy Redis cluster
         run: |
           kubectl apply -f k8s/redis-cluster/staging.yaml
 
+      # Applied server-side in its own step — NOT folded into `apply -k` below — so prod
+      # and staging cannot prune each other's node label (client-side apply does; on
+      # 2026-07-22 that stranded 243 prod parts). Must run BEFORE the overlay so
+      # api-local and drain-agent find labelled nodes on the first apply. Full rationale
+      # + the retire-a-node checklist: the manifest header.
+      - name: Label ingest nodes (server-side)
+        run: |
+          kubectl apply --server-side --force-conflicts \
+            --field-manager=hippius-s3-staging-ingest-labels \
+            -f k8s/staging/ingest-node-labels-staging.yaml
+          # Drop any pre-SSA client-side-apply record. Server-side apply does NOT clear it,
+          # and while one survives, a stray `kubectl apply -f` on this file WITHOUT
+          # --server-side (old runbook, muscle memory) would resurrect the prune-on-apply
+          # behaviour this step exists to prevent. Currently a no-op on node2/node3 — kept
+          # for symmetry with production-deploy.yaml and to stay safe if one reappears.
+          kubectl annotate node -l s3-staging-local-ingest=true \
+            kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
+
       - name: Deploy to staging
         run: |
           kubectl apply -k k8s/staging
+
+      # STAGING ONLY — the drain chaos matrix (stress-test/faults/) needs Chaos Mesh + toxiproxy.
+      # Chaos Mesh is namespace-scoped to hippius-s3-staging (clusterScoped=false + targetNamespace),
+      # so it can never inject into hippius-s3-prod on the shared cluster. See k8s/chaos-testing/.
+      # This step exists ONLY in the staging workflow; production-deploy.yaml installs none of it.
+      - name: Deploy chaos-testing tooling (staging-only)
+        run: |
+          helm repo add chaos-mesh https://charts.chaos-mesh.org
+          helm repo update chaos-mesh
+          # NO --wait: chaos-daemon is a DaemonSet that legitimately can't schedule on a node already
+          # at pod capacity, so a partial roll must not fail the deploy (same rationale as the
+          # drain-agent handling below). helm returning after apply is sufficient; the patches below
+          # are idempotent and the controller reconciles asynchronously.
+          # ENABLE_FILTER_NAMESPACE=false is set via the values file (the chart honours it), so no
+          # kubectl patch of the chart-managed Deployment is needed — that is deliberate: patching the
+          # Deployment with kubectl creates a field-manager that conflicts with the next helm upgrade
+          # (helm 4 uses server-side apply). Only standalone resources are applied alongside helm.
+          helm upgrade --install chaos-mesh chaos-mesh/chaos-mesh \
+            --namespace hippius-s3-staging --version 2.7.3 \
+            -f k8s/chaos-testing/chaos-mesh.values.yaml --timeout 5m
+          # Two standalone objects complete the working install (both idempotent, neither touches the
+          # helm-managed Deployment): (1) allow the apiserver to reach the webhook — the ns
+          # `allow-internal` NetworkPolicy otherwise drops it and every chaos CRD create fails
+          # fail-closed; (2) the one cluster-scoped read the namespaced controller needs to start.
+          kubectl apply -f k8s/chaos-testing/webhook-networkpolicy.yaml
+          kubectl apply -f k8s/chaos-testing/remotecluster-rbac.yaml
+          kubectl apply -f k8s/chaos-testing/toxiproxy.yaml
 
       - name: Wait for rollout
         run: |
           kubectl rollout status deployment/gateway -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/api -n hippius-s3-staging --timeout=10m
+          # api-local is a DaemonSet (one pod per ingest node). Wait on it, then prune the
+          # pre-DaemonSet Deployment of the same name: kustomize can't change a resource's kind
+          # in place, so the old Deployment/api-local lingers after the first DaemonSet apply and
+          # both would serve behind app=api-local. Delete AFTER the DaemonSet is Ready (no capacity
+          # dip); idempotent — a no-op on every deploy after the conversion lands.
+          if kubectl get daemonset/api-local -n hippius-s3-staging >/dev/null 2>&1; then
+            kubectl rollout status daemonset/api-local -n hippius-s3-staging --timeout=10m
+            kubectl delete deployment/api-local -n hippius-s3-staging --ignore-not-found=true
+          fi
           kubectl rollout status deployment/arion-downloader -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/arion-uploader -n hippius-s3-staging --timeout=10m
+          # Drain stack, allocator-first: the allocator applies the cephor_* migrations
+          # on startup, so confirm it is Ready (strict) before the per-node agent DaemonSet.
+          kubectl rollout status deployment/drain-allocator -n hippius-s3-staging --timeout=5m
+          # The agent is a DaemonSet: a labeled node at pod capacity legitimately cannot
+          # host its pod, which must not fail the whole deploy. But a blanket `|| echo`
+          # swallowed *every* failure (image pull, CrashLoop, bad config) and reported
+          # green (audit F8). Instead: require >= 1 agent Ready; warn only when it's a
+          # partial roll (some labeled node unschedulable), fail when zero are Ready.
+          if ! kubectl rollout status daemonset/drain-agent -n hippius-s3-staging --timeout=5m; then
+            ready=$(kubectl get ds drain-agent -n hippius-s3-staging -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+            desired=$(kubectl get ds drain-agent -n hippius-s3-staging -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
+            if [ "${ready:-0}" -ge 1 ]; then
+              echo "::warning::drain-agent rolled ${ready}/${desired} (a labeled node is likely at pod capacity); proceeding"
+            else
+              echo "::error::drain-agent has 0 Ready pods after 5m — rollout genuinely failed"
+              kubectl get pods -l app=drain-agent -n hippius-s3-staging -o wide || true
+              exit 1
+            fi
+          fi
 
       - name: Restart external deployments
         run: |

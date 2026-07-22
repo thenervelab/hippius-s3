@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import uuid
 from datetime import datetime
@@ -20,8 +21,8 @@ from hippius_s3.config import get_config
 from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.utils import get_query
+from hippius_s3.writer.db import set_object_version_address
 from hippius_s3.writer.object_writer import ObjectWriter
-from hippius_s3.writer.queue import enqueue_upload as writer_enqueue_upload
 
 
 logger = logging.getLogger(__name__)
@@ -133,25 +134,12 @@ async def handle_put_object(
                 if meta_key not in {"append", "append-id", "append-if-version"}:
                     metadata[meta_key] = value
 
-        # Capture previous object (to clean up multipart parts if overwriting)
-        with tracer.start_as_current_span("put_object.check_existing_object") as span:
-            async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
-                prev = await conn.fetchrow(
-                    get_query("get_object_by_path"),
-                    bucket_id,
-                    object_key,
-                )
-            set_span_attributes(span, {"is_overwrite": prev is not None})
-
-        # Candidate object_id: DB may override on (bucket_id, object_key) conflict
-        # TODO: Make object identity/version allocation fully DB-atomic by removing this
-        #       pre-check and always passing a generated candidate UUID. The writer already
-        #       treats the DB-returned object_id/object_version as authoritative.
-        if prev:
-            candidate_object_id = str(prev["object_id"])
-            logger.debug(f"Reusing existing object_id {candidate_object_id} for overwrite")
-        else:
-            candidate_object_id = str(uuid.uuid4())
+        # Object identity/version allocation is DB-atomic: upsert_object_basic's
+        # `ON CONFLICT (bucket_id, object_key) ... RETURNING object_id` resolves the authoritative
+        # id, so we always pass a fresh candidate and use put_res.object_id downstream. Skipping the
+        # old get_object_by_path pre-check removes a DB round trip per PUT and closes a TOCTOU window
+        # (WU-3). Overwrites are handled by the upsert; nothing keys off the previous row here.
+        candidate_object_id = str(uuid.uuid4())
 
         # Use ObjectWriter streaming upsert/write (single-part)
         # Note: No transaction wrapper needed here. The upsert_object_basic query is atomic
@@ -195,25 +183,41 @@ async def handle_put_object(
 
         logger.info(f"PUT {bucket_name}/{object_key}: size={put_res.size_bytes}, md5={put_res.etag}")
 
-        # Only enqueue after DB state is persisted; use writer queue helper
+        # Drain-direct (s3-2.1 PR-11): the api does NOT enqueue the backend upload. It
+        # persists the main-account address; the Rust drain reads it and LPUSHes the
+        # UploadChainRequest itself once the part has replicated to ceph (so the uploader
+        # only ever dequeues ceph-ready data). The drain is the sole upload producer.
         with tracer.start_as_current_span(
-            "put_object.enqueue_upload",
+            "put_object.persist_upload_address",
             attributes={"upload_id": str(put_res.upload_id), "has_upload_id": True},
         ):
-            await writer_enqueue_upload(
-                address=request.state.account.main_account,
-                bucket_name=bucket_name,
-                object_key=object_key,
-                object_id=str(put_res.object_id),
-                object_version=int(put_res.object_version),
-                upload_id=str(put_res.upload_id),
-                chunk_ids=[1],
-                ray_id=getattr(request.state, "ray_id", "no-ray-id"),
-            )
+            try:
+                await set_object_version_address(
+                    request.app.state.postgres_pool,
+                    object_id=str(put_res.object_id),
+                    object_version=int(put_res.object_version),
+                    address=request.state.account.main_account,
+                )
+            except Exception:
+                # B4: the version was made serveable (size/md5 written) BEFORE the drain address
+                # landed. If the address write fails, a GET would serve an object the drain can
+                # never back (no address → never enqueued → never replicated) and the janitor can
+                # never evict (no chunk_backend). Mark it unserveable (the reserved-row shape) so
+                # reads skip it and the A21 sweep + SSD reclaim clean up its parts; then surface
+                # the failure (is_completed stays FALSE, so DELETE-cascade cleanup also applies).
+                with contextlib.suppress(Exception):
+                    async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
+                        await conn.execute(
+                            "UPDATE object_versions SET size_bytes = 0, md5_hash = '' "
+                            "WHERE object_id = $1 AND object_version = $2",
+                            str(put_res.object_id),
+                            int(put_res.object_version),
+                        )
+                raise
 
-        # Mark upload completed only AFTER a successful enqueue. If enqueue fails above, this is
+        # Mark upload completed only AFTER the address is persisted. If that fails above, this is
         # skipped so the row stays is_completed=FALSE and remains eligible for the DELETE cascade
-        # cleanup, rather than becoming a durably-"complete" object that was never queued for upload.
+        # cleanup, rather than becoming a durably-"complete" object the drain can't enqueue.
         async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
             await conn.execute(
                 "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",

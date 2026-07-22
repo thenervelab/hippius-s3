@@ -1,90 +1,12 @@
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: otel-collector-config
-data:
-  otel-config.yaml: |
-    receivers:
-      otlp:
-        protocols:
-          grpc:
-            endpoint: 0.0.0.0:4317
-          http:
-            endpoint: 0.0.0.0:4318
-
-    processors:
-      resource:
-        attributes:
-          # insert (not upsert) so a producer's own service.name (api/gateway via
-          # configure_otel, workers via OTEL_SERVICE_NAME, the Rust drain) survives;
-          # this only labels telemetry that arrives without a service.name.
-          #
-          # This file said `upsert` until 2026-07-17, which overwrote the name every
-          # service sets for itself and left service_name="hippius-s3" and
-          # exported_job="<ns>/hippius-s3" on EVERYTHING — api, gateway and workers
-          # indistinguishable in Prometheus, so alert rules had to match pod names
-          # (exported_instance=~"arion-downloader-.*"), which breaks on any rename.
-          # The traces pipeline has never had this processor, which is why Tempo always
-          # showed the right names.
-          #
-          # `insert` rather than deleting the processor outright: telemetry does arrive
-          # here with no service.name of its own (Loki carries an unknown_service
-          # stream), and that should still be labelled hippius-s3 rather than become
-          # anonymous. Live staging has run exactly this since before this change and
-          # its Loki streams show correct per-service names — this codifies that, since
-          # it had been hand-edited into the staging ConfigMap and never sent back here.
-          - key: service.name
-            value: "hippius-s3"
-            action: insert
-      batch:
-        timeout: 1s
-        send_batch_size: 1024
-      memory_limiter:
-        limit_mib: 768
-        spike_limit_mib: 128
-        check_interval: 1s
-
-    exporters:
-      prometheus:
-        endpoint: "0.0.0.0:8889"
-        send_timestamps: true
-        metric_expiration: 180m
-        enable_open_metrics: true
-        resource_to_telemetry_conversion:
-          enabled: true
-      otlp/tempo:
-        endpoint: tempo.monitoring.svc.cluster.local:4317
-        tls:
-          insecure: true
-        retry_on_failure:
-          enabled: true
-          max_elapsed_time: 300s
-        sending_queue:
-          enabled: true
-          num_consumers: 4
-          queue_size: 100
-      loki:
-        endpoint: http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push
-
-    extensions:
-      health_check:
-        endpoint: 0.0.0.0:13133
-
-    service:
-      extensions: [health_check]
-      pipelines:
-        metrics:
-          receivers: [otlp]
-          processors: [memory_limiter, resource, batch]
-          exporters: [prometheus]
-        traces:
-          receivers: [otlp]
-          processors: [memory_limiter, batch]
-          exporters: [otlp/tempo]
-        logs:
-          receivers: [otlp]
-          processors: [memory_limiter, resource, batch]
-          exporters: [loki]
+# The otel-collector ConfigMap is NOT here — it is generated from otel-config.yaml by the
+# configMapGenerator in kustomization.yaml, which appends a content hash to its name.
+# That hash is what makes a config change actually take effect: the collector reads its
+# config ONCE at startup, and with a fixed ConfigMap name `kubectl apply -k` updates the
+# ConfigMap while leaving the running pod untouched. Prod sat 37 days on a stale config
+# that way (pod started 2026-06-15, ConfigMap last applied 2026-07-22), silently forcing
+# service.name=hippius-s3 onto every workload because the loaded copy still said `upsert`.
+# With the hash in the name, changing otel-config.yaml renames the ConfigMap, which changes
+# the volume reference, which rolls the pod. Do not pin the name back.
 ---
 apiVersion: apps/v1
 kind: Deployment

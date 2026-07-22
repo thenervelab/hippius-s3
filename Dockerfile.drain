@@ -1,0 +1,56 @@
+# Multi-stage build for the hippius-drain Rust binaries (agent + allocator).
+#
+# Unlike the api/gateway/workers images (which layer on Dockerfile.base), the drain
+# is a self-contained Cargo workspace under crates/, so this builds from the upstream
+# Rust image directly. Build context = repo root (the workspace Cargo.toml, Cargo.lock,
+# rust-toolchain.toml and crates/ all live there). One image carries BOTH binaries; the
+# k8s manifests choose the entrypoint (allocator Deployment vs agent DaemonSet) via
+# `command:`.
+
+# ---- builder ----
+FROM rust:1.95.0-slim-bookworm AS builder
+WORKDIR /build
+
+# build-essential covers any transitive build script needing a C toolchain/linker.
+# No TLS/openssl dev libs: the allocator's ceph-mgr probe is plain HTTP (reqwest is
+# built default-features-off, no TLS backend), and sha2/nix are pure-Rust + libc-link.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin the exact toolchain the workspace declares before any cargo invocation.
+COPY rust-toolchain.toml ./
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# Build the two release binaries. The store uses runtime sqlx queries and embeds its
+# migrations via sqlx::migrate!, so NO database and NO .sqlx offline cache are needed
+# at build time. BuildKit cache mounts persist the cargo registry + target dir across
+# builds; the binaries are copied out within the same RUN (the cache mount is gone once
+# the layer finishes).
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --locked \
+        -p hippius-drain-agent -p hippius-drain-allocator \
+    && cp target/release/hippius-drain-agent target/release/hippius-drain-allocator /usr/local/bin/
+
+# ---- runtime ----
+FROM debian:bookworm-slim AS runtime
+
+# ca-certificates for outbound TLS hygiene; tini as PID 1 so SIGTERM is forwarded to
+# the binary, which drives the workers' graceful shutdown (rust_quality_129).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates tini \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/hippius-drain-agent /usr/local/bin/hippius-drain-agent
+COPY --from=builder /usr/local/bin/hippius-drain-allocator /usr/local/bin/hippius-drain-allocator
+
+# Runs as root: the agent reads + unlinks chunk files the api wrote (a different uid)
+# on the shared SSD/CephFS mounts, so it needs cross-uid access. The manifests can
+# narrow this with a matching fsGroup/runAsUser once the api's uid is aligned.
+
+# tini reaps zombies and forwards signals; the manifest overrides CMD with the
+# concrete binary (hippius-drain-agent or hippius-drain-allocator).
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/usr/local/bin/hippius-drain-agent"]

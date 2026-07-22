@@ -6,6 +6,13 @@ groups:
     folder: Hippius S3 Alerts
     interval: 1m
     rules:
+      # PromQL =~ is FULLY ANCHORED. The old matcher used the bare literal "upload_requests", which
+      # metrics_collector_task.py never emits — every queue is backend-prefixed ("arion_upload_requests",
+      # "ovh_upload_requests"). So this alert silently watched substrate_requests ONLY and upload backlog
+      # was invisible. The prefix wildcard also picks up any future backend for free, and the trailing
+      # anchor keeps the ":dlq" siblings out (those have their own capacity + growth rules below).
+      # _upload_retries (a ZSET of parts awaiting a retry attempt) is pending upload work too, and was
+      # likewise ungauged by any alert.
       - uid: queue-backup-critical
         title: Queue Backup - Critical Threshold Exceeded
         condition: C
@@ -16,7 +23,7 @@ groups:
               to: 0
             datasourceUid: PBFA97CFB590B2093
             model:
-              expr: 'max(hippius_queue_length{queue_name=~"upload_requests|substrate_requests"})'
+              expr: 'max(hippius_queue_length{queue_name=~".*_upload_requests|.*_upload_retries|substrate_requests"})'
               refId: A
           - refId: B
             relativeTimeRange:
@@ -240,3 +247,642 @@ groups:
           summary: API response times severely degraded during user activity
         labels:
           severity: high
+
+      # DLQs live on redis-queues (2GB, noeviction) — a full DLQ fails ALL writes pipeline-wide.
+      # Thresholds are LITERALS for the default HIPPIUS_DLQ_MAX_ENTRIES=10000 (warn at 50%, page at 90%).
+      # If you change the cap, update 5000/9000 below in lockstep — otherwise the ratios drift.
+      - uid: dlq-near-full-warning
+        title: DLQ Filling - 50% of Cap
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(hippius_queue_length{queue_name=~".*:dlq"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 5000
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          summary: 'A DLQ is at {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} entries (warn threshold: 5000 = 50% of cap)'
+          description: 'A dead-letter queue is filling on redis-queues (noeviction). Triage/requeue via scripts/dlq_requeue.py before it hits the cap and drops entries.'
+        labels:
+          severity: high
+
+      - uid: dlq-near-full-critical
+        title: DLQ Near Cap - 90% of Cap
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(hippius_queue_length{queue_name=~".*:dlq"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 9000
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          summary: 'A DLQ is at {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} entries (page threshold: 9000 = 90% of cap)'
+          description: 'A dead-letter queue is about to hit its cap and drop new entries. Requeue via scripts/dlq_requeue.py NOW.'
+        labels:
+          severity: critical
+
+      - uid: dlq-entries-dropped
+        title: DLQ Dropping Entries - At Cap
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'sum(increase(dlq_dropped_total{job="otel-collector"}[5m])) or vector(0)'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 0m
+        annotations:
+          summary: 'A DLQ is at its cap and dropping entries - {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} dropped in last 5 minutes'
+          description: 'A DLQ hit HIPPIUS_DLQ_MAX_ENTRIES and is dropping failure records (drop-newest). This drops the failure record, not object data (janitor replication gate still protects chunks); durable trace is object_versions.status. Drain the DLQ immediately via scripts/dlq_requeue.py.'
+        labels:
+          severity: critical
+
+      # The three rules above alert on DLQ CAPACITY (50%/90%/at-cap of HIPPIUS_DLQ_MAX_ENTRIES=10000).
+      # Capacity is the wrong signal for an incident: on 2026-07-19 a bad Arion credential put 356 upload
+      # requests in the DLQ inside an hour (205 of them "Authentication failed: 401") and nobody was paged,
+      # because 393 total sits three orders of magnitude below 5000. A DLQ that GAINS entries at all means
+      # uploads are failing permanently RIGHT NOW — depth only says how long we have been ignoring it.
+      #
+      # delta(), not increase(): hippius_queue_length is a GAUGE. increase() applies counter-reset logic, so
+      # every dlq_requeue.py drain would read as a reset and inflate the result into a false page. delta()
+      # is the gauge equivalent and goes negative on a drain, which the >0-style threshold correctly ignores.
+      #
+      # Threshold 25 per 15m (~100/h): the 2026-07-19 incident ran ~89 entries/15m, 3.5x over, so it would
+      # have paged within the first quarter hour. Routine failures are single-digit — a handful of parts
+      # exhausting their retry budget on a transient Arion blip stays well under 25 and will not page.
+      - uid: dlq-growth-rate-critical
+        title: DLQ Growing - Uploads Failing Permanently Now
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(delta(hippius_queue_length{queue_name=~".*:dlq"}[15m]))'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 25
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 0m
+        annotations:
+          summary: 'A DLQ gained {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} entries in 15m (threshold: 25)'
+          description: 'Uploads or unpins are failing permanently and landing in a dead-letter queue right now. This fires on GROWTH, not depth, so it precedes the 50%/90%-of-cap alerts by hours. Inspect the failure reason with `python -m hippius_s3.scripts.dlq_requeue --worker upload --backend arion peek --limit 50` before requeueing — a single systemic cause (expired Arion credential, backend 5xx) is the usual driver. (Use peek, not stats: the stats branch has no argparse subparser registered, so it exits rc=2.)'
+        labels:
+          severity: critical
+
+  - orgId: 1
+    name: hippius-s3-drain
+    folder: Hippius S3 Alerts
+    interval: 1m
+    rules:
+      # Ingest-tier size. api-local and drain-agent are DaemonSets over the
+      # s3-prod-local-ingest=true label, so Ready == the number of labelled nodes (5, per
+      # k8s/production/ingest-node-labels-production.yaml). This exists because on 2026-07-22
+      # the label was pulled from two nodes and BOTH DaemonSets shrank to 3 together: the
+      # deploy-time check compares drain-agent against the api-local node count, so a
+      # symmetric shrink passes it, and the tier ran at 60% capacity for two hours with
+      # nothing firing. min() so either DaemonSet falling behind trips it. Threshold is the
+      # absolute node count, not a ratio — resizing the tier must be a conscious edit here
+      # AND in the label file. Node labels themselves aren't alertable: kube_node_labels is
+      # not exposed by this kube-state-metrics (no --metric-labels-allowlist), so the
+      # DaemonSet Ready count is the observable proxy for the label going missing.
+      - uid: ingest-tier-degraded
+        title: Ingest Tier Degraded - Fewer Ingest Nodes Than Configured
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'min(kube_daemonset_status_number_ready{namespace="hippius-s3-prod",daemonset=~"api-local|drain-agent"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 5
+                    type: lt
+                  type: query
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+        for: 10m
+        annotations:
+          description: 'Only {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} of 5 ingest nodes are running the tier. Check `kubectl get nodes -l s3-prod-local-ingest=true` — a missing label silently shrinks both DaemonSets and cuts ingest throughput headroom (5 nodes x 100 MB/s = 500 MB/s; below 4 an N-1 loss drops under the 257 MB/s p99 sustained peak).'
+          summary: Ingest tier is running on fewer nodes than configured
+        labels:
+          severity: critical
+
+      # Pages BEFORE the api's fs_cache_pressure 90% cutoff (which 503s every PUT on the
+      # node), leaving runway to drain or reclaim. drain_ssd_pressure is a 0..1 fill
+      # fraction per node; max() catches the worst node. Unlike drain_ssd_backlog_bytes
+      # (undrained work), this rises with an SSD leak even at zero drain demand — so a
+      # stalled reclaim (WI-20a/b) surfaces here.
+      - uid: drain-ssd-pressure-high
+        title: Drain SSD Pressure - Node Near the PUT-shedding Cutoff
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(drain_ssd_pressure{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 0.85
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: 'Worst node SSD fill is {{ if $values.B }}{{ printf "%.0f" (mulf $values.B.Value 100) }}{{ else }}N/A{{ end }}% (pages at 85%; the api sheds PUTs with 503 at 90%)'
+          summary: A drain node''s ingest SSD is filling toward the PUT-shedding cutoff
+        labels:
+          severity: critical
+
+      # G2 replication-gate sentinel. janitor_underreplicated_live_chunks counts live,
+      # serveable chunks lacking full-union backend coverage — the exact chunks the janitor
+      # gate refuses to reclaim, so any nonzero value is a standing data-loss risk (a chunk
+      # one eviction away from loss) and surfaces the C10 divergence. Fires on ANY breach.
+      # The sentinel query applies a replication-SLA grace (HIPPIUS_REPLICATION_SLA_SECONDS,
+      # default 15m) so chunks still replicating NORMALLY are excluded and only genuinely-stuck
+      # coverage gaps reach this metric — every nonzero value here is already >=15m stale, so
+      # `for: 10m` below is just scrape-blip smoothing, not the in-flight filter.
+      - uid: replication-gate-coverage-gap
+        title: Replication Gate - Live Chunks Under-replicated
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(janitor_underreplicated_live_chunks{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        annotations:
+          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} live serveable chunk(s) lack full-union backend coverage — at data-loss risk if reclaimed. Check the janitor "REPLICATION-GATE SENTINEL" logs for samples.'
+          summary: Live objects have chunks the replication gate cannot safely retain
+        labels:
+          severity: critical
+
+      # A21 aged-pending orphan backlog. janitor_aged_pending_orphans counts unservable
+      # pending/draining versions idle past the grace — the leak the replicated-only soak
+      # gate is blind to. A sustained elevated value means orphans accrue faster than the
+      # sweep (list_orphan_replication_versions.sql) clears them: a re-introduced leak (e.g.
+      # the abort-path bug) or a stalled sweep. A long `for` tolerates the transient backlog
+      # between a leak and the next sweep, firing only on a standing, non-draining backlog.
+      - uid: aged-pending-orphan-backlog
+        title: Drain A21 - Aged Pending Orphans Not Draining
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(janitor_aged_pending_orphans{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 100
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 30m
+        annotations:
+          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} aged pending/draining orphan version(s) are not draining — the A21 sweep is not keeping up (re-introduced leak or stalled reaper). This population is invisible to the replicated-only soak gate.'
+          summary: A21 orphan backlog is standing above threshold and not draining
+        labels:
+          severity: warning
+
+      # Split-brain: two allocators leading at once. drain_leader is 0/1 per instance, so
+      # sum(drain_leader) > 1 means the single-leader lease/epoch fence has failed and two
+      # leaders may both be writing budgets — the drain's core coordination invariant broken.
+      # Short `for` because a split-brain is urgent (concurrent Ceph overrun risk), not a slow
+      # trend. Complements the R3 write-fence: the fence prevents a STALE leader's writes; this
+      # catches the fence itself failing open.
+      - uid: drain-split-brain-two-leaders
+        title: Drain Allocator - Split-Brain (more than one leader)
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'sum(drain_leader{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 1
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        annotations:
+          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} allocators are leading simultaneously (expected exactly 1). The leader lease/epoch fence has failed open — two leaders may be writing conflicting budgets. Investigate cephor:leader / cephor:epoch in redis-queues immediately.'
+          summary: More than one drain allocator is leading (split-brain)
+        labels:
+          severity: critical
+
+      # Epoch-counter reset. drain_leader_epoch is the leadership era; while a leader is LIVE the
+      # fleet max() only climbs, so a decrease means the redis cephor:epoch counter was rewound
+      # (AOF reload / FLUSHALL / replica failover) — which silently degrades the R3 allocation
+      # write-fence OPEN (a legit leader can be fenced by cached higher-epoch alloc keys, or a
+      # stale writer slips through). The expr yields (epoch 5m ago − epoch now), positive only on
+      # a regression. The `and max(...) > 0` guard is load-bearing: a deposed leader now resets its
+      # gauge to 0 on lease loss (so a real reset is actually detectable — see the allocator
+      # `record_not_leading`), which means during a leadership-handoff VACUUM the fleet max() dips
+      # to 0 for a scrape or two before the new leader publishes its (higher) epoch. Without the
+      # guard that transient 0 vs the 5m-ago nonzero would page a spurious critical on every
+      # deploy/lease-loss. A genuine counter reset leaves the LIVE new leader at a low-but-nonzero
+      # epoch, so `max > 0` holds and the alert still fires. This is the sole failure mode of the
+      # write-fence, so it pages critical even though no split-brain has occurred YET.
+      - uid: drain-leader-epoch-decrease
+        title: Drain Allocator - Leader Epoch Decreased (counter reset)
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: '(max(drain_leader_epoch{job="otel-collector"} offset 5m) - max(drain_leader_epoch{job="otel-collector"})) and (max(drain_leader_epoch{job="otel-collector"}) > 0)'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        # 2m (well under the 5m offset): a genuine reset holds the decrease for ~5m, so 2m still
+        # pages promptly while absorbing any single-scrape handoff-vacuum blip the guard misses.
+        for: 2m
+        annotations:
+          description: 'The drain leader epoch decreased (counter reset in redis-queues) — the R3 allocation write-fence is degraded open and split-brain is now possible. Confirm redis-queues persistence (noeviction + AOF) and the cephor:epoch value.'
+          summary: Drain leader epoch counter was reset (write-fence degraded)
+        labels:
+          severity: critical
+
+      # R4 corrupt-live durability incident. drain_corrupt_parts counts parts held `corrupt`:
+      # a live, servable object whose CephFS pool copy is corrupt (a persistent byte-mismatch on
+      # drain), kept alive ONLY by its intact SSD source. The re-drive worker re-copies from SSD,
+      # so a transient corruption clears on its own; a value that persists is a part stuck at the
+      # re-drive attempt cap — an unrecoverable pool copy needing an operator. Any nonzero value
+      # is a real durability risk (the last good copy is one SSD-node loss from gone), so this
+      # pages; a modest `for` lets a single re-drive cycle clear a transient blip first.
+      - uid: drain-corrupt-live-parts
+        title: Drain R4 - Corrupt-Live Parts (last good copy on SSD only)
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(drain_corrupt_parts{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        annotations:
+          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} part(s) held corrupt — a live object''s pool copy is corrupt and only its SSD source remains. If it persists, the re-drive has exhausted its attempts (unrecoverable pool copy); investigate the object and CephFS pool health.'
+          summary: Live objects have a corrupt pool copy and only an SSD source (R4)
+        labels:
+          severity: critical
+
+      # Reclaim disabled-alarm (D4). drain_reclaim_backing_errors_total counts reclaim cycles that
+      # aborted on an object-backing read (ReclaimError::Backing: the object_versions table missing
+      # on a deploy, or a transient PG error). On this path the failed-part SSD GC reads nothing and
+      # removes NOTHING — it is silently DISABLED while failing safe, so SSD debris accrues invisibly
+      # until drain_ssd_pressure trips the critical PUT-shedding alert downstream. increase()>0 held
+      # for 15m means the failure is STANDING across the 1m reclaim cycles, not a single transient PG
+      # blip (whose lone increment ages out of the window). Warning, not critical: the reclaim fails
+      # safe (no data loss) and drain-ssd-pressure-high is the downstream hard page.
+      - uid: drain-reclaim-backing-errors
+        title: Drain Reclaim Disabled - Object-Backing Read Failing
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'sum(increase(drain_reclaim_backing_errors_total{job="otel-collector"}[15m]))'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        annotations:
+          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} reclaim cycle(s) in 15m aborted on an object-backing read — the failed-part SSD GC is disabled and removing nothing. Check for a missing object_versions table on the drain deploy or a PG error; SSD debris will accrue until the disk-pressure alert fires.'
+          summary: The drain failed-part SSD reclaim is disabled (object-backing read failing)
+        labels:
+          severity: warning

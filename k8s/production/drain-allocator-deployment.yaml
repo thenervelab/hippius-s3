@@ -1,0 +1,116 @@
+# The hippius-drain allocator: the singleton, leader-elected budget allocator.
+#
+# One replica. The allocator does NOT need the SSD/CephFS mounts — it only reads the
+# fleet's heartbeats and writes per-node write-budgets. Leadership, heartbeats, and
+# budgets are TTL-keyed in redis-queues (epoch-fenced via Lua), NOT Postgres, so the
+# ~2s leader tick never touches the WAL. It is still the schema owner: on startup it
+# applies the hippius-drain-core migrations (the durable cephor_* tables) before
+# contending for leadership, so the agents come up against a ready schema
+# (allocator-first deploy). A Redis leader-lease (monotonic epoch) fences any accidental
+# second instance, so even a brief rollout overlap allocates from exactly one leader.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drain-allocator
+  labels:
+    app: drain-allocator
+spec:
+  replicas: 1
+  # One leader at a time: never run an old and a new allocator pod concurrently.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: drain-allocator
+  template:
+    metadata:
+      labels:
+        app: drain-allocator
+    spec:
+      # > the allocator tick + lease-relinquish on SIGTERM (graceful handoff).
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: allocator
+          image: ghcr.io/thenervelab/hippius-s3/drain:latest
+          imagePullPolicy: Always
+          command: ["/usr/local/bin/hippius-drain-allocator"]
+          env:
+            # The lease holder id — the pod name makes a restart a distinct holder.
+            - name: CEPHOR_ALLOCATOR_INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Reuse the api's DATABASE_URL secret; the cephor_* tables live in the
+            # same `hippius` database (distinct table names, no collision).
+            - name: CEPHOR_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+            # Coordination state (leader lease / fleet heartbeats / per-node budgets) lives
+            # here, TTL-keyed — the same redis-queues instance the agents use. Reuse the
+            # api's secret.
+            - name: REDIS_QUEUES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_QUEUES_URL
+            - name: RUST_LOG
+              value: "info"
+            # OTLP metrics -> otel-collector -> Prometheus -> Grafana (feature `otel`, on by
+            # default). service_namespace is what the dashboard's var-namespace filters on.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ENVIRONMENT
+              value: "production"
+            - name: ENABLE_MONITORING
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector:4317"
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
+            # AIMD write-budget tuning (2026-07-14). The former defaults deadlocked the
+            # drain: target_p99=2000ms is compared against a WHOLE-part copy+fsync+verify,
+            # which for a 64 MiB part needs >=~41 MB/s/node to stay under 2s — so any dip
+            # collapsed the budget to the 1 MB/s min_total floor, and at 0.5 MB/s/node a
+            # 64 MiB part takes ~130s, keeping p99 above target permanently (self-reinforcing).
+            # Measured live: budget pinned at 1 MB/s, drain fully stalled. Raising the floor
+            # above the stability threshold and the p99 target above the real per-part copy
+            # time lets the AIMD ramp back up (validated live: budget 0.5 -> 100 MB/s, drain
+            # resumed). See drainer-optimisations.md.
+            - name: CEPHOR_ALLOC_MIN_TOTAL_BPS
+              value: "50000000"    # 50 MB/s floor (was 1 MB/s) — above the collapse threshold
+            - name: CEPHOR_ALLOC_TARGET_P99_MS
+              value: "8000"        # 8s (was 2s) — headroom over per-part copy under load
+            # Live ceph-mgr ceiling probe — ENABLED. The allocator reads the real Ceph
+            # pool capacity ceiling from the rook-ceph mgr Prometheus endpoint instead of
+            # its static fallback ceiling. Cross-namespace reach to rook-ceph confirmed.
+            - name: CEPHOR_CEPH_MGR_METRICS_URL
+              value: "http://rook-ceph-mgr.rook-ceph.svc.cluster.local:9283/metrics"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          # The allocator touches this file each tick (~2s); a stale file means a wedged
+          # (not crashed) tick loop — e.g. blocked on a hung Redis — so k8s restarts it. A
+          # hung leader stops refreshing per-node budgets and the whole fleet decays to
+          # floor, so a silent hang must not persist. initialDelay covers startup migrations.
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'f=/tmp/hippius-drain-allocator.alive; test -f "$f" && [ $(( $(date +%s) - $(stat -c %Y "$f") )) -lt 30 ]'
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3

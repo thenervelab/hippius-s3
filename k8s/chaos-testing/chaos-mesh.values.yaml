@@ -1,0 +1,40 @@
+# Chaos Mesh Helm values — STAGING ONLY, namespace-scoped to hippius-s3-staging.
+#
+# Installed by .github/workflows/staging-deploy.yaml (the staging workflow ONLY — prod never
+# installs this). Pinned to chart 2.7.3. The drain chaos matrix (stress-test/faults/, k8s/chaos/*.yaml)
+# needs the PodChaos / NetworkChaos / IOChaos / TimeChaos CRDs + controller these values install.
+#
+# ── PROD-SAFETY (why this can never touch hippius-s3-prod on the shared cluster) ──
+#   clusterScoped: false               -> controller runs in namespaced mode
+#   controllerManager.targetNamespace  -> it may ONLY inject faults into hippius-s3-staging (its
+#                                         fault-injection RBAC is a RoleBinding in that ns, not a
+#                                         ClusterRole — verified in the rendered manifest). This is the
+#                                         guarantee that a PodChaos aimed at hippius-s3-prod is rejected.
+#
+# enableFilterNamespace is left FALSE on purpose: the namespace filter would need cluster-scoped
+# namespace list/watch that namespaced mode doesn't grant (it produces Selected=False on every
+# target), and targetNamespace already confines injection to staging, so the filter is redundant.
+# The chart DOES honour this value (unlike some others), so it takes effect from here — no Deployment
+# patch needed. Two companion manifests complete the working install: webhook-networkpolicy.yaml
+# (lets the apiserver reach the webhook on the chart-default port 10250, which the ns `allow-internal`
+# NetworkPolicy otherwise drops) and remotecluster-rbac.yaml (the one cluster-scoped read the
+# namespaced controller needs to start).
+
+clusterScoped: false
+
+controllerManager:
+  targetNamespace: hippius-s3-staging
+  enableFilterNamespace: false
+
+# The nodes run k3s (containerd://…-k3s1), NOT docker. The chart defaults the chaos-daemon to the
+# docker runtime + /var/run/docker.sock, which doesn't exist here — so daemon-driven chaos
+# (NetworkChaos / TimeChaos / IOChaos / StressChaos: the daemon nsenters the target and runs tc /
+# clock / io faults) is created but NEVER reaches AllInjected=True. Point it at the k3s containerd
+# socket and only PodChaos-vs-full-matrix is no longer a limitation — every cell injects.
+chaosDaemon:
+  runtime: containerd
+  socketPath: /run/k3s/containerd/containerd.sock
+
+# No public dashboard/ingress — this is a test-tooling install, driven by kubectl + the harness.
+dashboard:
+  create: false

@@ -7,6 +7,7 @@ import psycopg  # type: ignore[import-untyped]
 import pytest
 
 from .support.cache import wait_for_all_backends_ready
+from .support.dsn import DEFAULT_DSN
 
 
 @pytest.mark.local
@@ -26,7 +27,7 @@ def test_upload_fans_out_to_both_backends(
 
     assert wait_for_all_backends_ready(bucket, key, min_count=1, timeout_seconds=30.0)
 
-    dsn = "postgresql://postgres:postgres@localhost:5432/hippius"
+    dsn = DEFAULT_DSN
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
         cur.execute(
             """

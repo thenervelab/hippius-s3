@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 from typing import Iterable
 from typing import List
@@ -7,6 +8,14 @@ from typing import List
 from .db_meta import read_parts_plain_and_chunk_sizes_batch
 from .types import ChunkPlanItem
 from .types import RangeRequest
+
+
+logger = logging.getLogger(__name__)
+
+# A6: fallback chunk size when a part has bytes but a missing/zero `chunk_size_bytes` (DB
+# inconsistency). MUST match the downloader's eager-meta fallback (`downloader.py`) so the plan and
+# the written chunks agree on chunk count/boundaries.
+_DEFAULT_CHUNK_SIZE_BYTES = 4 * 1024 * 1024
 
 
 async def build_chunk_plan(
@@ -20,9 +29,14 @@ async def build_chunk_plan(
     # Normalize and sort parts
     ordered = sorted(parts, key=lambda x: int(x.get("part_number", 0)))
 
-    # Batch-load all part sizes in a single DB query instead of N sequential calls
     part_numbers = [int(p.get("part_number", 0)) for p in ordered]
-    size_map = await read_parts_plain_and_chunk_sizes_batch(db, object_id, part_numbers, int(object_version))
+    # RD-3: the GET path already carries size_bytes + chunk_size_bytes on each part (from the parts
+    # catalog), so size the plan from them and skip the query. Fall back to the batch query when any
+    # part lacks them — copy/UploadPartCopy callers and the envelope-race re-read pass thinner lists.
+    if ordered and all("size_bytes" in p and int(p.get("chunk_size_bytes") or 0) > 0 for p in ordered):
+        size_map = {int(p["part_number"]): (int(p.get("size_bytes") or 0), int(p["chunk_size_bytes"])) for p in ordered}
+    else:
+        size_map = await read_parts_plain_and_chunk_sizes_batch(db, object_id, part_numbers, int(object_version))
 
     sizes: list[tuple[int, int, int]] = []  # (part_number, plain_size, chunk_size)
     for pn in part_numbers:
@@ -37,8 +51,21 @@ async def build_chunk_plan(
 
     plan: List[ChunkPlanItem] = []
     for pn, plain_size, chunk_size in sizes:
-        if plain_size <= 0 or chunk_size <= 0:
-            continue
+        if plain_size <= 0:
+            continue  # genuinely empty part — nothing to plan
+        if chunk_size <= 0:
+            # A6: size>0 but no chunk_size is a DB inconsistency. Dropping the part here would
+            # truncate the response while Content-Length still counts its bytes. Mirror the
+            # downloader's 4 MiB fallback so the bytes are planned; warn so the inconsistency shows.
+            logger.warning(
+                "planner: part %s v%s has plain_size=%d but chunk_size=%d; using %d-byte fallback",
+                pn,
+                object_version,
+                plain_size,
+                chunk_size,
+                _DEFAULT_CHUNK_SIZE_BYTES,
+            )
+            chunk_size = _DEFAULT_CHUNK_SIZE_BYTES
         num_chunks = (plain_size + chunk_size - 1) // chunk_size
         part_offset = int(offsets.get(int(pn), 0))
 

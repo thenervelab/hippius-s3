@@ -60,7 +60,6 @@ Every successful read calls `os.utime` on the chunk file AND the meta file ([fs_
 Key methods:
 
 - `get_chunk` / `set_chunk` / `chunks_exist_batch` → delegate to `self._fs`.
-- `set_chunks(..., start_index=N)` loops `set_chunk` ([object_parts.py:148-160](object_parts.py)). **This is the second FS write on upload** — see [todo.md](../../todo.md) P1.
 - `get_meta` / `set_meta` → delegate to `self._fs`.
 - `get(...)` / `set(...)` — whole-part legacy API, assembled from chunks ([object_parts.py:190-245](object_parts.py)).
 - `expire(...)` → `fs.touch_part` (was Redis TTL extension before the migration).
@@ -74,6 +73,7 @@ Key methods:
 - **Key format**: `f"obj:{object_id}:v:{version}:part:{part_number}:chunk:{chunk_index}"` ([notifier.py:26-32](notifier.py)).
 - **Channel**: `f"notify:{chunk_key}"`.
 - `notify(...)` publishes `"1"` on the channel.
+- **`stream_subscription(object_id, object_version, fetch_fn=...)`** (RQ-1) — an async context manager that opens ONE pattern subscription (`notify:obj:{oid}:v:{v}:part:*:chunk:*`) for a whole stream and demuxes notifications to per-chunk `asyncio.Event`s. Replaces the per-chunk subscribe/unsubscribe churn of `wait_for_chunk` on cold multi-chunk reads. Gated by `HIPPIUS_STREAM_SINGLE_SUBSCRIPTION` (default off); `stream_plan` falls back to per-chunk `wait_for_chunk` when off. Keeps the post-subscribe FS re-check race guard and adds a periodic FS re-check (`_STREAM_RECHECK_INTERVAL_SECONDS`) so a missed wakeup degrades to a bounded poll instead of hanging.
 - `wait_for_chunk(...)` flow ([notifier.py:61](notifier.py)):
   1. Fast-path call `fetch_fn` (typically `fs_store.get_chunk`); return if present.
   2. Subscribe to the channel.

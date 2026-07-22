@@ -1,0 +1,79 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  resource:
+    attributes:
+      # insert (not upsert) so a producer's own service.name (api/gateway via
+      # configure_otel, workers via OTEL_SERVICE_NAME, the Rust drain) survives;
+      # this only labels telemetry that arrives without a service.name.
+      #
+      # This said `upsert` until 2026-07-17, which overwrote the name every
+      # service sets for itself and left service_name="hippius-s3" and
+      # exported_job="<ns>/hippius-s3" on EVERYTHING — api, gateway and workers
+      # indistinguishable in Prometheus, so alert rules had to match pod names
+      # (exported_instance=~"arion-downloader-.*"), which breaks on any rename.
+      # The traces pipeline has never had this processor, which is why Tempo always
+      # showed the right names.
+      #
+      # `insert` rather than deleting the processor outright: telemetry does arrive
+      # here with no service.name of its own (Loki carries an unknown_service
+      # stream), and that should still be labelled hippius-s3 rather than become
+      # anonymous.
+      - key: service.name
+        value: "hippius-s3"
+        action: insert
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+  memory_limiter:
+    limit_mib: 768
+    spike_limit_mib: 128
+    check_interval: 1s
+
+exporters:
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    send_timestamps: true
+    metric_expiration: 180m
+    enable_open_metrics: true
+    resource_to_telemetry_conversion:
+      enabled: true
+  otlp/tempo:
+    endpoint: tempo.monitoring.svc.cluster.local:4317
+    tls:
+      insecure: true
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 100
+  loki:
+    endpoint: http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [prometheus]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [loki]

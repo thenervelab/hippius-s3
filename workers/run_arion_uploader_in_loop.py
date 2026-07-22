@@ -51,6 +51,9 @@ async def _handle_upload(uploader, db_pool, upload_request) -> None:
     ray_id = upload_request.ray_id or "no-ray-id"
     ray_id_context.set(ray_id)
     worker_logger = get_logger_with_ray_id(__name__, ray_id)
+
+    # Drain-direct (s3-2.1 PR-11): the drain only enqueues a part AFTER it's replicated to
+    # ceph, so a dequeued request is always ceph-ready — no defer-gate needed.
     worker_logger.info(
         f"Processing Arion upload request object_id={upload_request.object_id} "
         f"chunks={len(upload_request.chunks)} attempts={upload_request.attempts or 0}"

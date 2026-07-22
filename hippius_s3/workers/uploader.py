@@ -336,12 +336,10 @@ class Uploader:
                         if not isinstance(piece, (bytes, bytearray)):
                             raise RuntimeError("missing_cipher_chunk")
 
-                        async with self._acquire_conn() as conn:
-                            chunk_id = await conn.fetchval(
-                                "SELECT id FROM part_chunks WHERE part_id = $1 AND chunk_index = $2",
-                                part_id,
-                                int(ci),
-                            )
+                        # WU-2: read from the (chunk_index -> id) map prefetched once for the whole
+                        # part instead of a SELECT + connection acquire per chunk. A miss raises the
+                        # same part_chunk_row_missing so the requeue/DLQ classification is unchanged.
+                        chunk_id = chunk_id_map.get(int(ci))
                         if not chunk_id:
                             raise RuntimeError("part_chunk_row_missing")
 
@@ -369,6 +367,14 @@ class Uploader:
                                 file_hash,
                             )
                         return ci, file_hash
+
+                # WU-2: prefetch every chunk's part_chunks.id in one query before the gather.
+                async with self._acquire_conn() as conn:
+                    id_rows = await conn.fetch(
+                        "SELECT chunk_index, id FROM part_chunks WHERE part_id = $1",
+                        part_id,
+                    )
+                chunk_id_map = {int(r["chunk_index"]): r["id"] for r in id_rows}
 
                 results = await asyncio.gather(
                     *[upload_one_chunk(ci) for ci in range(num_chunks_meta)],

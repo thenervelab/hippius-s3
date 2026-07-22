@@ -9,12 +9,41 @@ resources:
   - postgres-cluster.yaml
   - postgres-scheduledbackup.yaml
   - postgres-objectstore.yaml
+  # s3-2.0 trial: node-local-SSD ingest tier (see README-local-ingest-trial.md).
+  # Uses a hostPath (DirectoryOrCreate) volume — no PV/PVC, no manual node prep.
+  #
+  # ingest-node-labels-staging.yaml is the ONE list of ingest nodes, but it is
+  # DELIBERATELY NOT listed here. This overlay is applied client-side, which prunes any
+  # label absent from the manifest — and prod declares the same Node objects, so the two
+  # deploys deleted each other's ingest label (2026-07-22: cost prod 243 stranded parts).
+  # The workflow applies that file in its own server-side step with a dedicated
+  # --field-manager, which scopes ownership to our label key. Do not re-add it here.
+  - api-local-deployments-staging.yaml
+  # The hippius-drain stack: the singleton allocator (also the cephor_* schema owner)
+  # and the per-ingest-node drain agent DaemonSet. Both use the `drain` image.
+  - drain-allocator-deployment.yaml
+  - drain-agent-daemonset.yaml
+  # Auto-aborts abandoned multipart uploads so the drain stops re-deferring their
+  # never-finalized parts (uses the `workers` image; DB + redis-queues only).
+  - mpu-reaper-deployment.yaml
 
 patches:
   - path: namespace-patch.yaml
   - path: environment-patch.yaml
   - path: resource-limits.yaml
   - path: services-patch.yaml
+  # s3-2.0 trial: the api fleet is entirely the local-ingest pods (base api scaled
+  # to 0 in resource-limits.yaml). Point the existing `api` Service — the gateway's
+  # GATEWAY_BACKEND_URL=http://api:8000 upstream — straight at them, so routing goes
+  # through the normal front door with no separate target.
+  - target:
+      kind: Service
+      name: api
+    patch: |-
+      - op: replace
+        path: /spec/selector
+        value:
+          app: api-local
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api
@@ -22,4 +51,6 @@ images:
   - name: ghcr.io/thenervelab/hippius-s3/gateway
     newTag: latest
   - name: ghcr.io/thenervelab/hippius-s3/workers
+    newTag: latest
+  - name: ghcr.io/thenervelab/hippius-s3/drain
     newTag: latest

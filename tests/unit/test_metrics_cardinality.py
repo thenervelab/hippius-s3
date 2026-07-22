@@ -34,6 +34,12 @@ BOUNDED_LABELS = {
     "attempt",
     "direction",
     "database",
+    # DLQ key: "unpin_requests:dlq" or "<backend>_upload_requests:dlq", so it is the
+    # configured backend set — same closed axis as `backend` above.
+    "queue",
+    # Cachet component status, mapped through _STATUS_LABELS from {1, 3, 4} with an
+    # "unknown" fallback — four values, fixed in code.
+    "status",
 }
 
 

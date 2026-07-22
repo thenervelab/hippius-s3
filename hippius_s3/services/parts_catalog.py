@@ -26,17 +26,26 @@ class PartsCatalog:
 
             # CIDs are optional: v4+ deployments may be CID-less (deterministic chunk addressing),
             # but we still want to surface CIDs when present so IPFS-backed reads remain possible.
+            # B1: restrict the assembled parts to the client's CompleteMPU selection when set
+            # (object_versions.completed_part_numbers). NULL = all parts (backward-compatible for
+            # every pre-existing object and every full-set completion). LEFT JOIN so a part with a
+            # missing object_versions row is still included (treated as unfiltered).
             rows = await db.fetch(
                 """
                 SELECT p.part_number,
                        COALESCE(c.cid, p.ipfs_cid) AS cid,
-                       p.size_bytes::bigint AS size_bytes
+                       p.size_bytes::bigint AS size_bytes,
+                       p.chunk_size_bytes::bigint AS chunk_size_bytes
                 FROM objects o
                 JOIN parts p
                   ON p.object_id = o.object_id
                  AND p.object_version = COALESCE($2, o.current_object_version)
+                LEFT JOIN object_versions ov
+                  ON ov.object_id = p.object_id
+                 AND ov.object_version = p.object_version
                 LEFT JOIN cids c ON p.cid_id = c.id
                 WHERE o.object_id = $1
+                  AND (ov.completed_part_numbers IS NULL OR p.part_number = ANY(ov.completed_part_numbers))
                 ORDER BY p.part_number
                 """,
                 object_info["object_id"],
@@ -63,7 +72,10 @@ class PartsCatalog:
                         cid = cid_str
 
                 size = int(r[2] or 0)
-                parts.append({"part_number": pn, "cid": cid, "size_bytes": size})
+                # RD-3: carry chunk_size_bytes so the read-path planner can size chunks without a
+                # second `parts` query. 0 when the row lacks it (legacy) → planner falls back.
+                chunk_size = int(r[3] or 0)
+                parts.append({"part_number": pn, "cid": cid, "size_bytes": size, "chunk_size_bytes": chunk_size})
 
             logger.debug(f"Built parts catalog: {parts}")
             return parts

@@ -12,6 +12,7 @@ the downloader loop. These tests verify:
 from __future__ import annotations
 
 import asyncio
+import time
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -43,6 +44,7 @@ def _req(name: str) -> MagicMock:
     r.chunks = []
     r.attempts = 0
     r.address = "5Addr"
+    r.first_enqueued_at = time.time()
     return r
 
 
