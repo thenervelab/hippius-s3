@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from hippius_s3.api.s3.copy_helpers import build_copy_success_response
+from hippius_s3.api.s3.copy_helpers import handle_streaming_copy
 from hippius_s3.api.s3.copy_helpers import is_multipart_object
 from hippius_s3.api.s3.copy_helpers import parse_copy_source
 from hippius_s3.api.s3.copy_helpers import parse_object_metadata
@@ -284,3 +285,54 @@ async def test_should_use_v5_fast_path_pending_cids():
     assert eligible is False
     assert chunk_rows is None
     assert reason == "v5_fast_path_disabled_object_id_binding"
+
+
+class _SentinelStop(Exception):
+    """Halts handle_streaming_copy right after stream_object is invoked."""
+
+
+@pytest.mark.asyncio
+async def test_streaming_copy_streams_via_app_obj_cache():
+    """The source read must go through the lifespan-built cache.
+
+    Building a fresh RedisObjectPartsCache here would leave its ChunkNotifier on the
+    general redis client, which in prod is a RedisCluster with no `.pubsub()` — every
+    copy that had to wait for a chunk 500'd. See handle_streaming_copy.
+    """
+    captured = {}
+
+    async def fake_stream_object(pool, redis_client, obj_cache, *args, **kwargs):
+        captured["obj_cache"] = obj_cache
+        raise _SentinelStop
+
+    app_obj_cache = Mock(name="app.state.obj_cache")
+
+    request = Mock()
+    request.app.state.obj_cache = app_obj_cache
+    request.state.ray_id = "ray-1"
+    request.state.account.main_account = "5Faccount"
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("hippius_s3.api.s3.copy_helpers.stream_object", fake_stream_object)
+        with pytest.raises(_SentinelStop):
+            await handle_streaming_copy(
+                pool=AsyncMock(),
+                redis_client=Mock(),
+                request=request,
+                source_bucket={"bucket_name": "src", "bucket_id": "bid-src", "is_public": False},
+                dest_bucket={"bucket_name": "dst", "bucket_id": "bid-dst"},
+                source_object={"object_key": "k.txt", "content_type": "text/plain"},
+                src_obj_row={
+                    "object_id": "obj-1",
+                    "bucket_id": "bid-src",
+                    "object_version": 1,
+                    "storage_version": 5,
+                    "metadata": None,
+                },
+                object_id="obj-2",
+                object_key="copy.txt",
+                copy_created_at=datetime.now(timezone.utc),
+                config=Mock(),
+            )
+
+    assert captured["obj_cache"] is app_obj_cache

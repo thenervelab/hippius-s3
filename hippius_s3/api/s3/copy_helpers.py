@@ -13,7 +13,6 @@ from fastapi import Response
 from lxml import etree as ET  # ty: ignore[unresolved-import]
 
 from hippius_s3.api.s3 import errors
-from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import Config
 from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.repositories.buckets import BucketRepository
@@ -177,7 +176,11 @@ async def handle_streaming_copy(
     metadata = parse_object_metadata(src_obj_row.get("metadata"))
     src_multipart = is_multipart_object(src_obj_row)
 
-    obj_cache = RedisObjectPartsCache(redis_client)
+    # Reuse the lifespan-built cache: it carries the standalone queues client used for
+    # chunk-ready pub/sub. Constructing our own here fell back to `redis_client`, which in
+    # prod is a RedisCluster — and redis-py's async RedisCluster has no `.pubsub()`, so any
+    # copy that had to wait for a chunk died with AttributeError -> 500.
+    obj_cache = request.app.state.obj_cache
     storage_version = require_supported_storage_version(int(src_obj_row.get("storage_version")))
 
     src_object_id = str(src_obj_row.get("object_id"))

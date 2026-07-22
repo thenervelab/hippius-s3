@@ -530,7 +530,9 @@ async def upload_part(
 
         # Enqueue downloader for any missing chunk indices in cache. CP-2: one batched existence
         # check (off-loop, meta-gated) instead of a serial per-chunk stat, matching the GET path.
-        obj_cache = RedisObjectPartsCache(request.app.state.redis_client)
+        # Lifespan-built cache: it holds the standalone queues client that `stream_plan` below
+        # needs for chunk-ready pub/sub. See the note in copy_helpers.handle_streaming_copy.
+        obj_cache = request.app.state.obj_cache
         checks = [(int(it.part_number), int(it.chunk_index)) for it in plan]
         exist_flags = await obj_cache.chunks_exist_batch(object_id_str, src_ver, checks)
         indices_by_part: dict[int, list[int]] = {}
