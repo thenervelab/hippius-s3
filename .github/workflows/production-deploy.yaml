@@ -327,8 +327,12 @@ jobs:
           # in place, so the old Deployment/api-local lingers after the first DaemonSet apply and
           # both would serve behind app=api-local. Delete AFTER the DaemonSet is Ready (no capacity
           # dip); idempotent — a no-op on every deploy after the conversion lands.
+          # 20m, not 10m: this DaemonSet rolls one node at a time (maxSurge 0), so the wall clock
+          # is per-pod startup x ingest node count and grows every time the tier does. 10m was
+          # already marginal at 5 nodes and timed out mid-roll on 2026-07-22 with the deploy
+          # otherwise healthy.
           if kubectl get daemonset/api-local -n "$ns" >/dev/null 2>&1; then
-            kubectl rollout status daemonset/api-local -n "$ns" --timeout=10m
+            kubectl rollout status daemonset/api-local -n "$ns" --timeout=20m
             kubectl delete deployment/api-local -n "$ns" --ignore-not-found=true
             assert_ingest_tier api-local
           else
@@ -346,7 +350,10 @@ jobs:
           # class ensures the agent can preempt for a slot, so a partial roll is a real problem now.
           # Require drain-agent numberReady == desiredNumberScheduled AND >= the api-local node count.
           if kubectl get ds/drain-agent -n "$ns" >/dev/null 2>&1; then
-            kubectl rollout status daemonset/drain-agent -n "$ns" --timeout=10m || true
+            # 20m for the same per-node-serial reason as api-local. The `|| true` means a timeout
+            # here does not fail directly — it falls through to the ready-count check below, which
+            # would then report a "partial roll" that is really just a roll still in progress.
+            kubectl rollout status daemonset/drain-agent -n "$ns" --timeout=20m || true
             ready=$(kubectl get ds drain-agent -n "$ns" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
             desired=$(kubectl get ds drain-agent -n "$ns" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
             apiloc=$(kubectl get pods -l app=api-local -n "$ns" --field-selector=status.phase=Running -o json 2>/dev/null | jq -r '[.items[].spec.nodeName]|unique|length' 2>/dev/null || echo 0)
