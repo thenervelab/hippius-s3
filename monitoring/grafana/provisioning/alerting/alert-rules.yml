@@ -453,6 +453,63 @@ groups:
     folder: Hippius S3 Alerts
     interval: 1m
     rules:
+      # Ingest-tier size. api-local and drain-agent are DaemonSets over the
+      # s3-prod-local-ingest=true label, so Ready == the number of labelled nodes (5, per
+      # k8s/production/ingest-node-labels-production.yaml). This exists because on 2026-07-22
+      # the label was pulled from two nodes and BOTH DaemonSets shrank to 3 together: the
+      # deploy-time check compares drain-agent against the api-local node count, so a
+      # symmetric shrink passes it, and the tier ran at 60% capacity for two hours with
+      # nothing firing. min() so either DaemonSet falling behind trips it. Threshold is the
+      # absolute node count, not a ratio — resizing the tier must be a conscious edit here
+      # AND in the label file. Node labels themselves aren't alertable: kube_node_labels is
+      # not exposed by this kube-state-metrics (no --metric-labels-allowlist), so the
+      # DaemonSet Ready count is the observable proxy for the label going missing.
+      - uid: ingest-tier-degraded
+        title: Ingest Tier Degraded - Fewer Ingest Nodes Than Configured
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'min(kube_daemonset_status_number_ready{namespace="hippius-s3-prod",daemonset=~"api-local|drain-agent"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 5
+                    type: lt
+                  type: query
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+        for: 10m
+        annotations:
+          description: 'Only {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} of 5 ingest nodes are running the tier. Check `kubectl get nodes -l s3-prod-local-ingest=true` — a missing label silently shrinks both DaemonSets and cuts ingest throughput headroom (5 nodes x 100 MB/s = 500 MB/s; below 4 an N-1 loss drops under the 257 MB/s p99 sustained peak).'
+          summary: Ingest tier is running on fewer nodes than configured
+        labels:
+          severity: critical
+
       # Pages BEFORE the api's fs_cache_pressure 90% cutoff (which 503s every PUT on the
       # node), leaving runway to drain or reclaim. drain_ssd_pressure is a 0..1 fill
       # fraction per node; max() catches the worst node. Unlike drain_ssd_backlog_bytes
