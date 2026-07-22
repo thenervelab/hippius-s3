@@ -16,7 +16,14 @@ resources:
   # Ingest nodes node1..node5 are prepared (dedicated 3.84 TB /s3-data NVMe, labeled
   # s3-prod-local-ingest=true). allocator-first ordering is handled by the agent/reaper
   # initContainers. Routing is NOT flipped here — that's the full-swap overlay (3/3).
-  - ingest-node-labels-production.yaml
+  #
+  # ingest-node-labels-production.yaml is the declarative node list but is NOT listed here,
+  # and must not be added back. This overlay is applied client-side, which prunes any label
+  # absent from the manifest — and staging declares the same Node objects (node2/node3), so
+  # the two deploys deleted each other's ingest label (2026-07-22: cost prod 243 stranded
+  # parts). The workflow applies that file in its own server-side step with a dedicated
+  # --field-manager, which scopes ownership to our label key. That step is UNCONDITIONAL,
+  # so the labels land on every prod deploy independently of the resources below.
   - api-local-deployments-production.yaml
   - drain-allocator-deployment.yaml   # singleton; owns the cephor_* schema (deploy first)
   - drain-agent-daemonset.yaml        # one per labelled ingest node

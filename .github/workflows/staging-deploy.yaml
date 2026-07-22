@@ -291,6 +291,17 @@ jobs:
         run: |
           kubectl apply -f k8s/redis-cluster/staging.yaml
 
+      # Applied server-side in its own step — NOT folded into `apply -k` below — so prod
+      # and staging cannot prune each other's node label (client-side apply does; on
+      # 2026-07-22 that stranded 243 prod parts). Must run BEFORE the overlay so
+      # api-local and drain-agent find labelled nodes on the first apply. Full rationale
+      # + the retire-a-node checklist: the manifest header.
+      - name: Label ingest nodes (server-side)
+        run: |
+          kubectl apply --server-side --force-conflicts \
+            --field-manager=hippius-s3-staging-ingest-labels \
+            -f k8s/staging/ingest-node-labels-staging.yaml
+
       - name: Deploy to staging
         run: |
           kubectl apply -k k8s/staging
