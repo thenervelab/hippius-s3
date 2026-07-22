@@ -97,6 +97,10 @@ pub struct RuntimeConfig {
     /// How long a no-DB-backing part (its object hard-deleted) is kept before the orphan
     /// reclaim unlinks it. Keyed on the part's FS `meta.json` age, so set generously.
     pub orphan_reclaim_grace: Duration,
+    /// How long a `replicated` part may linger on SSD before the reclaim re-drives the drain's
+    /// own unlink (a crash-orphan between the `mark_replicated` commit and the unlink). Keyed
+    /// on the row's `updated_at`.
+    pub replicated_reclaim_grace: Duration,
     /// How long workers get to finish an in-flight tick after cancellation
     /// before the supervisor force-aborts them.
     pub grace: Duration,
@@ -283,11 +287,11 @@ async fn heartbeat_once(ssd: &LocalSsd, store: &Store, coord: &Coordinator, node
 /// Reclaim and sweep errors are logged and skipped; the next tick retries, and no part
 /// is ever removed without a successful status read (fail-safe). The store is both the
 /// replication log and the object-backing log for the reclaim.
-async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, grace: Duration, orphan_grace: Duration) {
-    match reclaim_ssd(ssd, ssd, store, store, grace, orphan_grace).await {
+async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, grace: Duration, orphan_grace: Duration, replicated_grace: Duration) {
+    match reclaim_ssd(ssd, ssd, store, store, grace, orphan_grace, replicated_grace).await {
         Ok(report) => {
-            // Both dispositions free SSD bytes, so the reclaimed gauge counts their sum.
-            snapshot.record_reclaimed(report.reclaimed + report.reclaimed_orphan);
+            // All three dispositions free SSD bytes, so the reclaimed gauge counts their sum.
+            snapshot.record_reclaimed(report.reclaimed + report.reclaimed_orphan + report.reclaimed_replicated);
             if report.reclaimed > 0 {
                 // Aggregate, not per-part: an abandoned MPU reclaims many parts at once,
                 // so a per-part line would spam.
@@ -299,12 +303,19 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
                     "reclaimed no-DB-backing (deleted-object) SSD orphans"
                 );
             }
-            // The one signal that the (deliberately un-handled) replicated crash-orphan
-            // leak is actually occurring — otherwise invisible. Warn so it surfaces.
+            if report.reclaimed_replicated > 0 {
+                tracing::info!(
+                    reclaimed_replicated = report.reclaimed_replicated,
+                    "reclaimed replicated crash-orphan SSD parts — re-drove the drain's skipped unlink"
+                );
+            }
+            // Replicated parts still on SSD but within the reclaim grace: a just-committed part
+            // whose happy-path unlink may not have run yet. Transient and self-clearing — aged
+            // ones are reclaimed above — so this is DEBUG, not the old un-reclaimable-leak WARN.
             if report.skipped_replicated > 0 {
-                tracing::warn!(
+                tracing::debug!(
                     skipped_replicated = report.skipped_replicated,
-                    "replicated parts still on SSD — drain crash-orphans nothing currently reclaims"
+                    "replicated parts on SSD within grace — reclaimed once they age past it"
                 );
             }
             // Parts held this cycle because their live object's pool copy is corrupt (R4): a
@@ -638,12 +649,13 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
         let reclaim_poll = self.config.reclaim_poll;
         let reclaim_grace = self.config.reclaim_grace;
         let orphan_reclaim_grace = self.config.orphan_reclaim_grace;
+        let replicated_reclaim_grace = self.config.replicated_reclaim_grace;
         let redrive_max_attempts = self.config.redrive_max_attempts;
         supervisor.spawn(WorkerName::new("ssd_reclaim"), move |token| {
             run_periodic(token, reclaim_poll, move || {
                 let (ssd, store, snapshot) = (Arc::clone(&ssd), Arc::clone(&store), Arc::clone(&snapshot));
                 async move {
-                    reclaim_once(&ssd, &store, &snapshot, reclaim_grace, orphan_reclaim_grace).await;
+                    reclaim_once(&ssd, &store, &snapshot, reclaim_grace, orphan_reclaim_grace, replicated_reclaim_grace).await;
                     // R4 re-drive: reset bounded `corrupt` parts to `pending` for a fresh copy,
                     // then publish the held-corrupt gauge. Same cadence as reclaim (both are the
                     // node-local SSD lifecycle); errors log and retry next poll (fail-safe).
@@ -949,6 +961,7 @@ mod tests {
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
+                replicated_reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
                 redrive_max_attempts: 3,
@@ -1023,6 +1036,7 @@ mod tests {
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
+                replicated_reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
                 redrive_max_attempts: 3,
@@ -1115,6 +1129,7 @@ mod tests {
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
+                replicated_reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
                 redrive_max_attempts: 3,
@@ -1180,6 +1195,7 @@ mod tests {
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
+                replicated_reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
                 redrive_max_attempts: 3,
@@ -1228,6 +1244,7 @@ mod tests {
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
+                replicated_reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
                 redrive_max_attempts: 3,
@@ -1277,14 +1294,23 @@ mod tests {
         force_terminal_2h(&pool, &failed, "failed").await;
         seed_object_version(&pool, &failed, None, Some(0), Some("")).await;
 
-        // A replicated part -> the drain's own to clean up; the reclaimer leaves it.
+        // A replicated part within the replicated grace -> left for the drain's own in-flight
+        // unlink (the 24h grace below keeps this 2h-aged part inside the window).
         let replicated = part_at(5, 2);
         seed_ssd_dir(ssd_dir.path(), &replicated);
         store.record_landed_part(&replicated).await.unwrap();
         force_terminal_2h(&pool, &replicated, "replicated").await;
 
         let ssd = LocalSsd::new(ssd_dir.path());
-        super::reclaim_once(&ssd, &store, &snapshot, Duration::from_secs(1), Duration::from_secs(1)).await;
+        super::reclaim_once(
+            &ssd,
+            &store,
+            &snapshot,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_hours(24),
+        )
+        .await;
 
         assert!(
             !ssd_dir.path().join(failed.relative_dir()).exists(),
@@ -1292,7 +1318,7 @@ mod tests {
         );
         assert!(
             ssd_dir.path().join(replicated.relative_dir()).exists(),
-            "a replicated part is left for the drain, never reclaimed here",
+            "a replicated part within the replicated grace is left for the drain's own unlink",
         );
         assert_eq!(snapshot.load().reclaimed, 1, "exactly the failed part was counted");
         // Reclaim only unlinks the SSD copy; the DB row is left intact.
@@ -1300,6 +1326,45 @@ mod tests {
             <Store as PartReplicationStore>::status(&store, &failed).await.unwrap(),
             Some(ReplicationState::Failed),
             "reclaim does not touch the replication row",
+        );
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn reclaim_once_evicts_an_aged_replicated_crash_orphan(pool: PgPool) {
+        // The ssd-leak fix end-to-end through reclaim_once against real Postgres: a `replicated`
+        // part still on SSD past the replicated grace is a drain crash-orphan (the drain committed
+        // mark_replicated but crashed before its own unlink). It is evicted, counted, and its
+        // replication row is left intact — the pool copy remains authoritative.
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let store = Store::from_pool(pool.clone());
+        let snapshot = SnapshotCell::new();
+
+        let orphan = part_at(5, 1);
+        seed_ssd_dir(ssd_dir.path(), &orphan);
+        store.record_landed_part(&orphan).await.unwrap();
+        force_terminal_2h(&pool, &orphan, "replicated").await;
+
+        let ssd = LocalSsd::new(ssd_dir.path());
+        // Short replicated grace so the 2h-aged crash-orphan is past the window.
+        super::reclaim_once(
+            &ssd,
+            &store,
+            &snapshot,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(
+            !ssd_dir.path().join(orphan.relative_dir()).exists(),
+            "the aged replicated crash-orphan was evicted from the SSD",
+        );
+        assert_eq!(snapshot.load().reclaimed, 1, "the replicated crash-orphan counts toward reclaimed");
+        assert_eq!(
+            <Store as PartReplicationStore>::status(&store, &orphan).await.unwrap(),
+            Some(ReplicationState::Replicated),
+            "reclaim only unlinks the SSD copy; the replicated row is left intact",
         );
     }
 
@@ -1320,7 +1385,7 @@ mod tests {
 
         let ssd = LocalSsd::new(ssd_dir.path());
         // Zero grace so the just-written temp is past the (no-)window.
-        super::reclaim_once(&ssd, &store, &snapshot, Duration::ZERO, Duration::ZERO).await;
+        super::reclaim_once(&ssd, &store, &snapshot, Duration::ZERO, Duration::ZERO, Duration::from_hours(24)).await;
 
         assert!(!orphan.exists(), "reclaim_once swept the orphan temp");
         assert_eq!(snapshot.load().reclaimed, 0, "no failed part -> nothing reclaimed, only the temp swept");
@@ -1350,7 +1415,15 @@ mod tests {
         seed_object_version(&pool, &live, Some("5Flive"), Some(4096), None).await;
 
         let ssd = LocalSsd::new(ssd_dir.path());
-        super::reclaim_once(&ssd, &store, &snapshot, Duration::from_secs(1), Duration::from_hours(1)).await;
+        super::reclaim_once(
+            &ssd,
+            &store,
+            &snapshot,
+            Duration::from_secs(1),
+            Duration::from_hours(1),
+            Duration::from_hours(24),
+        )
+        .await;
 
         assert!(
             !ssd_dir.path().join(orphan.relative_dir()).exists(),
@@ -1382,7 +1455,15 @@ mod tests {
         seed_object_version(&pool, &corrupt_live, Some("5Fserve"), Some(4096), None).await;
 
         let ssd = LocalSsd::new(ssd_dir.path());
-        super::reclaim_once(&ssd, &store, &snapshot, Duration::from_secs(1), Duration::from_secs(1)).await;
+        super::reclaim_once(
+            &ssd,
+            &store,
+            &snapshot,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_hours(24),
+        )
+        .await;
 
         assert!(
             ssd_dir.path().join(corrupt_live.relative_dir()).exists(),
@@ -1410,7 +1491,15 @@ mod tests {
         force_terminal_2h(&pool, &failed, "failed").await;
 
         let ssd = LocalSsd::new(ssd_dir.path());
-        super::reclaim_once(&ssd, &store, &snapshot, Duration::from_secs(1), Duration::from_secs(1)).await;
+        super::reclaim_once(
+            &ssd,
+            &store,
+            &snapshot,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_hours(24),
+        )
+        .await;
 
         assert!(
             ssd_dir.path().join(failed.relative_dir()).exists(),
