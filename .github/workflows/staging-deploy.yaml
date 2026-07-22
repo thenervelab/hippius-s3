@@ -178,6 +178,24 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build-images, build-drain]
     environment: staging
+    # Serialize against the production deploy: both target the SAME cluster and share
+    # ingest nodes node2/node3. On 2026-07-22 they ran simultaneously and collided twice —
+    # the ingest-label flap that stranded 243 prod parts, and a db-migrations "field is
+    # immutable" race when one run recreated the Job between the other's delete and apply.
+    # Server-side apply fixes the label symptom; this fixes the cause.
+    #
+    # The group string is REPO-SCOPED and must stay byte-identical to the one in
+    # production-deploy.yaml — that shared string is the whole mechanism. Changing it in
+    # one file silently un-serializes the two environments.
+    #
+    # queue: max (GA 2026-05-07) is load-bearing, not decoration. The default queue:single
+    # allows only ONE pending run per group and CANCELS it when a third arrives — a deploy
+    # would be silently dropped. queue:max queues up to 100 FIFO instead. It cannot be
+    # combined with cancel-in-progress: true (workflow validation error).
+    concurrency:
+      group: hippius-s3-cluster-deploy
+      cancel-in-progress: false
+      queue: max
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -301,6 +319,13 @@ jobs:
           kubectl apply --server-side --force-conflicts \
             --field-manager=hippius-s3-staging-ingest-labels \
             -f k8s/staging/ingest-node-labels-staging.yaml
+          # Drop any pre-SSA client-side-apply record. Server-side apply does NOT clear it,
+          # and while one survives, a stray `kubectl apply -f` on this file WITHOUT
+          # --server-side (old runbook, muscle memory) would resurrect the prune-on-apply
+          # behaviour this step exists to prevent. Currently a no-op on node2/node3 — kept
+          # for symmetry with production-deploy.yaml and to stay safe if one reappears.
+          kubectl annotate node -l s3-staging-local-ingest=true \
+            kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 
       - name: Deploy to staging
         run: |
