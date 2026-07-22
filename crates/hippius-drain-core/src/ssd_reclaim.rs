@@ -30,23 +30,30 @@
 //! avoids racing an in-progress MPU whose reserved row is also unservable.
 //!
 //! It reclaims **`replicated` crash-orphans**: on the happy path the drain unlinks its own
-//! SSD copy the instant it commits a replication, and the SSD copy is never read (downloads
-//! stream from the `CephFS` pool, not the ingest SSD). A replicated copy that lingers is a
+//! SSD copy the instant it commits a replication. A replicated copy that lingers is a
 //! **drain crash-orphan** — a crash between the `mark_replicated` commit and the unlink —
 //! which `claim_part` never re-selects, so nothing else re-drives the unlink and it leaks
 //! (an inode/dir leak on `/s3-data`, unbounded across agent restarts). This worker re-drives
 //! it: a `replicated` part older than `replicated_grace` is unlinked, which is exactly what
 //! the happy-path unlink would have done. The safety argument is that this is strictly weaker
 //! than the happy path, not stronger: that unlink runs milliseconds after the commit, so
-//! re-driving it after a grace introduces no risk the happy path does not already accept. The
-//! pool copy is authoritative — the `replicated` state IS the drain's own record that the
-//! `CephFS` copy exists — and, unlike a `failed` part, a `replicated` one is never a
-//! corrupt-live object's last good source (a corrupt pool copy transitions the row to
-//! `failed`/`corrupt`, out of this arm), so no servability gate is needed. The grace only
-//! avoids racing a just-committed part whose in-process unlink has not yet run; a young
-//! `replicated` part is left (`skipped_replicated`). `pending`/`draining` parts are live
-//! (owned by the drain pipeline) and a no-row part whose object still exists may be
-//! mid-upload — both are left strictly alone.
+//! re-driving it after a grace introduces no risk the happy path does not already accept.
+//! Note the ingest SSD IS read — it is the api-local reader's *primary* tier, with the
+//! `CephFS` pool as its read *fallback* (`DualFileSystemPartsStore`) — so a same-node GET can
+//! hit the SSD copy first. But `mark_replicated` is committed only after the pool copy is
+//! written, byte-verified, and fsynced, so deleting the SSD copy merely makes a same-node read
+//! fall through to that durable fallback (the exact behaviour the fallback tier exists for),
+//! identical to the drain's own post-commit unlink. The pool copy is thus authoritative — the
+//! `replicated` state IS the drain's own record that the `CephFS` copy exists — and, unlike a
+//! `failed` part, a `replicated` one is never a corrupt-live object's last good source (a
+//! corrupt pool copy transitions the row to `failed`/`corrupt`, out of this arm), so no
+//! servability gate is needed. The grace only avoids racing a just-committed part whose
+//! in-process unlink has not yet run; a young `replicated` part is left (`skipped_replicated`).
+//! (An in-flight MPU whose address takes longer than the grace to finalize is reclaimed while
+//! still `replicated`/un-enqueued — safe: reads are served from the pool and the janitor's
+//! replication gate holds the pool copy until the upload backends have it.) `pending`/`draining`
+//! parts are live (owned by the drain pipeline) and a no-row part whose object still exists may
+//! be mid-upload — both are left strictly alone.
 //!
 //! Safety: `failed` is a terminal sink (nothing returns a row to `pending` except
 //! `release_part`/`defer_part`, each guarded on `status='draining'`), so the read can
