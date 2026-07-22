@@ -283,6 +283,18 @@ jobs:
         run: |
           kubectl apply -f k8s/redis-cluster/production.yaml
 
+      # Applied server-side in its own step — NOT folded into `apply -k` below — so prod
+      # and staging cannot prune each other's node label. Client-side apply does prune it:
+      # on 2026-07-22 a staging deploy stripped s3-prod-local-ingest from node2/node3 and
+      # stranded 243 prod parts, then a prod deploy stripped s3-staging-local-ingest back
+      # and took staging's ingest tier to 0. Full rationale + the retire-a-node checklist
+      # live in the manifest header.
+      - name: Label ingest nodes (server-side)
+        run: |
+          kubectl apply --server-side --force-conflicts \
+            --field-manager=hippius-s3-prod-ingest-labels \
+            -f k8s/production/ingest-node-labels-production.yaml
+
       - name: Deploy to production
         run: |
           kubectl apply -k k8s/production
