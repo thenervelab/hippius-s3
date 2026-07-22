@@ -129,7 +129,7 @@ spec:
           command:
             - redis-server
             - --maxmemory
-            - 2gb
+            - 4gb
             # noeviction (NOT allkeys-lru): redis-queues holds the drain's coordination
             # keys (the cephor:* leader lease + epoch fence) AND the upload work queues.
             # Evicting either is data loss — a reset epoch deadlocks the allocator (drain
@@ -138,6 +138,10 @@ spec:
             # alerted on, not silently drop data. Alert on redis-queues memory usage.
             - --maxmemory-policy
             - noeviction
+            # Pod memory limit (6Gi) is kept above --maxmemory (4gb) so Redis rejects writes
+            # at its own limit FIRST (the intended loud OOM under noeviction); the headroom
+            # absorbs AOF rewrite copy-on-write + client/replication buffers so k8s does not
+            # OOM-kill the pod before Redis can fail writes. Keep limit > maxmemory on any bump.
             - --appendonly
             - "yes"
             - --appendfsync
@@ -168,10 +172,10 @@ spec:
           resources:
             requests:
               cpu: 100m
-              memory: 2Gi
+              memory: 4Gi
             limits:
               cpu: 1000m
-              memory: 4Gi
+              memory: 6Gi
   volumeClaimTemplates:
     - metadata:
         name: redis-data

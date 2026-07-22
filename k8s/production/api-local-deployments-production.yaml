@@ -1,6 +1,6 @@
 # PROD api-local fleet: the api on node-local SSD ingest (s3-2.1 drain-direct).
 #
-# One `api-local` Deployment, 5 replicas (one per ingest node, node1..node5). At cutover the
+# One `api-local` DaemonSet — exactly one pod per ingest node (node1..node5). At cutover the
 # base (ceph) `api` deployment scales to 0 and the `api` Service selector points here, so ALL
 # api pods run on local SSD. Each pod writes to its node's /s3-data NVMe and read-falls-back
 # to the shared CephFS pool. Workers run on ceph. The drain-agent DaemonSet (sole upload
@@ -16,9 +16,11 @@
 #
 # Scheduling: pinned to nodes labeled `s3-prod-local-ingest=true` (the ONE list lives in
 # ingest-node-labels-production.yaml). The drain-agent DaemonSet selects the SAME label, so
-# they stay in lockstep. Preferred pod anti-affinity spreads the replicas one-per-node. A
-# required nodeAffinity hostname allow-list (node1..node5) is belt-and-suspenders WITH the
-# label: a stray/mislabeled node alone can't place ingest on a psql/cache node.
+# they stay in lockstep. Being a DaemonSet, exactly one api-local runs per labelled node — no
+# soft anti-affinity that lets replicas cluster (the Deployment form left node1/node4 with an
+# idle NVMe while node3/node5 ran two pods on one SSD). A required nodeAffinity hostname
+# allow-list (node1..node5) is belt-and-suspenders WITH the label: a stray/mislabeled node
+# alone can't place ingest on a psql/cache node.
 #
 # Routing: the existing `api` Service (the gateway's GATEWAY_BACKEND_URL=http://api:8000
 # upstream) is patched to select `app: api-local` (kustomization.yaml), so the gateway routes
@@ -27,15 +29,19 @@
 # IMPORTANT: with no ceph api pods, every upload stages locally and stays `pending` until the
 # drain replicates local->ceph. The drain stack (allocator + agent) MUST be up first.
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: api-local
   labels:
     app: api-local
 spec:
-  # One per prod ingest node — node1..node5 each have a dedicated /s3-data NVMe.
-  # podAntiAffinity below spreads replicas one-per-node across the labelled nodes.
-  replicas: 5
+  # DaemonSet: exactly one api-local per labelled ingest node (node1..node5), co-located with the
+  # drain-agent DaemonSet so every node's /s3-data writer has its sole drain producer on the same
+  # host. Auto-scales when an ingest node is added/removed (no replicas knob to keep in sync).
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: api-local
@@ -44,6 +50,9 @@ spec:
       labels:
         app: api-local
     spec:
+      # Outrank general workloads for the node1-5 slots (below system-*-critical; never preempts
+      # Ceph/system). See s3-ingest-priorityclass.yaml + peer-review B3.
+      priorityClassName: s3-ingest-priority
       nodeSelector:
         s3-prod-local-ingest: "true"
       affinity:
@@ -67,14 +76,6 @@ spec:
                       - k8s-v3-node3
                       - k8s-v3-node4
                       - k8s-v3-node5
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchLabels:
-                    app: api-local
-                topologyKey: kubernetes.io/hostname
       initContainers:
         - name: wait-for-postgres
           image: postgres:15

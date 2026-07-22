@@ -35,6 +35,10 @@ spec:
       labels:
         app: drain-agent
     spec:
+      # Outrank general workloads for the node1-5 slots so every ingest node running api-local also
+      # gets its drain-agent (below system-*-critical; never preempts Ceph/system). See
+      # s3-ingest-priorityclass.yaml + peer-review B3.
+      priorityClassName: s3-ingest-priority
       # Same label as api-local — keeps them in lockstep (see header).
       nodeSelector:
         s3-prod-local-ingest: "true"
