@@ -204,6 +204,43 @@ async def enqueue_retry_request(
     )
 
 
+# Every uploader, unpinner and downloader replica runs its own retry mover. ZRANGEBYSCORE is
+# non-destructive and the old MULTI[ZREM, LPUSH] never inspected the ZREM result, so all N pods
+# that saw the same due member re-enqueued it — N-fold retry amplification exactly when the
+# backend is degraded. Claiming server-side makes ZREM the compare-and-swap: only the pod whose
+# ZREM returns 1 pushes. Lua rather than a Python-side conditional ZREM-then-LPUSH because the
+# latter drops the member permanently if the pod is cancelled (rolling deploy) between the two
+# commands — this ZSET is the only record that the retry exists.
+#
+# The three movers share _claim_due_retries: an identical race in three places is exactly the
+# kind of drift that let unpin and download keep the bug after upload was fixed.
+_CLAIM_DUE_RETRIES_LUA = """
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+local moved = 0
+for i = 1, #due do
+  if redis.call('ZREM', KEYS[1], due[i]) == 1 then
+    redis.call('LPUSH', KEYS[2], due[i])
+    moved = moved + 1
+  end
+end
+return moved
+"""
+
+
+async def _claim_due_retries(*, zset_key: str, target_queue: str, now_ts: float | None, max_items: int) -> int:
+    """Atomically move due members from a retry ZSET onto its work queue. Returns number moved."""
+    client = get_queue_client()
+    moved = await client.eval(  # ty: ignore[invalid-await]
+        _CLAIM_DUE_RETRIES_LUA,
+        2,
+        zset_key,
+        target_queue,
+        str(time.time() if now_ts is None else now_ts),
+        str(max_items),
+    )
+    return int(moved)
+
+
 async def move_due_upload_retries(
     *,
     backend_name: str,
@@ -211,23 +248,12 @@ async def move_due_upload_retries(
     max_items: int = 64,
 ) -> int:
     """Move due retry items back to the backend's upload queue. Returns number moved."""
-    client = get_queue_client()
-    target_queue = f"{backend_name}_upload_requests"
-    zset_key = _upload_retry_zset(backend_name)
-
-    now_ts = time.time() if now_ts is None else now_ts
-    members = await client.zrangebyscore(zset_key, min="-inf", max=now_ts, start=0, num=max_items)
-    moved = 0
-    for m in members:
-        try:
-            async with client.pipeline(transaction=True) as pipe:
-                pipe.zrem(zset_key, m)
-                pipe.lpush(target_queue, m)
-                await pipe.execute()
-            moved += 1
-        except Exception:
-            logger.exception(f"Failed to move retry item back to {target_queue}")
-    return moved
+    return await _claim_due_retries(
+        zset_key=_upload_retry_zset(backend_name),
+        target_queue=f"{backend_name}_upload_requests",
+        now_ts=now_ts,
+        max_items=max_items,
+    )
 
 
 async def enqueue_unpin_request(payload: UnpinChainRequest, *, queue_name: str | None = None) -> None:
@@ -330,23 +356,12 @@ async def move_due_unpin_retries(
     max_items: int = 64,
 ) -> int:
     """Move due unpin retry items back to the backend's unpin queue. Returns number moved."""
-    client = get_queue_client()
-    target_queue = f"{backend_name}_unpin_requests"
-    zset_key = _unpin_retry_zset(backend_name)
-
-    now_ts = time.time() if now_ts is None else now_ts
-    members = await client.zrangebyscore(zset_key, min="-inf", max=now_ts, start=0, num=max_items)
-    moved = 0
-    for m in members:
-        try:
-            async with client.pipeline(transaction=True) as pipe:
-                pipe.zrem(zset_key, m)
-                pipe.lpush(target_queue, m)
-                await pipe.execute()
-            moved += 1
-        except Exception:
-            logger.exception(f"Failed to move unpin retry item back to {target_queue}")
-    return moved
+    return await _claim_due_retries(
+        zset_key=_unpin_retry_zset(backend_name),
+        target_queue=f"{backend_name}_unpin_requests",
+        now_ts=now_ts,
+        max_items=max_items,
+    )
 
 
 async def enqueue_download_request(payload: DownloadChainRequest) -> None:
@@ -397,3 +412,49 @@ async def dequeue_download_request(queue_name: str) -> DownloadChainRequest | No
         _, queue_data = result
         return DownloadChainRequest.model_validate_json(queue_data)
     return None
+
+
+# Per-backend download retry handling (mirrors the upload retry ZSET above)
+
+
+def _download_retry_zset(backend: str) -> str:
+    return f"{backend}_download_retries"
+
+
+async def enqueue_download_retry_request(
+    payload: DownloadChainRequest,
+    *,
+    backend_name: str,
+    delay_seconds: float,
+    last_error: str | None = None,
+) -> None:
+    client = get_queue_client()
+    if payload.request_id is None:
+        payload.request_id = uuid.uuid4().hex
+    payload.attempts = int((payload.attempts or 0) + 1)
+    payload.last_error = last_error
+    if payload.first_enqueued_at is None:
+        payload.first_enqueued_at = time.time()
+    next_ts = time.time() + max(0.0, float(delay_seconds))
+    member = payload.model_dump_json()
+    zset_key = _download_retry_zset(backend_name)
+    await client.zadd(zset_key, {member: next_ts})
+    logger.info(
+        f"Scheduled download retry for {payload.name=} backend={backend_name} "
+        f"attempts={payload.attempts} next_at={int(next_ts)}"
+    )
+
+
+async def move_due_download_retries(
+    *,
+    backend_name: str,
+    now_ts: float | None = None,
+    max_items: int = 64,
+) -> int:
+    """Move due retry items back to the backend's download queue. Returns number moved."""
+    return await _claim_due_retries(
+        zset_key=_download_retry_zset(backend_name),
+        target_queue=f"{backend_name}_download_requests",
+        now_ts=now_ts,
+        max_items=max_items,
+    )

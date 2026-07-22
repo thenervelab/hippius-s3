@@ -1,0 +1,60 @@
+# F5 — ingest-SSD fill (pressure -> critical).
+# Chaos Mesh has no first-class disk-fill, so this is a one-shot Job that fallocates a large file on
+# the ingest SSD hostPath the drain-agent + api-local share, driving fs_cache_pressure into elevated
+# then critical. Gate: PUTs get a CLEAN 503 SlowDown (not a 5xx), the replication gate stays ABSOLUTE
+# (no non-replicated part evicted even ≥95%), and 503s cease ≤2min after the fill file is removed.
+#
+# The shared host dir is /var/lib/hippius/local_ingest_staging (see drain-agent-daemonset.yaml and
+# api-local-deployments-staging.yaml: both hostPath-mount it at container /var/lib/hippius/local_object_cache,
+# which is HIPPIUS_OBJECT_CACHE_DIR — the exact path fs_cache_pressure statvfs's and the drain drains).
+# `local_object_cache` is only the in-container mount NAME, so a Job (a separate pod) must fill the
+# HOST path here or DirectoryOrCreate would just make an empty phantom dir and never move the gauge.
+#
+# ADJUST FILL_GIB + the hostPath to your node's ingest SSD size (prod uses local_ingest_prod). Remove the fill with:
+#   kubectl -n hippius-s3-staging delete job f5-ssd-fill
+#   # then rm the file via a debug pod, or a companion cleanup Job.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: f5-ssd-fill
+  namespace: hippius-s3-staging
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: f5-ssd-fill
+    spec:
+      restartPolicy: Never
+      # Pin to an ingest node so the fill lands on the same SSD the drain-agent uses.
+      nodeSelector:
+        hippius.io/ingest: "true"
+      containers:
+        - name: fill
+          image: busybox:1.35
+          env:
+            - name: FILL_GIB
+              value: "40"
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              F=/ingest/.chaos-f5-fill.bin
+              echo "fallocating ${FILL_GIB}GiB at $F"
+              fallocate -l "${FILL_GIB}G" "$F" || dd if=/dev/zero of="$F" bs=1M count=$((FILL_GIB*1024))
+              echo "filled; holding 180s so pressure engages, then removing"
+              sleep 180
+              rm -f "$F"
+              echo "removed fill file; pressure should clear"
+          volumeMounts:
+            - name: ingest
+              mountPath: /ingest
+      volumes:
+        - name: ingest
+          hostPath:
+            # The node-local ingest SSD dir api-local + drain-agent share (their container mount
+            # /var/lib/hippius/local_object_cache = HIPPIUS_OBJECT_CACHE_DIR resolves to THIS host path).
+            path: /var/lib/hippius/local_ingest_staging
+            type: DirectoryOrCreate

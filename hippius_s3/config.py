@@ -77,6 +77,10 @@ class Config:
     public_bucket_cache_ttl_seconds: int = env("PUBLIC_BUCKET_CACHE_TTL_SECONDS:60", convert=int)
     enable_bypass_credit_check: bool = env("HIPPIUS_BYPASS_CREDIT_CHECK:false", convert=lambda x: x.lower() == "true")
     read_only_mode: bool = env("HIPPIUS_READ_ONLY_MODE:false", convert=lambda x: x.lower() == "true")
+    # LS-1: do the ListObjectsV2 delimiter rollup in SQL (a loose-index skip-scan) instead of the
+    # Python collapse. Opt-in — the CommonPrefixes/pagination contract is client-facing; a differential
+    # test proves byte-identical output, and the Python path stays as the default rollback.
+    list_objects_sql_rollup: bool = env("HIPPIUS_LIST_OBJECTS_SQL_ROLLUP:false", convert=lambda x: x.lower() == "true")
 
     # S3 Validation Limits
     min_bucket_name_length: int = env("MIN_BUCKET_NAME_LENGTH", convert=int)
@@ -139,7 +143,7 @@ class Config:
     orphan_checker_account_whitelist: list[str] = dataclasses.field(default_factory=_parse_account_whitelist)
 
     # Uploader configuration (supersedes legacy pinner config)
-    uploader_max_attempts: int = env("HIPPIUS_UPLOADER_MAX_ATTEMPTS:5", convert=int)
+    uploader_max_attempts: int = env("HIPPIUS_UPLOADER_MAX_ATTEMPTS:7", convert=int)
     uploader_backoff_base_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_BASE_MS:500", convert=int)
     uploader_backoff_max_ms: int = env("HIPPIUS_UPLOADER_BACKOFF_MAX_MS:60000", convert=int)
     uploader_multipart_max_concurrency: int = env("HIPPIUS_UPLOADER_MULTIPART_MAX_CONCURRENCY:5", convert=int)
@@ -208,6 +212,17 @@ class Config:
 
     # Cache TTL (shared across components — still used for pub/sub wait timeout)
     cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:3600", convert=int)
+    # Bound on how long a GET waits for its FIRST chunk before failing fast with a retryable 503
+    # (DownloadNotReadyError). Keeps an un-drained/never-arriving object (e.g. a part not yet on any
+    # backend) from hanging the whole request up to cache_ttl_seconds (~1h). Later chunks keep the
+    # full wait — once the first chunk lands the object is actively draining.
+    stream_first_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS:90", convert=int)
+    # A3: bound on how long the streamer waits for EACH subsequent chunk (after the first). Without
+    # it a later chunk whose backend fetch permanently fails stalls the already-committed 200
+    # response up to cache_ttl_seconds (~1h) mid-stream; this caps that to a bounded fail (the
+    # stream breaks and the client retries). Generous (5 min) so a healthy-but-slow drain never
+    # trips it, but far below the 1h cache TTL.
+    stream_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_CHUNK_TIMEOUT_SECONDS:300", convert=int)
     # Hot-retention window for the FS cache: chunks read within this window
     # are protected from janitor deletion so frequently-accessed content
     # stays on NVMe. Touched on every read by the API/streamer.
@@ -223,6 +238,12 @@ class Config:
     downloader_chunk_retries: int = env("DOWNLOADER_CHUNK_RETRIES:3", convert=int)
     downloader_retry_base_seconds: float = env("DOWNLOADER_RETRY_BASE_SECONDS:0.1", convert=float)
     downloader_retry_jitter_seconds: float = env("DOWNLOADER_RETRY_JITTER_SECONDS:0.1", convert=float)
+    # Request-level retry: when a whole DownloadChainRequest fails (Arion exhaustion or a process
+    # error), requeue it via a per-backend retry ZSET + 2s mover instead of dropping it (A12).
+    # Mirrors the uploader's request-level retry (uploader_max_attempts / _backoff_*_ms).
+    downloader_max_attempts: int = env("HIPPIUS_DOWNLOADER_MAX_ATTEMPTS:5", convert=int)
+    downloader_backoff_base_ms: int = env("HIPPIUS_DOWNLOADER_BACKOFF_BASE_MS:500", convert=int)
+    downloader_backoff_max_ms: int = env("HIPPIUS_DOWNLOADER_BACKOFF_MAX_MS:60000", convert=int)
     downloader_semaphore: int = env("DOWNLOADER_SEMAPHORE:20", convert=int)
     # Max concurrent DownloadChainRequests a single downloader pod processes.
     # The main loop dequeues and spawns tasks up to this cap; the semaphore
@@ -233,9 +254,22 @@ class Config:
     # When multiple streamers hit a cache miss on the same part concurrently,
     # only one enqueues a DownloadChainRequest; the others wait via pub/sub.
     # The Redis lock that enforces this is cleared by the downloader on
-    # completion, and this TTL caps the worst-case hang if the downloader
-    # crashes mid-request.
-    download_coalesce_lock_ttl_seconds: int = env("DOWNLOAD_COALESCE_LOCK_TTL:120", convert=int)
+    # completion (compare-and-delete on the enqueuer's token, A5), and this TTL
+    # caps the worst-case hang if the downloader crashes mid-request. Raised to
+    # 600s (A5) so a legitimately slow multi-chunk part download does not expire
+    # the lock mid-flight and let a second streamer enqueue a duplicate DCR.
+    download_coalesce_lock_ttl_seconds: int = env("DOWNLOAD_COALESCE_LOCK_TTL:600", convert=int)
+    # DB-1: config-driven downloader Postgres pool (was hardcoded min=2/max=20). Audit
+    # Σ(replicas × pool_max) across roles against Postgres max_connections before raising.
+    downloader_db_pool_min: int = env("HIPPIUS_DOWNLOADER_DB_POOL_MIN:2", convert=int)
+    downloader_db_pool_max: int = env("HIPPIUS_DOWNLOADER_DB_POOL_MAX:20", convert=int)
+    # CF-3: depth of the encrypt producer/consumer queue per streaming write. Peak buffered memory
+    # per PUT ≈ chunk_size × this. Exposed so it can move with chunk size (CF-1).
+    write_queue_maxsize: int = env("HIPPIUS_WRITE_QUEUE_MAXSIZE:16", convert=int)
+    # RD-2 / WU-1: worker threads for the dedicated AES-GCM encrypt/decrypt pool (off the event loop).
+    crypto_pool_workers: int = env("HIPPIUS_CRYPTO_POOL_WORKERS:4", convert=int)
+    # NET-3: keep the expensive mTLS KMS connection warm across sparse/bursty calls.
+    ovh_kms_keepalive_expiry_seconds: int = env("HIPPIUS_OVH_KMS_KEEPALIVE_EXPIRY:300", convert=int)
 
     # Crypto configuration
     # hip-enc/legacy: SecretBox per-chunk (legacy objects)
@@ -272,6 +306,12 @@ class Config:
     # initial stream timeout (seconds) before sending first byte
     http_stream_initial_timeout_seconds: float = env("HTTP_STREAM_INITIAL_TIMEOUT_SECONDS:5", convert=float)
 
+    # RQ-1: use ONE pub/sub subscription per stream (demuxed to per-chunk events) instead of a fresh
+    # subscribe/unsubscribe per cold chunk. Correctness-sensitive (the demux + FS re-check race
+    # guard); opt-in with a per-chunk fallback so it can be rolled back without a redeploy.
+    stream_single_subscription: bool = env(
+        "HIPPIUS_STREAM_SINGLE_SUBSCRIPTION:false", convert=lambda x: x.lower() == "true"
+    )
     # Download streaming prefetch window (number of chunks to fetch concurrently).
     # Helps cache-hit throughput by reducing per-chunk Redis roundtrip stalls.
     http_stream_prefetch_chunks: int = env("HTTP_STREAM_PREFETCH_CHUNKS:16", convert=int)
@@ -279,13 +319,61 @@ class Config:
     # DLQ configuration
     dlq_dir: str = env("HIPPIUS_DLQ_DIR:/tmp/hippius_dlq")
     dlq_archive_dir: str = env("HIPPIUS_DLQ_ARCHIVE_DIR:/tmp/hippius_dlq_archive")
+    # Soft cap on entries per DLQ list (best-effort: a non-atomic LLEN+LPUSH may overshoot by up to
+    # the number of concurrent pushers). The DLQ lives on redis-queues (2GB, noeviction) alongside the
+    # drain's cephor:* lease/fence keys, work queues and notify:* pub/sub — a permanent-error storm on
+    # an uncapped DLQ can fill the instance and fail ALL writes pipeline-wide. At the cap, push() is a
+    # no-op (drop-newest). This drops the failure RECORD, never object data: the janitor's absolute
+    # replication gate still refuses to evict a non-replicated chunk. Entries already in the DLQ remain
+    # requeuable via scripts/dlq_requeue.py; a dropped failure's durable trace is object_versions.status
+    # (e.g. 'failed'), and the 50%/90% alerts fire long before the cap so drops shouldn't occur in
+    # practice. 0 (or negative) disables the cap.
+    dlq_max_entries: int = env("HIPPIUS_DLQ_MAX_ENTRIES:10000", convert=int)
 
     # Object parts filesystem cache configuration
     object_cache_dir: str = env("HIPPIUS_OBJECT_CACHE_DIR:/var/lib/hippius/object_cache")
     object_cache_fallback_dir: str = env("HIPPIUS_OBJECT_CACHE_FALLBACK_DIR:", convert=str)
     # 24h since last access — reads bump mtime (os.utime sets both atime+mtime), so this gates on idle time.
     fs_cache_gc_max_age_seconds: int = env("HIPPIUS_FS_CACHE_GC_MAX_AGE_SECONDS:86400", convert=int)
-    mpu_stale_seconds: int = env("HIPPIUS_MPU_STALE_SECONDS:86400", convert=int)  # 1 day
+    # An MPU is "abandoned" only after this long with NO part activity (not just since
+    # initiation) — a user can pause a multipart upload and resume it, so the window must
+    # exceed a realistic pause. 2 days gives leeway over a full-day pause + resume.
+    mpu_stale_seconds: int = env("HIPPIUS_MPU_STALE_SECONDS:172800", convert=int)  # 2 days
+    # Idle grace before an orphaned cephor_replication_status version (pending/draining,
+    # unservable) is swept to `failed` by the A21 reaper sweep — the reaper's *eligibility* window.
+    # The janitor's aged-pending-orphan GAUGE is now DECOUPLED onto aged_orphan_gauge_grace_seconds
+    # (below), so this can stay the long (48h) leak backstop without making the leak-VISIBILITY gauge
+    # read non-zero forever. Defaults to mpu_stale_seconds (tunable independently of it).
+    mpu_sweep_grace_seconds: int = env("HIPPIUS_MPU_SWEEP_GRACE_SECONDS:172800", convert=int)  # 2 days
+    # Idle grace for the janitor's aged-pending-orphan GAUGE only — deliberately DECOUPLED from
+    # mpu_sweep_grace_seconds. The sweep grace above is the reaper's *eligibility* window (48h);
+    # this is a leak-VISIBILITY window and must be SMALL. The gauge exists so a short (e.g. 6h)
+    # soak can see a re-introduced A21 leak: an orphan aged only a couple hours must register, so
+    # the soak gate's slope≈0 assertion is meaningful. Fed the 48h reaper grace, a soak-fresh leak
+    # never ages past the window and the gate passes vacuously — the failure C3 fixes. 1h default:
+    # long enough to exclude a still-arriving upload, short enough to surface a leak within a soak.
+    aged_orphan_gauge_grace_seconds: int = env("HIPPIUS_AGED_ORPHAN_GAUGE_GRACE_SECONDS:3600", convert=int)  # 1h
+    # How often the abandoned-multipart-upload reaper sweeps. The reaper auto-aborts
+    # never-finalized uploads older than mpu_stale_seconds (address never written),
+    # purging their SSD parts + drain replication rows so the drain stops re-deferring.
+    mpu_reaper_interval_seconds: int = env("HIPPIUS_MPU_REAPER_INTERVAL_SECONDS:120", convert=int)  # every 2 min
+    # Replication SLA grace for the G2 under-replication sentinel. `address` is stamped at
+    # PUT completion but the chunk_backend coverage row is written much later by the async
+    # drain→pool→backend pipeline, so every servable chunk is briefly under-covered while it
+    # replicates NORMALLY. The sentinel only counts a servable, under-covered chunk once its
+    # part landed (parts.uploaded_at) longer ago than this window — comfortably above normal
+    # drain→backend replication latency — so in-flight replication is excluded and only
+    # genuinely-stuck chunks page. Default 15m as a wide margin over the sub-minute latency
+    # replication normally takes when the drain is not backlogged.
+    # CAVEAT: this is a fixed WALL-CLOCK window, so it cannot distinguish "stuck" from "slow
+    # under load" — under a sustained upload spike or a partial drain slowdown, NORMAL in-flight
+    # replication can legitimately exceed 15m and re-trip the false page this grace exists to
+    # remove (a queue-depth/backlog signal would; a clock cannot). It is env-tunable via
+    # HIPPIUS_REPLICATION_SLA_SECONDS precisely so an operator can widen it for a known-slow
+    # backlog rather than eat spurious pages. The resulting detection latency for a genuinely
+    # stuck chunk (~SLA + the alert's for:10m ≈ 25m) is a deliberate, acceptable tradeoff for a
+    # sentinel whose gap only bites under disk-pressure eviction, not at the moment of the stall.
+    replication_sla_seconds: int = env("HIPPIUS_REPLICATION_SLA_SECONDS:900", convert=int)  # 15 min
     # Bounded concurrency for the janitor's per-part DB checks + deletes. The
     # cleanup loops are DB-roundtrip bound; this is how many parts are processed
     # in parallel (each over its own pooled connection).
@@ -313,8 +401,25 @@ class Config:
     cachet_component_id: int = env("CACHET_COMPONENT_ID:0", convert=int)
 
 
+_config_singleton: "Config | None" = None
+
+
+def reset_config() -> None:
+    """Drop the memoized config so the next get_config() rebuilds it.
+
+    Config is immutable after startup, so get_config() memoizes a single instance. Tests that mutate
+    the environment between cases call this to force a rebuild.
+    """
+    global _config_singleton
+    _config_singleton = None
+
+
 def get_config() -> Config:
-    """Get application configuration."""
+    """Get application configuration (memoized; immutable after startup)."""
+    global _config_singleton
+    if _config_singleton is not None:
+        return _config_singleton
+
     try:
         cfg = Config()
     except KeyError as e:
@@ -365,4 +470,6 @@ def get_config() -> Config:
             "HIPPIUS_AUTH_ENCRYPTION_KEY is required when HIPPIUS_KMS_MODE=disabled (used for local KEK wrapping)"
         )
 
+    # Cache only after successful validation so a bad config never poisons the singleton.
+    _config_singleton = cfg
     return cfg

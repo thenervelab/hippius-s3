@@ -79,7 +79,9 @@ dev = [
     # close() signatures. Bundled stubs only.
     "requests>=2.31.0",
     "psycopg[binary]>=3.1",
-    "fakeredis>=2.23.0",
+    # [lua] pulls lupa, without which fakeredis rejects EVAL — the retry movers
+    # in hippius_s3/queue.py claim due members via a Lua compare-and-swap.
+    "fakeredis[lua]>=2.23.0",
     "respx>=0.21.0",
     # Transitive via pip-audit -> cachecontrol[filecache]; floor to clear
     # GHSA-6v7p-g79w-8964 (msgpack <1.2.1). Not used by the app at runtime.
@@ -99,7 +101,7 @@ packages = ["hippius_s3"]
 [tool.ruff]
 line-length = 120
 target-version = "py312"
-exclude = ["examples/", "tests/"]
+exclude = ["examples/", "tests/", "stress-test/"]
 
 [tool.ruff.format]
 quote-style = "double"

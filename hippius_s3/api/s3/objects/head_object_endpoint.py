@@ -23,6 +23,11 @@ from hippius_s3.utils import get_query
 logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
 
+# Distinguishes "the light HEAD query returned a (possibly NULL) arion_file_hash" from "the column
+# isn't in this row" (the versioned path's heavy query) — asyncpg Record.get returns this only when
+# the key is absent.
+_MISSING = object()
+
 
 async def _get_object_with_permissions_min(
     bucket_name: str,
@@ -32,9 +37,10 @@ async def _get_object_with_permissions_min(
     version: Optional[int] = None,
 ) -> Any:
     """Lightweight existence and metadata check (HEAD). Gateway handles permissions."""
-    # Ensure user exists
-    if main_account_id:
-        await UserRepository(db).ensure_by_main_account(main_account_id)
+    # Ensure user exists — read-first (HD-2) so the common case stays off the write path, and skip
+    # anonymous (mirrors the GET guard; avoids creating a bogus "anonymous" user row).
+    if main_account_id and main_account_id != "anonymous":
+        await UserRepository(db).ensure_by_main_account_read_first(main_account_id)
 
     # Gateway already checked permissions, just fetch the object
     if version is not None:
@@ -73,7 +79,9 @@ async def _get_object_with_permissions_min(
                 message=f"The specified key {object_key} does not exist",
             )
     else:
-        row = await ObjectRepository(db).get_for_download_with_permissions(bucket_name, object_key, main_account_id)
+        # HD-4: HEAD uses the light by-path query (no download_chunks/mpu joins; carries append_version
+        # and the Arion hash). The versioned path above keeps the heavy query.
+        row = await ObjectRepository(db).get_head_by_path(bucket_name, object_key, main_account_id)
         if not row:
             bucket_exists = await db.fetchval(
                 "SELECT 1 FROM buckets WHERE bucket_name = $1 AND deleted_at IS NULL",
@@ -209,9 +217,12 @@ async def handle_head_object(
         with tracer.start_as_current_span("head_object.check_cache_status") as span:
             source = "pipeline"
             try:
+                # HD-6: exists() takes (object_id, object_version, part_number); the old 2-arg call
+                # raised a TypeError swallowed below, so the header was always "pipeline". Pass the
+                # version + part 1 so the hint is truthful. Costs one meta stat per HEAD.
                 obj_id_str = str(row["object_id"])
                 oc = request.app.state.obj_cache
-                has1 = await oc.exists(obj_id_str, 1)
+                has1 = await oc.exists(obj_id_str, int(row["object_version"]), 1)
                 source = "cache" if has1 else "pipeline"
                 headers["x-hippius-source"] = source
             except Exception:
@@ -222,33 +233,26 @@ async def handle_head_object(
         object_version = int(row.get("object_version") or 1)
         headers["x-amz-version-id"] = str(object_version)
 
-        # Add Arion file hash (first chunk of first part)
-        arion_hash = await db.fetchval(
-            get_query("get_chunk_backend_identifier"),
-            "arion",
-            row["object_id"],
-            object_version,
-            1,  # part_number (1-based)
-            0,  # chunk_index (0-based)
-        )
+        # Add Arion file hash (first chunk of first part). HD-5: the light HEAD query returns it via a
+        # LATERAL join, so skip the extra fetchval when present; the versioned path still fetches it.
+        # Sentinel (not `in row`) because asyncpg Record membership tests values, not column names.
+        arion_hash = row.get("arion_file_hash", _MISSING)
+        if arion_hash is _MISSING:
+            arion_hash = await db.fetchval(
+                get_query("get_chunk_backend_identifier"),
+                "arion",
+                row["object_id"],
+                object_version,
+                1,  # part_number (1-based)
+                0,  # chunk_index (0-based)
+            )
         headers["X-Hippius-Arion-File-Hash"] = arion_hash or "pending"
 
-        # Append version header if present
+        # Append version header if present. HD-3: the download query's outer SELECT now returns
+        # append_version, so no fallback JOIN is needed.
         with tracer.start_as_current_span("head_object.fetch_append_version") as span:
             try:
                 append_version = row.get("append_version")
-                if append_version is None:
-                    append_version = await db.fetchval(
-                        """
-                        SELECT ov.append_version
-                        FROM objects o
-                        JOIN object_versions ov
-                          ON ov.object_id = o.object_id
-                         AND ov.object_version = o.current_object_version
-                        WHERE o.object_id = $1
-                        """,
-                        row["object_id"],
-                    )
                 if append_version is not None:
                     headers["x-amz-meta-append-version"] = str(int(append_version))
                     set_span_attributes(span, {"append_version": int(append_version)})

@@ -21,7 +21,10 @@ kind: Deployment
 metadata:
   name: api
 spec:
-  replicas: 5
+  # Cutover full-swap: base ceph `api` scaled to 0 — the drain-direct `api-local` fleet
+  # (replicas=5) serves all traffic via the `api` Service selector patch in kustomization.yaml.
+  # Rollback = scale back to 5 + repoint the Service to app: api.
+  replicas: 0
   template:
     spec:
       containers:
@@ -128,7 +131,18 @@ metadata:
 spec:
   resources:
     requests:
-      storage: 9728Gi
+      # Grown 9728Gi -> 20Ti for the s3-2.1 cutover: this CephFS RWX pool becomes the shared READ
+      # cache once the node6 40 TB local cache (9.1 TB hot working set) is retired — the write-hot set
+      # moves to per-node /s3-data NVMe, but the read-hot 24 h retention lands here. Online expansion
+      # (ceph-filesystem allowVolumeExpansion=true); never shrink.
+      # NOTE — mild OVERCOMMIT: 20 TiB is above the pool's current backable ~16 TiB (MAX AVAIL
+      # ~14 TiB + 2.3 used); 20 TiB of ACTUAL data needs ~60 TiB raw (3x) vs ~57 TiB free, so it is
+      # not fully backable today. It is safe because actual usage is janitor-GC-bounded to the
+      # ~9-10 TB working set and never approaches the quota. To make >16 TiB physically backable, add
+      # Ceph OSD capacity (e.g. fold node6's freed disk into Ceph). Keep the janitor GC healthy — it is
+      # the real bound; if it stalls, the cache could push Ceph toward full-ratio (cluster-wide) before
+      # hitting this quota.
+      storage: 20480Gi
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

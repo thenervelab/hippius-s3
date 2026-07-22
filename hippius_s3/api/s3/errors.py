@@ -116,3 +116,86 @@ def pool_saturation_response(exc: BaseException) -> Response | None:
             extra_headers={"Retry-After": "3"},
         )
     return None
+
+
+# Stable RuntimeError markers raised by kek_service on a KMS/key failure. TRANSIENT is a brownout
+# (retry helps → 503); UNREADABLE means the object's key material is unusable (retry can't help →
+# 500). We string-match because kek_service raises RuntimeError(<marker>) — same convention the
+# global handler already uses for "initial_stream_timeout". Keep these in sync with the raises in
+# hippius_s3/services/kek_service.py.
+_KEY_TRANSIENT_MARKERS = frozenset({"kms_unavailable", "kms_auth_failed", "kms_error", "kek_database_unavailable"})
+_KEY_UNREADABLE_MARKERS = frozenset({"v5_missing_envelope_metadata", "local_unwrap_failed", "kek_not_found"})
+# Deploy-misconfig KEK errors raised as full sentences (KMS mode disabled with KMS-wrapped keys, or
+# the client never initialized). Reachable on a cold GET of a misconfigured pod — still a permanent
+# 500, but with a proper S3 body instead of a bare one. Matched by a stable substring.
+_KEY_MISCONFIG_SUBSTRINGS = ("KMS client not initialized", "HIPPIUS_KMS_MODE=disabled")
+
+
+def read_path_crypto_error_response(exc: BaseException) -> Response | None:
+    """Map read-path key/crypto failures to a well-formed S3 error instead of a bare 500.
+
+    Transient key/DB failures (KMS brownout, keystore-DB blip) → retryable 503; a genuinely
+    unreadable object (missing envelope, lost KEK, bad wrapped key, AEAD `InvalidTag`, KMS
+    deploy-misconfig) → 500 with a proper S3 body. Returns ``None`` for anything else (the caller
+    re-raises). `unsupported_enc_suite_id` is handled by `map_read_path_exception` (→ 501), not here.
+    """
+    msg = str(exc)
+    if isinstance(exc, RuntimeError) and msg in _KEY_TRANSIENT_MARKERS:
+        return s3_error_response(
+            code="SlowDown",
+            message="Encryption key service is temporarily unavailable. Please retry.",
+            status_code=503,
+            extra_headers={"Retry-After": "3"},
+        )
+    # InvalidTag (AEAD auth failure from unwrap_dek) is matched by class name to avoid importing the
+    # crypto exception type here; the two marker sets and the misconfig sentences are the key errors.
+    if exc.__class__.__name__ == "InvalidTag" or (
+        isinstance(exc, RuntimeError)
+        and (msg in _KEY_UNREADABLE_MARKERS or any(s in msg for s in _KEY_MISCONFIG_SUBSTRINGS))
+    ):
+        return s3_error_response(
+            code="InternalError",
+            message="Object could not be decrypted (encryption metadata missing or key authentication failed).",
+            status_code=500,
+        )
+    return None
+
+
+def map_read_path_exception(exc: BaseException) -> Response | None:
+    """The API's global exception-handler mapping, as a testable pure function.
+
+    Returns a well-formed S3 ``Response`` for a recognized read-path failure, or ``None`` (the
+    handler then re-raises so uvicorn returns a 500). Extracted from the inline handler body so the
+    WHOLE chain is unit-tested — the handler was previously inline and untested, which is how the
+    `v5_missing_envelope_metadata` bare-500 regression slipped in. Order matters: the first match
+    wins. `DownloadNotReadyError` and `UnsupportedStorageVersionError` are matched by class name to
+    avoid importing them here (they live in modules that would import this one).
+    """
+    # Not-ready (download pipeline / first-chunk bound) → retryable 503.
+    if exc.__class__.__name__ == "DownloadNotReadyError" or str(exc) == "initial_stream_timeout":
+        return s3_error_response(
+            code="SlowDown",
+            message="Object not ready for download yet. Please retry.",
+            status_code=503,
+        )
+    pool_busy = pool_saturation_response(exc)
+    if pool_busy is not None:
+        return pool_busy
+    crypto = read_path_crypto_error_response(exc)
+    if crypto is not None:
+        return crypto
+    # Unsupported storage version (typed) OR unknown enc-suite (read-path RuntimeError) → 501.
+    if exc.__class__.__name__ == "UnsupportedStorageVersionError":
+        sv = getattr(exc, "storage_version", "?")
+        return s3_error_response(
+            code="NotImplemented",
+            message=f"Object uses unsupported storage version (sv={sv}). Migrate object to v5.",
+            status_code=501,
+        )
+    if isinstance(exc, RuntimeError) and str(exc).startswith("unsupported_enc_suite_id"):
+        return s3_error_response(
+            code="NotImplemented",
+            message="Object uses an unsupported encryption suite and cannot be served.",
+            status_code=501,
+        )
+    return None

@@ -358,6 +358,10 @@ async def handle_get_object(
                 rng=v2_rng,
                 address=resolved_address,
                 range_was_invalid=range_was_invalid,
+                # RD-3: reuse the parts catalog built above only when it came from the DB (carries
+                # chunk_size_bytes + the completed-parts filter). "cached"/fallback → None so the
+                # reader re-reads authoritatively.
+                parts=download_chunks if parts_source == "db" else None,
             )
             set_span_attributes(span, {"http.status_code": int(response.status_code)})
 
@@ -423,8 +427,24 @@ async def handle_get_object(
         )
 
     except Exception as e:
-        logger.exception(f"Error getting object {bucket_name}/{object_key}: {e}")
         account = getattr(request.state, "account", None)
+        # A1: a synchronous read-path failure (KMS brownout, unsupported enc-suite / storage
+        # version, envelope error) is raised INSIDE this try, so it never reaches main.py's
+        # global handler — this blanket except would otherwise bury it as a bare 500. Run the
+        # same mapping the global handler uses first, so a KMS blip returns a retryable 503 and
+        # an unsupported suite/version returns 501, not 500. Only genuinely-unrecognized errors
+        # fall through to InternalError.
+        mapped = errors.map_read_path_exception(e)
+        if mapped is not None:
+            logger.warning(f"GET {bucket_name}/{object_key}: mapped read-path error ({mapped.status_code}): {e}")
+            get_metrics_collector().record_error(
+                error_type="read_path_error",
+                operation="get_object",
+                bucket_name=bucket_name,
+                main_account=account.main_account if account else None,
+            )
+            return mapped
+        logger.exception(f"Error getting object {bucket_name}/{object_key}: {e}")
         get_metrics_collector().record_error(
             error_type="internal_error",
             operation="get_object",

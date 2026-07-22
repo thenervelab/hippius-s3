@@ -127,7 +127,10 @@ async def handle_list_objects(
     # cursor jump already keeps it from recurring across continuation pages, so the floor is
     # only meaningful for an explicit start-after (ignored when a continuation token resumes).
     cp_floor = None if continuation_token else start_after
-    items, is_truncated, next_cursor = await _collect_page(
+    # LS-1: the SQL skip-scan and the Python collapse produce byte-identical pages (proven by the
+    # differential test); the flag picks which runs, defaulting to the Python path.
+    collect = _collect_page_sql if _sql_rollup_enabled() else _collect_page
+    items, is_truncated, next_cursor = await collect(
         pool,
         bucket_id,
         prefix=prefix,
@@ -182,6 +185,56 @@ async def handle_list_objects(
     )
 
 
+def _sql_rollup_enabled() -> bool:
+    try:
+        from hippius_s3.config import get_config
+
+        return bool(get_config().list_objects_sql_rollup)
+    except Exception:
+        return False
+
+
+async def _collect_page_sql(
+    pool: asyncpg.Pool,
+    bucket_id: Any,
+    *,
+    prefix: str | None,
+    delimiter: str | None,
+    cursor: str | None,
+    target: int,
+    cp_floor: str | None,
+) -> tuple[list[tuple[str, Any]], bool, str | None]:
+    """LS-1: same page contract as `_collect_page`, but the delimiter rollup runs in SQL.
+
+    The recursive `list_objects_delimited` query returns the already-collapsed, cp_floor-suppressed
+    items in key order (up to target+1 to probe truncation), so this only shapes them into the
+    ``("content", row)`` / ``("prefix", str)`` tuples the endpoint expects.
+    """
+    if target == 0:
+        # AWS returns an empty, non-truncated page for max-keys=0 (degenerate probe).
+        return [], False, None
+
+    rows = await pool.fetch(
+        get_query("list_objects_delimited"),
+        bucket_id,
+        prefix,
+        cursor,
+        delimiter,
+        target,
+        cp_floor,
+    )
+    items: list[tuple[str, Any]] = []
+    for row in rows[:target]:
+        if row["is_prefix"]:
+            items.append(("prefix", row["group_key"]))
+        else:
+            items.append(("content", row))
+    is_truncated = len(rows) > target
+    # Resume just past the last KEPT item — the query already computed its inclusive successor.
+    next_cursor = rows[target - 1]["next_boundary"] if is_truncated else None
+    return items, is_truncated, next_cursor
+
+
 async def _collect_page(
     pool: asyncpg.Pool,
     bucket_id: Any,
@@ -212,37 +265,46 @@ async def _collect_page(
     items: list[tuple[str, Any]] = []
     seen_prefixes: set[str] = set()
     query = get_query("list_objects")
+    # LS-2: exclusive upper bound for the prefix range. Only pass it when _prefix_resume actually
+    # produced a successor (a pathological all-U+10FFFF prefix returns itself → keep NULL, LIKE guards).
+    prefix_upper = _prefix_resume(prefix) if prefix else None
+    if prefix_upper == prefix:
+        prefix_upper = None
 
-    while True:
-        batch = await pool.fetch(query, bucket_id, prefix, cursor, batch_limit)
-        if not batch:
-            return items, False, None
+    # LS-45: hold one pooled connection for the whole skip-scan instead of acquire/release per batch.
+    async with pool.acquire() as conn:
+        while True:
+            batch = await conn.fetch(query, bucket_id, prefix, cursor, batch_limit, prefix_upper)
+            if not batch:
+                return items, False, None
 
-        for row in batch:
-            key = row["object_key"]
-            if cursor is not None and key < cursor:
-                # Row sorts before a collapsed-group boundary we already jumped — skip cheaply.
-                continue
-
-            di = key.find(delimiter, plen) if delimiter else -1
-            if di == -1:
-                items.append(("content", row))
-                cursor = _content_resume(key)
-            else:
-                common_prefix = key[: di + dlen]
-                cursor = _prefix_resume(common_prefix)
-                if common_prefix in seen_prefixes:
+            for row in batch:
+                key = row["object_key"]
+                if cursor is not None and key < cursor:
+                    # Row sorts before a collapsed-group boundary we already jumped — skip cheaply.
                     continue
-                seen_prefixes.add(common_prefix)
-                if cp_floor is not None and common_prefix <= cp_floor:
-                    continue
-                items.append(("prefix", common_prefix))
 
-            if len(items) > target:
-                # The (target+1)th item proves truncation; resume just past the last KEPT item.
-                kind, payload = items[target - 1]
-                next_cursor = _prefix_resume(payload) if kind == "prefix" else _content_resume(payload["object_key"])
-                return items[:target], True, next_cursor
+                di = key.find(delimiter, plen) if delimiter else -1
+                if di == -1:
+                    items.append(("content", row))
+                    cursor = _content_resume(key)
+                else:
+                    common_prefix = key[: di + dlen]
+                    cursor = _prefix_resume(common_prefix)
+                    if common_prefix in seen_prefixes:
+                        continue
+                    seen_prefixes.add(common_prefix)
+                    if cp_floor is not None and common_prefix <= cp_floor:
+                        continue
+                    items.append(("prefix", common_prefix))
 
-        if len(batch) < batch_limit:
-            return items, False, None
+                if len(items) > target:
+                    # The (target+1)th item proves truncation; resume just past the last KEPT item.
+                    kind, payload = items[target - 1]
+                    next_cursor = (
+                        _prefix_resume(payload) if kind == "prefix" else _content_resume(payload["object_key"])
+                    )
+                    return items[:target], True, next_cursor
+
+            if len(batch) < batch_limit:
+                return items, False, None
