@@ -126,11 +126,13 @@ spec:
             - name: kms-certs
               mountPath: /kms_certs
               readOnly: true
+          # Kept in step with production: failureThreshold x periodSeconds already grants 200s
+          # for a slow start, so a long initialDelay only adds dead time to every rollout.
           startupProbe:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 120
+            initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 20

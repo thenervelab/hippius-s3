@@ -88,11 +88,11 @@ spec:
               value: "50000000"    # 50 MB/s floor (was 1 MB/s) — above the collapse threshold
             - name: CEPHOR_ALLOC_TARGET_P99_MS
               value: "8000"        # 8s (was 2s) — headroom over per-part copy under load
-            # Live ceph-mgr ceiling probe. Left unset for first bring-up so the
-            # allocator uses its static ceiling; enable once cross-namespace reach to
-            # rook-ceph is confirmed:
-            # - name: CEPHOR_CEPH_MGR_METRICS_URL
-            #   value: "http://rook-ceph-mgr.rook-ceph.svc:9283/metrics"
+            # Live ceph-mgr ceiling probe — ENABLED. The allocator reads the real Ceph
+            # pool capacity ceiling from the rook-ceph mgr Prometheus endpoint instead of
+            # its static fallback ceiling. Cross-namespace reach to rook-ceph confirmed.
+            - name: CEPHOR_CEPH_MGR_METRICS_URL
+              value: "http://rook-ceph-mgr.rook-ceph.svc.cluster.local:9283/metrics"
           resources:
             requests:
               cpu: 50m
