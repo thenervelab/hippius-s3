@@ -28,10 +28,13 @@ import os
 import shutil
 import sys
 import time
+import zlib
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +102,20 @@ _fs_hot_parts = 0
 _fs_pressure_mode = 0  # 0 = normal, 1 = elevated, 2 = critical
 _prev_pressure_mode = 0  # C2: last mode returned by _pressure_mode, for hysteresis (single-instance janitor)
 _fs_age_buckets: dict[str, int] = dict.fromkeys(AGE_BUCKET_NAMES, 0)
+# Census is now accumulated across a full sharded sweep (the age-GC walk covers 1/shards of
+# the tree per cycle), then published to the gauges above only when a sweep completes without
+# a budget truncation — so `_fs_parts_on_disk` etc. reflect the whole cache, never one shard
+# or a half-finished pass. Between sweeps the gauges hold the last complete sweep's values.
+_census_accum: dict[str, Any] = {
+    "parts_seen": 0,
+    "hot_parts": 0,
+    "oldest_mtime": None,
+    "age_counts": dict.fromkeys(AGE_BUCKET_NAMES, 0),
+}
+_census_accum_complete = True
+# Which hash-shard the FS walk covers this cycle. Advances by one every cycle; a full sweep
+# of the tree completes every `janitor_walk_shards` cycles. See config.janitor_walk_shards.
+_walk_shard = 0
 # G2 replication-gate sentinel: live/serveable chunks lacking full-union backend coverage
 # (the population the gate must never reclaim). Any nonzero value is a standing durability
 # alarm; sampled/capped by SENTINEL_SCAN_LIMIT, so a value at the cap means ">=".
@@ -212,6 +229,241 @@ def _safe_iterdir(path: Path) -> Iterator[Path]:
         except OSError:
             return
         yield entry
+
+
+@dataclass(frozen=True)
+class PartDirInfo:
+    """One part directory the walk found, with the stat the phases gate on.
+
+    `mtime`/`atime` are read from `meta.json` when present, else the part dir — the same
+    "part complete signal or fall back to the dir" rule the serial walk used.
+    """
+
+    object_id: str
+    object_version: int
+    part_number: int
+    mtime: float
+    atime: float
+
+
+@dataclass
+class WalkState:
+    """Out-of-band result of a walk: whether the wall-clock budget truncated it, and how
+    many object dirs (in this shard) it reached. The census is only trustworthy for a full
+    (untruncated) sweep, so callers check `truncated` before publishing gauges."""
+
+    truncated: bool = False
+    objects_scanned: int = 0
+
+
+def _object_in_shard(object_id: str, shard: int, shards: int) -> bool:
+    # crc32 is deterministic per name, so a given object falls in the same shard every sweep —
+    # rotating `shard` per cycle covers the whole tree over `shards` cycles without a cursor.
+    if shards <= 1:
+        return True
+    return zlib.crc32(object_id.encode("utf-8", "surrogatepass")) % shards == shard % shards
+
+
+def _read_dir_batch(scan_it: Any, n: int) -> tuple[list[str], bool]:
+    """Pull up to `n` sub-directory names from an os.scandir iterator. Returns
+    (names, exhausted). Runs in a worker thread so a slow CephFS readdir never blocks the loop.
+    A vanished/odd entry is skipped, not fatal (the tree mutates under the walk)."""
+    names: list[str] = []
+    for _ in range(n):
+        try:
+            entry = next(scan_it)
+        except StopIteration:
+            return names, True
+        except OSError:
+            return names, True
+        try:
+            if entry.is_dir():
+                names.append(entry.name)
+        except OSError:
+            continue
+    return names, False
+
+
+def _descend_object(root_str: str, object_name: str) -> list[PartDirInfo]:
+    """Blocking descent of ONE object dir → its part dirs, run in a walk thread.
+
+    Mirrors the serial walk exactly: `v<n>` version dirs, `part_<n>` part dirs, stat
+    `meta.json` if present else the part dir. Every FS error is swallowed to a skip — the
+    tree is mutating underneath us. Returns the parts found (possibly empty)."""
+    out: list[PartDirInfo] = []
+    obj_path = os.path.join(root_str, object_name)  # noqa: PTH118 — hot walk path, os.* avoids per-entry Path alloc
+    try:
+        version_scan = os.scandir(obj_path)
+    except OSError:
+        return out
+    with version_scan:
+        for vd in version_scan:
+            name = vd.name
+            if not name.startswith("v"):
+                continue
+            try:
+                if not vd.is_dir():
+                    continue
+            except OSError:
+                continue
+            try:
+                object_version = int(name[1:])
+            except ValueError:
+                continue
+            try:
+                part_scan = os.scandir(vd.path)
+            except OSError:
+                continue
+            with part_scan:
+                for pd in part_scan:
+                    pname = pd.name
+                    if not pname.startswith("part_"):
+                        continue
+                    try:
+                        if not pd.is_dir():
+                            continue
+                    except OSError:
+                        continue
+                    try:
+                        part_number = int(pname.split("_")[1])
+                    except (ValueError, IndexError):
+                        continue
+                    meta = os.path.join(pd.path, "meta.json")  # noqa: PTH118
+                    try:
+                        st = os.stat(meta)  # noqa: PTH116
+                    except OSError:
+                        try:
+                            st = os.stat(pd.path)  # noqa: PTH116
+                        except OSError:
+                            continue
+                    out.append(PartDirInfo(object_name, object_version, part_number, st.st_mtime, st.st_atime))
+    return out
+
+
+async def _stream_shard_object_names(
+    root_str: str,
+    shard: int,
+    shards: int,
+    deadline: float | None,
+    state: WalkState,
+) -> AsyncIterator[str]:
+    """Stream this shard's object-dir names off the event loop, stopping at the budget deadline."""
+    loop = asyncio.get_running_loop()
+    try:
+        scan_it = await asyncio.to_thread(os.scandir, root_str)
+    except OSError:
+        return
+    try:
+        while True:
+            if deadline is not None and loop.time() >= deadline:
+                state.truncated = True
+                return
+            names, exhausted = await asyncio.to_thread(_read_dir_batch, scan_it, 512)
+            for name in names:
+                if _object_in_shard(name, shard, shards):
+                    state.objects_scanned += 1
+                    yield name
+            if exhausted:
+                return
+    finally:
+        await asyncio.to_thread(scan_it.close)
+
+
+async def iter_part_dirs(
+    root: Path,
+    *,
+    concurrency: int,
+    shard: int,
+    shards: int,
+    deadline: float | None,
+    state: WalkState,
+) -> AsyncIterator[PartDirInfo]:
+    """Walk `root` and yield every part dir in the current shard, descending object dirs
+    across a bounded thread pool so many CephFS metadata roundtrips are in flight at once.
+
+    This replaces the single-threaded, event-loop-blocking `_safe_iterdir` walk that could
+    not complete a pass over ~2.8M object dirs inside a cycle (measured ~40 objects/s serial
+    on prod). Callers apply their own per-part gating + census to the yielded records; the
+    deletion logic downstream is unchanged.
+
+    `concurrency<=1` degrades to a serial descent (legacy behaviour, one object at a time).
+    """
+    concurrency = max(1, concurrency)
+    root_str = str(root)
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="janitor-walk")
+    inflight: set[asyncio.Future[list[PartDirInfo]]] = set()
+    try:
+        async for name in _stream_shard_object_names(root_str, shard, shards, deadline, state):
+            inflight.add(loop.run_in_executor(executor, _descend_object, root_str, name))
+            if len(inflight) >= concurrency:
+                done, inflight = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+                for fut in done:
+                    for info in fut.result():
+                        yield info
+        while inflight:
+            done, inflight = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+            for fut in done:
+                for info in fut.result():
+                    yield info
+    finally:
+        for fut in inflight:
+            fut.cancel()
+        executor.shutdown(wait=False)
+
+
+def _walk_deadline(loop: asyncio.AbstractEventLoop, pressure: int, budget: int) -> float | None:
+    """The wall-clock deadline for one FS-walk phase. None (unbounded) under CRITICAL pressure
+    or when the budget is disabled — freeing space must never be capped by a clock."""
+    if pressure >= 2 or budget <= 0:
+        return None
+    return loop.time() + budget
+
+
+def _reset_census_accum() -> None:
+    global _census_accum, _census_accum_complete
+    _census_accum = {
+        "parts_seen": 0,
+        "hot_parts": 0,
+        "oldest_mtime": None,
+        "age_counts": dict.fromkeys(AGE_BUCKET_NAMES, 0),
+    }
+    _census_accum_complete = True
+
+
+def _accumulate_census(stats: dict[str, Any], shard_complete: bool) -> None:
+    """Fold one shard's census into the in-progress sweep. `shard_complete` is False if the
+    shard's walk hit the budget, which taints the whole sweep's completeness."""
+    global _census_accum_complete
+    _census_accum["parts_seen"] += stats["parts_seen"]
+    _census_accum["hot_parts"] += stats["hot_parts"]
+    for bucket, count in stats["age_counts"].items():
+        _census_accum["age_counts"][bucket] += count
+    om = stats["oldest_mtime"]
+    if om is not None and (_census_accum["oldest_mtime"] is None or om < _census_accum["oldest_mtime"]):
+        _census_accum["oldest_mtime"] = om
+    if not shard_complete:
+        _census_accum_complete = False
+
+
+def _publish_census(now: float) -> None:
+    """Publish the completed sweep's census to the gauges, then reset for the next sweep.
+    A sweep tainted by a budget truncation is dropped (gauges hold their last complete value)
+    rather than reported as a full census that undercounts. The pressure gauge is owned by
+    _update_disk_metrics (refreshed every cycle top), so it is not touched here."""
+    global _fs_parts_on_disk, _fs_oldest_age_seconds, _fs_age_buckets, _fs_hot_parts
+    if _census_accum_complete:
+        oldest_mtime = _census_accum["oldest_mtime"]
+        _fs_parts_on_disk = _census_accum["parts_seen"]
+        _fs_oldest_age_seconds = max(0.0, now - float(oldest_mtime)) if oldest_mtime is not None else 0.0
+        _fs_age_buckets = dict(_census_accum["age_counts"])
+        _fs_hot_parts = _census_accum["hot_parts"]
+    else:
+        logger.info(
+            "Census sweep truncated by walk budget — holding last complete census (partial parts_seen=%d)",
+            _census_accum["parts_seen"],
+        )
+    _reset_census_accum()
 
 
 def _update_disk_metrics(root: Path) -> None:
@@ -414,6 +666,11 @@ async def cleanup_stale_parts(
     pool: asyncpg.Pool,
     fs_store: FileSystemPartsStore,
     redis_client: Redis,
+    *,
+    shard: int = 0,
+    shards: int = 1,
+    walk_concurrency: int = 1,
+    deadline: float | None = None,
 ) -> int:
     """Conservative cleanup of stale parts: rely on FS mtime only for now.
 
@@ -422,10 +679,10 @@ async def cleanup_stale_parts(
     approach: remove only parts whose meta/dir mtime is older than the
     configured stale threshold and which have no recent DB part activity.
 
-    The FS walk (cheap, stat-only) runs in the producer; the per-part DB checks
-    and deletes run with bounded concurrency over a connection pool — see
-    `_run_worker_pool`. At 3M+ parts the old serial single-connection loop could
-    not complete a pass in a day; this parallelizes the DB-roundtrip bottleneck.
+    The FS walk (parallel, stat-only) runs in the producer via `iter_part_dirs`; the
+    per-part DB checks and deletes run with bounded concurrency over a connection pool
+    (`_run_worker_pool`). The walk is sharded + budgeted so it cannot monopolise the cycle:
+    it descends only this cycle's shard and stops at `deadline`. Deletion logic is unchanged.
     """
     stale_threshold_seconds = config.mpu_stale_seconds
     cutoff_sql = "NOW() - INTERVAL '1 second' * $4"
@@ -447,51 +704,30 @@ async def cleanup_stale_parts(
 
     mtime_cutoff = time.time() - stale_threshold_seconds
 
+    walk_state = WalkState()
+
     async def candidates() -> AsyncIterator[tuple[str, int, int]]:
-        scanned = 0
-        for object_dir in _safe_iterdir(root):
-            if not object_dir.is_dir():
+        async for part in iter_part_dirs(
+            root,
+            concurrency=walk_concurrency,
+            shard=shard,
+            shards=shards,
+            deadline=deadline,
+            state=walk_state,
+        ):
+            if part.mtime > mtime_cutoff:
+                # Recently touched, skip
                 continue
-            object_id = object_dir.name
-            for version_dir in _safe_iterdir(object_dir):
-                if not version_dir.is_dir() or not version_dir.name.startswith("v"):
-                    continue
-                try:
-                    object_version = int(version_dir.name[1:])
-                except (ValueError, IndexError):
-                    continue
 
-                for part_dir in _safe_iterdir(version_dir):
-                    if not part_dir.is_dir() or not part_dir.name.startswith("part_"):
-                        continue
-                    try:
-                        part_number = int(part_dir.name.split("_")[1])
-                    except (ValueError, IndexError):
-                        continue
+            # Skip deletion if object is in DLQ
+            if part.object_id in dlq_object_ids:
+                logger.debug(
+                    f"Skipping DLQ-protected part: object_id={part.object_id} "
+                    f"v={part.object_version} part={part.part_number}"
+                )
+                continue
 
-                    scanned += 1
-                    if scanned % 5000 == 0:
-                        await asyncio.sleep(0)  # yield so workers drain while we walk
-
-                    meta_file = part_dir / "meta.json"
-                    check_path = meta_file if meta_file.exists() else part_dir
-                    try:
-                        mtime = check_path.stat().st_mtime
-                    except OSError:
-                        continue
-
-                    if mtime > mtime_cutoff:
-                        # Recently touched, skip
-                        continue
-
-                    # Skip deletion if object is in DLQ
-                    if object_id in dlq_object_ids:
-                        logger.debug(
-                            f"Skipping DLQ-protected part: object_id={object_id} v={object_version} part={part_number}"
-                        )
-                        continue
-
-                    yield (object_id, object_version, part_number)
+            yield (part.object_id, part.object_version, part.part_number)
 
     async def handle(conn: asyncpg.Connection, item: tuple[str, int, int]) -> bool:
         object_id, object_version, part_number = item
@@ -561,7 +797,14 @@ async def cleanup_stale_parts(
             return False
 
     parts_cleaned = await _run_worker_pool(pool, candidates(), handle, config.janitor_concurrency)
-    logger.info(f"Janitor cleaned {parts_cleaned} stale parts by mtime threshold")
+    logger.info(
+        "Janitor cleaned %d stale parts by mtime threshold (shard=%d/%d objects_scanned=%d truncated=%s)",
+        parts_cleaned,
+        shard,
+        shards,
+        walk_state.objects_scanned,
+        walk_state.truncated,
+    )
     return parts_cleaned
 
 
@@ -733,39 +976,104 @@ async def is_terminally_abandoned(
     return bool(row and row["abandoned"])
 
 
-async def cleanup_orphan_tmp_files(fs_store: FileSystemPartsStore) -> int:
+def _descend_object_tmp(root_str: str, object_name: str, cutoff: float) -> int:
+    """Blocking: unlink `*.tmp.*` files older than `cutoff` under one object dir's part dirs.
+    Runs in a walk thread. Returns how many it removed. Every FS error is a skip."""
+    removed = 0
+    obj_path = os.path.join(root_str, object_name)  # noqa: PTH118 — hot walk path
+    try:
+        version_scan = os.scandir(obj_path)
+    except OSError:
+        return 0
+    with version_scan:
+        for vd in version_scan:
+            if not vd.name.startswith("v"):
+                continue
+            try:
+                if not vd.is_dir():
+                    continue
+            except OSError:
+                continue
+            try:
+                part_scan = os.scandir(vd.path)
+            except OSError:
+                continue
+            with part_scan:
+                for pd in part_scan:
+                    if not pd.name.startswith("part_"):
+                        continue
+                    try:
+                        if not pd.is_dir():
+                            continue
+                    except OSError:
+                        continue
+                    try:
+                        file_scan = os.scandir(pd.path)
+                    except OSError:
+                        continue
+                    with file_scan:
+                        for f in file_scan:
+                            if ".tmp." not in f.name:
+                                continue
+                            try:
+                                if not f.is_file():
+                                    continue
+                                if f.stat().st_mtime > cutoff:
+                                    continue
+                                os.unlink(f.path)  # noqa: PTH108
+                                removed += 1
+                            except OSError:
+                                continue
+    return removed
+
+
+async def cleanup_orphan_tmp_files(
+    fs_store: FileSystemPartsStore,
+    *,
+    shard: int = 0,
+    shards: int = 1,
+    walk_concurrency: int = 1,
+    deadline: float | None = None,
+) -> int:
     """Remove orphan atomic-write temp files that outlived a crashed worker.
 
-    Workers use `<target>.tmp.<uuid>` as the tempfile for atomic rename.
-    If the worker crashes between creating the tempfile and renaming it,
-    the tempfile is left behind. Delete anything named `*.tmp.*` older than
-    `TMP_FILE_MAX_AGE_SECONDS`.
+    Workers use `<target>.tmp.<uuid>` as the tempfile for atomic rename. A crash between
+    create and rename leaves it behind; delete anything named `*.tmp.*` older than
+    `TMP_FILE_MAX_AGE_SECONDS`. Uses the same sharded, budgeted, parallel descent as the GC
+    walk — the previous `root.rglob("*.tmp.*")` was a full-tree walk on the event loop, so on
+    a multi-million-object cache it would block the loop for hours (the same starvation the GC
+    walk had), never mind that it ran after the phase that already never returned.
     """
     root = fs_store.root
     if not root.exists():
         return 0
 
-    now = time.time()
-    cutoff = now - TMP_FILE_MAX_AGE_SECONDS
+    root_str = str(root)
+    cutoff = time.time() - TMP_FILE_MAX_AGE_SECONDS
+    loop = asyncio.get_running_loop()
+    concurrency = max(1, walk_concurrency)
+    executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="janitor-tmp")
+    state = WalkState()
     removed = 0
-
-    # rglob is fine; the FS is bounded by active objects
-    for path in root.rglob("*.tmp.*"):
-        try:
-            if not path.is_file():
-                continue
-            if path.stat().st_mtime > cutoff:
-                continue
-            path.unlink()
-            removed += 1
-            logger.info(f"Removed orphan tmp file: {path}")
-        except OSError as e:
-            logger.debug(f"Skip orphan tmp {path}: {e}")
+    inflight: set[asyncio.Future[int]] = set()
+    try:
+        async for name in _stream_shard_object_names(root_str, shard, shards, deadline, state):
+            inflight.add(loop.run_in_executor(executor, _descend_object_tmp, root_str, name, cutoff))
+            if len(inflight) >= concurrency:
+                done, inflight = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+                removed += sum(f.result() for f in done)
+        while inflight:
+            done, inflight = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+            removed += sum(f.result() for f in done)
+    finally:
+        for fut in inflight:
+            fut.cancel()
+        executor.shutdown(wait=False)
 
     if removed > 0 and _janitor_tmp_deleted_counter is not None:
         _janitor_tmp_deleted_counter.add(removed)
     if removed > 0:
-        logger.info(f"Janitor removed {removed} orphan tmp files")
+        logger.info(f"Janitor removed {removed} orphan tmp files (shard={shard}/{shards} truncated={state.truncated})")
     return removed
 
 
@@ -773,6 +1081,12 @@ async def cleanup_old_parts_by_mtime(
     pool: asyncpg.Pool,
     fs_store: FileSystemPartsStore,
     redis_client: Redis,
+    *,
+    shard: int = 0,
+    shards: int = 1,
+    walk_concurrency: int = 1,
+    deadline: float | None = None,
+    publish_sweep: bool = True,
 ) -> int:
     """Safe, replication-gated GC.
 
@@ -844,108 +1158,91 @@ async def cleanup_old_parts_by_mtime(
         "oldest_mtime": None,
         "age_counts": dict.fromkeys(AGE_BUCKET_NAMES, 0),
     }
+    walk_state = WalkState()
 
     async def candidates() -> AsyncIterator[tuple[str, int, int, bool]]:
-        scanned = 0
-        # Walk the FS hierarchy: <root>/<object_id>/v<version>/part_<n>/
-        for object_dir in _safe_iterdir(root):
-            if not object_dir.is_dir():
-                continue
-
-            object_id = object_dir.name
+        # Walk the FS hierarchy <root>/<object_id>/v<version>/part_<n>/ via the parallel,
+        # sharded, budgeted walker. The mtime/atime the census + gating use come straight
+        # from the walk (meta.json if present else the part dir) — identical to the old
+        # inline stat, just done in the walk threads.
+        async for part in iter_part_dirs(
+            root,
+            concurrency=walk_concurrency,
+            shard=shard,
+            shards=shards,
+            deadline=deadline,
+            state=walk_state,
+        ):
+            object_id = part.object_id
+            object_version = part.object_version
+            part_number = part.part_number
             is_dlq_protected = object_id in dlq_object_ids
 
-            for version_dir in _safe_iterdir(object_dir):
-                if not version_dir.is_dir() or not version_dir.name.startswith("v"):
+            stats["parts_seen"] += 1
+
+            # Check mtime (for age) and atime (for hot retention).
+            #
+            # ZFS + noatime note: in prod the local-cache volume is a ZFS
+            # dataset mounted `noatime` (see `mount | grep local_object_cache`
+            # → `rw,noatime,xattr,noacl,casesensitive`). `noatime` only
+            # blocks VFS-triggered atime updates on reads (the
+            # `file_accessed() → atime_needs_update() → dirty_inode()`
+            # path). It does NOT block explicit `utimensat(2)` metadata
+            # writes, which go through `setattr()`. Our reader refreshes
+            # atime on every chunk read via `os.utime(path, None)` in
+            # `fs_store.get_chunk`, so hot-retention works correctly here.
+            # OpenZFS PR #4482 ("Fix atime handling and relatime") made
+            # this behaviour consistent — atime is handled purely by VFS
+            # and explicit setattr writes are always honoured regardless
+            # of the mount's noatime flag.
+            #
+            # Side effect: `os.utime(path, None)` sets BOTH atime and
+            # mtime to "now" (UTIME_NOW on both). Recently-read chunks
+            # therefore show `atime == mtime` to the nanosecond — that's
+            # expected, not a bug. It also means reads push mtime
+            # forward, so the mtime-based age check below is more
+            # conservative on actively-read content (treats hot chunks
+            # as younger than their original landing time). Replication
+            # is still the absolute gate, so this only relaxes, never
+            # tightens, what we delete.
+            try:
+                mtime = part.mtime
+                atime = part.atime
+                if stats["oldest_mtime"] is None or mtime < stats["oldest_mtime"]:
+                    stats["oldest_mtime"] = mtime
+
+                part_age = now - mtime
+                stats["age_counts"][_classify_age_bucket(part_age)] += 1
+
+                is_hot = hot_window > 0 and atime > (now - hot_window)
+                if is_hot:
+                    stats["hot_parts"] += 1
+
+                # Don't clean DLQ-protected parts (only count them for metrics)
+                if is_dlq_protected:
                     continue
 
-                try:
-                    object_version = int(version_dir.name[1:])
-                except (ValueError, IndexError):
+                # Hot files are protected. Under critical pressure
+                # hot_window is 0, which forces is_hot=False, letting
+                # fully-replicated parts become eligible even if recently read.
+                if is_hot:
                     continue
 
-                for part_dir in _safe_iterdir(version_dir):
-                    if not part_dir.is_dir() or not part_dir.name.startswith("part_"):
-                        continue
-                    stats["parts_seen"] += 1
+                # A fully-replicated, cold, non-DLQ part is safe to evict.
+                # Under normal pressure we additionally require age > cutoff
+                # so we don't thrash. Under any pressure level we evict
+                # replicated cold parts regardless of age. The replication
+                # gate itself is enforced in the worker below.
+                old_enough = mtime < cutoff_time
+                if pressure == 0 and not old_enough:
+                    continue
+            except Exception as e:
+                logger.warning(
+                    f"Failed to classify part object_id={object_id} v={object_version} part={part_number}: {e}"
+                )
+                continue
 
-                    try:
-                        part_number = int(part_dir.name.split("_")[1])
-                    except (ValueError, IndexError):
-                        continue
-
-                    scanned += 1
-                    if scanned % 5000 == 0:
-                        await asyncio.sleep(0)  # yield so workers drain while we walk
-
-                    # Check mtime (for age) and atime (for hot retention).
-                    #
-                    # ZFS + noatime note: in prod the local-cache volume is a ZFS
-                    # dataset mounted `noatime` (see `mount | grep local_object_cache`
-                    # → `rw,noatime,xattr,noacl,casesensitive`). `noatime` only
-                    # blocks VFS-triggered atime updates on reads (the
-                    # `file_accessed() → atime_needs_update() → dirty_inode()`
-                    # path). It does NOT block explicit `utimensat(2)` metadata
-                    # writes, which go through `setattr()`. Our reader refreshes
-                    # atime on every chunk read via `os.utime(path, None)` in
-                    # `fs_store.get_chunk`, so hot-retention works correctly here.
-                    # OpenZFS PR #4482 ("Fix atime handling and relatime") made
-                    # this behaviour consistent — atime is handled purely by VFS
-                    # and explicit setattr writes are always honoured regardless
-                    # of the mount's noatime flag.
-                    #
-                    # Side effect: `os.utime(path, None)` sets BOTH atime and
-                    # mtime to "now" (UTIME_NOW on both). Recently-read chunks
-                    # therefore show `atime == mtime` to the nanosecond — that's
-                    # expected, not a bug. It also means reads push mtime
-                    # forward, so the mtime-based age check below is more
-                    # conservative on actively-read content (treats hot chunks
-                    # as younger than their original landing time). Replication
-                    # is still the absolute gate, so this only relaxes, never
-                    # tightens, what we delete.
-                    meta_file = part_dir / "meta.json"
-                    check_path = meta_file if meta_file.exists() else part_dir
-
-                    # A single stat() can race a concurrent delete or return an
-                    # odd value; be conservative and skip the part rather than
-                    # abort the whole walk (matches the pre-split behaviour).
-                    try:
-                        stat = check_path.stat()
-                        mtime = stat.st_mtime
-                        atime = stat.st_atime
-                        if stats["oldest_mtime"] is None or mtime < stats["oldest_mtime"]:
-                            stats["oldest_mtime"] = mtime
-
-                        part_age = now - mtime
-                        stats["age_counts"][_classify_age_bucket(part_age)] += 1
-
-                        is_hot = hot_window > 0 and atime > (now - hot_window)
-                        if is_hot:
-                            stats["hot_parts"] += 1
-
-                        # Don't clean DLQ-protected parts (only count them for metrics)
-                        if is_dlq_protected:
-                            continue
-
-                        # Hot files are protected. Under critical pressure
-                        # hot_window is 0, which forces is_hot=False, letting
-                        # fully-replicated parts become eligible even if recently read.
-                        if is_hot:
-                            continue
-
-                        # A fully-replicated, cold, non-DLQ part is safe to evict.
-                        # Under normal pressure we additionally require age > cutoff
-                        # so we don't thrash. Under any pressure level we evict
-                        # replicated cold parts regardless of age. The replication
-                        # gate itself is enforced in the worker below.
-                        old_enough = mtime < cutoff_time
-                        if pressure == 0 and not old_enough:
-                            continue
-                    except Exception as e:
-                        logger.warning(f"Failed to classify part {part_dir}: {e}")
-                        continue
-
-                    yield (object_id, object_version, part_number, old_enough)
+            yield (object_id, object_version, part_number, old_enough)
 
     async def handle(conn: asyncpg.Connection, item: tuple[str, int, int, bool]) -> bool:
         object_id, object_version, part_number, old_enough = item
@@ -972,15 +1269,19 @@ async def cleanup_old_parts_by_mtime(
 
     parts_cleaned = await _run_worker_pool(pool, candidates(), handle, config.janitor_concurrency)
 
-    # Update the part-census gauges from the walk. Disk-usage + pressure gauges
-    # are owned by _update_disk_metrics (refreshed at cycle top) — don't re-stat
-    # the disk here.
-    oldest_mtime = stats["oldest_mtime"]
-    _fs_parts_on_disk = stats["parts_seen"]
-    _fs_oldest_age_seconds = max(0.0, now - float(oldest_mtime)) if oldest_mtime is not None else 0.0
-    _fs_age_buckets = stats["age_counts"]
-    _fs_hot_parts = stats["hot_parts"]
+    # Census is accumulated across the sharded sweep (this cycle covered shard `shard` of
+    # `shards`) and only published to the gauges when the sweep completes — see
+    # _accumulate_census / _publish_census. Disk-usage + pressure gauges are owned by
+    # _update_disk_metrics (refreshed at cycle top); don't re-stat the disk here.
+    # Pressure is a per-cycle fact (not per-sweep), so publish it every call regardless of the
+    # sharded census; _update_disk_metrics also sets it at cycle top, this keeps it in sync with
+    # the pressure this GC pass actually acted on.
+    global _fs_pressure_mode
     _fs_pressure_mode = pressure
+
+    _accumulate_census(stats, shard_complete=not walk_state.truncated)
+    if publish_sweep:
+        _publish_census(now)
 
     if parts_cleaned > 0 and _janitor_deleted_counter is not None:
         _janitor_deleted_counter.add(parts_cleaned)
@@ -1051,74 +1352,111 @@ async def run_janitor_loop():
     sleep_normal = 600  # 10m
     sleep_pressure = 120  # 2m
 
+    global _walk_shard
+    loop = asyncio.get_running_loop()
+
     try:
         while True:
             logger.info("Janitor cycle starting...")
-            # Refresh disk/pressure gauges up front. The GC walk below can take
-            # hours over millions of parts; disk visibility must not wait on it.
+            # Refresh disk/pressure gauges up front, and read pressure ONCE for the whole cycle.
             _update_disk_metrics(fs_store.root)
-
-            stale_count = 0
-            gc_count = 0
-            hard_deleted = 0
-            tmp_count = 0
-
-            # Phase 1: Clean stale MPU parts (aborted uploads)
-            try:
-                stale_count = await cleanup_stale_parts(db_pool, fs_store, redis_client)
-            except Exception as e:
-                logger.error(f"Phase 1 (stale cleanup) error: {e}", exc_info=True)
-
-            # Phase 2: GC old parts by mtime + update disk/cache metrics
-            try:
-                gc_count = await cleanup_old_parts_by_mtime(db_pool, fs_store, redis_client)
-            except Exception as e:
-                logger.error(f"Phase 2 (GC) error: {e}", exc_info=True)
-
-            # Phase 3: Clean orphan .tmp.* files from crashed atomic writes
-            try:
-                tmp_count = await cleanup_orphan_tmp_files(fs_store)
-            except Exception as e:
-                logger.error(f"Phase 3 (tmp cleanup) error: {e}", exc_info=True)
-
-            # Phase 4: Hard-delete soft-deleted objects where all unpins are confirmed
-            try:
-                hard_deleted = await gc_soft_deleted_objects(db_pool)
-            except Exception as e:
-                logger.error(f"Phase 4 (hard delete) error: {e}", exc_info=True)
-
-            # Phase 5: read-only replication-gate sentinel (G2). Publishes the durability
-            # gauge and alarms on any live/serveable chunk lacking full-union coverage.
             pressure = _pressure_mode(fs_store.root)
+
+            # --- DB-only DURABILITY phases run FIRST ------------------------------------------
+            # These used to run LAST, behind two full-tree FS walks. cleanup_stale_parts could
+            # not finish a pass over ~2.8M object dirs inside a cycle, so on prod these never ran
+            # at all — the replication-gate sentinel and the A21 aged-orphan leak gauge went dark.
+            # They are single indexed DB reads; nothing about the FS cache should gate them.
             sentinel_violations = 0
             try:
                 sentinel_violations = await check_replication_sentinel(db_pool, pressure)
             except Exception as e:
-                logger.error(f"Phase 5 (replication sentinel) error: {e}", exc_info=True)
+                logger.error(f"Replication sentinel error: {e}", exc_info=True)
 
-            # Phase 6: read-only aged-pending orphan gauge (A21 soak-gate feed). Publishes the
-            # standing leak backlog the replicated-only soak gate cannot see. The DLQ set is
-            # gathered fresh via the janitor's fail-closed get_all_dlq_object_ids and excluded so
-            # the gauge counts EXACTLY the population the sweep clears — a DLQ-parked orphan the
-            # sweep skips must not read as a phantom leak. On a DLQ-read failure the whole phase is
-            # skipped (gauge holds its prior value) rather than over-counting against an empty set.
-            # Note: the sweep's own DLQ set comes from mpu_cleanup.gather_dlq_object_ids, which is
-            # BEST-EFFORT (a Redis read failure logs and skips that key rather than aborting), so
-            # under a partial Redis failure the two briefly diverge — the sweep proceeds with a
-            # smaller set (clears more) while this gauge deliberately fails closed and stalls.
+            # Aged-pending orphan gauge (A21 soak-gate feed). The DLQ set is gathered fresh via
+            # the fail-closed get_all_dlq_object_ids and excluded so the gauge counts EXACTLY the
+            # population the sweep clears; on a DLQ-read failure the whole phase is skipped (gauge
+            # holds its prior value) rather than over-counting against an empty set.
             aged_orphans = 0
             try:
                 gauge_dlq_object_ids = await get_all_dlq_object_ids(redis_client)
                 aged_orphans = await check_aged_pending_orphans(db_pool, gauge_dlq_object_ids)
             except Exception as e:
-                logger.error(f"Phase 6 (aged-pending orphan gauge) error: {e}", exc_info=True)
+                logger.error(f"Aged-pending orphan gauge error: {e}", exc_info=True)
+
+            # --- FS-walk phases: sharded + budgeted so the cycle ALWAYS completes -------------
+            # Each cycle covers one hash-shard of the tree; a full sweep takes `shards` cycles.
+            # Under disk pressure we walk the whole tree every cycle (shards=1) and, at CRITICAL,
+            # lift the wall-clock budget entirely — freeing space must never be capped by a clock.
+            shards = 1 if pressure > 0 else max(1, config.janitor_walk_shards)
+            walk_shard = _walk_shard % shards
+            publish_sweep = walk_shard == shards - 1  # census publishes when the sweep wraps
+            walk_conc = max(1, config.janitor_walk_concurrency)
+            budget = config.janitor_walk_budget_seconds
+
+            stale_count = 0
+            gc_count = 0
+            tmp_count = 0
+            hard_deleted = 0
+
+            # Phase A: clean stale/orphan/terminally-abandoned parts (each phase gets its OWN
+            # fresh budget so the first walk can't starve the second — the bug we are fixing).
+            try:
+                stale_count = await cleanup_stale_parts(
+                    db_pool,
+                    fs_store,
+                    redis_client,
+                    shard=walk_shard,
+                    shards=shards,
+                    walk_concurrency=walk_conc,
+                    deadline=_walk_deadline(loop, pressure, budget),
+                )
+            except Exception as e:
+                logger.error(f"Stale cleanup error: {e}", exc_info=True)
+
+            # Phase B: replication-gated age GC + census (census published only on a full sweep).
+            try:
+                gc_count = await cleanup_old_parts_by_mtime(
+                    db_pool,
+                    fs_store,
+                    redis_client,
+                    shard=walk_shard,
+                    shards=shards,
+                    walk_concurrency=walk_conc,
+                    deadline=_walk_deadline(loop, pressure, budget),
+                    publish_sweep=publish_sweep,
+                )
+            except Exception as e:
+                logger.error(f"Age-GC error: {e}", exc_info=True)
+
+            # Phase C: orphan .tmp.* files from crashed atomic writes.
+            try:
+                tmp_count = await cleanup_orphan_tmp_files(
+                    fs_store,
+                    shard=walk_shard,
+                    shards=shards,
+                    walk_concurrency=walk_conc,
+                    deadline=_walk_deadline(loop, pressure, budget),
+                )
+            except Exception as e:
+                logger.error(f"Tmp cleanup error: {e}", exc_info=True)
+
+            # Phase D: hard-delete soft-deleted objects where all unpins are confirmed (DB-bound,
+            # batch-capped — cannot starve the cycle).
+            try:
+                hard_deleted = await gc_soft_deleted_objects(db_pool)
+            except Exception as e:
+                logger.error(f"Hard delete error: {e}", exc_info=True)
+
+            _walk_shard += 1  # advance the shard for next cycle
 
             logger.info(
-                f"Janitor cycle complete: stale={stale_count} gc={gc_count} tmp={tmp_count} "
-                f"hard_deleted={hard_deleted} sentinel_violations={sentinel_violations} aged_orphans={aged_orphans}"
+                f"Janitor cycle complete: shard={walk_shard}/{shards} publish_sweep={publish_sweep} "
+                f"stale={stale_count} gc={gc_count} tmp={tmp_count} hard_deleted={hard_deleted} "
+                f"sentinel_violations={sentinel_violations} aged_orphans={aged_orphans}"
             )
 
-            # Pick sleep interval based on current pressure (already probed for Phase 5)
+            # Pick sleep interval based on current pressure.
             sleep_interval = sleep_pressure if pressure > 0 else sleep_normal
             logger.info(f"Janitor sleeping {sleep_interval}s (pressure={pressure})")
             await asyncio.sleep(sleep_interval)
