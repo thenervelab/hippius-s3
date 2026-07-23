@@ -110,9 +110,18 @@ def clean_traceback(longrepr: str, max_lines: int = 10) -> str:
     for line in longrepr.split("\n"):
         if re.match(r"^\[gw\d+\]", line):
             continue
-        frame_header = re.match(r"^(\S+):\d+: in ", line)
-        if frame_header:
-            in_library_frame = "site-packages" in frame_header.group(1)
+        # Frame headers come in two shapes: pytest's --tb=short ("path:NN: in func")
+        # and the classic format used in collection errors ('  File "path", line NN').
+        frame_path = None
+        short_frame = re.match(r"^(\S+):\d+: in ", line)
+        classic_frame = re.match(r'^\s+File "([^"]+)", line \d+', line)
+        if short_frame:
+            frame_path = short_frame.group(1)
+        elif classic_frame:
+            frame_path = classic_frame.group(1)
+        if frame_path is not None:
+            # "lib/python" also covers stdlib frames (importlib etc.), not just site-packages.
+            in_library_frame = "site-packages" in frame_path or "lib/python" in frame_path
             if in_library_frame:
                 continue
         elif in_library_frame and (line.startswith("    ") or not line.strip()):
@@ -123,7 +132,8 @@ def clean_traceback(longrepr: str, max_lines: int = 10) -> str:
     result = "\n".join(kept).strip()
     lines = result.split("\n")
     if len(lines) > max_lines:
-        result = "\n".join(lines[:max_lines]) + "\n... (truncated)"
+        # The exception itself is the last line in both formats — never truncate it away.
+        result = "\n".join(lines[: max_lines - 2]) + "\n... (truncated)\n" + lines[-1]
     return result
 
 

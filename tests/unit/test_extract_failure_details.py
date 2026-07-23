@@ -122,21 +122,45 @@ def test_unparseable_report_file_is_reported(tmp_path):
     assert "killed mid-run" in message
 
 
-def test_collection_error_is_surfaced(tmp_path):
+COLLECTOR_LONGREPR = (
+    "Traceback (most recent call last):\n"
+    '  File "/opt/hostedtoolcache/Python/3.12.13/x64/lib/python3.12/site-packages/_pytest/python.py", '
+    "line 493, in importtestmodule\n"
+    "    mod = import_path(...)\n"
+    '  File "/opt/hostedtoolcache/Python/3.12.13/x64/lib/python3.12/importlib/__init__.py", '
+    "line 90, in import_module\n"
+    "    return _bootstrap._gcd_import(name[level:], package, level)\n"
+    '  File "tests/smoke/test_smoke_production.py", line 12, in <module>\n'
+    "    from hippius_api_client import HippiusApiClient\n"
+    "ImportError: cannot import name 'HippiusApiClient' from 'hippius_api_client'"
+)
+
+
+def test_collection_error_keeps_the_import_error_not_library_frames(tmp_path):
     report = make_report(
         exitcode=2,
         collectors=[
             {
                 "nodeid": "smoke/test_smoke_production.py",
                 "outcome": "error",
-                "longrepr": "ImportError: cannot import name 'boto3'",
+                "longrepr": COLLECTOR_LONGREPR,
             }
         ],
     )
     message = mod.build_alert_message([write_report(tmp_path, "smoke-production", report)])
 
     assert "could not even collect" in message
-    assert "ImportError" in message
+    assert "ImportError: cannot import name 'HippiusApiClient'" in message
+    assert "site-packages" not in message
+    assert "importlib" not in message
+
+
+def test_truncation_never_drops_the_final_error_line():
+    frames = "\n".join(f"tests/smoke/test_x.py:{n}: in helper_{n}\n    call()" for n in range(1, 12))
+    cleaned = mod.clean_traceback(f"{frames}\nE   RuntimeError: the actual problem", max_lines=6)
+
+    assert "... (truncated)" in cleaned
+    assert cleaned.endswith("E   RuntimeError: the actual problem")
 
 
 def test_nonzero_exit_without_failures_is_surfaced(tmp_path):
