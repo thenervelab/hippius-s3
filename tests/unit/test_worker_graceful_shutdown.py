@@ -24,6 +24,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from hippius_s3.workers.shutdown import DEFAULT_DRAIN_TIMEOUT_SECONDS
+from hippius_s3.workers.shutdown import _drain_timeout
 from hippius_s3.workers.shutdown import _supervise
 from hippius_s3.workers.shutdown import run_worker
 
@@ -213,3 +215,26 @@ def test_worker_entrypoints_use_the_supervisor() -> None:
         f"{offenders} call asyncio.run() directly instead of run_worker(), so they install "
         f"no SIGTERM handler and their cleanup never runs."
     )
+
+
+def test_drain_timeout_honors_env_override(monkeypatch) -> None:
+    """The drain bound is operator-tunable via HIPPIUS_WORKER_DRAIN_TIMEOUT_SECONDS; the supervisor
+    reads that env, not just the compiled-in default. Exercises the override path (unset in every
+    manifest today, so otherwise never covered)."""
+    monkeypatch.delenv("HIPPIUS_WORKER_DRAIN_TIMEOUT_SECONDS", raising=False)
+    assert _drain_timeout() == DEFAULT_DRAIN_TIMEOUT_SECONDS
+
+    monkeypatch.setenv("HIPPIUS_WORKER_DRAIN_TIMEOUT_SECONDS", "37")
+    assert _drain_timeout() == 37.0
+
+
+def test_effective_drain_timeout_fits_every_worker_grace_period(monkeypatch) -> None:
+    """Guard the EFFECTIVE drain bound (what _drain_timeout() actually returns at the default),
+    not just the hardcoded 20, against every worker's terminationGracePeriodSeconds. If the default
+    ever drifts above a grace, the kubelet SIGKILLs mid-cleanup — the exact bug this PR fixes.
+    (Raising the env above a grace is an operator's explicit choice and out of scope here.)"""
+    monkeypatch.delenv("HIPPIUS_WORKER_DRAIN_TIMEOUT_SECONDS", raising=False)
+    effective = _drain_timeout()
+    for name, spec in _worker_deployments():
+        grace = spec["terminationGracePeriodSeconds"]
+        assert grace > effective, f"{name} grace={grace}s <= effective drain {effective}s → kubelet SIGKILL mid-cleanup"

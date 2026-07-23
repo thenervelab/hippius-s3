@@ -281,3 +281,59 @@ async def test_durability_phases_run_before_fs_walks(monkeypatch):
     first_fs = min(order.index(p) for p in ("fs_stale", "fs_gc", "fs_tmp"))
     assert order.index("sentinel") < first_fs, f"sentinel must run before FS walks; got {order}"
     assert order.index("aged_orphans") < first_fs, f"aged-orphan gauge must run before FS walks; got {order}"
+
+
+@pytest.mark.asyncio
+async def test_disk_pressure_collapses_the_walk_to_a_single_whole_tree_shard(monkeypatch):
+    """Safety rule (config.janitor_walk_shards): under ANY disk pressure the janitor must collapse
+    sharding to shards=1 so ONE cycle walks the WHOLE tree and eviction sees every deletable part —
+    never a 1/Nth slice while the disk fills. A regression that kept the normal shard count under
+    pressure would silently slow eviction exactly when it matters most; pin it here."""
+
+    async def _shards_passed_at_pressure(pressure: int) -> dict:
+        captured: dict = {}
+
+        async def _capture_stale(*a, **k):
+            captured["stale"] = k.get("shards")
+            return 0
+
+        async def _capture_gc(*a, **k):
+            captured["gc"] = k.get("shards")
+            return 0
+
+        monkeypatch.setattr(janitor, "_update_disk_metrics", lambda root: None)
+        monkeypatch.setattr(janitor, "_pressure_mode", lambda root: pressure)
+        monkeypatch.setattr(janitor, "check_replication_sentinel", AsyncMock(return_value=0))
+        monkeypatch.setattr(janitor, "get_all_dlq_object_ids", AsyncMock(return_value=set()))
+        monkeypatch.setattr(janitor, "check_aged_pending_orphans", AsyncMock(return_value=0))
+        monkeypatch.setattr(janitor, "cleanup_stale_parts", _capture_stale)
+        monkeypatch.setattr(janitor, "cleanup_old_parts_by_mtime", _capture_gc)
+        monkeypatch.setattr(janitor, "cleanup_orphan_tmp_files", AsyncMock(return_value=0))
+        monkeypatch.setattr(janitor, "gc_soft_deleted_objects", AsyncMock(return_value=0))
+        monkeypatch.setattr(janitor, "_setup_janitor_metrics", lambda: None)
+        monkeypatch.setattr(janitor, "create_fs_store", lambda config: MagicMock(root=Path("/tmp")))
+        monkeypatch.setattr(janitor.asyncpg, "create_pool", AsyncMock(return_value=AsyncMock()))
+        monkeypatch.setattr(janitor.Redis, "from_url", lambda url: AsyncMock())
+
+        class _Stop(Exception):
+            pass
+
+        async def _sleep_then_stop(_seconds):
+            raise _Stop
+
+        monkeypatch.setattr(janitor.asyncio, "sleep", _sleep_then_stop)
+        with pytest.raises(_Stop):
+            await janitor.run_janitor_loop()
+        return captured
+
+    # Elevated (1) AND critical (2) both force the whole-tree single-shard walk.
+    for pressure in (1, 2):
+        captured = await _shards_passed_at_pressure(pressure)
+        assert captured["stale"] == 1, f"pressure={pressure} must force shards=1 (stale phase), got {captured}"
+        assert captured["gc"] == 1, f"pressure={pressure} must force shards=1 (age-GC phase), got {captured}"
+
+    # Normal pressure keeps the configured sharded sweep.
+    normal = await _shards_passed_at_pressure(0)
+    expected = max(1, janitor.config.janitor_walk_shards)
+    assert normal["stale"] == expected, f"normal pressure must use the configured shard count, got {normal}"
+    assert normal["gc"] == expected, f"normal pressure must use the configured shard count, got {normal}"
