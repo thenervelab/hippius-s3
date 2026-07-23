@@ -33,6 +33,7 @@ Operational and migration scripts. Most are invoked manually by an operator duri
 |---|---|
 | [nuke_user.py](nuke_user.py) | **⚠️ DESTRUCTIVE**. Deletes a user and all their buckets/objects. Usually invoked for GDPR requests or test cleanup. |
 | [purge_buckets.py](purge_buckets.py) | **⚠️ DESTRUCTIVE**. Delete one or more buckets and their contents. |
+| [sweep_partless_multipart_uploads.py](sweep_partless_multipart_uploads.py) | **⚠️ DELETES**, but only MPU headers with **zero** `parts` rows — no chunk data exists behind them, so this is what `AbortMultipartUpload` already does. One-time cleanup of the ~874k such rows (97% of the incomplete backlog) that the mpu-reaper can never reach, because its query INNER-joins to `parts`. Dry run by default; needs `--yes`. Batched with a `statement_timeout` so it cannot itself pin the xmin horizon. |
 
 ## Invocation
 
