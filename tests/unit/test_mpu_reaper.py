@@ -19,6 +19,26 @@ import pytest
 from hippius_s3.services import mpu_cleanup
 
 
+class _StopLoop(Exception):
+    """Breaks run_mpu_reaper_loop's `while True` after one pass."""
+
+
+def statement_of(query: str) -> str:
+    """The query with its leading comments stripped.
+
+    These tests route on the SQL text, and query files routinely NAME other tables in
+    their comments — list_abandoned_versions.sql explains its plan in terms of the drain's
+    cephor_replication_status. Matching the raw text then silently misroutes: the reaper's
+    query looks like the sweep's, so the fake feeds it the wrong rows and the grace-window
+    assertion reads the wrong call. Route on the statement instead.
+
+    Strips leading `--` lines only. That covers every file in hippius_s3/sql/queries (checked:
+    no block comments, no trailing inline comments), so if someone introduces `/* ... */` or a
+    trailing `-- note`, extend this rather than assuming it still holds.
+    """
+    return "\n".join(line for line in query.splitlines() if not line.lstrip().startswith("--"))
+
+
 class FakeDb:
     """A minimal asyncpg-connection stand-in: fetch returns canned rows; execute records.
 
@@ -45,7 +65,7 @@ class FakeDb:
 
     async def fetch(self, query: str, *args: object) -> list[dict]:
         self.fetched.append((query, args))
-        if "cephor_replication_status" in query:
+        if "cephor_replication_status" in statement_of(query):
             return self._sweep_rows
         return self._fetch_rows
 
@@ -291,7 +311,46 @@ async def test_run_reaper_cycle_threads_distinct_grace_windows() -> None:
             pool, _fake_redis(), stale_seconds=86400, sweep_grace_seconds=999, upload_backends=["arion"]
         )
 
-    reaper_grace = next(args[0] for query, args in db.fetched if "multipart_uploads" in query)
-    sweep_grace = next(args[0] for query, args in db.fetched if "cephor_replication_status" in query)
+    reaper_grace = next(args[0] for query, args in db.fetched if "multipart_uploads" in statement_of(query))
+    sweep_grace = next(args[0] for query, args in db.fetched if "cephor_replication_status" in statement_of(query))
     assert reaper_grace == 86400, "the abandoned-MPU reaper uses stale_seconds"
     assert sweep_grace == 999, "the orphan sweep uses the distinct sweep_grace_seconds"
+
+
+@pytest.mark.asyncio
+async def test_reaper_pool_bounds_every_statement() -> None:
+    """The reaper's pool must cap statement runtime.
+
+    Without a command_timeout a bad plan runs unbounded, and an unbounded statement pins
+    its snapshot — so the xmin horizon stops advancing and VACUUM reclaims nothing
+    database-wide. That is how one 96-minute query on 2026-07-23 bloated the drain's
+    partial indexes and stalled replication. Fixing that query's plan does not stop the
+    next one; the timeout is what bounds the blast radius.
+    """
+    captured: dict = {}
+
+    async def fake_create_pool(_dsn, **kwargs):
+        captured.update(kwargs)
+        pool = MagicMock()
+        pool.close = AsyncMock()
+        return pool
+
+    async def stop_the_loop(_seconds):
+        raise _StopLoop
+
+    fake_asyncpg = MagicMock()
+    fake_asyncpg.create_pool = fake_create_pool
+
+    with (
+        patch.dict("sys.modules", {"asyncpg": fake_asyncpg}),
+        patch.object(mpu_cleanup, "run_reaper_cycle", new=AsyncMock()),
+        patch.object(mpu_cleanup, "initialize_metrics_collector", new=MagicMock(), create=True),
+        patch.object(mpu_cleanup.asyncio, "sleep", new=stop_the_loop),
+    ):
+        with pytest.raises(_StopLoop):
+            await mpu_cleanup.run_mpu_reaper_loop()
+
+    assert captured.get("command_timeout"), (
+        "the reaper pool was created without a command_timeout — an unbounded statement "
+        "can pin the xmin horizon and stop VACUUM database-wide"
+    )
