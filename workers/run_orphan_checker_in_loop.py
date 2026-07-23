@@ -19,6 +19,7 @@ from hippius_s3.queue import enqueue_unpin_request
 from hippius_s3.queue import initialize_queue_client
 from hippius_s3.sentry import init_sentry
 from hippius_s3.services.hippius_api_service import HippiusApiClient
+from hippius_s3.workers.shutdown import run_worker
 
 
 config = get_config()
@@ -152,20 +153,20 @@ async def run_orphan_checker_loop() -> None:
     else:
         logger.info("Account whitelist: disabled (processing all accounts)")
 
-    while True:
-        ok = await run_orphan_check_cycle(db)
-        sleep_for = config.orphan_checker_loop_sleep if ok else 60
-        logger.info(f"Sleeping for {sleep_for} seconds...")
-        await asyncio.sleep(sleep_for)
+    # Closing on the way out is what tells Postgres and Redis this client is gone. Without
+    # it a cancelled worker leaves its backend behind, which is the orphan this PR exists to
+    # stop — the other workers already had the `finally`, this one did not.
+    try:
+        while True:
+            ok = await run_orphan_check_cycle(db)
+            sleep_for = config.orphan_checker_loop_sleep if ok else 60
+            logger.info(f"Sleeping for {sleep_for} seconds...")
+            await asyncio.sleep(sleep_for)
+    finally:
+        await db.close()
+        await redis_client.aclose()
+        await redis_queues_client.aclose()
 
 
 if __name__ == "__main__":
-    while True:
-        try:
-            asyncio.run(run_orphan_checker_loop())
-        except KeyboardInterrupt:
-            logger.info("Orphan checker service stopped by user")
-            break
-        except Exception as e:
-            logger.error(f"Orphan checker crashed, restarting in 5 seconds: {e}", exc_info=True)
-            time.sleep(5)
+    run_worker(run_orphan_checker_loop, "orphan-checker", restart_on_crash=True)

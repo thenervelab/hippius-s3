@@ -216,7 +216,22 @@ class Config:
     # (DownloadNotReadyError). Keeps an un-drained/never-arriving object (e.g. a part not yet on any
     # backend) from hanging the whole request up to cache_ttl_seconds (~1h). Later chunks keep the
     # full wait — once the first chunk lands the object is actively draining.
-    stream_first_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS:90", convert=int)
+    #
+    # MUST STAY BELOW THE CLIENT'S READ TIMEOUT. This was 90s, which is above boto3's 60s default,
+    # so the fail-fast never actually reached anyone: the client hung up at 60s and got a dead
+    # socket, which is NOT retryable, while the 503 SlowDown this raises IS. Worse, from the
+    # server's side the request later completed 200, so nothing was recorded as a failure.
+    # Observed 2026-07-23 14:50:05 — a presigned GET returned 200 after processing_time_ms=60167,
+    # 167ms after the client had already given up.
+    #
+    # 25s leaves room for two client-side retries inside one 60s budget. A cross-node
+    # read-after-write costs ~60s end to end (the part lands on one node's SSD; a reconciler
+    # notices, the drain copies it, an enqueue sweep publishes, the uploader uploads — every stage
+    # a poll, not an event), so on a fresh object the FIRST attempt is EXPECTED to 503 and a retry
+    # to succeed. That is the mechanism working, not a failure. Making the read genuinely fast is a
+    # separate problem: serve it from the peer that holds the data instead of waiting out the
+    # pipeline.
+    stream_first_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS:25", convert=int)
     # A3: bound on how long the streamer waits for EACH subsequent chunk (after the first). Without
     # it a later chunk whose backend fetch permanently fails stalls the already-committed 200
     # response up to cache_ttl_seconds (~1h) mid-stream; this caps that to a bounded fail (the
@@ -388,6 +403,31 @@ class Config:
     # cleanup loops are DB-roundtrip bound; this is how many parts are processed
     # in parallel (each over its own pooled connection).
     janitor_concurrency: int = env("HIPPIUS_JANITOR_CONCURRENCY:16", convert=int)
+    # Concurrency for the FS *walk* itself (distinct from janitor_concurrency, which is the
+    # per-part DB roundtrip fan-out). The cache root is a single flat directory of millions of
+    # object dirs on CephFS; a single-threaded walk is metadata-latency bound (~40 objects/s
+    # measured on prod 2026-07-23, so a full pass over ~2.8M objects is ~20h and never completes
+    # inside a cycle — which starves every phase after it). This fans the per-object descent
+    # (scandir + stat) across a thread pool so many CephFS metadata roundtrips are in flight at
+    # once. Set to 1 for the legacy serial walk. Kept modest by default because the same CephFS
+    # MDS serves live GET/PUT — do not crank without watching MDS latency.
+    janitor_walk_concurrency: int = env("HIPPIUS_JANITOR_WALK_CONCURRENCY:8", convert=int)
+    # Wall-clock budget for each FS-walk phase (stale-cleanup, age-GC, tmp-sweep). Once exceeded
+    # the walk stops enqueuing new object dirs and the phase returns, so the cycle always
+    # completes and the phases after it — plus the DB-only durability sentinel + aged-orphan
+    # gauge which now run FIRST regardless — keep ticking. 0 = unbounded. Automatically lifted to
+    # unbounded under CRITICAL disk pressure — freeing space must never be capped by a clock.
+    janitor_walk_budget_seconds: int = env("HIPPIUS_JANITOR_WALK_BUDGET_SECONDS:240", convert=int)
+    # Number of hash-shards the FS walk rotates through, one per cycle, for FAIR coverage: each
+    # cycle descends only into object dirs where crc32(object_id) % shards == cycle_shard, so a
+    # full sweep of the tree takes `shards` cycles and no object waits behind an always-truncated
+    # prefix. SIZING: a shard must fit inside the budget or its tail is never reached — pick
+    # shards ≳ (objects / (walk_concurrency · per-thread-obj/s · budget_s)). At ~2.8M objects,
+    # concurrency 8 (~8× the ~40 obj/s serial rate measured on prod) and a 240s budget, one shard
+    # is ~44k objects → comfortably inside budget; a full sweep is ~64 cycles (~10h at the 600s
+    # normal sleep). Raise it if the cache grows or the walk logs truncated=True; 1 = walk the
+    # whole tree every cycle. Forced to 1 under disk pressure so eviction sees the whole tree.
+    janitor_walk_shards: int = env("HIPPIUS_JANITOR_WALK_SHARDS:64", convert=int)
     # Max soft-deleted objects hard-deleted per janitor cycle. The find query is
     # an index-probe over this many candidates; keep it bounded so a large
     # backlog drains gradually instead of in one DELETE-cascade burst.

@@ -22,6 +22,8 @@ import httpx
 import pytest
 from botocore.config import Config
 
+from .retrying_http import get_with_slowdown_retry
+
 
 REGIONAL_ENDPOINTS = [
     "https://eu-central-1.hippius.com",
@@ -93,7 +95,7 @@ def test_regional_public_object_anonymous_download(regional_s3_client, session_t
     regional_s3_client.put_object_acl(Bucket=session_tracker.bucket, Key=key, ACL="public-read")
 
     anon_url = f"{endpoint.rstrip('/')}/{session_tracker.bucket}/{key}"
-    resp = httpx.get(anon_url, timeout=60)
+    resp = get_with_slowdown_retry(anon_url, timeout=60)
     assert resp.status_code == 200, f"anonymous GET failed: status={resp.status_code} body={resp.text[:200]}"
     assert hashlib.md5(resp.content).hexdigest() == expected_hash, (
         f"[{region}] anonymously-downloaded public object does not match what was uploaded — public-read reads through the {region} edge are corrupting data."
@@ -129,7 +131,7 @@ def test_regional_presigned_url_roundtrip(regional_s3_client, session_tracker, f
         Params={"Bucket": session_tracker.bucket, "Key": key},
         ExpiresIn=300,
     )
-    get_resp = httpx.get(get_url, timeout=60)
+    get_resp = get_with_slowdown_retry(get_url, timeout=60)
     assert get_resp.status_code == 200, f"[{region}] presigned GET failed: {get_resp.status_code} {get_resp.text[:200]}"
     assert hashlib.md5(get_resp.content).hexdigest() == expected_hash, (
         f"[{region}] object fetched via presigned URL does not match what was PUT via presigned URL — the {region} presigned round-trip is corrupting data."
