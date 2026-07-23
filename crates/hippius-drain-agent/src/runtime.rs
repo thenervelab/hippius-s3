@@ -351,6 +351,15 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
         Ok(removed) => tracing::info!(removed, "swept orphan SSD write-temps"),
         Err(err) => tracing::warn!(error = %err, "orphan-temp sweep failed; will retry next poll"),
     }
+
+    // Reuses the failed-part grace as the "untouched for long enough" gate: both answer the
+    // same question — has anything written here recently — and a second knob for the same
+    // property is a knob that gets set inconsistently.
+    match ssd.sweep_empty_shells(graces.failed).await {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(removed, "swept empty SSD object/version shells"),
+        Err(err) => tracing::warn!(error = %err, "empty-shell sweep failed; will retry next poll"),
+    }
 }
 
 /// One R4 re-drive pass: reset this node's bounded `corrupt` parts back to `pending` (so the

@@ -26,7 +26,6 @@ import json
 import logging
 import os
 import shutil
-import socket
 import sys
 import time
 from collections.abc import AsyncIterator
@@ -41,7 +40,6 @@ from opentelemetry import metrics as otel_metrics
 from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-from opentelemetry.sdk.resources import Resource
 from redis.asyncio import Redis
 
 
@@ -51,6 +49,7 @@ from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import create_fs_store
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
+from hippius_s3.otel_setup import build_resource
 from hippius_s3.sentry import init_sentry
 from hippius_s3.utils import get_query
 
@@ -298,7 +297,7 @@ def _setup_janitor_metrics() -> None:
         endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
         service_name = os.getenv("OTEL_SERVICE_NAME", "hippius-s3")
 
-        resource = Resource.create({"service.name": service_name, "service.instance.id": socket.gethostname()})
+        resource = build_resource(service_name)
         metric_reader = PeriodicExportingMetricReader(
             OTLPMetricExporter(endpoint=endpoint, insecure=True),
             export_interval_millis=10000,

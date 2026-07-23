@@ -357,6 +357,16 @@ class Config:
     # never-finalized uploads older than mpu_stale_seconds (address never written),
     # purging their SSD parts + drain replication rows so the drain stops re-deferring.
     mpu_reaper_interval_seconds: int = env("HIPPIUS_MPU_REAPER_INTERVAL_SECONDS:120", convert=int)  # every 2 min
+    # Hard ceiling on any single reaper statement. The reaper's pool had NO command_timeout, so
+    # on 2026-07-23 one abandoned-upload query ran for 96 MINUTES on a bad plan. The damage was
+    # not the slowness: a long statement pins its snapshot, so the xmin horizon stops advancing
+    # and VACUUM reclaims nothing database-wide — cephor_replication_status held ~499k dead
+    # tuples through 429 autovacuum runs, its partial indexes bloated, the drain fell behind and
+    # a cross-node read took 83s. The plan is fixed (list_abandoned_versions.sql, ~8s), but a
+    # timeout is what bounds the DAMAGE of the next bad plan rather than that one instance.
+    # Well above the measured runtime, far below anything that can hurt the horizon; a cycle
+    # that trips it is logged and retried on the next interval.
+    mpu_reaper_statement_timeout_seconds: int = env("HIPPIUS_MPU_REAPER_STATEMENT_TIMEOUT_SECONDS:60", convert=int)
     # Replication SLA grace for the G2 under-replication sentinel. `address` is stamped at
     # PUT completion but the chunk_backend coverage row is written much later by the async
     # drain→pool→backend pipeline, so every servable chunk is briefly under-covered while it

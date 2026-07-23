@@ -86,7 +86,6 @@ async def _handle_upload(uploader, db_pool, upload_request) -> None:
                     upload_request, backend_name="arion", delay_seconds=delay_ms / 1000.0, last_error=err_str
                 )
                 get_metrics_collector().record_uploader_operation(
-                    main_account=upload_request.address,
                     success=False,
                     backend="arion",
                     attempt=attempts_next,

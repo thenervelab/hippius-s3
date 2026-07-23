@@ -50,6 +50,10 @@ spec:
       labels:
         app: api-local
     spec:
+      # 10s preStop + up to 25s uvicorn drain, with headroom before the kubelet SIGKILLs.
+      # A DaemonSet rolls with no surge pod, so each node loses its only api-local for the
+      # duration — draining rather than being killed is what keeps in-flight requests alive.
+      terminationGracePeriodSeconds: 45
       # Outrank general workloads for the node1-5 slots (below system-*-critical; never preempts
       # Ceph/system). See s3-ingest-priorityclass.yaml + peer-review B3.
       priorityClassName: s3-ingest-priority
@@ -152,6 +156,12 @@ spec:
             periodSeconds: 60
             timeoutSeconds: 10
             failureThreshold: 5
+          # See the note in k8s/base/api-deployment.yaml: keeps this pod serving while
+          # endpoint removal propagates, so SIGTERM lands only after traffic has moved off.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "10"]
           readinessProbe:
             httpGet:
               path: /health

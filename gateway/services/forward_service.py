@@ -12,6 +12,12 @@ from hippius_s3.monitoring import get_metrics_collector
 
 logger = logging.getLogger(__name__)
 
+# Methods that are safe to re-send when the upstream connection dies before any response
+# byte exists. Deliberately excludes DELETE: it is idempotent by S3 semantics, but a retry
+# after an ambiguous failure can turn one caller's delete into a second version-deleting
+# call, so it stays single-shot.
+_RETRIABLE_METHODS = frozenset({"GET", "HEAD"})
+
 _HOP_BY_HOP_HEADERS = {
     # RFC 7230 hop-by-hop headers that proxies should not forward end-to-end
     "connection",
@@ -133,15 +139,38 @@ class ForwardService:
                 bytes_received += len(chunk)
                 yield chunk
 
+        # A pooled keep-alive connection to the API can be closed under us at any time — most
+        # visibly when an api pod is rolled, which shows up here as RemoteProtocolError before
+        # a single response byte exists. Retrying is only sound when we can reproduce the
+        # request exactly, and `request.stream()` is one-shot: it cannot be replayed. So the
+        # retry is limited to bodyless idempotent requests, where there is nothing to replay.
+        has_body = request.headers.get("content-length", "").strip() not in ("", "0") or (
+            "chunked" in request.headers.get("transfer-encoding", "").lower()
+        )
+        can_retry = request.method in _RETRIABLE_METHODS and not has_body
+        send_body = request.method != "HEAD" and has_body
+
         # Stream backend response for ALL methods (prevents buffering large downloads in gateway memory).
         # Important: We must keep the upstream httpx stream open until the client finishes consuming.
-        stream_cm = self.client.stream(
-            method=request.method,
-            url=target_url,
-            headers=headers,
-            content=None if request.method == "HEAD" else request_body_iter(),
-        )
-        upstream_response = await stream_cm.__aenter__()
+        for attempt in range(2 if can_retry else 1):
+            stream_cm = self.client.stream(
+                method=request.method,
+                url=target_url,
+                headers=headers,
+                content=request_body_iter() if send_body else None,
+            )
+            try:
+                upstream_response = await stream_cm.__aenter__()
+                break
+            except (httpx.RemoteProtocolError, httpx.ConnectError) as exc:
+                if not can_retry or attempt == 1:
+                    raise
+                logger.warning(
+                    "Upstream connection died before a response (%s); retrying %s %s once",
+                    type(exc).__name__,
+                    request.method,
+                    request.url.path,
+                )
 
         # Preserve multi-value headers (e.g. Set-Cookie) by forwarding raw headers.
         filtered_raw = _filter_hop_by_hop_raw_headers(list(upstream_response.headers.raw))
