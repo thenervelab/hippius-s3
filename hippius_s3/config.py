@@ -216,7 +216,22 @@ class Config:
     # (DownloadNotReadyError). Keeps an un-drained/never-arriving object (e.g. a part not yet on any
     # backend) from hanging the whole request up to cache_ttl_seconds (~1h). Later chunks keep the
     # full wait — once the first chunk lands the object is actively draining.
-    stream_first_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS:90", convert=int)
+    #
+    # MUST STAY BELOW THE CLIENT'S READ TIMEOUT. This was 90s, which is above boto3's 60s default,
+    # so the fail-fast never actually reached anyone: the client hung up at 60s and got a dead
+    # socket, which is NOT retryable, while the 503 SlowDown this raises IS. Worse, from the
+    # server's side the request later completed 200, so nothing was recorded as a failure.
+    # Observed 2026-07-23 14:50:05 — a presigned GET returned 200 after processing_time_ms=60167,
+    # 167ms after the client had already given up.
+    #
+    # 25s leaves room for two client-side retries inside one 60s budget. A cross-node
+    # read-after-write costs ~60s end to end (the part lands on one node's SSD; a reconciler
+    # notices, the drain copies it, an enqueue sweep publishes, the uploader uploads — every stage
+    # a poll, not an event), so on a fresh object the FIRST attempt is EXPECTED to 503 and a retry
+    # to succeed. That is the mechanism working, not a failure. Making the read genuinely fast is a
+    # separate problem: serve it from the peer that holds the data instead of waiting out the
+    # pipeline.
+    stream_first_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS:25", convert=int)
     # A3: bound on how long the streamer waits for EACH subsequent chunk (after the first). Without
     # it a later chunk whose backend fetch permanently fails stalls the already-committed 200
     # response up to cache_ttl_seconds (~1h) mid-stream; this caps that to a bounded fail (the
