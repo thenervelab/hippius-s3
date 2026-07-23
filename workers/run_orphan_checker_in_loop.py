@@ -169,4 +169,4 @@ async def run_orphan_checker_loop() -> None:
 
 
 if __name__ == "__main__":
-    run_worker(run_orphan_checker_loop, "orphan-checker")
+    run_worker(run_orphan_checker_loop, "orphan-checker", restart_on_crash=True)

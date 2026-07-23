@@ -111,7 +111,7 @@ def test_signal_does_not_restart_the_worker() -> None:
     assert starts == 1
 
 
-def test_crash_restarts_then_stops() -> None:
+def test_crash_restarts_then_stops_when_opted_in() -> None:
     attempts = 0
 
     async def flaky() -> None:
@@ -121,8 +121,39 @@ def test_crash_restarts_then_stops() -> None:
             raise RuntimeError("transient")
         return None
 
-    run_worker(flaky, "test-worker", restart_delay=0.0, drain_timeout=1.0)
+    run_worker(flaky, "test-worker", restart_on_crash=True, restart_delay=0.0, drain_timeout=1.0)
     assert attempts == 3
+
+
+def test_crash_exits_by_default() -> None:
+    """Restarting in-process hides a persistent crash: the pod stays Ready with
+    restart_count 0. Only entrypoints that already restarted themselves opt in."""
+    attempts = 0
+
+    async def always_broken() -> None:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run_worker(always_broken, "test-worker", restart_delay=0.0, drain_timeout=1.0)
+    assert attempts == 1, "default must not retry in-process"
+
+
+def test_only_previously_self_restarting_entrypoints_opt_in() -> None:
+    """Guards the behaviour-preservation claim: before this module, exactly these three
+    entrypoints wrapped themselves in `while True / except Exception / sleep(5)`."""
+    expected = {
+        "run_mpu_reaper_in_loop.py",
+        "run_orphan_checker_in_loop.py",
+        "run_arion_unpinner_in_loop.py",
+    }
+    opted_in = {
+        script.name
+        for script in (REPO_ROOT / "workers").glob("run_*_in_loop.py")
+        if "restart_on_crash=True" in script.read_text()
+    }
+    assert opted_in == expected
 
 
 # ---- the manifests have to give that cleanup room to run ----

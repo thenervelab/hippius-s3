@@ -75,19 +75,30 @@ def run_worker(
     factory: CoroFactory,
     name: str,
     *,
+    restart_on_crash: bool = False,
     restart_delay: float = DEFAULT_RESTART_DELAY_SECONDS,
     drain_timeout: float | None = None,
 ) -> None:
     """Entry point for a long-running worker: run `factory()` until SIGTERM/SIGINT.
 
-    Restarts the worker if it crashes, but never after a shutdown signal — a pod that is
-    being terminated must not start a fresh cycle it has no time to finish.
+    `restart_on_crash` mirrors whatever each entrypoint did before this module existed, and
+    defaults off deliberately. Restarting in-process keeps the pod Ready with restart_count
+    at 0, so a persistently crashing worker becomes invisible to the pod-restart alerting;
+    letting the crash exit hands that job to the kubelet, which makes it visible. Only the
+    entrypoints that already had a `while True / except Exception / sleep(5)` wrapper pass
+    True, so this PR changes shutdown behaviour without also changing crash behaviour.
+
+    A shutdown signal never restarts, either way — a pod being terminated must not start a
+    fresh cycle it has no time to finish.
     """
     timeout = _drain_timeout() if drain_timeout is None else drain_timeout
     while True:
         try:
             signalled = asyncio.run(_supervise(factory, name, timeout))
         except Exception as exc:
+            if not restart_on_crash:
+                logger.error("%s: crashed, exiting for the kubelet to restart: %s", name, exc, exc_info=True)
+                raise
             logger.error("%s: crashed, restarting in %.0fs: %s", name, restart_delay, exc, exc_info=True)
             time.sleep(restart_delay)
             continue

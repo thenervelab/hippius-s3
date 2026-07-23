@@ -28,4 +28,5 @@ if __name__ == "__main__":
             queue_name="arion_unpin_requests",
         ),
         "arion-unpinner",
+        restart_on_crash=True,
     )

@@ -20,4 +20,4 @@ init_sentry("mpu-reaper", is_worker=True)
 
 
 if __name__ == "__main__":
-    run_worker(run_mpu_reaper_loop, "mpu-reaper")
+    run_worker(run_mpu_reaper_loop, "mpu-reaper", restart_on_crash=True)
