@@ -52,6 +52,7 @@ from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.otel_setup import build_resource
 from hippius_s3.sentry import init_sentry
 from hippius_s3.utils import get_query
+from hippius_s3.workers.shutdown import run_worker
 
 
 config = get_config()
@@ -1130,4 +1131,4 @@ async def run_janitor_loop():
 
 
 if __name__ == "__main__":
-    asyncio.run(run_janitor_loop())
+    run_worker(run_janitor_loop, "janitor")
