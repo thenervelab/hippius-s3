@@ -114,9 +114,12 @@ metadata:
 spec:
   podSelector:
     matchExpressions:
+      # NB the operator names sentinel pods `<sentinelName>-sentinel`, so their `app` label is
+      # `redis-queues-sentinel-sentinel` (doubled suffix) — matching only `redis-queues-sentinel`
+      # would leave operator->sentinel:26379 blocked and the sentinels never configured.
       - key: app
         operator: In
-        values: ["redis-queues-ha", "redis-queues-sentinel"]
+        values: ["redis-queues-ha", "redis-queues-sentinel-sentinel"]
   policyTypes: ["Ingress"]
   ingress:
     - from:
