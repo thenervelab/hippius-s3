@@ -32,8 +32,20 @@
 --
 -- Ordering by initiated_at instead lets idx_multipart_uploads_initiated_at supply the
 -- order so LIMIT stops early, and materialising the candidates first bounds the parts
--- join to those 2000 uploads. Same rows, 96 minutes -> ~11s. Oldest-first is also the
--- order the reaper wants, since it reports the oldest reaped age as its lag.
+-- join to those 2000 uploads. 96 minutes -> ~8s. Oldest-first is also the order the reaper
+-- wants, since it reports the oldest reaped age as its lag.
+--
+-- The result is a strict SUBSET of what this returned before, never a superset: see the
+-- address gate below for the one case that narrowed, and why narrowing is the only safe
+-- direction on a path that DELETEs.
+--
+-- COST IS O(INCOMPLETE BACKLOG), NOT O(RESULT). The LIMIT bounds what comes OUT, not the
+-- index walk: in the steady state (fewer than 2000 reapable uploads — the state this is
+-- driving toward) it walks every entry in idx_multipart_uploads_initiated_at, ~904k on prod,
+-- probing parts up to 3x each, every mpu_reaper_interval_seconds. That backlog is 97%
+-- partless uploads which NOTHING deletes, so the ~8s degrades linearly and forever. It is
+-- comfortably under the reaper's command_timeout today; it will not stay that way. The fix
+-- is a partless-MPU sweep (see the PR discussion), not more tuning here.
 WITH candidates AS MATERIALIZED (
     SELECT mu.upload_id, mu.initiated_at
     FROM multipart_uploads mu
@@ -55,6 +67,14 @@ WITH candidates AS MATERIALIZED (
       -- The address gate, hoisted into the candidate set so it cannot be defeated by the
       -- LIMIT: filtering after the limit would let 2000 non-reapable uploads occupy every
       -- slot and stall the reaper on the same rows every cycle.
+      --
+      -- Hoisting makes this per-UPLOAD where it used to be per-VERSION, which diverges for an
+      -- upload whose parts span several object versions with only SOME addressed: previously
+      -- the unaddressed ones were reaped, now the upload is skipped entirely. Deliberate — on
+      -- a path that DELETES, declining to act on a mixed upload is the safe direction. Nothing
+      -- ties an upload to one version in the schema, but nothing produces the mix either: a
+      -- 5000-upload sample of the live candidate population on 2026-07-23 had max 1 version
+      -- per upload and zero spanning uploads.
       AND NOT EXISTS (
             SELECT 1 FROM parts p2
             JOIN object_versions ov2

@@ -245,23 +245,60 @@ async def test_partless_uploads_do_not_starve_the_candidate_budget(conn):
     assert await _abandoned(conn) == {(upload, object_id, 1)}
 
 
-async def test_oldest_upload_is_reported_first(conn):
-    """Oldest-first: the reaper reports the oldest reaped age as its lag.
+async def test_rows_come_back_oldest_first(conn):
+    """Oldest-first, asserted as a total order rather than a lucky pair.
 
-    The upload_ids are pinned so that ordering by upload_id yields the OPPOSITE order to
-    ordering by initiated_at — otherwise, with random uuids, a query still ordering by
-    upload_id would pass this half the time.
+    Three uploads, inserted out of order, with upload_ids pinned so that ordering by
+    upload_id (what this used to do) gives a DIFFERENT answer from ordering by age — so
+    neither dropping the ORDER BY nor reverting to upload_id can pass by coincidence.
     """
-    older, newer = "ffffffff-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"
-    obj_older, obj_newer = str(uuid.uuid4()), str(uuid.uuid4())
-    await _mpu(conn, newer, completed=False, age_seconds=7200)
-    await _part(conn, newer, obj_newer, 1)
-    await _ov(conn, obj_newer, 1, address=None)
-    await _mpu(conn, older, completed=False, age_seconds=99999)
-    await _part(conn, older, obj_older, 1)
-    await _ov(conn, obj_older, 1, address=None)
+    specs = [
+        ("ffffffff-0000-4000-8000-000000000001", 50000),
+        ("00000000-0000-4000-8000-000000000002", 99999),
+        ("88888888-0000-4000-8000-000000000003", 7200),
+    ]
+    for upload, age in specs:
+        obj = str(uuid.uuid4())
+        await _mpu(conn, upload, completed=False, age_seconds=age)
+        await _part(conn, upload, obj, 1)
+        await _ov(conn, obj, 1, address=None)
 
     rows = await conn.fetch(get_query("list_abandoned_versions"), _STALE)
+    ages = [r["age_seconds"] for r in rows]
 
-    assert [str(r["upload_id"]) for r in rows] == [older, newer]
-    assert rows[0]["age_seconds"] > rows[1]["age_seconds"]
+    assert len(ages) == 3
+    assert ages == sorted(ages, reverse=True), f"not oldest-first: {ages}"
+
+
+async def test_upload_with_any_addressed_version_is_never_listed(conn):
+    """An upload with even ONE live, addressed version is off limits entirely.
+
+    Reaping is per-UPLOAD: the reaper deletes the multipart_uploads row, and parts cascades
+    off it. So reaping an upload for its unaddressed version would also delete the parts row
+    describing the ADDRESSED one — silently orphaning a live object's metadata. The gate is
+    therefore per-upload, which is narrower than the per-version gate this replaced. That
+    narrowing is the one behavioural change in the rewrite, and it is the safe direction.
+    """
+    upload, obj = str(uuid.uuid4()), str(uuid.uuid4())
+    await _mpu(conn, upload, completed=False, age_seconds=7200)
+    await _part(conn, upload, obj, 1)
+    await _ov(conn, obj, 1, address="5Flive")  # finalized — must not be collaterally deleted
+    await _part(conn, upload, obj, 2)
+    await _ov(conn, obj, 2, address=None)  # abandoned
+
+    assert await _abandoned(conn) == set()
+
+
+async def test_candidate_selection_stays_index_ordered():
+    """Pin the two clauses that produce the fast plan; nothing else in the suite can.
+
+    The temp tables here carry no indexes or stats, so every plan is a seq scan and an
+    EXPLAIN-based assertion would prove nothing. These two clauses ARE the fix: ordering by
+    initiated_at is what lets idx_multipart_uploads_initiated_at supply the order so LIMIT
+    stops early, and MATERIALIZED is what stops the planner inlining the CTE and re-deriving
+    the 140M-row parts-driven join that ran for 96 minutes.
+    """
+    sql = get_query("list_abandoned_versions")
+
+    assert "AS MATERIALIZED" in sql, "the CTE must not be inlineable"
+    assert "ORDER BY mu.initiated_at" in sql, "candidate order must match the partial index"
