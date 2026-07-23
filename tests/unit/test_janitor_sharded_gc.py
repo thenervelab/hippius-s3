@@ -172,6 +172,27 @@ async def test_census_publishes_only_on_full_sweep(tmp_path: Path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_shard_zero_resets_accumulator_so_a_mid_sweep_shard_change_cannot_inflate(tmp_path: Path, monkeypatch):
+    """If pressure flips `shards` to 1 mid-sweep, the next shard-0 walk must start a clean
+    accumulator — otherwise the prior partial sweep's counts blend in and inflate the census."""
+    monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 0)
+    _n_objects(tmp_path, 40)
+    store = _FakeFsStore(tmp_path)
+    with patch.object(janitor, "is_replicated_on_all_backends", AsyncMock(return_value=False)):
+        # Partial 4-shard sweep: cover shards 0,1 (accumulates ~half the tree), never published.
+        for s in (0, 1):
+            await janitor.cleanup_old_parts_by_mtime(
+                _FakePool(_db()), store, _redis(), shard=s, shards=4, walk_concurrency=4, publish_sweep=False
+            )
+        # Pressure kicks in → shards=1, shard=0, publish. shard-0 reset must discard the partial
+        # accumulation and publish exactly the whole tree, not tree + the earlier half.
+        await janitor.cleanup_old_parts_by_mtime(
+            _FakePool(_db()), store, _redis(), shard=0, shards=1, walk_concurrency=4, publish_sweep=True
+        )
+    assert janitor._fs_parts_on_disk == 40, "shard-0 reset must prevent the mid-sweep count from inflating"
+
+
+@pytest.mark.asyncio
 async def test_truncated_sweep_does_not_publish_partial_census(tmp_path: Path, monkeypatch):
     """A budget-truncated shard taints the sweep; the gauge must hold its last good value."""
     monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 0)

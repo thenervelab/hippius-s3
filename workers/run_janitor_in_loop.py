@@ -447,9 +447,10 @@ def _accumulate_census(stats: dict[str, Any], shard_complete: bool) -> None:
 
 
 def _publish_census(now: float) -> None:
-    """Publish the completed sweep's census to the gauges, then reset for the next sweep.
-    A sweep tainted by a budget truncation is dropped (gauges hold their last complete value)
-    rather than reported as a full census that undercounts. The pressure gauge is owned by
+    """Publish the completed sweep's census to the gauges. A sweep tainted by a budget
+    truncation is dropped (gauges hold their last complete value) rather than reported as a
+    full census that undercounts. The accumulator is reset at the NEXT sweep's shard 0, not
+    here, so a same-cycle re-read stays consistent. The pressure gauge is owned by
     _update_disk_metrics (refreshed every cycle top), so it is not touched here."""
     global _fs_parts_on_disk, _fs_oldest_age_seconds, _fs_age_buckets, _fs_hot_parts
     if _census_accum_complete:
@@ -463,7 +464,6 @@ def _publish_census(now: float) -> None:
             "Census sweep truncated by walk budget — holding last complete census (partial parts_seen=%d)",
             _census_accum["parts_seen"],
         )
-    _reset_census_accum()
 
 
 def _update_disk_metrics(root: Path) -> None:
@@ -1279,6 +1279,12 @@ async def cleanup_old_parts_by_mtime(
     global _fs_pressure_mode
     _fs_pressure_mode = pressure
 
+    # A sweep always starts at shard 0, so reset the accumulator there. This bounds the
+    # accumulator to exactly one sweep even if `shards` changed mid-sweep (e.g. a pressure
+    # transition flips it to 1) — without it the old partial sweep's counts would blend into
+    # the new one and inflate the published census once.
+    if shard == 0:
+        _reset_census_accum()
     _accumulate_census(stats, shard_complete=not walk_state.truncated)
     if publish_sweep:
         _publish_census(now)
