@@ -33,12 +33,21 @@ Each `run_*_in_loop.py` is a thin wrapper that imports the shared logic and prov
 - **Elevated** (85-95%): halve the hot-retention window. Evict replicated + cold regardless of age.
 - **Critical** (≥95%): hot retention disabled. Evict replicated + cold aggressively. If nothing replicated → log ERROR, do nothing.
 
+### Cycle order (durability first) + walk bounding
+
+The **DB-only durability phases run FIRST**, before the FS walks — the replication-gate sentinel and the A21 aged-orphan gauge. Deliberate: the FS cache is a single flat CephFS directory of millions of object dirs, and a full walk is metadata-latency bound (~40 objects/s serial on prod → ~20h a pass). Before this ordering those two ran LAST, behind two full-tree walks that never finished, so on prod they never ran at all. They must not be gated on the cache walk.
+
+The FS-walk phases are **parallel, sharded, and budgeted** so a cycle always completes:
+- `iter_part_dirs` fans the per-object descent across a thread pool (`HIPPIUS_JANITOR_WALK_CONCURRENCY`, default 8) so many CephFS metadata roundtrips are in flight at once — the single-threaded event-loop walk was the bottleneck, not the DB (per-part queries are 0.1–0.7ms, indexed).
+- Each cycle covers one hash-shard (`HIPPIUS_JANITOR_WALK_SHARDS`, default 64) of the tree; a full sweep takes `shards` cycles. Under disk pressure `shards=1` (whole tree every cycle).
+- Each walk phase stops at `HIPPIUS_JANITOR_WALK_BUDGET_SECONDS` (default 240s); **lifted to unbounded under CRITICAL pressure** so freeing space is never capped by a clock.
+
 ### Cleanup passes
 
-- `cleanup_stale_parts` ([run_janitor_in_loop.py:253](run_janitor_in_loop.py)) — delete parts whose mtime > `MPU_STALE_SECONDS`. DLQ protection via `get_all_dlq_object_ids` ([line 220](run_janitor_in_loop.py)) — scans every upload DLQ + unpin DLQ dynamically per `config.upload_backends` so new backends automatically get protected.
-- Age-based GC — classify by age bucket (0-1h / 1-6h / 6-24h / 1-3d / 3-7d / 7d+), gate on replication, honor hot retention.
-- Orphan `.tmp.*` cleanup — delete if older than `TMP_FILE_MAX_AGE_SECONDS=3600` (1h). Catches crashed atomic writes.
-- Hard-delete for soft-deleted objects whose unpins have been confirmed on every backend.
+- `cleanup_stale_parts` — delete parts whose mtime > `MPU_STALE_SECONDS` (orphan-with-no-DB-row reap + terminally-abandoned reclaim). DLQ protection via `get_all_dlq_object_ids` — scans every upload + unpin DLQ per `config.upload_backends`. Fail-closed if the DLQ set is unavailable.
+- Age-based GC (`cleanup_old_parts_by_mtime`) — classify by age bucket (0-1h / 1-6h / 6-24h / 1-3d / 3-7d / 7d+), gate on replication, honor hot retention. The census (parts/age-buckets/hot) is accumulated across a full sharded sweep and published only when the sweep completes untruncated, so the gauges reflect the whole cache, not one shard.
+- Orphan `.tmp.*` cleanup — delete if older than `TMP_FILE_MAX_AGE_SECONDS=3600` (1h). Same sharded parallel descent as the GC walk (was a full-tree `rglob` that also blocked the loop for hours).
+- Hard-delete for soft-deleted objects whose unpins have been confirmed on every backend (DB-bound, batch-capped).
 
 ### Metrics (OTel observable gauges + counters)
 
