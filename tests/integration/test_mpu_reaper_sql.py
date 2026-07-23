@@ -210,3 +210,58 @@ async def test_full_mix(conn):
     await _ov(conn, fresh_o, 1, address=None)
 
     assert await _abandoned(conn) == {(abandoned_u, abandoned_o, 1), (orphan_u, orphan_o, 1)}
+
+
+async def test_partless_upload_is_not_listed(conn):
+    """An upload that never received a part has nothing to reap — the join drops it."""
+    upload = str(uuid.uuid4())
+    await _mpu(conn, upload, completed=False, age_seconds=7200)
+
+    assert await _abandoned(conn) == set()
+
+
+async def test_partless_uploads_do_not_starve_the_candidate_budget(conn):
+    """The reaper must still make progress when partless uploads dominate the backlog.
+
+    The query picks candidate uploads before joining their parts, so the LIMIT is spent on
+    uploads, not output rows. Partless uploads can never be reaped (the join is INNER), so
+    without an EXISTS-parts gate the oldest of them fill every slot and the reaper returns
+    nothing, forever. Prod carries 874k such uploads against 904k incomplete total, and they
+    are the oldest rows in the table — so this is the normal case there, not a corner.
+    """
+    # 2001 partless uploads, all OLDER than the reapable one, so oldest-first ordering puts
+    # every single one ahead of it and they would consume the entire 2000-row budget.
+    await conn.execute(
+        "INSERT INTO multipart_uploads (upload_id, is_completed, initiated_at) "
+        "SELECT gen_random_uuid(), false, now() - make_interval(secs => 100000 + g) "
+        "FROM generate_series(1, 2001) g"
+    )
+
+    upload, object_id = str(uuid.uuid4()), str(uuid.uuid4())
+    await _mpu(conn, upload, completed=False, age_seconds=7200)
+    await _part(conn, upload, object_id, 1)
+    await _ov(conn, object_id, 1, address=None)
+
+    assert await _abandoned(conn) == {(upload, object_id, 1)}
+
+
+async def test_oldest_upload_is_reported_first(conn):
+    """Oldest-first: the reaper reports the oldest reaped age as its lag.
+
+    The upload_ids are pinned so that ordering by upload_id yields the OPPOSITE order to
+    ordering by initiated_at — otherwise, with random uuids, a query still ordering by
+    upload_id would pass this half the time.
+    """
+    older, newer = "ffffffff-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"
+    obj_older, obj_newer = str(uuid.uuid4()), str(uuid.uuid4())
+    await _mpu(conn, newer, completed=False, age_seconds=7200)
+    await _part(conn, newer, obj_newer, 1)
+    await _ov(conn, obj_newer, 1, address=None)
+    await _mpu(conn, older, completed=False, age_seconds=99999)
+    await _part(conn, older, obj_older, 1)
+    await _ov(conn, obj_older, 1, address=None)
+
+    rows = await conn.fetch(get_query("list_abandoned_versions"), _STALE)
+
+    assert [str(r["upload_id"]) for r in rows] == [older, newer]
+    assert rows[0]["age_seconds"] > rows[1]["age_seconds"]
