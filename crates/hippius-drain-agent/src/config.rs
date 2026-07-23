@@ -73,6 +73,13 @@ const DEFAULT_ORPHAN_RECLAIM_GRACE: Duration = Duration::from_hours(24);
 /// (abandoned-upload) part — and an orphan write-temp — is kept on SSD before
 /// eviction (a diagnosis / abort-settle window).
 const DEFAULT_RECLAIM_GRACE: Duration = Duration::from_hours(1);
+/// Replicated crash-orphan grace when `CEPHOR_REPLICATED_RECLAIM_GRACE_SECS` is unset: how
+/// long a `replicated` part may linger on SSD before the reclaim treats it as a drain
+/// crash-orphan (a crash between the `mark_replicated` commit and the drain's own unlink) and
+/// re-drives that unlink. The happy-path unlink runs milliseconds after the commit, so this
+/// need only clear the in-flight-unlink window; a conservative hour also absorbs reclaim-poll
+/// skew. Keyed on the row's `updated_at` (store clock), so no agent-clock dependence.
+const DEFAULT_REPLICATED_RECLAIM_GRACE: Duration = Duration::from_hours(1);
 
 /// Default path of the liveness file the runtime touches each heartbeat tick; the
 /// k8s `livenessProbe` checks its freshness. Container-local `/tmp` is always writable.
@@ -141,6 +148,10 @@ pub struct Config {
     /// How long a no-DB-backing part (its object hard-deleted) is kept on SSD before the
     /// orphan reclaim evicts it. Keyed on the part's FS `meta.json` age, so set generously.
     pub orphan_reclaim_grace: Duration,
+    /// How long a `replicated` part may linger on SSD before the reclaim re-drives the drain's
+    /// own unlink (treating it as a crash-orphan). Keyed on the row's `updated_at`, so set only
+    /// to clear the in-flight-unlink window.
+    pub replicated_reclaim_grace: Duration,
     /// Maximum parts the drain worker processes concurrently — the in-flight gate
     /// that lets the node overlap fsync latency across parts.
     pub drain_concurrency: u32,
@@ -224,6 +235,7 @@ impl Config {
             reclaim_poll: self.reclaim_poll,
             reclaim_grace: self.reclaim_grace,
             orphan_reclaim_grace: self.orphan_reclaim_grace,
+            replicated_reclaim_grace: self.replicated_reclaim_grace,
             grace: self.grace,
             drain_concurrency: self.drain_concurrency,
             redrive_max_attempts: self.redrive_max_attempts,
@@ -295,6 +307,7 @@ impl Config {
             reclaim_poll: duration_secs(&get, "CEPHOR_RECLAIM_POLL_SECS", DEFAULT_RECLAIM_POLL)?,
             reclaim_grace: duration_secs(&get, "CEPHOR_RECLAIM_GRACE_SECS", DEFAULT_RECLAIM_GRACE)?,
             orphan_reclaim_grace: duration_secs(&get, "CEPHOR_ORPHAN_RECLAIM_GRACE_SECS", DEFAULT_ORPHAN_RECLAIM_GRACE)?,
+            replicated_reclaim_grace: duration_secs(&get, "CEPHOR_REPLICATED_RECLAIM_GRACE_SECS", DEFAULT_REPLICATED_RECLAIM_GRACE)?,
             drain_concurrency: positive_u32_or(&get, "CEPHOR_DRAIN_CONCURRENCY", DEFAULT_DRAIN_CONCURRENCY)?,
             redrive_max_attempts: positive_u32_or(&get, "CEPHOR_REDRIVE_MAX_ATTEMPTS", DEFAULT_REDRIVE_MAX_ATTEMPTS)?,
             liveness_file: path_or(&get, "CEPHOR_LIVENESS_FILE", DEFAULT_LIVENESS_FILE),
@@ -403,7 +416,7 @@ mod tests {
     use super::{
         Config, ConfigError, DEFAULT_ALLOCATION_POLL, DEFAULT_CLAIM_LEASE, DEFAULT_DECAY_HALF_LIFE, DEFAULT_DRAIN_CONCURRENCY, DEFAULT_DRAIN_POLL,
         DEFAULT_FLOOR_RATE_BPS, DEFAULT_HEARTBEAT_POLL, DEFAULT_HEARTBEAT_TTL, DEFAULT_MAX_DRAIN_RATE_BPS, DEFAULT_ORPHAN_RECLAIM_GRACE,
-        DEFAULT_RECLAIM_GRACE, DEFAULT_RECLAIM_POLL,
+        DEFAULT_RECLAIM_GRACE, DEFAULT_RECLAIM_POLL, DEFAULT_REPLICATED_RECLAIM_GRACE,
     };
     use core::str::FromStr;
     use hippius_drain_core::{ByteRate, NodeId};
@@ -537,6 +550,7 @@ mod tests {
         assert_eq!(config.reclaim_poll, DEFAULT_RECLAIM_POLL);
         assert_eq!(config.reclaim_grace, DEFAULT_RECLAIM_GRACE);
         assert_eq!(config.orphan_reclaim_grace, DEFAULT_ORPHAN_RECLAIM_GRACE);
+        assert_eq!(config.replicated_reclaim_grace, DEFAULT_REPLICATED_RECLAIM_GRACE);
     }
 
     #[test]
@@ -545,10 +559,12 @@ mod tests {
         pairs.push(("CEPHOR_RECLAIM_POLL_SECS", "120"));
         pairs.push(("CEPHOR_RECLAIM_GRACE_SECS", "600"));
         pairs.push(("CEPHOR_ORPHAN_RECLAIM_GRACE_SECS", "7200"));
+        pairs.push(("CEPHOR_REPLICATED_RECLAIM_GRACE_SECS", "1800"));
         let config = Config::from_lookup(lookup(&pairs)).unwrap();
         assert_eq!(config.reclaim_poll, Duration::from_mins(2));
         assert_eq!(config.reclaim_grace, Duration::from_mins(10));
         assert_eq!(config.orphan_reclaim_grace, Duration::from_hours(2));
+        assert_eq!(config.replicated_reclaim_grace, Duration::from_mins(30));
     }
 
     #[test]

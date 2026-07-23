@@ -140,12 +140,15 @@ spec:
                   name: hippius-s3-secrets
                   key: HIPPIUS_UPLOAD_BACKENDS
             # SSD-ingest reclaim worker: clean up broken/abandoned uploads (failed parts
-            # the drain skips forever) + orphan write-temps, once aged, so abandoned-upload
-            # junk does not accumulate on the node-local disk. Both have safe code defaults
-            # (300s poll / 1h grace); set here for visibility + per-node tuning.
+            # the drain skips forever), replicated crash-orphans (a crash between the
+            # mark_replicated commit and the drain's own unlink), and orphan write-temps,
+            # once aged, so junk does not accumulate on the node-local disk. All have safe
+            # code defaults (300s poll / 1h graces); set here for visibility + per-node tuning.
             - name: CEPHOR_RECLAIM_POLL_SECS
               value: "300"
             - name: CEPHOR_RECLAIM_GRACE_SECS
+              value: "3600"
+            - name: CEPHOR_REPLICATED_RECLAIM_GRACE_SECS
               value: "3600"
             # Max parts drained concurrently — the in-flight gate that lets the node
             # overlap fsync latency across parts (the AIMD allocator only tunes bytes/s).
