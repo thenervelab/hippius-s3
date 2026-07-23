@@ -35,6 +35,20 @@ kubectl -n $NS exec redis-queues-ha-0 -- redis-cli info replication   # role:mas
 ```
 Nothing is repointed yet; the old `redis-queues` still serves all traffic.
 
+**Two prerequisites are baked into the manifest — learned on staging 2026-07-23 (don't strip them):**
+1. **`podSecurityContext {runAsUser/runAsGroup/fsGroup: 1000}`** — without `fsGroup` the opstree
+   image (uid 1000) can't write `appendonlydir` on the root:root CephFS mount → the master
+   CrashLoops on `Can't open the append-only dir: Permission denied`. Symptom if missing:
+   `redis-queues-ha-0` in CrashLoopBackOff.
+2. **The `allow-redis-operator` NetworkPolicy** — the namespace's `allow-internal` policy does not
+   admit `redis-operator-system`, so every operator→pod dial times out. Symptom if missing:
+   `connected_slaves:0` (replicas never told `slaveof`) **and no sentinel StatefulSet is ever
+   created** (operator errors `Failed to Get the role Info … i/o timeout` and bails before making
+   it). Existing `redis-cluster` is unaffected because RedisCluster self-heals via the in-namespace
+   :16379 gossip bus; RedisReplication+Sentinel needs ongoing operator→pod connectivity.
+
+If Phase 0 shows `connected_slaves:0` or a missing sentinel STS, check these two before anything else.
+
 ## Phase 1 — GATING TEST on staging: does a failover regress the fence? (do this BEFORE prod)
 1. Repoint **staging's** `REDIS_QUEUES_URL` → `redis://redis-queues-ha-master:6379/0` (Phase 2
    method) and roll the staging consumers. Generate active ingest so the drain is live.

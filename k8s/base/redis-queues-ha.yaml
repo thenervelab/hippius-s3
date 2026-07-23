@@ -38,6 +38,13 @@ metadata:
   name: redis-queues-ha
 spec:
   clusterSize: 3 # 1 master + 2 replicas — survives a replica loss while keeping a failover target
+  # The opstree image runs as uid/gid 1000 (redis), but the CephFS PVC mounts root:root, so AOF
+  # (`appendonlydir` under /data) fails with EACCES and the pod CrashLoops. fsGroup makes the
+  # mount group-owned + setgid so uid 1000 can write; the CephFS CSI (fsGroupPolicy=File) honors it.
+  podSecurityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
   kubernetesConfig:
     image: quay.io/opstree/redis:v7.0.15
     imagePullPolicy: IfNotPresent
@@ -69,6 +76,10 @@ metadata:
   name: redis-queues-sentinel
 spec:
   clusterSize: 3 # 3 sentinels, quorum 2 — no sentinel is itself a SPOF
+  podSecurityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
   kubernetesConfig:
     image: quay.io/opstree/redis-sentinel:v7.0.15
     imagePullPolicy: IfNotPresent
@@ -87,3 +98,33 @@ spec:
     downAfterMilliseconds: "5000"
     failoverTimeout: "18000"
     parallelSyncs: "1"
+---
+# The namespace's `allow-internal` NetworkPolicy only admits in-namespace + ingress-nginx +
+# `hippius.io/role: cache` pods. The redis-operator lives in `redis-operator-system`, so without
+# this hole every operator->pod dial times out — and unlike RedisCluster (which self-heals via the
+# in-namespace :16379 gossip bus), RedisReplication+Sentinel needs ONGOING operator->pod
+# connectivity: it dials :6379 to determine the master role and orchestrate `slaveof`, and dials
+# :26379 to configure the sentinels. Missing this, replicas never attach (connected_slaves:0) and
+# the sentinel StatefulSet is never created. Scope is tight: only the operator namespace, only to
+# these pods, only on the two redis ports.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-redis-operator
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: ["redis-queues-ha", "redis-queues-sentinel"]
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: redis-operator-system
+      ports:
+        - protocol: TCP
+          port: 6379
+        - protocol: TCP
+          port: 26379
