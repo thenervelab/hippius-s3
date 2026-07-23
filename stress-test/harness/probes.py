@@ -95,26 +95,48 @@ class ClusterProbe:
         pods = self.api_pods()
         dirs = [f"{self.cfg.ssd_cache_dir.rstrip('/')}/{oid}" for oid in object_ids]
         ok_pods = 0
+        # `kubectl exec -- rm -rf <paths>` sends every path as a URL query param on the SPDY/exec
+        # upgrade request; the API ingress (nginx) rejects the request with `414 Request-URI Too Large`
+        # once the encoded URL crosses ~8 KiB. Each path is ~150 bytes URL-encoded, so a batch of 100
+        # (~15 KiB) always 414s — the durability gate silently downgraded to OBSERVED with 0/N evicted.
+        # 20 paths (~3 KiB) stays comfortably under the limit; the corpus is small so the extra round
+        # trips are cheap.
+        BATCH = 20
         for pod in pods:
             ok = True
-            # Bound the arg vector: chunk the rm so a large corpus can't blow the exec argv limit.
-            for i in range(0, len(dirs), 100):
-                try:
-                    proc = subprocess.run(  # noqa: S603 — fixed argv, oids are DB uuids
-                        ["kubectl", "-n", self.cfg.namespace, "exec", pod, "-c", "api",
-                         "--", "rm", "-rf", *dirs[i:i + 100]],
-                        capture_output=True, text=True, timeout=60,
-                    )
-                except (subprocess.TimeoutExpired, FileNotFoundError):
-                    # A kubectl hang / missing binary is an environment fault: mark this pod not-ok
-                    # so the gate downgrades to non-authoritative — same as a returncode!=0 failure —
-                    # rather than propagating and flipping the whole no-data-loss gate red.
+            for i in range(0, len(dirs), BATCH):
+                if not self._exec_rm_with_retry(pod, dirs[i:i + BATCH]):
                     ok = False
                     break
-                ok = ok and proc.returncode == 0
             if ok:
                 ok_pods += 1
         return (len(object_ids), ok_pods, len(pods))
+
+    def _exec_rm_with_retry(self, pod: str, dirs: list[str], attempts: int = 3) -> bool:
+        """rm a batch of dirs on one pod, retrying the transient `kubectl exec` flakes that show up when
+        the api pods are busy (right after the concurrency ramp). The rm itself is deterministic —
+        root, a 0777 cache dir, `-f` ignores absent paths — so a non-zero result is a kubectl-transport
+        blip, not a real failure; a short retry is what makes the durability gate authoritative instead
+        of flakily downgrading to OBSERVED. Returns True only if some attempt's rm returned 0.
+        The last failure's rc+stderr is printed so a persistent 0/N eviction is debuggable (the gate
+        used to swallow it and just report a non-authoritative count with no reason)."""
+        last = ""
+        for attempt in range(attempts):
+            try:
+                proc = subprocess.run(  # noqa: S603 — fixed argv, oids are DB uuids
+                    ["kubectl", "-n", self.cfg.namespace, "exec", pod, "-c", "api",
+                     "--", "rm", "-rf", *dirs],
+                    capture_output=True, text=True, timeout=90,
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                last = f"exec raised {type(e).__name__}"
+                continue  # a hang/missing-binary is transport-level — retry, then give up (non-authoritative)
+            if proc.returncode == 0:
+                return True
+            last = f"rc={proc.returncode} stderr={(proc.stderr or '').strip()[:300]!r}"
+            time.sleep(1.0 * (attempt + 1))
+        print(f"    [evict] {pod}: {len(dirs)} dirs FAILED after {attempts} attempts — {last}")
+        return False
 
     # ---------------------------------------------------------------- prometheus (port-forward)
     def start_prometheus(self) -> bool:

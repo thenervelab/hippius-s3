@@ -1,6 +1,6 @@
 # Trial (s3-2.0 prototype): the entire staging api fleet on node-local SSD.
 #
-# A single `api-local` Deployment (2 replicas, one per ingest node) — the base (ceph) `api` deployment
+# A single `api-local` DaemonSet — exactly one pod per ingest node. The base (ceph) `api` deployment
 # is scaled to 0 in resource-limits.yaml, so ALL api pods run on local SSD. Each
 # pod writes to its node's local dir and read-falls-back to the shared CephFS
 # cache. All workers stay on ceph, untouched.
@@ -18,8 +18,10 @@
 #
 # Scheduling: pinned to nodes labeled `s3-staging-local-ingest=true` (the ONE list
 # lives in ingest-node-labels-staging.yaml). The drain-agent DaemonSet selects
-# the SAME label, so they stay in lockstep. Preferred pod anti-affinity spreads the
-# 2 replicas across the labeled nodes. A required nodeAffinity hostname allow-list
+# the SAME label, so they stay in lockstep. Being a DaemonSet, exactly one api-local
+# runs per labelled node — no soft anti-affinity that lets replicas cluster (in prod
+# the Deployment form left two nodes with an idle NVMe while two others ran two pods
+# on one SSD; see PR #302). A required nodeAffinity hostname allow-list
 # (node2/node3) is belt-and-suspenders WITH the label: a stray/mislabeled node alone
 # can't place ingest on a psql/cache node — the hostname must ALSO be on the list.
 #
@@ -31,13 +33,19 @@
 # `pending` until the replicator copies local->ceph. Install + test the replicator
 # when ready. See README-local-ingest-trial.md.
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: api-local
   labels:
     app: api-local
 spec:
-  replicas: 2
+  # DaemonSet: exactly one api-local per labelled ingest node, co-located with the drain-agent
+  # DaemonSet so every node's local writer has its sole drain producer on the same host.
+  # Auto-scales when an ingest node is added/removed (no replicas knob to keep in sync).
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: api-local
@@ -61,14 +69,6 @@ spec:
                     values:
                       - k8s-v3-node2
                       - k8s-v3-node3
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchLabels:
-                    app: api-local
-                topologyKey: kubernetes.io/hostname
       initContainers:
         - name: wait-for-postgres
           image: postgres:15

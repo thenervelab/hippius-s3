@@ -178,6 +178,24 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build-images, build-drain]
     environment: staging
+    # Serialize against the production deploy: both target the SAME cluster and share
+    # ingest nodes node2/node3. On 2026-07-22 they ran simultaneously and collided twice —
+    # the ingest-label flap that stranded 243 prod parts, and a db-migrations "field is
+    # immutable" race when one run recreated the Job between the other's delete and apply.
+    # Server-side apply fixes the label symptom; this fixes the cause.
+    #
+    # The group string is REPO-SCOPED and must stay byte-identical to the one in
+    # production-deploy.yaml — that shared string is the whole mechanism. Changing it in
+    # one file silently un-serializes the two environments.
+    #
+    # queue: max (GA 2026-05-07) is load-bearing, not decoration. The default queue:single
+    # allows only ONE pending run per group and CANCELS it when a third arrives — a deploy
+    # would be silently dropped. queue:max queues up to 100 FIFO instead. It cannot be
+    # combined with cancel-in-progress: true (workflow validation error).
+    concurrency:
+      group: hippius-s3-cluster-deploy
+      cancel-in-progress: false
+      queue: max
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -279,11 +297,35 @@ jobs:
 
       - name: Delete old migration job
         run: |
-          kubectl delete job db-migrations -n hippius-s3-staging --ignore-not-found=true
+          # A Job's spec.template is immutable, so `apply -k` re-creating db-migrations with a new image
+          # tag over an existing (or still-terminating) Job fails with "spec.template ... field is
+          # immutable". Plain `kubectl delete` can return while the Job is still terminating (its pods
+          # carry the batch.kubernetes.io/job-tracking finalizer), so the very next `apply` races it.
+          # Delete AND wait for the object to be fully gone before applying.
+          kubectl delete job db-migrations -n hippius-s3-staging --ignore-not-found=true --wait=true --timeout=120s
+          kubectl wait --for=delete job/db-migrations -n hippius-s3-staging --timeout=120s 2>/dev/null || true
 
       - name: Deploy Redis cluster
         run: |
           kubectl apply -f k8s/redis-cluster/staging.yaml
+
+      # Applied server-side in its own step — NOT folded into `apply -k` below — so prod
+      # and staging cannot prune each other's node label (client-side apply does; on
+      # 2026-07-22 that stranded 243 prod parts). Must run BEFORE the overlay so
+      # api-local and drain-agent find labelled nodes on the first apply. Full rationale
+      # + the retire-a-node checklist: the manifest header.
+      - name: Label ingest nodes (server-side)
+        run: |
+          kubectl apply --server-side --force-conflicts \
+            --field-manager=hippius-s3-staging-ingest-labels \
+            -f k8s/staging/ingest-node-labels-staging.yaml
+          # Drop any pre-SSA client-side-apply record. Server-side apply does NOT clear it,
+          # and while one survives, a stray `kubectl apply -f` on this file WITHOUT
+          # --server-side (old runbook, muscle memory) would resurrect the prune-on-apply
+          # behaviour this step exists to prevent. Currently a no-op on node2/node3 — kept
+          # for symmetry with production-deploy.yaml and to stay safe if one reappears.
+          kubectl annotate node -l s3-staging-local-ingest=true \
+            kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 
       - name: Deploy to staging
         run: |
@@ -320,6 +362,15 @@ jobs:
         run: |
           kubectl rollout status deployment/gateway -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/api -n hippius-s3-staging --timeout=10m
+          # api-local is a DaemonSet (one pod per ingest node). Wait on it, then prune the
+          # pre-DaemonSet Deployment of the same name: kustomize can't change a resource's kind
+          # in place, so the old Deployment/api-local lingers after the first DaemonSet apply and
+          # both would serve behind app=api-local. Delete AFTER the DaemonSet is Ready (no capacity
+          # dip); idempotent — a no-op on every deploy after the conversion lands.
+          if kubectl get daemonset/api-local -n hippius-s3-staging >/dev/null 2>&1; then
+            kubectl rollout status daemonset/api-local -n hippius-s3-staging --timeout=10m
+            kubectl delete deployment/api-local -n hippius-s3-staging --ignore-not-found=true
+          fi
           kubectl rollout status deployment/arion-downloader -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/arion-uploader -n hippius-s3-staging --timeout=10m
           # Drain stack, allocator-first: the allocator applies the cephor_* migrations
