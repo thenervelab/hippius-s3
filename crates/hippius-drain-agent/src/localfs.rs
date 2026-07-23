@@ -320,11 +320,39 @@ async fn copy_into(dir: &Path, name: &str, source: &Path, sync_dir: bool) -> io:
 /// Remove a part's whole directory; an already-absent dir is `Ok` (idempotent, so a
 /// re-drive after a crash still converges). Shared by the SSD-source unlink and the
 /// pool corrupt-copy cleanup.
+///
+/// After removing `part_<n>/`, prune the now-empty `v<version>/` then `<object_id>/`
+/// parents. Without this, every part removal (the drain's happy-path unlink AND the reclaim
+/// worker) left the two ancestor dirs behind as empty shells — an unbounded directory/inode
+/// leak on the node-local SSD (observed at 100k+ dirs per node, all `<oid>/v1/` with nothing
+/// inside). Pruning here fixes it at the single point every removal already funnels through.
 async fn remove_part_dir(root: &Path, part: &PartKey) -> io::Result<()> {
-    match fs::remove_dir_all(part_dir(root, part)).await {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
+    let dir = part_dir(root, part);
+    match fs::remove_dir_all(&dir).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    prune_empty_ancestors(root, &dir).await;
+    Ok(())
+}
+
+/// Best-effort removal of the empty ancestor dirs of `dir`, climbing up to but never removing
+/// `root`. Uses `remove_dir` (rmdir), which removes ONLY an empty directory — so it is
+/// race-safe against a concurrent writer that `mkdir -p`s the same path: a still-populated
+/// ancestor (a sibling `part_N`, or a just-recreated dir) fails the rmdir and stops the climb,
+/// and a re-created dir is harmless. A prune failure is swallowed: the part is already gone,
+/// and any residual shell is re-attempted on the next removal under that object.
+async fn prune_empty_ancestors(root: &Path, dir: &Path) {
+    let mut cursor = dir.parent();
+    while let Some(ancestor) = cursor {
+        if ancestor == root || !ancestor.starts_with(root) {
+            break;
+        }
+        if fs::remove_dir(ancestor).await.is_err() {
+            break;
+        }
+        cursor = ancestor.parent();
     }
 }
 
@@ -605,9 +633,9 @@ impl PartRemover for LocalSsd {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::{LocalSsd, TEMP_NONCE, TmpGuard, hex_lower, is_temp_name, safe_component, temp_name};
+    use super::{LocalSsd, TEMP_NONCE, TmpGuard, hex_lower, is_temp_name, part_dir, remove_part_dir, safe_component, temp_name};
     use core::str::FromStr;
-    use hippius_drain_core::{FileId, SsdCache};
+    use hippius_drain_core::{FileId, ObjectId, PartKey, PartNumber, SsdCache, Version};
     use proptest::prelude::*;
     use std::io;
     use std::path::Path;
@@ -656,6 +684,89 @@ mod tests {
         // which the GC layer (hippius_drain_core::gc) classifies as AlreadyGone.
         let err = ssd.remove_object(&fid("file-7")).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    fn part(uuid: &str, version: u32, number: u32) -> PartKey {
+        PartKey::new(ObjectId::from_str(uuid).unwrap(), Version::new(version), PartNumber::new(number))
+    }
+
+    fn seed_part(root: &Path, p: &PartKey) {
+        let dir = part_dir(root, p);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), b"{}").unwrap();
+        std::fs::write(dir.join("chunk_0.bin"), b"data").unwrap();
+    }
+
+    #[tokio::test]
+    async fn removing_a_part_prunes_its_empty_version_and_object_parents() {
+        // The empty-shell leak fix: once the part dir is gone, its now-empty `v<version>/`
+        // and `<object_id>/` parents are pruned too, so a drained part leaves nothing behind.
+        let root = TempDir::new().unwrap();
+        let p = part("466916c0-d61b-4518-b81b-9576b574270a", 1, 1);
+        seed_part(root.path(), &p);
+        let part_path = part_dir(root.path(), &p);
+        let version_dir = part_path.parent().unwrap().to_path_buf();
+        let object_dir = version_dir.parent().unwrap().to_path_buf();
+
+        remove_part_dir(root.path(), &p).await.unwrap();
+
+        assert!(!part_path.exists(), "the part dir is removed");
+        assert!(!version_dir.exists(), "the empty v<version> parent is pruned");
+        assert!(!object_dir.exists(), "the empty <object_id> parent is pruned");
+        assert!(root.path().exists(), "the SSD root is never removed");
+    }
+
+    #[tokio::test]
+    async fn a_sibling_part_protects_the_shared_parents() {
+        // `rmdir` removes only an EMPTY dir, so a sibling `part_N` under the same version keeps
+        // both shared parents alive — no cross-part collateral removal.
+        let root = TempDir::new().unwrap();
+        let p1 = part("466916c0-d61b-4518-b81b-9576b574270a", 1, 1);
+        let p2 = part("466916c0-d61b-4518-b81b-9576b574270a", 1, 2);
+        seed_part(root.path(), &p1);
+        seed_part(root.path(), &p2);
+        let shared_version = part_dir(root.path(), &p1).parent().unwrap().to_path_buf();
+
+        remove_part_dir(root.path(), &p1).await.unwrap();
+
+        assert!(!part_dir(root.path(), &p1).exists(), "only the removed part is gone");
+        assert!(part_dir(root.path(), &p2).exists(), "the sibling part is untouched");
+        assert!(shared_version.exists(), "the shared version dir is kept while a sibling remains");
+    }
+
+    #[tokio::test]
+    async fn removing_one_version_keeps_a_populated_sibling_version() {
+        // Pruning climbs only through EMPTY ancestors: removing v1's sole part prunes `v1/`,
+        // but the object dir stays because `v2/` is still populated.
+        let root = TempDir::new().unwrap();
+        let v1 = part("466916c0-d61b-4518-b81b-9576b574270a", 1, 1);
+        let v2 = part("466916c0-d61b-4518-b81b-9576b574270a", 2, 1);
+        seed_part(root.path(), &v1);
+        seed_part(root.path(), &v2);
+        let v1_dir = part_dir(root.path(), &v1).parent().unwrap().to_path_buf();
+        let object_dir = v1_dir.parent().unwrap().to_path_buf();
+
+        remove_part_dir(root.path(), &v1).await.unwrap();
+
+        assert!(!v1_dir.exists(), "the emptied v1 dir is pruned");
+        assert!(object_dir.exists(), "the object dir survives while v2 is populated");
+        assert!(part_dir(root.path(), &v2).exists(), "v2's part is untouched");
+    }
+
+    #[tokio::test]
+    async fn removing_an_already_absent_part_is_ok_and_still_prunes_shells() {
+        // Idempotent: a re-drive after the part is already gone returns Ok, and a leftover
+        // empty ancestor shell is still cleaned.
+        let root = TempDir::new().unwrap();
+        let p = part("00000000-0000-4000-8000-000000000000", 1, 1);
+        let version_dir = part_dir(root.path(), &p).parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&version_dir).unwrap(); // a shell with no part dir
+        let object_dir = version_dir.parent().unwrap().to_path_buf();
+
+        remove_part_dir(root.path(), &p).await.unwrap();
+
+        assert!(!version_dir.exists(), "a leftover empty version shell is pruned");
+        assert!(!object_dir.exists(), "a leftover empty object shell is pruned");
     }
 
     #[test]
