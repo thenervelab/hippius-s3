@@ -56,7 +56,7 @@ def _exprs(panel: dict) -> list[str]:
 
 @pytest.mark.parametrize("reason", ["stale_mtime", "gc_age", "abandoned"])
 def test_every_delete_path_increments_the_counter(janitor_source: str, reason: str) -> None:
-    assert f'{{"reason": "{reason}"}}' in janitor_source, (
+    assert f'attributes={{"reason": "{reason}"}}' in janitor_source, (
         f"the {reason} deletion path does not increment fs_janitor_deleted_total, so the "
         f"delete-rate panel under-reports (it read flat zero on prod because stale_mtime — "
         f"the busiest path by far — counted nothing)."

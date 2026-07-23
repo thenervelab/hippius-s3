@@ -604,11 +604,11 @@ async def cleanup_stale_parts(
                 if _janitor_abandoned_deleted_counter is not None:
                     _janitor_abandoned_deleted_counter.add(1)
                 if _janitor_deleted_counter is not None:
-                    _janitor_deleted_counter.add(1, {"reason": "abandoned"})
+                    _janitor_deleted_counter.add(1, attributes={"reason": "abandoned"})
             else:
                 logger.info(f"Cleaned stale part by mtime: object_id={object_id} v={object_version} part={part_number}")
                 if _janitor_deleted_counter is not None:
-                    _janitor_deleted_counter.add(1, {"reason": "stale_mtime"})
+                    _janitor_deleted_counter.add(1, attributes={"reason": "stale_mtime"})
             return True
         except Exception as e:
             logger.warning(f"Failed to clean part: object_id={object_id} v={object_version} part={part_number}: {e}")
@@ -1037,7 +1037,7 @@ async def cleanup_old_parts_by_mtime(
     _fs_pressure_mode = pressure
 
     if parts_cleaned > 0 and _janitor_deleted_counter is not None:
-        _janitor_deleted_counter.add(parts_cleaned, {"reason": "gc_age"})
+        _janitor_deleted_counter.add(parts_cleaned, attributes={"reason": "gc_age"})
 
     logger.info(f"GC cleaned {parts_cleaned=} hot_parts={stats['hot_parts']} pressure={pressure}")
 
@@ -1170,8 +1170,8 @@ async def run_janitor_loop():
             # smaller set (clears more) while this gauge deliberately fails closed and stalls.
             aged_orphans = 0
             try:
-                gauge_dlq_object_ids = await get_all_dlq_object_ids(redis_client)
                 _janitor_phase = 6
+                gauge_dlq_object_ids = await get_all_dlq_object_ids(redis_client)
                 aged_orphans = await check_aged_pending_orphans(db_pool, gauge_dlq_object_ids)
             except Exception as e:
                 logger.error(f"Phase 6 (aged-pending orphan gauge) error: {e}", exc_info=True)
