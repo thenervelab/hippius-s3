@@ -1,0 +1,89 @@
+# redis-queues HA — operator-managed RedisReplication + RedisSentinel (auto-failover)
+#
+# WHY: today redis-queues is a single-replica StatefulSet. Its data is on CephFS (3x, so a
+# node loss is NOT data loss), but the single pod is stuck Terminating on a hard node loss
+# until a human force-deletes it — a few-minute manual-recovery outage of the s3 WRITE path
+# (uploads can't enqueue; cache-miss GETs stall on chunk-ready pub/sub). redis-queues also
+# holds the drain's `cephor:*` leader lease + epoch fence, so its loss stalls the drain too.
+#
+# THIS FILE IS STAGED, NOT AUTO-APPLIED. It is deliberately NOT listed in any kustomization —
+# applying it must be a controlled cutover (see docs/redis-queues-ha-cutover.md), because it
+# introduces a SECOND redis holding the queue + fence, and the app must be repointed at the
+# operator's master service without losing pending uploads or regressing the cephor:epoch
+# fence. Apply per the runbook, staging first.
+#
+# Operator: quay.io/opstree/redis-operator:v0.23.0 (CRDs redis.redis.opstreelabs.in/v1beta2),
+# already installed cluster-wide and already managing the staging redis-cluster.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-queues-ha-config
+data:
+  # Preserves the semantics of the current standalone redis-queues (see redis-statefulsets.yaml):
+  # noeviction (dropping a queue entry = a lost upload; a reset epoch deadlocks the allocator —
+  # must fail writes LOUDLY under memory pressure, never silently evict) + AOF everysec on CephFS.
+  # NOTE: intentionally NO `min-replicas-to-write` — requiring a replica ack would BLOCK writes
+  # when a replica is down, defeating the availability goal. The failover-safety of the epoch
+  # fence is handled by the cutover acceptance test, not by blocking writes.
+  redis-additional.conf: |
+    maxmemory 4gb
+    maxmemory-policy noeviction
+    appendonly yes
+    appendfsync everysec
+---
+apiVersion: redis.redis.opstreelabs.in/v1beta2
+kind: RedisReplication
+metadata:
+  name: redis-queues-ha
+spec:
+  clusterSize: 3 # 1 master + 2 replicas — survives a replica loss while keeping a failover target
+  kubernetesConfig:
+    image: quay.io/opstree/redis:v7.0.15
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 100m
+        memory: 4Gi
+      limits:
+        # Keep limit (6Gi) > maxmemory (4gb) so Redis rejects writes at ITS limit first (the
+        # intended loud OOM under noeviction) before k8s OOM-kills the pod; headroom absorbs
+        # AOF-rewrite copy-on-write + replication buffers.
+        cpu: 1000m
+        memory: 6Gi
+  redisConfig:
+    additionalRedisConfig: redis-queues-ha-config
+  storage:
+    volumeClaimTemplate:
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: ceph-filesystem
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: redis.redis.opstreelabs.in/v1beta2
+kind: RedisSentinel
+metadata:
+  name: redis-queues-sentinel
+spec:
+  clusterSize: 3 # 3 sentinels, quorum 2 — no sentinel is itself a SPOF
+  kubernetesConfig:
+    image: quay.io/opstree/redis-sentinel:v7.0.15
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+  redisSentinelConfig:
+    redisReplicationName: redis-queues-ha
+    masterGroupName: myMaster
+    quorum: "2"
+    # Detect a dead master in 5s, then fail over. failoverTimeout bounds a stuck failover.
+    downAfterMilliseconds: "5000"
+    failoverTimeout: "18000"
+    parallelSyncs: "1"
