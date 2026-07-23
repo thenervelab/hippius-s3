@@ -382,7 +382,6 @@ async def initiate_multipart_upload(
             error_type="internal_error",
             operation="initiate_multipart_upload",
             bucket_name=bucket_name,
-            main_account=getattr(request.state, "account", None) and request.state.account.main_account,
         )
         return s3_error_response(
             "InternalError",
@@ -724,12 +723,15 @@ async def upload_part(
         total_time = time.time() - start_time
         logger.debug(f"Part {part_number}: TOTAL processing time: {total_time:.3f}s")
 
+        get_metrics_collector().record_s3_operation(
+            operation="upload_part",
+            bucket_name=ongoing_multipart_upload.get("bucket_name", ""),
+            success=True,
+        )
         get_metrics_collector().record_data_transfer(
             operation="upload_part",
             bytes_transferred=file_size,
             bucket_name=ongoing_multipart_upload.get("bucket_name", ""),
-            main_account=request.state.account.main_account,
-            subaccount_id=request.state.account.id,
         )
 
         # Return response
@@ -1211,16 +1213,12 @@ async def complete_multipart_upload(
         get_metrics_collector().record_s3_operation(
             operation="complete_multipart_upload",
             bucket_name=bucket_name,
-            main_account=request.state.account.main_account,
-            subaccount_id=request.state.account.id,
             success=True,
         )
         get_metrics_collector().record_data_transfer(
             operation="complete_multipart_upload",
             bytes_transferred=int(complete_res.size_bytes),
             bucket_name=bucket_name,
-            main_account=request.state.account.main_account,
-            subaccount_id=request.state.account.id,
         )
 
         # Return with proper headers
@@ -1238,7 +1236,6 @@ async def complete_multipart_upload(
             error_type="internal_error",
             operation="complete_multipart_upload",
             bucket_name=bucket_name,
-            main_account=getattr(request.state, "account", None) and request.state.account.main_account,
         )
         return s3_error_response(
             "InternalError",

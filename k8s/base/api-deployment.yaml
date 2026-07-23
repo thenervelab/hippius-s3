@@ -12,6 +12,8 @@ spec:
       labels:
         app: api
     spec:
+      # 10s preStop + up to 25s uvicorn drain, with headroom before the kubelet SIGKILLs.
+      terminationGracePeriodSeconds: 45
       initContainers:
         - name: wait-for-postgres
           image: postgres:15
@@ -151,6 +153,15 @@ spec:
             - name: kms-certs
               mountPath: /kms_certs
               readOnly: true
+          # Endpoint removal and SIGTERM are dispatched concurrently by the kubelet, so
+          # without this sleep the Service can still be routing here after uvicorn has
+          # stopped accepting. Sleeping keeps us serving while the removal propagates to
+          # every kube-proxy; SIGTERM only lands afterwards. The sleep is deducted from
+          # terminationGracePeriodSeconds, so 10 + uvicorn's 25s drain fits inside 45.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "10"]
           startupProbe:
             httpGet:
               path: /health

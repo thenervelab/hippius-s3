@@ -234,8 +234,6 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
             get_metrics_collector().record_s3_operation(
                 operation="put_bucket",
                 bucket_name=bucket_name,
-                main_account=main_account_id,
-                subaccount_id=request.state.account.id,
                 success=True,
             )
 
@@ -246,7 +244,6 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
                 error_type="BucketAlreadyExists",
                 operation="put_bucket",
                 bucket_name=bucket_name,
-                main_account=request.state.account.main_account,
             )
             return errors.s3_error_response(
                 "BucketAlreadyExists",
@@ -260,7 +257,6 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
                 error_type="internal_error",
                 operation="put_bucket",
                 bucket_name=bucket_name,
-                main_account=request.state.account.main_account,
             )
             return errors.s3_error_response(
                 "InternalError",

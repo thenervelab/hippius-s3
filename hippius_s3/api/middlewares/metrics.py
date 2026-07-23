@@ -73,8 +73,6 @@ async def metrics_middleware(
         request=request,
         response=response,
         duration=duration,
-        main_account=main_account,
-        subaccount_id=subaccount_id,
         handler=endpoint_name,
     )
 
@@ -94,7 +92,6 @@ async def metrics_middleware(
             error_type=error_type,
             operation=endpoint_name,
             bucket_name=bucket_name,
-            main_account=main_account,
         )
 
     return response

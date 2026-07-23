@@ -121,7 +121,6 @@ async def _route_failed_request(
             last_error=last_error,
         )
         get_metrics_collector().record_unpinner_operation(
-            main_account=request.address,
             success=False,
             backend=backend_name,
             attempt=attempts_next,
@@ -133,7 +132,6 @@ async def _route_failed_request(
         )
         await dlq_manager.push(request, last_error, error_class)
         get_metrics_collector().record_unpinner_operation(
-            main_account=request.address,
             success=False,
             backend=backend_name,
             error_type=error_class,
@@ -281,7 +279,6 @@ async def process_unpin_batch(
         request = entry.request
         if all(file_id in soft_deleted_ok for file_id in entry.file_ids):
             get_metrics_collector().record_unpinner_operation(
-                main_account=request.address,
                 success=True,
                 backend=backend_name,
             )
@@ -453,7 +450,6 @@ async def process_unpin_request(
                     await _unpin_all(owned_client)
 
             get_metrics_collector().record_unpinner_operation(
-                main_account=request.address,
                 success=True,
                 backend=backend_name,
             )
@@ -486,7 +482,6 @@ async def process_unpin_request(
                 )
 
                 get_metrics_collector().record_unpinner_operation(
-                    main_account=request.address,
                     success=False,
                     backend=backend_name,
                     attempt=attempts_next,
@@ -499,7 +494,6 @@ async def process_unpin_request(
                 await dlq_manager.push(request, str(e), error_class)
 
                 get_metrics_collector().record_unpinner_operation(
-                    main_account=request.address,
                     success=False,
                     backend=backend_name,
                     error_type=error_class,

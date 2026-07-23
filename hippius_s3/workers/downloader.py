@@ -366,7 +366,6 @@ async def process_download_request(
             if success_count == total:
                 get_metrics_collector().record_downloader_operation(
                     backend=backend_name,
-                    main_account=download_request.address,
                     success=True,
                     duration=total_duration,
                     num_chunks=sum(len(p.chunks) for p in download_request.chunks),
@@ -374,7 +373,6 @@ async def process_download_request(
                 return True
             get_metrics_collector().record_downloader_operation(
                 backend=backend_name,
-                main_account=download_request.address,
                 success=False,
                 duration=total_duration,
             )
@@ -383,7 +381,6 @@ async def process_download_request(
         except Exception as exc:
             get_metrics_collector().record_downloader_operation(
                 backend=backend_name,
-                main_account=download_request.address,
                 success=False,
             )
             logger.error(f"[{backend_name}] process_download_request error: {exc}", exc_info=True)
