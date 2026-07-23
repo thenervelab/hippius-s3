@@ -55,6 +55,7 @@ from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.otel_setup import build_resource
 from hippius_s3.sentry import init_sentry
 from hippius_s3.utils import get_query
+from hippius_s3.workers.shutdown import run_worker
 
 
 config = get_config()
@@ -125,6 +126,25 @@ _replication_sentinel_violations = 0
 # than the sweep clears them — a re-introduced leak.
 _aged_pending_orphans = 0
 
+# Cycle progress. The census gauges below (parts_on_disk, age buckets, hot parts) are only
+# written at the END of the GC phase, so if an earlier phase runs long they report 0 forever
+# and read as "cache is empty" rather than "never measured". Prod 2026-07-23: cleanup_stale_parts
+# ran >1h48m without returning, so every one of those gauges sat at 0 while the janitor was
+# deleting 18,737 parts. These two make that state visible instead of silent.
+_janitor_phase = 0  # index into JANITOR_PHASES; 0 = idle/sleeping
+_janitor_last_cycle_completed_at = 0.0
+_janitor_cycle_seconds = 0.0
+
+JANITOR_PHASES = (
+    "idle",
+    "stale_parts",
+    "gc_age",
+    "orphan_tmp",
+    "soft_deleted",
+    "sentinel",
+    "aged_orphans",
+)
+
 _janitor_deleted_counter = None  # set by _setup_janitor_metrics
 _janitor_tmp_deleted_counter = None
 _janitor_abandoned_deleted_counter = None
@@ -164,6 +184,22 @@ def _obs_replication_sentinel(_: object) -> list[otel_metrics.Observation]:
 
 def _obs_aged_pending_orphans(_: object) -> list[otel_metrics.Observation]:
     return [otel_metrics.Observation(_aged_pending_orphans, {})]
+
+
+def _obs_janitor_phase(_: object) -> list[otel_metrics.Observation]:
+    return [otel_metrics.Observation(_janitor_phase, {"phase": JANITOR_PHASES[_janitor_phase]})]
+
+
+def _obs_cycle_age(_: object) -> list[otel_metrics.Observation]:
+    # Age of the last COMPLETED cycle. Rises without bound while a phase is stuck, which is
+    # the signal that the census gauges are stale rather than genuinely zero.
+    if _janitor_last_cycle_completed_at <= 0:
+        return [otel_metrics.Observation(-1.0, {})]
+    return [otel_metrics.Observation(max(0.0, time.time() - _janitor_last_cycle_completed_at), {})]
+
+
+def _obs_cycle_seconds(_: object) -> list[otel_metrics.Observation]:
+    return [otel_metrics.Observation(_janitor_cycle_seconds, {})]
 
 
 def _classify_age_bucket(age_seconds: float) -> str:
@@ -604,9 +640,24 @@ def _setup_janitor_metrics() -> None:
         callbacks=[_obs_aged_pending_orphans],
         description="Aged pending/draining unservable orphan versions (A21 leak backlog; the soak gate asserts bounded / slope ~ 0)",
     )
+    meter.create_observable_gauge(
+        name="fs_janitor_phase",
+        callbacks=[_obs_janitor_phase],
+        description="Janitor phase currently executing (0=idle); label carries the phase name",
+    )
+    meter.create_observable_gauge(
+        name="fs_janitor_last_cycle_age_seconds",
+        callbacks=[_obs_cycle_age],
+        description="Seconds since the last COMPLETED janitor cycle (-1 = none since start). Rising without bound means a phase is stuck and the census gauges are stale, not zero",
+    )
+    meter.create_observable_gauge(
+        name="fs_janitor_cycle_seconds",
+        callbacks=[_obs_cycle_seconds],
+        description="Duration of the last completed janitor cycle",
+    )
     _janitor_deleted_counter = meter.create_counter(
         name="fs_janitor_deleted_total",
-        description="Total number of FS parts deleted by the janitor",
+        description="FS parts deleted by the janitor, by reason (gc_age|stale_mtime|abandoned)",
         unit="1",
     )
     _janitor_tmp_deleted_counter = meter.create_counter(
@@ -789,8 +840,12 @@ async def cleanup_stale_parts(
                 )
                 if _janitor_abandoned_deleted_counter is not None:
                     _janitor_abandoned_deleted_counter.add(1)
+                if _janitor_deleted_counter is not None:
+                    _janitor_deleted_counter.add(1, attributes={"reason": "abandoned"})
             else:
                 logger.info(f"Cleaned stale part by mtime: object_id={object_id} v={object_version} part={part_number}")
+                if _janitor_deleted_counter is not None:
+                    _janitor_deleted_counter.add(1, attributes={"reason": "stale_mtime"})
             return True
         except Exception as e:
             logger.warning(f"Failed to clean part: object_id={object_id} v={object_version} part={part_number}: {e}")
@@ -1290,7 +1345,7 @@ async def cleanup_old_parts_by_mtime(
         _publish_census(now)
 
     if parts_cleaned > 0 and _janitor_deleted_counter is not None:
-        _janitor_deleted_counter.add(parts_cleaned)
+        _janitor_deleted_counter.add(parts_cleaned, attributes={"reason": "gc_age"})
 
     logger.info(f"GC cleaned {parts_cleaned=} hot_parts={stats['hot_parts']} pressure={pressure}")
 
@@ -1358,11 +1413,12 @@ async def run_janitor_loop():
     sleep_normal = 600  # 10m
     sleep_pressure = 120  # 2m
 
-    global _walk_shard
+    global _walk_shard, _janitor_phase, _janitor_last_cycle_completed_at, _janitor_cycle_seconds
     loop = asyncio.get_running_loop()
 
     try:
         while True:
+            _cycle_started = time.time()
             logger.info("Janitor cycle starting...")
             # Refresh disk/pressure gauges up front, and read pressure ONCE for the whole cycle.
             _update_disk_metrics(fs_store.root)
@@ -1375,6 +1431,7 @@ async def run_janitor_loop():
             # They are single indexed DB reads; nothing about the FS cache should gate them.
             sentinel_violations = 0
             try:
+                _janitor_phase = 5  # sentinel
                 sentinel_violations = await check_replication_sentinel(db_pool, pressure)
             except Exception as e:
                 logger.error(f"Replication sentinel error: {e}", exc_info=True)
@@ -1385,6 +1442,7 @@ async def run_janitor_loop():
             # holds its prior value) rather than over-counting against an empty set.
             aged_orphans = 0
             try:
+                _janitor_phase = 6  # aged_orphans
                 gauge_dlq_object_ids = await get_all_dlq_object_ids(redis_client)
                 aged_orphans = await check_aged_pending_orphans(db_pool, gauge_dlq_object_ids)
             except Exception as e:
@@ -1408,6 +1466,7 @@ async def run_janitor_loop():
             # Phase A: clean stale/orphan/terminally-abandoned parts (each phase gets its OWN
             # fresh budget so the first walk can't starve the second — the bug we are fixing).
             try:
+                _janitor_phase = 1  # stale_parts
                 stale_count = await cleanup_stale_parts(
                     db_pool,
                     fs_store,
@@ -1422,6 +1481,7 @@ async def run_janitor_loop():
 
             # Phase B: replication-gated age GC + census (census published only on a full sweep).
             try:
+                _janitor_phase = 2  # gc_age
                 gc_count = await cleanup_old_parts_by_mtime(
                     db_pool,
                     fs_store,
@@ -1437,6 +1497,7 @@ async def run_janitor_loop():
 
             # Phase C: orphan .tmp.* files from crashed atomic writes.
             try:
+                _janitor_phase = 3  # orphan_tmp
                 tmp_count = await cleanup_orphan_tmp_files(
                     fs_store,
                     shard=walk_shard,
@@ -1450,6 +1511,7 @@ async def run_janitor_loop():
             # Phase D: hard-delete soft-deleted objects where all unpins are confirmed (DB-bound,
             # batch-capped — cannot starve the cycle).
             try:
+                _janitor_phase = 4  # soft_deleted
                 hard_deleted = await gc_soft_deleted_objects(db_pool)
             except Exception as e:
                 logger.error(f"Hard delete error: {e}", exc_info=True)
@@ -1462,9 +1524,13 @@ async def run_janitor_loop():
                 f"sentinel_violations={sentinel_violations} aged_orphans={aged_orphans}"
             )
 
+            _janitor_cycle_seconds = time.time() - _cycle_started
+            _janitor_last_cycle_completed_at = time.time()
+
             # Pick sleep interval based on current pressure.
             sleep_interval = sleep_pressure if pressure > 0 else sleep_normal
             logger.info(f"Janitor sleeping {sleep_interval}s (pressure={pressure})")
+            _janitor_phase = 0
             await asyncio.sleep(sleep_interval)
     finally:
         if redis_client:
@@ -1474,4 +1540,4 @@ async def run_janitor_loop():
 
 
 if __name__ == "__main__":
-    asyncio.run(run_janitor_loop())
+    run_worker(run_janitor_loop, "janitor")

@@ -11,6 +11,7 @@ from hippius_s3.config import get_config
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.sentry import init_sentry
+from hippius_s3.workers.shutdown import run_worker
 
 
 logging.basicConfig(level=logging.INFO)
@@ -63,4 +64,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run_worker(main, "account-cacher")
