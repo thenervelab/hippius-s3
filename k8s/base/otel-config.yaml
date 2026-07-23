@@ -12,6 +12,19 @@ processors:
       # insert (not upsert) so a producer's own service.name (api/gateway via
       # configure_otel, workers via OTEL_SERVICE_NAME, the Rust drain) survives;
       # this only labels telemetry that arrives without a service.name.
+      #
+      # This said `upsert` until 2026-07-17, which overwrote the name every
+      # service sets for itself and left service_name="hippius-s3" and
+      # exported_job="<ns>/hippius-s3" on EVERYTHING — api, gateway and workers
+      # indistinguishable in Prometheus, so alert rules had to match pod names
+      # (exported_instance=~"arion-downloader-.*"), which breaks on any rename.
+      # The traces pipeline has never had this processor, which is why Tempo always
+      # showed the right names.
+      #
+      # `insert` rather than deleting the processor outright: telemetry does arrive
+      # here with no service.name of its own (Loki carries an unknown_service
+      # stream), and that should still be labelled hippius-s3 rather than become
+      # anonymous.
       - key: service.name
         value: "hippius-s3"
         action: insert

@@ -397,6 +397,12 @@ jobs:
         run: |
           kubectl rollout restart deployment/hydrator -n hippius-s3-staging --ignore-not-found || true
           kubectl rollout restart deployment/backup -n hippius-s3-staging --ignore-not-found || true
+          # otel-collector mounts otel-collector-config by static name, with no reloader
+          # sidecar and no kustomize hash suffix, so `kubectl apply -k` updates the
+          # ConfigMap and the running collector keeps its old config indefinitely. Without
+          # this restart, any change to k8s/base/otel-collector.yaml lands silently and
+          # looks like it simply did not work.
+          kubectl rollout restart deployment/otel-collector -n hippius-s3-staging --ignore-not-found || true
 
       - name: Verify deployment
         run: |

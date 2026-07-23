@@ -22,6 +22,60 @@ logger = logging.getLogger(__name__)
 _otel_configured_pid: int | None = None
 
 
+def build_resource(service_name: str) -> Resource:
+    """Identify this PROCESS — not this pod — to the collector.
+
+    configure_otel runs once per forked uvicorn worker (see the pid guard below), so
+    with UVICORN_WORKERS=4 a pod holds four independent MeterProviders. If they share
+    one service.instance.id, their four cumulative counters collide in a single
+    accumulator slot in the collector's prometheus exporter: the exported value
+    flip-flops between workers and every downward step reads as a counter reset.
+    Measured on prod 2026-07-17 before this fix, 19 resets per series per 10m, and
+    rate(http_requests_total) reporting 14.5k/s against a true 138/s from the gateway
+    audit log — ~105x.
+
+    The collision is structural, not a setting: the exporter's timeseriesSignature()
+    derives job and instance from the resource unconditionally (accumulator.go:333,
+    collector.go:126,326), so identical resources mean one slot no matter how the
+    exporter is configured. In particular resource_to_telemetry_conversion is NOT the
+    cause and flipping it off changes nothing.
+
+    Nor is there a way out via delta temporality. The delta-to-cumulative path only
+    accumulates points whose timestamps chain from a single stream and otherwise
+    overwrites the counter with the raw delta, while the histogram path drops
+    misaligned points outright — the code names this "violation of the single-writer
+    principle" (accumulator.go:204 and :256-272, contrib v0.96.0). deltatocumulative
+    keys by identity too. The identity itself has to be unique per writer.
+
+    An earlier comment here forbade os.getpid() to protect cardinality. It was wrong in
+    the main: this attribute is the POD NAME, which already churns completely on every
+    deploy, so the pid mostly rides an axis that already churns, at a bounded 4x — and
+    the same change removed the account labels (87% of this namespace's series), so the
+    net is still a large reduction. But it was not baseless, and two things keep it
+    true rather than lucky:
+      - UVICORN_MAX_REQUESTS=0. It disables worker recycling, so pids turn over only on
+        crash. start-gateway.sh invites raising it if a leak ever appears; doing so
+        would recycle workers continuously and turn this 4x into genuine churn, because
+        a crash-respawn mints a new pid under a STABLE pod name — an axis the pod name
+        alone does not have.
+      - metric_expiration: 180m on the collector, which keeps every dead series
+        resident for 3h after its writer is gone.
+    If either changes, re-measure before assuming this is still cheap.
+
+    Resource.create() merges OTEL_RESOURCE_ATTRIBUTES from env first and the dict passed
+    here wins over it — which matters, because the deployments set
+    service.instance.id=$(POD_NAME) there and that would otherwise undo this silently.
+    Everything else in that env var (service.namespace, deployment.environment) still
+    merges through.
+    """
+    return Resource.create(
+        {
+            "service.name": service_name,
+            "service.instance.id": f"{socket.gethostname()}:{os.getpid()}",
+        }
+    )
+
+
 def configure_otel(service_name: str) -> None:
     """Programmatic OTel initialization, safe to call per-worker after fork.
 
@@ -42,17 +96,7 @@ def configure_otel(service_name: str) -> None:
 
     endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
 
-    # Resource.create() automatically merges OTEL_RESOURCE_ATTRIBUTES from env
-    # Keep service.instance.id at the (stable) pod hostname — never append os.getpid().
-    # The collector promotes this resource attr to the `instance` metric label, so a
-    # per-process value mints a fresh series set for every worker (re)spawn and blows
-    # up Prometheus head cardinality. Workers of one pod aggregate under one instance.
-    resource = Resource.create(
-        {
-            "service.name": service_name,
-            "service.instance.id": socket.gethostname(),
-        }
-    )
+    resource = build_resource(service_name)
 
     # Traces
     tracer_provider = TracerProvider(resource=resource)
