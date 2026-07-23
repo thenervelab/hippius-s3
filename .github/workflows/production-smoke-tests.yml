@@ -32,7 +32,10 @@ jobs:
           pip install --upgrade pip
           pip install -r tests/smoke/requirements.txt
 
+      # Per-step timeouts keep a hung suite below the job's 30-minute cap: a job-level
+      # timeout cancels the remaining steps, so the failure notification would never fire.
       - name: Run smoke tests against s3.hippius.com
+        timeout-minutes: 8
         env:
           AWS_ACCESS_KEY: ${{ secrets.HIPPIUS_PROD_ACCESS_KEY }}
           AWS_SECRET_KEY: ${{ secrets.HIPPIUS_PROD_SECRET_KEY }}
@@ -48,6 +51,7 @@ jobs:
 
       - name: Run smoke tests against regional caches
         if: always()
+        timeout-minutes: 8
         env:
           AWS_ACCESS_KEY: ${{ secrets.HIPPIUS_PROD_ACCESS_KEY }}
           AWS_SECRET_KEY: ${{ secrets.HIPPIUS_PROD_SECRET_KEY }}
@@ -64,6 +68,7 @@ jobs:
 
       - name: Run sub-token scope smoke tests against s3.hippius.com
         if: always()
+        timeout-minutes: 8
         env:
           AWS_ACCESS_KEY: ${{ secrets.HIPPIUS_PROD_ACCESS_KEY }}
           AWS_SECRET_KEY: ${{ secrets.HIPPIUS_PROD_SECRET_KEY }}
