@@ -412,6 +412,27 @@ class FileSystemPartsStore:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 2.0)
 
+    def stat_part(self, object_id: str, object_version: int, part_number: int) -> os.stat_result | None:
+        """Stat a part's readiness marker for the janitor's SQL-eviction candidate check.
+
+        BLOCKING — callers wrap in `asyncio.to_thread` (each stat is a CephFS metadata
+        roundtrip that must not run on the loop). Stats `meta.json` when present, else the part
+        dir, returning None when neither exists — the same "meta.json is the part-complete
+        signal, fall back to the dir" rule the walk gates on (see `_descend_object`). The
+        returned atime drives the hot-retention skip; a None tells the caller the inventory row
+        is stale (the dir is already gone) so it can self-heal by clearing the row.
+        """
+        part_dir = Path(self.part_path(object_id, object_version, part_number))
+        meta_path = self._meta_file(part_dir)
+        try:
+            return meta_path.stat()
+        except OSError:
+            pass
+        try:
+            return part_dir.stat()
+        except OSError:
+            return None
+
     async def delete_part(self, object_id: str, object_version: int, part_number: int) -> None:
         """Delete a part directory and attempt to prune empty parent directories.
 
@@ -425,40 +446,33 @@ class FileSystemPartsStore:
         """
         part_dir = Path(self.part_path(object_id, object_version, part_number))
 
-        if not part_dir.exists():
-            logger.debug(
-                f"FS: delete_part no-op (not present) object_id={object_id} v={object_version} part={part_number}"
-            )
-            return
+        def _delete_and_prune() -> bool:
+            # One thread hop for the whole sequence: the exists-check, rmtree,
+            # and the empty-parent prunes are each a CephFS metadata roundtrip;
+            # doing them on-loop serialized every janitor worker behind MDS
+            # latency.
+            if not part_dir.exists():
+                return False
+            shutil.rmtree(part_dir)
+            for parent in (part_dir.parent, part_dir.parent.parent):
+                with contextlib.suppress(OSError):
+                    parent.rmdir()  # only succeeds if empty — race-safe by contract
+            return True
 
         try:
-            # Remove all files in the part directory
-            await asyncio.to_thread(shutil.rmtree, part_dir)
-            logger.info(f"FS: deleted part object_id={object_id} v={object_version} part={part_number}")
+            deleted = await asyncio.to_thread(_delete_and_prune)
         except Exception as e:
             logger.warning(
                 f"FS: failed to delete part object_id={object_id} v={object_version} part={part_number}: {e}"
             )
             return
-
-        # Attempt to remove parent directories if empty (race-safe)
-        try:
-            version_dir = part_dir.parent
-            if version_dir.exists():
-                with contextlib.suppress(OSError):
-                    version_dir.rmdir()  # Only succeeds if empty
-                logger.debug(f"FS: pruned empty version dir {version_dir}")
-        except OSError:
-            pass  # Directory not empty or other race; ignore
-
-        try:
-            object_dir = version_dir.parent if version_dir else None
-            if object_dir and object_dir.exists():
-                with contextlib.suppress(OSError):
-                    object_dir.rmdir()  # Only succeeds if empty
-                logger.debug(f"FS: pruned empty object dir {object_dir}")
-        except (OSError, AttributeError):
-            pass  # Directory not empty or other race; ignore
+        if deleted:
+            # DEBUG, not INFO — this fires ~11k times per janitor cycle on prod.
+            logger.debug(f"FS: deleted part object_id={object_id} v={object_version} part={part_number}")
+        else:
+            logger.debug(
+                f"FS: delete_part no-op (not present) object_id={object_id} v={object_version} part={part_number}"
+            )
 
     async def delete_object(self, object_id: str, object_version: Optional[int] = None) -> None:
         """Delete an entire object or specific version.
