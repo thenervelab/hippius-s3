@@ -563,6 +563,8 @@ Commits: `feat(janitor): walk demoted to consistency sweep` → `feat(janitor): 
 | 4 | staging soak ≥1 week → prod | set `HIPPIUS_JANITOR_SQL_MAX_DELETES_PER_CYCLE=0` (kills the phase without a deploy) or revert; walk is still full eviction engine |
 | 5 | only after soak gate above | revert restores per-cycle walk; inventory keeps working |
 
+**Wave-4 enablement conditions (from the 4.1 scale-probe review):** the candidate query's good plan (ordered keyset walk, early LIMIT stop) and bad plan (hash-join everything, ~250ms per 50k rows, repeated per page) are BOTH reachable depending on table stats. Before trusting the SQL phase on prod: run `EXPLAIN (ANALYZE, BUFFERS)` of `janitor_evictable_candidates` on a prod-scale snapshot (`scripts/gen_clean_dump.py`); if the hash shape appears, set `HIPPIUS_JANITOR_SQL_MAX_DELETES_PER_CYCLE=0` and restructure to a scan-budget inner subquery (keyset+LIMIT inside, expensive checks via LATERAL outside) with `plan_cache_mode=force_custom_plan` on the discovery connection. Per-page scan volume is additionally bounded at runtime by `HIPPIUS_JANITOR_SQL_QUERY_TIMEOUT_SECONDS` (timeout = end discovery this cycle; the cursor resumes from the same spot next cycle).
+
 **Ops notes:**
 - `fs_cache_inventory` write rate = part-materialization rate (PUT parts + cache fills). Rows are ~100 bytes; 15.6M rows ≈ ~2 GB with index — fine on the NVMe Postgres. Autovacuum was just tuned for this DB (commit `2d70604`); the delete-heavy pattern is exactly what it now handles.
 - The candidate query's coverage anti-join is the same shape the sentinel already runs every cycle against the whole table — the inventory join makes it strictly cheaper.
