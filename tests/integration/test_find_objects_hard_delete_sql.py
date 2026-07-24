@@ -29,6 +29,10 @@ _T_D = datetime.datetime(2000, 1, 2, tzinfo=_EPOCH)  # ready
 _T_B = datetime.datetime(2000, 1, 3, tzinfo=_EPOCH)  # not-ready (a live backend)
 _T_C = datetime.datetime(2000, 1, 4, tzinfo=_EPOCH)  # no chunk_backend rows
 
+# Start-of-ring keyset cursor: the finder pages on (deleted_at, object_id) > ($2, $3).
+_EPOCH_CURSOR = datetime.datetime(1970, 1, 1, tzinfo=_EPOCH)
+_ZERO_UUID = uuid.UUID("00000000-0000-0000-0000-000000000000")
+
 
 async def _seed_bucket(conn: asyncpg.Connection) -> uuid.UUID:
     acct = f"5HDTEST{uuid.uuid4().hex[:12]}"
@@ -112,23 +116,46 @@ async def test_find_objects_ready_for_hard_delete_semantics(pg_tx: asyncpg.Conne
 
     sql = get_query("find_objects_ready_for_hard_delete")
 
-    # Large batch: ready objects returned, not-ready / no-chunks excluded (membership —
-    # robust to any other soft-deleted rows already in the DB).
-    returned = {r["object_id"] for r in await pg_tx.fetch(sql, 1000)}
-    assert a in returned
-    assert d in returned
-    assert b not in returned
-    assert c not in returned
+    # The finder now returns the whole keyset SLICE with a per-row `ready` flag (so the caller can
+    # advance its ring cursor past un-ready rows), rather than filtering to ready rows. Assert on
+    # the flag, not on membership.
+    rows = await pg_tx.fetch(sql, 1000, _EPOCH_CURSOR, _ZERO_UUID)
+    ready = {r["object_id"] for r in rows if r["ready"]}
+    scanned = {r["object_id"] for r in rows}
+    assert a in ready
+    assert d in ready
+    assert b in scanned and b not in ready, "a live backend row means not-ready — but still scanned"
+    # `c` never had a chunk_backend row; the aged escape hatch (deleted_at older than 24h) makes it
+    # ready, so the never-replicated population can drain instead of wedging the ring forever.
+    assert c in scanned and c in ready, "an aged zero-backend-row object must become ready"
 
-    # Batch=2: only the two OLDEST candidates (a, d) are even considered, so the
-    # newer not-ready/no-chunks rows can't appear — proves LIMIT bounds the scan.
-    assert {r["object_id"] for r in await pg_tx.fetch(sql, 2)} == {a, d}
+    # Batch=2: only the two OLDEST candidates (a, d) are even scanned — proves LIMIT bounds the slice.
+    assert {r["object_id"] for r in await pg_tx.fetch(sql, 2, _EPOCH_CURSOR, _ZERO_UUID)} == {a, d}
 
 
 @pytest.mark.asyncio
 async def test_find_objects_ready_for_hard_delete_respects_batch_limit(pg_conn: asyncpg.Connection) -> None:
-    rows = await pg_conn.fetch(get_query("find_objects_ready_for_hard_delete"), 1)
+    rows = await pg_conn.fetch(get_query("find_objects_ready_for_hard_delete"), 1, _EPOCH_CURSOR, _ZERO_UUID)
     assert len(rows) <= 1
+
+
+@pytest.mark.asyncio
+async def test_slice_is_returned_in_keyset_order_so_the_cursor_is_correct(pg_tx: asyncpg.Connection) -> None:
+    """The caller derives the next ring cursor from `rows[-1]`, so the result ORDER is load-bearing.
+    Without an explicit ORDER BY the outer SELECT inherits the CTE's order only incidentally, and a
+    future plan shape could return the slice in any order — making `rows[-1]` not the maximum keyset
+    position, so the cursor would skip unscanned rows or move backwards. Pin the contract."""
+    bucket_id = await _seed_bucket(pg_tx)
+    # Seed out of chronological order so a naive/unordered scan is unlikely to be sorted by accident.
+    await _seed_object(pg_tx, bucket_id, _T_C, [True])
+    await _seed_object(pg_tx, bucket_id, _T_A, [True])
+    await _seed_object(pg_tx, bucket_id, _T_D, [True])
+    await _seed_object(pg_tx, bucket_id, _T_B, [True])
+
+    rows = await pg_tx.fetch(get_query("find_objects_ready_for_hard_delete"), 4, _EPOCH_CURSOR, _ZERO_UUID)
+    keys = [(r["deleted_at"], r["object_id"]) for r in rows]
+    assert keys == sorted(keys), f"slice must be in (deleted_at, object_id) order, got {keys}"
+    assert keys[-1] == max(keys), "rows[-1] must be the maximum keyset position — the caller's cursor"
 
 
 @pytest.mark.asyncio
