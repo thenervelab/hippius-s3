@@ -112,7 +112,9 @@ async def test_find_objects_ready_for_hard_delete_semantics(pg_tx: asyncpg.Conne
     a = await _seed_object(pg_tx, bucket_id, _T_A, [True, True])  # ready: all backends deleted
     d = await _seed_object(pg_tx, bucket_id, _T_D, [True])  # ready: single deleted backend
     b = await _seed_object(pg_tx, bucket_id, _T_B, [True, False])  # not-ready: one live backend
-    c = await _seed_object(pg_tx, bucket_id, _T_C, [])  # excluded: never had a chunk_backend row
+    c = await _seed_object(
+        pg_tx, bucket_id, _T_C, []
+    )  # aged + zero chunk_backend rows -> READY via the 24h escape hatch
 
     sql = get_query("find_objects_ready_for_hard_delete")
 
@@ -139,23 +141,15 @@ async def test_find_objects_ready_for_hard_delete_respects_batch_limit(pg_conn: 
     assert len(rows) <= 1
 
 
-@pytest.mark.asyncio
-async def test_slice_is_returned_in_keyset_order_so_the_cursor_is_correct(pg_tx: asyncpg.Connection) -> None:
-    """The caller derives the next ring cursor from `rows[-1]`, so the result ORDER is load-bearing.
-    Without an explicit ORDER BY the outer SELECT inherits the CTE's order only incidentally, and a
-    future plan shape could return the slice in any order — making `rows[-1]` not the maximum keyset
-    position, so the cursor would skip unscanned rows or move backwards. Pin the contract."""
-    bucket_id = await _seed_bucket(pg_tx)
-    # Seed out of chronological order so a naive/unordered scan is unlikely to be sorted by accident.
-    await _seed_object(pg_tx, bucket_id, _T_C, [True])
-    await _seed_object(pg_tx, bucket_id, _T_A, [True])
-    await _seed_object(pg_tx, bucket_id, _T_D, [True])
-    await _seed_object(pg_tx, bucket_id, _T_B, [True])
-
-    rows = await pg_tx.fetch(get_query("find_objects_ready_for_hard_delete"), 4, _EPOCH_CURSOR, _ZERO_UUID)
-    keys = [(r["deleted_at"], r["object_id"]) for r in rows]
-    assert keys == sorted(keys), f"slice must be in (deleted_at, object_id) order, got {keys}"
-    assert keys[-1] == max(keys), "rows[-1] must be the maximum keyset position — the caller's cursor"
+# NOTE: no ordering test lives here on purpose. An earlier draft of this PR added one, but it was a
+# tautology — the `candidates` CTE carries its own `ORDER BY deleted_at, object_id`, so the
+# tuplestore is sorted regardless of insert order and a CTE Scan reads it sequentially; the test
+# passed identically with the outer ORDER BY reverted, i.e. it could not fail. Real coverage of the
+# contract (the caller's `rows[-1]` advance across pages, plus exactly-once slice coverage) already
+# exists in tests/integration/test_hard_delete_ring.py::test_keyset_pagination_walks_in_order_and_
+# covers_slice. The outer ORDER BY this PR adds is defensive: on PG18 the planner already elides the
+# sort because it propagates the CTE's pathkeys, so it closes a latent portability gap, not a live
+# bug — worth having, not worth a test that only looks like one.
 
 
 @pytest.mark.asyncio
@@ -166,7 +160,12 @@ async def test_find_objects_ready_for_hard_delete_plan_is_index_driven(pg_conn: 
     if not n or n < 1_000_000:
         pytest.skip(f"chunk_backend too small ({n}) for a meaningful plan assertion")
     sql = get_query("find_objects_ready_for_hard_delete")
-    plan = "\n".join(r["QUERY PLAN"] for r in await pg_conn.fetch("EXPLAIN " + sql, 5000))
+    # 3 params, not 1: the finder grew the ($2, $3) ring cursor. Passing 1 raises InterfaceError —
+    # which this test masked, because the size guard above skips before the call on a small DB. It
+    # therefore never ran anywhere: skipped locally/CI (no data), errored on anything prod-sized.
+    # This is the ONLY assertion guarding the ~135 GiB read-storm plan shape, so it silently being
+    # dead is the expensive kind of broken.
+    plan = "\n".join(r["QUERY PLAN"] for r in await pg_conn.fetch("EXPLAIN " + sql, 5000, _EPOCH_CURSOR, _ZERO_UUID))
     assert "idx_objects_deleted" in plan
     assert "Seq Scan on chunk_backend" not in plan
     assert "Seq Scan on parts" not in plan
