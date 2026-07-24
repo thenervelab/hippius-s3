@@ -363,3 +363,76 @@ async def test_unified_walk_publishes_census_only_on_full_sweep(tmp_path: Path, 
         )
     assert janitor._fs_parts_on_disk == 8, "a completed sweep must publish the whole-tree part count"
     assert janitor._fs_hot_parts == 1, "the one hot part (HOT_PROTECTED) must be counted"
+
+
+# ============================================================================================
+# fs_cache_inventory clear-on-evict (Task 3.2) + walk-sweep backfill (Task 3.3)
+# ============================================================================================
+#
+# The unified walk owns the inventory table's lifecycle for evicted/kept parts: after every
+# successful delete it clears the row (so the SQL-eviction phase never re-picks a gone part), and
+# every part that SURVIVES all gates is backfilled (so the walk doubles as the inventory
+# reconciler). These two duties, and their asymmetry, are pinned below.
+
+
+class _ClearSpy:
+    """Stand-in for fs_cache_inventory.clear_cached: records every (oid, ov, pn) it is asked to
+    clear, and optionally raises to prove a post-delete clear failure cannot undo the delete."""
+
+    def __init__(self, *, raises: bool = False) -> None:
+        self.calls: list[tuple[str, int, int]] = []
+        self._raises = raises
+
+    async def __call__(self, conn, object_id, object_version, part_number) -> None:
+        self.calls.append((object_id, int(object_version), int(part_number)))
+        if self._raises:
+            raise RuntimeError("clear boom")
+
+
+@pytest.mark.asyncio
+async def test_unified_clears_inventory_once_per_successful_delete(tmp_path: Path, monkeypatch):
+    """Every successful delete (stale-reap AND age-GC branch) clears the inventory row exactly once;
+    parts refused by a gate or never deleted are never cleared."""
+    monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 0)
+    root = tmp_path / "t"
+    _build_catalogue(root)
+    store = _FakeFsStore(root)
+    clear = _ClearSpy()
+    with (
+        patch.object(janitor, "is_replicated_on_all_backends", _fake_replicated),
+        patch.object(janitor, "is_terminally_abandoned", _fake_abandoned),
+        patch.object(janitor.fs_cache_inventory, "clear_cached", clear),
+        patch.object(janitor.fs_cache_inventory, "record_cached_batch", AsyncMock()),
+    ):
+        await janitor.cleanup_parts_unified(
+            _FakePool(_FakeConn()), store, _redis((DLQ_PROTECTED,)), pressure=0, shard=0, shards=1, walk_concurrency=4
+        )
+    # Cleared EXACTLY the deleted set (ORPHAN_STALE + ABANDONED via stale-reap, GC_REPLICATED_COLD
+    # via age-GC), once each — never for the survivors or gate-refused parts.
+    assert set(clear.calls) == EXPECTED_DELETED
+    assert len(clear.calls) == len(EXPECTED_DELETED)
+    assert set(store.deleted) == EXPECTED_DELETED
+
+
+@pytest.mark.asyncio
+async def test_unified_clear_failure_after_delete_still_counts_delete(tmp_path: Path, monkeypatch, caplog):
+    """A clear that raises AFTER a successful delete_part must NOT flip the handle to False: the
+    part is gone from disk, the delete stands and is counted, and the failure is warned."""
+    monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 0)
+    root = tmp_path / "t"
+    _build_catalogue(root)
+    store = _FakeFsStore(root)
+    clear = _ClearSpy(raises=True)
+    with (
+        patch.object(janitor, "is_replicated_on_all_backends", _fake_replicated),
+        patch.object(janitor, "is_terminally_abandoned", _fake_abandoned),
+        patch.object(janitor.fs_cache_inventory, "clear_cached", clear),
+        patch.object(janitor.fs_cache_inventory, "record_cached_batch", AsyncMock()),
+        caplog.at_level("WARNING"),
+    ):
+        res = await janitor.cleanup_parts_unified(
+            _FakePool(_FakeConn()), store, _redis((DLQ_PROTECTED,)), pressure=0, shard=0, shards=1, walk_concurrency=4
+        )
+    assert set(store.deleted) == EXPECTED_DELETED, "deletes stand even though every clear raised"
+    assert res["stale_mtime"] == 1 and res["abandoned"] == 1 and res["gc"] == 1
+    assert any("clear failed after eviction" in r.message for r in caplog.records)

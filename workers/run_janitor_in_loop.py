@@ -55,6 +55,7 @@ from hippius_s3.cache import create_fs_store
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.otel_setup import build_resource
+from hippius_s3.repositories import fs_cache_inventory
 from hippius_s3.sentry import init_sentry
 from hippius_s3.utils import get_query
 from hippius_s3.workers.shutdown import run_worker
@@ -336,6 +337,30 @@ def _effective_hot_retention(mode: int) -> float:
     if mode == 2:
         return 0.0  # disable hot retention under critical pressure
     return base
+
+
+async def _clear_inventory_after_delete(
+    conn: asyncpg.Connection, object_id: str, object_version: int, part_number: int
+) -> None:
+    """Drop a just-evicted part from `fs_cache_inventory`, swallowing any clear failure.
+
+    `clear_cached` RAISES by design, but its ONE janitor caller must not let a clear failure that
+    lands AFTER a successful `delete_part` flip the delete's result to False: the part is already
+    gone from disk, so re-counting it as "not deleted" is the wrong outcome. A stale inventory row
+    is self-healing — the walk sweep re-walks kept parts, and the SQL-eviction re-check tolerates a
+    part that is already absent — so a swallowed clear costs at most a delayed row cleanup, never a
+    resurrected candidate for data that still exists.
+    """
+    try:
+        await fs_cache_inventory.clear_cached(conn, object_id, object_version, part_number)
+    except Exception as exc:
+        logger.warning(
+            "fs_cache_inventory clear failed after eviction (row self-heals via next walk sweep): %s v%s p%s: %s",
+            object_id,
+            object_version,
+            part_number,
+            exc,
+        )
 
 
 def _safe_iterdir(path: Path) -> Iterator[Path]:
@@ -1022,6 +1047,7 @@ async def cleanup_stale_parts(
 
         try:
             await fs_store.delete_part(object_id, object_version, part_number)
+            await _clear_inventory_after_delete(conn, object_id, object_version, part_number)
             if abandoned:
                 logger.info(
                     "Reclaimed terminally-abandoned part (failed+unservable): "
@@ -1512,6 +1538,7 @@ async def cleanup_old_parts_by_mtime(
 
         try:
             await fs_store.delete_part(object_id, object_version, part_number)
+            await _clear_inventory_after_delete(conn, object_id, object_version, part_number)
             logger.debug(
                 f"GC cleaned part: object_id={object_id} v={object_version} part={part_number} "
                 f"replicated=True pressure={pressure} {old_enough=}"
@@ -1727,6 +1754,7 @@ async def cleanup_parts_unified(
                         f"v={item.object_version} part={item.part_number}: {e}"
                     )
                     return False
+                await _clear_inventory_after_delete(conn, item.object_id, item.object_version, item.part_number)
                 if abandoned:
                     logger.info(
                         "Reclaimed terminally-abandoned part (failed+unservable): "
@@ -1768,6 +1796,7 @@ async def cleanup_parts_unified(
                     f"v={item.object_version} part={item.part_number}: {e}"
                 )
                 return False
+            await _clear_inventory_after_delete(conn, item.object_id, item.object_version, item.part_number)
             logger.debug(
                 f"GC cleaned part: object_id={item.object_id} v={item.object_version} part={item.part_number} "
                 f"replicated=True pressure={pressure} old_enough={item.gc_old_enough}"
