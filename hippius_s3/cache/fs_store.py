@@ -412,6 +412,27 @@ class FileSystemPartsStore:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 2.0)
 
+    def stat_part(self, object_id: str, object_version: int, part_number: int) -> os.stat_result | None:
+        """Stat a part's readiness marker for the janitor's SQL-eviction candidate check.
+
+        BLOCKING — callers wrap in `asyncio.to_thread` (each stat is a CephFS metadata
+        roundtrip that must not run on the loop). Stats `meta.json` when present, else the part
+        dir, returning None when neither exists — the same "meta.json is the part-complete
+        signal, fall back to the dir" rule the walk gates on (see `_descend_object`). The
+        returned atime drives the hot-retention skip; a None tells the caller the inventory row
+        is stale (the dir is already gone) so it can self-heal by clearing the row.
+        """
+        part_dir = Path(self.part_path(object_id, object_version, part_number))
+        meta_path = self._meta_file(part_dir)
+        try:
+            return meta_path.stat()
+        except OSError:
+            pass
+        try:
+            return part_dir.stat()
+        except OSError:
+            return None
+
     async def delete_part(self, object_id: str, object_version: int, part_number: int) -> None:
         """Delete a part directory and attempt to prune empty parent directories.
 
