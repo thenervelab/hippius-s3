@@ -21,6 +21,7 @@ from hippius_s3.cache import create_fs_store
 from hippius_s3.config import get_config
 from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.db_retry import retry_on_object_version_conflict
+from hippius_s3.repositories import fs_cache_inventory
 from hippius_s3.services.crypto_pool import run_crypto
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.parts_service import upsert_part_placeholder
@@ -443,45 +444,53 @@ class ObjectWriter:
                 "storage_version": resolved_storage_version,
             },
         ):
-            async with acquire_with_timeout(self.pool, self.config.db_pool_acquire_timeout) as conn, conn.transaction():
-                # Until this UPDATE sets non-empty size/md5 the version is invisible to downloads.
-                await conn.execute(
-                    get_query("update_object_version_metadata"),
-                    int(total_size),
-                    md5_hash,
-                    content_type,
-                    json.dumps(metadata),
-                    datetime.now(timezone.utc),
-                    object_id,
-                    int(object_version),
-                )
-                # Envelope (kek_id, wrapped_dek) was already written in the head transaction
-                # to prevent the read-race on concurrent overwrites.
+            async with acquire_with_timeout(self.pool, self.config.db_pool_acquire_timeout) as conn:
+                async with conn.transaction():
+                    # Until this UPDATE sets non-empty size/md5 the version is invisible to downloads.
+                    await conn.execute(
+                        get_query("update_object_version_metadata"),
+                        int(total_size),
+                        md5_hash,
+                        content_type,
+                        json.dumps(metadata),
+                        datetime.now(timezone.utc),
+                        object_id,
+                        int(object_version),
+                    )
+                    # Envelope (kek_id, wrapped_dek) was already written in the head transaction
+                    # to prevent the read-race on concurrent overwrites.
 
-                upload_id = await ensure_upload_row(
-                    conn,
-                    object_id=object_id,
-                    bucket_id=bucket_id,
-                    object_key=object_key,
-                    content_type=content_type,
-                    metadata=metadata,
-                )
+                    upload_id = await ensure_upload_row(
+                        conn,
+                        object_id=object_id,
+                        bucket_id=bucket_id,
+                        object_key=object_key,
+                        content_type=content_type,
+                        metadata=metadata,
+                    )
 
-                await upsert_part_placeholder(
-                    conn,
-                    object_id=object_id,
-                    upload_id=str(upload_id),
-                    part_number=int(part_number),
-                    size_bytes=int(total_size),
-                    etag=md5_hash,
-                    chunk_size_bytes=int(chunk_size),
-                    object_version=int(object_version),
-                    chunk_cipher_sizes=chunk_cipher_sizes,
-                )
-                # NOTE: `multipart_uploads.is_completed = TRUE` is intentionally NOT set here.
-                # It must be set only AFTER the upload is enqueued (the endpoint does it), so that
-                # if the enqueue fails the row stays is_completed=FALSE and remains eligible for the
-                # DELETE cascade cleanup instead of becoming an un-uploadable, un-evictable orphan.
+                    await upsert_part_placeholder(
+                        conn,
+                        object_id=object_id,
+                        upload_id=str(upload_id),
+                        part_number=int(part_number),
+                        size_bytes=int(total_size),
+                        etag=md5_hash,
+                        chunk_size_bytes=int(chunk_size),
+                        object_version=int(object_version),
+                        chunk_cipher_sizes=chunk_cipher_sizes,
+                    )
+                    # NOTE: `multipart_uploads.is_completed = TRUE` is intentionally NOT set here.
+                    # It must be set only AFTER the upload is enqueued (the endpoint does it), so that
+                    # if the enqueue fails the row stays is_completed=FALSE and remains eligible for the
+                    # DELETE cascade cleanup instead of becoming an un-uploadable, un-evictable orphan.
+
+                # The part's chunks+meta are on FS; record it so the janitor's SQL discovery finds it.
+                # MUST run AFTER the tail transaction commits: a failed INSERT inside the open txn
+                # would poison it and turn the block-exit COMMIT into a silent ROLLBACK, losing the
+                # part rows above. Reuses the still-held conn (autocommit per statement outside the
+                # txn block) so there is no extra pool checkout on the hot PUT path.
+                await fs_cache_inventory.record_cached(conn, object_id, int(object_version), int(part_number))
         perf_post_ms = (time.monotonic() - perf_post_start) * 1000
 
         throughput_mbps = (
