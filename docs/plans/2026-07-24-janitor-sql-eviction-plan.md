@@ -337,7 +337,11 @@ WITH required_sets AS (
 SELECT inv.object_id, inv.object_version, inv.part_number, inv.cached_at
 FROM fs_cache_inventory inv
 JOIN parts p
-  ON p.object_id::text = inv.object_id
+  -- Cast the TEXT side to uuid (cephor precedent, drain-core store.rs): casting parts.object_id
+  -- instead would defeat every parts index (leading-column entry impossible) and hash-join ~15.6M
+  -- rows per keyset page. Precondition: inventory rows are always UUID-shaped (producers insert DB
+  -- UUIDs; the walk backfill must skip non-UUID dirnames — _safe_object_id already enforces shape).
+  ON p.object_id = inv.object_id::uuid
  AND p.object_version = inv.object_version
  AND p.part_number = inv.part_number
 JOIN required_sets rs
