@@ -38,6 +38,7 @@ from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import PartToDownload
 from hippius_s3.redis_utils import create_redis_client
+from hippius_s3.repositories import fs_cache_inventory
 from hippius_s3.utils import get_query
 from hippius_s3.utils.timing import log_timing
 
@@ -338,7 +339,16 @@ async def process_download_request(
                     token = str(getattr(download_request, "ray_id", None) or "anonymous")
                     release_lua = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
                     await obj_cache.redis.eval(release_lua, 1, lock_key, token)
-                return all(chunk_results)
+
+                part_complete = all(chunk_results)
+                if part_complete:
+                    # Every chunk landed on FS (meta was written eagerly up-front); record the part so
+                    # the janitor's SQL discovery finds it. Advisory-only, gated on completion — never
+                    # the eager meta write. Best-effort (swallows internally).
+                    await fs_cache_inventory.record_cached(
+                        db_pool, download_request.object_id, int(download_request.object_version), part_number
+                    )
+                return part_complete
 
         try:
             # Process parts in bounded batches to prevent OOM with huge objects

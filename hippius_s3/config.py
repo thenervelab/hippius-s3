@@ -428,8 +428,17 @@ class Config:
     # concurrency 8 (~8× the ~40 obj/s serial rate measured on prod) and a 240s budget, one shard
     # is ~44k objects → comfortably inside budget; a full sweep is ~64 cycles (~10h at the 600s
     # normal sleep). Raise it if the cache grows or the walk logs truncated=True; 1 = walk the
-    # whole tree every cycle. Forced to 1 under disk pressure so eviction sees the whole tree.
+    # whole tree every cycle. Forced to 1 under CRITICAL disk pressure so eviction sees the whole
+    # tree in a single unbounded walk.
     janitor_walk_shards: int = env("HIPPIUS_JANITOR_WALK_SHARDS:64", convert=int)
+    # Under ELEVATED pressure keep rotating a small number of shards instead of collapsing to a
+    # single head-restarting whole-tree walk (the 480s budget truncates a 15.6M-entry readdir long
+    # before the tail; with shards=1 the tail is never reached). CRITICAL still forces shards=1 +
+    # unbounded budget — freeing space beats coverage fairness there.
+    janitor_elevated_walk_shards: int = env("HIPPIUS_JANITOR_ELEVATED_WALK_SHARDS:8", convert=int)
+    # Sleep between cycles while under any disk pressure. 120s of a ~600s cycle was dead time
+    # exactly when eviction throughput mattered most.
+    janitor_pressure_sleep_seconds: int = env("HIPPIUS_JANITOR_PRESSURE_SLEEP_SECONDS:15", convert=int)
     # Pool-fullness gate for the janitor's disk-pressure probe. _pressure_mode reads statvfs on the
     # cache mount, which sees the CephFS *PVC quota* — NOT the backing pool. On 2026-07-24 statvfs
     # read 69% while ceph-filesystem-data0 sat at 94%, so the janitor stayed in Normal mode (10min
@@ -448,6 +457,15 @@ class Config:
     # an index-probe over this many candidates; keep it bounded so a large
     # backlog drains gradually instead of in one DELETE-cascade burst.
     janitor_hard_delete_batch: int = env("HIPPIUS_JANITOR_HARD_DELETE_BATCH:30000", convert=int)
+    # SQL discovery phase: candidate rows fetched per keyset page, and the per-cycle delete
+    # budget (0 disables the phase entirely — the runtime kill switch for prod rollback).
+    janitor_sql_page_size: int = env("HIPPIUS_JANITOR_SQL_PAGE_SIZE:1000", convert=int)
+    janitor_sql_max_deletes_per_cycle: int = env("HIPPIUS_JANITOR_SQL_MAX_DELETES_PER_CYCLE:50000", convert=int)
+    # Per-page asyncpg query timeout for candidate discovery. A sparse ring (a head of young/hot/
+    # under-replicated rows) can make one keyset page scan the whole inventory before it fills, so
+    # this bounds per-page scan volume: a timeout ENDS discovery this cycle with the cursor left at
+    # the last completed page, and the next cycle resumes from that spot.
+    janitor_sql_query_timeout_seconds: float = env("HIPPIUS_JANITOR_SQL_QUERY_TIMEOUT_SECONDS:30", convert=float)
 
     # Filesystem cache disk-pressure backoff (ingress control).
     # Threshold can be expressed as either absolute bytes or ratio; we trigger if ANY threshold is hit.

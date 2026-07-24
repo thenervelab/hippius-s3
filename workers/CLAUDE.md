@@ -39,7 +39,7 @@ The **DB-only durability phases run FIRST**, before the FS walks — the replica
 
 The FS-walk phases are **parallel, sharded, and budgeted** so a cycle always completes:
 - `iter_part_dirs` fans the per-object descent across a thread pool (`HIPPIUS_JANITOR_WALK_CONCURRENCY`, default 8) so many CephFS metadata roundtrips are in flight at once — the single-threaded event-loop walk was the bottleneck, not the DB (per-part queries are 0.1–0.7ms, indexed).
-- Each cycle covers one hash-shard (`HIPPIUS_JANITOR_WALK_SHARDS`, default 64) of the tree; a full sweep takes `shards` cycles. Under disk pressure `shards=1` (whole tree every cycle).
+- Each cycle covers one hash-shard (`HIPPIUS_JANITOR_WALK_SHARDS`, default 64) of the tree; a full sweep takes `shards` cycles. Under ELEVATED pressure a smaller rotation (`HIPPIUS_JANITOR_ELEVATED_WALK_SHARDS`, default 8) keeps the budget-truncated walk from restarting at the same readdir head every cycle; CRITICAL forces `shards=1` (whole tree every cycle).
 - Each walk phase stops at `HIPPIUS_JANITOR_WALK_BUDGET_SECONDS` (default 240s); **lifted to unbounded under CRITICAL pressure** so freeing space is never capped by a clock.
 
 ### Cleanup passes
