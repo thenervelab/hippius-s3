@@ -1722,9 +1722,14 @@ async def cleanup_parts_unified(
             if not backfill_batch:
                 return
             # The producer holds no pooled connection of its own, so acquire one per flush.
-            # record_cached_batch swallows its own errors — a backfill write never disrupts the walk.
-            async with pool.acquire() as conn:
-                await fs_cache_inventory.record_cached_batch(conn, backfill_batch)
+            # Best-effort end to end: record_cached_batch swallows its own errors, and the acquire
+            # is wrapped too — a pool failure here would otherwise escape the candidates() generator
+            # and abort the whole walk for an advisory write (next sweep backfills what was lost).
+            try:
+                async with pool.acquire() as conn:
+                    await fs_cache_inventory.record_cached_batch(conn, backfill_batch)
+            except Exception as e:
+                logger.warning(f"Inventory backfill flush failed (next sweep re-covers): {e}")
             backfill_batch = []
 
         async for part in iter_part_dirs(
