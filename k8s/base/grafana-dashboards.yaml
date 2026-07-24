@@ -28,6 +28,164 @@ data:
       "links": [],
       "panels": [
         {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 8,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "reqps"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "2xx"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "fixedColor": "green",
+                      "mode": "fixed"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "3xx"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "fixedColor": "#EAB839",
+                      "mode": "fixed"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "4xx"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "fixedColor": "orange",
+                      "mode": "fixed"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "5xx"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "fixedColor": "red",
+                      "mode": "fixed"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 1
+          },
+          "id": 96,
+          "options": {
+            "legend": {
+              "calcs": [
+                "last",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "12.3.1",
+          "targets": [
+            {
+              "expr": "sum by (class) (label_replace(rate(http_requests_total{service_namespace=\"$namespace\", handler=~\"gateway.*\"}[5m]), \"class\", \"${1}xx\", \"status_code\", \"([0-9])[0-9][0-9]\"))",
+              "legendFormat": "{{class}}",
+              "refId": "A"
+            }
+          ],
+          "title": "Gateway Type/s",
+          "type": "timeseries",
+          "description": "Gateway request rate collapsed into HTTP status classes (2xx/3xx/4xx/5xx), one line each. Individual status codes are in \"Gateway req/s\" below; this is the at-a-glance health shape."
+        },
+        {
           "collapsed": false,
           "gridPos": {
             "h": 1,
@@ -106,7 +264,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 0,
-            "y": 1
+            "y": 9
           },
           "id": 2,
           "options": {
@@ -199,7 +357,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 6,
-            "y": 1
+            "y": 9
           },
           "id": 3,
           "options": {
@@ -292,7 +450,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 12,
-            "y": 1
+            "y": 9
           },
           "id": 4,
           "options": {
@@ -390,7 +548,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 18,
-            "y": 1
+            "y": 9
           },
           "id": 5,
           "options": {
@@ -483,7 +641,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 0,
-            "y": 9
+            "y": 17
           },
           "id": 6,
           "options": {
@@ -581,7 +739,7 @@ data:
             "h": 8,
             "w": 8,
             "x": 6,
-            "y": 9
+            "y": 17
           },
           "id": 82,
           "options": {
@@ -674,7 +832,7 @@ data:
             "h": 8,
             "w": 7,
             "x": 14,
-            "y": 9
+            "y": 17
           },
           "id": 81,
           "options": {
@@ -768,7 +926,7 @@ data:
             "h": 8,
             "w": 3,
             "x": 21,
-            "y": 9
+            "y": 17
           },
           "id": 83,
           "options": {
@@ -810,7 +968,7 @@ data:
             "h": 1,
             "w": 24,
             "x": 0,
-            "y": 17
+            "y": 25
           },
           "id": 80,
           "panels": [],
@@ -823,7 +981,7 @@ data:
             "h": 1,
             "w": 24,
             "x": 0,
-            "y": 18
+            "y": 26
           },
           "id": 10,
           "panels": [],
@@ -896,7 +1054,7 @@ data:
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 19
+            "y": 27
           },
           "id": 11,
           "options": {
@@ -932,7 +1090,7 @@ data:
             "h": 1,
             "w": 24,
             "x": 0,
-            "y": 27
+            "y": 35
           },
           "id": 20,
           "panels": [],
@@ -1005,7 +1163,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 0,
-            "y": 28
+            "y": 36
           },
           "id": 21,
           "options": {
@@ -1098,7 +1256,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 6,
-            "y": 28
+            "y": 36
           },
           "id": 22,
           "options": {
@@ -1191,7 +1349,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 12,
-            "y": 28
+            "y": 36
           },
           "id": 23,
           "options": {
@@ -1284,7 +1442,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 18,
-            "y": 28
+            "y": 36
           },
           "id": 24,
           "options": {
@@ -1317,7 +1475,7 @@ data:
             "h": 1,
             "w": 24,
             "x": 0,
-            "y": 36
+            "y": 44
           },
           "id": 30,
           "panels": [],
@@ -1390,7 +1548,7 @@ data:
             "h": 8,
             "w": 8,
             "x": 0,
-            "y": 37
+            "y": 45
           },
           "id": 31,
           "options": {
@@ -1483,7 +1641,7 @@ data:
             "h": 8,
             "w": 8,
             "x": 8,
-            "y": 37
+            "y": 45
           },
           "id": 32,
           "options": {
@@ -1576,7 +1734,7 @@ data:
             "h": 8,
             "w": 8,
             "x": 16,
-            "y": 37
+            "y": 45
           },
           "id": 33,
           "options": {
@@ -1609,7 +1767,7 @@ data:
             "h": 1,
             "w": 24,
             "x": 0,
-            "y": 45
+            "y": 53
           },
           "id": 40,
           "panels": [],
@@ -1682,7 +1840,7 @@ data:
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 46
+            "y": 54
           },
           "id": 41,
           "options": {
@@ -1775,7 +1933,7 @@ data:
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 46
+            "y": 54
           },
           "id": 42,
           "options": {
@@ -1808,7 +1966,7 @@ data:
             "h": 1,
             "w": 24,
             "x": 0,
-            "y": 54
+            "y": 62
           },
           "id": 50,
           "panels": [],
@@ -1881,7 +2039,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 0,
-            "y": 55
+            "y": 63
           },
           "id": 51,
           "options": {
@@ -1978,13 +2136,37 @@ data:
               },
               "unit": "bytes"
             },
-            "overrides": []
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "fill %"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "percent"
+                  },
+                  {
+                    "id": "custom.axisPlacement",
+                    "value": "right"
+                  },
+                  {
+                    "id": "color",
+                    "value": {
+                      "fixedColor": "orange",
+                      "mode": "fixed"
+                    }
+                  }
+                ]
+              }
+            ]
           },
           "gridPos": {
             "h": 8,
             "w": 6,
             "x": 6,
-            "y": 55
+            "y": 63
           },
           "id": 52,
           "options": {
@@ -2009,12 +2191,18 @@ data:
             },
             {
               "expr": "max(redis_memory_max_bytes{service_namespace=\"$namespace\"})",
-              "legendFormat": "max",
+              "legendFormat": "maxmemory (cap)",
               "refId": "B"
+            },
+            {
+              "expr": "max(avg_over_time(redis_memory_used_bytes{service_namespace=\"$namespace\"}[2m])) / max(redis_memory_max_bytes{service_namespace=\"$namespace\"} > 0) * 100",
+              "legendFormat": "fill %",
+              "refId": "C"
             }
           ],
-          "title": "Redis memory",
-          "type": "timeseries"
+          "title": "Redis memory (redis-queues cluster)",
+          "type": "timeseries",
+          "description": "Memory of the redis-queues CLUSTER (noeviction) \u2014 the instance that carries the upload LPUSH, chunk pub/sub and cephor:* coordination keys; when it fills, every write fails. Emitted by the app collector, which sums used_memory/maxmemory across all cluster primaries (a RedisCluster INFO returns one dict per node). max() de-dupes the identical value each pod reports; pods that cannot reach the cluster report 0 and are ignored by max()."
         },
         {
           "datasource": {
@@ -2054,7 +2242,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 12,
-            "y": 55
+            "y": 63
           },
           "id": 53,
           "options": {
@@ -2080,8 +2268,9 @@ data:
               "refId": "A"
             }
           ],
-          "title": "Cache disk usage",
-          "type": "gauge"
+          "title": "Cache disk usage (PVC quota)",
+          "type": "gauge",
+          "description": "statvfs on the cache mount = the CephFS PVC QUOTA, not the backing pool. Compare with \"Ceph pool usage (data0)\" to the right \u2014 they diverge sharply when the pool fills ahead of the quota (the 2026-07-24 blind spot)."
         },
         {
           "datasource": {
@@ -2118,8 +2307,8 @@ data:
           "gridPos": {
             "h": 8,
             "w": 6,
-            "x": 18,
-            "y": 55
+            "x": 0,
+            "y": 71
           },
           "id": 54,
           "options": {
@@ -2148,7 +2337,8 @@ data:
             }
           ],
           "title": "Cache parts on disk",
-          "type": "stat"
+          "type": "stat",
+          "description": "Parts on disk across the whole cache tree. CENSUS METRIC \u2014 only published after a FULL, untruncated janitor sweep. On prod the FS walk hits its wall-clock budget every cycle (truncated=True), so the gauge never gets a complete sweep and holds its initial 0 (\"Census sweep truncated by walk budget - holding last complete census\" in the janitor log). Staging, whose tree fits in the budget, reports real values. Reads as \"empty cache\", not \"unknown\" \u2014 the janitor should publish a partial census instead (tracked separately)."
         },
         {
           "collapsed": false,
@@ -2156,7 +2346,7 @@ data:
             "h": 1,
             "w": 24,
             "x": 0,
-            "y": 63
+            "y": 71
           },
           "id": 60,
           "panels": [],
@@ -2235,7 +2425,7 @@ data:
             "h": 8,
             "w": 8,
             "x": 0,
-            "y": 64
+            "y": 72
           },
           "id": 61,
           "options": {
@@ -2422,7 +2612,7 @@ data:
             "h": 8,
             "w": 8,
             "x": 8,
-            "y": 64
+            "y": 72
           },
           "id": 62,
           "options": {
@@ -2447,7 +2637,8 @@ data:
             }
           ],
           "title": "Cache age distribution",
-          "type": "timeseries"
+          "type": "timeseries",
+          "description": "Parts bucketed by age. CENSUS METRIC \u2014 only published after a FULL, untruncated janitor sweep. On prod the FS walk hits its wall-clock budget every cycle (truncated=True), so the gauge never gets a complete sweep and holds its initial 0 (\"Census sweep truncated by walk budget - holding last complete census\" in the janitor log). Staging, whose tree fits in the budget, reports real values. Reads as \"empty cache\", not \"unknown\" \u2014 the janitor should publish a partial census instead (tracked separately)."
         },
         {
           "datasource": {
@@ -2515,7 +2706,7 @@ data:
             "h": 8,
             "w": 4,
             "x": 16,
-            "y": 64
+            "y": 72
           },
           "id": 63,
           "options": {
@@ -2608,13 +2799,16 @@ data:
             "h": 8,
             "w": 4,
             "x": 20,
-            "y": 64
+            "y": 72
           },
           "id": 64,
           "options": {
             "legend": {
-              "calcs": [],
-              "displayMode": "list",
+              "calcs": [
+                "last",
+                "max"
+              ],
+              "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
             },
@@ -2627,13 +2821,14 @@ data:
           "pluginVersion": "12.3.1",
           "targets": [
             {
-              "expr": "sum(rate(fs_janitor_deleted_total{service_namespace=\"$namespace\"}[10m]))",
-              "legendFormat": "GC rate",
+              "expr": "sum by (reason) (rate(fs_janitor_deleted_total{service_namespace=\"$namespace\"}[10m]))",
+              "legendFormat": "{{reason}}",
               "refId": "A"
             }
           ],
-          "title": "GC rate",
-          "type": "timeseries"
+          "title": "Janitor GC rate (parts deleted/s)",
+          "type": "timeseries",
+          "description": "Rate at which the janitor DELETES cache parts from disk, split by reason:\n- gc_age: replication-gated age eviction (part is fully replicated to every required backend, cold i.e. atime outside the hot-retention window, and not DLQ-protected). This is normal cache reclaim.\n- stale_mtime: stale/orphan reap (mtime older than the MPU stale threshold with no live parts row).\n- abandoned: terminally-abandoned upload reclaimed (failed part on an unservable version).\nSustained 0 while the disk is filling means eviction is blocked - usually nothing is replicated yet (the replication gate is absolute) or everything is inside the hot-retention window."
         },
         {
           "collapsed": false,
@@ -2641,7 +2836,7 @@ data:
             "h": 1,
             "w": 24,
             "x": 0,
-            "y": 72
+            "y": 80
           },
           "id": 70,
           "panels": [],
@@ -2720,7 +2915,7 @@ data:
             "h": 8,
             "w": 8,
             "x": 0,
-            "y": 73
+            "y": 81
           },
           "id": 71,
           "options": {
@@ -2832,7 +3027,7 @@ data:
             "h": 8,
             "w": 8,
             "x": 8,
-            "y": 73
+            "y": 81
           },
           "id": 72,
           "options": {
@@ -2899,7 +3094,7 @@ data:
             "h": 8,
             "w": 8,
             "x": 16,
-            "y": 73
+            "y": 81
           },
           "id": 73,
           "options": {
@@ -2936,7 +3131,7 @@ data:
             "h": 1,
             "w": 24,
             "x": 0,
-            "y": 81
+            "y": 89
           },
           "id": 84,
           "panels": [],
@@ -2975,7 +3170,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 0,
-            "y": 82
+            "y": 90
           },
           "id": 85,
           "options": {
@@ -3040,7 +3235,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 6,
-            "y": 82
+            "y": 90
           },
           "id": 86,
           "options": {
@@ -3103,7 +3298,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 12,
-            "y": 82
+            "y": 90
           },
           "id": 87,
           "options": {
@@ -3166,7 +3361,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 18,
-            "y": 82
+            "y": 90
           },
           "id": 88,
           "options": {
@@ -3238,7 +3433,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 0,
-            "y": 90
+            "y": 98
           },
           "id": 89,
           "options": {
@@ -3301,7 +3496,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 6,
-            "y": 90
+            "y": 98
           },
           "id": 90,
           "options": {
@@ -3364,7 +3559,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 12,
-            "y": 90
+            "y": 98
           },
           "id": 91,
           "options": {
@@ -3427,7 +3622,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 18,
-            "y": 90
+            "y": 98
           },
           "id": 92,
           "options": {
@@ -3444,17 +3639,14 @@ data:
           },
           "targets": [
             {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "prometheus"
-              },
-              "expr": "sum(rate(fs_janitor_abandoned_reclaimed_total{service_namespace=\"$namespace\"}[10m]))",
+              "expr": "sum(rate(fs_janitor_deleted_total{service_namespace=\"$namespace\", reason=\"abandoned\"}[10m]))",
               "legendFormat": "reclaimed/s",
               "refId": "A"
             }
           ],
           "title": "Abandoned-part reclaim (janitor)",
-          "type": "timeseries"
+          "type": "timeseries",
+          "description": "Terminally-abandoned parts reclaimed by the janitor. Was querying fs_janitor_abandoned_reclaimed_total, which is not a metric this codebase emits (panel was permanently empty); the real signal is the abandoned reason on fs_janitor_deleted_total."
         },
         {
           "datasource": {
@@ -3490,7 +3682,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 0,
-            "y": 98
+            "y": 106
           },
           "id": 93,
           "options": {
@@ -3553,7 +3745,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 6,
-            "y": 98
+            "y": 106
           },
           "id": 94,
           "options": {
@@ -3616,7 +3808,7 @@ data:
             "h": 8,
             "w": 6,
             "x": 12,
-            "y": 98
+            "y": 106
           },
           "id": 95,
           "options": {
@@ -3644,6 +3836,74 @@ data:
           ],
           "title": "Account cacher \u2014 cycles",
           "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "max": 100,
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 85
+                  },
+                  {
+                    "color": "red",
+                    "value": 95
+                  }
+                ]
+              },
+              "unit": "percent"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 18,
+            "y": 63
+          },
+          "id": 97,
+          "options": {
+            "minVizHeight": 75,
+            "minVizWidth": 75,
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "showThresholdLabels": false,
+            "showThresholdMarkers": true,
+            "sizing": "auto"
+          },
+          "pluginVersion": "12.3.1",
+          "targets": [
+            {
+              "expr": "max(ceph_pool_percent_used * on(pool_id) group_left(name) ceph_pool_metadata{name=\"ceph-filesystem-data0\"}) * 100",
+              "legendFormat": "pool %USED",
+              "refId": "A"
+            }
+          ],
+          "title": "Ceph pool usage (data0)",
+          "type": "gauge",
+          "description": "TRUE fullness of the backing CephFS pool ceph-filesystem-data0, straight from the ceph-mgr exporter. The panel to the left reads statvfs on the cache mount, which only sees the PVC QUOTA \u2014 during the 2026-07-24 incident that read ~69% while this pool was at ~94%. Ceph gates writes on the fullest OSD, so this is the number that matters: >=85% nearfull, >=95% read-only."
         }
       ],
       "preload": false,
