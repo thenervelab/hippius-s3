@@ -1,17 +1,18 @@
-"""Truth table for the janitor's evictable-candidate prefilter, against real Postgres.
+"""Truth table for the janitor's evictable-candidate FILTER, against real Postgres.
 
 `janitor_evictable_candidates.sql` is `find_underreplicated_live_chunks` with its coverage
-predicate FLIPPED: it returns the FULLY-replicated, aged, cache-resident parts the SQL
-discovery phase may consider for eviction (the worker still re-runs the authoritative
-per-part gate before deleting). Getting the flip wrong is a data-loss risk in the making —
-an under-replicated part must never surface here — so the required-set / coverage /
-expected-chunks / age / keyset semantics are pinned against real Postgres.
+predicate FLIPPED: it returns the FULLY-replicated, aged parts that are safe to evict. Since the
+slice-then-filter split, it no longer scans fs_cache_inventory — it filters a GIVEN set of inventory
+tuples (the page produced by `janitor_inventory_slice.sql`, whose own keyset walk is covered in
+test_janitor_inventory_slice.py) passed in as three parallel arrays. Getting the flip wrong is a
+data-loss risk in the making — an under-replicated part must never surface here — so the required-set
+/ coverage / expected-chunks / age semantics are pinned against real Postgres.
 
 Seed data is written via the `pg_tx` fixture (always rolled back); the tables are the real
-migrated schema, so the EXPLAIN test can assert the production indexes are used. Each test
-wipes `fs_cache_inventory` inside its transaction first: because every candidate must be
-present in inventory, that clean slate makes the returned set exactly the rows the test
-seeded, so assertions can be equality rather than membership.
+migrated schema, so the EXPLAIN test can assert the parts index survives the ::uuid cast. Each test
+wipes `fs_cache_inventory` inside its transaction first: the `_candidates` helper builds the filter's
+tuple arrays from whatever inventory is resident, so a clean slate makes the input set exactly the
+rows the test seeded and the returned set an equality (not membership) assertion.
 """
 
 from __future__ import annotations
@@ -34,8 +35,8 @@ _DEFAULT_UPLOAD = ["arion"]  # config.upload_backends fallback for legacy (NULL)
 _MAX_AGE = 900  # age gate window used by the tests
 _AGED = 3600  # parts.uploaded_at this far in the past => past the age gate
 _YOUNG = 0  # uploaded just now => inside the age gate
-# Keyset start sentinel: strictly below every real row (cursor columns are NOT NULL, so the
-# caller must never pass NULL — a NULL element would make the row comparison NULL and drop all).
+# Keyset start sentinel for the slice read the helper does before filtering (strictly below every
+# real row; cursor columns are NOT NULL, so a NULL element would drop every row).
 _CURSOR_START = (datetime.datetime(1970, 1, 1, tzinfo=_UTC), "", 0, 0)
 
 
@@ -136,27 +137,42 @@ async def _seed_candidate(
     return str(oid), 1, 1
 
 
+async def _resident_tuples(conn: asyncpg.Connection) -> tuple[list[str], list[int], list[int]]:
+    """Read every resident inventory tuple (the slice the worker would feed the filter). Tests wipe
+    inventory first, so this is exactly the seeded set — as three parallel arrays for the filter."""
+    rows = await conn.fetch(
+        get_query("janitor_inventory_slice"),
+        100000,
+        _CURSOR_START[0],
+        _CURSOR_START[1],
+        _CURSOR_START[2],
+        _CURSOR_START[3],
+    )
+    return (
+        [r["object_id"] for r in rows],
+        [r["object_version"] for r in rows],
+        [r["part_number"] for r in rows],
+    )
+
+
 async def _candidates(
     conn: asyncpg.Connection,
     *,
     backup: list[str],
     default_upload: list[str] | None = None,
-    limit: int = 1000,
     max_age: int = _MAX_AGE,
     ignore_age: bool = False,
-    cursor: tuple[datetime.datetime, str, int, int] = _CURSOR_START,
 ) -> list[asyncpg.Record]:
+    object_ids, versions, part_numbers = await _resident_tuples(conn)
     return await conn.fetch(
         get_query("janitor_evictable_candidates"),
+        object_ids,
+        versions,
+        part_numbers,
         backup,
         default_upload if default_upload is not None else _DEFAULT_UPLOAD,
-        limit,
         max_age,
         ignore_age,
-        cursor[0],
-        cursor[1],
-        cursor[2],
-        cursor[3],
     )
 
 
@@ -342,76 +358,6 @@ async def test_backup_backend_union_gates_until_backup_rows_exist(pg_tx: asyncpg
     assert _keys(await _candidates(pg_tx, backup=["ovh"])) == {both}
 
 
-# ===================================================== keyset paging
-
-
-async def test_keyset_pagination_walks_all_candidates_disjoint_and_ordered(pg_tx: asyncpg.Connection) -> None:
-    await _fresh_inventory(pg_tx)
-    bucket = await _seed_bucket(pg_tx)
-    base = datetime.datetime(2026, 1, 1, tzinfo=_UTC)
-    seeded: set[tuple[str, int, int]] = set()
-    for i in range(5):
-        cand = await _seed_candidate(
-            pg_tx,
-            bucket,
-            per_chunk_live=[["arion"]],
-            upload_backends=["arion"],
-            cached_at=base + datetime.timedelta(seconds=i),
-        )
-        seeded.add(cand)
-
-    collected: list[tuple[str, int, int]] = []
-    cursor = _CURSOR_START
-    pages = 0
-    while True:
-        rows = await _candidates(pg_tx, backup=[], limit=2, cursor=cursor)
-        pages += 1
-        if not rows:
-            break
-        for r in rows:
-            collected.append((r["object_id"], r["object_version"], r["part_number"]))
-        last = rows[-1]
-        cursor = (last["cached_at"], last["object_id"], last["object_version"], last["part_number"])
-        if len(rows) < 2:
-            break
-
-    # Ordered by cached_at, disjoint (no dupes), and complete.
-    ordered_cached_at = []
-    for oid, ov, pn in collected:
-        ordered_cached_at.append(
-            await pg_tx.fetchval(
-                "SELECT cached_at FROM fs_cache_inventory WHERE object_id = $1 AND object_version = $2"
-                " AND part_number = $3",
-                oid,
-                ov,
-                pn,
-            )
-        )
-    assert ordered_cached_at == sorted(ordered_cached_at), "pages walk oldest-first"
-    assert len(collected) == len(set(collected)) == 5, "every candidate seen exactly once"
-    assert set(collected) == seeded
-    assert pages == 3, "5 rows at LIMIT 2 => pages of 2, 2, 1 (the short last page terminates)"
-
-
-async def test_keyset_short_final_page_terminates(pg_tx: asyncpg.Connection) -> None:
-    await _fresh_inventory(pg_tx)
-    bucket = await _seed_bucket(pg_tx)
-    base = datetime.datetime(2026, 2, 1, tzinfo=_UTC)
-    for i in range(2):
-        await _seed_candidate(
-            pg_tx,
-            bucket,
-            per_chunk_live=[["arion"]],
-            upload_backends=["arion"],
-            cached_at=base + datetime.timedelta(seconds=i),
-        )
-    page1 = await _candidates(pg_tx, backup=[], limit=5)
-    assert len(page1) == 2  # short page (< limit) => end of ring, no second page needed
-    last = page1[-1]
-    cursor = (last["cached_at"], last["object_id"], last["object_version"], last["part_number"])
-    assert await _candidates(pg_tx, backup=[], limit=5, cursor=cursor) == []
-
-
 # ===================================================== plan shape (index usage)
 
 
@@ -422,38 +368,43 @@ def _walk_plan(node: dict[str, Any]) -> list[dict[str, Any]]:
     return nodes
 
 
-async def test_explain_uses_inventory_index_and_keeps_parts_indexed(pg_tx: asyncpg.Connection) -> None:
+async def test_explain_keeps_parts_indexed_off_the_slice_arrays(pg_tx: asyncpg.Connection) -> None:
     await _fresh_inventory(pg_tx)
     bucket = await _seed_bucket(pg_tx)
     for _ in range(3):
         await _seed_candidate(pg_tx, bucket, per_chunk_live=[["arion"]], upload_backends=["arion"])
+    object_ids, versions, part_numbers = await _resident_tuples(pg_tx)
 
-    # The test DB is tiny, so without this the planner would seq-scan everything regardless of
-    # index shape. Forcing seqscan off proves the query CAN be served by indexes: fs_cache_inventory
-    # via its cached_at index, and parts via idx_parts_object_id — the latter only reachable because
-    # the ::uuid cast is on the inventory side, not on parts.object_id.
+    # The filter no longer touches fs_cache_inventory (it unnests the given arrays); the load-bearing
+    # property is that the join into parts still drives off an object_id-leading index rather than a
+    # seq scan. The test DB is tiny, so force seqscan off to prove the query CAN be served by an index
+    # — reachable only because the ::uuid cast is on the slice side (s.oid::uuid), keeping
+    # parts.object_id a bare indexed column. Casting parts.object_id::text would defeat every parts
+    # index and force a seq scan.
     await pg_tx.execute("SET LOCAL enable_seqscan = off")
     rows = await pg_tx.fetch(
         "EXPLAIN (FORMAT JSON) " + get_query("janitor_evictable_candidates"),
+        object_ids,
+        versions,
+        part_numbers,
         [],
         _DEFAULT_UPLOAD,
-        1000,
         _MAX_AGE,
         False,
-        _CURSOR_START[0],
-        _CURSOR_START[1],
-        _CURSOR_START[2],
-        _CURSOR_START[3],
     )
     raw = rows[0][0]
     plan = json.loads(raw) if isinstance(raw, str) else raw
     nodes = _walk_plan(plan[0]["Plan"])
 
     seq_scans = {n.get("Relation Name") for n in nodes if n.get("Node Type") == "Seq Scan"}
-    assert "fs_cache_inventory" not in seq_scans, f"inventory seq-scanned: {nodes}"
     assert "parts" not in seq_scans, f"parts seq-scanned (cast defeated its index): {nodes}"
 
-    # fs_cache_inventory is reached through its cached_at index (a Bitmap Index Scan carries the
-    # Index Name; its parent Bitmap Heap Scan carries the Relation Name — either node form counts).
-    used_indexes = {n.get("Index Name") for n in nodes if n.get("Index Name")}
-    assert "fs_cache_inventory_cached_at" in used_indexes, f"cached_at index not used: {nodes}"
+    # parts is reached by an Index Scan whose Index Cond carries the slice-side cast — proof the cast
+    # direction kept parts.object_id indexable (the planner picks whichever object_id-leading index,
+    # e.g. idx_parts_object_id / idx_parts_object_version; the name is not load-bearing, the cast is).
+    parts_scans = [n for n in nodes if n.get("Relation Name") == "parts"]
+    assert parts_scans, f"parts not scanned at all: {nodes}"
+    assert all(n.get("Node Type") == "Index Scan" for n in parts_scans), f"parts not index-scanned: {nodes}"
+    assert all("(s.oid)::uuid" in n.get("Index Cond", "") for n in parts_scans), (
+        f"parts index probe is not driven by the slice-side ::uuid cast: {parts_scans}"
+    )

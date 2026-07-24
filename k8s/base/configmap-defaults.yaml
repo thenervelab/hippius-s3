@@ -50,9 +50,10 @@ data:
   # exactly when eviction throughput matters most.
   HIPPIUS_JANITOR_ELEVATED_WALK_SHARDS: "8"
   HIPPIUS_JANITOR_PRESSURE_SLEEP_SECONDS: "15"
-  # SQL-driven eviction discovery: candidate rows per keyset page, and the per-cycle delete
-  # budget. Set the budget to 0 to disable the phase without a deploy (prod rollback kill switch);
-  # the unified walk remains the full eviction engine when it is off.
+  # SQL-driven eviction discovery: inventory ROWS SCANNED per keyset page (the slice window that is
+  # then filtered for evictability — not the candidate count), and the per-cycle delete budget. Set
+  # the budget to 0 to disable the phase without a deploy (prod rollback kill switch); the unified
+  # walk remains the full eviction engine when it is off.
   HIPPIUS_JANITOR_SQL_PAGE_SIZE: "1000"
   HIPPIUS_JANITOR_SQL_MAX_DELETES_PER_CYCLE: "50000"
   # Per-page discovery query timeout. A sparse ring can make one keyset page scan the whole
