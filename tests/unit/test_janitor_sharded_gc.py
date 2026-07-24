@@ -287,12 +287,36 @@ async def test_durability_phases_run_before_fs_walks(monkeypatch):
     assert order.index("aged_orphans") < first_fs, f"aged-orphan gauge must run before the FS walk; got {order}"
 
 
+@pytest.mark.parametrize(
+    ("pressure", "expected_attr"),
+    [
+        (0, "janitor_walk_shards"),
+        (1, "janitor_elevated_walk_shards"),
+        (2, None),  # CRITICAL collapses to a single whole-tree walk
+    ],
+)
+def test_shards_for_pressure_selects_per_pressure_level(pressure: int, expected_attr: str | None):
+    """NORMAL keeps the fair sharded sweep; ELEVATED keeps rotating a small shard count so the
+    budget-truncated walk still reaches the tail of the tree across cycles; CRITICAL collapses to
+    shards=1 (whole tree, unbounded budget) because freeing space beats coverage fairness."""
+    expected = 1 if expected_attr is None else max(1, getattr(janitor.config, expected_attr))
+    assert janitor._shards_for_pressure(pressure) == expected
+
+
+def test_shards_for_pressure_never_returns_below_one(monkeypatch):
+    monkeypatch.setattr(janitor.config, "janitor_walk_shards", 0)
+    monkeypatch.setattr(janitor.config, "janitor_elevated_walk_shards", 0)
+    assert janitor._shards_for_pressure(0) == 1
+    assert janitor._shards_for_pressure(1) == 1
+    assert janitor._shards_for_pressure(2) == 1
+
+
 @pytest.mark.asyncio
 async def test_disk_pressure_collapses_the_walk_to_a_single_whole_tree_shard(monkeypatch):
-    """Safety rule (config.janitor_walk_shards): under ANY disk pressure the janitor must collapse
-    sharding to shards=1 so ONE cycle walks the WHOLE tree and eviction sees every deletable part —
-    never a 1/Nth slice while the disk fills. A regression that kept the normal shard count under
-    pressure would silently slow eviction exactly when it matters most; pin it here."""
+    """Safety rule: under CRITICAL pressure the janitor must collapse sharding to shards=1 so ONE
+    cycle walks the WHOLE tree and eviction sees every deletable part. ELEVATED keeps rotating
+    `janitor_elevated_walk_shards` — collapsing to 1 there starved the tail of a ~15.6M-entry
+    readdir because the 480s budget truncates the walk long before the end. Pin both here."""
 
     async def _shards_passed_at_pressure(pressure: int) -> dict:
         captured: dict = {}
@@ -324,10 +348,16 @@ async def test_disk_pressure_collapses_the_walk_to_a_single_whole_tree_shard(mon
             await janitor.run_janitor_loop()
         return captured
 
-    # Elevated (1) AND critical (2) both force the whole-tree single-shard walk.
-    for pressure in (1, 2):
-        captured = await _shards_passed_at_pressure(pressure)
-        assert captured["unified"] == 1, f"pressure={pressure} must force shards=1 (unified walk), got {captured}"
+    # Critical (2) forces the whole-tree single-shard walk.
+    critical = await _shards_passed_at_pressure(2)
+    assert critical["unified"] == 1, f"critical pressure must force shards=1 (unified walk), got {critical}"
+
+    # Elevated (1) keeps rotating the small elevated shard count so the tail is eventually reached.
+    elevated = await _shards_passed_at_pressure(1)
+    expected_elevated = max(1, janitor.config.janitor_elevated_walk_shards)
+    assert elevated["unified"] == expected_elevated, (
+        f"elevated pressure must use janitor_elevated_walk_shards, got {elevated}"
+    )
 
     # Normal pressure keeps the configured sharded sweep.
     normal = await _shards_passed_at_pressure(0)

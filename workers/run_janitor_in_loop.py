@@ -596,6 +596,18 @@ def _walk_deadline(loop: asyncio.AbstractEventLoop, pressure: int, budget: int) 
     return loop.time() + budget
 
 
+def _shards_for_pressure(pressure: int) -> int:
+    """How many hash-shards the walk rotates through at this pressure level. CRITICAL collapses
+    to a single whole-tree walk (paired with the unbounded budget above). ELEVATED keeps rotating
+    a small shard count — collapsing to 1 there made every budget-truncated cycle re-walk the same
+    readdir head and starve the tail of the tree. NORMAL keeps the full fair sweep."""
+    if pressure >= 2:
+        return 1
+    if pressure == 1:
+        return max(1, config.janitor_elevated_walk_shards)
+    return max(1, config.janitor_walk_shards)
+
+
 def _reset_census_accum() -> None:
     global _census_accum, _census_accum_complete
     _census_accum = {
@@ -1872,7 +1884,7 @@ async def run_janitor_loop():
 
     # Sleep intervals: shorter under disk pressure to catch up
     sleep_normal = 600  # 10m
-    sleep_pressure = 120  # 2m
+    sleep_pressure = max(1, config.janitor_pressure_sleep_seconds)
 
     global _walk_shard, _janitor_phase, _janitor_last_cycle_completed_at, _janitor_cycle_seconds
     loop = asyncio.get_running_loop()
@@ -1911,9 +1923,10 @@ async def run_janitor_loop():
 
             # --- FS-walk phases: sharded + budgeted so the cycle ALWAYS completes -------------
             # Each cycle covers one hash-shard of the tree; a full sweep takes `shards` cycles.
-            # Under disk pressure we walk the whole tree every cycle (shards=1) and, at CRITICAL,
-            # lift the wall-clock budget entirely — freeing space must never be capped by a clock.
-            shards = 1 if pressure > 0 else max(1, config.janitor_walk_shards)
+            # ELEVATED pressure rotates a smaller shard count (see _shards_for_pressure); CRITICAL
+            # walks the whole tree with the wall-clock budget lifted entirely — freeing space must
+            # never be capped by a clock.
+            shards = _shards_for_pressure(pressure)
             walk_shard = _walk_shard % shards
             publish_sweep = walk_shard == shards - 1  # census publishes when the sweep wraps
             walk_conc = max(1, config.janitor_walk_concurrency)
