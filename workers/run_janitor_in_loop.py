@@ -1020,7 +1020,9 @@ async def cleanup_stale_parts(
                 if _janitor_deleted_counter is not None:
                     _janitor_deleted_counter.add(1, attributes={"reason": "abandoned"})
             else:
-                logger.info(f"Cleaned stale part by mtime: object_id={object_id} v={object_version} part={part_number}")
+                logger.debug(
+                    f"Cleaned stale part by mtime: object_id={object_id} v={object_version} part={part_number}"
+                )
                 if _janitor_deleted_counter is not None:
                     _janitor_deleted_counter.add(1, attributes={"reason": "stale_mtime"})
             return True
@@ -1498,7 +1500,7 @@ async def cleanup_old_parts_by_mtime(
 
         try:
             await fs_store.delete_part(object_id, object_version, part_number)
-            logger.info(
+            logger.debug(
                 f"GC cleaned part: object_id={object_id} v={object_version} part={part_number} "
                 f"replicated=True pressure={pressure} {old_enough=}"
             )
@@ -1724,7 +1726,7 @@ async def cleanup_parts_unified(
                     if _janitor_deleted_counter is not None:
                         _janitor_deleted_counter.add(1, attributes={"reason": "abandoned"})
                 else:
-                    logger.info(
+                    logger.debug(
                         f"Cleaned stale part by mtime: object_id={item.object_id} "
                         f"v={item.object_version} part={item.part_number}"
                     )
@@ -1754,7 +1756,7 @@ async def cleanup_parts_unified(
                     f"v={item.object_version} part={item.part_number}: {e}"
                 )
                 return False
-            logger.info(
+            logger.debug(
                 f"GC cleaned part: object_id={item.object_id} v={item.object_version} part={item.part_number} "
                 f"replicated=True pressure={pressure} old_enough={item.gc_old_enough}"
             )
