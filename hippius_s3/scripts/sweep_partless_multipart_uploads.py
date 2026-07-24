@@ -84,7 +84,16 @@ WHERE COALESCE(mu.is_completed, false) = false
   AND NOT EXISTS (SELECT 1 FROM parts p WHERE p.upload_id = mu.upload_id)
 """
 
-DELETE_SQL = "DELETE FROM multipart_uploads WHERE upload_id = ANY($1::uuid[])"
+# Re-assert the partless guard AT DELETE TIME (not just in the SELECT above): a client can upload
+# a part to a 48h-old MPU between the SELECT and this DELETE, and `parts.upload_id ON DELETE CASCADE`
+# would then silently cascade-delete that fresh part (UploadPart already returned 200 →
+# CompleteMultipartUpload later fails confusingly). The NOT EXISTS makes the delete a no-op for any
+# upload that grew a part in the meantime — closing the TOCTOU window.
+DELETE_SQL = """
+DELETE FROM multipart_uploads
+WHERE upload_id = ANY($1::uuid[])
+  AND NOT EXISTS (SELECT 1 FROM parts p WHERE p.upload_id = multipart_uploads.upload_id)
+"""
 
 
 async def _dlq_protected_ids(config) -> set[str]:  # noqa: ANN001
