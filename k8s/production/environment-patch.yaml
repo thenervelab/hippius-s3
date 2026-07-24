@@ -13,3 +13,21 @@ data:
   # in the same change as a 396-commit cutover — it is rollback-without-redeploy, so enable it
   # as a separate change AFTER the cutover has soaked.
   HIPPIUS_STREAM_SINGLE_SUBSCRIPTION: "false"
+  # SAFETY-CRITICAL — the janitor's absolute replication gate. Do not remove.
+  #
+  # is_replicated_on_all_backends() unions this into the required-backend set before ANY
+  # eviction, so this is what makes "replicated to BOTH arion and ovh" the condition for
+  # deleting a cached part. Legacy object_versions rows whose `upload_backends` column says
+  # only ['arion'] are covered by ovh ONLY because of this value.
+  #
+  # It has to be declared here because config.py defaults it to EMPTY
+  # (`env("HIPPIUS_BACKUP_BACKENDS:")`). Until 2026-07-25 it existed solely as a live
+  # `kubectl set env` override on the prod janitor and appeared nowhere in git — one
+  # server-side apply, `kubectl replace`, deployment recreate, or "reconcile to the manifest"
+  # would have silently dropped ovh from the gate and made every arion-only chunk instantly
+  # evictable (>=500 live chunks were in exactly that state when this was found).
+  #
+  # PRODUCTION-ONLY on purpose: staging does not replicate to ovh, so requiring ovh coverage
+  # there would make nothing ever evictable and wedge its janitor. Read only by the janitor
+  # (gate + replication sentinel + SQL eviction) — no other component consumes it.
+  HIPPIUS_BACKUP_BACKENDS: "ovh"
