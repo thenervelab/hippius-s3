@@ -29,6 +29,7 @@ import os
 import shutil
 import sys
 import time
+import uuid
 import zlib
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
@@ -93,6 +94,10 @@ TMP_FILE_MAX_AGE_SECONDS = 1800  # 30m
 # Cap on the G2 sentinel scan: it needs only to DETECT a durability gap and sample a few
 # offenders, not enumerate every one, so a bounded page keeps the read-only query cheap.
 SENTINEL_SCAN_LIMIT = 500
+# How many kept-part inventory rows the unified walk buffers before flushing one
+# `record_cached_batch`. A module constant (not a config knob) so tests can shrink it to exercise
+# the flush boundary without a live 500-part tree; there is no operational reason to tune it.
+INVENTORY_BACKFILL_BATCH_SIZE = 500
 # The idle grace before a pending/draining orphan counts toward the aged-orphan gauge is
 # `config.mpu_sweep_grace_seconds` — the SAME window the reaper's orphan sweep
 # (list_orphan_replication_versions.sql) uses. They MUST match: the gauge is only meaningful
@@ -361,6 +366,20 @@ async def _clear_inventory_after_delete(
             part_number,
             exc,
         )
+
+
+def _is_uuid_name(name: str) -> bool:
+    """True iff a walked cache dirname parses as a UUID.
+
+    The walk yields raw directory names, but Task 4.1's eviction query casts
+    `fs_cache_inventory.object_id::uuid` and a single non-UUID row would abort the whole candidate
+    page. So only UUID-shaped dirnames may be backfilled into the inventory.
+    """
+    try:
+        uuid.UUID(name)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
 
 
 def _safe_iterdir(path: Path) -> Iterator[Path]:
@@ -1691,6 +1710,23 @@ async def cleanup_parts_unified(
     walk_state = WalkState()
 
     async def candidates() -> AsyncIterator[_UnifiedCandidate]:
+        # The walk doubles as the inventory backfill/reconciler: every part that SURVIVES all gates
+        # (i.e. will REMAIN on disk) is recorded into fs_cache_inventory, so the first full sweep
+        # after deploy populates the table and later sweeps repair any row a materialization
+        # pipeline (Task 3.1) failed to write. Deletion candidates are deliberately NOT backfilled
+        # here — see the asymmetry note at the survivor branch below.
+        backfill_batch: list[tuple[str, int, int]] = []
+
+        async def _flush_backfill() -> None:
+            nonlocal backfill_batch
+            if not backfill_batch:
+                return
+            # The producer holds no pooled connection of its own, so acquire one per flush.
+            # record_cached_batch swallows its own errors — a backfill write never disrupts the walk.
+            async with pool.acquire() as conn:
+                await fs_cache_inventory.record_cached_batch(conn, backfill_batch)
+            backfill_batch = []
+
         async for part in iter_part_dirs(
             root,
             concurrency=walk_concurrency,
@@ -1731,10 +1767,22 @@ async def cleanup_parts_unified(
                 continue
 
             if not stale_candidate and not gc_candidate:
+                # Survivor: stays on disk this sweep → backfill its inventory row. Only UUID-shaped
+                # dirnames — Task 4.1's eviction query casts object_id::uuid and one non-UUID row
+                # would abort the whole candidate page. A yielded candidate that later survives the
+                # worker's gate re-check (e.g. an under-replicated cold part) is NOT recorded here;
+                # it is re-walked and re-evaluated next sweep, so it only enters the inventory once
+                # it is genuinely at rest — which is fine, since it is not evictable until then.
+                if _is_uuid_name(object_id):
+                    backfill_batch.append((object_id, object_version, part_number))
+                    if len(backfill_batch) >= INVENTORY_BACKFILL_BATCH_SIZE:
+                        await _flush_backfill()
                 continue
             yield _UnifiedCandidate(
                 object_id, object_version, part_number, stale_candidate, gc_candidate, gc_old_enough
             )
+
+        await _flush_backfill()  # final partial batch of kept parts
 
     async def handle(conn: asyncpg.Connection, item: _UnifiedCandidate) -> bool:
         # Evaluate stale-reap FIRST (matches the old serial order: stale phase ran before age-GC,

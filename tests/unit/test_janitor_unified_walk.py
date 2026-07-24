@@ -389,6 +389,29 @@ class _ClearSpy:
             raise RuntimeError("clear boom")
 
 
+class _BatchSpy:
+    """Stand-in for fs_cache_inventory.record_cached_batch: captures each flushed batch (copied,
+    since the producer reuses its buffer) so tests can assert on both the rows and the flush sizes."""
+
+    def __init__(self) -> None:
+        self.batches: list[list[tuple[str, int, int]]] = []
+
+    async def __call__(self, conn, rows) -> None:
+        self.batches.append([(o, int(v), int(p)) for o, v, p in rows])
+
+    @property
+    def rows(self) -> set[tuple[str, int, int]]:
+        return {r for batch in self.batches for r in batch}
+
+
+# Survivors that pass EVERY gate (never yielded as a deletion candidate) with DLQ=(DLQ_PROTECTED,).
+BACKFILLED_SURVIVORS = {(HOT_PROTECTED, 1, 1), (DLQ_PROTECTED, 1, 1), (TMP_SURVIVOR, 1, 1)}
+# Yielded as candidates but survive the worker's gate re-check — the backfill asymmetry: NOT
+# recorded this sweep even though they remain on disk. (PROTECTED_PENDING: stale-eligible but a
+# not-replicated, non-abandoned old row → kept; UNDER_REPLICATED: gc-eligible but replication gate.)
+YIELDED_BUT_KEPT = {(PROTECTED_PENDING, 1, 1), (UNDER_REPLICATED, 1, 1)}
+
+
 @pytest.mark.asyncio
 async def test_unified_clears_inventory_once_per_successful_delete(tmp_path: Path, monkeypatch):
     """Every successful delete (stale-reap AND age-GC branch) clears the inventory row exactly once;
@@ -436,3 +459,76 @@ async def test_unified_clear_failure_after_delete_still_counts_delete(tmp_path: 
     assert set(store.deleted) == EXPECTED_DELETED, "deletes stand even though every clear raised"
     assert res["stale_mtime"] == 1 and res["abandoned"] == 1 and res["gc"] == 1
     assert any("clear failed after eviction" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_unified_backfills_kept_parts_not_deletion_candidates(tmp_path: Path, monkeypatch):
+    """Every survivor that passes all gates is backfilled; no deletion candidate is — neither the
+    parts actually deleted nor the ones yielded-then-kept by the worker's gate re-check."""
+    monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 0)
+    root = tmp_path / "t"
+    _build_catalogue(root)
+    store = _FakeFsStore(root)
+    batch = _BatchSpy()
+    with (
+        patch.object(janitor, "is_replicated_on_all_backends", _fake_replicated),
+        patch.object(janitor, "is_terminally_abandoned", _fake_abandoned),
+        patch.object(janitor.fs_cache_inventory, "record_cached_batch", batch),
+    ):
+        await janitor.cleanup_parts_unified(
+            _FakePool(_FakeConn()), store, _redis((DLQ_PROTECTED,)), pressure=0, shard=0, shards=1, walk_concurrency=4
+        )
+    recorded = batch.rows
+    assert BACKFILLED_SURVIVORS <= recorded, "all gate-passing survivors must be backfilled"
+    assert recorded.isdisjoint(EXPECTED_DELETED), "deleted parts are cleared, never backfilled"
+    assert recorded.isdisjoint(YIELDED_BUT_KEPT), "yielded-then-kept candidates are not backfilled this sweep"
+    assert recorded == BACKFILLED_SURVIVORS
+
+
+@pytest.mark.asyncio
+async def test_unified_backfill_skips_non_uuid_dirname(tmp_path: Path, monkeypatch):
+    """A non-UUID cache dirname must never enter the inventory — Task 4.1's query casts
+    object_id::uuid and one bad row would abort the candidate page — while a UUID sibling does."""
+    monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 0)
+    root = tmp_path / "t"
+    uuid_survivor = f"{0x21:032x}"
+    _make_part(root, uuid_survivor, mtime_ago=10, atime_ago=10)  # recent → survivor
+    _make_part(root, "not-a-uuid-dir", mtime_ago=10, atime_ago=10)  # recent → survivor, bad name
+    store = _FakeFsStore(root)
+    batch = _BatchSpy()
+    with (
+        patch.object(janitor, "is_replicated_on_all_backends", _fake_replicated),
+        patch.object(janitor, "is_terminally_abandoned", _fake_abandoned),
+        patch.object(janitor.fs_cache_inventory, "record_cached_batch", batch),
+    ):
+        await janitor.cleanup_parts_unified(
+            _FakePool(_FakeConn()), store, _redis(), pressure=0, shard=0, shards=1, walk_concurrency=2
+        )
+    recorded = batch.rows
+    assert (uuid_survivor, 1, 1) in recorded
+    assert not any(oid == "not-a-uuid-dir" for oid, _, _ in recorded)
+
+
+@pytest.mark.asyncio
+async def test_unified_backfill_flushes_at_batch_size_boundary(tmp_path: Path, monkeypatch):
+    """The producer flushes every INVENTORY_BACKFILL_BATCH_SIZE kept parts and once more at the end.
+    With the threshold shrunk to 2 and 5 survivors, that is two full flushes plus a final partial."""
+    monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 0)
+    monkeypatch.setattr(janitor, "INVENTORY_BACKFILL_BATCH_SIZE", 2)
+    root = tmp_path / "t"
+    survivors = {f"{(0x30 + i):032x}" for i in range(5)}
+    for oid in survivors:
+        _make_part(root, oid, mtime_ago=10, atime_ago=10)  # recent → survivor
+    store = _FakeFsStore(root)
+    batch = _BatchSpy()
+    with (
+        patch.object(janitor, "is_replicated_on_all_backends", _fake_replicated),
+        patch.object(janitor, "is_terminally_abandoned", _fake_abandoned),
+        patch.object(janitor.fs_cache_inventory, "record_cached_batch", batch),
+    ):
+        await janitor.cleanup_parts_unified(
+            _FakePool(_FakeConn()), store, _redis(), pressure=0, shard=0, shards=1, walk_concurrency=1
+        )
+    assert sorted(len(b) for b in batch.batches) == [1, 2, 2], "flushes at each boundary plus a final partial"
+    assert batch.rows == {(oid, 1, 1) for oid in survivors}
+    assert store.deleted == []
