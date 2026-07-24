@@ -101,16 +101,32 @@ async fn run_with_ceiling_source(coord: &Coordinator, config: &AllocatorConfig, 
     if let Some(url) = config.ceph_mgr_metrics_url.clone() {
         // The decay floor is the AIMD floor: while the probe is blind, the fleet
         // backs off toward the same conservative rate the allocator never drops below.
-        let probe = hippius_drain_allocator::probe::CephProbe::new(
-            url.clone(),
-            config.ceph_ceiling,
-            config.alloc.min_total,
-            config.ceph_thresholds,
-            config.ceph_probe_timeout,
-        )?;
-        tracing::info!(mgr_url = %url, "driving the budget from the live ceph-mgr ceiling probe");
+        let probe = hippius_drain_allocator::probe::CephProbe::new(hippius_drain_allocator::probe::ProbeSettings {
+            url: url.clone(),
+            ceiling_rate: config.ceph_ceiling,
+            nearfull_rate: config.ceph_nearfull_rate,
+            floor: config.alloc.min_total,
+            thresholds: config.ceph_thresholds,
+            timeout: config.ceph_probe_timeout,
+            pools: config.ceph_pools.clone(),
+        })?;
+        tracing::info!(
+            mgr_url = %url,
+            pools = config.ceph_pools.join(","),
+            nearfull_rate_bps = config.ceph_nearfull_rate.get(),
+            "driving the budget from the live ceph-mgr ceiling probe"
+        );
         drive(coord, &probe, config, metrics).await;
         return Ok(());
+    }
+    if !config.ceph_pools.is_empty() {
+        // The pool fullness gate only exists inside the live probe; pools configured
+        // without a mgr URL is the silent no-protection state that caused the
+        // 2026-07-24 incident, so it must be loud.
+        tracing::warn!(
+            pools = config.ceph_pools.join(","),
+            "CEPHOR_CEPH_POOLS is set but CEPHOR_CEPH_MGR_METRICS_URL is not; the pool fullness gate is INACTIVE on the static ceiling"
+        );
     }
     tracing::info!("no ceph mgr url configured; using the static ceiling");
     drive(coord, &config.ceiling(), config, metrics).await;

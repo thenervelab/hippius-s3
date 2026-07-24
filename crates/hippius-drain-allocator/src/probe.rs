@@ -46,38 +46,54 @@ struct ProbeState {
     consecutive_failures: u32,
 }
 
+/// Everything [`CephProbe::new`] needs. A settings struct rather than positional
+/// parameters: the probe's signal set grows (the target pool and the reduced
+/// near-full rate were added after the 2026-07-24 pool-fill incident), and seven
+/// positional arguments of mostly-`ByteRate` types invite transposition bugs.
+#[derive(Debug, Clone)]
+pub struct ProbeSettings {
+    /// The mgr prometheus exporter URL to scrape.
+    pub url: String,
+    /// The open ceiling handed to the allocator when Ceph is healthy.
+    pub ceiling_rate: ByteRate,
+    /// The reduced rate a near-full cluster or pool carries — this must bound the
+    /// drain below any AIMD floor, so it is deliberately not `ceiling_rate`.
+    pub nearfull_rate: ByteRate,
+    /// The conservative rate the fail-safe decays toward while the probe is blind.
+    pub floor: ByteRate,
+    /// The near-full / full watermarks.
+    pub thresholds: CephThresholds,
+    /// Per-scrape HTTP timeout.
+    pub timeout: Duration,
+    /// The pools whose `percent_used` additionally gate the ceiling (the fullest
+    /// one binds). Empty gates on cluster-wide signals only — the pre-incident
+    /// behavior, kept for clusters with no stable pool names.
+    pub pools: Vec<String>,
+}
+
 /// A [`CephCeilingSource`] backed by the Ceph mgr prometheus exporter.
 #[derive(Debug)]
 pub struct CephProbe {
     client: reqwest::Client,
-    url: String,
-    ceiling_rate: ByteRate,
-    floor: ByteRate,
-    thresholds: CephThresholds,
+    settings: ProbeSettings,
     state: Mutex<ProbeState>,
 }
 
 impl CephProbe {
-    /// Builds a probe for the mgr exporter at `url`.
-    ///
-    /// `ceiling_rate` is the open ceiling handed to the allocator when Ceph is
-    /// healthy; `floor` is the conservative rate the fail-safe decays toward while
-    /// the probe is blind; `thresholds` are the near-full / full watermarks.
+    /// Builds a probe for the mgr exporter described by `settings`.
     ///
     /// # Errors
     ///
     /// [`ProbeError::Http`] if the HTTP client cannot be built (e.g. an invalid TLS
     /// or timeout configuration).
-    pub fn new(url: String, ceiling_rate: ByteRate, floor: ByteRate, thresholds: CephThresholds, timeout: Duration) -> Result<Self, ProbeError> {
-        let client = reqwest::Client::builder().timeout(timeout).build()?;
+    pub fn new(settings: ProbeSettings) -> Result<Self, ProbeError> {
+        let client = reqwest::Client::builder().timeout(settings.timeout).build()?;
+        let last_known = CephCeiling::Open(settings.ceiling_rate);
         Ok(Self {
             client,
-            url,
-            ceiling_rate,
-            floor,
-            thresholds,
+            settings,
             state: Mutex::new(ProbeState {
-                last_known: CephCeiling::Open(ceiling_rate),
+                last_known,
                 consecutive_failures: 0,
             }),
         })
@@ -98,13 +114,14 @@ impl CephProbe {
     ///
     /// [`ProbeError`] on transport failure, a non-success status, or unparseable body.
     async fn probe(&self) -> Result<CephReport, ProbeError> {
-        let response = self.client.get(&self.url).send().await?;
+        let response = self.client.get(&self.settings.url).send().await?;
         let status = response.status();
         if !status.is_success() {
             return Err(ProbeError::Status { code: status.as_u16() });
         }
         let body = response.text().await?;
-        Ok(parse_prometheus_metrics(&body)?)
+        let pools: Vec<&str> = self.settings.pools.iter().map(String::as_str).collect();
+        Ok(parse_prometheus_metrics(&body, &pools)?)
     }
 
     /// Locks the state, recovering the guard if a previous holder poisoned it. The
@@ -124,7 +141,12 @@ impl CephCeilingSource for CephProbe {
 
         match self.probe().await {
             Ok(report) => {
-                let ceiling = classify(&report, self.ceiling_rate, &self.thresholds);
+                let ceiling = classify(
+                    &report,
+                    self.settings.ceiling_rate,
+                    self.settings.nearfull_rate,
+                    &self.settings.thresholds,
+                );
                 let mut state = self.lock();
                 state.last_known = ceiling;
                 state.consecutive_failures = 0;
@@ -135,7 +157,7 @@ impl CephCeilingSource for CephProbe {
                 // Decay the last *successful* ceiling by the new failure count — never
                 // the already-decayed value, so the back-off is geometric in failures,
                 // not compounded per tick. `last_known` is deliberately left intact.
-                let ceiling = decay(last_known, failures, self.floor);
+                let ceiling = decay(last_known, failures, self.settings.floor);
                 self.lock().consecutive_failures = failures;
                 tracing::warn!(error = %err, consecutive_failures = failures, ?ceiling, "ceph mgr probe failed; using decayed ceiling");
                 ceiling
@@ -147,7 +169,7 @@ impl CephCeilingSource for CephProbe {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::CephProbe;
+    use super::{CephProbe, ProbeSettings};
     use hippius_drain_core::DiskPressure;
     use hippius_drain_core::{ByteRate, CephCeiling, CephCeilingSource, CephThresholds};
     use std::time::Duration;
@@ -155,6 +177,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const CEILING: ByteRate = ByteRate::new(1_000_000_000);
+    const NEARFULL_RATE: ByteRate = ByteRate::new(10_000_000);
     const FLOOR: ByteRate = ByteRate::new(1_000_000);
 
     /// The trimmed-but-real healthy scrape captured from the live mgr exporter.
@@ -169,8 +192,28 @@ ceph_health_detail{name=\"MON_DISK_LOW\",severity=\"HEALTH_WARN\"} 1.0
         CephThresholds::new(DiskPressure::try_from(8_500).unwrap(), DiskPressure::try_from(9_500).unwrap()).unwrap()
     }
 
+    fn settings(url: String) -> ProbeSettings {
+        ProbeSettings {
+            url,
+            ceiling_rate: CEILING,
+            nearfull_rate: NEARFULL_RATE,
+            floor: FLOOR,
+            thresholds: thresholds(),
+            timeout: Duration::from_secs(2),
+            pools: Vec::new(),
+        }
+    }
+
     fn probe(url: String) -> CephProbe {
-        CephProbe::new(url, CEILING, FLOOR, thresholds(), Duration::from_secs(2)).unwrap()
+        CephProbe::new(settings(url)).unwrap()
+    }
+
+    fn pool_probe(url: String, pools: &[&str]) -> CephProbe {
+        CephProbe::new(ProbeSettings {
+            pools: pools.iter().map(|&p| p.to_owned()).collect(),
+            ..settings(url)
+        })
+        .unwrap()
     }
 
     async fn server_returning(status: u16, body: &str) -> MockServer {
@@ -191,11 +234,69 @@ ceph_health_detail{name=\"MON_DISK_LOW\",severity=\"HEALTH_WARN\"} 1.0
     }
 
     #[tokio::test]
-    async fn an_osd_nearfull_scrape_yields_a_nearfull_ceiling() {
+    async fn an_osd_nearfull_scrape_yields_a_nearfull_ceiling_at_the_reduced_rate() {
         let body = format!("{HEALTHY}ceph_health_detail{{name=\"OSD_NEARFULL\",severity=\"HEALTH_WARN\"}} 1.0\n");
         let server = server_returning(200, &body).await;
         let probe = probe(format!("{}/metrics", server.uri()));
-        assert_eq!(probe.ceiling().await, CephCeiling::NearFull(CEILING));
+        // The reduced rate, not the open ceiling: the ceiling clamp must bound the
+        // drain below any operator-raised AIMD floor (2026-07-24 incident).
+        assert_eq!(probe.ceiling().await, CephCeiling::NearFull(NEARFULL_RATE));
+    }
+
+    #[tokio::test]
+    async fn a_full_target_pool_yields_critical_on_an_otherwise_healthy_scrape() {
+        // The 2026-07-24 incident shape end-to-end: cluster ~27% used, no OSD checks
+        // firing, but the drain's target pool at 98%.
+        let body = format!(
+            "{HEALTHY}\
+ceph_pool_metadata{{pool_id=\"5\",name=\"ceph-filesystem-data0\",type=\"replicated\"}} 1.0\n\
+ceph_pool_percent_used{{pool_id=\"5\"}} 0.98\n"
+        );
+        let server = server_returning(200, &body).await;
+        let probe = pool_probe(format!("{}/metrics", server.uri()), &["ceph-filesystem-data0"]);
+        assert_eq!(probe.ceiling().await, CephCeiling::Critical);
+    }
+
+    #[tokio::test]
+    async fn a_nearfull_target_pool_yields_the_reduced_nearfull_rate() {
+        let body = format!(
+            "{HEALTHY}\
+ceph_pool_metadata{{pool_id=\"5\",name=\"ceph-filesystem-data0\",type=\"replicated\"}} 1.0\n\
+ceph_pool_percent_used{{pool_id=\"5\"}} 0.88\n"
+        );
+        let server = server_returning(200, &body).await;
+        let probe = pool_probe(format!("{}/metrics", server.uri()), &["ceph-filesystem-data0"]);
+        assert_eq!(probe.ceiling().await, CephCeiling::NearFull(NEARFULL_RATE));
+    }
+
+    #[tokio::test]
+    async fn the_fullest_of_several_configured_pools_gates_through_the_probe() {
+        // Both CephFS pools plus the blockpool are configured; the fullest (the
+        // metadata pool here) drives the band even though the others are healthy.
+        let body = format!(
+            "{HEALTHY}\
+ceph_pool_metadata{{pool_id=\"2\",name=\"ceph-blockpool\",type=\"replicated\"}} 1.0\n\
+ceph_pool_metadata{{pool_id=\"3\",name=\"ceph-filesystem-metadata\",type=\"replicated\"}} 1.0\n\
+ceph_pool_metadata{{pool_id=\"5\",name=\"ceph-filesystem-data0\",type=\"replicated\"}} 1.0\n\
+ceph_pool_percent_used{{pool_id=\"2\"}} 0.10\n\
+ceph_pool_percent_used{{pool_id=\"3\"}} 0.97\n\
+ceph_pool_percent_used{{pool_id=\"5\"}} 0.20\n"
+        );
+        let server = server_returning(200, &body).await;
+        let probe = pool_probe(
+            format!("{}/metrics", server.uri()),
+            &["ceph-blockpool", "ceph-filesystem-metadata", "ceph-filesystem-data0"],
+        );
+        assert_eq!(probe.ceiling().await, CephCeiling::Critical);
+    }
+
+    #[tokio::test]
+    async fn a_scrape_missing_the_configured_pool_decays_rather_than_reading_healthy() {
+        // A renamed/deleted target pool must fail safe like any other parse failure.
+        let server = server_returning(200, HEALTHY).await;
+        let probe = pool_probe(format!("{}/metrics", server.uri()), &["ceph-filesystem-data0"]);
+        assert_eq!(probe.ceiling().await, CephCeiling::Open(ByteRate::new(500_000_000)));
+        assert_eq!(probe.consecutive_failures(), 1);
     }
 
     #[tokio::test]
