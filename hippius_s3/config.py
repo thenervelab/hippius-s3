@@ -457,6 +457,15 @@ class Config:
     # an index-probe over this many candidates; keep it bounded so a large
     # backlog drains gradually instead of in one DELETE-cascade burst.
     janitor_hard_delete_batch: int = env("HIPPIUS_JANITOR_HARD_DELETE_BATCH:30000", convert=int)
+    # SQL discovery phase: candidate rows fetched per keyset page, and the per-cycle delete
+    # budget (0 disables the phase entirely — the runtime kill switch for prod rollback).
+    janitor_sql_page_size: int = env("HIPPIUS_JANITOR_SQL_PAGE_SIZE:1000", convert=int)
+    janitor_sql_max_deletes_per_cycle: int = env("HIPPIUS_JANITOR_SQL_MAX_DELETES_PER_CYCLE:50000", convert=int)
+    # Per-page asyncpg query timeout for candidate discovery. A sparse ring (a head of young/hot/
+    # under-replicated rows) can make one keyset page scan the whole inventory before it fills, so
+    # this bounds per-page scan volume: a timeout ENDS discovery this cycle with the cursor left at
+    # the last completed page, and the next cycle resumes from that spot.
+    janitor_sql_query_timeout_seconds: float = env("HIPPIUS_JANITOR_SQL_QUERY_TIMEOUT_SECONDS:30", convert=float)
 
     # Filesystem cache disk-pressure backoff (ingress control).
     # Threshold can be expressed as either absolute bytes or ratio; we trigger if ANY threshold is hit.
