@@ -608,6 +608,15 @@ spec:
               value: "hippius-s3-janitor"
             - name: WORKER_SCRIPT
               value: "workers/run_janitor_in_loop.py"
+            # Pool-fullness gate (2026-07-24 incident). statvfs on the cache PVC sees the CephFS
+            # quota (~69%), not the backing pool (~94%), so the janitor stayed in Normal mode as
+            # the pool filled to the read-only cliff. These make _pressure_mode take max(statvfs,
+            # fullest pool %USED) from the mgr exporter — the same signal + pools the drain
+            # allocator uses (CEPHOR_CEPH_*). Cross-namespace reach to rook-ceph confirmed.
+            - name: HIPPIUS_JANITOR_CEPH_MGR_METRICS_URL
+              value: "http://rook-ceph-mgr.rook-ceph.svc.cluster.local:9283/metrics"
+            - name: HIPPIUS_JANITOR_CEPH_POOLS
+              value: "ceph-filesystem-data0,ceph-filesystem-metadata,ceph-blockpool"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
