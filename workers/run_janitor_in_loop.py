@@ -1950,17 +1950,26 @@ async def evict_from_inventory(
     *,
     pressure: int,
 ) -> int:
-    """SQL-driven eviction: keyset-page fs_cache_inventory joined to full backend coverage, stat
-    only the candidates (existence + atime hot-check), then apply the UNCHANGED absolute
-    replication gate per part before deleting. O(evictable) instead of O(resident) — the walk's
-    ~36 obj/s CephFS-readdir bottleneck is replaced by indexed DB reads.
+    """SQL-driven eviction: SLICE-THEN-FILTER over fs_cache_inventory, stat only the candidates
+    (existence + atime hot-check), then apply the UNCHANGED absolute replication gate per part
+    before deleting. O(evictable) instead of O(resident) — the walk's ~36 obj/s CephFS-readdir
+    bottleneck is replaced by indexed DB reads.
 
-    Cursor lives in janitor_state['sql_evict_cursor'] and only advances past a page after the
-    page is fully processed, so a crash mid-page re-processes it (idempotent: delete_part no-ops
-    on a missing dir, clear_cached no-ops on a missing row). The scan is a RING: an empty page
-    resets the cursor to the start, a short page ends the cycle after advancing.
+    Each page runs TWO bounded queries: janitor_inventory_slice (a pure keyset window of the
+    inventory ring, index-only, cost bounded by page_size) then janitor_evictable_candidates
+    (the coverage/age filter over exactly that window's tuples). THE CURSOR ADVANCES BY THE SLICE,
+    not by the filter output: a window that is 100% non-candidates still advances the ring. This is
+    the stall fix — the old single scan-and-filter query, on an inventory whose head is millions of
+    non-candidates, re-scanned from the same cursor every cycle, deterministically re-timed-out, and
+    never advanced, so the SQL phase permanently freed zero. Bounding the scan window guarantees
+    forward progress at ANY sparseness.
 
-    Safety is the walk's exact model: the SQL query is a PREFILTER only (invariant 1); the
+    Cursor lives in janitor_state['sql_evict_cursor'] and only advances past a slice after the
+    slice's candidates are fully processed, so a crash mid-page re-processes it (idempotent:
+    delete_part no-ops on a missing dir, clear_cached no-ops on a missing row). The scan is a RING:
+    an empty slice resets the cursor to the start, a short slice ends the cycle after advancing.
+
+    Safety is the walk's exact model: the SQL filter is a PREFILTER only (invariant 1); the
     per-part is_replicated_on_all_backends gate is re-run on the worker connection before every
     delete. DLQ protection is honoured when available and fails OPEN (invariant 2) — the same
     age-GC-class rule, since a fully-replicated part is safe to evict regardless of any DLQ entry.
@@ -2016,27 +2025,30 @@ async def evict_from_inventory(
             _janitor_deleted_counter.add(1, attributes={"reason": "sql_evict"})
         return True
 
+    async def candidates(page: list[Any]) -> AsyncIterator[tuple[str, int, int]]:
+        for r in page:
+            if r["object_id"] in dlq_object_ids:
+                continue  # DLQ-parked: an in-flight op owns this object's data
+            yield (r["object_id"], r["object_version"], r["part_number"])
+
     deleted_total = 0
     pages = 0
     while deleted_total < max_deletes:
+        # Step 1 — SLICE: pure keyset window of the inventory ring (index-only, bounded by
+        # page_size). This is the cursor-advancing scan; on timeout we leave the cursor UNMOVED
+        # (no advance, no {} reset) so the next cycle resumes here. With the scan bounded, a
+        # timeout now only fires on a genuinely degraded DB, not on a sparse ring head.
         try:
             async with pool.acquire() as conn:
-                rows = await conn.fetch(
-                    get_query("janitor_evictable_candidates"),
-                    backup_backends,
-                    upload_backends,
+                slice_rows = await conn.fetch(
+                    get_query("janitor_inventory_slice"),
                     page_size,
-                    config.fs_cache_gc_max_age_seconds,
-                    ignore_age,
                     *cursor,
                     timeout=query_timeout,
                 )
         except asyncio.TimeoutError:
-            # Sparse ring: this page scanned past the timeout without filling. End discovery this
-            # cycle with the cursor UNMOVED (no advance, no {} reset), so the next cycle resumes
-            # from exactly here. Swallowed, not raised — a slow page is expected, not a phase error.
             logger.warning(
-                "SQL eviction discovery timed out after %ss; ending cycle at cursor "
+                "SQL eviction slice scan timed out after %ss; ending cycle at cursor "
                 "cached_at=%s object_id=%s v=%s part=%s (resumes here next cycle)",
                 query_timeout,
                 cursor[0],
@@ -2045,23 +2057,50 @@ async def evict_from_inventory(
                 cursor[3],
             )
             break
-        if not rows:
+        if not slice_rows:
             async with pool.acquire() as conn:
                 await set_janitor_state(conn, "sql_evict_cursor", {})  # ring wrap: restart at the head
             break
         pages += 1
 
-        async def candidates(page: list[Any]) -> AsyncIterator[tuple[str, int, int]]:
-            for r in page:
-                if r["object_id"] in dlq_object_ids:
-                    continue  # DLQ-parked: an in-flight op owns this object's data
-                yield (r["object_id"], r["object_version"], r["part_number"])
+        # Step 2 — FILTER: coverage/age evictability over exactly this slice's tuples. On timeout,
+        # same semantics as the slice: cursor UNMOVED, cycle ends. Only reachable now if the DB is
+        # genuinely degraded, since the filter operates on a bounded (page_size) tuple set.
+        object_ids = [r["object_id"] for r in slice_rows]
+        versions = [r["object_version"] for r in slice_rows]
+        part_numbers = [r["part_number"] for r in slice_rows]
+        try:
+            async with pool.acquire() as conn:
+                cand_rows = await conn.fetch(
+                    get_query("janitor_evictable_candidates"),
+                    object_ids,
+                    versions,
+                    part_numbers,
+                    backup_backends,
+                    upload_backends,
+                    config.fs_cache_gc_max_age_seconds,
+                    ignore_age,
+                    timeout=query_timeout,
+                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "SQL eviction filter query timed out after %ss; ending cycle at cursor "
+                "cached_at=%s object_id=%s v=%s part=%s (resumes here next cycle)",
+                query_timeout,
+                cursor[0],
+                cursor[1],
+                cursor[2],
+                cursor[3],
+            )
+            break
 
-        deleted_total += await _run_worker_pool(pool, candidates(rows), handle, config.janitor_concurrency)
+        deleted_total += await _run_worker_pool(pool, candidates(cand_rows), handle, config.janitor_concurrency)
 
-        # last["cached_at"] is a datetime (asyncpg decodes timestamptz) — pass it straight to the
-        # next $6, and isoformat only for the JSON-persisted cursor.
-        last = rows[-1]
+        # Advance the cursor to the LAST SLICE ROW — NOT the last candidate. This is the stall fix:
+        # a slice with zero candidates still advances the ring by every row it scanned, so a head of
+        # non-candidates can never re-pin the cursor. last["cached_at"] is a datetime (asyncpg
+        # decodes timestamptz) — pass it straight to the next $2, isoformat only for the JSON cursor.
+        last = slice_rows[-1]
         cursor = (last["cached_at"], last["object_id"], last["object_version"], last["part_number"])
         async with pool.acquire() as conn:
             await set_janitor_state(
@@ -2074,8 +2113,8 @@ async def evict_from_inventory(
                     "part_number": last["part_number"],
                 },
             )
-        if len(rows) < page_size:
-            break  # short page = end of the ring this cycle
+        if len(slice_rows) < page_size:
+            break  # short slice = end of the ring this cycle
 
     logger.info(
         "SQL eviction cycle: deleted=%d pages=%d pressure=%d ignore_age=%s",
@@ -2087,27 +2126,78 @@ async def evict_from_inventory(
     return deleted_total
 
 
+# The hard-delete ring cursor's cold-start position: sorts strictly before every real (deleted_at,
+# object_id) pair, so a wrapped ring restarts at the oldest soft-deleted object. deleted_at is a
+# NATIVE timestamptz param ($2) — asyncpg rejects a string there — so the sentinel is the epoch
+# (soft-deletes are always after 1970); object_id ($3) is a uuid, so the sentinel is the nil-uuid.
+_HARD_DELETE_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_HARD_DELETE_NIL_UUID = "00000000-0000-0000-0000-000000000000"
+_HARD_DELETE_CURSOR_START: tuple[datetime, str] = (_HARD_DELETE_EPOCH, _HARD_DELETE_NIL_UUID)
+
+
+def _load_hard_delete_cursor(state: dict[str, Any] | None) -> tuple[datetime, str]:
+    """Parse the durable (deleted_at, object_id) ring cursor from janitor_state, falling back to the
+    epoch/nil-uuid ring-start on any malformed value. deleted_at is persisted as an ISO string (JSON
+    has no datetime) and parsed back to a datetime here for the native-timestamptz $2. A corrupt
+    cursor must restart the ring, never crash the phase."""
+    if not state:
+        return _HARD_DELETE_CURSOR_START
+    try:
+        return (datetime.fromisoformat(state["deleted_at"]), str(state["object_id"]))
+    except (TypeError, ValueError, KeyError):
+        return _HARD_DELETE_CURSOR_START
+
+
 async def gc_soft_deleted_objects(pool: asyncpg.Pool) -> int:
-    """Hard-delete objects where all backends have confirmed unpin."""
+    """Hard-delete soft-deleted objects whose backends have confirmed unpin, walking a durable keyset
+    RING so a permanently-unready head (e.g. a never-replicated CopyObject destination) can no longer
+    block the whole batch forever. The finder returns a (deleted_at, object_id)-ordered SLICE of ALL
+    soft-deleted candidates past grace — ready and not — with a per-row `ready` boolean; we hard-delete
+    only the ready ones via the guarded delete but advance the cursor over the ENTIRE slice, so the
+    next cycle resumes strictly after it. An empty slice wraps the ring back to the start."""
     async with pool.acquire() as db:
-        rows = await db.fetch(get_query("find_objects_ready_for_hard_delete"), config.janitor_hard_delete_batch)
+        cursor = _load_hard_delete_cursor(await get_janitor_state(db, "hard_delete_cursor"))
+        rows = await db.fetch(
+            get_query("find_objects_ready_for_hard_delete"),
+            config.janitor_hard_delete_batch,
+            *cursor,
+        )
+        if not rows:
+            await set_janitor_state(db, "hard_delete_cursor", {})  # ring wrap: restart at the head
+            logger.info("Hard-delete cycle: scanned=0 ready=0 deleted=0 skipped=0 wrapped=True")
+            return 0
+
+        ready = sum(1 for r in rows if r["ready"])
         deleted = 0
         skipped = 0
         for row in rows:
+            if not row["ready"]:
+                continue  # cursor still advances past it below — no head-of-line block
             try:
-                # Guarded delete: re-verifies readiness atomically so a row revived
-                # (re-PUT clears deleted_at + adds live chunks) between the find and
-                # here is left untouched. "DELETE 0" => skipped, not deleted.
+                # Guarded delete re-verifies readiness atomically (mirrors the finder), so a row
+                # revived between the find and here — re-PUT clears deleted_at + adds live chunks —
+                # is left untouched. "DELETE 0" => skipped, not deleted.
                 tag = await db.execute(get_query("hard_delete_object"), row["object_id"])
                 if tag == "DELETE 0":
                     skipped += 1
                     continue
                 deleted += 1
-                logger.info(f"Hard-deleted soft-deleted object: object_id={row['object_id']}")
             except Exception as e:
                 logger.warning(f"Failed to hard-delete object {row['object_id']}: {e}")
-        if skipped:
-            logger.info(f"Hard-delete skipped {skipped} object(s) no longer ready (revived/in-flight)")
+
+        last = rows[-1]
+        await set_janitor_state(
+            db,
+            "hard_delete_cursor",
+            {"deleted_at": last["deleted_at"].isoformat(), "object_id": str(last["object_id"])},
+        )
+        logger.info(
+            "Hard-delete cycle: scanned=%d ready=%d deleted=%d skipped=%d wrapped=False",
+            len(rows),
+            ready,
+            deleted,
+            skipped,
+        )
     return deleted
 
 
