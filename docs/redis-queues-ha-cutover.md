@@ -47,6 +47,12 @@ Nothing is repointed yet; the old `redis-queues` still serves all traffic.
    it). Existing `redis-cluster` is unaffected because RedisCluster self-heals via the in-namespace
    :16379 gossip bus; RedisReplication+Sentinel needs ongoing operator→pod connectivity.
 
+3. **The image is pinned to redis 7.4.x** (`quay.io/opstree/redis:v7.4.8`) to match the live
+   `redis-queues` (7.4.x). If someone downgrades it below the live version, the Phase-2 seed fails
+   (`Failed trying to load the MASTER synchronization DB from disk: Invalid argument`). Sanity check
+   before cutover: `kubectl -n $NS exec redis-queues-0 -- redis-cli info server | grep redis_version`
+   must be the same minor as the manifest image.
+
 If Phase 0 shows `connected_slaves:0` or a missing sentinel STS, check these two before anything else.
 
 ## Phase 1 — GATING TEST on staging: does a failover regress the fence? (do this BEFORE prod)
@@ -76,18 +82,34 @@ If Phase 0 shows `connected_slaves:0` or a missing sentinel STS, check these two
 
 ## Phase 2 — Data migration (copy the queue + cephor:* keys into the HA master)
 The HA set comes up empty. To cut over without losing pending uploads or the fence, seed it from
-the live `redis-queues` **before** repointing. Recommended (validate on staging):
+the live `redis-queues` **before** repointing.
+
+**Do NOT use `replicaof` + promote (the obvious approach FAILS here).** Validated on staging
+2026-07-24: making the HA master `replicaof redis-queues` then `replicaof no one` seeds the data,
+but the opstree operator **reconciles the topology and FLUSHES the seed on promote** — the promoted
+node is reverted to a replica and re-synced from an empty peer (dbsize → 0). The operator fights any
+manual topology change.
+
+**Use a logical key-copy into the operator's designated master instead** — these are ordinary client
+writes the reconciler does not touch, and they replicate to the replicas normally:
 ```bash
-# Temporarily make the HA master replicate the live standalone redis-queues to copy ALL keys:
-kubectl -n $NS exec redis-queues-ha-0 -- redis-cli replicaof redis-queues 6379
-kubectl -n $NS exec redis-queues-ha-0 -- redis-cli info replication   # master_link_status:up, sync done
-# Then promote it (keeps every key incl. cephor:* + the queues):
-kubectl -n $NS exec redis-queues-ha-0 -- redis-cli replicaof no one
+# 1. Find the operator's current master (the pod the master service points at):
+MASTER_IP=$(kubectl -n $NS get endpoints redis-queues-ha-master -o jsonpath='{.subsets[0].addresses[0].ip}')
+# 2. MIGRATE COPY every key from the live redis-queues into it (COPY = non-destructive to the source;
+#    REPLACE = idempotent; run via `sh -c` so the empty-key arg survives kubectl's arg parsing):
+KEYS=$(kubectl -n $NS exec redis-queues-0 -- redis-cli --scan | tr -d '\r' | tr '\n' ' ')
+kubectl -n $NS exec redis-queues-0 -- sh -c "redis-cli MIGRATE $MASTER_IP 6379 '' 0 5000 COPY REPLACE KEYS $KEYS"
+# 3. Verify on the master (survives an operator reconcile — wait ~45s — and replicates to ha replicas):
+kubectl -n $NS exec redis-queues-ha-0 -- redis-cli -h redis-queues-ha-master get cephor:epoch   # == live value
+kubectl -n $NS exec redis-queues-ha-0 -- redis-cli -h redis-queues-ha-master dbsize             # == live dbsize
 ```
-**Caveat to validate on staging:** the OT operator reconciler manages `replicaof`; confirm it
-does not fight the manual `replicaof` mid-migration (if it does, use a one-shot `redis-cli --rdb`
-dump of the old + `redis-cli -x restore`/`--pipe` load into the new master instead, during a
-brief writer quiesce). Pick whichever staging proves clean; document it here before prod.
+For a large keyspace, batch the `KEYS` list (a few hundred per MIGRATE). Both redis versions must be
+the **same minor** (7.4.x ↔ 7.4.x) or MIGRATE's serialization is rejected — the same version rule the
+manifest's image pin enforces. **Quiesce note:** MIGRATE is a point-in-time copy; any queue entry
+written to the live redis *after* the copy and *before* the Phase-3 repoint won't be on the HA master.
+The drain re-enqueues on transient error so this is tolerable, but do Phase 2 → Phase 3 back-to-back
+(minimize the gap), or briefly pause the producers, to avoid stranding in-flight uploads on the old
+redis.
 
 ## Phase 3 — Repoint + roll consumers (the actual cutover; seconds)
 ```bash

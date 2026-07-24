@@ -46,7 +46,12 @@ spec:
     runAsGroup: 1000
     fsGroup: 1000
   kubernetesConfig:
-    image: quay.io/opstree/redis:v7.0.15
+    # MUST be >= the live redis-queues version (redis:7-alpine → 7.4.x; prod 7.4.8, staging 7.4.9).
+    # Redis replication is forward-incompatible: an older replica cannot load a newer master's RDB —
+    # a v7.0.15 node fails the Phase-2 seed from a 7.4.x source with "Failed trying to load the MASTER
+    # synchronization DB from disk: Invalid argument". v7.4.8 is opstree's newest 7.4 tag and shares
+    # the 7.4 RDB format with the live 7.4.9 (verified on staging 2026-07-24).
+    image: quay.io/opstree/redis:v7.4.8
     imagePullPolicy: IfNotPresent
     resources:
       requests:
@@ -81,7 +86,7 @@ spec:
     runAsGroup: 1000
     fsGroup: 1000
   kubernetesConfig:
-    image: quay.io/opstree/redis-sentinel:v7.0.15
+    image: quay.io/opstree/redis-sentinel:v7.4.8 # keep in lockstep with the redis image above
     imagePullPolicy: IfNotPresent
     resources:
       requests:
