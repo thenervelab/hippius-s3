@@ -199,7 +199,8 @@ async def test_worker_pool_clamps_nonpositive_concurrency():
 # --------------------------------------------------------- _update_disk_metrics
 
 
-def test_update_disk_metrics_populates_gauges_without_cleanup(monkeypatch):
+@pytest.mark.asyncio
+async def test_update_disk_metrics_populates_gauges_without_cleanup(monkeypatch):
     """Disk + pressure gauges are set from a single statvfs, not from a GC pass."""
 
     class FakeUsage:
@@ -207,36 +208,59 @@ def test_update_disk_metrics_populates_gauges_without_cleanup(monkeypatch):
         total = 1000  # 85% → elevated
 
     monkeypatch.setattr(janitor.shutil, "disk_usage", lambda p: FakeUsage())
+    # Pool gating off (default) → no mgr scrape; pressure keyed on statvfs alone.
+    monkeypatch.setattr(janitor, "_fetch_pool_percent_used", AsyncMock(return_value=None))
 
     janitor._fs_disk_used_bytes = 0
     janitor._fs_disk_total_bytes = 0
     janitor._fs_pressure_mode = 0
 
-    janitor._update_disk_metrics(Path("/tmp"))
+    await janitor._update_disk_metrics(Path("/tmp"))
 
     assert janitor._fs_disk_used_bytes == 850
     assert janitor._fs_disk_total_bytes == 1000
     assert janitor._fs_pressure_mode == 1  # 85% == elevated boundary
 
 
-def test_update_disk_metrics_critical(monkeypatch):
+@pytest.mark.asyncio
+async def test_update_disk_metrics_critical(monkeypatch):
     class FakeUsage:
         used = 990
         total = 1000  # 99% → critical
 
     monkeypatch.setattr(janitor.shutil, "disk_usage", lambda p: FakeUsage())
-    janitor._update_disk_metrics(Path("/tmp"))
+    monkeypatch.setattr(janitor, "_fetch_pool_percent_used", AsyncMock(return_value=None))
+    await janitor._update_disk_metrics(Path("/tmp"))
     assert janitor._fs_pressure_mode == 2
 
 
-def test_update_disk_metrics_normal(monkeypatch):
+@pytest.mark.asyncio
+async def test_update_disk_metrics_normal(monkeypatch):
     class FakeUsage:
         used = 100
         total = 1000  # 10% → normal
 
     monkeypatch.setattr(janitor.shutil, "disk_usage", lambda p: FakeUsage())
-    janitor._update_disk_metrics(Path("/tmp"))
+    monkeypatch.setattr(janitor, "_fetch_pool_percent_used", AsyncMock(return_value=None))
+    await janitor._update_disk_metrics(Path("/tmp"))
     assert janitor._fs_pressure_mode == 0
+
+
+@pytest.mark.asyncio
+async def test_update_disk_metrics_pool_gate_raises_pressure_above_statvfs(monkeypatch):
+    """The pool signal (94%) drives Critical even when local statvfs (the PVC quota) reads a calm
+    10% — the 2026-07-24 blind spot. max(statvfs, pool) is what _pressure_mode must key on."""
+
+    class FakeUsage:
+        used = 100
+        total = 1000  # 10% locally (PVC quota) → would be Normal on statvfs alone
+
+    monkeypatch.setattr(janitor.shutil, "disk_usage", lambda p: FakeUsage())
+    monkeypatch.setattr(janitor, "_fetch_pool_percent_used", AsyncMock(return_value=0.96))
+    janitor._prev_pressure_mode = 0
+    await janitor._update_disk_metrics(Path("/tmp"))
+    assert janitor._fs_pressure_mode == 2, "pool at 96% must force Critical despite statvfs at 10%"
+    assert janitor._fs_pool_percent_used == 0.96
 
 
 class _RmtreeFsStore:
@@ -380,7 +404,9 @@ async def test_main_loop_refreshes_disk_metrics_before_phases(monkeypatch):
         order.append(name)
         return 0
 
-    monkeypatch.setattr(janitor, "_update_disk_metrics", lambda root: order.append("disk_metrics"))
+    monkeypatch.setattr(
+        janitor, "_update_disk_metrics", AsyncMock(side_effect=lambda root: order.append("disk_metrics"))
+    )
     monkeypatch.setattr(janitor, "cleanup_stale_parts", lambda *a, **k: _phase_stub("phase1"))
     monkeypatch.setattr(janitor, "cleanup_old_parts_by_mtime", lambda *a, **k: _phase_stub("phase2"))
     monkeypatch.setattr(janitor, "cleanup_orphan_tmp_files", lambda *a, **k: _phase_stub("phase3"))

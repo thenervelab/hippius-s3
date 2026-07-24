@@ -24,6 +24,7 @@ Disk-pressure modes (all still replication-gated):
 import asyncio
 import json
 import logging
+import math
 import os
 import shutil
 import sys
@@ -39,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 import asyncpg
+import httpx
 from opentelemetry import metrics as otel_metrics
 from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
 from opentelemetry.sdk.metrics import MeterProvider
@@ -84,7 +86,9 @@ PRESSURE_CRITICAL_EXIT = 0.93
 
 # Maximum age of an orphan `.tmp.*` file before we delete it. Atomic writes
 # finish in milliseconds; anything older than this is a crashed-write orphan.
-TMP_FILE_MAX_AGE_SECONDS = 3600  # 1h
+# 30min: atomic writes complete in ms, so half an hour is already many orders of
+# magnitude of slack — no reason to sit on crashed-write bytes for a full hour.
+TMP_FILE_MAX_AGE_SECONDS = 1800  # 30m
 # Cap on the G2 sentinel scan: it needs only to DETECT a durability gap and sample a few
 # offenders, not enumerate every one, so a bounded page keeps the read-only query cheap.
 SENTINEL_SCAN_LIMIT = 500
@@ -102,6 +106,10 @@ _fs_disk_total_bytes = 0
 _fs_hot_parts = 0
 _fs_pressure_mode = 0  # 0 = normal, 1 = elevated, 2 = critical
 _prev_pressure_mode = 0  # C2: last mode returned by _pressure_mode, for hysteresis (single-instance janitor)
+# Fullest configured Ceph pool's %USED (0.0-1.0), refreshed once per cycle by _update_disk_metrics
+# from the mgr exporter. None when pool gating is unconfigured or the probe failed this cycle — in
+# which case _pressure_mode falls back to statvfs alone. See _fetch_pool_percent_used.
+_fs_pool_percent_used: float | None = None
 _fs_age_buckets: dict[str, int] = dict.fromkeys(AGE_BUCKET_NAMES, 0)
 # Census is now accumulated across a full sharded sweep (the age-GC walk covers 1/shards of
 # the tree per cycle), then published to the gauges above only when a sweep completes without
@@ -174,6 +182,12 @@ def _obs_pressure_mode(_: object) -> list[otel_metrics.Observation]:
     return [otel_metrics.Observation(_fs_pressure_mode, {})]
 
 
+def _obs_pool_percent_used(_: object) -> list[otel_metrics.Observation]:
+    # -1 = pool gating unconfigured or the probe failed this cycle (falling back to statvfs).
+    value = _fs_pool_percent_used if _fs_pool_percent_used is not None else -1.0
+    return [otel_metrics.Observation(value, {})]
+
+
 def _obs_age_buckets(_: object) -> list[otel_metrics.Observation]:
     return [otel_metrics.Observation(count, {"age_bucket": bucket}) for bucket, count in _fs_age_buckets.items()]
 
@@ -209,6 +223,80 @@ def _classify_age_bucket(age_seconds: float) -> str:
     return "7d+"
 
 
+def _label_value(line: str, needle: str) -> str | None:
+    """The prometheus label value following `needle` (e.g. `pool_id="`), up to its closing quote."""
+    start = line.find(needle)
+    if start < 0:
+        return None
+    start += len(needle)
+    end = line.find('"', start)
+    return line[start:end] if end >= 0 else None
+
+
+def _parse_pool_percent_used(body: str, pools: list[str]) -> float | None:
+    """The fullest of `pools` from a mgr prometheus scrape, resolving each name to its id via
+    `ceph_pool_metadata` then reading `ceph_pool_percent_used`. Returns None if ANY pool is absent
+    — a missing pool must fail safe (fall back to statvfs), never silently shrink the gate. Pure so
+    the parse is unit-testable without a live exporter."""
+    name_to_id: dict[str, str] = {}
+    id_to_pct: dict[str, float] = {}
+    for line in body.splitlines():
+        if line.startswith("ceph_pool_metadata{"):
+            name = _label_value(line, 'name="')
+            pool_id = _label_value(line, 'pool_id="')
+            if name is not None and pool_id is not None and name in pools:
+                name_to_id[name] = pool_id
+        elif line.startswith("ceph_pool_percent_used{"):
+            pool_id = _label_value(line, 'pool_id="')
+            if pool_id is None:
+                continue
+            try:
+                value = float(line.rsplit(" ", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            if math.isfinite(value):  # a NaN/inf is not a ratio — drop it so the pool reads missing
+                id_to_pct[pool_id] = value
+
+    fullest: float | None = None
+    for pool in pools:
+        pool_id = name_to_id.get(pool)
+        pct = id_to_pct.get(pool_id) if pool_id is not None else None
+        if pct is None:
+            logger.warning("janitor pool-fullness probe: pool %r absent from mgr output; falling back to statvfs", pool)
+            return None
+        pct = min(max(pct, 0.0), 1.0)  # exporter rounding can nudge just past 1.0
+        fullest = pct if fullest is None else max(fullest, pct)
+    return fullest
+
+
+async def _fetch_pool_percent_used() -> float | None:
+    """The fullest configured Ceph pool's %USED (0.0-1.0) from the mgr exporter, or None.
+
+    statvfs on the cache mount (what _pressure_mode reads locally) sees the CephFS *PVC quota*,
+    not the backing pool: on 2026-07-24 statvfs read 0.69 while ceph-filesystem-data0 sat at 0.94,
+    so the janitor never left Normal mode as the pool filled to the read-only cliff. This reads the
+    same `ceph_pool_percent_used` signal PR #337 gave the drain allocator.
+
+    Returns None — the caller then falls back to statvfs alone — when pool gating is unconfigured,
+    the mgr is unreachable, or any configured pool is absent (a missing pool must not silently
+    shrink the gate). The pool signal only ever RAISES pressure via the max in _pressure_mode; on
+    failure the janitor is no worse off than its pre-incident statvfs-only behavior, but it logs.
+    """
+    url = config.janitor_ceph_mgr_metrics_url
+    pools = [p.strip() for p in config.janitor_ceph_pools.split(",") if p.strip()]
+    if not url or not pools:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=config.janitor_ceph_probe_timeout_seconds) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            body = resp.text
+    except httpx.HTTPError as exc:
+        logger.warning("janitor pool-fullness probe failed (%s); falling back to statvfs", exc)
+        return None
+    return _parse_pool_percent_used(body, pools)
+
+
 def _pressure_mode(root: Path) -> int:
     """Return the current disk-pressure mode (0/1/2) with hysteresis.
 
@@ -217,13 +305,20 @@ def _pressure_mode(root: Path) -> int:
     0.85 or 0.95 from oscillating the mode — and the hot-retention window and loop sleep that key
     off it — on every cycle. The janitor is single-instance, so a module-global previous-mode is
     safe. On a stat error we hold the previous mode rather than snapping to normal.
+
+    The ratio is the MAX of the local statvfs used-fraction and the backing Ceph pool's %USED
+    (`_fs_pool_percent_used`, refreshed once per cycle). statvfs alone sees the CephFS PVC quota,
+    not the pool, so it under-reports fullness for a pool whose CRUSH subtree fills ahead of the
+    quota — the 2026-07-24 incident. `None` (pool gating off / probe failed) uses statvfs alone.
     """
     global _prev_pressure_mode
     try:
         usage = shutil.disk_usage(root)
-        ratio = usage.used / usage.total if usage.total else 0.0
+        local_ratio = usage.used / usage.total if usage.total else 0.0
     except OSError:
         return _prev_pressure_mode
+    pool_ratio = _fs_pool_percent_used if _fs_pool_percent_used is not None else 0.0
+    ratio = max(local_ratio, pool_ratio)
     prev = _prev_pressure_mode
     if ratio >= PRESSURE_CRITICAL or (prev == 2 and ratio >= PRESSURE_CRITICAL_EXIT):
         mode = 2
@@ -502,14 +597,19 @@ def _publish_census(now: float) -> None:
         )
 
 
-def _update_disk_metrics(root: Path) -> None:
+async def _update_disk_metrics(root: Path) -> None:
     """Refresh disk-usage + pressure gauges from a single statvfs.
 
     Called at the top of every cycle so disk visibility never depends on a full
     GC pass completing — the GC walk over millions of parts can take hours, and
     operators need to see a filling disk long before then.
+
+    The pool-fullness probe is refreshed HERE (once per cycle) into a module global that
+    _pressure_mode reads, so the many per-cycle _pressure_mode calls (each GC phase re-reads it)
+    share one mgr scrape rather than hammering the exporter.
     """
-    global _fs_disk_used_bytes, _fs_disk_total_bytes, _fs_pressure_mode
+    global _fs_disk_used_bytes, _fs_disk_total_bytes, _fs_pressure_mode, _fs_pool_percent_used
+    _fs_pool_percent_used = await _fetch_pool_percent_used()
     usage = shutil.disk_usage(root)
     _fs_disk_used_bytes = usage.used
     _fs_disk_total_bytes = usage.total
@@ -624,6 +724,11 @@ def _setup_janitor_metrics() -> None:
         name="fs_cache_pressure_mode",
         callbacks=[_obs_pressure_mode],
         description="0=normal, 1=elevated, 2=critical",
+    )
+    meter.create_observable_gauge(
+        name="fs_cache_pool_percent_used",
+        callbacks=[_obs_pool_percent_used],
+        description="Backing Ceph pool %USED (0.0-1.0) from the mgr exporter; -1 = pool gating off or probe failed (statvfs fallback). The real fullness signal statvfs misses.",
     )
     meter.create_observable_gauge(
         name="fs_cache_age_bucket_parts",
@@ -1408,6 +1513,16 @@ async def run_janitor_loop():
     logger.info(f"FS GC max age: {config.fs_cache_gc_max_age_seconds}s")
     logger.info(f"FS hot retention: {getattr(config, 'fs_cache_hot_retention_seconds', 10800)}s")
     logger.info(f"Cleanup concurrency: {concurrency}")
+    if config.janitor_ceph_mgr_metrics_url and config.janitor_ceph_pools:
+        logger.info(
+            f"Pool-fullness gate ACTIVE: pools={config.janitor_ceph_pools} via {config.janitor_ceph_mgr_metrics_url} "
+            f"(pressure = max(statvfs, fullest pool %USED))"
+        )
+    else:
+        logger.warning(
+            "Pool-fullness gate INACTIVE (HIPPIUS_JANITOR_CEPH_MGR_METRICS_URL / _POOLS unset); "
+            "pressure keyed on statvfs, which sees the PVC quota not the backing pool — the 2026-07-24 blind spot"
+        )
 
     # Sleep intervals: shorter under disk pressure to catch up
     sleep_normal = 600  # 10m
@@ -1421,7 +1536,7 @@ async def run_janitor_loop():
             _cycle_started = time.time()
             logger.info("Janitor cycle starting...")
             # Refresh disk/pressure gauges up front, and read pressure ONCE for the whole cycle.
-            _update_disk_metrics(fs_store.root)
+            await _update_disk_metrics(fs_store.root)
             pressure = _pressure_mode(fs_store.root)
 
             # --- DB-only DURABILITY phases run FIRST ------------------------------------------
