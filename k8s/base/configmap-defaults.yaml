@@ -50,6 +50,15 @@ data:
   # exactly when eviction throughput matters most.
   HIPPIUS_JANITOR_ELEVATED_WALK_SHARDS: "8"
   HIPPIUS_JANITOR_PRESSURE_SLEEP_SECONDS: "15"
+  # SQL-driven eviction discovery: candidate rows per keyset page, and the per-cycle delete
+  # budget. Set the budget to 0 to disable the phase without a deploy (prod rollback kill switch);
+  # the unified walk remains the full eviction engine when it is off.
+  HIPPIUS_JANITOR_SQL_PAGE_SIZE: "1000"
+  HIPPIUS_JANITOR_SQL_MAX_DELETES_PER_CYCLE: "50000"
+  # Per-page discovery query timeout. A sparse ring can make one keyset page scan the whole
+  # inventory; on timeout, discovery ends this cycle with the cursor at the last completed page
+  # and resumes there next cycle (never advances/resets past an incomplete page).
+  HIPPIUS_JANITOR_SQL_QUERY_TIMEOUT_SECONDS: "30"
   HTTP_STREAM_INITIAL_TIMEOUT_SECONDS: "0.5"
   HIPPIUS_DLQ_DIR: "/tmp/hippius_dlq"
   HIPPIUS_DLQ_ARCHIVE_DIR: "/tmp/hippius_dlq_archive"

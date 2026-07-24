@@ -413,6 +413,7 @@ async def test_main_loop_refreshes_disk_metrics_before_phases(monkeypatch):
     )
     # The three FS-walk phases are now ONE unified walk; patch it (and the DB-only durability
     # phases) so nothing crawls a real tree.
+    monkeypatch.setattr(janitor, "evict_from_inventory", AsyncMock(return_value=0))
     monkeypatch.setattr(janitor, "cleanup_parts_unified", _unified_stub)
     monkeypatch.setattr(janitor, "check_replication_sentinel", AsyncMock(return_value=0))
     monkeypatch.setattr(janitor, "get_all_dlq_object_ids", AsyncMock(return_value=set()))
