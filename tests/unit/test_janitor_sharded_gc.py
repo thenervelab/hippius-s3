@@ -251,7 +251,9 @@ async def test_durability_phases_run_before_fs_walks(monkeypatch):
         order.append(name)
         return ret
 
-    monkeypatch.setattr(janitor, "_update_disk_metrics", lambda root: order.append("disk_metrics"))
+    monkeypatch.setattr(
+        janitor, "_update_disk_metrics", AsyncMock(side_effect=lambda root: order.append("disk_metrics"))
+    )
     monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 0)
     monkeypatch.setattr(janitor, "check_replication_sentinel", lambda *a, **k: _rec("sentinel"))
     monkeypatch.setattr(janitor, "get_all_dlq_object_ids", lambda *a, **k: _rec("dlq", set()))
@@ -301,7 +303,7 @@ async def test_disk_pressure_collapses_the_walk_to_a_single_whole_tree_shard(mon
             captured["gc"] = k.get("shards")
             return 0
 
-        monkeypatch.setattr(janitor, "_update_disk_metrics", lambda root: None)
+        monkeypatch.setattr(janitor, "_update_disk_metrics", AsyncMock(return_value=None))
         monkeypatch.setattr(janitor, "_pressure_mode", lambda root: pressure)
         monkeypatch.setattr(janitor, "check_replication_sentinel", AsyncMock(return_value=0))
         monkeypatch.setattr(janitor, "get_all_dlq_object_ids", AsyncMock(return_value=set()))
