@@ -161,8 +161,12 @@ async def test_tail_scope_single_transaction(patched_writer: Any) -> None:
     assert captured["tail_parts_in_txn"] is True
     assert tail_conn.conn_id != captured["head_conn"].conn_id
 
-    # All tail writes are inside the transaction.
-    tail_executes = _events_on(pool, tail_conn.conn_id, "execute")
+    # All tail writes are inside the transaction — except the advisory fs_cache_inventory row,
+    # which is deliberately issued on the same held conn AFTER the transaction commits (autocommit),
+    # so a failed advisory INSERT can never poison the tail transaction.
+    tail_executes = [
+        e for e in _events_on(pool, tail_conn.conn_id, "execute") if "fs_cache_inventory" not in (e.get("query") or "")
+    ]
     assert all(e["in_txn"] for e in tail_executes)
 
 
