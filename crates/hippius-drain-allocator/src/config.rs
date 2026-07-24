@@ -73,6 +73,13 @@ const DEFAULT_CEPH_FULL_BPS: u16 = 9_500;
 /// Per-scrape timeout for the live mgr probe when `CEPHOR_CEPH_PROBE_TIMEOUT_SECS`
 /// is unset — short relative to the tick so a hung mgr decays rather than stalls.
 const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The fleet-wide rate a near-full ceiling carries when
+/// `CEPHOR_CEPH_NEARFULL_RATE_BPS` is unset. Deliberately far below any plausible
+/// `min_total`: the 2026-07-24 incident showed the AIMD floor (raised to 50 MB/s
+/// in prod) is an operator latency knob, not a fullness brake, so near-full must
+/// bound the drain through the ceiling clamp instead. 10 MB/s keeps a relief
+/// valve open for SSD pressure while a near-full pool fills in days, not hours.
+const DEFAULT_CEPH_NEARFULL_RATE_BPS: u64 = 10_000_000;
 
 /// How long a terminal (`replicated`/`failed`) replication row is kept before the periodic
 /// GC prunes it, when `CEPHOR_STATUS_RETENTION_SECS` is unset. A week comfortably exceeds
@@ -108,6 +115,13 @@ pub struct AllocatorConfig {
     pub ceph_mgr_metrics_url: Option<String>,
     /// The near-full / full watermarks the live probe classifies against.
     pub ceph_thresholds: CephThresholds,
+    /// The reduced fleet-wide rate a near-full ceiling carries
+    /// (`CEPHOR_CEPH_NEARFULL_RATE_BPS`).
+    pub ceph_nearfull_rate: ByteRate,
+    /// The pools whose `percent_used` additionally gate the live probe's ceiling
+    /// (`CEPHOR_CEPH_POOLS`, comma-separated; the fullest binds). Empty gates on
+    /// cluster-wide signals only.
+    pub ceph_pools: Vec<String>,
     /// Per-scrape timeout for the live probe.
     pub ceph_probe_timeout: Duration,
     /// Path of the liveness file the tick loop touches each iteration; a k8s
@@ -220,6 +234,8 @@ impl AllocatorConfig {
             alloc,
             ceph_mgr_metrics_url: optional(&get, "CEPHOR_CEPH_MGR_METRICS_URL"),
             ceph_thresholds: ceph_thresholds(&get)?,
+            ceph_nearfull_rate: ByteRate::new(positive_u64(&get, "CEPHOR_CEPH_NEARFULL_RATE_BPS", DEFAULT_CEPH_NEARFULL_RATE_BPS)?),
+            ceph_pools: name_list(&get, "CEPHOR_CEPH_POOLS"),
             ceph_probe_timeout: duration_secs(&get, "CEPHOR_CEPH_PROBE_TIMEOUT_SECS", DEFAULT_PROBE_TIMEOUT)?,
             liveness_file: path_or(&get, "CEPHOR_LIVENESS_FILE", DEFAULT_LIVENESS_FILE),
             status_retention: duration_secs(&get, "CEPHOR_STATUS_RETENTION_SECS", DEFAULT_STATUS_RETENTION)?,
@@ -252,6 +268,21 @@ fn required(get: &impl Fn(&str) -> Option<String>, var: &'static str) -> Result<
 /// absent — a blank mgr URL must not select the probe with an unusable endpoint.
 fn optional(get: &impl Fn(&str) -> Option<String>, var: &'static str) -> Option<String> {
     get(var).filter(|value| !value.trim().is_empty())
+}
+
+/// Resolves a comma-separated name list: entries are trimmed, blanks dropped, so
+/// `"a, b,,c "` reads as `["a","b","c"]` and an unset or all-blank variable as empty.
+fn name_list(get: &impl Fn(&str) -> Option<String>, var: &'static str) -> Vec<String> {
+    get(var)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Resolves an optional path variable, falling back to `default` when unset or blank.
@@ -519,15 +550,56 @@ mod tests {
             osd_full: false,
             osd_nearfull: false,
             used: Some(DiskPressure::try_from(bps).unwrap()),
+            pool_used: None,
         };
         assert_eq!(
-            classify(&report(8_500), config.ceph_ceiling, &config.ceph_thresholds),
-            CephCeiling::NearFull(config.ceph_ceiling)
+            classify(&report(8_500), config.ceph_ceiling, config.ceph_nearfull_rate, &config.ceph_thresholds),
+            CephCeiling::NearFull(config.ceph_nearfull_rate)
         );
         assert_eq!(
-            classify(&report(9_500), config.ceph_ceiling, &config.ceph_thresholds),
+            classify(&report(9_500), config.ceph_ceiling, config.ceph_nearfull_rate, &config.ceph_thresholds),
             CephCeiling::Critical
         );
+    }
+
+    #[test]
+    fn the_pool_gate_and_nearfull_rate_default_off_and_conservative() {
+        let config = AllocatorConfig::from_lookup(lookup(&required_only())).unwrap();
+        assert!(config.ceph_pools.is_empty(), "pool gating is opt-in per deployment");
+        assert_eq!(config.ceph_nearfull_rate, ByteRate::new(10_000_000));
+    }
+
+    #[test]
+    fn the_pools_and_nearfull_rate_are_read_from_the_environment() {
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_CEPH_POOLS", "ceph-filesystem-data0, ceph-filesystem-metadata,ceph-blockpool"));
+        pairs.push(("CEPHOR_CEPH_NEARFULL_RATE_BPS", "5000000"));
+        let config = AllocatorConfig::from_lookup(lookup(&pairs)).unwrap();
+        assert_eq!(config.ceph_pools, ["ceph-filesystem-data0", "ceph-filesystem-metadata", "ceph-blockpool"]);
+        assert_eq!(config.ceph_nearfull_rate, ByteRate::new(5_000_000));
+    }
+
+    #[test]
+    fn a_blank_pool_list_is_treated_as_absent() {
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_CEPH_POOLS", " , ,"));
+        let config = AllocatorConfig::from_lookup(lookup(&pairs)).unwrap();
+        assert!(config.ceph_pools.is_empty(), "commas and whitespace alone select no pools");
+    }
+
+    #[test]
+    fn a_zero_nearfull_rate_is_rejected() {
+        // Zero would silence the near-full relief valve entirely; a full stop is
+        // Critical's job, so a zero here is a misconfiguration.
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_CEPH_NEARFULL_RATE_BPS", "0"));
+        let err = AllocatorConfig::from_lookup(lookup(&pairs)).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::NonPositive {
+                var: "CEPHOR_CEPH_NEARFULL_RATE_BPS"
+            }
+        ));
     }
 
     #[test]

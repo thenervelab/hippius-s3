@@ -101,14 +101,21 @@ async fn run_with_ceiling_source(coord: &Coordinator, config: &AllocatorConfig, 
     if let Some(url) = config.ceph_mgr_metrics_url.clone() {
         // The decay floor is the AIMD floor: while the probe is blind, the fleet
         // backs off toward the same conservative rate the allocator never drops below.
-        let probe = hippius_drain_allocator::probe::CephProbe::new(
-            url.clone(),
-            config.ceph_ceiling,
-            config.alloc.min_total,
-            config.ceph_thresholds,
-            config.ceph_probe_timeout,
-        )?;
-        tracing::info!(mgr_url = %url, "driving the budget from the live ceph-mgr ceiling probe");
+        let probe = hippius_drain_allocator::probe::CephProbe::new(hippius_drain_allocator::probe::ProbeSettings {
+            url: url.clone(),
+            ceiling_rate: config.ceph_ceiling,
+            nearfull_rate: config.ceph_nearfull_rate,
+            floor: config.alloc.min_total,
+            thresholds: config.ceph_thresholds,
+            timeout: config.ceph_probe_timeout,
+            pools: config.ceph_pools.clone(),
+        })?;
+        tracing::info!(
+            mgr_url = %url,
+            pools = config.ceph_pools.join(","),
+            nearfull_rate_bps = config.ceph_nearfull_rate.get(),
+            "driving the budget from the live ceph-mgr ceiling probe"
+        );
         drive(coord, &probe, config, metrics).await;
         return Ok(());
     }
