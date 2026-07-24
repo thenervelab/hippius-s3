@@ -29,6 +29,33 @@ spec:
     shared_preload_libraries:
     - pg_stat_statements
     parameters:
+      # --- autovacuum: tuned for NVMe + 100GB-class tables (2026-07-24) ---
+      # This cluster carries 30-103GB tables. With the stock cost_limit (200, a spinning-disk
+      # value that throttles vacuum to a few MB/s) autovacuum could not finish a 56GB table
+      # before a lock cancelled it, so chunk_backend (43% dead) and object_versions had NEVER
+      # completed an autovacuum, the freeze horizon aged to 188M/200M (~22h from a forced
+      # anti-wraparound storm), and an ordinary vacuum of `parts` at 07:33 UTC saturated the
+      # NVMe enough to make a 24ms ListObjects take 3.5 min and time out the smoke suite.
+      # Full write-up + the one-time manual catch-up in psql-nvme-issue.md.
+      #
+      # 3000 not 200: raises vacuum's I/O budget ~15x so a big-table vacuum finishes rather than
+      # being cancelled mid-run. NVMe here (random_page_cost 1.1), so it absorbs it, and it stays
+      # throttled by autovacuum_vacuum_cost_delay (2ms default) — this is "fast enough to finish",
+      # not "unthrottled". Deliberately NOT raising autovacuum_max_workers: the cost budget is
+      # SHARED across workers, so more workers each run slower.
+      autovacuum_vacuum_cost_limit: '3000'
+      # 100k not the PG18 default of 100M: caps the trigger at an absolute dead-tuple count so a
+      # huge table can't wait for scale_factor*rows (tens of millions) to go dead first. Paired
+      # with per-table autovacuum_vacuum_scale_factor overrides (0.02-0.05) applied via ALTER
+      # TABLE on chunk_backend/object_versions/multipart_uploads/objects/parts/part_chunks — those
+      # are catalog storage params, not postgresql.conf, so they live in the DB, documented in
+      # psql-nvme-issue.md so a cluster rebuild re-applies them.
+      autovacuum_vacuum_max_threshold: '100000'
+      # 0 not 600000 (10min): the old value hid the problem — a vacuum that starts, runs a few
+      # minutes and is cancelled before completing logged NOTHING, so the never-finishing tables
+      # were invisible. Logging every autovacuum makes a still-failing table visible. Can be
+      # dialled up to '1000' (>=1s) once we've confirmed autovacuum is healthy on the big tables.
+      log_autovacuum_min_duration: '0'
       checkpoint_completion_target: '0.9'
       checkpoint_timeout: 15min
       default_statistics_target: '500'
