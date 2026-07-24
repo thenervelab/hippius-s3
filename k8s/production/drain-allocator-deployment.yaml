@@ -98,11 +98,20 @@ spec:
             # near-full, so the ceiling stayed Open all night. Every pool this stack
             # writes is listed (CephFS data + metadata, and the RBD blockpool backing
             # the Postgres/Redis PVCs); the fullest one gates: NearFull at 85% caps
-            # the drain at CEPHOR_CEPH_NEARFULL_RATE_BPS (default 10 MB/s fleet-wide —
-            # deliberately below the min_total floor above, which is a latency knob,
-            # not a fullness brake), Critical at 95% stops it.
+            # the drain at CEPHOR_CEPH_NEARFULL_RATE_BPS, Critical at 95% stops it.
             - name: CEPHOR_CEPH_POOLS
               value: "ceph-filesystem-data0,ceph-filesystem-metadata,ceph-blockpool"
+            # 50 MB/s, not the code-default 10 MB/s (2026-07-24 evening lesson): fresh
+            # writes are readable ONLY from their ingest node's SSD until drained, and
+            # this workload reads its writes cross-node within seconds. At 10 MB/s the
+            # cap sat below live ingest — the backlog grew 0->185 GB in 3h and every
+            # cross-node GET of a fresh object 503'd ("parts not ready"). 50 MB/s keeps
+            # the backlog draining under NearFull; the 95% Critical stop (zero budget)
+            # is the actual pool protection, and the janitor's pool-gated eviction has
+            # outpaced a 50 MB/s drain all day. Must stay <= CEPHOR_CEPH_CEILING_BPS
+            # (config-enforced) and should move WITH the ceph watermarks if retuned.
+            - name: CEPHOR_CEPH_NEARFULL_RATE_BPS
+              value: "50000000"
           resources:
             requests:
               cpu: 50m
