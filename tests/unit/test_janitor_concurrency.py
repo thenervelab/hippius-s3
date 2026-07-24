@@ -404,12 +404,19 @@ async def test_main_loop_refreshes_disk_metrics_before_phases(monkeypatch):
         order.append(name)
         return 0
 
+    async def _unified_stub(*a, **k):
+        order.append("unified")
+        return {"stale_mtime": 0, "abandoned": 0, "gc": 0, "tmp": 0}
+
     monkeypatch.setattr(
         janitor, "_update_disk_metrics", AsyncMock(side_effect=lambda root: order.append("disk_metrics"))
     )
-    monkeypatch.setattr(janitor, "cleanup_stale_parts", lambda *a, **k: _phase_stub("phase1"))
-    monkeypatch.setattr(janitor, "cleanup_old_parts_by_mtime", lambda *a, **k: _phase_stub("phase2"))
-    monkeypatch.setattr(janitor, "cleanup_orphan_tmp_files", lambda *a, **k: _phase_stub("phase3"))
+    # The three FS-walk phases are now ONE unified walk; patch it (and the DB-only durability
+    # phases) so nothing crawls a real tree.
+    monkeypatch.setattr(janitor, "cleanup_parts_unified", _unified_stub)
+    monkeypatch.setattr(janitor, "check_replication_sentinel", AsyncMock(return_value=0))
+    monkeypatch.setattr(janitor, "get_all_dlq_object_ids", AsyncMock(return_value=set()))
+    monkeypatch.setattr(janitor, "check_aged_pending_orphans", AsyncMock(return_value=0))
     monkeypatch.setattr(janitor, "gc_soft_deleted_objects", lambda *a, **k: _phase_stub("phase4"))
     monkeypatch.setattr(janitor, "_setup_janitor_metrics", lambda: None)
     monkeypatch.setattr(janitor, "create_fs_store", lambda config: MagicMock(root=Path("/tmp")))
@@ -432,4 +439,4 @@ async def test_main_loop_refreshes_disk_metrics_before_phases(monkeypatch):
         await janitor.run_janitor_loop()
 
     assert order[0] == "disk_metrics", f"disk metrics must refresh before any phase; got {order}"
-    assert order[:3] == ["disk_metrics", "phase1", "phase2"]
+    assert order[:3] == ["disk_metrics", "unified", "phase4"]

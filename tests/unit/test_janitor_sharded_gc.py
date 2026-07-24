@@ -251,6 +251,10 @@ async def test_durability_phases_run_before_fs_walks(monkeypatch):
         order.append(name)
         return ret
 
+    async def _rec_unified(*a, **k):
+        order.append("fs_unified")
+        return {"stale_mtime": 0, "abandoned": 0, "gc": 0, "tmp": 0}
+
     monkeypatch.setattr(
         janitor, "_update_disk_metrics", AsyncMock(side_effect=lambda root: order.append("disk_metrics"))
     )
@@ -258,9 +262,7 @@ async def test_durability_phases_run_before_fs_walks(monkeypatch):
     monkeypatch.setattr(janitor, "check_replication_sentinel", lambda *a, **k: _rec("sentinel"))
     monkeypatch.setattr(janitor, "get_all_dlq_object_ids", lambda *a, **k: _rec("dlq", set()))
     monkeypatch.setattr(janitor, "check_aged_pending_orphans", lambda *a, **k: _rec("aged_orphans"))
-    monkeypatch.setattr(janitor, "cleanup_stale_parts", lambda *a, **k: _rec("fs_stale"))
-    monkeypatch.setattr(janitor, "cleanup_old_parts_by_mtime", lambda *a, **k: _rec("fs_gc"))
-    monkeypatch.setattr(janitor, "cleanup_orphan_tmp_files", lambda *a, **k: _rec("fs_tmp"))
+    monkeypatch.setattr(janitor, "cleanup_parts_unified", _rec_unified)
     monkeypatch.setattr(janitor, "gc_soft_deleted_objects", lambda *a, **k: _rec("hard_delete"))
     monkeypatch.setattr(janitor, "_setup_janitor_metrics", lambda: None)
     monkeypatch.setattr(janitor, "create_fs_store", lambda config: MagicMock(root=Path("/tmp")))
@@ -279,10 +281,10 @@ async def test_durability_phases_run_before_fs_walks(monkeypatch):
         await janitor.run_janitor_loop()
 
     assert "sentinel" in order and "aged_orphans" in order
-    # both durability signals must precede every FS-walk phase
-    first_fs = min(order.index(p) for p in ("fs_stale", "fs_gc", "fs_tmp"))
-    assert order.index("sentinel") < first_fs, f"sentinel must run before FS walks; got {order}"
-    assert order.index("aged_orphans") < first_fs, f"aged-orphan gauge must run before FS walks; got {order}"
+    # both durability signals must precede the unified FS walk
+    first_fs = order.index("fs_unified")
+    assert order.index("sentinel") < first_fs, f"sentinel must run before the FS walk; got {order}"
+    assert order.index("aged_orphans") < first_fs, f"aged-orphan gauge must run before the FS walk; got {order}"
 
 
 @pytest.mark.asyncio
@@ -295,22 +297,16 @@ async def test_disk_pressure_collapses_the_walk_to_a_single_whole_tree_shard(mon
     async def _shards_passed_at_pressure(pressure: int) -> dict:
         captured: dict = {}
 
-        async def _capture_stale(*a, **k):
-            captured["stale"] = k.get("shards")
-            return 0
-
-        async def _capture_gc(*a, **k):
-            captured["gc"] = k.get("shards")
-            return 0
+        async def _capture_unified(*a, **k):
+            captured["unified"] = k.get("shards")
+            return {"stale_mtime": 0, "abandoned": 0, "gc": 0, "tmp": 0}
 
         monkeypatch.setattr(janitor, "_update_disk_metrics", AsyncMock(return_value=None))
         monkeypatch.setattr(janitor, "_pressure_mode", lambda root: pressure)
         monkeypatch.setattr(janitor, "check_replication_sentinel", AsyncMock(return_value=0))
         monkeypatch.setattr(janitor, "get_all_dlq_object_ids", AsyncMock(return_value=set()))
         monkeypatch.setattr(janitor, "check_aged_pending_orphans", AsyncMock(return_value=0))
-        monkeypatch.setattr(janitor, "cleanup_stale_parts", _capture_stale)
-        monkeypatch.setattr(janitor, "cleanup_old_parts_by_mtime", _capture_gc)
-        monkeypatch.setattr(janitor, "cleanup_orphan_tmp_files", AsyncMock(return_value=0))
+        monkeypatch.setattr(janitor, "cleanup_parts_unified", _capture_unified)
         monkeypatch.setattr(janitor, "gc_soft_deleted_objects", AsyncMock(return_value=0))
         monkeypatch.setattr(janitor, "_setup_janitor_metrics", lambda: None)
         monkeypatch.setattr(janitor, "create_fs_store", lambda config: MagicMock(root=Path("/tmp")))
@@ -331,11 +327,9 @@ async def test_disk_pressure_collapses_the_walk_to_a_single_whole_tree_shard(mon
     # Elevated (1) AND critical (2) both force the whole-tree single-shard walk.
     for pressure in (1, 2):
         captured = await _shards_passed_at_pressure(pressure)
-        assert captured["stale"] == 1, f"pressure={pressure} must force shards=1 (stale phase), got {captured}"
-        assert captured["gc"] == 1, f"pressure={pressure} must force shards=1 (age-GC phase), got {captured}"
+        assert captured["unified"] == 1, f"pressure={pressure} must force shards=1 (unified walk), got {captured}"
 
     # Normal pressure keeps the configured sharded sweep.
     normal = await _shards_passed_at_pressure(0)
     expected = max(1, janitor.config.janitor_walk_shards)
-    assert normal["stale"] == expected, f"normal pressure must use the configured shard count, got {normal}"
-    assert normal["gc"] == expected, f"normal pressure must use the configured shard count, got {normal}"
+    assert normal["unified"] == expected, f"normal pressure must use the configured shard count, got {normal}"
