@@ -238,12 +238,23 @@ class Config:
     # stream breaks and the client retries). Generous (5 min) so a healthy-but-slow drain never
     # trips it, but far below the 1h cache TTL.
     stream_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_CHUNK_TIMEOUT_SECONDS:300", convert=int)
-    # Hot-retention window for the FS cache: chunks read within this window
-    # are protected from janitor deletion so frequently-accessed content
-    # stays on NVMe. Touched on every read by the API/streamer. Tightened from
-    # 3h to 1h (2026-07-24): a fuller default eviction floor clears cold cache
-    # sooner; a missed re-fetch is one backend read, cheap next to a full pool.
-    fs_cache_hot_retention_seconds: int = env("HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS:3600", convert=int)
+    # Hot-retention window for the FS cache: chunks read within this window are protected from
+    # janitor deletion so frequently-accessed content stays on NVMe. Touched on every read by the
+    # API/streamer, and HALVED at elevated pressure / zeroed at critical (_effective_hot_retention).
+    #
+    # 4h, raised from 1h on 2026-07-25. The 1h value (itself tightened from 3h earlier the same day,
+    # on the theory that "a missed re-fetch is one backend read, cheap next to a full pool") turned
+    # out to have the causality backwards: the janitor has NO LRU — it evicts on a binary atime
+    # threshold in filesystem-walk order — so this window IS the working-set protection. Too short
+    # and the live working set reads as "cold", gets evicted, is re-read, re-fetched from a backend
+    # and re-written into the pool. That refill flywheel is what pinned the CephFS pool near-full
+    # during the 2026-07-24 incident: pool writes ran at 172 MiB/s of pure churn and eviction never
+    # got ahead. Raising the window collapsed it to ~54 MiB/s and the pool finally drained.
+    #
+    # 4h is empirically cheap: it retains only ~6% of walked parts (hot_parts 3546 / parts_seen
+    # 56666 at pressure 0). Prod carries the same value in k8s/base/workers-deployments.yaml — keep
+    # the two in step, and do not "optimise" this downward without re-checking the churn rate.
+    fs_cache_hot_retention_seconds: int = env("HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS:14400", convert=int)
     # Unified object part chunk size (bytes) for cache and range math
     object_chunk_size_bytes: int = env("HIPPIUS_CHUNK_SIZE_BYTES:4194304", convert=int)
     # Downloader behavior (default: no whole-part backfill)
