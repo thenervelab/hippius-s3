@@ -240,8 +240,10 @@ class Config:
     stream_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_CHUNK_TIMEOUT_SECONDS:300", convert=int)
     # Hot-retention window for the FS cache: chunks read within this window
     # are protected from janitor deletion so frequently-accessed content
-    # stays on NVMe. Touched on every read by the API/streamer.
-    fs_cache_hot_retention_seconds: int = env("HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS:10800", convert=int)
+    # stays on NVMe. Touched on every read by the API/streamer. Tightened from
+    # 3h to 1h (2026-07-24): a fuller default eviction floor clears cold cache
+    # sooner; a missed re-fetch is one backend read, cheap next to a full pool.
+    fs_cache_hot_retention_seconds: int = env("HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS:3600", convert=int)
     # Unified object part chunk size (bytes) for cache and range math
     object_chunk_size_bytes: int = env("HIPPIUS_CHUNK_SIZE_BYTES:4194304", convert=int)
     # Downloader behavior (default: no whole-part backfill)
@@ -402,7 +404,7 @@ class Config:
     # Bounded concurrency for the janitor's per-part DB checks + deletes. The
     # cleanup loops are DB-roundtrip bound; this is how many parts are processed
     # in parallel (each over its own pooled connection).
-    janitor_concurrency: int = env("HIPPIUS_JANITOR_CONCURRENCY:16", convert=int)
+    janitor_concurrency: int = env("HIPPIUS_JANITOR_CONCURRENCY:32", convert=int)
     # Concurrency for the FS *walk* itself (distinct from janitor_concurrency, which is the
     # per-part DB roundtrip fan-out). The cache root is a single flat directory of millions of
     # object dirs on CephFS; a single-threaded walk is metadata-latency bound (~40 objects/s
@@ -417,7 +419,7 @@ class Config:
     # completes and the phases after it — plus the DB-only durability sentinel + aged-orphan
     # gauge which now run FIRST regardless — keep ticking. 0 = unbounded. Automatically lifted to
     # unbounded under CRITICAL disk pressure — freeing space must never be capped by a clock.
-    janitor_walk_budget_seconds: int = env("HIPPIUS_JANITOR_WALK_BUDGET_SECONDS:240", convert=int)
+    janitor_walk_budget_seconds: int = env("HIPPIUS_JANITOR_WALK_BUDGET_SECONDS:480", convert=int)
     # Number of hash-shards the FS walk rotates through, one per cycle, for FAIR coverage: each
     # cycle descends only into object dirs where crc32(object_id) % shards == cycle_shard, so a
     # full sweep of the tree takes `shards` cycles and no object waits behind an always-truncated
@@ -428,6 +430,20 @@ class Config:
     # normal sleep). Raise it if the cache grows or the walk logs truncated=True; 1 = walk the
     # whole tree every cycle. Forced to 1 under disk pressure so eviction sees the whole tree.
     janitor_walk_shards: int = env("HIPPIUS_JANITOR_WALK_SHARDS:64", convert=int)
+    # Pool-fullness gate for the janitor's disk-pressure probe. _pressure_mode reads statvfs on the
+    # cache mount, which sees the CephFS *PVC quota* — NOT the backing pool. On 2026-07-24 statvfs
+    # read 69% while ceph-filesystem-data0 sat at 94%, so the janitor stayed in Normal mode (10min
+    # sleep, 64-shard sweep, hot retention honored) while the pool filled to the read-only cliff.
+    # When BOTH are set, the janitor also scrapes ceph_pool_percent_used for these pools from the
+    # mgr exporter (the same signal PR #337 gave the drain allocator) and takes the MAX of that and
+    # the local statvfs ratio: the pool signal can only ever RAISE pressure, never mask it. Empty =
+    # statvfs-only (pre-incident behavior). Point the URL at the mgr exporter and list the same
+    # pools as the drain's CEPHOR_CEPH_POOLS.
+    janitor_ceph_mgr_metrics_url: str = env("HIPPIUS_JANITOR_CEPH_MGR_METRICS_URL:")
+    janitor_ceph_pools: str = env("HIPPIUS_JANITOR_CEPH_POOLS:")
+    # Per-scrape timeout for the pool-fullness probe; short relative to the cycle so a hung mgr
+    # falls back to statvfs rather than stalling the loop.
+    janitor_ceph_probe_timeout_seconds: float = env("HIPPIUS_JANITOR_CEPH_PROBE_TIMEOUT_SECONDS:5", convert=float)
     # Max soft-deleted objects hard-deleted per janitor cycle. The find query is
     # an index-probe over this many candidates; keep it bounded so a large
     # backlog drains gradually instead of in one DELETE-cascade burst.
