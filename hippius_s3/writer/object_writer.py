@@ -892,6 +892,13 @@ class ObjectWriter:
             object_version=int(object_version),
             chunk_cipher_sizes=chunk_cipher_sizes,
         )
+        # The part's chunks+meta are on FS; record it so the janitor's SQL discovery finds it.
+        # Advisory-only, on the autocommit pool (no open transaction here — upsert_part_placeholder
+        # above also writes via self.pool). This hook also covers the APPEND path, which materializes
+        # its delta part through mpu_upload_part_stream. The dead CacheWriter (todo.md) and the
+        # script-only non-streaming put paths are intentionally unhooked — the janitor walk sweep
+        # backfills any inventory rows they would have written.
+        await fs_cache_inventory.record_cached(self.pool, str(object_id), int(object_version), int(part_number))
         perf_post_ms = (time.monotonic() - perf_post_start) * 1000
 
         throughput_mbps = (
