@@ -385,6 +385,42 @@ mod tests {
     }
 
     #[test]
+    fn a_nearfull_budget_caps_capacity_below_the_aimd_floor() {
+        // Regression for the 2026-07-24 incident: ops had raised min_total to 50 MB/s
+        // (for latency reasons), and NearFull carried the full open rate, so the only
+        // brake was the AIMD floor — five nodes kept flushing 10 MB/s each into a
+        // ~98%-full pool. The NearFull budget must bound the distributed total even
+        // when the AIMD estimate is pinned at a floor far above it.
+        let min_total = ByteRate::new(50_000_000);
+        let cfg = AllocConfig { min_total, ..config() };
+        let nearfull_rate = ByteRate::new(10_000_000);
+        let fleet = fleet_of(&[
+            node("a", 5_000, 10_000_000_000, 1_000_000_000),
+            node("b", 5_000, 10_000_000_000, 1_000_000_000),
+            node("c", 5_000, 10_000_000_000, 1_000_000_000),
+            node("d", 5_000, 10_000_000_000, 1_000_000_000),
+            node("e", 5_000, 10_000_000_000, 1_000_000_000),
+        ]);
+        let plan = allocate(
+            &fleet,
+            CephCeiling::NearFull(nearfull_rate),
+            BudgetController::new(ByteRate::new(1_000_000_000)),
+            &cfg,
+        );
+        let distributed: u64 = plan.allocations.iter().map(|a| a.budget.get()).sum();
+        assert!(
+            distributed <= nearfull_rate.get(),
+            "NearFull({nearfull}) must bound the fleet total; got {distributed} (AIMD floor {floor})",
+            nearfull = nearfull_rate.get(),
+            floor = min_total.get(),
+        );
+        assert!(
+            plan.controller.total().get() >= min_total.get(),
+            "the carried AIMD estimate keeps its floor so the fleet resumes promptly when the ceiling reopens",
+        );
+    }
+
+    #[test]
     fn a_healthy_slow_fleet_ramps_the_estimate_up() {
         // Regression for the drain throttle deadlock: a whole-part SSD->CephFS drain has a p99 of
         // hundreds of ms even when perfectly healthy (measured ~330-410 ms on staging). With a

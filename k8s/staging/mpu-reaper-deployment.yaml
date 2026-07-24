@@ -22,6 +22,12 @@ spec:
         app: mpu-reaper
         worker-type: mpu-reaper
     spec:
+      # Workers take no inbound traffic, so there is no preStop endpoint-propagation wait —
+      # this is purely drain headroom. run_worker() cancels the loop on SIGTERM and bounds the
+      # cleanup at HIPPIUS_WORKER_DRAIN_TIMEOUT_SECONDS (20s), and that cleanup closing the
+      # asyncpg pool is what stops a long statement outliving the pod and pinning the xmin
+      # horizon. 40 leaves headroom over the 20s bound.
+      terminationGracePeriodSeconds: 40
       initContainers:
         - name: wait-for-services
           image: busybox:1.35

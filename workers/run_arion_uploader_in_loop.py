@@ -31,6 +31,7 @@ from hippius_s3.services.ray_id_service import ray_id_context
 from hippius_s3.workers.errors import classify_error
 from hippius_s3.workers.errors import compute_backoff_ms
 from hippius_s3.workers.errors import extract_http_status_code
+from hippius_s3.workers.shutdown import run_worker
 from hippius_s3.workers.uploader import Uploader
 
 
@@ -212,4 +213,4 @@ async def run_arion_uploader_loop():
 
 
 if __name__ == "__main__":
-    asyncio.run(run_arion_uploader_loop())
+    run_worker(run_arion_uploader_loop, "arion-uploader")

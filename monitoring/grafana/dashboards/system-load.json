@@ -2141,7 +2141,8 @@
         }
       ],
       "title": "Cache parts on disk",
-      "type": "stat"
+      "type": "stat",
+      "description": "Census from the last COMPLETED GC phase. If 'Janitor cycle health' shows a stuck/never-completed cycle, this is stale rather than zero."
     },
     {
       "collapsed": false,
@@ -2440,7 +2441,8 @@
         }
       ],
       "title": "Cache age distribution",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Census from the last COMPLETED GC phase \u2014 see 'Janitor cycle health'. All-zero with a non-zero cache disk means the phase has not finished."
     },
     {
       "datasource": {
@@ -2620,12 +2622,17 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
-          "expr": "sum(rate(fs_janitor_deleted_total{service_namespace=\"$namespace\"}[10m]))",
-          "legendFormat": "GC rate",
+          "expr": "sum by (reason) (rate(fs_janitor_deleted_total{service_namespace=\"$namespace\"}[10m]))",
+          "legendFormat": "{{reason}}",
           "refId": "A"
+        },
+        {
+          "expr": "sum(rate(fs_janitor_tmp_deleted_total{service_namespace=\"$namespace\"}[10m]))",
+          "legendFormat": "orphan tmp",
+          "refId": "B"
         }
       ],
-      "title": "GC rate",
+      "title": "Janitor delete rate (by reason)",
       "type": "timeseries"
     },
     {
@@ -3117,8 +3124,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max(drain_ssd_backlog_bytes{service_namespace=\"$namespace\"})",
-          "legendFormat": "backlog",
+          "expr": "max by (service_instance_id) (drain_ssd_backlog_bytes{service_namespace=\"$namespace\"})",
+          "legendFormat": "{{service_instance_id}}",
           "refId": "A"
         }
       ],
@@ -3637,6 +3644,105 @@
       ],
       "title": "Account cacher \u2014 cycles",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 0,
+        "y": 64
+      },
+      "id": 65,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "expr": "max(fs_janitor_last_cycle_age_seconds{service_namespace=\"$namespace\"})",
+          "legendFormat": "since last completed cycle",
+          "refId": "A"
+        },
+        {
+          "expr": "max(fs_janitor_cycle_seconds{service_namespace=\"$namespace\"})",
+          "legendFormat": "last cycle duration",
+          "refId": "B"
+        }
+      ],
+      "title": "Janitor cycle health",
+      "type": "timeseries",
+      "description": "Seconds since the last COMPLETED janitor cycle (-1 = none since start). A line climbing without resetting means a phase is stuck and every census gauge on this dashboard is stale."
     }
   ],
   "preload": false,
