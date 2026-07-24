@@ -2087,27 +2087,78 @@ async def evict_from_inventory(
     return deleted_total
 
 
+# The hard-delete ring cursor's cold-start position: sorts strictly before every real (deleted_at,
+# object_id) pair, so a wrapped ring restarts at the oldest soft-deleted object. deleted_at is a
+# NATIVE timestamptz param ($2) — asyncpg rejects a string there — so the sentinel is the epoch
+# (soft-deletes are always after 1970); object_id ($3) is a uuid, so the sentinel is the nil-uuid.
+_HARD_DELETE_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_HARD_DELETE_NIL_UUID = "00000000-0000-0000-0000-000000000000"
+_HARD_DELETE_CURSOR_START: tuple[datetime, str] = (_HARD_DELETE_EPOCH, _HARD_DELETE_NIL_UUID)
+
+
+def _load_hard_delete_cursor(state: dict[str, Any] | None) -> tuple[datetime, str]:
+    """Parse the durable (deleted_at, object_id) ring cursor from janitor_state, falling back to the
+    epoch/nil-uuid ring-start on any malformed value. deleted_at is persisted as an ISO string (JSON
+    has no datetime) and parsed back to a datetime here for the native-timestamptz $2. A corrupt
+    cursor must restart the ring, never crash the phase."""
+    if not state:
+        return _HARD_DELETE_CURSOR_START
+    try:
+        return (datetime.fromisoformat(state["deleted_at"]), str(state["object_id"]))
+    except (TypeError, ValueError, KeyError):
+        return _HARD_DELETE_CURSOR_START
+
+
 async def gc_soft_deleted_objects(pool: asyncpg.Pool) -> int:
-    """Hard-delete objects where all backends have confirmed unpin."""
+    """Hard-delete soft-deleted objects whose backends have confirmed unpin, walking a durable keyset
+    RING so a permanently-unready head (e.g. a never-replicated CopyObject destination) can no longer
+    block the whole batch forever. The finder returns a (deleted_at, object_id)-ordered SLICE of ALL
+    soft-deleted candidates past grace — ready and not — with a per-row `ready` boolean; we hard-delete
+    only the ready ones via the guarded delete but advance the cursor over the ENTIRE slice, so the
+    next cycle resumes strictly after it. An empty slice wraps the ring back to the start."""
     async with pool.acquire() as db:
-        rows = await db.fetch(get_query("find_objects_ready_for_hard_delete"), config.janitor_hard_delete_batch)
+        cursor = _load_hard_delete_cursor(await get_janitor_state(db, "hard_delete_cursor"))
+        rows = await db.fetch(
+            get_query("find_objects_ready_for_hard_delete"),
+            config.janitor_hard_delete_batch,
+            *cursor,
+        )
+        if not rows:
+            await set_janitor_state(db, "hard_delete_cursor", {})  # ring wrap: restart at the head
+            logger.info("Hard-delete cycle: scanned=0 ready=0 deleted=0 skipped=0 wrapped=True")
+            return 0
+
+        ready = sum(1 for r in rows if r["ready"])
         deleted = 0
         skipped = 0
         for row in rows:
+            if not row["ready"]:
+                continue  # cursor still advances past it below — no head-of-line block
             try:
-                # Guarded delete: re-verifies readiness atomically so a row revived
-                # (re-PUT clears deleted_at + adds live chunks) between the find and
-                # here is left untouched. "DELETE 0" => skipped, not deleted.
+                # Guarded delete re-verifies readiness atomically (mirrors the finder), so a row
+                # revived between the find and here — re-PUT clears deleted_at + adds live chunks —
+                # is left untouched. "DELETE 0" => skipped, not deleted.
                 tag = await db.execute(get_query("hard_delete_object"), row["object_id"])
                 if tag == "DELETE 0":
                     skipped += 1
                     continue
                 deleted += 1
-                logger.info(f"Hard-deleted soft-deleted object: object_id={row['object_id']}")
             except Exception as e:
                 logger.warning(f"Failed to hard-delete object {row['object_id']}: {e}")
-        if skipped:
-            logger.info(f"Hard-delete skipped {skipped} object(s) no longer ready (revived/in-flight)")
+
+        last = rows[-1]
+        await set_janitor_state(
+            db,
+            "hard_delete_cursor",
+            {"deleted_at": last["deleted_at"].isoformat(), "object_id": str(last["object_id"])},
+        )
+        logger.info(
+            "Hard-delete cycle: scanned=%d ready=%d deleted=%d skipped=%d wrapped=False",
+            len(rows),
+            ready,
+            deleted,
+            skipped,
+        )
     return deleted
 
 
