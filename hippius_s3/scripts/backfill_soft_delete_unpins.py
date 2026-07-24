@@ -28,9 +28,17 @@ Resumable: keyset-paginates by (deleted_at, object_id); pass the last printed cu
 --start-after-ts/--start-after-id to resume. --loop re-scans from the start after each full
 pass (continuous sweeper mode) to catch newly soft-deleted objects.
 
+ROUTING (--backends): unpins go to `<backend>_unpin_requests` for each backend in
+`config.delete_backends` unless --backends overrides it. This matters: on prod
+delete_backends is ['arion'], but the objects that block the hard-delete scan have their
+LIVE rows on **ovh** (arion is already fully unpinned). Default routing would enqueue work
+that is already done and leave them stuck forever. `ovh_unpin_requests` is consumed by the
+s3-backup `cleanup` worker, which deletes from OVH *and* marks `chunk_backend.deleted`.
+
   python -m hippius_s3.scripts.backfill_soft_delete_unpins --dry-run
   python -m hippius_s3.scripts.backfill_soft_delete_unpins --batch 1000 --queue-cap 50000 \
-      --throttle-queues arion_unpin_requests
+      --backends ovh --deprecated-backends ipfs \
+      --throttle-queues arion_unpin_requests,ovh_unpin_requests
 """
 
 from __future__ import annotations
@@ -111,6 +119,12 @@ async def main_async(args: argparse.Namespace) -> int:
     config = get_config()
     deprecated = [b.strip() for b in args.deprecated_backends.split(",") if b.strip()]
     throttle_queues = [q.strip() for q in args.throttle_queues.split(",") if q.strip()]
+    backends = [b.strip() for b in args.backends.split(",") if b.strip()]
+    logger.info(
+        "unpin routing: %s (deprecated, reconciled in-DB: %s)",
+        f"--backends {backends}" if backends else f"config.delete_backends {config.delete_backends}",
+        deprecated or "none",
+    )
     db = await asyncpg.connect(config.database_url)
     redis_q = async_redis.from_url(config.redis_queues_url)
     initialize_queue_client(redis_q)
@@ -149,6 +163,8 @@ async def main_async(args: argparse.Namespace) -> int:
                                 address=r["main_account_id"],
                                 object_id=str(oid),
                                 object_version=int(r["object_version"]),
+                                # None => fall back to config.delete_backends (the live delete path).
+                                delete_backends=backends or None,
                             )
                         )
                         enqueued += 1
@@ -196,6 +212,18 @@ def main() -> None:
         "--deprecated-backends",
         default="ipfs",
         help="Comma-separated backends with no unpin worker; their rows are reconciled in-DB (no backend call)",
+    )
+    ap.add_argument(
+        "--backends",
+        default="",
+        help=(
+            "Comma-separated backends to route the unpins to, overriding config.delete_backends "
+            "(each becomes a `<backend>_unpin_requests` queue). REQUIRED when the blocking rows are "
+            "on a backend that delete_backends omits: on prod delete_backends is ['arion'] but the "
+            "stuck objects' live rows are on ovh, so the default routing enqueues work that is "
+            "already done and the objects stay un-hard-deletable. `ovh_unpin_requests` is consumed "
+            "by the s3-backup `cleanup` worker, which deletes from OVH AND marks chunk_backend."
+        ),
     )
     ap.add_argument("--max-objects", type=int, default=0, help="Stop after scanning this many objects (0 = all)")
     ap.add_argument("--sleep", type=float, default=0.0, help="Seconds to sleep between batches")
