@@ -220,6 +220,17 @@ impl AllocatorConfig {
             critical_pressure: critical_pressure(&get, "CEPHOR_ALLOC_CRITICAL_PRESSURE_BPS", DEFAULT_CRITICAL_PRESSURE_BPS)?,
             reservation_floor: ByteRate::new(u64_or(&get, "CEPHOR_ALLOC_RESERVATION_FLOOR_BPS", DEFAULT_RESERVATION_FLOOR_BPS)?),
         };
+        let ceph_ceiling = positive_u64(&get, "CEPHOR_CEPH_CEILING_BPS", DEFAULT_CEPH_CEILING_BPS)?;
+        let ceph_nearfull_rate = positive_u64(&get, "CEPHOR_CEPH_NEARFULL_RATE_BPS", DEFAULT_CEPH_NEARFULL_RATE_BPS)?;
+        if ceph_nearfull_rate > ceph_ceiling {
+            // NearFull carrying more budget than Open would invert the "fuller is
+            // never looser" ceiling invariant.
+            return Err(ConfigError::OutOfRange {
+                var: "CEPHOR_CEPH_NEARFULL_RATE_BPS",
+                value: ceph_nearfull_rate,
+                limit: ceph_ceiling,
+            });
+        }
         Ok(Self {
             database_url: required(&get, "CEPHOR_DATABASE_URL")?,
             instance_id: required(&get, "CEPHOR_ALLOCATOR_INSTANCE_ID")?,
@@ -227,14 +238,14 @@ impl AllocatorConfig {
             tick_interval: duration_secs(&get, "CEPHOR_ALLOCATOR_TICK_SECS", DEFAULT_TICK)?,
             redis_queues_url: required(&get, "REDIS_QUEUES_URL")?,
             alloc_ttl: duration_secs(&get, "CEPHOR_ALLOCATION_TTL_SECS", DEFAULT_ALLOCATION_TTL)?,
-            ceph_ceiling: ByteRate::new(positive_u64(&get, "CEPHOR_CEPH_CEILING_BPS", DEFAULT_CEPH_CEILING_BPS)?),
+            ceph_ceiling: ByteRate::new(ceph_ceiling),
             // The first tick starts from the AIMD floor unless overridden, so a
             // fresh leader ramps up from a safe rate rather than a guess.
             initial_total: ByteRate::new(u64_or(&get, "CEPHOR_ALLOC_INITIAL_TOTAL_BPS", min_total)?),
             alloc,
             ceph_mgr_metrics_url: optional(&get, "CEPHOR_CEPH_MGR_METRICS_URL"),
             ceph_thresholds: ceph_thresholds(&get)?,
-            ceph_nearfull_rate: ByteRate::new(positive_u64(&get, "CEPHOR_CEPH_NEARFULL_RATE_BPS", DEFAULT_CEPH_NEARFULL_RATE_BPS)?),
+            ceph_nearfull_rate: ByteRate::new(ceph_nearfull_rate),
             ceph_pools: name_list(&get, "CEPHOR_CEPH_POOLS"),
             ceph_probe_timeout: duration_secs(&get, "CEPHOR_CEPH_PROBE_TIMEOUT_SECS", DEFAULT_PROBE_TIMEOUT)?,
             liveness_file: path_or(&get, "CEPHOR_LIVENESS_FILE", DEFAULT_LIVENESS_FILE),
@@ -417,6 +428,9 @@ mod tests {
     fn tick_config_and_ceiling_reflect_the_config() {
         let mut pairs = required_only();
         pairs.push(("CEPHOR_CEPH_CEILING_BPS", "500000"));
+        // The tiny test ceiling sits below the default near-full rate, which the
+        // ordering check would (correctly) reject; pick a rate under the ceiling.
+        pairs.push(("CEPHOR_CEPH_NEARFULL_RATE_BPS", "100000"));
         let config = AllocatorConfig::from_lookup(lookup(&pairs)).unwrap();
         let tick = config.tick_config();
         assert_eq!(tick.instance_id, "alloc-1");
@@ -585,6 +599,24 @@ mod tests {
         pairs.push(("CEPHOR_CEPH_POOLS", " , ,"));
         let config = AllocatorConfig::from_lookup(lookup(&pairs)).unwrap();
         assert!(config.ceph_pools.is_empty(), "commas and whitespace alone select no pools");
+    }
+
+    #[test]
+    fn a_nearfull_rate_above_the_ceiling_is_rejected() {
+        // NearFull carrying more budget than Open would invert the "fuller is
+        // never looser" invariant the classifier property-tests.
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_CEPH_CEILING_BPS", "1000000000"));
+        pairs.push(("CEPHOR_CEPH_NEARFULL_RATE_BPS", "2000000000"));
+        let err = AllocatorConfig::from_lookup(lookup(&pairs)).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::OutOfRange {
+                var: "CEPHOR_CEPH_NEARFULL_RATE_BPS",
+                value: 2_000_000_000,
+                limit: 1_000_000_000,
+            }
+        ));
     }
 
     #[test]

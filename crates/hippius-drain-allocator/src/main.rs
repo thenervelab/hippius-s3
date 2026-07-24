@@ -119,6 +119,15 @@ async fn run_with_ceiling_source(coord: &Coordinator, config: &AllocatorConfig, 
         drive(coord, &probe, config, metrics).await;
         return Ok(());
     }
+    if !config.ceph_pools.is_empty() {
+        // The pool fullness gate only exists inside the live probe; pools configured
+        // without a mgr URL is the silent no-protection state that caused the
+        // 2026-07-24 incident, so it must be loud.
+        tracing::warn!(
+            pools = config.ceph_pools.join(","),
+            "CEPHOR_CEPH_POOLS is set but CEPHOR_CEPH_MGR_METRICS_URL is not; the pool fullness gate is INACTIVE on the static ceiling"
+        );
+    }
     tracing::info!("no ceph mgr url configured; using the static ceiling");
     drive(coord, &config.ceiling(), config, metrics).await;
     Ok(())
