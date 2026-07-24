@@ -2087,13 +2087,48 @@ async def evict_from_inventory(
     return deleted_total
 
 
+HARD_DELETE_CURSOR_KEY = "hard_delete_cursor"
+_HARD_DELETE_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_HARD_DELETE_ZERO_UUID = uuid.UUID("00000000-0000-0000-0000-000000000000")
+
+
 async def gc_soft_deleted_objects(pool: asyncpg.Pool) -> int:
-    """Hard-delete objects where all backends have confirmed unpin."""
+    """Hard-delete objects where all backends have confirmed unpin.
+
+    Keyset-paged over a DURABLE cursor (`janitor_state.hard_delete_cursor`) rather than always
+    re-reading the oldest batch. The oldest soft-deleted objects on prod are permanently un-ready
+    — their unpins were lost in the redis-queues unpin-overrun incident, so they still hold live
+    chunk_backend rows — and the un-cursored query re-scanned exactly those every cycle, returning
+    0 forever while ~33M ready objects queued behind them. See the SQL for the full write-up.
+
+    The cursor advances over EVERY scanned candidate (ready or not), so a stuck object costs one
+    page-slot per full sweep instead of blocking the phase permanently. A short page means the end
+    of the table was reached, so the cursor wraps to the epoch and the next cycle re-sweeps from
+    the start (picking up newly soft-deleted objects, and retrying stuck ones once per lap).
+
+    The cursor is advisory: it is persisted best-effort AFTER the deletes, so a crash mid-page
+    re-scans that page next cycle (harmless — hard_delete_object is idempotent and re-verifies
+    readiness atomically).
+    """
     async with pool.acquire() as db:
-        rows = await db.fetch(get_query("find_objects_ready_for_hard_delete"), config.janitor_hard_delete_batch)
+        state = await get_janitor_state(db, HARD_DELETE_CURSOR_KEY) or {}
+        raw_ts, raw_id = state.get("deleted_at"), state.get("object_id")
+        try:
+            cursor_ts = datetime.fromisoformat(raw_ts) if raw_ts else _HARD_DELETE_EPOCH
+            cursor_id = uuid.UUID(raw_id) if raw_id else _HARD_DELETE_ZERO_UUID
+        except (TypeError, ValueError):
+            # A corrupt/hand-edited cursor must not wedge the phase: restart the sweep.
+            logger.warning("Hard-delete cursor unparseable (%r, %r); restarting sweep", raw_ts, raw_id)
+            cursor_ts, cursor_id = _HARD_DELETE_EPOCH, _HARD_DELETE_ZERO_UUID
+
+        batch = config.janitor_hard_delete_batch
+        rows = await db.fetch(get_query("find_objects_ready_for_hard_delete"), batch, cursor_ts, cursor_id)
         deleted = 0
         skipped = 0
+        scanned = len(rows)
         for row in rows:
+            if not row["ready"]:
+                continue  # scanned-but-not-ready: the cursor still advances past it
             try:
                 # Guarded delete: re-verifies readiness atomically so a row revived
                 # (re-PUT clears deleted_at + adds live chunks) between the find and
@@ -2103,11 +2138,36 @@ async def gc_soft_deleted_objects(pool: asyncpg.Pool) -> int:
                     skipped += 1
                     continue
                 deleted += 1
-                logger.info(f"Hard-deleted soft-deleted object: object_id={row['object_id']}")
+                logger.debug(f"Hard-deleted soft-deleted object: object_id={row['object_id']}")
             except Exception as e:
                 logger.warning(f"Failed to hard-delete object {row['object_id']}: {e}")
         if skipped:
             logger.info(f"Hard-delete skipped {skipped} object(s) no longer ready (revived/in-flight)")
+
+        # Advance (or wrap) the cursor. A short page == end of table.
+        if scanned < batch:
+            next_ts, next_id, wrapped = _HARD_DELETE_EPOCH, _HARD_DELETE_ZERO_UUID, True
+        else:
+            last = rows[-1]
+            next_ts, next_id, wrapped = last["deleted_at"], last["object_id"], False
+        try:
+            await set_janitor_state(
+                db,
+                HARD_DELETE_CURSOR_KEY,
+                {"deleted_at": next_ts.isoformat(), "object_id": str(next_id)},
+            )
+        except Exception as e:
+            # Losing the cursor write only costs a re-scan of this page next cycle.
+            logger.warning(f"Failed to persist hard-delete cursor: {e}")
+        logger.info(
+            "Hard-delete phase: scanned=%d ready_deleted=%d skipped=%d wrapped=%s cursor=(%s, %s)",
+            scanned,
+            deleted,
+            skipped,
+            wrapped,
+            next_ts.isoformat(),
+            next_id,
+        )
     return deleted
 
 

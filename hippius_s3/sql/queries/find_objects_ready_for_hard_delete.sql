@@ -13,7 +13,8 @@
 -- exists per expected chunk — i.e. the object was actually replicated at
 -- some point, so the "all deleted" signal is meaningful.
 --
--- Parameter: $1 = batch size (max objects returned per call).
+-- Parameters: $1 = batch size (max objects SCANNED per call).
+--             $2 = cursor deleted_at, $3 = cursor object_id (keyset position).
 --
 -- We materialise a small batch of soft-deleted candidates FIRST, then apply
 -- the EXISTS/NOT EXISTS checks to just that batch. Without this, the planner
@@ -22,28 +23,54 @@
 -- parts on every call — a ~135 GiB read storm that saturated the data disk and
 -- stalled the primary (see oom-psql-postmortem.md). AS MATERIALIZED + LIMIT
 -- forces per-object index probes; the janitor drains the backlog over cycles.
+--
+-- HEAD-OF-LINE FIX (2026-07-24): the batch used to be a bare `ORDER BY deleted_at
+-- LIMIT $1` — always the SAME oldest N objects. Those oldest objects are permanently
+-- un-ready: their unpins were lost when the unpin queue was cleared during the
+-- redis-queues unpin-overrun incident, so they still hold LIVE chunk_backend rows and
+-- can never satisfy the NOT EXISTS. Measured on prod: of the 2000 oldest candidates
+-- 0 were ready, while 1577/2000 RECENT ones were. The janitor therefore re-scanned the
+-- same doomed batch every cycle and hard-deleted NOTHING (`hard_deleted=0` in every
+-- cycle) while ~33M ready objects queued behind them — leaving their `parts` rows in
+-- place, which in turn kept their FS cache dirs pinned (the replication gate reads an
+-- all-unpinned part as "unreplicated" and protects it). That is what filled the pool.
+--
+-- The keyset cursor ($2,$3) makes the scan ADVANCE past un-ready objects instead of
+-- restarting at the stuck head. The caller persists the cursor in `janitor_state` and
+-- wraps back to the epoch on a short page, so stuck objects are revisited once per full
+-- sweep (cheap) instead of blocking every cycle (fatal).
+--
+-- Returns EVERY scanned candidate with a `ready` flag — not just the ready ones — so the
+-- caller can advance the cursor over un-ready objects too. Returning only ready rows
+-- would leave the cursor pinned at the stuck head exactly as before.
 WITH candidates AS MATERIALIZED (
-    SELECT object_id
+    SELECT object_id, deleted_at
     FROM objects
     WHERE deleted_at IS NOT NULL
       AND deleted_at < now() - INTERVAL '1 hour'  -- grace period
-    ORDER BY deleted_at  -- oldest first; uses idx_objects_deleted
+      AND (deleted_at, object_id) > ($2::timestamptz, $3::uuid)
+    ORDER BY deleted_at, object_id  -- uses idx_objects_deleted
     LIMIT $1
 )
-SELECT c.object_id
+SELECT
+    c.object_id,
+    c.deleted_at,
+    (
+        EXISTS (
+            SELECT 1
+            FROM parts p
+            JOIN part_chunks pc ON pc.part_id = p.part_id
+            JOIN chunk_backend cb ON cb.chunk_id = pc.id
+            WHERE p.object_id = c.object_id
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM parts p
+            JOIN part_chunks pc ON pc.part_id = p.part_id
+            JOIN chunk_backend cb ON cb.chunk_id = pc.id
+            WHERE p.object_id = c.object_id
+              AND NOT cb.deleted
+        )
+    ) AS ready
 FROM candidates c
-WHERE EXISTS (
-      SELECT 1
-      FROM parts p
-      JOIN part_chunks pc ON pc.part_id = p.part_id
-      JOIN chunk_backend cb ON cb.chunk_id = pc.id
-      WHERE p.object_id = c.object_id
-  )
-  AND NOT EXISTS (
-      SELECT 1
-      FROM parts p
-      JOIN part_chunks pc ON pc.part_id = p.part_id
-      JOIN chunk_backend cb ON cb.chunk_id = pc.id
-      WHERE p.object_id = c.object_id
-        AND NOT cb.deleted
-  );
+ORDER BY c.deleted_at, c.object_id;
