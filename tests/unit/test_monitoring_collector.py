@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 
+from hippius_s3.metrics_collector_task import _redis_memory
 from hippius_s3.monitoring import MetricsCollector
 from hippius_s3.monitoring import NullMetricsCollector
 
@@ -38,3 +39,28 @@ def test_null_collector_no_ops_every_new_method() -> None:
 def test_dlq_requeue_ignores_nonpositive_counts(count: int) -> None:
     # A batch that requeued nothing must not emit a spurious increment.
     MetricsCollector().record_dlq_requeue(queue="q", count=count)
+
+
+# ------------------------------------------------------- redis memory gauge (cluster-aware)
+
+
+def test_redis_memory_reads_a_single_node_info() -> None:
+    used, cap = _redis_memory({"used_memory": 15354056, "maxmemory": 4294967296})
+    assert (used, cap) == (15354056, 4294967296)
+
+
+def test_redis_memory_sums_across_cluster_nodes() -> None:
+    """A RedisCluster fans INFO out to every primary and returns one mapping PER NODE, so the flat
+    `info["used_memory"]` lookup returned 0 and the gauge read empty for cluster-backed pods."""
+    info = {
+        "10.0.0.1:6379": {"used_memory": 100, "maxmemory": 1000},
+        "10.0.0.2:6379": {"used_memory": 250, "maxmemory": 1000},
+        "10.0.0.3:6379": {"used_memory": 50, "maxmemory": 1000},
+    }
+    assert _redis_memory(info) == (400, 3000)
+
+
+@pytest.mark.parametrize("info", [{}, {"n1": {}}, {"n1": {"used_memory": 5}, "n2": {}}])
+def test_redis_memory_tolerates_missing_fields(info: dict) -> None:
+    used, cap = _redis_memory(info)
+    assert used >= 0 and cap >= 0
