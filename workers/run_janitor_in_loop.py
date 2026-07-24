@@ -145,9 +145,7 @@ _janitor_cycle_seconds = 0.0
 
 JANITOR_PHASES = (
     "idle",
-    "stale_parts",
-    "gc_age",
-    "orphan_tmp",
+    "parts_unified",
     "soft_deleted",
     "sentinel",
     "aged_orphans",
@@ -379,12 +377,15 @@ class PartDirInfo:
 
 @dataclass
 class WalkState:
-    """Out-of-band result of a walk: whether the wall-clock budget truncated it, and how
-    many object dirs (in this shard) it reached. The census is only trustworthy for a full
-    (untruncated) sweep, so callers check `truncated` before publishing gauges."""
+    """Out-of-band result of a walk: whether the wall-clock budget truncated it, how
+    many object dirs (in this shard) it reached, and how many orphan `.tmp.*` files it
+    unlinked (only when the walk was asked to clean tmp — see `iter_part_dirs`'s
+    `tmp_cutoff`). The census is only trustworthy for a full (untruncated) sweep, so
+    callers check `truncated` before publishing gauges."""
 
     truncated: bool = False
     objects_scanned: int = 0
+    tmp_removed: int = 0
 
 
 def _object_in_shard(object_id: str, shard: int, shards: int) -> bool:
@@ -415,18 +416,48 @@ def _read_dir_batch(scan_it: Any, n: int) -> tuple[list[str], bool]:
     return names, False
 
 
-def _descend_object(root_str: str, object_name: str) -> list[PartDirInfo]:
+def _unlink_old_tmp_files(part_path: str, cutoff: float) -> int:
+    """Unlink `*.tmp.*` files older than `cutoff` directly under one part dir. Returns how many
+    were removed. Every FS error is a skip — the tree mutates underneath us. This is the
+    per-part-dir tmp-reap the standalone tmp walk used, extracted so the unified walk can apply
+    it in the SAME descent that gathers part stats (one visit per part dir, not two)."""
+    removed = 0
+    try:
+        file_scan = os.scandir(part_path)  # noqa: PTH208
+    except OSError:
+        return 0
+    with file_scan:
+        for f in file_scan:
+            if ".tmp." not in f.name:
+                continue
+            try:
+                if not f.is_file():
+                    continue
+                if f.stat().st_mtime > cutoff:
+                    continue
+                os.unlink(f.path)  # noqa: PTH108
+                removed += 1
+            except OSError:
+                continue
+    return removed
+
+
+def _descend_object(root_str: str, object_name: str, tmp_cutoff: float | None = None) -> tuple[list[PartDirInfo], int]:
     """Blocking descent of ONE object dir → its part dirs, run in a walk thread.
 
     Mirrors the serial walk exactly: `v<n>` version dirs, `part_<n>` part dirs, stat
     `meta.json` if present else the part dir. Every FS error is swallowed to a skip — the
-    tree is mutating underneath us. Returns the parts found (possibly empty)."""
+    tree is mutating underneath us. Returns `(parts, tmp_removed)`: the parts found (possibly
+    empty), and — when `tmp_cutoff` is not None — the count of orphan `.tmp.*` files older than
+    the cutoff unlinked from those part dirs (0 when `tmp_cutoff` is None; that keeps the legacy
+    stat-only callers byte-for-byte unchanged)."""
     out: list[PartDirInfo] = []
+    tmp_removed = 0
     obj_path = os.path.join(root_str, object_name)  # noqa: PTH118 — hot walk path, os.* avoids per-entry Path alloc
     try:
-        version_scan = os.scandir(obj_path)
+        version_scan = os.scandir(obj_path)  # noqa: PTH208
     except OSError:
-        return out
+        return out, tmp_removed
     with version_scan:
         for vd in version_scan:
             name = vd.name
@@ -442,7 +473,7 @@ def _descend_object(root_str: str, object_name: str) -> list[PartDirInfo]:
             except ValueError:
                 continue
             try:
-                part_scan = os.scandir(vd.path)
+                part_scan = os.scandir(vd.path)  # noqa: PTH208
             except OSError:
                 continue
             with part_scan:
@@ -455,6 +486,10 @@ def _descend_object(root_str: str, object_name: str) -> list[PartDirInfo]:
                             continue
                     except OSError:
                         continue
+                    # tmp reap runs on every valid part dir, BEFORE the part-number parse guard,
+                    # so it covers the same part dirs the standalone tmp walk did.
+                    if tmp_cutoff is not None:
+                        tmp_removed += _unlink_old_tmp_files(pd.path, tmp_cutoff)
                     try:
                         part_number = int(pname.split("_")[1])
                     except (ValueError, IndexError):
@@ -468,7 +503,7 @@ def _descend_object(root_str: str, object_name: str) -> list[PartDirInfo]:
                         except OSError:
                             continue
                     out.append(PartDirInfo(object_name, object_version, part_number, st.st_mtime, st.st_atime))
-    return out
+    return out, tmp_removed
 
 
 async def _stream_shard_object_names(
@@ -508,6 +543,7 @@ async def iter_part_dirs(
     shards: int,
     deadline: float | None,
     state: WalkState,
+    tmp_cutoff: float | None = None,
 ) -> AsyncIterator[PartDirInfo]:
     """Walk `root` and yield every part dir in the current shard, descending object dirs
     across a bounded thread pool so many CephFS metadata roundtrips are in flight at once.
@@ -517,25 +553,34 @@ async def iter_part_dirs(
     on prod). Callers apply their own per-part gating + census to the yielded records; the
     deletion logic downstream is unchanged.
 
+    When `tmp_cutoff` is not None the SAME descent also unlinks orphan `.tmp.*` files older
+    than the cutoff from every part dir it visits, accumulating the count into
+    `state.tmp_removed` — so the unified walk folds the old standalone tmp sweep into this one
+    pass instead of a third full-tree crawl. `None` leaves the walk stat-only (legacy callers).
+
     `concurrency<=1` degrades to a serial descent (legacy behaviour, one object at a time).
     """
     concurrency = max(1, concurrency)
     root_str = str(root)
     loop = asyncio.get_running_loop()
     executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="janitor-walk")
-    inflight: set[asyncio.Future[list[PartDirInfo]]] = set()
+    inflight: set[asyncio.Future[tuple[list[PartDirInfo], int]]] = set()
     try:
         async for name in _stream_shard_object_names(root_str, shard, shards, deadline, state):
-            inflight.add(loop.run_in_executor(executor, _descend_object, root_str, name))
+            inflight.add(loop.run_in_executor(executor, _descend_object, root_str, name, tmp_cutoff))
             if len(inflight) >= concurrency:
                 done, inflight = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
                 for fut in done:
-                    for info in fut.result():
+                    parts, tmp_removed = fut.result()
+                    state.tmp_removed += tmp_removed
+                    for info in parts:
                         yield info
         while inflight:
             done, inflight = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
             for fut in done:
-                for info in fut.result():
+                parts, tmp_removed = fut.result()
+                state.tmp_removed += tmp_removed
+                for info in parts:
                     yield info
     finally:
         for fut in inflight:
@@ -818,6 +863,81 @@ async def get_all_dlq_object_ids(redis_client: Redis) -> set[str]:
     return object_ids
 
 
+def _stale_fs_eligible(
+    mtime: float,
+    mtime_cutoff: float,
+    object_id: str,
+    dlq_available: bool,
+    dlq_object_ids: set[str],
+) -> bool:
+    """FS-level stale-reap gate (byte-for-byte the stale phase's producer filter).
+
+    A part is a stale-reap candidate iff the DLQ protection set is available (fail-CLOSED:
+    with no complete DLQ set we never reap the non-replication-gated stale path), its
+    meta/dir mtime is older than the stale threshold, and its object is not DLQ-protected.
+    The DB 3-state decision (`_stale_reap_decision`) is only consulted for parts that pass here.
+    """
+    if not dlq_available:
+        return False
+    if mtime > mtime_cutoff:
+        return False
+    return object_id not in dlq_object_ids
+
+
+async def _stale_reap_decision(
+    conn: asyncpg.Connection,
+    object_id: str,
+    object_version: int,
+    part_number: int,
+    stale_threshold_seconds: int,
+) -> tuple[bool, bool]:
+    """The stale phase's DB-side 3-state decision, extracted VERBATIM so the unified walk and
+    the standalone `cleanup_stale_parts` share one implementation.
+
+    Returns `(should_delete, abandoned)`:
+      row is None        → no `parts` row → orphan → reap  → (True, False).
+      row["recent"] true → row exists, recently written    → keep → (False, False).
+      row old + replicated → safe to reap (fully backed up)→ (True, False).
+      row old + not replicated:
+          terminally-abandoned (failed + unservable)       → reclaim → (True, True).
+          otherwise (pending/in-flight/aborted)            → protect → (False, False).
+    Any DB error is conservative: (False, False) — never delete on an incomplete read.
+    """
+    cutoff_sql = "NOW() - INTERVAL '1 second' * $4"
+    abandoned = False
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT (uploaded_at > """
+            + cutoff_sql
+            + """) AS recent
+            FROM parts
+            WHERE object_id = $1 AND object_version = $2 AND part_number = $3
+            LIMIT 1""",
+            object_id,
+            object_version,
+            part_number,
+            stale_threshold_seconds,
+        )
+        if row is not None:
+            if row["recent"]:
+                return (False, False)
+            if not await is_replicated_on_all_backends(conn, object_id, object_version, part_number):
+                # Not replicated → normally protect (pending / in-flight / aborted).
+                # The ONE exception: a terminally-abandoned upload — the reaper or an
+                # abort marked the part 'failed' AND its version is unservable. The
+                # drain never re-claims a 'failed' part, so its pool bytes leak
+                # forever otherwise; an unservable version can never be served by a
+                # GET, so reclaiming is safe (see is_terminally_abandoned).
+                if not await is_terminally_abandoned(conn, object_id, object_version, part_number):
+                    return (False, False)
+                abandoned = True
+    except Exception:
+        # If any DB check fails, be extra conservative: skip deletion
+        return (False, False)
+    return (True, abandoned)
+
+
 async def cleanup_stale_parts(
     pool: asyncpg.Pool,
     fs_store: FileSystemPartsStore,
@@ -841,7 +961,6 @@ async def cleanup_stale_parts(
     it descends only this cycle's shard and stops at `deadline`. Deletion logic is unchanged.
     """
     stale_threshold_seconds = config.mpu_stale_seconds
-    cutoff_sql = "NOW() - INTERVAL '1 second' * $4"
 
     try:
         dlq_object_ids = await get_all_dlq_object_ids(redis_client)
@@ -871,69 +990,22 @@ async def cleanup_stale_parts(
             deadline=deadline,
             state=walk_state,
         ):
-            if part.mtime > mtime_cutoff:
-                # Recently touched, skip
+            # dlq_available=True: we only reach here when get_all_dlq_object_ids succeeded
+            # (the fail-closed early-return above handles the unavailable case).
+            if not _stale_fs_eligible(part.mtime, mtime_cutoff, part.object_id, True, dlq_object_ids):
                 continue
-
-            # Skip deletion if object is in DLQ
-            if part.object_id in dlq_object_ids:
-                logger.debug(
-                    f"Skipping DLQ-protected part: object_id={part.object_id} "
-                    f"v={part.object_version} part={part.part_number}"
-                )
-                continue
-
             yield (part.object_id, part.object_version, part.part_number)
 
     async def handle(conn: asyncpg.Connection, item: tuple[str, int, int]) -> bool:
         object_id, object_version, part_number = item
 
-        # Decide, in one query, which of three states this part is in:
-        #   row is None        → no `parts` row at all. The object's DB rows are
-        #                        gone (Phase 4 hard-delete cascades parts →
-        #                        part_chunks → chunk_backend) or this is orphaned
-        #                        FS with no record. mtime>1d already rules out an
-        #                        in-flight write (chunks land before the parts
-        #                        row), so it is safe to reap → fall through.
-        #   row["recent"] true → row exists and was (re)written recently → leave it.
-        #   row["recent"] false→ row exists but is old → only reap once every chunk
-        #                        is replicated to every required backend. A
-        #                        not-yet-replicated part is a pending or aborted
-        #                        upload and must be protected (no data loss) — with
-        #                        ONE exception, the terminally-abandoned upload below.
-        # Distinguishing "no DB row" (orphan, reap) from "DB row but not replicated"
-        # (pending, protect) is what keeps deleted-object cache cleanup working
-        # without ever deleting data that hasn't been backed up.
-        abandoned = False
-        try:
-            row = await conn.fetchrow(
-                """
-                SELECT (uploaded_at > """
-                + cutoff_sql
-                + """) AS recent
-                FROM parts
-                WHERE object_id = $1 AND object_version = $2 AND part_number = $3
-                LIMIT 1""",
-                object_id,
-                object_version,
-                part_number,
-                stale_threshold_seconds,
-            )
-            if row is not None:
-                if row["recent"]:
-                    return False
-                if not await is_replicated_on_all_backends(conn, object_id, object_version, part_number):
-                    # Not replicated → normally protect (pending / in-flight / aborted).
-                    # The ONE exception: a terminally-abandoned upload — the reaper or an
-                    # abort marked the part 'failed' AND its version is unservable. The
-                    # drain never re-claims a 'failed' part, so its pool bytes leak
-                    # forever otherwise; an unservable version can never be served by a
-                    # GET, so reclaiming is safe (see is_terminally_abandoned).
-                    if not await is_terminally_abandoned(conn, object_id, object_version, part_number):
-                        return False
-                    abandoned = True
-        except Exception:
-            # If any DB check fails, be extra conservative: skip deletion
+        # Decide, in one query, which of three states this part is in (see
+        # _stale_reap_decision): no `parts` row → orphan → reap; recent row → keep;
+        # old row → reap only if fully replicated, or terminally-abandoned when not.
+        should_delete, abandoned = await _stale_reap_decision(
+            conn, object_id, object_version, part_number, stale_threshold_seconds
+        )
+        if not should_delete:
             return False
 
         try:
@@ -1167,23 +1239,7 @@ def _descend_object_tmp(root_str: str, object_name: str, cutoff: float) -> int:
                             continue
                     except OSError:
                         continue
-                    try:
-                        file_scan = os.scandir(pd.path)
-                    except OSError:
-                        continue
-                    with file_scan:
-                        for f in file_scan:
-                            if ".tmp." not in f.name:
-                                continue
-                            try:
-                                if not f.is_file():
-                                    continue
-                                if f.stat().st_mtime > cutoff:
-                                    continue
-                                os.unlink(f.path)  # noqa: PTH108
-                                removed += 1
-                            except OSError:
-                                continue
+                    removed += _unlink_old_tmp_files(pd.path, cutoff)
     return removed
 
 
@@ -1235,6 +1291,45 @@ async def cleanup_orphan_tmp_files(
     if removed > 0:
         logger.info(f"Janitor removed {removed} orphan tmp files (shard={shard}/{shards} truncated={state.truncated})")
     return removed
+
+
+def _age_gc_decision(
+    mtime: float,
+    atime: float,
+    now: float,
+    hot_window: float,
+    cutoff_time: float,
+    pressure: int,
+    is_dlq_protected: bool,
+) -> tuple[bool, bool, bool]:
+    """The age-GC phase's FS-level eligibility gate, extracted VERBATIM so the unified walk and
+    the standalone `cleanup_old_parts_by_mtime` share one rule.
+
+    Returns `(is_hot, gc_candidate, old_enough)`:
+    - is_hot: atime within the pressure-adjusted hot-retention window (computed for census even
+      when the part is skipped — hot parts are counted regardless of DLQ/eligibility).
+    - gc_candidate: passes all FS gates → hand to the worker's replication check. False when
+      DLQ-protected, hot, or (under normal pressure) not yet old enough.
+    - old_enough: mtime older than the GC max-age cutoff (for logging).
+
+    The replication gate itself is NOT here — it is the absolute DB check the worker applies to
+    every gc_candidate. This gate only decides which replicated parts are ELIGIBLE, never
+    overriding replication.
+    """
+    is_hot = hot_window > 0 and atime > (now - hot_window)
+    if is_dlq_protected:
+        return (is_hot, False, False)
+    # Hot files are protected. Under critical pressure hot_window is 0, which forces
+    # is_hot=False, letting fully-replicated parts become eligible even if recently read.
+    if is_hot:
+        return (is_hot, False, False)
+    # A fully-replicated, cold, non-DLQ part is safe to evict. Under normal pressure we
+    # additionally require age > cutoff so we don't thrash; under any pressure level we evict
+    # replicated cold parts regardless of age. The replication gate is enforced in the worker.
+    old_enough = mtime < cutoff_time
+    if pressure == 0 and not old_enough:
+        return (is_hot, False, False)
+    return (is_hot, True, old_enough)
 
 
 async def cleanup_old_parts_by_mtime(
@@ -1374,27 +1469,12 @@ async def cleanup_old_parts_by_mtime(
                 part_age = now - mtime
                 stats["age_counts"][_classify_age_bucket(part_age)] += 1
 
-                is_hot = hot_window > 0 and atime > (now - hot_window)
+                is_hot, gc_candidate, old_enough = _age_gc_decision(
+                    mtime, atime, now, hot_window, cutoff_time, pressure, is_dlq_protected
+                )
                 if is_hot:
                     stats["hot_parts"] += 1
-
-                # Don't clean DLQ-protected parts (only count them for metrics)
-                if is_dlq_protected:
-                    continue
-
-                # Hot files are protected. Under critical pressure
-                # hot_window is 0, which forces is_hot=False, letting
-                # fully-replicated parts become eligible even if recently read.
-                if is_hot:
-                    continue
-
-                # A fully-replicated, cold, non-DLQ part is safe to evict.
-                # Under normal pressure we additionally require age > cutoff
-                # so we don't thrash. Under any pressure level we evict
-                # replicated cold parts regardless of age. The replication
-                # gate itself is enforced in the worker below.
-                old_enough = mtime < cutoff_time
-                if pressure == 0 and not old_enough:
+                if not gc_candidate:
                     continue
             except Exception as e:
                 logger.warning(
@@ -1467,6 +1547,270 @@ async def cleanup_old_parts_by_mtime(
         )
 
     return parts_cleaned
+
+
+@dataclass(frozen=True)
+class _UnifiedCandidate:
+    """One part the unified walk found that qualifies for AT LEAST one deletion rule. The two
+    `*_candidate` flags carry the FS-level pre-decision so the worker only runs the DB checks a
+    part actually needs; a part can qualify for both (deleted once, stale attributed first)."""
+
+    object_id: str
+    object_version: int
+    part_number: int
+    stale_candidate: bool
+    gc_candidate: bool
+    gc_old_enough: bool
+
+
+async def cleanup_parts_unified(
+    pool: asyncpg.Pool,
+    fs_store: FileSystemPartsStore,
+    redis_client: Redis,
+    *,
+    pressure: int,
+    shard: int = 0,
+    shards: int = 1,
+    walk_concurrency: int = 1,
+    deadline: float | None = None,
+    publish_sweep: bool = True,
+) -> dict[str, int]:
+    """ONE FS walk that applies all three old FS-walk phases per part dir.
+
+    This collapses `cleanup_stale_parts` + `cleanup_old_parts_by_mtime` + `cleanup_orphan_tmp_files`
+    — which each independently crawled the whole shard via `iter_part_dirs` — into a single pass.
+    On prod that turned a 3× metadata crawl of a ~15.6M-object CephFS tree (contending with live
+    GET/PUT on the MDS) into 1×, for the same coverage. The WALK is unified; the deletion RULES are
+    the SAME byte-for-byte helpers the standalone phases use:
+      - stale-reap:  `_stale_fs_eligible` (producer) + `_stale_reap_decision` (worker).
+      - age-GC:      `_age_gc_decision` (producer) + `is_replicated_on_all_backends` (worker).
+      - tmp:         `_unlink_old_tmp_files`, folded into the walk via `iter_part_dirs(tmp_cutoff=)`.
+      - census:      accumulated in the producer, published only on an untruncated full sweep.
+
+    A part is deleted if EITHER the stale rule OR the age-GC rule fires; both are evaluated and it
+    is deleted once, attributing the correct reason (abandoned / stale_mtime / gc_age). The one
+    walk gets ONE budget (`deadline`), unbounded at Critical — that is the ~3× cycle-time win.
+
+    DLQ semantics (invariants 2 & 3): the protection set is fetched ONCE.
+      - On success: stale-reap requires the object be absent from it; age-GC honours it too.
+      - On DLQProtectionUnavailable: stale-reap is SKIPPED entirely this cycle (fail-CLOSED),
+        while age-GC still runs replication-gate-only (fail-OPEN) — a fully-replicated part is
+        safe to evict regardless of any DLQ entry.
+
+    Returns a dict of per-reason delete counts plus tmp: {stale_mtime, abandoned, gc, tmp}.
+    """
+    root = fs_store.root
+    if not root.exists():
+        return {"stale_mtime": 0, "abandoned": 0, "gc": 0, "tmp": 0}
+
+    stale_threshold_seconds = config.mpu_stale_seconds
+    max_age_seconds = config.fs_cache_gc_max_age_seconds
+    logger.info(
+        "Unified janitor walk: stale_threshold=%ds gc_max_age=%ds tmp_max_age=%ds pressure=%d (replication-gated)",
+        stale_threshold_seconds,
+        max_age_seconds,
+        TMP_FILE_MAX_AGE_SECONDS,
+        pressure,
+    )
+
+    # A15/C1: one DLQ fetch drives both rules. dlq_available=False means the stale-reap path is
+    # skipped this cycle (fail-closed); age-GC proceeds against an empty set (fail-open) — its
+    # replication gate is the hard safety net.
+    dlq_available = True
+    try:
+        dlq_object_ids = await get_all_dlq_object_ids(redis_client)
+    except DLQProtectionUnavailable as exc:
+        logger.error(
+            "DLQ protection unavailable — stale-reap SKIPPED this cycle (fail-closed); "
+            "age-GC falls back to replication-gate-only eviction: %s",
+            exc,
+        )
+        dlq_object_ids = set()
+        dlq_available = False
+    if dlq_object_ids:
+        logger.info(f"Protecting {len(dlq_object_ids)} DLQ objects from the unified walk")
+
+    now = time.time()
+    mtime_cutoff = now - stale_threshold_seconds
+    cutoff_time = now - max_age_seconds
+    tmp_cutoff = now - TMP_FILE_MAX_AGE_SECONDS
+    hot_window = _effective_hot_retention(pressure)
+    if pressure > 0:
+        logger.warning(
+            f"Disk pressure={pressure} ({'elevated' if pressure == 1 else 'critical'}); hot_window={hot_window}s"
+        )
+
+    stats: dict[str, Any] = {
+        "parts_seen": 0,
+        "hot_parts": 0,
+        "oldest_mtime": None,
+        "age_counts": dict.fromkeys(AGE_BUCKET_NAMES, 0),
+    }
+    reason_counts = {"stale_mtime": 0, "abandoned": 0, "gc": 0}
+    walk_state = WalkState()
+
+    async def candidates() -> AsyncIterator[_UnifiedCandidate]:
+        async for part in iter_part_dirs(
+            root,
+            concurrency=walk_concurrency,
+            shard=shard,
+            shards=shards,
+            deadline=deadline,
+            state=walk_state,
+            tmp_cutoff=tmp_cutoff,  # folds the old orphan-tmp sweep into this one walk
+        ):
+            object_id = part.object_id
+            object_version = part.object_version
+            part_number = part.part_number
+            is_dlq_protected = object_id in dlq_object_ids
+
+            stats["parts_seen"] += 1
+            try:
+                mtime = part.mtime
+                atime = part.atime
+                if stats["oldest_mtime"] is None or mtime < stats["oldest_mtime"]:
+                    stats["oldest_mtime"] = mtime
+                stats["age_counts"][_classify_age_bucket(now - mtime)] += 1
+
+                # Age-GC gate (also yields is_hot for the census — counted for every part,
+                # even DLQ-protected/hot ones, exactly as the standalone census did).
+                is_hot, gc_candidate, gc_old_enough = _age_gc_decision(
+                    mtime, atime, now, hot_window, cutoff_time, pressure, is_dlq_protected
+                )
+                if is_hot:
+                    stats["hot_parts"] += 1
+
+                # Stale-reap gate (mtime-only; does NOT honour hot retention, matching the
+                # standalone stale phase). Skipped wholesale when the DLQ set is unavailable.
+                stale_candidate = _stale_fs_eligible(mtime, mtime_cutoff, object_id, dlq_available, dlq_object_ids)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to classify part object_id={object_id} v={object_version} part={part_number}: {e}"
+                )
+                continue
+
+            if not stale_candidate and not gc_candidate:
+                continue
+            yield _UnifiedCandidate(
+                object_id, object_version, part_number, stale_candidate, gc_candidate, gc_old_enough
+            )
+
+    async def handle(conn: asyncpg.Connection, item: _UnifiedCandidate) -> bool:
+        # Evaluate stale-reap FIRST (matches the old serial order: stale phase ran before age-GC,
+        # so a part deletable by both is attributed to stale). If stale protects it, fall through
+        # to age-GC — a not-replicated part is protected by both, a stale-recent-but-replicated
+        # part is still an age-GC delete.
+        if item.stale_candidate:
+            should_delete, abandoned = await _stale_reap_decision(
+                conn, item.object_id, item.object_version, item.part_number, stale_threshold_seconds
+            )
+            if should_delete:
+                try:
+                    await fs_store.delete_part(item.object_id, item.object_version, item.part_number)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to clean part: object_id={item.object_id} "
+                        f"v={item.object_version} part={item.part_number}: {e}"
+                    )
+                    return False
+                if abandoned:
+                    logger.info(
+                        "Reclaimed terminally-abandoned part (failed+unservable): "
+                        f"object_id={item.object_id} v={item.object_version} part={item.part_number}"
+                    )
+                    reason_counts["abandoned"] += 1
+                    if _janitor_abandoned_deleted_counter is not None:
+                        _janitor_abandoned_deleted_counter.add(1)
+                    if _janitor_deleted_counter is not None:
+                        _janitor_deleted_counter.add(1, attributes={"reason": "abandoned"})
+                else:
+                    logger.info(
+                        f"Cleaned stale part by mtime: object_id={item.object_id} "
+                        f"v={item.object_version} part={item.part_number}"
+                    )
+                    reason_counts["stale_mtime"] += 1
+                    if _janitor_deleted_counter is not None:
+                        _janitor_deleted_counter.add(1, attributes={"reason": "stale_mtime"})
+                return True
+
+        if item.gc_candidate:
+            # ABSOLUTE safety gate: never delete non-replicated data.
+            try:
+                fully_replicated = await is_replicated_on_all_backends(
+                    conn, item.object_id, item.object_version, item.part_number
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Replication check failed for {item.object_id} v{item.object_version} part{item.part_number}: {e}"
+                )
+                return False
+            if not fully_replicated:
+                return False
+            try:
+                await fs_store.delete_part(item.object_id, item.object_version, item.part_number)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to clean part: object_id={item.object_id} "
+                    f"v={item.object_version} part={item.part_number}: {e}"
+                )
+                return False
+            logger.info(
+                f"GC cleaned part: object_id={item.object_id} v={item.object_version} part={item.part_number} "
+                f"replicated=True pressure={pressure} old_enough={item.gc_old_enough}"
+            )
+            reason_counts["gc"] += 1
+            if _janitor_deleted_counter is not None:
+                _janitor_deleted_counter.add(1, attributes={"reason": "gc_age"})
+            return True
+
+        return False
+
+    parts_cleaned = await _run_worker_pool(pool, candidates(), handle, config.janitor_concurrency)
+
+    # Census: accumulated across the sharded sweep, published only on an untruncated full sweep.
+    # A sweep starts at shard 0, so reset the accumulator there (bounds it to one sweep even if
+    # `shards` changed mid-sweep). Pressure is a per-cycle fact — publish it every call.
+    global _fs_pressure_mode
+    _fs_pressure_mode = pressure
+    if shard == 0:
+        _reset_census_accum()
+    _accumulate_census(stats, shard_complete=not walk_state.truncated)
+    if publish_sweep:
+        _publish_census(now)
+
+    tmp_removed = walk_state.tmp_removed
+    if tmp_removed > 0 and _janitor_tmp_deleted_counter is not None:
+        _janitor_tmp_deleted_counter.add(tmp_removed)
+
+    logger.info(
+        "Unified walk cleaned: stale=%d abandoned=%d gc=%d tmp=%d hot_parts=%d parts_seen=%d "
+        "(shard=%d/%d objects_scanned=%d truncated=%s pressure=%d)",
+        reason_counts["stale_mtime"],
+        reason_counts["abandoned"],
+        reason_counts["gc"],
+        tmp_removed,
+        stats["hot_parts"],
+        stats["parts_seen"],
+        shard,
+        shards,
+        walk_state.objects_scanned,
+        walk_state.truncated,
+        pressure,
+    )
+
+    # Critical pressure but nothing freed: every remaining part is hot (ignored under critical —
+    # nothing to free) or non-replicated (we refuse to delete). parts_cleaned counts BOTH stale
+    # and age-GC part deletions, so this fires only when the walk genuinely freed no part space.
+    if pressure == 2 and parts_cleaned == 0 and stats["parts_seen"] > 0:
+        logger.error(
+            "JANITOR_CRITICAL_PRESSURE_BLOCKED parts_seen=%d hot_parts=%d — "
+            "disk is >=95%% full but all remaining parts are non-replicated. "
+            "Operator action required; refusing to delete unreplicated data.",
+            stats["parts_seen"],
+            stats["hot_parts"],
+        )
+
+    return {**reason_counts, "tmp": tmp_removed}
 
 
 async def gc_soft_deleted_objects(pool: asyncpg.Pool) -> int:
@@ -1546,7 +1890,7 @@ async def run_janitor_loop():
             # They are single indexed DB reads; nothing about the FS cache should gate them.
             sentinel_violations = 0
             try:
-                _janitor_phase = 5  # sentinel
+                _janitor_phase = 3  # sentinel
                 sentinel_violations = await check_replication_sentinel(db_pool, pressure)
             except Exception as e:
                 logger.error(f"Replication sentinel error: {e}", exc_info=True)
@@ -1557,7 +1901,7 @@ async def run_janitor_loop():
             # holds its prior value) rather than over-counting against an empty set.
             aged_orphans = 0
             try:
-                _janitor_phase = 6  # aged_orphans
+                _janitor_phase = 4  # aged_orphans
                 gauge_dlq_object_ids = await get_all_dlq_object_ids(redis_client)
                 aged_orphans = await check_aged_pending_orphans(db_pool, gauge_dlq_object_ids)
             except Exception as e:
@@ -1574,59 +1918,40 @@ async def run_janitor_loop():
             budget = config.janitor_walk_budget_seconds
 
             stale_count = 0
+            abandoned_count = 0
             gc_count = 0
             tmp_count = 0
             hard_deleted = 0
 
-            # Phase A: clean stale/orphan/terminally-abandoned parts (each phase gets its OWN
-            # fresh budget so the first walk can't starve the second — the bug we are fixing).
+            # Phase A (UNIFIED): ONE FS walk applies stale-reap + age-GC + census + orphan-tmp per
+            # part dir. This replaces the three separate full-tree walks that each independently
+            # crawled the shard (3× the CephFS MDS metadata load, ~3× the cycle time); the deletion
+            # RULES are unchanged (shared helpers), only the WALK is merged. The single walk gets
+            # ONE budget, unbounded at Critical — that is the ~3× cycle-time win.
             try:
-                _janitor_phase = 1  # stale_parts
-                stale_count = await cleanup_stale_parts(
+                _janitor_phase = 1  # parts_unified
+                unified = await cleanup_parts_unified(
                     db_pool,
                     fs_store,
                     redis_client,
-                    shard=walk_shard,
-                    shards=shards,
-                    walk_concurrency=walk_conc,
-                    deadline=_walk_deadline(loop, pressure, budget),
-                )
-            except Exception as e:
-                logger.error(f"Stale cleanup error: {e}", exc_info=True)
-
-            # Phase B: replication-gated age GC + census (census published only on a full sweep).
-            try:
-                _janitor_phase = 2  # gc_age
-                gc_count = await cleanup_old_parts_by_mtime(
-                    db_pool,
-                    fs_store,
-                    redis_client,
+                    pressure=pressure,
                     shard=walk_shard,
                     shards=shards,
                     walk_concurrency=walk_conc,
                     deadline=_walk_deadline(loop, pressure, budget),
                     publish_sweep=publish_sweep,
                 )
+                stale_count = unified["stale_mtime"]
+                abandoned_count = unified["abandoned"]
+                gc_count = unified["gc"]
+                tmp_count = unified["tmp"]
             except Exception as e:
-                logger.error(f"Age-GC error: {e}", exc_info=True)
-
-            # Phase C: orphan .tmp.* files from crashed atomic writes.
-            try:
-                _janitor_phase = 3  # orphan_tmp
-                tmp_count = await cleanup_orphan_tmp_files(
-                    fs_store,
-                    shard=walk_shard,
-                    shards=shards,
-                    walk_concurrency=walk_conc,
-                    deadline=_walk_deadline(loop, pressure, budget),
-                )
-            except Exception as e:
-                logger.error(f"Tmp cleanup error: {e}", exc_info=True)
+                logger.error(f"Unified parts cleanup error: {e}", exc_info=True)
 
             # Phase D: hard-delete soft-deleted objects where all unpins are confirmed (DB-bound,
             # batch-capped — cannot starve the cycle).
             try:
-                _janitor_phase = 4  # soft_deleted
+                _janitor_phase = 2  # soft_deleted
                 hard_deleted = await gc_soft_deleted_objects(db_pool)
             except Exception as e:
                 logger.error(f"Hard delete error: {e}", exc_info=True)
@@ -1635,8 +1960,9 @@ async def run_janitor_loop():
 
             logger.info(
                 f"Janitor cycle complete: shard={walk_shard}/{shards} publish_sweep={publish_sweep} "
-                f"stale={stale_count} gc={gc_count} tmp={tmp_count} hard_deleted={hard_deleted} "
-                f"sentinel_violations={sentinel_violations} aged_orphans={aged_orphans}"
+                f"stale={stale_count} abandoned={abandoned_count} gc={gc_count} tmp={tmp_count} "
+                f"hard_deleted={hard_deleted} sentinel_violations={sentinel_violations} "
+                f"aged_orphans={aged_orphans}"
             )
 
             _janitor_cycle_seconds = time.time() - _cycle_started
