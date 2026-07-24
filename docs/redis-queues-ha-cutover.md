@@ -112,8 +112,22 @@ The drain re-enqueues on transient error so this is tolerable, but do Phase 2 �
 redis.
 
 ## Phase 3 — Repoint + roll consumers (the actual cutover; seconds)
+
+**CRITICAL — `REDIS_QUEUES_URL` is NOT a GitHub Actions secret; it is a plaintext literal in the
+deploy workflow.** The deploy's "Update secrets" step (`.github/workflows/production-deploy.yaml`,
+`kubectl create secret generic hippius-s3-secrets --from-literal=REDIS_QUEUES_URL=...`) **recreates
+`hippius-s3-secrets` on every deploy from that literal**. So a live `kubectl patch` of the secret is
+**silently reverted on the very next deploy**. The durable change is editing the workflow literal.
+Do BOTH:
+
+1. **Durable repoint (source of truth):** change the literal in `production-deploy.yaml`
+   (`redis://redis-queues:6379/0` → `redis://redis-queues-ha-master:6379/0`) and merge to
+   `k8s-production`. Prepared as a held PR (see the "cutover repoint" PR). **Merge it only AFTER
+   Phase 0** (the `redis-queues-ha-master` service must exist, or that deploy breaks the queue path).
+   `staging-deploy.yaml` has the analogous literal — edit it on `staging` for a staging cutover.
+2. **Immediate repoint + roll** (the live switch; the merge in step 1 recreates the secret but does
+   NOT restart pods without an image change, so you roll them explicitly):
 ```bash
-# Patch the secret key (base64) and roll every workload that reads REDIS_QUEUES_URL:
 NEW=$(printf 'redis://redis-queues-ha-master:6379/0' | base64)
 kubectl -n $NS patch secret hippius-s3-secrets --type merge -p "{\"data\":{\"REDIS_QUEUES_URL\":\"$NEW\"}}"
 kubectl -n $NS rollout restart ds/drain-agent ds/api-local deploy/drain-allocator deploy/mpu-reaper \
@@ -132,7 +146,9 @@ OLD=$(printf 'redis://redis-queues:6379/0' | base64)
 kubectl -n <ns> patch secret hippius-s3-secrets --type merge -p "{\"data\":{\"REDIS_QUEUES_URL\":\"$OLD\"}}"
 kubectl -n <ns> rollout restart ds/drain-agent ds/api-local deploy/drain-allocator deploy/mpu-reaper ...
 ```
-If the HA master accumulated new queue entries after cutover, drain them back or accept the
+**If the durable repoint (Phase 3 step 1) was already merged, also `git revert` that workflow commit**
+— otherwise the next deploy recreates the secret pointing back at the HA master and undoes this
+rollback. If the HA master accumulated new queue entries after cutover, drain them back or accept the
 drain's re-enqueue (idempotent). Instant, no data loss (both redises are CephFS-durable).
 
 ## Decommission (after soak)
