@@ -29,6 +29,7 @@ import os
 import shutil
 import sys
 import time
+import uuid
 import zlib
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
@@ -55,6 +56,7 @@ from hippius_s3.cache import create_fs_store
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.otel_setup import build_resource
+from hippius_s3.repositories import fs_cache_inventory
 from hippius_s3.sentry import init_sentry
 from hippius_s3.utils import get_query
 from hippius_s3.workers.shutdown import run_worker
@@ -92,6 +94,10 @@ TMP_FILE_MAX_AGE_SECONDS = 1800  # 30m
 # Cap on the G2 sentinel scan: it needs only to DETECT a durability gap and sample a few
 # offenders, not enumerate every one, so a bounded page keeps the read-only query cheap.
 SENTINEL_SCAN_LIMIT = 500
+# How many kept-part inventory rows the unified walk buffers before flushing one
+# `record_cached_batch`. A module constant (not a config knob) so tests can shrink it to exercise
+# the flush boundary without a live 500-part tree; there is no operational reason to tune it.
+INVENTORY_BACKFILL_BATCH_SIZE = 500
 # The idle grace before a pending/draining orphan counts toward the aged-orphan gauge is
 # `config.mpu_sweep_grace_seconds` — the SAME window the reaper's orphan sweep
 # (list_orphan_replication_versions.sql) uses. They MUST match: the gauge is only meaningful
@@ -336,6 +342,44 @@ def _effective_hot_retention(mode: int) -> float:
     if mode == 2:
         return 0.0  # disable hot retention under critical pressure
     return base
+
+
+async def _clear_inventory_after_delete(
+    conn: asyncpg.Connection, object_id: str, object_version: int, part_number: int
+) -> None:
+    """Drop a just-evicted part from `fs_cache_inventory`, swallowing any clear failure.
+
+    `clear_cached` RAISES by design, but its ONE janitor caller must not let a clear failure that
+    lands AFTER a successful `delete_part` flip the delete's result to False: the part is already
+    gone from disk, so re-counting it as "not deleted" is the wrong outcome. A stale inventory row
+    is self-healing — the walk sweep re-walks kept parts, and the SQL-eviction re-check tolerates a
+    part that is already absent — so a swallowed clear costs at most a delayed row cleanup, never a
+    resurrected candidate for data that still exists.
+    """
+    try:
+        await fs_cache_inventory.clear_cached(conn, object_id, object_version, part_number)
+    except Exception as exc:
+        logger.warning(
+            "fs_cache_inventory clear failed after eviction (row self-heals via next walk sweep): %s v%s p%s: %s",
+            object_id,
+            object_version,
+            part_number,
+            exc,
+        )
+
+
+def _is_uuid_name(name: str) -> bool:
+    """True iff a walked cache dirname parses as a UUID.
+
+    The walk yields raw directory names, but Task 4.1's eviction query casts
+    `fs_cache_inventory.object_id::uuid` and a single non-UUID row would abort the whole candidate
+    page. So only UUID-shaped dirnames may be backfilled into the inventory.
+    """
+    try:
+        uuid.UUID(name)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
 
 
 def _safe_iterdir(path: Path) -> Iterator[Path]:
@@ -1022,6 +1066,7 @@ async def cleanup_stale_parts(
 
         try:
             await fs_store.delete_part(object_id, object_version, part_number)
+            await _clear_inventory_after_delete(conn, object_id, object_version, part_number)
             if abandoned:
                 logger.info(
                     "Reclaimed terminally-abandoned part (failed+unservable): "
@@ -1512,6 +1557,7 @@ async def cleanup_old_parts_by_mtime(
 
         try:
             await fs_store.delete_part(object_id, object_version, part_number)
+            await _clear_inventory_after_delete(conn, object_id, object_version, part_number)
             logger.debug(
                 f"GC cleaned part: object_id={object_id} v={object_version} part={part_number} "
                 f"replicated=True pressure={pressure} {old_enough=}"
@@ -1664,6 +1710,23 @@ async def cleanup_parts_unified(
     walk_state = WalkState()
 
     async def candidates() -> AsyncIterator[_UnifiedCandidate]:
+        # The walk doubles as the inventory backfill/reconciler: every part that SURVIVES all gates
+        # (i.e. will REMAIN on disk) is recorded into fs_cache_inventory, so the first full sweep
+        # after deploy populates the table and later sweeps repair any row a materialization
+        # pipeline (Task 3.1) failed to write. Deletion candidates are deliberately NOT backfilled
+        # here — see the asymmetry note at the survivor branch below.
+        backfill_batch: list[tuple[str, int, int]] = []
+
+        async def _flush_backfill() -> None:
+            nonlocal backfill_batch
+            if not backfill_batch:
+                return
+            # The producer holds no pooled connection of its own, so acquire one per flush.
+            # record_cached_batch swallows its own errors — a backfill write never disrupts the walk.
+            async with pool.acquire() as conn:
+                await fs_cache_inventory.record_cached_batch(conn, backfill_batch)
+            backfill_batch = []
+
         async for part in iter_part_dirs(
             root,
             concurrency=walk_concurrency,
@@ -1704,10 +1767,22 @@ async def cleanup_parts_unified(
                 continue
 
             if not stale_candidate and not gc_candidate:
+                # Survivor: stays on disk this sweep → backfill its inventory row. Only UUID-shaped
+                # dirnames — Task 4.1's eviction query casts object_id::uuid and one non-UUID row
+                # would abort the whole candidate page. A yielded candidate that later survives the
+                # worker's gate re-check (e.g. an under-replicated cold part) is NOT recorded here;
+                # it is re-walked and re-evaluated next sweep, so it only enters the inventory once
+                # it is genuinely at rest — which is fine, since it is not evictable until then.
+                if _is_uuid_name(object_id):
+                    backfill_batch.append((object_id, object_version, part_number))
+                    if len(backfill_batch) >= INVENTORY_BACKFILL_BATCH_SIZE:
+                        await _flush_backfill()
                 continue
             yield _UnifiedCandidate(
                 object_id, object_version, part_number, stale_candidate, gc_candidate, gc_old_enough
             )
+
+        await _flush_backfill()  # final partial batch of kept parts
 
     async def handle(conn: asyncpg.Connection, item: _UnifiedCandidate) -> bool:
         # Evaluate stale-reap FIRST (matches the old serial order: stale phase ran before age-GC,
@@ -1727,6 +1802,7 @@ async def cleanup_parts_unified(
                         f"v={item.object_version} part={item.part_number}: {e}"
                     )
                     return False
+                await _clear_inventory_after_delete(conn, item.object_id, item.object_version, item.part_number)
                 if abandoned:
                     logger.info(
                         "Reclaimed terminally-abandoned part (failed+unservable): "
@@ -1768,6 +1844,7 @@ async def cleanup_parts_unified(
                     f"v={item.object_version} part={item.part_number}: {e}"
                 )
                 return False
+            await _clear_inventory_after_delete(conn, item.object_id, item.object_version, item.part_number)
             logger.debug(
                 f"GC cleaned part: object_id={item.object_id} v={item.object_version} part={item.part_number} "
                 f"replicated=True pressure={pressure} old_enough={item.gc_old_enough}"
