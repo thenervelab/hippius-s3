@@ -313,3 +313,53 @@ async def test_unified_tmp_only_no_part_deletes(tmp_path: Path, monkeypatch):
     assert store.deleted == []
     assert res == {"stale_mtime": 0, "abandoned": 0, "gc": 0, "tmp": 1}
     assert list((root / TMP_SURVIVOR / "v1" / "part_1").glob("*.tmp.*")) == []
+
+
+@pytest.mark.asyncio
+async def test_unified_walk_publishes_census_only_on_full_sweep(tmp_path: Path, monkeypatch):
+    """The unified walk carries the census the old age-GC phase did: `parts_on_disk` + `hot_parts`
+    accumulate across the sharded sweep and publish ONLY on the final untruncated shard. This is
+    the prod path now (the pre-existing census tests exercise the retained standalone age-GC fn),
+    so pin it directly.
+
+    Note a deliberate semantic: the census counts every part the producer SEES, before any delete —
+    so `parts_on_disk` reflects the whole tree (all 8 catalogue parts), including the stale-reapable
+    orphans. The old split census ran age-GC's count AFTER the separate stale phase had already
+    deleted those orphans, so it read lower. Counting at walk-start is the more accurate on-disk
+    figure; the difference is only the (small) stale-reapable set.
+    """
+    monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 0)
+    root = tmp_path / "t"
+    _build_catalogue(root)  # 8 parts; HOT_PROTECTED is the single hot one (atime==now)
+    store = _FakeFsStore(root)
+    janitor._fs_parts_on_disk = -1  # sentinel: unchanged means "not published"
+    janitor._fs_hot_parts = -1
+    shards = 3
+    with (
+        patch.object(janitor, "is_replicated_on_all_backends", _fake_replicated),
+        patch.object(janitor, "is_terminally_abandoned", _fake_abandoned),
+    ):
+        for s in range(shards - 1):
+            await janitor.cleanup_parts_unified(
+                _FakePool(_FakeConn()),
+                store,
+                _redis((DLQ_PROTECTED,)),
+                pressure=0,
+                shard=s,
+                shards=shards,
+                walk_concurrency=4,
+                publish_sweep=False,
+            )
+        assert janitor._fs_parts_on_disk == -1, "census must not publish mid-sweep"
+        await janitor.cleanup_parts_unified(
+            _FakePool(_FakeConn()),
+            store,
+            _redis((DLQ_PROTECTED,)),
+            pressure=0,
+            shard=shards - 1,
+            shards=shards,
+            walk_concurrency=4,
+            publish_sweep=True,
+        )
+    assert janitor._fs_parts_on_disk == 8, "a completed sweep must publish the whole-tree part count"
+    assert janitor._fs_hot_parts == 1, "the one hot part (HOT_PROTECTED) must be counted"
