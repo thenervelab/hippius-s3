@@ -2338,7 +2338,7 @@ data:
           ],
           "title": "Cache parts on disk",
           "type": "stat",
-          "description": "Parts on disk across the whole cache tree. CENSUS METRIC \u2014 only published after a FULL, untruncated janitor sweep. On prod the FS walk hits its wall-clock budget every cycle (truncated=True), so the gauge never gets a complete sweep and holds its initial 0 (\"Census sweep truncated by walk budget - holding last complete census\" in the janitor log). Staging, whose tree fits in the budget, reports real values. Reads as \"empty cache\", not \"unknown\" \u2014 the janitor should publish a partial census instead (tracked separately)."
+          "description": "Census from the last COMPLETED GC phase. If 'Janitor cycle health' shows a stuck/never-completed cycle, this is stale rather than zero."
         },
         {
           "collapsed": false,
@@ -2638,7 +2638,7 @@ data:
           ],
           "title": "Cache age distribution",
           "type": "timeseries",
-          "description": "Parts bucketed by age. CENSUS METRIC \u2014 only published after a FULL, untruncated janitor sweep. On prod the FS walk hits its wall-clock budget every cycle (truncated=True), so the gauge never gets a complete sweep and holds its initial 0 (\"Census sweep truncated by walk budget - holding last complete census\" in the janitor log). Staging, whose tree fits in the budget, reports real values. Reads as \"empty cache\", not \"unknown\" \u2014 the janitor should publish a partial census instead (tracked separately)."
+          "description": "Census from the last COMPLETED GC phase \u2014 see 'Janitor cycle health'. All-zero with a non-zero cache disk means the phase has not finished."
         },
         {
           "datasource": {
@@ -2824,11 +2824,15 @@ data:
               "expr": "sum by (reason) (rate(fs_janitor_deleted_total{service_namespace=\"$namespace\"}[10m]))",
               "legendFormat": "{{reason}}",
               "refId": "A"
+            },
+            {
+              "expr": "sum(rate(fs_janitor_tmp_deleted_total{service_namespace=\"$namespace\"}[10m]))",
+              "legendFormat": "orphan tmp",
+              "refId": "B"
             }
           ],
-          "title": "Janitor GC rate (parts deleted/s)",
-          "type": "timeseries",
-          "description": "Rate at which the janitor DELETES cache parts from disk, split by reason:\n- gc_age: replication-gated age eviction (part is fully replicated to every required backend, cold i.e. atime outside the hot-retention window, and not DLQ-protected). This is normal cache reclaim.\n- stale_mtime: stale/orphan reap (mtime older than the MPU stale threshold with no live parts row).\n- abandoned: terminally-abandoned upload reclaimed (failed part on an unservable version).\nSustained 0 while the disk is filling means eviction is blocked - usually nothing is replicated yet (the replication gate is absolute) or everything is inside the hot-retention window."
+          "title": "Janitor delete rate (by reason)",
+          "type": "timeseries"
         },
         {
           "collapsed": false,
@@ -3319,8 +3323,8 @@ data:
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "max(drain_ssd_backlog_bytes{service_namespace=\"$namespace\"})",
-              "legendFormat": "backlog",
+              "expr": "max by (service_instance_id) (drain_ssd_backlog_bytes{service_namespace=\"$namespace\"})",
+              "legendFormat": "{{service_instance_id}}",
               "refId": "A"
             }
           ],
@@ -3845,11 +3849,43 @@ data:
           "fieldConfig": {
             "defaults": {
               "color": {
-                "mode": "thresholds"
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
               },
               "mappings": [],
-              "max": 100,
-              "min": 0,
               "thresholds": {
                 "mode": "absolute",
                 "steps": [
@@ -3858,52 +3894,51 @@ data:
                     "value": 0
                   },
                   {
-                    "color": "yellow",
-                    "value": 85
-                  },
-                  {
                     "color": "red",
-                    "value": 95
+                    "value": 80
                   }
                 ]
               },
-              "unit": "percent"
+              "unit": "s"
             },
             "overrides": []
           },
           "gridPos": {
             "h": 8,
-            "w": 6,
-            "x": 18,
-            "y": 63
+            "w": 4,
+            "x": 0,
+            "y": 64
           },
-          "id": 97,
+          "id": 65,
           "options": {
-            "minVizHeight": 75,
-            "minVizWidth": 75,
-            "orientation": "auto",
-            "reduceOptions": {
-              "calcs": [
-                "lastNotNull"
-              ],
-              "fields": "",
-              "values": false
+            "legend": {
+              "calcs": [],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
             },
-            "showThresholdLabels": false,
-            "showThresholdMarkers": true,
-            "sizing": "auto"
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "none"
+            }
           },
           "pluginVersion": "12.3.1",
           "targets": [
             {
-              "expr": "max(ceph_pool_percent_used * on(pool_id) group_left(name) ceph_pool_metadata{name=\"ceph-filesystem-data0\"}) * 100",
-              "legendFormat": "pool %USED",
+              "expr": "max(fs_janitor_last_cycle_age_seconds{service_namespace=\"$namespace\"})",
+              "legendFormat": "since last completed cycle",
               "refId": "A"
+            },
+            {
+              "expr": "max(fs_janitor_cycle_seconds{service_namespace=\"$namespace\"})",
+              "legendFormat": "last cycle duration",
+              "refId": "B"
             }
           ],
-          "title": "Ceph pool usage (data0)",
-          "type": "gauge",
-          "description": "TRUE fullness of the backing CephFS pool ceph-filesystem-data0, straight from the ceph-mgr exporter. The panel to the left reads statvfs on the cache mount, which only sees the PVC QUOTA \u2014 during the 2026-07-24 incident that read ~69% while this pool was at ~94%. Ceph gates writes on the fullest OSD, so this is the number that matters: >=85% nearfull, >=95% read-only."
+          "title": "Janitor cycle health",
+          "type": "timeseries",
+          "description": "Seconds since the last COMPLETED janitor cycle (-1 = none since start). A line climbing without resetting means a phase is stuck and every census gauge on this dashboard is stale."
         }
       ],
       "preload": false,
@@ -3950,178 +3985,4 @@ data:
       "title": "Hippius S3 \u2014 System Load",
       "uid": "hippius-s3-system-load",
       "version": 10
-    }
-  cache-overview.json: |
-    {
-      "annotations": { "list": [] },
-      "editable": true,
-      "graphTooltip": 1,
-      "id": null,
-      "links": [],
-      "templating": {
-        "list": [
-          {
-            "current": { "selected": true, "text": "hippius-s3-cache-us-0", "value": "hippius-s3-cache-us-0" },
-            "hide": 0,
-            "includeAll": true,
-            "label": "Cache Region",
-            "multi": true,
-            "name": "cache_region",
-            "options": [
-              { "selected": false, "text": "All", "value": "$__all" },
-              { "selected": true, "text": "cache-us-0", "value": "hippius-s3-cache-us-0" },
-              { "selected": false, "text": "cache-eu-0", "value": "hippius-s3-cache-eu-0" }
-            ],
-            "query": "hippius-s3-cache-us-0,hippius-s3-cache-eu-0",
-            "type": "custom"
-          }
-        ]
-      },
-      "panels": [
-        {
-          "collapsed": false,
-          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
-          "id": 1,
-          "title": "Cache Traffic by Region",
-          "type": "row"
-        },
-        {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "fieldConfig": {
-            "defaults": { "color": { "mode": "palette-classic" }, "unit": "reqps" }
-          },
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
-          "id": 2,
-          "targets": [
-            {
-              "expr": "sum by (service_namespace) (rate(http_requests_total{service_namespace=~\"$cache_region\", handler=~\"gateway.*\"}[5m]))",
-              "legendFormat": "{{service_namespace}}"
-            }
-          ],
-          "title": "Gateway req/s by Region",
-          "type": "timeseries"
-        },
-        {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "fieldConfig": {
-            "defaults": { "color": { "mode": "palette-classic" }, "unit": "reqps" }
-          },
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
-          "id": 3,
-          "targets": [
-            {
-              "expr": "sum by (service_namespace) (rate(http_requests_total{service_namespace=~\"$cache_region\", handler!~\"gateway.*\"}[5m]))",
-              "legendFormat": "{{service_namespace}}"
-            }
-          ],
-          "title": "API req/s by Region",
-          "type": "timeseries"
-        },
-        {
-          "collapsed": false,
-          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
-          "id": 4,
-          "title": "Cache Performance",
-          "type": "row"
-        },
-        {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "fieldConfig": {
-            "defaults": { "color": { "mode": "palette-classic" }, "unit": "percentunit", "min": 0, "max": 1 }
-          },
-          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 10 },
-          "id": 5,
-          "targets": [
-            {
-              "expr": "sum by (service_namespace) (rate(cache_hits_total{service_namespace=~\"$cache_region\"}[5m])) / (sum by (service_namespace) (rate(cache_hits_total{service_namespace=~\"$cache_region\"}[5m])) + sum by (service_namespace) (rate(cache_misses_total{service_namespace=~\"$cache_region\"}[5m])))",
-              "legendFormat": "{{service_namespace}}"
-            }
-          ],
-          "title": "Cache Hit Ratio by Region",
-          "type": "timeseries"
-        },
-        {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "fieldConfig": {
-            "defaults": { "color": { "mode": "palette-classic" }, "unit": "s" }
-          },
-          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 10 },
-          "id": 6,
-          "targets": [
-            {
-              "expr": "histogram_quantile(0.95, sum by (le, service_namespace) (rate(downloader_duration_seconds_bucket{service_namespace=~\"$cache_region\"}[5m])))",
-              "legendFormat": "p95 {{service_namespace}}"
-            },
-            {
-              "expr": "histogram_quantile(0.50, sum by (le, service_namespace) (rate(downloader_duration_seconds_bucket{service_namespace=~\"$cache_region\"}[5m])))",
-              "legendFormat": "p50 {{service_namespace}}"
-            }
-          ],
-          "title": "Download Latency by Region",
-          "type": "timeseries"
-        },
-        {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "fieldConfig": {
-            "defaults": { "color": { "mode": "palette-classic" }, "unit": "bytes" }
-          },
-          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 10 },
-          "id": 7,
-          "targets": [
-            {
-              "expr": "max by (service_namespace) (redis_memory_used_bytes{service_namespace=~\"$cache_region\"})",
-              "legendFormat": "{{service_namespace}}"
-            }
-          ],
-          "title": "Redis Memory by Region",
-          "type": "timeseries"
-        },
-        {
-          "collapsed": false,
-          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
-          "id": 8,
-          "title": "Errors & Health",
-          "type": "row"
-        },
-        {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "fieldConfig": {
-            "defaults": { "color": { "mode": "palette-classic" }, "unit": "reqps" }
-          },
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 19 },
-          "id": 9,
-          "targets": [
-            {
-              "expr": "sum by (service_namespace, status_code) (rate(http_requests_total{service_namespace=~\"$cache_region\", status_code=~\"[45]..\"}[5m]))",
-              "legendFormat": "{{service_namespace}} {{status_code}}"
-            }
-          ],
-          "title": "Error Rates by Region",
-          "type": "timeseries"
-        },
-        {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "fieldConfig": {
-            "defaults": { "color": { "mode": "palette-classic" } }
-          },
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 19 },
-          "id": 10,
-          "targets": [
-            {
-              "expr": "kube_deployment_status_replicas_ready{namespace=~\"hippius-s3-cache-.*\"}",
-              "legendFormat": "{{namespace}} / {{deployment}}"
-            }
-          ],
-          "title": "Ready Replicas by Region",
-          "type": "timeseries"
-        }
-      ],
-      "schemaVersion": 39,
-      "tags": ["hippius", "s3", "cache", "cdn"],
-      "time": { "from": "now-1h", "to": "now" },
-      "timepicker": {},
-      "timezone": "browser",
-      "title": "Hippius S3 — Cache Overview",
-      "uid": "hippius-s3-cache-overview",
-      "version": 1
     }

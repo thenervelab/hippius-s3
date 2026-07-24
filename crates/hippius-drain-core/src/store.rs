@@ -333,7 +333,11 @@ impl Store {
     /// contributes zero bytes to that SUM but is still undrained WORK, so the byte-backlog of a
     /// wedged node can read 0 while rows remain — which readiness would misread as idle. Counting
     /// the replication rows directly cannot be zeroed that way, so it is the signal readiness gates
-    /// on. Uses the node-scoped pending index. Mirrors the params of `node_backlog_bytes`.
+    /// on. Mirrors the params of `node_backlog_bytes`.
+    ///
+    /// Served by `cephor_replication_status_undrained_by_node` (0013). NOT by the node-scoped
+    /// pending index, which is `WHERE status = 'pending'` and so never covered a query that also
+    /// matches `'draining'` — before 0013 this fell to the orphan index and post-filtered by node.
     ///
     /// # Errors
     ///

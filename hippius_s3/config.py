@@ -216,7 +216,22 @@ class Config:
     # (DownloadNotReadyError). Keeps an un-drained/never-arriving object (e.g. a part not yet on any
     # backend) from hanging the whole request up to cache_ttl_seconds (~1h). Later chunks keep the
     # full wait — once the first chunk lands the object is actively draining.
-    stream_first_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS:90", convert=int)
+    #
+    # MUST STAY BELOW THE CLIENT'S READ TIMEOUT. This was 90s, which is above boto3's 60s default,
+    # so the fail-fast never actually reached anyone: the client hung up at 60s and got a dead
+    # socket, which is NOT retryable, while the 503 SlowDown this raises IS. Worse, from the
+    # server's side the request later completed 200, so nothing was recorded as a failure.
+    # Observed 2026-07-23 14:50:05 — a presigned GET returned 200 after processing_time_ms=60167,
+    # 167ms after the client had already given up.
+    #
+    # 25s leaves room for two client-side retries inside one 60s budget. A cross-node
+    # read-after-write costs ~60s end to end (the part lands on one node's SSD; a reconciler
+    # notices, the drain copies it, an enqueue sweep publishes, the uploader uploads — every stage
+    # a poll, not an event), so on a fresh object the FIRST attempt is EXPECTED to 503 and a retry
+    # to succeed. That is the mechanism working, not a failure. Making the read genuinely fast is a
+    # separate problem: serve it from the peer that holds the data instead of waiting out the
+    # pipeline.
+    stream_first_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS:25", convert=int)
     # A3: bound on how long the streamer waits for EACH subsequent chunk (after the first). Without
     # it a later chunk whose backend fetch permanently fails stalls the already-committed 200
     # response up to cache_ttl_seconds (~1h) mid-stream; this caps that to a bounded fail (the
@@ -225,8 +240,10 @@ class Config:
     stream_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_CHUNK_TIMEOUT_SECONDS:300", convert=int)
     # Hot-retention window for the FS cache: chunks read within this window
     # are protected from janitor deletion so frequently-accessed content
-    # stays on NVMe. Touched on every read by the API/streamer.
-    fs_cache_hot_retention_seconds: int = env("HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS:10800", convert=int)
+    # stays on NVMe. Touched on every read by the API/streamer. Tightened from
+    # 3h to 1h (2026-07-24): a fuller default eviction floor clears cold cache
+    # sooner; a missed re-fetch is one backend read, cheap next to a full pool.
+    fs_cache_hot_retention_seconds: int = env("HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS:3600", convert=int)
     # Unified object part chunk size (bytes) for cache and range math
     object_chunk_size_bytes: int = env("HIPPIUS_CHUNK_SIZE_BYTES:4194304", convert=int)
     # Downloader behavior (default: no whole-part backfill)
@@ -357,6 +374,16 @@ class Config:
     # never-finalized uploads older than mpu_stale_seconds (address never written),
     # purging their SSD parts + drain replication rows so the drain stops re-deferring.
     mpu_reaper_interval_seconds: int = env("HIPPIUS_MPU_REAPER_INTERVAL_SECONDS:120", convert=int)  # every 2 min
+    # Hard ceiling on any single reaper statement. The reaper's pool had NO command_timeout, so
+    # on 2026-07-23 one abandoned-upload query ran for 96 MINUTES on a bad plan. The damage was
+    # not the slowness: a long statement pins its snapshot, so the xmin horizon stops advancing
+    # and VACUUM reclaims nothing database-wide — cephor_replication_status held ~499k dead
+    # tuples through 429 autovacuum runs, its partial indexes bloated, the drain fell behind and
+    # a cross-node read took 83s. The plan is fixed (list_abandoned_versions.sql, ~8s), but a
+    # timeout is what bounds the DAMAGE of the next bad plan rather than that one instance.
+    # Well above the measured runtime, far below anything that can hurt the horizon; a cycle
+    # that trips it is logged and retried on the next interval.
+    mpu_reaper_statement_timeout_seconds: int = env("HIPPIUS_MPU_REAPER_STATEMENT_TIMEOUT_SECONDS:60", convert=int)
     # Replication SLA grace for the G2 under-replication sentinel. `address` is stamped at
     # PUT completion but the chunk_backend coverage row is written much later by the async
     # drain→pool→backend pipeline, so every servable chunk is briefly under-covered while it
@@ -377,11 +404,69 @@ class Config:
     # Bounded concurrency for the janitor's per-part DB checks + deletes. The
     # cleanup loops are DB-roundtrip bound; this is how many parts are processed
     # in parallel (each over its own pooled connection).
-    janitor_concurrency: int = env("HIPPIUS_JANITOR_CONCURRENCY:16", convert=int)
+    janitor_concurrency: int = env("HIPPIUS_JANITOR_CONCURRENCY:32", convert=int)
+    # Concurrency for the FS *walk* itself (distinct from janitor_concurrency, which is the
+    # per-part DB roundtrip fan-out). The cache root is a single flat directory of millions of
+    # object dirs on CephFS; a single-threaded walk is metadata-latency bound (~40 objects/s
+    # measured on prod 2026-07-23, so a full pass over ~2.8M objects is ~20h and never completes
+    # inside a cycle — which starves every phase after it). This fans the per-object descent
+    # (scandir + stat) across a thread pool so many CephFS metadata roundtrips are in flight at
+    # once. Set to 1 for the legacy serial walk. Kept modest by default because the same CephFS
+    # MDS serves live GET/PUT — do not crank without watching MDS latency.
+    janitor_walk_concurrency: int = env("HIPPIUS_JANITOR_WALK_CONCURRENCY:8", convert=int)
+    # Wall-clock budget for each FS-walk phase (stale-cleanup, age-GC, tmp-sweep). Once exceeded
+    # the walk stops enqueuing new object dirs and the phase returns, so the cycle always
+    # completes and the phases after it — plus the DB-only durability sentinel + aged-orphan
+    # gauge which now run FIRST regardless — keep ticking. 0 = unbounded. Automatically lifted to
+    # unbounded under CRITICAL disk pressure — freeing space must never be capped by a clock.
+    janitor_walk_budget_seconds: int = env("HIPPIUS_JANITOR_WALK_BUDGET_SECONDS:480", convert=int)
+    # Number of hash-shards the FS walk rotates through, one per cycle, for FAIR coverage: each
+    # cycle descends only into object dirs where crc32(object_id) % shards == cycle_shard, so a
+    # full sweep of the tree takes `shards` cycles and no object waits behind an always-truncated
+    # prefix. SIZING: a shard must fit inside the budget or its tail is never reached — pick
+    # shards ≳ (objects / (walk_concurrency · per-thread-obj/s · budget_s)). At ~2.8M objects,
+    # concurrency 8 (~8× the ~40 obj/s serial rate measured on prod) and a 240s budget, one shard
+    # is ~44k objects → comfortably inside budget; a full sweep is ~64 cycles (~10h at the 600s
+    # normal sleep). Raise it if the cache grows or the walk logs truncated=True; 1 = walk the
+    # whole tree every cycle. Forced to 1 under CRITICAL disk pressure so eviction sees the whole
+    # tree in a single unbounded walk.
+    janitor_walk_shards: int = env("HIPPIUS_JANITOR_WALK_SHARDS:64", convert=int)
+    # Under ELEVATED pressure keep rotating a small number of shards instead of collapsing to a
+    # single head-restarting whole-tree walk (the 480s budget truncates a 15.6M-entry readdir long
+    # before the tail; with shards=1 the tail is never reached). CRITICAL still forces shards=1 +
+    # unbounded budget — freeing space beats coverage fairness there.
+    janitor_elevated_walk_shards: int = env("HIPPIUS_JANITOR_ELEVATED_WALK_SHARDS:8", convert=int)
+    # Sleep between cycles while under any disk pressure. 120s of a ~600s cycle was dead time
+    # exactly when eviction throughput mattered most.
+    janitor_pressure_sleep_seconds: int = env("HIPPIUS_JANITOR_PRESSURE_SLEEP_SECONDS:15", convert=int)
+    # Pool-fullness gate for the janitor's disk-pressure probe. _pressure_mode reads statvfs on the
+    # cache mount, which sees the CephFS *PVC quota* — NOT the backing pool. On 2026-07-24 statvfs
+    # read 69% while ceph-filesystem-data0 sat at 94%, so the janitor stayed in Normal mode (10min
+    # sleep, 64-shard sweep, hot retention honored) while the pool filled to the read-only cliff.
+    # When BOTH are set, the janitor also scrapes ceph_pool_percent_used for these pools from the
+    # mgr exporter (the same signal PR #337 gave the drain allocator) and takes the MAX of that and
+    # the local statvfs ratio: the pool signal can only ever RAISE pressure, never mask it. Empty =
+    # statvfs-only (pre-incident behavior). Point the URL at the mgr exporter and list the same
+    # pools as the drain's CEPHOR_CEPH_POOLS.
+    janitor_ceph_mgr_metrics_url: str = env("HIPPIUS_JANITOR_CEPH_MGR_METRICS_URL:")
+    janitor_ceph_pools: str = env("HIPPIUS_JANITOR_CEPH_POOLS:")
+    # Per-scrape timeout for the pool-fullness probe; short relative to the cycle so a hung mgr
+    # falls back to statvfs rather than stalling the loop.
+    janitor_ceph_probe_timeout_seconds: float = env("HIPPIUS_JANITOR_CEPH_PROBE_TIMEOUT_SECONDS:5", convert=float)
     # Max soft-deleted objects hard-deleted per janitor cycle. The find query is
     # an index-probe over this many candidates; keep it bounded so a large
     # backlog drains gradually instead of in one DELETE-cascade burst.
     janitor_hard_delete_batch: int = env("HIPPIUS_JANITOR_HARD_DELETE_BATCH:30000", convert=int)
+    # SQL discovery phase: inventory ROWS SCANNED per keyset page (the slice window that then gets
+    # filtered for evictability — not the candidate count), and the per-cycle delete budget (0
+    # disables the phase entirely — the runtime kill switch for prod rollback).
+    janitor_sql_page_size: int = env("HIPPIUS_JANITOR_SQL_PAGE_SIZE:1000", convert=int)
+    janitor_sql_max_deletes_per_cycle: int = env("HIPPIUS_JANITOR_SQL_MAX_DELETES_PER_CYCLE:50000", convert=int)
+    # Per-page asyncpg query timeout for candidate discovery. A sparse ring (a head of young/hot/
+    # under-replicated rows) can make one keyset page scan the whole inventory before it fills, so
+    # this bounds per-page scan volume: a timeout ENDS discovery this cycle with the cursor left at
+    # the last completed page, and the next cycle resumes from that spot.
+    janitor_sql_query_timeout_seconds: float = env("HIPPIUS_JANITOR_SQL_QUERY_TIMEOUT_SECONDS:30", convert=float)
 
     # Filesystem cache disk-pressure backoff (ingress control).
     # Threshold can be expressed as either absolute bytes or ratio; we trigger if ANY threshold is hit.
