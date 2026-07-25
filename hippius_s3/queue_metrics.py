@@ -115,24 +115,31 @@ class QueueDepthSampler:
 
     async def sample_once(self, now: float | None = None) -> None:
         now = time.time() if now is None else now
+        # Build fresh dicts and atomically rebind at the end. The OTel exporter runs the
+        # gauge callbacks on a BACKGROUND thread, so mutating the live dicts in place here
+        # (on the event loop) can raise "dictionary changed size during iteration" in a
+        # callback. A reference rebind is atomic under the GIL, so a callback always reads a
+        # complete prior-or-next snapshot.
+        new_depths: dict[str, int] = {}
         for key in self.list_keys:
-            self.depths[key] = int(await self._redis.llen(key))
+            new_depths[key] = int(await self._redis.llen(key))
         for key in self.zset_keys:
-            self.depths[key] = int(await self._redis.zcard(key))
+            new_depths[key] = int(await self._redis.zcard(key))
         # Oldest-age only for plain request lists: BRPOP consumes from the
         # right, so index -1 is the next payload out and the oldest waiting.
+        # Keys with unknowable age are simply omitted (fresh dict starts empty).
+        new_oldest_age: dict[str, float] = {}
         for key in self.list_keys:
             if key.endswith(":dlq"):
                 continue
-            age: float | None = None
-            if self.depths.get(key, 0) > 0:
+            if new_depths.get(key, 0) > 0:
                 raw = await self._redis.lindex(key, -1)
                 if raw is not None:
                     age = _payload_age_seconds(raw, now)
-            if age is None:
-                self.oldest_age.pop(key, None)
-            else:
-                self.oldest_age[key] = age
+                    if age is not None:
+                        new_oldest_age[key] = age
+        self.depths = new_depths
+        self.oldest_age = new_oldest_age
 
     async def run(self, interval: float = DEFAULT_SAMPLE_INTERVAL_SECONDS) -> None:
         while True:
