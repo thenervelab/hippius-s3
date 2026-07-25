@@ -32,18 +32,12 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 30.0
 
-# The pinner's consume queue is not backend-derived; it is fed by the api's
-# producer fan-out and drained by the external pinner. substrate_requests is
-# the chain-publish queue, likewise not backend-derived.
-#
 # OVERLAP NOTE: the api's BackgroundMetricsCollector also samples list depths
 # into `hippius_queue_length{queue_name=...}` every 10s. This sampler is the
 # intended single source of truth going forward (it adds retry ZSETs and
 # oldest-age, and lives with the janitor rather than every api pod); retiring
 # the api collector's depth loop is a planned follow-up — until then dashboards
 # should prefer `queue_depth{queue=...}`.
-PINNER_QUEUE = "upload_requests"
-SUBSTRATE_QUEUE = "substrate_requests"
 
 
 def build_queue_key_sets(config: Config) -> tuple[list[str], list[str]]:
@@ -59,7 +53,7 @@ def build_queue_key_sets(config: Config) -> tuple[list[str], list[str]]:
         ("download", config.download_backends),
         ("unpin", config.delete_backends),
     )
-    lists: list[str] = [PINNER_QUEUE, SUBSTRATE_QUEUE]
+    lists: list[str] = []
     zsets: list[str] = []
     for kind, backends in kinds:
         lists.extend(f"{backend}_{kind}_requests" for backend in backends)
