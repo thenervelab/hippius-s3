@@ -15,6 +15,8 @@ import httpx
 import pytest
 import respx
 
+from hippius_s3.pressure_signal import label_value
+from hippius_s3.pressure_signal import parse_pool_percent_used
 from workers import run_janitor_in_loop as janitor
 
 
@@ -35,25 +37,25 @@ POOL_SERIES = (
 
 def test_label_value_extracts_up_to_the_closing_quote() -> None:
     line = 'ceph_pool_metadata{pool_id="5",name="ceph-filesystem-data0",type="replicated"} 1.0'
-    assert janitor._label_value(line, 'pool_id="') == "5"
-    assert janitor._label_value(line, 'name="') == "ceph-filesystem-data0"
+    assert label_value(line, 'pool_id="') == "5"
+    assert label_value(line, 'name="') == "ceph-filesystem-data0"
 
 
 def test_label_value_absent_needle_is_none() -> None:
-    assert janitor._label_value("ceph_pool_percent_used 0.5", 'pool_id="') is None
+    assert label_value("ceph_pool_percent_used 0.5", 'pool_id="') is None
 
 
 # --------------------------------------------------------- _parse_pool_percent_used
 
 
 def test_parse_resolves_the_pool_fraction_via_its_metadata_id() -> None:
-    got = janitor._parse_pool_percent_used(HEALTHY + POOL_SERIES, ["ceph-filesystem-data0"])
+    got = parse_pool_percent_used(HEALTHY + POOL_SERIES, ["ceph-filesystem-data0"])
     assert got == pytest.approx(0.9507322907447815), "pool 5's fraction, not pool 2's"
 
 
 def test_parse_fullest_of_several_pools_wins_regardless_of_order() -> None:
     # data0 (95%) is fuller than blockpool (70%) and metadata (0.7%); order must not matter.
-    got = janitor._parse_pool_percent_used(
+    got = parse_pool_percent_used(
         HEALTHY + POOL_SERIES, ["ceph-blockpool", "ceph-filesystem-data0", "ceph-filesystem-metadata"]
     )
     assert got == pytest.approx(0.9507322907447815)
@@ -62,28 +64,28 @@ def test_parse_fullest_of_several_pools_wins_regardless_of_order() -> None:
 def test_parse_series_order_does_not_matter() -> None:
     # percent-used emitted BEFORE the metadata that names the pool must still resolve.
     body = HEALTHY + 'ceph_pool_percent_used{pool_id="5"} 0.5\nceph_pool_metadata{pool_id="5",name="data"} 1.0\n'
-    assert janitor._parse_pool_percent_used(body, ["data"]) == pytest.approx(0.5)
+    assert parse_pool_percent_used(body, ["data"]) == pytest.approx(0.5)
 
 
 def test_parse_missing_pool_is_none_fail_safe() -> None:
     # A typo'd/renamed pool anywhere in the list must fail safe (fall back to statvfs), never
     # silently shrink the gate to the pools that did resolve.
-    assert janitor._parse_pool_percent_used(HEALTHY + POOL_SERIES, ["ceph-filesystem-data0", "nope"]) is None
+    assert parse_pool_percent_used(HEALTHY + POOL_SERIES, ["ceph-filesystem-data0", "nope"]) is None
 
 
 def test_parse_pool_absent_entirely_is_none() -> None:
-    assert janitor._parse_pool_percent_used(HEALTHY, ["ceph-filesystem-data0"]) is None
+    assert parse_pool_percent_used(HEALTHY, ["ceph-filesystem-data0"]) is None
 
 
 def test_parse_prefix_name_is_not_matched() -> None:
     # name="data0" must not resolve for target "data": the label match is exact.
     body = HEALTHY + 'ceph_pool_metadata{pool_id="7",name="data0"} 1.0\nceph_pool_percent_used{pool_id="7"} 0.99\n'
-    assert janitor._parse_pool_percent_used(body, ["data"]) is None
+    assert parse_pool_percent_used(body, ["data"]) is None
 
 
 def test_parse_fraction_above_one_clamps() -> None:
     body = HEALTHY + 'ceph_pool_metadata{pool_id="5",name="data"} 1.0\nceph_pool_percent_used{pool_id="5"} 1.0000001\n'
-    assert janitor._parse_pool_percent_used(body, ["data"]) == pytest.approx(1.0)
+    assert parse_pool_percent_used(body, ["data"]) == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize("bad", ["NaN", "inf", "garbage"])
@@ -91,7 +93,7 @@ def test_parse_non_finite_or_garbage_percent_reads_missing(bad: str) -> None:
     # A NaN/inf/garbage value is not a ratio — it is dropped, so the pool has no valid percent and
     # the whole probe reads "missing" → None (fail safe to statvfs), never a silent healthy read.
     body = HEALTHY + f'ceph_pool_metadata{{pool_id="5",name="data"}} 1.0\nceph_pool_percent_used{{pool_id="5"}} {bad}\n'
-    assert janitor._parse_pool_percent_used(body, ["data"]) is None
+    assert parse_pool_percent_used(body, ["data"]) is None
 
 
 # --------------------------------------------------------- _fetch_pool_percent_used

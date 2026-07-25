@@ -14,6 +14,22 @@ from hippius_s3.monitoring import MetricsCollector
 logger = logging.getLogger(__name__)
 
 
+def _redis_memory(info: dict) -> tuple[int, int]:
+    """`(used_memory, maxmemory)` from an INFO reply, for a single node OR a cluster.
+
+    A single `Redis` returns a flat mapping. A `RedisCluster` fans INFO out to every primary and
+    returns one mapping PER NODE, keyed by node name — so the flat `info["used_memory"]` lookup
+    silently yielded 0 and the redis-memory gauge read empty for every cluster-backed pod. Sum the
+    per-node values so the gauge reports the cluster as a whole; `maxmemory` sums too, since the
+    cap that matters is the cluster's aggregate headroom. Nodes missing the field contribute 0.
+    """
+    per_node = bool(info) and all(isinstance(v, dict) for v in info.values())
+    nodes = list(info.values()) if per_node else [info]
+    used = sum(int(n.get("used_memory", 0) or 0) for n in nodes)
+    cap = sum(int(n.get("maxmemory", 0) or 0) for n in nodes)
+    return used, cap
+
+
 class BackgroundMetricsCollector:
     """Background task for collecting custom metrics from Redis and other sources."""
 
@@ -101,9 +117,7 @@ class BackgroundMetricsCollector:
             # `noeviction`, so once it fills EVERY write fails — the sole-producer upload LPUSH,
             # the chunk pub/sub, and the cephor:* coordination keys — a pipeline-wide cascade.
             # (The old code read the main redis, whose fullness is harmless — it just evicts.)
-            info = await rc.info("memory")
-            used_mem = int(info.get("used_memory", 0) or 0)
-            max_mem = int(info.get("maxmemory", 0) or 0)
+            used_mem, max_mem = _redis_memory(await rc.info("memory"))
             self.metrics_collector._used_mem = used_mem
             self.metrics_collector._max_mem = max_mem
             if max_mem > 0:

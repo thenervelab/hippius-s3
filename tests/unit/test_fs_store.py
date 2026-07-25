@@ -272,14 +272,15 @@ async def test_touch_chunk_missing_is_noop(fs: FileSystemPartsStore) -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_chunk_touches_file(fs: FileSystemPartsStore) -> None:
-    """Every successful read updates atime/mtime — the janitor's hot-retention
-    signal — without needing filesystem-level `strictatime`."""
+async def test_get_chunk_does_not_touch_file(fs: FileSystemPartsStore) -> None:
+    """Reads must NOT write filesystem timestamps: the per-read utime was dead
+    on read-only mounts and an MDS metadata write elsewhere. Read recency lives
+    in fs_cache_inventory.last_access_at (cache/access_tracker.py); stat times
+    now reflect write recency only."""
     await fs.set_chunk(OBJ, 1, 1, 0, b"payload")
     await fs.set_meta(OBJ, 1, 1, chunk_size=7, num_chunks=1, size_bytes=7)
 
     chunk_path = Path(fs.part_path(OBJ, 1, 1)) / "chunk_0.bin"
-    # Rewind both times to clearly distant past
     past = time.time() - 3600
     os.utime(chunk_path, (past, past))
     old_mtime = chunk_path.stat().st_mtime
@@ -287,8 +288,7 @@ async def test_get_chunk_touches_file(fs: FileSystemPartsStore) -> None:
     data = await fs.get_chunk(OBJ, 1, 1, 0)
     assert data == b"payload"
 
-    new_mtime = chunk_path.stat().st_mtime
-    assert new_mtime > old_mtime
+    assert chunk_path.stat().st_mtime == old_mtime
 
 
 @pytest.mark.asyncio

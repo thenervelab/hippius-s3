@@ -90,12 +90,15 @@ class _RouterConn:
     serves that page's candidate rows, advancing to the next page after the filter fetch. A page's
     slice or cand entry may be an Exception instance to inject a timeout on that specific fetch."""
 
-    def __init__(self, pages: list[tuple[Any, Any]]) -> None:
+    def __init__(self, pages: list[tuple[Any, Any]], last_access: Any = None) -> None:
         self._pages = pages
         self._i = 0
         self.slice_args: list[tuple] = []
         self.filter_args: list[tuple] = []
         self.fetch = AsyncMock(side_effect=self._fetch)
+        # handle()'s read-recency probe (fs_cache_inventory.last_access_at).
+        # None = never read, which preserves the legacy write-recency-only path.
+        self.fetchval = AsyncMock(return_value=last_access)
 
     async def _fetch(self, query: str, *args: Any, **_kwargs: Any) -> Any:
         if query == "janitor_inventory_slice":
@@ -131,10 +134,11 @@ def _config(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(janitor, "_janitor_deleted_counter", MagicMock())
 
 
-def _conn(*pages: tuple[Any, Any]) -> _RouterConn:
+def _conn(*pages: tuple[Any, Any], last_access: Any = None) -> _RouterConn:
     """Build a router conn from (slice_rows, cand_rows) pages. For the common case where every slice
-    row is also a candidate, pass the same list for both."""
-    return _RouterConn(list(pages))
+    row is also a candidate, pass the same list for both. `last_access` seeds the read-recency
+    probe (fs_cache_inventory.last_access_at); None = never read."""
+    return _RouterConn(list(pages), last_access=last_access)
 
 
 def _same(rows: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -214,6 +218,20 @@ async def test_replicated_cold_candidate_is_deleted_cleared_and_counted(monkeypa
     assert fs.deleted == [(OID_A, 1, 1)]
     janitor.clear_cached.assert_awaited_once()
     janitor._janitor_deleted_counter.add.assert_called_once_with(1, attributes={"reason": "sql_evict"})
+
+
+@pytest.mark.asyncio
+async def test_recently_read_candidate_is_protected_via_last_access(monkeypatch: pytest.MonkeyPatch) -> None:
+    # atime is COLD (the read path no longer touches it), but the inventory's
+    # last_access_at is fresh — hot retention must protect the part.
+    monkeypatch.setattr(janitor, "is_replicated_on_all_backends", AsyncMock(return_value=True))
+    fs = _FakeFs(stat_map={(OID_A, 1, 1): _stat(COLD)})
+    conn = _conn(_same([_row(OID_A)]), ([], []), last_access=datetime.now(timezone.utc))
+
+    deleted = await _evict(conn, fs)
+
+    assert deleted == 0
+    assert fs.deleted == []
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ from fastapi import Response
 
 from hippius_s3.api.s3 import errors as s3_errors
 from hippius_s3.fs_pressure import should_reject_fs_cache_write
+from hippius_s3.pressure_signal import get_published_pressure_mode
 
 
 logger = logging.getLogger(__name__)
@@ -56,7 +57,10 @@ async def fs_cache_pressure_middleware(
     if config is None:
         return await call_next(request)
 
-    reject, retry_after, pressure, reason = should_reject_fs_cache_write(config=config)
+    # Janitor-published pool signal (memoized ~5s; None = unavailable → the
+    # local statvfs check alone governs, which is the pre-signal behavior).
+    published_mode = await get_published_pressure_mode(getattr(request.app.state, "redis_client", None))
+    reject, retry_after, pressure, reason = should_reject_fs_cache_write(config=config, published_mode=published_mode)
     if not reject:
         return await call_next(request)
 
