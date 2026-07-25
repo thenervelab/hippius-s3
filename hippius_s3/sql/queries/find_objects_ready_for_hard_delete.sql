@@ -70,4 +70,13 @@ SELECT
             OR c.deleted_at < now() - INTERVAL '24 hours'
         )
     ) AS ready
-FROM candidates c;
+FROM candidates c
+-- The caller derives the next ring cursor from the LAST returned row (`rows[-1]`), so the result
+-- order is load-bearing, not cosmetic. A bare `FROM candidates c` inherits the CTE's order only
+-- incidentally — SQL guarantees no ordering without ORDER BY, and a future plan shape (parallel
+-- scan, a different join strategy) could return the slice in any order. `rows[-1]` would then not
+-- be the maximum keyset position, and the cursor would either jump PAST unscanned rows (silently
+-- skipping objects until the next lap) or move backwards (re-scanning). Ordering here makes the
+-- caller's `rows[-1]` correct by construction; it is free, since `candidates` is already sorted on
+-- exactly this key and is at most $1 rows.
+ORDER BY c.deleted_at, c.object_id;

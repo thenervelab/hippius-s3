@@ -29,6 +29,10 @@ _T_D = datetime.datetime(2000, 1, 2, tzinfo=_EPOCH)  # ready
 _T_B = datetime.datetime(2000, 1, 3, tzinfo=_EPOCH)  # not-ready (a live backend)
 _T_C = datetime.datetime(2000, 1, 4, tzinfo=_EPOCH)  # no chunk_backend rows
 
+# Start-of-ring keyset cursor: the finder pages on (deleted_at, object_id) > ($2, $3).
+_EPOCH_CURSOR = datetime.datetime(1970, 1, 1, tzinfo=_EPOCH)
+_ZERO_UUID = uuid.UUID("00000000-0000-0000-0000-000000000000")
+
 
 async def _seed_bucket(conn: asyncpg.Connection) -> uuid.UUID:
     acct = f"5HDTEST{uuid.uuid4().hex[:12]}"
@@ -108,27 +112,44 @@ async def test_find_objects_ready_for_hard_delete_semantics(pg_tx: asyncpg.Conne
     a = await _seed_object(pg_tx, bucket_id, _T_A, [True, True])  # ready: all backends deleted
     d = await _seed_object(pg_tx, bucket_id, _T_D, [True])  # ready: single deleted backend
     b = await _seed_object(pg_tx, bucket_id, _T_B, [True, False])  # not-ready: one live backend
-    c = await _seed_object(pg_tx, bucket_id, _T_C, [])  # excluded: never had a chunk_backend row
+    c = await _seed_object(
+        pg_tx, bucket_id, _T_C, []
+    )  # aged + zero chunk_backend rows -> READY via the 24h escape hatch
 
     sql = get_query("find_objects_ready_for_hard_delete")
 
-    # Large batch: ready objects returned, not-ready / no-chunks excluded (membership —
-    # robust to any other soft-deleted rows already in the DB).
-    returned = {r["object_id"] for r in await pg_tx.fetch(sql, 1000)}
-    assert a in returned
-    assert d in returned
-    assert b not in returned
-    assert c not in returned
+    # The finder now returns the whole keyset SLICE with a per-row `ready` flag (so the caller can
+    # advance its ring cursor past un-ready rows), rather than filtering to ready rows. Assert on
+    # the flag, not on membership.
+    rows = await pg_tx.fetch(sql, 1000, _EPOCH_CURSOR, _ZERO_UUID)
+    ready = {r["object_id"] for r in rows if r["ready"]}
+    scanned = {r["object_id"] for r in rows}
+    assert a in ready
+    assert d in ready
+    assert b in scanned and b not in ready, "a live backend row means not-ready — but still scanned"
+    # `c` never had a chunk_backend row; the aged escape hatch (deleted_at older than 24h) makes it
+    # ready, so the never-replicated population can drain instead of wedging the ring forever.
+    assert c in scanned and c in ready, "an aged zero-backend-row object must become ready"
 
-    # Batch=2: only the two OLDEST candidates (a, d) are even considered, so the
-    # newer not-ready/no-chunks rows can't appear — proves LIMIT bounds the scan.
-    assert {r["object_id"] for r in await pg_tx.fetch(sql, 2)} == {a, d}
+    # Batch=2: only the two OLDEST candidates (a, d) are even scanned — proves LIMIT bounds the slice.
+    assert {r["object_id"] for r in await pg_tx.fetch(sql, 2, _EPOCH_CURSOR, _ZERO_UUID)} == {a, d}
 
 
 @pytest.mark.asyncio
 async def test_find_objects_ready_for_hard_delete_respects_batch_limit(pg_conn: asyncpg.Connection) -> None:
-    rows = await pg_conn.fetch(get_query("find_objects_ready_for_hard_delete"), 1)
+    rows = await pg_conn.fetch(get_query("find_objects_ready_for_hard_delete"), 1, _EPOCH_CURSOR, _ZERO_UUID)
     assert len(rows) <= 1
+
+
+# NOTE: no ordering test lives here on purpose. An earlier draft of this PR added one, but it was a
+# tautology — the `candidates` CTE carries its own `ORDER BY deleted_at, object_id`, so the
+# tuplestore is sorted regardless of insert order and a CTE Scan reads it sequentially; the test
+# passed identically with the outer ORDER BY reverted, i.e. it could not fail. Real coverage of the
+# contract (the caller's `rows[-1]` advance across pages, plus exactly-once slice coverage) already
+# exists in tests/integration/test_hard_delete_ring.py::test_keyset_pagination_walks_in_order_and_
+# covers_slice. The outer ORDER BY this PR adds is defensive: on PG18 the planner already elides the
+# sort because it propagates the CTE's pathkeys, so it closes a latent portability gap, not a live
+# bug — worth having, not worth a test that only looks like one.
 
 
 @pytest.mark.asyncio
@@ -139,7 +160,12 @@ async def test_find_objects_ready_for_hard_delete_plan_is_index_driven(pg_conn: 
     if not n or n < 1_000_000:
         pytest.skip(f"chunk_backend too small ({n}) for a meaningful plan assertion")
     sql = get_query("find_objects_ready_for_hard_delete")
-    plan = "\n".join(r["QUERY PLAN"] for r in await pg_conn.fetch("EXPLAIN " + sql, 5000))
+    # 3 params, not 1: the finder grew the ($2, $3) ring cursor. Passing 1 raises InterfaceError —
+    # which this test masked, because the size guard above skips before the call on a small DB. It
+    # therefore never ran anywhere: skipped locally/CI (no data), errored on anything prod-sized.
+    # This is the ONLY assertion guarding the ~135 GiB read-storm plan shape, so it silently being
+    # dead is the expensive kind of broken.
+    plan = "\n".join(r["QUERY PLAN"] for r in await pg_conn.fetch("EXPLAIN " + sql, 5000, _EPOCH_CURSOR, _ZERO_UUID))
     assert "idx_objects_deleted" in plan
     assert "Seq Scan on chunk_backend" not in plan
     assert "Seq Scan on parts" not in plan
