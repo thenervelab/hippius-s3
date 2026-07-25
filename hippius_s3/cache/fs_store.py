@@ -173,20 +173,17 @@ class FileSystemPartsStore:
             return None
 
         try:
+            # Read-recency for hot retention is recorded in
+            # fs_cache_inventory.last_access_at (cache/access_tracker.py), not
+            # via atime: the old per-read os.utime was silently dead on
+            # read-only mounts (prod api-local) and an MDS metadata WRITE on
+            # every read elsewhere. stat atime now reflects write recency only.
 
-            def _read_and_touch() -> bytes:
+            def _read() -> bytes:
                 with chunk_path.open("rb") as f:
-                    data = f.read()
-                # Update atime/mtime so janitor treats this as recently-read.
-                # Janitor's hot-retention check uses stat() on the part dir /
-                # meta, so touch both the chunk file AND the part dir's mtime.
-                with contextlib.suppress(OSError):
-                    os.utime(chunk_path, None)
-                with contextlib.suppress(OSError):
-                    os.utime(meta_path, None)
-                return data
+                    return f.read()
 
-            data = await asyncio.to_thread(_read_and_touch)
+            data = await asyncio.to_thread(_read)
             logger.debug(
                 f"FS: read chunk object_id={object_id} v={object_version} part={part_number} chunk={chunk_index} size={len(data)}"
             )

@@ -1961,8 +1961,23 @@ async def evict_from_inventory(
         if st is None:
             await clear_cached(conn, object_id, object_version, part_number)  # stale row: self-heal
             return False
-        if hot_window > 0 and st.st_atime > (now - hot_window):
-            return False  # recently read — hot retention protects it (skipped when window==0)
+        if hot_window > 0:
+            # Write recency: atime reflects the last write now that the read
+            # path no longer touches it (fs_store.get_chunk dropped os.utime).
+            if st.st_atime > (now - hot_window):
+                return False
+            # Read recency: recorded by the api's AccessTracker into
+            # last_access_at. NULL = not read since the column shipped, which
+            # degrades to the old write-recency-only behavior. PK lookup.
+            last_access = await conn.fetchval(
+                "SELECT last_access_at FROM fs_cache_inventory "
+                "WHERE object_id = $1 AND object_version = $2 AND part_number = $3",
+                object_id,
+                object_version,
+                part_number,
+            )
+            if last_access is not None and last_access.timestamp() > (now - hot_window):
+                return False  # recently read — hot retention protects it
         # ABSOLUTE safety gate — identical call to the walk's, never bypassed by the prefilter.
         try:
             fully_replicated = await is_replicated_on_all_backends(conn, object_id, object_version, part_number)
