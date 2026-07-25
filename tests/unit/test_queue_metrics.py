@@ -43,8 +43,11 @@ class FakeRedis:
 def test_key_sets_cover_all_backends_and_kinds():
     lists, zsets = build_queue_key_sets(_config())
 
-    assert "upload_requests" in lists  # pinner queue
-    assert "substrate_requests" in lists  # chain-publish queue
+    # Only backend-qualified queues that the current producer actually writes to are gauged.
+    # The legacy bare `upload_requests` (old standalone pinner) and `substrate_requests`
+    # (chain-publish is now inline in the uploader) receive no traffic — no phantom always-0 gauges.
+    assert "upload_requests" not in lists
+    assert "substrate_requests" not in lists
     for backend in ("arion", "ovh"):
         for kind in ("upload", "download", "unpin"):
             assert f"{backend}_{kind}_requests" in lists
