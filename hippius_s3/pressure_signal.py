@@ -175,15 +175,19 @@ class PressurePublisher:
 
 
 # Consumer-side memo: one Redis read per _PUBLISHED_MEMO_SECONDS per process,
-# not one per request. (mode, ts) — ts=0 forces the first read.
+# not one per request. (mode, ts) — ts=0 forces the first read. _last_good
+# survives READ ERRORS (a Redis blip during genuine mode-2 must not open the
+# gate) but never key ABSENCE (absence is the publisher's honest "signal off"),
+# and only within the publish TTL so a dead Redis can't pin a stale mode.
 _published_cache: tuple[int | None, float] = (None, 0.0)
+_last_good: tuple[int | None, float] = (None, 0.0)
 _PUBLISHED_MEMO_SECONDS = 5.0
 
 
 async def get_published_pressure_mode(redis_client: Any) -> int | None:
     """The published mode, or None when the signal is unavailable (consumer
     then falls back to its own local check per the contract)."""
-    global _published_cache
+    global _published_cache, _last_good
     cached_mode, cached_at = _published_cache
     now = time.monotonic()
     if now - cached_at < _PUBLISHED_MEMO_SECONDS:
@@ -197,8 +201,12 @@ async def get_published_pressure_mode(redis_client: Any) -> int | None:
                 parsed = int(json.loads(raw)["mode"])
                 if parsed in (0, 1, 2):
                     mode = parsed
+                    _last_good = (mode, now)
         except Exception as exc:
-            logger.debug("published pressure read failed (falling back to local): %s", exc)
+            logger.debug("published pressure read failed: %s", exc)
+            good_mode, good_at = _last_good
+            if good_mode is not None and now - good_at < PRESSURE_TTL_SECONDS:
+                mode = good_mode
     _published_cache = (mode, now)
     return mode
 

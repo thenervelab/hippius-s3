@@ -44,6 +44,7 @@ def test_key_sets_cover_all_backends_and_kinds():
     lists, zsets = build_queue_key_sets(_config())
 
     assert "upload_requests" in lists  # pinner queue
+    assert "substrate_requests" in lists  # chain-publish queue
     for backend in ("arion", "ovh"):
         for kind in ("upload", "download", "unpin"):
             assert f"{backend}_{kind}_requests" in lists

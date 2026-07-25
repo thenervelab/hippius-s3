@@ -47,8 +47,10 @@ def _usage(used, total):
 @pytest.fixture(autouse=True)
 def _reset_consumer_memo():
     ps._published_cache = (None, 0.0)
+    ps._last_good = (None, 0.0)
     yield
     ps._published_cache = (None, 0.0)
+    ps._last_good = (None, 0.0)
 
 
 # ------------------------------------------------------------------ compute_mode
@@ -147,6 +149,30 @@ async def test_consumer_unavailable_signal_is_none(value):
 @pytest.mark.asyncio
 async def test_consumer_none_redis_is_none():
     assert await get_published_pressure_mode(None) is None
+
+
+@pytest.mark.asyncio
+async def test_consumer_holds_last_good_mode_on_read_error():
+    """A Redis blip during genuine mode-2 must not open the PUT gate: read
+    ERRORS hold the last-good mode (bounded by the publish TTL)."""
+    redis = FakeRedis(value=json.dumps({"mode": 2, "ratio": 0.96, "source": "janitor", "ts": 1.0}))
+    assert await get_published_pressure_mode(redis) == 2
+
+    ps._published_cache = (2, -100.0)  # expire the memo, keep _last_good
+    redis.fail = True
+    assert await get_published_pressure_mode(redis) == 2
+
+
+@pytest.mark.asyncio
+async def test_consumer_key_absence_is_not_masked_by_last_good():
+    """Key ABSENCE is the publisher's honest 'signal unavailable' — last-good
+    must not override it (that's how a retired publisher would haunt the gate)."""
+    redis = FakeRedis(value=json.dumps({"mode": 2, "ratio": 0.96, "source": "janitor", "ts": 1.0}))
+    assert await get_published_pressure_mode(redis) == 2
+
+    ps._published_cache = (2, -100.0)
+    redis.value = None  # key expired/absent, read succeeds
+    assert await get_published_pressure_mode(redis) is None
 
 
 # ------------------------------------------------------------------ fs_pressure integration
