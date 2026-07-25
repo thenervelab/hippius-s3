@@ -7,7 +7,6 @@ writes it into the shared filesystem cache (``FileSystemPartsStore``),
 and publishes a pub/sub notification so waiting streamers can read it.
 """
 
-import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -20,6 +19,7 @@ from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.sentry import init_sentry
 from hippius_s3.services.arion_service import ArionClient
 from hippius_s3.workers.downloader import run_downloader_loop
+from hippius_s3.workers.shutdown import run_worker
 
 
 config = get_config()
@@ -50,4 +50,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run_worker(main, "arion-downloader")

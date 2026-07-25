@@ -8,6 +8,8 @@ from datetime import timezone
 import httpx
 import pytest
 
+from .retrying_http import get_with_slowdown_retry
+
 
 def test_01_cleanup_old_files(production_s3_client, session_tracker):
     from datetime import timedelta
@@ -254,7 +256,10 @@ def test_07_presigned_url_roundtrip(production_s3_client, session_tracker, file_
         Params={"Bucket": session_tracker.bucket, "Key": key},
         ExpiresIn=300,
     )
-    get_resp = httpx.get(get_url, timeout=60)
+    # Retries 503 like a real S3 client: a fresh object read from a different node than the one
+    # that took the PUT is legitimately not ready yet, and the read path fails fast with a
+    # retryable SlowDown rather than holding the socket. See tests/smoke/retrying_http.py.
+    get_resp = get_with_slowdown_retry(get_url, timeout=60)
     assert get_resp.status_code == 200, f"presigned GET failed: {get_resp.status_code} {get_resp.text[:200]}"
 
     downloaded_hash = hashlib.md5(get_resp.content).hexdigest()

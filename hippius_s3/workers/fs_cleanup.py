@@ -11,9 +11,29 @@ import logging
 from typing import Any
 
 from hippius_s3.cache import FileSystemPartsStore
+from hippius_s3.repositories import fs_cache_inventory
 
 
 logger = logging.getLogger(__name__)
+
+
+async def _clear_inventory_after_delete(db: Any, object_id: str, object_version: int, part_number: int) -> None:
+    """Drop a just-deleted part from `fs_cache_inventory`, swallowing any clear failure.
+
+    Mirrors the janitor's discipline: `clear_cached` RAISES by design, but a clear that fails AFTER
+    a successful `delete_part` must not abort this cleanup (in the object-level path it would strand
+    the remaining parts). A stale inventory row self-heals on the next janitor walk sweep.
+    """
+    try:
+        await fs_cache_inventory.clear_cached(db, object_id, object_version, part_number)
+    except Exception as exc:
+        logger.warning(
+            "fs_cache_inventory clear failed after cleanup delete (row self-heals): %s v%s p%s: %s",
+            object_id,
+            object_version,
+            part_number,
+            exc,
+        )
 
 
 async def cleanup_pinned_object_parts(
@@ -88,6 +108,7 @@ async def cleanup_pinned_object_parts(
 
                 # Safe to delete: all chunks have CIDs
                 await fs_store.delete_part(object_id, object_version, part_number)
+                await _clear_inventory_after_delete(db, object_id, object_version, part_number)
                 parts_deleted += 1
                 logger.info(f"Cleaned up FS part: object_id={object_id} v={object_version} part={part_number}")
             else:
@@ -142,6 +163,7 @@ async def cleanup_pinned_part(
 
         # Safe to delete
         await fs_store.delete_part(object_id, object_version, part_number)
+        await _clear_inventory_after_delete(db, object_id, object_version, part_number)
         logger.info(f"Cleaned up FS part: object_id={object_id} v={object_version} part={part_number}")
 
     except Exception as e:

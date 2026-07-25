@@ -203,6 +203,57 @@ impl LocalSsd {
         }
         Ok(removed)
     }
+
+    /// Removes the empty `<object_id>/v<version>/` and `<object_id>/` shells a drained part
+    /// leaves behind, once untouched for `max_age`.
+    ///
+    /// `remove_part_dir` deletes only `part_<n>/`, so over millions of drained parts the two
+    /// ancestor dirs accumulate as empty shells — an unbounded directory/inode leak on the
+    /// node-local SSD (observed at 100k-338k dirs per prod node, all `<oid>/v1/` with nothing
+    /// inside). The crash-orphan reclaim never sees them: it keys on `meta.json`, and a shell
+    /// has none.
+    ///
+    /// THE AGE GATE IS THE SAFETY PROPERTY, not the emptiness check. Pruning inline at removal
+    /// time looks safe because `rmdir` refuses a non-empty dir — but `mkdir -p` is not atomic.
+    /// The api's writer (`fs_store.set_chunk`) calls `mkdir(parents=True)`, which on ENOENT
+    /// creates the parent and then retries the leaf; a pruner that rmdirs that freshly-created,
+    /// still-empty parent inside the gap makes the retry raise. FS writes are fatal in
+    /// `object_writer`, so that is a 500 on PutObject/UploadPart — and it is reachable, because
+    /// the drain unlinks in-flight MPU parts and so prunes the very directory a client is
+    /// uploading siblings into. Creating an entry in a directory updates that directory's
+    /// mtime, so requiring the shell to have been untouched for `max_age` means no writer has
+    /// created anything in it recently — closing the window rather than narrowing it.
+    ///
+    /// Sweeps version dirs before object dirs, so an object emptied by its last version going
+    /// away is collected in the same pass. Returns how many shells it removed; a missing root
+    /// is an empty cache, not an error.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if walking the cache fails for a reason other than a concurrently-removed
+    /// entry (which is tolerated).
+    pub async fn sweep_empty_shells(&self, max_age: Duration) -> io::Result<u64> {
+        let mut removed = 0;
+        let Some(mut objects) = open_dir(&self.root).await? else {
+            return Ok(0);
+        };
+        while let Some(object) = objects.next_entry().await? {
+            if !object.file_type().await?.is_dir() {
+                continue;
+            }
+            if let Some(mut versions) = open_dir(&object.path()).await? {
+                while let Some(version) = versions.next_entry().await? {
+                    if !version.file_type().await?.is_dir() {
+                        continue;
+                    }
+                    removed += u64::from(rmdir_if_stale_and_empty(&version.path(), max_age).await?);
+                }
+            }
+            // Only after its versions, so an object whose last version just went is collected now.
+            removed += u64::from(rmdir_if_stale_and_empty(&object.path(), max_age).await?);
+        }
+        Ok(removed)
+    }
 }
 
 impl SsdCache for LocalSsd {
@@ -320,6 +371,10 @@ async fn copy_into(dir: &Path, name: &str, source: &Path, sync_dir: bool) -> io:
 /// Remove a part's whole directory; an already-absent dir is `Ok` (idempotent, so a
 /// re-drive after a crash still converges). Shared by the SSD-source unlink and the
 /// pool corrupt-copy cleanup.
+///
+/// Removes ONLY the part dir. The now-empty `v<version>/`/`<object_id>/` parents are left
+/// for [`LocalSsd::sweep_empty_shells`], deliberately — see that method for why pruning them
+/// inline is unsafe.
 async fn remove_part_dir(root: &Path, part: &PartKey) -> io::Result<()> {
     match fs::remove_dir_all(part_dir(root, part)).await {
         Ok(()) => Ok(()),
@@ -357,6 +412,33 @@ fn file_age(meta: &std::fs::Metadata) -> Duration {
 /// Unlinks aged orphan write-temps directly inside one part dir. Only temp FILES older
 /// than `max_age` are removed; real chunk/meta files, fresh temps, and any subdirectory
 /// are left untouched. A temp another writer renamed away mid-sweep is already gone.
+/// `rmdir` `dir` if it is empty AND has been untouched for `max_age`; `Ok(false)` otherwise.
+///
+/// Both conditions are load-bearing. Emptiness is enforced by the kernel (`rmdir` returns
+/// `ENOTEMPTY` otherwise), so a sibling part can never be collateral. The age gate is what
+/// makes it safe against a concurrent `mkdir -p`, whose non-atomicity leaves a window where a
+/// parent is created but still empty — see [`LocalSsd::sweep_empty_shells`].
+///
+/// A concurrently-removed dir (`NotFound`) and a dir that filled up between the stat and the
+/// `rmdir` (`DirectoryNotEmpty`) are both normal races, not failures. Anything else is
+/// surfaced: a silently-swallowed `EACCES`/`EIO` would let the leak grow unbounded while the
+/// sweep reports success.
+async fn rmdir_if_stale_and_empty(dir: &Path, max_age: Duration) -> io::Result<bool> {
+    let meta = match fs::metadata(dir).await {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    if file_age(&meta) < max_age {
+        return Ok(false);
+    }
+    match fs::remove_dir(dir).await {
+        Ok(()) => Ok(true),
+        Err(err) if matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 async fn sweep_part_tmp(part_path: &Path, max_age: Duration) -> io::Result<u64> {
     let mut removed = 0;
     let Some(mut entries) = open_dir(part_path).await? else {
@@ -605,9 +687,10 @@ impl PartRemover for LocalSsd {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::{LocalSsd, TEMP_NONCE, TmpGuard, hex_lower, is_temp_name, safe_component, temp_name};
+    use super::{LocalSsd, TEMP_NONCE, TmpGuard, hex_lower, is_temp_name, part_dir, remove_part_dir, safe_component, temp_name};
     use core::str::FromStr;
-    use hippius_drain_core::{FileId, SsdCache};
+    use core::time::Duration;
+    use hippius_drain_core::{FileId, ObjectId, PartKey, PartNumber, SsdCache, Version};
     use proptest::prelude::*;
     use std::io;
     use std::path::Path;
@@ -656,6 +739,171 @@ mod tests {
         // which the GC layer (hippius_drain_core::gc) classifies as AlreadyGone.
         let err = ssd.remove_object(&fid("file-7")).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    fn part(uuid: &str, version: u32, number: u32) -> PartKey {
+        PartKey::new(ObjectId::from_str(uuid).unwrap(), Version::new(version), PartNumber::new(number))
+    }
+
+    fn seed_part(root: &Path, p: &PartKey) {
+        let dir = part_dir(root, p);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), b"{}").unwrap();
+        std::fs::write(dir.join("chunk_0.bin"), b"data").unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_sweep_removes_stale_empty_version_and_object_shells() {
+        // The leak fix: a drained part leaves `v<version>/` and `<object_id>/` behind, and the
+        // sweep collects both once they have been untouched for the grace.
+        let root = TempDir::new().unwrap();
+        let p = part("466916c0-d61b-4518-b81b-9576b574270a", 1, 1);
+        seed_part(root.path(), &p);
+        let part_path = part_dir(root.path(), &p);
+        let version_dir = part_path.parent().unwrap().to_path_buf();
+        let object_dir = version_dir.parent().unwrap().to_path_buf();
+        let ssd = LocalSsd::new(root.path().to_path_buf());
+
+        remove_part_dir(root.path(), &p).await.unwrap();
+        assert!(version_dir.exists(), "removal itself leaves the shells — that is the point");
+
+        assert_eq!(ssd.sweep_empty_shells(Duration::ZERO).await.unwrap(), 2, "version + object");
+
+        assert!(!version_dir.exists(), "the empty v<version> shell is swept");
+        assert!(!object_dir.exists(), "the empty <object_id> shell is swept");
+        assert!(root.path().exists(), "the SSD root is never removed");
+    }
+
+    #[tokio::test]
+    async fn the_sweep_spares_a_shell_younger_than_the_grace() {
+        // THE race guard. A shell younger than the grace may be a parent that a writer's
+        // non-atomic `mkdir -p` has just created and is about to create its part dir inside.
+        // Removing it there makes the writer's retry raise — a fatal FS write, i.e. a 500 on
+        // PutObject. Only an untouched-for-the-grace shell can be collected.
+        let root = TempDir::new().unwrap();
+        let p = part("466916c0-d61b-4518-b81b-9576b574270a", 1, 1);
+        let version_dir = part_dir(root.path(), &p).parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let ssd = LocalSsd::new(root.path().to_path_buf());
+
+        assert_eq!(ssd.sweep_empty_shells(Duration::from_hours(1)).await.unwrap(), 0);
+
+        assert!(version_dir.exists(), "a freshly-created shell is left for a possible writer");
+    }
+
+    #[tokio::test]
+    async fn a_sibling_part_protects_the_shared_parents() {
+        // `rmdir` is kernel-gated on emptiness, so a sibling `part_N` under the same version
+        // keeps both shared parents alive — no cross-part collateral removal.
+        let root = TempDir::new().unwrap();
+        let p1 = part("466916c0-d61b-4518-b81b-9576b574270a", 1, 1);
+        let p2 = part("466916c0-d61b-4518-b81b-9576b574270a", 1, 2);
+        seed_part(root.path(), &p1);
+        seed_part(root.path(), &p2);
+        let shared_version = part_dir(root.path(), &p1).parent().unwrap().to_path_buf();
+        let ssd = LocalSsd::new(root.path().to_path_buf());
+
+        remove_part_dir(root.path(), &p1).await.unwrap();
+        assert_eq!(ssd.sweep_empty_shells(Duration::ZERO).await.unwrap(), 0, "nothing is empty");
+
+        assert!(part_dir(root.path(), &p2).exists(), "the sibling part is untouched");
+        assert!(shared_version.exists(), "the shared version dir is kept while a sibling remains");
+    }
+
+    #[tokio::test]
+    async fn sweeping_one_version_keeps_a_populated_sibling_version() {
+        // The sweep collects only EMPTY dirs: v1 goes, but the object dir stays because v2 is
+        // still populated.
+        let root = TempDir::new().unwrap();
+        let v1 = part("466916c0-d61b-4518-b81b-9576b574270a", 1, 1);
+        let v2 = part("466916c0-d61b-4518-b81b-9576b574270a", 2, 1);
+        seed_part(root.path(), &v1);
+        seed_part(root.path(), &v2);
+        let v1_dir = part_dir(root.path(), &v1).parent().unwrap().to_path_buf();
+        let object_dir = v1_dir.parent().unwrap().to_path_buf();
+        let ssd = LocalSsd::new(root.path().to_path_buf());
+
+        remove_part_dir(root.path(), &v1).await.unwrap();
+        assert_eq!(ssd.sweep_empty_shells(Duration::ZERO).await.unwrap(), 1, "v1 only");
+
+        assert!(!v1_dir.exists(), "the emptied v1 dir is swept");
+        assert!(object_dir.exists(), "the object dir survives while v2 is populated");
+        assert!(part_dir(root.path(), &v2).exists(), "v2's part is untouched");
+    }
+
+    #[tokio::test]
+    async fn the_sweep_collects_an_object_emptied_by_its_last_version_in_one_pass() {
+        // Version dirs are swept before their object, so the object shell does not need a
+        // second pass — otherwise the leak would drain at one level per reclaim tick.
+        let root = TempDir::new().unwrap();
+        let p = part("00000000-0000-4000-8000-000000000000", 7, 1);
+        let version_dir = part_dir(root.path(), &p).parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let object_dir = version_dir.parent().unwrap().to_path_buf();
+        let ssd = LocalSsd::new(root.path().to_path_buf());
+
+        assert_eq!(ssd.sweep_empty_shells(Duration::ZERO).await.unwrap(), 2);
+
+        assert!(!version_dir.exists());
+        assert!(!object_dir.exists(), "collected in the SAME pass, not the next one");
+    }
+
+    #[tokio::test]
+    async fn removing_an_already_absent_part_is_ok() {
+        // Idempotent: a re-drive after the part is already gone returns Ok.
+        let root = TempDir::new().unwrap();
+        let p = part("00000000-0000-4000-8000-000000000000", 1, 1);
+
+        remove_part_dir(root.path(), &p).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_sweep_never_breaks_a_concurrent_writers_mkdir_p() {
+        // The regression this whole change exists for. Pruning inline at removal time raced the
+        // api's `mkdir(parents=True)`: that call is not atomic — on ENOENT it creates the parent
+        // then retries the leaf — so removing the freshly-created, still-empty parent in the gap
+        // made the retry fail. FS writes are fatal in object_writer, so that is a 500.
+        //
+        // The sweep is genuinely BUSY here, not idling: 200 pre-aged shells are collected while
+        // the writer runs, so this exercises concurrent removal rather than a no-op. What keeps
+        // the writer safe is the grace — its own dirs are touched on every iteration and so are
+        // never old enough to collect.
+        let root = TempDir::new().unwrap();
+        let ssd = LocalSsd::new(root.path().to_path_buf());
+        let grace = Duration::from_millis(100);
+
+        for i in 0..200 {
+            let shell = root.path().join(format!("0000{i:04}-0000-4000-8000-000000000000")).join("v1");
+            std::fs::create_dir_all(&shell).unwrap();
+        }
+        tokio::time::sleep(grace * 2).await; // age the shells past the grace
+
+        let p = part("466916c0-d61b-4518-b81b-9576b574270a", 1, 2);
+        let dir = part_dir(root.path(), &p);
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sweeper_stop = std::sync::Arc::clone(&stop);
+        let swept = tokio::spawn(async move {
+            let mut total = 0;
+            while !sweeper_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                total += ssd.sweep_empty_shells(grace).await.unwrap_or(0);
+                tokio::task::yield_now().await;
+            }
+            total
+        });
+
+        let mut failures = 0_u32;
+        for _ in 0..3000 {
+            if tokio::fs::create_dir_all(&dir).await.is_err() {
+                failures += 1;
+            }
+            let _ = tokio::fs::remove_dir(&dir).await;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let total_swept = swept.await.unwrap();
+
+        assert_eq!(failures, 0, "the sweep broke a concurrent writer's mkdir -p");
+        assert!(total_swept > 0, "the sweep must have been actively removing, or this proves nothing");
     }
 
     #[test]

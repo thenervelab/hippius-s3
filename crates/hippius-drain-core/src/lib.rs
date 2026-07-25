@@ -42,7 +42,7 @@ pub use partdrain::{
 };
 pub use reconcile::{DiscoveredPart, PartLandingLog, PartScan, PartStatus, ReconcileError, ReconcileReport, reconcile_parts};
 pub use snapshot::{AgentSnapshot, SnapshotCell};
-pub use ssd_reclaim::{PartRemover, PartStatusAge, ReclaimError, ReclaimLog, ReclaimReport, reclaim_ssd};
+pub use ssd_reclaim::{PartRemover, PartStatusAge, ReclaimError, ReclaimGraces, ReclaimLog, ReclaimReport, reclaim_ssd};
 pub use state::{CephCeiling, PressureZone, ReplicationState};
 pub use units::{ByteRate, Bytes, DiskPressure};
 

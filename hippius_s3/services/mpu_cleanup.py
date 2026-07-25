@@ -212,7 +212,21 @@ async def run_mpu_reaper_loop() -> None:
     from hippius_s3.monitoring import initialize_metrics_collector
 
     config = get_config()
-    db_pool = await asyncpg.create_pool(config.database_url, min_size=1, max_size=5)
+    # command_timeout is load-bearing, not tidiness: without it a bad plan runs unbounded and
+    # pins the xmin horizon, which stops VACUUM reclaiming anywhere in the database. See
+    # mpu_reaper_statement_timeout_seconds in config.py for the incident this bounds.
+    db_pool = await asyncpg.create_pool(
+        config.database_url,
+        min_size=1,
+        max_size=5,
+        command_timeout=config.mpu_reaper_statement_timeout_seconds,
+        # Belt AND braces, because they fail differently. command_timeout is client-side:
+        # asyncpg sends a CancelRequest, which does nothing if the client itself is wedged
+        # or the connection is black-holed — exactly when a statement would keep running and
+        # keep pinning the horizon. statement_timeout is enforced by the backend and needs no
+        # live client. Same value; whichever notices first wins.
+        server_settings={"statement_timeout": f"{config.mpu_reaper_statement_timeout_seconds * 1000}"},
+    )
     # The upload/unpin DLQs live on redis-queues (not the main cache), matching the
     # janitor's DLQ scan — read protection ids from the same instance.
     redis_client = async_redis.from_url(config.redis_queues_url)
