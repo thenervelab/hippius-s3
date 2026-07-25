@@ -25,7 +25,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import math
 import os
 import shutil
 import sys
@@ -59,6 +58,12 @@ from hippius_s3.cache import create_fs_store
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.otel_setup import build_resource
+from hippius_s3.pressure_signal import PRESSURE_CRITICAL
+from hippius_s3.pressure_signal import PRESSURE_CRITICAL_EXIT
+from hippius_s3.pressure_signal import PRESSURE_ELEVATED
+from hippius_s3.pressure_signal import PRESSURE_ELEVATED_EXIT
+from hippius_s3.pressure_signal import PressurePublisher
+from hippius_s3.pressure_signal import parse_pool_percent_used
 from hippius_s3.queue_metrics import QueueDepthSampler
 from hippius_s3.repositories import fs_cache_inventory
 from hippius_s3.repositories.fs_cache_inventory import clear_cached
@@ -85,13 +90,9 @@ AGE_BUCKET_BOUNDARIES = [
 ]
 AGE_BUCKET_NAMES = [b[0] for b in AGE_BUCKET_BOUNDARIES] + ["7d+"]
 
-# Disk pressure thresholds (fraction of total disk used). Enter thresholds are higher than exit
-# thresholds (hysteresis) so a disk hovering at a boundary doesn't flap the mode — and with it the
-# hot-retention window and loop-sleep — every cycle. C2.
-PRESSURE_ELEVATED = 0.85
-PRESSURE_ELEVATED_EXIT = 0.83
-PRESSURE_CRITICAL = 0.95
-PRESSURE_CRITICAL_EXIT = 0.93
+# Disk pressure thresholds live in hippius_s3.pressure_signal (imported below):
+# the janitor's cycle gating and the published fs_cache:pressure signal must
+# key off the SAME watermarks or consumers would disagree with the evictor.
 
 # Maximum age of an orphan `.tmp.*` file before we delete it. Atomic writes
 # finish in milliseconds; anything older than this is a crashed-write orphan.
@@ -235,52 +236,6 @@ def _classify_age_bucket(age_seconds: float) -> str:
     return "7d+"
 
 
-def _label_value(line: str, needle: str) -> str | None:
-    """The prometheus label value following `needle` (e.g. `pool_id="`), up to its closing quote."""
-    start = line.find(needle)
-    if start < 0:
-        return None
-    start += len(needle)
-    end = line.find('"', start)
-    return line[start:end] if end >= 0 else None
-
-
-def _parse_pool_percent_used(body: str, pools: list[str]) -> float | None:
-    """The fullest of `pools` from a mgr prometheus scrape, resolving each name to its id via
-    `ceph_pool_metadata` then reading `ceph_pool_percent_used`. Returns None if ANY pool is absent
-    — a missing pool must fail safe (fall back to statvfs), never silently shrink the gate. Pure so
-    the parse is unit-testable without a live exporter."""
-    name_to_id: dict[str, str] = {}
-    id_to_pct: dict[str, float] = {}
-    for line in body.splitlines():
-        if line.startswith("ceph_pool_metadata{"):
-            name = _label_value(line, 'name="')
-            pool_id = _label_value(line, 'pool_id="')
-            if name is not None and pool_id is not None and name in pools:
-                name_to_id[name] = pool_id
-        elif line.startswith("ceph_pool_percent_used{"):
-            pool_id = _label_value(line, 'pool_id="')
-            if pool_id is None:
-                continue
-            try:
-                value = float(line.rsplit(" ", 1)[1])
-            except (ValueError, IndexError):
-                continue
-            if math.isfinite(value):  # a NaN/inf is not a ratio — drop it so the pool reads missing
-                id_to_pct[pool_id] = value
-
-    fullest: float | None = None
-    for pool in pools:
-        pool_id = name_to_id.get(pool)
-        pct = id_to_pct.get(pool_id) if pool_id is not None else None
-        if pct is None:
-            logger.warning("janitor pool-fullness probe: pool %r absent from mgr output; falling back to statvfs", pool)
-            return None
-        pct = min(max(pct, 0.0), 1.0)  # exporter rounding can nudge just past 1.0
-        fullest = pct if fullest is None else max(fullest, pct)
-    return fullest
-
-
 async def _fetch_pool_percent_used() -> float | None:
     """The fullest configured Ceph pool's %USED (0.0-1.0) from the mgr exporter, or None.
 
@@ -306,7 +261,7 @@ async def _fetch_pool_percent_used() -> float | None:
     except httpx.HTTPError as exc:
         logger.warning("janitor pool-fullness probe failed (%s); falling back to statvfs", exc)
         return None
-    return _parse_pool_percent_used(body, pools)
+    return parse_pool_percent_used(body, pools)
 
 
 def _pressure_mode(root: Path) -> int:
@@ -2220,6 +2175,22 @@ async def run_janitor_loop():
     queue_sampler = QueueDepthSampler(redis_client, config)
     queue_sampler_task = asyncio.create_task(queue_sampler.run())
 
+    # Publish the shared pressure signal (fs_cache:pressure on the CACHE Redis
+    # — where the api middleware and the s3-backup hydrator read it). Sampled
+    # every 30s rather than once per cycle: a mass writer can move the pool
+    # percent materially inside one ~20min cycle. The janitor's own per-cycle
+    # _pressure_mode stays authoritative for eviction pacing; both key off the
+    # same watermarks in hippius_s3.pressure_signal.
+    cache_redis_client = Redis.from_url(config.redis_url)
+    pressure_publisher = PressurePublisher(
+        cache_redis_client,
+        Path(config.object_cache_dir),
+        mgr_metrics_url=config.janitor_ceph_mgr_metrics_url,
+        pools=config.janitor_ceph_pools.split(","),
+        probe_timeout_seconds=config.janitor_ceph_probe_timeout_seconds,
+    )
+    pressure_publish_task = asyncio.create_task(pressure_publisher.run())
+
     logger.info("Starting janitor service...")
     logger.info(f"FS store root: {config.object_cache_dir}")
     logger.info(f"MPU stale threshold: {config.mpu_stale_seconds}s")
@@ -2360,9 +2331,11 @@ async def run_janitor_loop():
             _janitor_phase = 0
             await asyncio.sleep(sleep_interval)
     finally:
-        queue_sampler_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await queue_sampler_task
+        for task in (queue_sampler_task, pressure_publish_task):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await cache_redis_client.close()
         if redis_client:
             await redis_client.close()
         if db_pool:
