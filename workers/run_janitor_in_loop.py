@@ -65,6 +65,7 @@ from hippius_s3.pressure_signal import PRESSURE_ELEVATED_EXIT
 from hippius_s3.pressure_signal import PressurePublisher
 from hippius_s3.pressure_signal import parse_pool_percent_used
 from hippius_s3.queue_metrics import QueueDepthSampler
+from hippius_s3.redis_utils import create_redis_client
 from hippius_s3.repositories import fs_cache_inventory
 from hippius_s3.repositories.fs_cache_inventory import clear_cached
 from hippius_s3.repositories.fs_cache_inventory import get_janitor_state
@@ -2161,35 +2162,68 @@ async def gc_soft_deleted_objects(pool: asyncpg.Pool) -> int:
 async def run_janitor_loop():
     """Main janitor loop: periodically clean stale and old parts."""
     concurrency = max(1, config.janitor_concurrency)
-    db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=concurrency + 4)
-    fs_store = create_fs_store(config)
-    redis_client = Redis.from_url(config.redis_queues_url)
+    # Pre-declared so _shutdown can tear down exactly what was created — a
+    # mid-setup exception must not skip cleanup (review finding: setup used to
+    # sit outside the try, so a failed constructor leaked the earlier task and
+    # left clients unclosed).
+    db_pool = None
+    redis_client = None
+    cache_redis_client = None
+    queue_sampler_task = None
+    pressure_publish_task = None
 
-    # Initialize janitor-owned OTel metrics
-    _setup_janitor_metrics()
+    async def _shutdown() -> None:
+        # Idempotent teardown shared by the setup-failure path and the main
+        # finally; closures read the current values of the names above.
+        for task in (queue_sampler_task, pressure_publish_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        if cache_redis_client is not None:
+            await cache_redis_client.close()
+        if redis_client is not None:
+            await redis_client.close()
+        if db_pool is not None:
+            await db_pool.close()
 
-    # Queue depth/age gauges (2026-07-25 audit: 136k payloads accumulated
-    # unseen in ovh_download_requests). Janitor hosts the sampler because it is
-    # single-instance and already holds the queues-Redis client; the task runs
-    # off the cycle path so a slow walk never blinds the queue gauges.
-    queue_sampler = QueueDepthSampler(redis_client, config)
-    queue_sampler_task = asyncio.create_task(queue_sampler.run())
+    try:
+        db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=concurrency + 4)
+        fs_store = create_fs_store(config)
+        redis_client = Redis.from_url(config.redis_queues_url)
 
-    # Publish the shared pressure signal (fs_cache:pressure on the CACHE Redis
-    # — where the api middleware and the s3-backup hydrator read it). Sampled
-    # every 30s rather than once per cycle: a mass writer can move the pool
-    # percent materially inside one ~20min cycle. The janitor's own per-cycle
-    # _pressure_mode stays authoritative for eviction pacing; both key off the
-    # same watermarks in hippius_s3.pressure_signal.
-    cache_redis_client = Redis.from_url(config.redis_url)
-    pressure_publisher = PressurePublisher(
-        cache_redis_client,
-        Path(config.object_cache_dir),
-        mgr_metrics_url=config.janitor_ceph_mgr_metrics_url,
-        pools=config.janitor_ceph_pools.split(","),
-        probe_timeout_seconds=config.janitor_ceph_probe_timeout_seconds,
-    )
-    pressure_publish_task = asyncio.create_task(pressure_publisher.run())
+        # Initialize janitor-owned OTel metrics
+        _setup_janitor_metrics()
+
+        # Queue depth/age gauges (2026-07-25 audit: 136k payloads accumulated
+        # unseen in ovh_download_requests). Janitor hosts the sampler because it
+        # is single-instance and already holds the queues-Redis client; the task
+        # runs off the cycle path so a slow walk never blinds the queue gauges.
+        queue_sampler = QueueDepthSampler(redis_client, config)
+        queue_sampler_task = asyncio.create_task(queue_sampler.run())
+
+        # Publish the shared pressure signal (fs_cache:pressure on the CACHE
+        # Redis — where the api middleware and the s3-backup hydrator read it).
+        # Sampled every 30s rather than once per cycle: a mass writer can move
+        # the pool percent materially inside one ~20min cycle. The janitor's own
+        # per-cycle _pressure_mode stays authoritative for eviction pacing; both
+        # key off the same watermarks in hippius_s3.pressure_signal.
+        # create_redis_client (not Redis.from_url): the cache Redis may be a
+        # cluster (cluster=true / redis-cluster URLs) — a standalone client
+        # there gets MOVED errors, every publish fails, and consumers silently
+        # stay on local-only pressure forever. Same factory the api uses.
+        cache_redis_client = create_redis_client(config.redis_url)
+        pressure_publisher = PressurePublisher(
+            cache_redis_client,
+            Path(config.object_cache_dir),
+            mgr_metrics_url=config.janitor_ceph_mgr_metrics_url,
+            pools=config.janitor_ceph_pools.split(","),
+            probe_timeout_seconds=config.janitor_ceph_probe_timeout_seconds,
+        )
+        pressure_publish_task = asyncio.create_task(pressure_publisher.run())
+    except BaseException:
+        await _shutdown()
+        raise
 
     logger.info("Starting janitor service...")
     logger.info(f"FS store root: {config.object_cache_dir}")
@@ -2331,15 +2365,7 @@ async def run_janitor_loop():
             _janitor_phase = 0
             await asyncio.sleep(sleep_interval)
     finally:
-        for task in (queue_sampler_task, pressure_publish_task):
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        await cache_redis_client.close()
-        if redis_client:
-            await redis_client.close()
-        if db_pool:
-            await db_pool.close()
+        await _shutdown()
 
 
 if __name__ == "__main__":
