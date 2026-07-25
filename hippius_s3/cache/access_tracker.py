@@ -31,6 +31,9 @@ FLUSH_INTERVAL_SECONDS = 30.0
 # Bound on the sampling map so a pathological key scan can't grow it forever;
 # pruning drops the oldest entries, which only means earlier re-sampling.
 MAX_TRACKED_KEYS = 100_000
+# One UPDATE's unnest arrays are capped so a storm-sized flush can't become a
+# single giant statement.
+FLUSH_CHUNK_SIZE = 10_000
 
 
 class AccessTracker:
@@ -61,38 +64,48 @@ class AccessTracker:
             return
         self._last_noted[key] = now
         self._pending.add(key)
+        if len(self._last_noted) > MAX_TRACKED_KEYS:
+            self._enforce_bound(now)
 
     async def flush_once(self) -> int:
-        """Write pending keys in one batched UPDATE. Returns rows attempted."""
+        """Write pending keys in chunked batched UPDATEs. Returns rows attempted."""
         if not self._pending:
-            self._prune(time.monotonic())
             return 0
         batch = list(self._pending)
         self._pending.clear()
-        try:
-            await self._pool.execute(
-                """
-                UPDATE fs_cache_inventory AS f SET last_access_at = now()
-                FROM unnest($1::text[], $2::bigint[], $3::bigint[]) AS u(oid, ver, pnum)
-                WHERE f.object_id = u.oid AND f.object_version = u.ver AND f.part_number = u.pnum
-                """,
-                [k[0] for k in batch],
-                [k[1] for k in batch],
-                [k[2] for k in batch],
-            )
-        except Exception as exc:
-            # Advisory data: dropping the batch (not re-queueing) keeps a DB
-            # outage from growing an unbounded buffer; the parts re-sample on
-            # their next read after the sample window.
-            logger.warning("last_access_at flush failed (%s keys dropped): %s", len(batch), exc)
-        self._prune(time.monotonic())
+        for start in range(0, len(batch), FLUSH_CHUNK_SIZE):
+            chunk = batch[start : start + FLUSH_CHUNK_SIZE]
+            try:
+                await self._pool.execute(
+                    """
+                    UPDATE fs_cache_inventory AS f SET last_access_at = now()
+                    FROM unnest($1::text[], $2::bigint[], $3::bigint[]) AS u(oid, ver, pnum)
+                    WHERE f.object_id = u.oid AND f.object_version = u.ver AND f.part_number = u.pnum
+                    """,
+                    [k[0] for k in chunk],
+                    [k[1] for k in chunk],
+                    [k[2] for k in chunk],
+                )
+            except Exception as exc:
+                # Advisory data: dropping the chunk (not re-queueing) keeps a DB
+                # outage from growing an unbounded buffer; the parts re-sample
+                # on their next read after the sample window.
+                logger.warning("last_access_at flush failed (%s keys dropped): %s", len(chunk), exc)
         return len(batch)
 
-    def _prune(self, now: float) -> None:
-        if len(self._last_noted) <= MAX_TRACKED_KEYS:
-            return
+    def _enforce_bound(self, now: float) -> None:
+        """Shrink the sampling map: window-prune first, then hard-evict oldest.
+
+        The window prune alone cannot shrink a map whose keys were ALL read
+        within the sample window (key-diverse storm) — that case drops the
+        oldest quarter; the only cost is earlier re-sampling of those parts.
+        """
         cutoff = now - self._sample_window
         self._last_noted = {k: ts for k, ts in self._last_noted.items() if ts >= cutoff}
+        if len(self._last_noted) <= MAX_TRACKED_KEYS:
+            return
+        items = sorted(self._last_noted.items(), key=lambda kv: kv[1])
+        self._last_noted = dict(items[len(items) // 4 :])
 
     async def run(self) -> None:
         while True:

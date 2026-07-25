@@ -20,6 +20,8 @@ from typing import Any
 from typing import Optional
 from uuid import UUID
 
+from hippius_s3.cache.access_tracker import get_access_tracker
+
 
 logger = logging.getLogger(__name__)
 
@@ -149,8 +151,10 @@ class FileSystemPartsStore:
         """Read a chunk from filesystem.
 
         Gated on meta.json existence — readers only see chunks once the part
-        is marked ready. Also touches the chunk file to update atime/mtime,
-        which the janitor uses for hot-file retention.
+        is marked ready. Read recency is recorded via the AccessTracker (into
+        fs_cache_inventory.last_access_at) rather than atime; the hook lives
+        HERE, at the store level, because the streamer passes fetch_fn =
+        fs.get_chunk directly and bypasses every higher-level wrapper.
 
         Args:
             object_id: Object UUID
@@ -184,6 +188,11 @@ class FileSystemPartsStore:
                     return f.read()
 
             data = await asyncio.to_thread(_read)
+            # Sync, sampled, no-op in processes that never initialize the
+            # tracker (workers/janitor).
+            tracker = get_access_tracker()
+            if tracker is not None:
+                tracker.note_read(object_id, int(object_version), int(part_number))
             logger.debug(
                 f"FS: read chunk object_id={object_id} v={object_version} part={part_number} chunk={chunk_index} size={len(data)}"
             )

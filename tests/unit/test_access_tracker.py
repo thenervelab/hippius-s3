@@ -89,20 +89,32 @@ def test_singleton_wiring():
 
 
 @pytest.mark.asyncio
-async def test_object_parts_get_chunk_notes_read_on_hit():
-    from hippius_s3.cache.object_parts import RedisObjectPartsCache
+async def test_fs_store_get_chunk_notes_read_on_hit(tmp_path):
+    """The hook must live in FileSystemPartsStore.get_chunk itself: the
+    streamer passes fetch_fn = fs.get_chunk and bypasses every wrapper, so a
+    wrapper-level hook would be inert for all streamed GET traffic (the
+    original review blocker)."""
+    from hippius_s3.cache.fs_store import FileSystemPartsStore
 
     tracker = initialize_access_tracker(FakePool(), hot_window_seconds=3600)
+    store = FileSystemPartsStore(str(tmp_path))
+    await store.set_chunk(OID, 1, 3, 0, b"data")
+    await store.set_meta(OID, 1, 3, chunk_size=4, num_chunks=1, size_bytes=4)
 
-    class FakeFs:
-        async def get_chunk(self, object_id, object_version, part_number, chunk_index):
-            return b"data" if chunk_index == 0 else None
-
-    cache = RedisObjectPartsCache.__new__(RedisObjectPartsCache)
-    cache._fs = FakeFs()
-
-    assert await cache.get_chunk(OID, 1, 3, 0) == b"data"
-    assert await cache.get_chunk(OID, 1, 4, 1) is None  # miss: no note
+    assert await store.get_chunk(OID, 1, 3, 0) == b"data"
+    assert await store.get_chunk(OID, 1, 4, 0) is None  # miss: no note
 
     assert (OID, 1, 3) in tracker._pending
     assert (OID, 1, 4) not in tracker._pending
+
+
+def test_note_read_enforces_hard_key_bound():
+    """A key-diverse read storm inside the sample window must not grow the
+    sampling map unboundedly — the window prune alone can't shrink it."""
+    import hippius_s3.cache.access_tracker as mod
+
+    tracker = AccessTracker(FakePool(), hot_window_seconds=3600)
+    for i in range(mod.MAX_TRACKED_KEYS + 1000):
+        tracker.note_read(OID, 1, i)
+
+    assert len(tracker._last_noted) <= mod.MAX_TRACKED_KEYS

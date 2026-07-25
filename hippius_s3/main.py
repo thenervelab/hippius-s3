@@ -180,7 +180,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
         tracker = initialize_access_tracker(
             app.state.postgres_pool,
-            hot_window_seconds=float(getattr(config, "fs_cache_hot_retention_seconds", 10800)),
+            hot_window_seconds=float(config.fs_cache_hot_retention_seconds),
         )
         app.state.access_tracker_task = asyncio.create_task(tracker.run())
         logger.info("Access tracker flush task started")
@@ -191,6 +191,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         try:
             if hasattr(app.state, "access_tracker_task"):
                 app.state.access_tracker_task.cancel()
+                import contextlib
+
+                with contextlib.suppress(asyncio.CancelledError):
+                    await app.state.access_tracker_task
         except Exception:
             logger.exception("Error stopping access tracker task")
 

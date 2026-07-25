@@ -15,7 +15,6 @@ from typing import Any
 from typing import Optional
 from typing import Protocol
 
-from .access_tracker import get_access_tracker
 from .fs_store import FileSystemPartsStore
 from .notifier import ChunkNotifier
 from .notifier import build_chunk_key
@@ -118,16 +117,11 @@ class RedisObjectPartsCache:
     async def get_chunk(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int
     ) -> Optional[bytes]:
+        # Read-recency tracking happens inside fs.get_chunk (store level): the
+        # streamer bypasses this wrapper with fetch_fn = fs.get_chunk, so a
+        # hook here would miss all streamed GET traffic.
         data = await self.fs.get_chunk(object_id, int(object_version), int(part_number), int(chunk_index))
         _get_metrics_collector().record_cache_operation(hit=data is not None, operation="get_chunk")
-        if data is not None:
-            # Read-recency for the janitor's hot retention. Replaces the old
-            # per-read os.utime (dead on read-only mounts, an MDS write
-            # elsewhere). Sync + sampled; no-op in processes that never
-            # initialize the tracker (workers).
-            tracker = get_access_tracker()
-            if tracker is not None:
-                tracker.note_read(object_id, int(object_version), int(part_number))
         return data
 
     async def set_chunk(
