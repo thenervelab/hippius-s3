@@ -22,6 +22,7 @@ Disk-pressure modes (all still replication-gated):
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
@@ -58,6 +59,7 @@ from hippius_s3.cache import create_fs_store
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.otel_setup import build_resource
+from hippius_s3.queue_metrics import QueueDepthSampler
 from hippius_s3.repositories import fs_cache_inventory
 from hippius_s3.repositories.fs_cache_inventory import clear_cached
 from hippius_s3.repositories.fs_cache_inventory import get_janitor_state
@@ -2211,6 +2213,13 @@ async def run_janitor_loop():
     # Initialize janitor-owned OTel metrics
     _setup_janitor_metrics()
 
+    # Queue depth/age gauges (2026-07-25 audit: 136k payloads accumulated
+    # unseen in ovh_download_requests). Janitor hosts the sampler because it is
+    # single-instance and already holds the queues-Redis client; the task runs
+    # off the cycle path so a slow walk never blinds the queue gauges.
+    queue_sampler = QueueDepthSampler(redis_client, config)
+    queue_sampler_task = asyncio.create_task(queue_sampler.run())
+
     logger.info("Starting janitor service...")
     logger.info(f"FS store root: {config.object_cache_dir}")
     logger.info(f"MPU stale threshold: {config.mpu_stale_seconds}s")
@@ -2351,6 +2360,9 @@ async def run_janitor_loop():
             _janitor_phase = 0
             await asyncio.sleep(sleep_interval)
     finally:
+        queue_sampler_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await queue_sampler_task
         if redis_client:
             await redis_client.close()
         if db_pool:
