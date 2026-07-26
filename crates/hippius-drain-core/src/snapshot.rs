@@ -108,6 +108,14 @@ pub struct AgentSnapshot {
     /// (a wedge, not an outage, is what readiness must catch). Kept out of `error_bps` (a
     /// throttle is not a Ceph-write failure), exactly like `deferred`.
     pub throttled: u64,
+    /// Parts written off as terminal `failed` by the missing-source escalation: the SSD
+    /// source was observed gone enough consecutive claims that the row will never drain.
+    /// This is the only standing metric of a write-off — the counter is per-process (reset
+    /// on restart), `node_undrained_count` excludes `failed`, and the terminal GC deletes
+    /// the row, so the WARN log in Loki is the only per-event trace.
+    /// Kept OUT of [`error_bps`](Self::error_bps) like `deferred`: a write-off is a data
+    /// disposition, not a Ceph-write failure.
+    pub written_off: u64,
 }
 
 impl AgentSnapshot {
@@ -148,6 +156,7 @@ pub struct SnapshotCell {
     /// [`AgentSnapshot::reclaim_backing_errors`] for why it stays out of `error_bps`.
     reclaim_backing_errors: AtomicU64,
     throttled: AtomicU64,
+    written_off: AtomicU64,
     /// Current SSD backlog (undrained bytes) — a LEVEL, not a monotonic counter, so it
     /// has its own atomic (set, not accumulated) rather than living in [`AgentSnapshot`].
     /// The heartbeat worker writes it (`usage.used_bytes`) each tick; the metrics layer
@@ -160,6 +169,11 @@ pub struct SnapshotCell {
     /// while undrained rows remain — which readiness would misread as idle. The COUNT cannot be
     /// zeroed that way, so readiness keys on it while the gauge keeps reporting bytes.
     undrained_count: AtomicU64,
+    /// Age in whole seconds of this node's oldest `pending` replication row — a LEVEL like
+    /// `undrained_count`, set each heartbeat from `Store::node_oldest_pending_age_secs`. The
+    /// starvation signal the 2026-07-26 incident lacked: one node's oldest pending age
+    /// exploding while peers sit near zero means claimable work nobody is finishing.
+    oldest_pending_age_secs: AtomicU64,
     /// Current SSD disk saturation in basis points (`0..=10000` = `0.0..=1.0` full) — a
     /// LEVEL like `backlog_bytes`, set each heartbeat from the same `statvfs` probe. This
     /// is the fill fraction that 503s every PUT once it crosses the api's cutoff, so it is
@@ -249,6 +263,26 @@ impl SnapshotCell {
         self.undrained_count.load(Ordering::Relaxed)
     }
 
+    /// Records the current age (whole seconds) of this node's oldest `pending` replication
+    /// row. A gauge: `store`, not add. The heartbeat writes it from
+    /// `Store::node_oldest_pending_age_secs` each tick.
+    pub fn record_oldest_pending_age_secs(&self, secs: u64) {
+        self.oldest_pending_age_secs.store(secs, Ordering::Relaxed);
+    }
+
+    /// The last-recorded oldest-pending age in seconds (the `drain_pending_oldest_age_seconds`
+    /// gauge source) — the per-node starvation signal (see the field doc).
+    #[must_use]
+    pub fn oldest_pending_age_secs(&self) -> u64 {
+        self.oldest_pending_age_secs.load(Ordering::Relaxed)
+    }
+
+    /// Records `n` parts written off as terminal `failed` by the missing-source escalation
+    /// (not a Ceph-write failure — see [`AgentSnapshot::written_off`]).
+    pub fn record_written_off(&self, n: u64) {
+        self.written_off.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Records the current SSD disk saturation in basis points (`0..=10000`). A gauge:
     /// `store`, not add. The heartbeat writes it from the `statvfs` pressure each tick.
     pub fn record_disk_pressure(&self, bps: u16) {
@@ -305,6 +339,7 @@ impl SnapshotCell {
             reclaimed: self.reclaimed.load(Ordering::Relaxed),
             reclaim_backing_errors: self.reclaim_backing_errors.load(Ordering::Relaxed),
             throttled: self.throttled.load(Ordering::Relaxed),
+            written_off: self.written_off.load(Ordering::Relaxed),
         }
     }
 }
@@ -394,6 +429,35 @@ mod tests {
     }
 
     #[test]
+    fn oldest_pending_age_is_a_settable_gauge_not_a_counter() {
+        // Task F starvation signal: the age of this node's oldest `pending` row, a LEVEL
+        // set each heartbeat from Store::node_oldest_pending_age_secs — so a later record
+        // replaces rather than accumulates, exactly like undrained_count.
+        let cell = SnapshotCell::new();
+        assert_eq!(cell.oldest_pending_age_secs(), 0, "a fresh cell reports no pending age");
+        cell.record_oldest_pending_age_secs(12_600); // the 2026-07-26 3.5h wall
+        assert_eq!(cell.oldest_pending_age_secs(), 12_600);
+        cell.record_oldest_pending_age_secs(10);
+        assert_eq!(cell.oldest_pending_age_secs(), 10, "age is a level: a later record replaces");
+    }
+
+    #[test]
+    fn written_off_records_accumulate_without_polluting_error_bps() {
+        // Task F durable write-off signal: a terminal missing-source escalation
+        // (status='failed', GC'd later) previously left only a WARN log. The counter is
+        // monotonic like `deferred` and — like every non-Ceph outcome — must stay out
+        // of error_bps: a write-off is not a Ceph-write failure.
+        let cell = SnapshotCell::new();
+        cell.record_drained(7);
+        cell.record_failed(3);
+        cell.record_written_off(1);
+        cell.record_written_off(1);
+        let snap = cell.load();
+        assert_eq!(snap.written_off, 2, "each write-off is counted durably");
+        assert_eq!(snap.error_bps(), 3000, "write-offs stay out of the Ceph failure rate");
+    }
+
+    #[test]
     fn records_accumulate_per_counter() {
         let cell = SnapshotCell::new();
         cell.record_drained(3);
@@ -412,6 +476,7 @@ mod tests {
                 reclaimed: 6,
                 reclaim_backing_errors: 0,
                 throttled: 9,
+                written_off: 0,
             },
         );
     }
@@ -476,6 +541,7 @@ mod tests {
             reclaimed: 0,
             reclaim_backing_errors: 0,
             throttled: 0,
+            written_off: 0,
         };
         assert_eq!(snapshot.error_bps(), 10_000);
     }
@@ -490,6 +556,7 @@ mod tests {
             reclaimed: 0,
             reclaim_backing_errors: 0,
             throttled: 0,
+            written_off: 0,
         };
         // 3 failed attempts of 10 total attempts = 30%, i.e. 3000 basis points.
         assert_eq!(snapshot.error_bps(), 3000);

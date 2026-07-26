@@ -52,6 +52,6 @@ pub use clock::TestClock;
 #[cfg(feature = "coord")]
 pub use coordination::{CoordError, Coordinator, DEFAULT_REDIS_TIMEOUT, Lease, StoredAllocation};
 #[cfg(feature = "pg")]
-pub use store::{PendingPart, Store, StoreError, UploadContext};
+pub use store::{MissingSourceOutcome, PendingPart, Store, StoreError, UploadContext};
 #[cfg(feature = "coord")]
 pub use tick::{CephCeilingSource, StaticCeiling, TickConfig, TickOutcome, run_tick};

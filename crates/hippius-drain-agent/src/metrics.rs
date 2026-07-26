@@ -150,6 +150,31 @@ pub fn init(service_name: &'static str, snapshot: &Arc<SnapshotCell>, enforcer: 
             .build(),
     ));
 
+    // Starvation: age of this node's oldest still-`pending` row (gauge, seconds), refreshed
+    // by the heartbeat from Store::node_oldest_pending_age_secs. The 2026-07-26 incident's
+    // earliest unambiguous signal — one node's age exploding while its peers sat near zero —
+    // was only reachable by hand-written SQL; this makes it a standing per-node gauge.
+    // Deferred (backed-off) rows count: an MPU wall aging past hours is exactly the tell.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_gauge("drain_pending_oldest_age_seconds")
+            .with_callback(move |observer| observer.observe(snap.oldest_pending_age_secs(), &[]))
+            .build(),
+    ));
+
+    // Write-off alarm: parts escalated to terminal `failed` by the missing-source path
+    // (monotonic counter). The only DURABLE signal of a write-off — the row is excluded from
+    // node_undrained_count and later deleted by the terminal GC, leaving just a WARN log.
+    // Deliberately not folded into error_bps/failed: a write-off is not a Ceph failure.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_parts_written_off_total")
+            .with_callback(move |observer| observer.observe(snap.load().written_off, &[]))
+            .build(),
+    ));
+
     // Silent-failure alarm: the Ceph breaker (trips at debug-level today) as a 0/1 gauge.
     if let Some(enforcer) = enforcer {
         let enforcer = Arc::clone(enforcer);

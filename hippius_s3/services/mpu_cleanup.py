@@ -1,4 +1,6 @@
-# Terminal cleanup for aborted or abandoned multipart uploads.
+# Terminal cleanup for aborted or abandoned multipart uploads — plus the completion-side
+# counterpart (wake_version_replication), so every Python-side mutation of the drain's
+# cephor_replication_status rows lives in one module.
 #
 # An MPU writes each part to a node-local SSD object cache (the drain's CEPHOR_SSD_ROOT)
 # and the drain records a cephor_replication_status row per part, but
@@ -65,6 +67,21 @@ async def fail_version_replication(db: Any, *, object_id: Any, object_version: i
         get_query("fail_replication_status_for_version"),
         str(object_id),
         None if object_version is None else int(object_version),
+    )
+
+
+async def wake_version_replication(db: Any, *, object_id: Any, object_version: int) -> None:
+    """Clear drain defer backoff for one completed version's still-'pending' rows.
+
+    The counterpart of ``fail_version_replication``: completion (not abort) is the
+    signal. In-progress-MPU parts defer with exponential backoff because their upload
+    enqueue is not ready until the address lands at complete; clearing the backoff lets
+    the drain claim them on its next poll instead of waiting out up to the cap.
+    """
+    await db.execute(
+        get_query("wake_replication_status_for_version"),
+        str(object_id),
+        int(object_version),
     )
 
 

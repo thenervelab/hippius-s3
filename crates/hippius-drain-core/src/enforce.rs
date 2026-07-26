@@ -144,6 +144,14 @@ pub struct TokenBucket {
     /// tick. Carrying it makes a low-rate / high-frequency refill exact instead of
     /// systematically under-crediting (each tick would otherwise truncate to zero).
     remainder_nanos: u64,
+    /// Bytes admitted ahead of budget by [`Self::try_take_overdraft`] and not yet
+    /// paid back. `refill` services this before minting any token and an overdraft
+    /// only fires at `debt == 0` after draining `tokens` to zero, so on every path
+    /// `tokens > 0` implies `debt == 0` — which is what makes a plain `try_take`
+    /// implicitly denied for the whole payoff window: an oversized admission
+    /// suppresses exactly its own byte-cost of future budget, keeping long-run
+    /// throughput <= rate.
+    debt: u64,
 }
 
 impl TokenBucket {
@@ -156,11 +164,18 @@ impl TokenBucket {
             tokens: burst.get(),
             last: now,
             remainder_nanos: 0,
+            debt: 0,
         }
     }
 
     /// Replaces the refill rate (the adapter from an [`crate::Allocation`] budget).
-    pub fn set_rate(&mut self, rate: ByteRate) {
+    /// Settles the un-refilled window since `last` at the OLD rate before swapping:
+    /// `refill` prices the whole elapsed window at the current rate, and while debt
+    /// is outstanding that minting is NOT burst-capped — re-pricing a quiet stretch
+    /// at a higher new rate would erase real debt for free (and a drop would
+    /// underpay it), breaking the "long-run throughput <= rate" guarantee.
+    pub fn set_rate(&mut self, rate: ByteRate, now: Instant) {
+        self.refill(now);
         self.rate = rate;
     }
 
@@ -171,7 +186,8 @@ impl TokenBucket {
     }
 
     /// The burst ceiling (the max tokens the bucket holds — one second of rate). The
-    /// drain admission clamps an oversize part's charge to this so it can always make
+    /// drain admission routes parts larger than this through
+    /// [`try_take_overdraft`](Self::try_take_overdraft) so they can always make
     /// progress (audit F1).
     #[must_use]
     pub fn burst(&self) -> u64 {
@@ -187,8 +203,18 @@ impl TokenBucket {
         let numerator = u128::from(self.rate.get()) * elapsed.as_nanos() + u128::from(self.remainder_nanos);
         let added = u64::try_from(numerator / 1_000_000_000).unwrap_or(u64::MAX);
         self.remainder_nanos = u64::try_from(numerator % 1_000_000_000).unwrap_or(0);
-        self.tokens = self.tokens.saturating_add(added).min(self.burst.get());
-        self.last = now;
+        // Newly minted tokens pay outstanding overdraft debt before crediting the
+        // bucket, so an oversized admission consumes exactly its byte-cost of
+        // future budget rather than getting the over-burst remainder for free.
+        let repaid = added.min(self.debt);
+        self.debt -= repaid;
+        self.tokens = self.tokens.saturating_add(added - repaid).min(self.burst.get());
+        // Only ever ADVANCE the clock: a stale `now` (an Instant captured before the
+        // caller won the enforcer lock, arriving after a fresher refill) prices a
+        // zero-length window above, but assigning it would rewind `last` and let the
+        // NEXT refill re-price the already-minted [now, last] window — free tokens
+        // (and free debt payoff) exactly under lock contention.
+        self.last = self.last.max(now);
     }
 
     /// Tries to spend `bytes` tokens, refilling first. Returns whether granted.
@@ -203,9 +229,41 @@ impl TokenBucket {
         }
     }
 
-    /// Returns `bytes` tokens to the bucket (used when a later gate denies).
+    /// Admits a part larger than the burst by taking everything available now and
+    /// carrying the remainder as debt the refill pays off before any new tokens mint.
+    /// One overdraft at a time: denied while debt is outstanding. This guarantees an
+    /// oversized part drains at the budgeted rate; the prior full-bucket-only overdraft
+    /// never fired under continuous load (2026-07-26: two 2 GiB parts churned the claim
+    /// head for 4h), while long-run throughput stays <= rate because the debt suppresses
+    /// exactly `bytes` of future admissions.
+    ///
+    /// Total for any `bytes`: with `bytes <= tokens` it degenerates to a plain
+    /// [`try_take`](Self::try_take) (takes `bytes`, zero debt), so a misrouted
+    /// small part is charged correctly rather than panicking or over-charging.
+    /// Denied outright at rate 0: an overdraft is a loan against future refill,
+    /// and a zero rate (the allocator's Ceph-critical freeze) can never repay it —
+    /// admitting would hand a multi-GiB write to a pool that asked for silence.
+    #[must_use]
+    pub fn try_take_overdraft(&mut self, bytes: u64, now: Instant) -> bool {
+        self.refill(now);
+        if self.debt > 0 || self.rate.get() == 0 {
+            return false;
+        }
+        let taken = self.tokens.min(bytes);
+        self.tokens -= taken;
+        self.debt = bytes - taken;
+        true
+    }
+
+    /// Returns `bytes` tokens to the bucket (used when a later gate denies). Pays
+    /// outstanding debt first, then credits tokens capped at burst — the exact
+    /// mirror of an overdraft charge (tokens drained, remainder as debt), so an
+    /// admission unwound by a concurrency denial restores the bucket as if it
+    /// never happened, and the `tokens > 0 ⟹ debt == 0` invariant is preserved.
     pub fn refund(&mut self, bytes: u64) {
-        self.tokens = self.tokens.saturating_add(bytes).min(self.burst.get());
+        let repaid = bytes.min(self.debt);
+        self.debt -= repaid;
+        self.tokens = self.tokens.saturating_add(bytes - repaid).min(self.burst.get());
     }
 }
 
@@ -277,6 +335,11 @@ pub enum DenyReason {
     BreakerOpen,
     /// The bandwidth budget for this tick is exhausted.
     RateLimited,
+    /// An earlier overdraft admission is still being paid off, so another oversized
+    /// part cannot be admitted yet. This is a part-specific wait, NOT node-global
+    /// budget exhaustion like [`DenyReason::RateLimited`]: the worker defers just
+    /// this part with backoff instead of stopping the burst.
+    OverdraftOutstanding,
     /// The concurrency limit is reached.
     AtConcurrencyLimit,
 }
@@ -340,9 +403,11 @@ impl Enforcer {
         }
     }
 
-    /// Applies a fresh allocation by setting the bandwidth refill rate.
-    pub fn set_rate(&mut self, rate: ByteRate) {
-        self.bucket.set_rate(rate);
+    /// Applies a fresh allocation by setting the bandwidth refill rate. `now` lets
+    /// the bucket settle the elapsed window at the outgoing rate before the swap
+    /// (see [`TokenBucket::set_rate`]).
+    pub fn set_rate(&mut self, rate: ByteRate, now: Instant) {
+        self.bucket.set_rate(rate, now);
     }
 
     /// The bandwidth budget currently enforced (the token-bucket refill rate).
@@ -371,16 +436,23 @@ impl Enforcer {
         }
         // Bandwidth gate. Normal path spends `bytes`. A part larger than the burst can
         // never fit (tokens cap at `burst`), so it would loop `Denied(RateLimited)`
-        // forever (audit F1); admit it as a one-shot overdraft when the bucket is full,
-        // spending one burst. The `burst > 0` guard keeps a fully-throttled (zero-budget)
-        // bucket denying everything — without it `bytes.min(0) == 0` would admit any
-        // part free. The amount actually charged is refunded if concurrency then denies,
-        // so a rejected drain costs no budget.
+        // forever (audit F1); admit it via the debt-carrying overdraft, which takes
+        // whatever is available now and charges the remainder against future refills —
+        // the full `bytes` is the charge either way, so a concurrency denial's
+        // `refund(charged)` fully unwinds it. The `burst > 0 && rate > 0` guards keep
+        // a throttled bucket denying everything via the normal RateLimited path:
+        // `burst` is fixed at construction while `rate` tracks the live allocation,
+        // so a zero-RATE bucket (the allocator's Ceph-critical freeze) still holds
+        // tokens/burst — without the rate guard the overdraft would admit a
+        // multi-GiB part on never-repayable debt exactly when the pool is critical.
         let burst = self.bucket.burst();
         let charged = if self.bucket.try_take(bytes, now) {
             bytes
-        } else if bytes > burst && burst > 0 && self.bucket.try_take(burst, now) {
-            burst
+        } else if bytes > burst && burst > 0 && self.bucket.rate().get() > 0 {
+            if !self.bucket.try_take_overdraft(bytes, now) {
+                return DrainDecision::Denied(DenyReason::OverdraftOutstanding);
+            }
+            bytes
         } else {
             return DrainDecision::Denied(DenyReason::RateLimited);
         };
@@ -491,6 +563,21 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_refill_cannot_regress_the_clock_and_remint_a_window() {
+        // Two callers race for the enforcer lock, each with an Instant captured
+        // pre-lock. The loser's older `now` must not rewind the bucket's clock:
+        // rewinding re-prices the already-minted [stale_now, last] window on the
+        // NEXT refill — free tokens (and free debt payoff) under lock contention.
+        let now = t0();
+        let mut bucket = TokenBucket::new(ByteRate::new(1_000), Bytes::new(1_000), now);
+        assert!(bucket.try_take(1_000, now), "drain the initial burst");
+        let later = now + Duration::from_secs(1);
+        assert!(bucket.try_take(1_000, later), "the now->later window minted its full burst once");
+        let _ = bucket.try_take(0, now); // the stale, pre-lock refill arrives late
+        assert!(!bucket.try_take(1, later), "a stale refill after a fresh one mints nothing extra");
+    }
+
+    #[test]
     fn bucket_caps_at_burst() {
         let now = t0();
         let mut bucket = TokenBucket::new(ByteRate::new(1_000), Bytes::new(1_000), now);
@@ -499,6 +586,88 @@ mod tests {
         let later = now + Duration::from_secs(10);
         assert!(bucket.try_take(1_000, later));
         assert!(!bucket.try_take(1, later), "tokens cannot exceed burst");
+    }
+
+    #[test]
+    fn oversized_part_admits_via_debt_and_blocks_next_overdraft() {
+        let now = t0();
+        let mut bucket = TokenBucket::new(ByteRate::new(100), Bytes::new(100), now);
+        assert!(
+            bucket.try_take_overdraft(250, now),
+            "at debt == 0 an oversized take is admitted immediately, draining all tokens"
+        );
+        assert!(
+            !bucket.try_take_overdraft(250, now),
+            "a second oversized take is denied while the first's debt is outstanding"
+        );
+        // 1.5s at 100 B/s mints exactly the 150 debt: it clears, but no token has
+        // minted yet, so even a 1-byte take is still denied at this instant.
+        let paid = now + Duration::from_millis(1_500);
+        assert!(!bucket.try_take(1, paid), "the refill paid debt only; no tokens yet");
+        // Past the payoff, refill credits tokens again.
+        let later = now + Duration::from_secs(2);
+        assert!(bucket.try_take(50, later), "0.5s past payoff minted 50 fresh tokens");
+    }
+
+    #[test]
+    fn refund_pays_debt_before_crediting_tokens() {
+        let now = t0();
+        let mut bucket = TokenBucket::new(ByteRate::new(100), Bytes::new(100), now);
+        assert!(bucket.try_take_overdraft(250, now)); // tokens 100 -> 0, debt 150
+        // The exact mirror of the charge: 150 pays the debt, the remaining 100
+        // restores the tokens — as if the admission never happened.
+        bucket.refund(250);
+        assert!(bucket.try_take(100, now), "tokens restored to the pre-admission full burst");
+        assert!(!bucket.try_take(1, now), "but not a token more");
+        assert!(
+            bucket.try_take_overdraft(150, now),
+            "debt was zeroed by the refund, so a fresh overdraft is admitted"
+        );
+    }
+
+    #[test]
+    fn set_rate_settles_the_elapsed_window_at_the_old_rate() {
+        // The refill prices the whole window since `last` at the CURRENT rate, so a
+        // rate swap must settle the un-refilled window at the OLD rate first. Debt
+        // payment is not burst-capped: re-pricing a quiet second at the new
+        // 10_000 B/s would mint 10_000 against a 250 debt and erase it (plus a full
+        // burst) for free, letting the next oversized part admit far ahead of budget.
+        let now = t0();
+        let mut bucket = TokenBucket::new(ByteRate::new(100), Bytes::new(100), now);
+        assert!(bucket.try_take_overdraft(350, now)); // tokens 100 -> 0, debt 250
+        // 1s at the old 100 B/s pays 100 of the debt (250 -> 150), nothing more.
+        let t1 = now + Duration::from_secs(1);
+        bucket.set_rate(ByteRate::new(10_000), t1);
+        assert!(!bucket.try_take(1, t1), "150 debt remains; the swap itself minted nothing extra");
+        // 15ms at the NEW rate mints exactly the remaining 150 debt: still no tokens.
+        let t2 = t1 + Duration::from_millis(15);
+        assert!(!bucket.try_take(1, t2), "post-swap minting services the settled debt first");
+        // 10ms more mints 100 tokens (burst-capped): the bucket is healthy again.
+        let t3 = t2 + Duration::from_millis(10);
+        assert!(bucket.try_take(100, t3), "tokens mint at the new rate once the debt clears");
+        assert!(!bucket.try_take(1, t3), "and not a token more");
+    }
+
+    #[test]
+    fn zero_rate_denies_the_overdraft_even_with_tokens_banked() {
+        // At rate 0 the refill can never repay debt, so the overdraft loan must be
+        // refused no matter how many tokens are banked from before the throttle —
+        // otherwise a multi-GiB part would be admitted on never-repayable debt.
+        let now = t0();
+        let mut bucket = TokenBucket::new(ByteRate::new(0), Bytes::new(100), now);
+        assert!(!bucket.try_take_overdraft(250, now), "no loan without repayment capacity");
+        assert!(bucket.try_take(100, now), "the refused overdraft left the banked tokens intact");
+    }
+
+    #[test]
+    fn normal_take_is_denied_while_debt_outstanding() {
+        let now = t0();
+        let mut bucket = TokenBucket::new(ByteRate::new(100), Bytes::new(100), now);
+        assert!(bucket.try_take_overdraft(250, now)); // debt 150
+        // 1s mints 100 tokens; ALL of it services the debt (150 -> 50), so tokens
+        // stay 0 and even a 1-byte take is denied: tokens > 0 implies debt == 0.
+        let later = now + Duration::from_secs(1);
+        assert!(!bucket.try_take(1, later), "refill pays debt before minting any token");
     }
 
     // --- CircuitBreaker ---
@@ -713,10 +882,11 @@ mod tests {
     }
 
     #[test]
-    fn enforcer_admits_a_part_larger_than_the_burst_ceiling() {
-        // Regression for F1: a part bigger than one second of rate (burst) must still
-        // drain. Before the charge-clamp it looped Denied(RateLimited) forever because
-        // `tokens` caps at `burst`, so `tokens >= bytes` was unsatisfiable.
+    fn enforcer_admits_a_part_larger_than_the_burst_and_charges_it_in_full() {
+        // Regression for F1, upgraded to debt semantics: a part bigger than one second
+        // of rate (burst) must still drain — and now pays for ALL its bytes. The burst
+        // is taken up front and the remaining 4_000 is carried as debt the refill
+        // services before minting any token, so long-run throughput stays <= rate.
         let now = t0();
         let mut e = enforcer(now); // burst = 1_000
         assert_eq!(
@@ -724,10 +894,41 @@ mod tests {
             DrainDecision::Allowed,
             "a 5_000-byte part must be admitted from a full 1_000 burst, not stalled",
         );
-        // It paid at most one burst: the bucket is now empty, so the next drain is rate
-        // limited (and the oversize part did NOT overdraw into a negative balance).
         e.record_outcome(BreakerSignal::CephSuccess, now);
         assert_eq!(e.try_drain(1, now), DrainDecision::Denied(DenyReason::RateLimited));
+        // 4s of refill (4_000 tokens at 1_000 B/s) all services the debt: not a
+        // single token mints, so a 1-byte drain is still rate limited.
+        let paying = now + Duration::from_secs(4);
+        assert_eq!(e.try_drain(1, paying), DrainDecision::Denied(DenyReason::RateLimited));
+        // One second past the payoff, a full burst is available again.
+        let paid = now + Duration::from_secs(5);
+        assert_eq!(e.try_drain(1_000, paid), DrainDecision::Allowed);
+    }
+
+    #[test]
+    fn enforcer_admits_an_oversized_part_from_a_non_full_bucket() {
+        // The exact prod failure (2026-07-26): under continuous load the bucket is
+        // never exactly full, so the old full-bucket-only overdraft never fired and
+        // two 2 GiB parts churned Denied(RateLimited) at the claim head for 4+ hours.
+        // The debt overdraft must admit at ANY debt-free level, then deny further
+        // overdrafts with the part-specific OverdraftOutstanding until the debt clears.
+        let now = t0();
+        let mut e = enforcer(now); // rate 1_000, burst 1_000, concurrency 1
+        assert_eq!(e.try_drain(400, now), DrainDecision::Allowed); // bucket at 600: NOT full
+        e.record_outcome(BreakerSignal::CephSuccess, now);
+        assert_eq!(
+            e.try_drain(5_000, now),
+            DrainDecision::Allowed,
+            "an oversized part is admitted from a non-full bucket while debt == 0",
+        );
+        e.record_outcome(BreakerSignal::CephSuccess, now);
+        // debt = 5_000 - 600 = 4_400: the next oversized part gets the part-specific
+        // reason (defer just this part), while a normal part reads as rate limited.
+        assert_eq!(e.try_drain(5_000, now), DrainDecision::Denied(DenyReason::OverdraftOutstanding));
+        assert_eq!(e.try_drain(1, now), DrainDecision::Denied(DenyReason::RateLimited));
+        // 4.4s pays the debt off at the budgeted rate; 1s more refills a full burst.
+        let later = now + Duration::from_millis(5_400);
+        assert_eq!(e.try_drain(1_000, later), DrainDecision::Allowed, "debt paid at the budgeted rate");
     }
 
     #[test]
@@ -748,12 +949,29 @@ mod tests {
     }
 
     #[test]
+    fn enforcer_denies_oversized_part_after_rate_drops_to_zero() {
+        // The reachable prod state: the allocator hands out budget 0 under
+        // CephCeiling::Critical and the runtime adopts it via set_rate(0), but
+        // `burst` stays fixed from construction. Without a rate guard the debt
+        // overdraft would admit a multi-GiB Ceph write exactly when the pool is
+        // critical — on debt a zero rate can never repay.
+        let now = t0();
+        let mut e = enforcer(now); // rate 1_000, burst 1_000
+        e.set_rate(ByteRate::new(0), now);
+        assert_eq!(
+            e.try_drain(5_000, now),
+            DrainDecision::Denied(DenyReason::RateLimited),
+            "a zero-rate node must not admit an oversized part on never-repayable debt",
+        );
+    }
+
+    #[test]
     fn enforcer_set_rate_applies_allocation() {
         let now = t0();
         let mut e = enforcer(now);
         assert_eq!(e.try_drain(1_000, now), DrainDecision::Allowed);
         e.record_outcome(BreakerSignal::CephSuccess, now);
-        e.set_rate(ByteRate::new(2_000)); // a larger allocation refills faster
+        e.set_rate(ByteRate::new(2_000), now); // a larger allocation refills faster
         let later = now + Duration::from_secs(1);
         assert_eq!(
             e.try_drain(1_000, later),
