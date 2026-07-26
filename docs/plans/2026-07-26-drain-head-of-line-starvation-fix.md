@@ -433,6 +433,19 @@ incident** — it must fail on `main` and pass on the branch (verify both).
 soak (watch `drain_pending_oldest_age_seconds`, per-node replicated/hour via the diagnosis query in
 the hippius-mem note) → `k8s-production`. Do not push or open the PR without the user's go-ahead.
 
+**Rollout notes:**
+
+- **Deploy the allocator before the agent DaemonSet.** The allocator is the sole `migrate()` caller
+  (`crates/hippius-drain-allocator/src/main.rs:54`), so migrations 0014/0015 apply only when it rolls.
+  An agent from this branch against the pre-0014 schema errors on every `defer_part` /
+  `defer_part_missing_source` (missing `defer_attempts` / `missing_source_attempts` columns); it
+  degrades safely via claim-lease recovery rather than losing data, but is noisy and cannot back
+  off a not-ready part until the columns exist.
+- **The `drain_pending_oldest_age_seconds` alert must pair its threshold with an absence/staleness
+  check** (e.g. `absent(...)` or `... unless timestamp(...) < time() - <staleness>`): an agent
+  restarting during a DB blip briefly serves 0 for the gauge, so a threshold-only rule reads a
+  live starvation as recovered exactly when the node is least healthy.
+
 **Step 4:** After prod soak, `mcp__hippius-mem__remember` the deploy outcome and link it to
 `mem_01KYEMV313BBPJ7GDKQ3WAEVP9`; mark the fix-directions paragraph there as implemented via
 `mcp__hippius-mem__edit`.

@@ -182,9 +182,9 @@ pub async fn drain_next<E: UploadEnqueuer>(
                         tracing::debug!(observations, "part source missing; part deferred, burst continues");
                     }
                     MissingSourceOutcome::Failed => {
-                        // The DURABLE write-off record: `node_undrained_count` excludes
-                        // `failed` and the terminal GC deletes the row, so without this
-                        // counter the disposition survives only as the WARN below. Still
+                        // The only standing metric of a write-off (per-process; the WARN
+                        // below is the only per-event trace): `node_undrained_count`
+                        // excludes `failed` and the terminal GC deletes the row. Still
                         // NOT counted in `failed`/error_bps — not a Ceph-write failure.
                         if let Some(snapshot) = snapshot {
                             snapshot.record_written_off(1);
@@ -873,7 +873,7 @@ mod tests {
         assert_eq!(counts.error_bps(), 0, "the write-off stays out of the Ceph failure rate");
         assert_eq!(
             counts.written_off, 1,
-            "the write-off is durably counted — the WARN log and the (GC'd) failed row are not a signal"
+            "the write-off is counted in the snapshot — the WARN log and the (GC'd) failed row are not a metric"
         );
         assert_eq!(
             enforcer.lock().unwrap().try_drain(1, Instant::now()),
@@ -1047,7 +1047,11 @@ mod tests {
         )));
         {
             let mut guard = enforcer.lock().unwrap();
-            assert_eq!(guard.try_drain(10_000, Instant::now()), DrainDecision::Allowed, "book the incident's debt");
+            assert_eq!(
+                guard.try_drain(10_000, Instant::now()),
+                DrainDecision::Allowed,
+                "book the incident's debt"
+            );
             guard.record_outcome(BreakerSignal::Deferred, Instant::now());
         }
 
@@ -1109,7 +1113,11 @@ mod tests {
         // The wall stays pending-with-backoff — deferred out of the claim head, not
         // written off and not churning as promptly-reclaimable releases.
         for part in &wall {
-            assert_eq!(status_of(&store, part).await, Some(ReplicationState::Pending), "the wall is not written off");
+            assert_eq!(
+                status_of(&store, part).await,
+                Some(ReplicationState::Pending),
+                "the wall is not written off"
+            );
             let (backed_off, attempts) = defer_state(&db, part).await;
             assert!(backed_off && attempts >= 1, "wall part {} is deferred with backoff", part.part().get());
         }

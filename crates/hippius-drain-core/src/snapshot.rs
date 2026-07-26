@@ -110,8 +110,9 @@ pub struct AgentSnapshot {
     pub throttled: u64,
     /// Parts written off as terminal `failed` by the missing-source escalation: the SSD
     /// source was observed gone enough consecutive claims that the row will never drain.
-    /// This is the DURABLE record of a write-off — `node_undrained_count` excludes `failed`
-    /// and the terminal GC deletes the row, so without this counter only a WARN log remains.
+    /// This is the only standing metric of a write-off — the counter is per-process (reset
+    /// on restart), `node_undrained_count` excludes `failed`, and the terminal GC deletes
+    /// the row, so the WARN log in Loki is the only per-event trace.
     /// Kept OUT of [`error_bps`](Self::error_bps) like `deferred`: a write-off is a data
     /// disposition, not a Ceph-write failure.
     pub written_off: u64,
