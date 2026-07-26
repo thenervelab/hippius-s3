@@ -313,12 +313,12 @@ if an end-to-end drain-cycle harness exists there — check `tests/it/main.rs` f
 
 **Step 3: Implement**
 
-- Change `drain_next` to return `Result<DrainStep, DrainCycleError>` with
+- Change `drain_next` to return `Result<ClaimOutcome, DrainCycleError>` with
 
 ```rust
 /// One claim-slot outcome, distinguishing part-specific skips (keep claiming)
 /// from node-global stops (budget spent / breaker open / backlog empty).
-pub enum DrainStep {
+pub enum ClaimOutcome {
     Drained(DrainOutcome),
     /// This part cannot proceed right now but others can: it was deferred
     /// (backoff) and the burst must keep refilling.

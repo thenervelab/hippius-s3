@@ -108,7 +108,7 @@ async fn part_size(ssd: &LocalSsd, part: &PartKey) -> std::io::Result<u64> {
 /// One claim-slot outcome, distinguishing part-specific skips (keep claiming)
 /// from node-global stops (budget spent / breaker open / backlog empty).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DrainStep {
+pub enum ClaimOutcome {
     /// The claimed part drained to the pool.
     Drained(DrainOutcome),
     /// This part cannot proceed right now but others can: it was deferred
@@ -120,9 +120,9 @@ pub enum DrainStep {
 
 /// Claims one pending part and drains it SSD → pool, gated by `enforcer`.
 ///
-/// Returns [`DrainStep::Drained`] for the part it drained; [`DrainStep::Skipped`]
+/// Returns [`ClaimOutcome::Drained`] for the part it drained; [`ClaimOutcome::Skipped`]
 /// when the claimed part cannot proceed right now but others can (it was deferred
-/// with backoff, so the caller keeps the burst claiming); [`DrainStep::Idle`] when
+/// with backoff, so the caller keeps the burst claiming); [`ClaimOutcome::Idle`] when
 /// nothing is pending or a node-global gate denied — the claimed part, if any, is
 /// returned to pending for a later wake. With `enforcer = None` the drain is
 /// ungated. A drain failure leaves the SSD copy intact, so the cycle is always
@@ -139,9 +139,9 @@ pub async fn drain_next<E: UploadEnqueuer>(
     enqueuer: &E,
     enforcer: Option<&Arc<Mutex<Enforcer>>>,
     snapshot: Option<&SnapshotCell>,
-) -> Result<DrainStep, DrainCycleError> {
+) -> Result<ClaimOutcome, DrainCycleError> {
     let Some(claim) = store.claim_part().await? else {
-        return Ok(DrainStep::Idle);
+        return Ok(ClaimOutcome::Idle);
     };
 
     if let Some(enforcer) = enforcer {
@@ -159,7 +159,7 @@ pub async fn drain_next<E: UploadEnqueuer>(
                     snapshot.record_deferred(1);
                 }
                 tracing::debug!("part source missing; part deferred, burst continues");
-                return Ok(DrainStep::Skipped);
+                return Ok(ClaimOutcome::Skipped);
             }
             Err(err) => {
                 // Any other stat/list failure must not admit the part at zero cost
@@ -168,7 +168,7 @@ pub async fn drain_next<E: UploadEnqueuer>(
                 // right: hand the claim back (promptly re-claimable) and end the burst.
                 store.release_part(claim.part()).await?;
                 tracing::debug!(error = ?err, "part size unavailable; part returned to pending");
-                return Ok(DrainStep::Idle);
+                return Ok(ClaimOutcome::Idle);
             }
         };
         // The guard's scope ends before the drain await — a `MutexGuard` must never
@@ -198,7 +198,7 @@ pub async fn drain_next<E: UploadEnqueuer>(
                 DenyReason::OverdraftOutstanding => {
                     store.defer_part(claim.part()).await?;
                     tracing::debug!(?reason, "drain deferred; part backed off, burst continues");
-                    Ok(DrainStep::Skipped)
+                    Ok(ClaimOutcome::Skipped)
                 }
                 // Node-global: the budget is spent, the breaker is open, or every
                 // in-flight slot is taken — no part would fare better, so hand the
@@ -207,7 +207,7 @@ pub async fn drain_next<E: UploadEnqueuer>(
                 DenyReason::BreakerOpen | DenyReason::RateLimited | DenyReason::AtConcurrencyLimit => {
                     store.release_part(claim.part()).await?;
                     tracing::debug!(?reason, "drain throttled; part returned to pending");
-                    Ok(DrainStep::Idle)
+                    Ok(ClaimOutcome::Idle)
                 }
             };
         }
@@ -293,7 +293,7 @@ pub async fn drain_next<E: UploadEnqueuer>(
             );
         }
     }
-    result.map(DrainStep::Drained).map_err(DrainCycleError::from)
+    result.map(ClaimOutcome::Drained).map_err(DrainCycleError::from)
 }
 
 /// What one burst accomplished: parts drained to the pool, and part-specific
@@ -302,7 +302,8 @@ pub async fn drain_next<E: UploadEnqueuer>(
 pub struct BurstTally {
     /// Parts drained (committed to the pool) in this burst.
     pub drained: u64,
-    /// Parts skipped: deferred with backoff without stopping the refill.
+    /// Parts skipped: deferred with backoff — at the admission gate or mid-drain —
+    /// without stopping the refill.
     pub skipped: u64,
 }
 
@@ -319,9 +320,10 @@ pub struct BurstTally {
 /// `Enforcer` still bounds the real rate/concurrency; this just stops the *driver*
 /// from being the bottleneck.
 ///
-/// Each slot resolves three ways ([`DrainStep`]): `Drained` counts and refills;
-/// `Skipped` (a part-specific back-off — the part was deferred) refills WITHOUT
-/// counting, so one unprocessable part cannot stop the burst and starve the parts
+/// Each slot resolves three ways ([`ClaimOutcome`]): `Drained` counts and refills;
+/// `Skipped` (a part-specific back-off — the part was deferred, whether at the
+/// admission gate or as a mid-drain benign-deferral `Err`) counts as `skipped` and
+/// refills, so one unprocessable part cannot stop the burst and starve the parts
 /// behind it (the 2026-07-26 head-of-line incident); `Idle` (empty backlog or a
 /// node-global denial) stops claiming new work, but in-flight drains are awaited to
 /// completion — never abandoned mid-flight, since dropping one at its await would
@@ -370,48 +372,39 @@ pub async fn drain_until_empty<E: UploadEnqueuer>(
     // Pushing into a FuturesUnordered while iterating it is supported; the `.next()`
     // borrow ends before the body runs, so the refill push is safe.
     while let Some(outcome) = inflight.next().await {
-        match outcome {
-            Ok(DrainStep::Drained(_)) => {
+        // Classify the slot once: does the burst keep claiming after it? A skip — the
+        // gated ClaimOutcome::Skipped or a mid-drain benign-deferral Err — deferred its
+        // part (backed off out of the claim set), so the burst keeps claiming: the
+        // parts behind it are often ready, and stopping here is what starved a node
+        // down to 64 parts/hour (2026-07-26). The backoff makes the skipped part
+        // unclaimable within this burst, so the burst still terminates once only
+        // backed-off parts remain (claim_part then returns None). Idle and real
+        // failures stop the refill; each failed drain has already returned its part.
+        let keep_claiming = match outcome {
+            Ok(ClaimOutcome::Drained(_)) => {
                 tally.drained += 1;
-                if refill && !token.is_cancelled() {
-                    inflight.push(drain_next(ceph, ssd, store, enqueuer, enforcer, snapshot));
-                } else {
-                    refill = false;
-                }
+                true
             }
-            Ok(DrainStep::Skipped) => {
-                // The part was deferred (backed off out of the claim set), so the burst
-                // keeps claiming: the parts behind it are often ready, and stopping here
-                // is what starved a node down to 64 parts/hour (2026-07-26). The backoff
-                // makes the skipped part unclaimable within this burst, so the burst
-                // still terminates once only backed-off parts remain.
+            Ok(ClaimOutcome::Skipped) => {
                 tally.skipped += 1;
-                if refill && !token.is_cancelled() {
-                    inflight.push(drain_next(ceph, ssd, store, enqueuer, enforcer, snapshot));
-                } else {
-                    refill = false;
-                }
+                true
             }
-            Ok(DrainStep::Idle) => refill = false,
+            Ok(ClaimOutcome::Idle) => false,
             Err(err) if err.is_deferral() => {
-                // A deferral is not a cycle failure: the part backed off, so keep
-                // draining the rest of the backlog instead of stopping the burst —
-                // otherwise a not-ready part (an in-progress/abandoned MPU) starves the
-                // ready parts behind it. The backoff keeps the deferred part out of the
-                // claim set, so the burst still terminates when only backed-off parts
-                // remain (claim_part then returns None).
-                if refill && !token.is_cancelled() {
-                    inflight.push(drain_next(ceph, ssd, store, enqueuer, enforcer, snapshot));
-                } else {
-                    refill = false;
-                }
+                tally.skipped += 1;
+                true
             }
             Err(err) => {
                 if first_err.is_none() {
                     first_err = Some(err);
                 }
-                refill = false;
+                false
             }
+        };
+        if keep_claiming && refill && !token.is_cancelled() {
+            inflight.push(drain_next(ceph, ssd, store, enqueuer, enforcer, snapshot));
+        } else {
+            refill = false;
         }
     }
 
@@ -425,7 +418,7 @@ pub async fn drain_until_empty<E: UploadEnqueuer>(
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::PermitGuard;
-    use super::{DrainStep, drain_next, drain_until_empty};
+    use super::{ClaimOutcome, drain_next, drain_until_empty};
     use crate::localfs::{LocalFs, LocalSsd};
     use core::str::FromStr;
     use hippius_drain_core::{
@@ -589,7 +582,7 @@ mod tests {
 
         // One ungated cycle claims it and drains it end-to-end.
         let outcome = drain_next(&ceph, &ssd, &store, &NoopEnqueuer, None, None).await.unwrap();
-        assert_eq!(outcome, DrainStep::Drained(DrainOutcome::Replicated));
+        assert_eq!(outcome, ClaimOutcome::Drained(DrainOutcome::Replicated));
 
         // The SSD part is freed only after the verified, committed pool copy exists.
         let ssd_part = ssd_dir.path().join(part.relative_dir());
@@ -603,7 +596,10 @@ mod tests {
         assert!(pool_part.join("meta.json").exists(), "the meta marker landed last");
 
         // Nothing else is pending: the next cycle is a no-op.
-        assert_eq!(drain_next(&ceph, &ssd, &store, &NoopEnqueuer, None, None).await.unwrap(), DrainStep::Idle);
+        assert_eq!(
+            drain_next(&ceph, &ssd, &store, &NoopEnqueuer, None, None).await.unwrap(),
+            ClaimOutcome::Idle
+        );
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
@@ -624,7 +620,7 @@ mod tests {
             drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&empty), Some(&snapshot))
                 .await
                 .unwrap(),
-            DrainStep::Idle
+            ClaimOutcome::Idle
         );
         assert!(ssd_part.exists(), "a throttled drain leaves the SSD part untouched");
         assert_eq!(
@@ -642,7 +638,7 @@ mod tests {
         let ample = enforcer_with(1_000_000);
         assert_eq!(
             drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&ample), None).await.unwrap(),
-            DrainStep::Drained(DrainOutcome::Replicated)
+            ClaimOutcome::Drained(DrainOutcome::Replicated)
         );
         assert!(!ssd_part.exists(), "the admitted drain frees the SSD part");
     }
@@ -661,7 +657,7 @@ mod tests {
         // A successful drain feeds its latency into the window, so p99 leaves zero.
         assert_eq!(
             drain_next(&ceph, &ssd, &store, &NoopEnqueuer, None, Some(&snapshot)).await.unwrap(),
-            DrainStep::Drained(DrainOutcome::Replicated)
+            ClaimOutcome::Drained(DrainOutcome::Replicated)
         );
         assert!(snapshot.p99() > Duration::ZERO, "the drain's latency was recorded in the snapshot");
     }
@@ -750,7 +746,7 @@ mod tests {
         let step = drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot))
             .await
             .unwrap();
-        assert_eq!(step, DrainStep::Skipped, "a vanished source skips this part; the burst keeps claiming");
+        assert_eq!(step, ClaimOutcome::Skipped, "a vanished source skips this part; the burst keeps claiming");
 
         let counts = snapshot.load();
         assert_eq!(counts.deferred, 1, "a vanished source is counted as a deferral");
@@ -781,6 +777,10 @@ mod tests {
         // oldest again, denied again, and every part behind it starved (64 parts/hour).
         // OverdraftOutstanding is PART-specific (an earlier overdraft is still being
         // paid off), so the part must be deferred with backoff and the burst continue.
+        // Intra-burst continuation under OverdraftOutstanding is mostly theoretical —
+        // while debt is outstanding the bucket holds zero tokens, so followers are
+        // RateLimited (hence the zero-byte follower below); the production win is the
+        // backoff removing the oversized part from the claim head across wakes.
         let db = pool.clone();
         let ssd_dir = tempfile::tempdir().unwrap();
         let pool_dir = tempfile::tempdir().unwrap();
@@ -884,6 +884,35 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn a_mid_drain_deferral_counts_as_a_skip_in_the_tally(pool: PgPool) {
+        // UNGATED (enforcer None), the size gate never runs, so a missing source only
+        // surfaces mid-drain as a benign-deferral Err. That arm defers with backoff and
+        // keeps the burst refilling — which IS the documented meaning of `skipped` — so
+        // the tally must count it, or the cycle log undercounts what the burst skipped.
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let pool_dir = tempfile::tempdir().unwrap();
+        let ssd = LocalSsd::new(ssd_dir.path());
+        let ceph = LocalFs::new(pool_dir.path());
+        let store = Store::from_pool(pool);
+
+        let missing = part_at(5, 1);
+        store.record_landed_part(&missing).await.unwrap();
+        let ready = part_at(5, 2);
+        seed_part(ssd_dir.path(), &store, &ready, &[b"ready part"]).await;
+
+        let token = CancellationToken::new();
+        let tally = drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, None, None, &token, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (tally.drained, tally.skipped),
+            (1, 1),
+            "the mid-drain deferral is a skip: burst continued, part backed off"
+        );
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
     async fn a_non_notfound_stat_failure_releases_the_part_and_idles_the_burst(pool: PgPool) {
         // A stat/list failure that is NOT ENOENT (here NotADirectory: a regular file
         // where the part directory should be) smells like genuine node I/O trouble, so
@@ -959,7 +988,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             outcome,
-            DrainStep::Drained(DrainOutcome::Replicated),
+            ClaimOutcome::Drained(DrainOutcome::Replicated),
             "a not-ready enqueue still commits Replicated"
         );
 

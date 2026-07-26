@@ -308,6 +308,9 @@ impl Config {
             decay_half_life: duration_secs(&get, "CEPHOR_DECAY_HALF_LIFE_SECS", DEFAULT_DECAY_HALF_LIFE)?,
             allocation_poll: duration_secs(&get, "CEPHOR_ALLOCATION_POLL_SECS", DEFAULT_ALLOCATION_POLL)?,
             claim_lease: duration_secs(&get, "CEPHOR_CLAIM_LEASE_TTL_SECS", DEFAULT_CLAIM_LEASE)?,
+            // Burst termination leans on this being nonzero: a skipped part's backoff is
+            // what keeps it out of the claim set, so 0 lets a burst re-claim/re-defer the
+            // same part in a tight loop until cancellation.
             defer_backoff: duration_secs(&get, "CEPHOR_DEFER_BACKOFF_SECS", DEFAULT_DEFER_BACKOFF)?,
             defer_backoff_cap: duration_secs(&get, "CEPHOR_DEFER_BACKOFF_CAP_SECS", DEFAULT_DEFER_BACKOFF_CAP)?,
             heartbeat_ttl: duration_secs(&get, "CEPHOR_HEARTBEAT_TTL_SECS", DEFAULT_HEARTBEAT_TTL)?,
