@@ -10,8 +10,8 @@ use crate::localfs::{LocalFs, LocalSsd};
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
 use hippius_drain_core::{
-    BreakerSignal, DenyReason, DrainDecision, DrainOutcome, Enforcer, MissingSourceOutcome, PartDrainError, PartKey, PartSource, SnapshotCell, Store,
-    StoreError, UploadEnqueuer, breaker_signal_for, drain_part,
+    BreakerSignal, ClaimedPart, DenyReason, DrainDecision, DrainOutcome, Enforcer, MissingSourceOutcome, PartDrainError, PartKey, PartSource,
+    SnapshotCell, Store, StoreError, UploadEnqueuer, breaker_signal_for, drain_part,
 };
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -129,6 +129,78 @@ pub enum ClaimOutcome {
     Idle,
 }
 
+/// Resolves a size-gate `ENOENT`: the SSD source for the claimed part is absent.
+///
+/// Split out of [`drain_next`] so the volume guard and the escalation ladder read as one
+/// decision (and to keep `drain_next` inside the function-length lint).
+///
+/// The SSD source being gone (MPU abort / `DeleteObject` / overwrite deleted the ingest
+/// copy) is specific to THIS part, so it is deferred and the burst keeps claiming. The
+/// DEFERRAL metric is counted exactly like the mid-drain vanished-source case, so that
+/// metric does not depend on WHERE the ENOENT surfaced — but the missing-source
+/// ESCALATION is location-dependent by design: only this arm observes it (a mid-drain
+/// ENOENT goes through plain `defer_part` and counts nothing toward the write-off; a
+/// truly gone source hits this gate on the next claim anyway). The store counts the
+/// observation and — atomically, inside the same draining-guarded UPDATE — writes the
+/// part off as terminal `failed` once observed missing `MISSING_SOURCE_FAIL_ATTEMPTS`
+/// times, so a permanently gone source (the 2026-07-22 rows) stops churning
+/// claim→defer forever. A write-off is NOT a Ceph failure: it stays off the breaker and
+/// out of `error_bps`.
+///
+/// # Errors
+///
+/// [`DrainCycleError::Claim`] if the release/defer query fails.
+async fn resolve_missing_source(
+    ssd: &LocalSsd,
+    store: &Store,
+    claim: &ClaimedPart,
+    snapshot: Option<&SnapshotCell>,
+) -> Result<ClaimOutcome, DrainCycleError> {
+    // The escalation may only run once the VOLUME is proven present. An ingest SSD that
+    // fails to mount leaves an empty dir on the parent filesystem, so every part on the
+    // node stats ENOENT identically to a genuinely vanished source — and the escalation
+    // would retire the node's whole backlog as terminal `failed` (never resurrected)
+    // within hours of a mount failure. That is volume-wide, not this part's fault: hand
+    // the claim back un-counted and end the burst, exactly like the breaker. Costs a
+    // delayed write-off; the inverse costs data.
+    if !ssd.root_is_available().await {
+        store.release_part(claim.part()).await?;
+        tracing::warn!(
+            ssd_root = %ssd.root().display(),
+            "SSD root unavailable (unmounted or unreadable); part returned to pending, \
+             missing-source escalation suppressed",
+        );
+        return Ok(ClaimOutcome::Idle);
+    }
+    match store.defer_part_missing_source(claim.part(), MISSING_SOURCE_FAIL_ATTEMPTS).await? {
+        MissingSourceOutcome::Deferred(observations) => {
+            if let Some(snapshot) = snapshot {
+                snapshot.record_deferred(1);
+            }
+            tracing::debug!(observations, "part source missing; part deferred, burst continues");
+        }
+        MissingSourceOutcome::Failed => {
+            // The only standing metric of a write-off (per-process; the WARN below is the
+            // only per-event trace): `node_undrained_count` excludes `failed` and the
+            // terminal GC deletes the row. Still NOT counted in `failed`/error_bps.
+            if let Some(snapshot) = snapshot {
+                snapshot.record_written_off(1);
+            }
+            tracing::warn!(
+                object_id = %claim.part().object().as_str(),
+                version = claim.part().version().get(),
+                part_number = claim.part().part().get(),
+                observations = MISSING_SOURCE_FAIL_ATTEMPTS,
+                "writing off part: SSD source gone after repeated observations",
+            );
+        }
+        MissingSourceOutcome::Superseded => {
+            tracing::debug!("part source missing but the claim was superseded; nothing recorded");
+        }
+    }
+    Ok(ClaimOutcome::Skipped)
+}
+
 /// Claims one pending part and drains it SSD → pool, gated by `enforcer`.
 ///
 /// Returns [`ClaimOutcome::Drained`] for the part it drained; [`ClaimOutcome::Skipped`]
@@ -159,49 +231,7 @@ pub async fn drain_next<E: UploadEnqueuer>(
         let bytes = match part_size(ssd, claim.part()).await {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                // The SSD source is gone (MPU abort / DeleteObject / overwrite deleted
-                // the ingest copy) — specific to THIS part, so back it off and keep the
-                // burst claiming. The DEFERRAL metric is counted exactly like the
-                // mid-drain vanished-source case, so that metric does not depend on
-                // WHERE the ENOENT surfaced — but the missing-source ESCALATION is
-                // location-dependent by design: only this size-gate arm observes it
-                // (a mid-drain ENOENT goes through plain defer_part and counts nothing
-                // toward the write-off; a truly gone source hits this gate on the next
-                // claim anyway). The store counts the observation and — atomically,
-                // inside the same draining-guarded UPDATE — writes the part off as
-                // terminal `failed` once it has been observed missing
-                // MISSING_SOURCE_FAIL_ATTEMPTS times: a source that is permanently
-                // gone (the 2026-07-22 rows) must stop churning claim→defer forever.
-                // A write-off is NOT a Ceph failure: it stays off the breaker and out
-                // of error_bps (the WARN + the terminal row are its record).
-                match store.defer_part_missing_source(claim.part(), MISSING_SOURCE_FAIL_ATTEMPTS).await? {
-                    MissingSourceOutcome::Deferred(observations) => {
-                        if let Some(snapshot) = snapshot {
-                            snapshot.record_deferred(1);
-                        }
-                        tracing::debug!(observations, "part source missing; part deferred, burst continues");
-                    }
-                    MissingSourceOutcome::Failed => {
-                        // The only standing metric of a write-off (per-process; the WARN
-                        // below is the only per-event trace): `node_undrained_count`
-                        // excludes `failed` and the terminal GC deletes the row. Still
-                        // NOT counted in `failed`/error_bps — not a Ceph-write failure.
-                        if let Some(snapshot) = snapshot {
-                            snapshot.record_written_off(1);
-                        }
-                        tracing::warn!(
-                            object_id = %claim.part().object().as_str(),
-                            version = claim.part().version().get(),
-                            part_number = claim.part().part().get(),
-                            observations = MISSING_SOURCE_FAIL_ATTEMPTS,
-                            "writing off part: SSD source gone after repeated observations",
-                        );
-                    }
-                    MissingSourceOutcome::Superseded => {
-                        tracing::debug!("part source missing but the claim was superseded; nothing recorded");
-                    }
-                }
-                return Ok(ClaimOutcome::Skipped);
+                return resolve_missing_source(ssd, store, &claim, snapshot).await;
             }
             Err(err) => {
                 // Any other stat/list failure must not admit the part at zero cost
@@ -765,7 +795,7 @@ mod tests {
         // healthy part on the node). Old behavior stopped the burst here; the 2026-07-26
         // incident showed one such part starves the whole node.
         let db = pool.clone();
-        let ssd_dir = tempfile::tempdir().unwrap();
+        let ssd_dir = mounted_ssd_dir();
         let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
         let ceph = LocalFs::new(pool_dir.path());
@@ -817,6 +847,85 @@ mod tests {
         );
     }
 
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn an_unavailable_ssd_root_suppresses_the_missing_source_escalation(pool: PgPool) {
+        // The mass write-off hazard. An ingest SSD that fails to mount leaves an EMPTY
+        // directory on the parent filesystem, so EVERY part on the node stats ENOENT
+        // exactly like a genuinely vanished source. Without a volume-level check the
+        // escalation would count an observation per part per cycle and retire the whole
+        // node's backlog as terminal `failed` (never resurrected) within hours — silent
+        // replication loss at node scale, from a cable, not a delete.
+        //
+        // The root here is empty AND not a mount point: the unmounted shape. The part
+        // must come back as node-global `Idle` (claim handed back, burst ended, exactly
+        // like the breaker) with the escalation counter UNTOUCHED.
+        let db = pool.clone();
+        let parent = tempfile::tempdir().unwrap();
+        let never_mounted = parent.path().join("local_object_cache");
+        std::fs::create_dir_all(&never_mounted).unwrap();
+        let pool_dir = tempfile::tempdir().unwrap();
+        let ssd = LocalSsd::new(&never_mounted);
+        let ceph = LocalFs::new(pool_dir.path());
+        let store = Store::from_pool(pool);
+        let snapshot = SnapshotCell::new();
+        let enforcer = Arc::new(Mutex::new(Enforcer::new(
+            CircuitBreaker::new(BreakerConfig {
+                failure_threshold: 1,
+                cooldown: Duration::from_secs(5),
+            }),
+            TokenBucket::new(ByteRate::new(1_000_000), Bytes::new(1_000_000), Instant::now()),
+            ConcurrencyLimiter::new(4),
+        )));
+
+        let part = part_at(11, 1);
+        store.record_landed_part(&part).await.unwrap();
+
+        let step = drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot))
+            .await
+            .unwrap();
+        assert_eq!(
+            step,
+            ClaimOutcome::Idle,
+            "an unavailable volume is node-global: end the burst, do not blame the part"
+        );
+        assert_eq!(
+            missing_source_count(&db, &part).await,
+            0,
+            "the write-off counter must NOT advance while the volume is unproven — this is \
+             the assertion that stops a mount failure from retiring the node's backlog",
+        );
+        assert_eq!(
+            status_of(&store, &part).await,
+            Some(ReplicationState::Pending),
+            "the part is released back to pending, promptly re-claimable once the mount returns",
+        );
+        assert_eq!(
+            defer_state(&db, &part).await,
+            (false, 0),
+            "released, not backed off: nothing about this part is wrong",
+        );
+        assert_eq!(snapshot.load().written_off, 0, "no write-off was recorded");
+        assert_eq!(
+            enforcer.lock().unwrap().try_drain(1, Instant::now()),
+            DrainDecision::Allowed,
+            "an unavailable SSD volume is not a Ceph failure and must not trip the breaker",
+        );
+    }
+
+    /// An SSD root that looks like a MOUNTED volume to `LocalSsd::root_is_available`.
+    ///
+    /// A bare `tempdir()` is empty AND shares its parent's `st_dev` — precisely the
+    /// never-mounted shape the volume guard rejects. A fixture that records a part as
+    /// landed without writing any files therefore reads as "the whole disk is gone"
+    /// rather than "this part is gone", which suppresses the missing-source escalation
+    /// under test. Real nodes holding pending parts always have something under the
+    /// root; this marker restores that property without weakening the guard.
+    fn mounted_ssd_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".mounted")).unwrap();
+        dir
+    }
+
     /// The row's `missing_source_attempts` — the write-off escalation counter.
     async fn missing_source_count(db: &PgPool, part: &PartKey) -> i64 {
         sqlx::query_scalar(
@@ -840,7 +949,7 @@ mod tests {
         // write-off is NOT a Ceph failure: it must stay out of error_bps and off the
         // breaker, and the burst keeps claiming (Skipped).
         let db = pool.clone();
-        let ssd_dir = tempfile::tempdir().unwrap();
+        let ssd_dir = mounted_ssd_dir();
         let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
         let ceph = LocalFs::new(pool_dir.path());
@@ -890,7 +999,7 @@ mod tests {
         // resurrected, so that would be silent replication loss. Only missing-source
         // observations count.
         let db = pool.clone();
-        let ssd_dir = tempfile::tempdir().unwrap();
+        let ssd_dir = mounted_ssd_dir();
         let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
         let ceph = LocalFs::new(pool_dir.path());
