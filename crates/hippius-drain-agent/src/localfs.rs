@@ -159,6 +159,52 @@ impl LocalSsd {
         self.root.as_path()
     }
 
+    /// Whether an absent part under this root means "that part is gone" rather than
+    /// "the whole volume is gone".
+    ///
+    /// A per-part `ENOENT` is ambiguous on its own: an ext4 ingest volume that fails
+    /// to mount leaves an EMPTY directory on the PARENT filesystem, so every part
+    /// stats `NotFound` cleanly, with no error to distinguish it from a genuinely
+    /// vanished source. Escalating that to the terminal missing-source write-off would
+    /// retire a node's entire backlog as unrecoverable within hours of a mount failure.
+    ///
+    /// Two positive signals, either of which proves the volume is really there:
+    /// - the root has at least one entry (data is present, so absence is real), or
+    /// - the root is its own mount point (`st_dev` differs from its parent), which
+    ///   covers the legitimately-empty case of a fully-drained node — the orphan rows
+    ///   this write-off exists to clear.
+    ///
+    /// Unreadable, or empty AND not a mount point, returns `false`: the caller must
+    /// treat that as a node-global condition instead of blaming the part. Erring this
+    /// way only delays a write-off; the opposite error is silent replication loss.
+    pub async fn root_is_available(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        let Ok(meta) = fs::metadata(&self.root).await else {
+            return false;
+        };
+        if !meta.is_dir() {
+            return false;
+        }
+        match fs::read_dir(&self.root).await {
+            Ok(mut entries) => {
+                if matches!(entries.next_entry().await, Ok(Some(_))) {
+                    return true;
+                }
+            }
+            Err(_) => return false,
+        }
+        // Empty. Only a distinct st_dev separates "drained volume" from "never mounted".
+        match self.root.parent() {
+            Some(parent) => match fs::metadata(parent).await {
+                Ok(parent_meta) => parent_meta.dev() != meta.dev(),
+                Err(_) => false,
+            },
+            // No parent means the root IS the filesystem root; nothing to compare.
+            None => true,
+        }
+    }
+
     /// Removes orphaned write-temp files left on the SSD by a crashed mid-write PUT
     /// (the api's `<name>.tmp.<uuid>`) or a cancelled persist (the agent's
     /// `.tmp-<name>`), once older than `max_age`.
@@ -720,6 +766,55 @@ mod tests {
             "both carry the stable per-process nonce: {a} {b}"
         );
     }
+
+    // `root_is_available` gates the terminal missing-source write-off. Its whole job is
+    // to tell "this part vanished" apart from "the ingest volume vanished", because both
+    // surface as a bare ENOENT on the part path and only the first may retire a row.
+
+    #[tokio::test]
+    async fn a_populated_root_proves_the_volume_is_present() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("some-object")).unwrap();
+        assert!(
+            LocalSsd::new(dir.path()).root_is_available().await,
+            "any entry under the root is positive proof the volume is mounted"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_root_that_is_not_a_mount_point_is_not_available() {
+        // The mount-failure shape: an EMPTY directory sitting on its parent's
+        // filesystem. Indistinguishable from a drained volume by content alone, so the
+        // st_dev comparison is what has to catch it. Nested inside a TempDir, both
+        // share one st_dev — exactly an ingest SSD that never mounted.
+        let dir = TempDir::new().unwrap();
+        let never_mounted = dir.path().join("local_object_cache");
+        std::fs::create_dir_all(&never_mounted).unwrap();
+        assert!(
+            !LocalSsd::new(&never_mounted).root_is_available().await,
+            "an empty non-mount root must NOT authorize write-offs — this is the mass \
+             write-off hazard the guard exists for"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_non_directory_root_is_not_available() {
+        let dir = TempDir::new().unwrap();
+        assert!(
+            !LocalSsd::new(dir.path().join("absent")).root_is_available().await,
+            "a root that isn't there proves nothing about the parts under it"
+        );
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(
+            !LocalSsd::new(&file).root_is_available().await,
+            "a non-directory root is a misconfiguration, not a drained volume"
+        );
+    }
+
+    // NB: the remaining arm — empty AND a real mount point, i.e. a fully-drained node
+    // whose orphan rows SHOULD still be written off — needs an actual mount and so is
+    // not unit-testable here. It is the `parent_meta.dev() != meta.dev()` branch.
 
     #[tokio::test]
     async fn remove_object_deletes_the_whole_file_folder_and_surfaces_absence() {

@@ -164,12 +164,14 @@ spec:
             #   the claim query is a partial-index (node_id, landed_at) WHERE status='pending'
             #   lookup, so 1s polling scans only the small active-pending set, not the ~94M-row
             #   parts table — unconditionally cheap even at prod scale.
-            # CEPHOR_DEFER_BACKOFF_SECS is deliberately left at its 5s code default: a
+            # CEPHOR_DEFER_BACKOFF_SECS is deliberately left at its 5s code default. Since the
+            # 2026-07-26 head-of-line fix it is the BASE of a per-part EXPONENTIAL backoff: a
             # not-yet-drainable part (MPU whose Complete hasn't written object_versions.address,
-            # or a stuck A21 orphan) re-parks for that long, so lowering it to 1s would make those
-            # parts retry the claim 5x more often — pure churn at prod cardinality with the A21
-            # orphan leak unfixed. It only affects the tail (MPU parts already wait for Complete),
-            # not the common simple-PUT case the poll cut covers.
+            # or a stuck A21 orphan) re-parks for base × 2^defer_attempts — 5s, 10s, 20s, … —
+            # capped by CEPHOR_DEFER_BACKOFF_CAP_SECS (code default 600). A chronic wall thus
+            # escalates out of the oldest-first claim head instead of churning it, while still
+            # re-checking within minutes; CompleteMultipartUpload clears the backoff (deferred_until
+            # AND defer_attempts), so a just-completed MPU's parts drain promptly regardless.
             - name: CEPHOR_DRAIN_POLL_SECS
               value: "1"
             # Reconciler scan period (was the 60s code default). The reconciler is the SOLE

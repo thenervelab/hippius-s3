@@ -34,6 +34,7 @@ from hippius_s3.services.envelope_service import generate_dek
 from hippius_s3.services.envelope_service import wrap_dek
 from hippius_s3.services.kek_service import get_or_create_active_bucket_kek
 from hippius_s3.services.mpu_cleanup import fail_version_replication
+from hippius_s3.services.mpu_cleanup import wake_version_replication
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import set_object_version_address
@@ -1199,6 +1200,24 @@ async def complete_multipart_upload(
             object_version=int(object_version),
             address=request.state.account.main_account,
         )
+
+        # Drain wake: the address write above removes the cause of this version's defer
+        # backoff (rationale, incl. the deliberate defer_attempts reset, lives in
+        # wake_replication_status_for_version.sql). Best-effort (narrow exception to the
+        # no-try/except rule): the complete is already committed, the wake is only an
+        # optimization — the backoff self-heals within the cap — and this handler's
+        # outer catch-all would otherwise turn a wake failure into a 500 for a success.
+        try:
+            await wake_version_replication(db, object_id=object_id, object_version=object_version)
+        except Exception:
+            logger.warning(
+                "drain wake failed after CompleteMultipartUpload bucket=%s upload_id=%s object_id=%s version=%s",
+                bucket_name,
+                upload_id,
+                object_id,
+                object_version,
+                exc_info=True,
+            )
 
         # Create XML response
         xml_bytes = f"""<?xml version="1.0" encoding="UTF-8"?>

@@ -182,6 +182,47 @@ const DEFAULT_CLAIM_LEASE: Duration = Duration::from_mins(5);
 /// [`Store::with_defer_backoff`].
 const DEFAULT_DEFER_BACKOFF: Duration = Duration::from_secs(5);
 
+/// The ceiling on the exponential deferral backoff: a part that keeps deferring
+/// (an abandoned MPU that never finalizes) doubles its backoff per attempt but is
+/// never parked longer than this, so it still re-checks within minutes of the
+/// address finally landing. Override via [`Store::with_defer_backoff_cap`].
+const DEFAULT_DEFER_BACKOFF_CAP: Duration = Duration::from_mins(10);
+
+/// What [`Store::defer_part_missing_source`] did to the row — decided atomically
+/// inside the guarded UPDATE, so no concurrent claim can interleave between the
+/// deferral and the terminal escalation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingSourceOutcome {
+    /// Below the threshold: deferred back to `pending` with the shared exponential
+    /// backoff, carrying the row's new missing-source observation count.
+    Deferred(u64),
+    /// The observation count reached the threshold: the row is now terminal `failed`
+    /// (never resurrected — the write-off is deliberate and conservative).
+    Failed,
+    /// The `status='draining'` guard missed — the row advanced under a concurrent
+    /// transition (e.g. a lease-expiry re-claim) — so nothing changed. A no-op
+    /// defer cannot escalate.
+    Superseded,
+}
+
+/// Splices the shared exponential-backoff expression between two SQL literal halves,
+/// yielding one `&'static str` (sqlx 0.9's `SqlSafeStr` rejects runtime-built strings,
+/// so this is `concat!`, not `format!`). The expression — base × 2^`defer_attempts`,
+/// exponent clamped at 16 so `power` cannot overflow, product capped by the outer
+/// `LEAST` — is defined ONCE here so the cap/clamp geometry cannot drift between
+/// [`Store::defer_part`] and [`Store::defer_part_missing_source`]. It reads the row's
+/// OLD `defer_attempts` (UPDATE right-hand sides see pre-update values) and requires
+/// the splicing query to bind `$4` = base backoff seconds and `$5` = cap seconds.
+macro_rules! with_defer_backoff_sql {
+    ($prefix:expr, $suffix:expr) => {
+        concat!(
+            $prefix,
+            "now() + LEAST($4 * power(2::float8, LEAST(defer_attempts, 16)), $5) * interval '1 second'",
+            $suffix
+        )
+    };
+}
+
 /// Handle to the Postgres central state. Cheap to clone (shares the pool).
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -192,7 +233,12 @@ pub struct Store {
     /// How long a deferred part is backed off before it is re-claimable, so the
     /// drain does not re-claim a not-ready part on every poll (which would starve
     /// the ready ones). Applied by [`Store::defer_part`], honored by `claim_part`.
+    /// This is the BASE of the per-row exponential backoff; the row's
+    /// `defer_attempts` doubles it per deferral up to [`defer_backoff_cap`](Self::with_defer_backoff_cap).
     defer_backoff: Duration,
+    /// Ceiling on the exponential deferral backoff, so a chronically not-ready part
+    /// still re-checks within minutes of its address finally landing.
+    defer_backoff_cap: Duration,
     /// The agent's node id. Parts live on node-local SSD, so a part may only be
     /// drained by the node that holds it: `record_landed_part` stamps this and
     /// `claim_part` scopes to it. `None` for the allocator, which records/claims
@@ -212,6 +258,7 @@ impl Store {
             pool,
             claim_lease: DEFAULT_CLAIM_LEASE,
             defer_backoff: DEFAULT_DEFER_BACKOFF,
+            defer_backoff_cap: DEFAULT_DEFER_BACKOFF_CAP,
             node_id: None,
         })
     }
@@ -226,6 +273,7 @@ impl Store {
             pool,
             claim_lease: DEFAULT_CLAIM_LEASE,
             defer_backoff: DEFAULT_DEFER_BACKOFF,
+            defer_backoff_cap: DEFAULT_DEFER_BACKOFF_CAP,
             node_id: Some("test-node".to_owned()),
         }
     }
@@ -243,6 +291,14 @@ impl Store {
     #[must_use]
     pub fn with_defer_backoff(mut self, backoff: Duration) -> Self {
         self.defer_backoff = backoff;
+        self
+    }
+
+    /// Sets the exponential-deferral ceiling (the daemon wires this from
+    /// `CEPHOR_DEFER_BACKOFF_CAP_SECS`). No deferral parks a part longer than `cap`.
+    #[must_use]
+    pub fn with_defer_backoff_cap(mut self, cap: Duration) -> Self {
+        self.defer_backoff_cap = cap;
         self
     }
 
@@ -352,6 +408,36 @@ impl Store {
         .await?;
         // count(*) is >= 0; the cast guards against an impossible negative for total-ness.
         Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    /// The age in whole seconds of `node`'s oldest `pending` replication row, or 0 when none
+    /// — the per-node starvation signal that would have caught 2026-07-26 at ~03:40: one
+    /// node's oldest pending age past 30min while its peers sat near zero (a part landed
+    /// 03:48 sat unclaimed 3.5h, diagnosable only by hand-written SQL at the time).
+    ///
+    /// `pending` ONLY — a `draining` row is being worked, so the signal is specifically
+    /// "claimable-or-backed-off work nobody has finished". Deferred rows are deliberately
+    /// INCLUDED (a backed-off row is still `pending`): an in-progress/abandoned-MPU wall
+    /// aging past hours is exactly what the operator must see.
+    ///
+    /// Served index-only by `cephor_replication_status_pending` (0006: `(node_id, landed_at)
+    /// WHERE status = 'pending'`) — the min is the first entry under the node prefix.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn node_oldest_pending_age_secs(&self, node: &str) -> Result<u64> {
+        let (secs,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(EXTRACT(EPOCH FROM (now() - min(landed_at)))::bigint, 0) \
+             FROM cephor_replication_status \
+             WHERE node_id = $1 AND status = 'pending'",
+        )
+        .bind(node)
+        .fetch_one(&self.pool)
+        .await?;
+        // Clock skew could put min(landed_at) marginally in the future; clamp to 0 rather
+        // than wrap into an absurd u64 age.
+        Ok(u64::try_from(secs).unwrap_or(0))
     }
 
     /// R4 re-drive: reset this node's `corrupt` parts back to `pending` for a fresh SSD->pool
@@ -527,7 +613,9 @@ impl Store {
     pub async fn release_part(&self, part: &PartKey) -> Result<()> {
         // Clear deferred_until too: a release is the Ceph-failure retry path, which
         // should be re-claimable immediately — it must not inherit a stale backoff a
-        // prior deferral parked on the row.
+        // prior deferral parked on the row. defer_attempts is deliberately left alone:
+        // the escalation tracks the not-ready condition, which a Ceph blip says
+        // nothing about, so resetting it here would re-arm the starvation spiral.
         sqlx::query(
             "UPDATE cephor_replication_status SET status = 'pending', updated_at = now(), claimed_at = NULL, deferred_until = NULL \
              WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining'",
@@ -549,22 +637,108 @@ impl Store {
     /// on `draining` like [`release_part`](Store::release_part), so a late defer cannot
     /// resurrect a finished part.
     ///
+    /// The backoff is EXPONENTIAL per row (base × 2^`defer_attempts`, capped): a fixed
+    /// backoff let a wall of not-ready in-progress-MPU parts — oldest by `landed_at`,
+    /// so at the claim head — re-enter the claimable set every interval and consume
+    /// every claim slot, starving all younger parts (the 2026-07-26 head-of-line
+    /// starvation incident). Doubling per deferral moves a not-ready wall out of the
+    /// claim hot path geometrically. The inner `LEAST(defer_attempts, 16)` clamps the
+    /// exponent so `power` cannot overflow; the outer `LEAST` enforces
+    /// [`defer_backoff_cap`](Store::with_defer_backoff_cap). `release_part` deliberately
+    /// preserves `defer_attempts` — a transient Ceph-failure retry must not erase the
+    /// not-ready escalation.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Database`] on failure.
     pub async fn defer_part(&self, part: &PartKey) -> Result<()> {
-        sqlx::query(
+        sqlx::query(with_defer_backoff_sql!(
             "UPDATE cephor_replication_status \
-             SET status = 'pending', updated_at = now(), claimed_at = NULL, deferred_until = now() + $4 * interval '1 second' \
-             WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining'",
-        )
+             SET status = 'pending', updated_at = now(), claimed_at = NULL, \
+                 defer_attempts = defer_attempts + 1, \
+                 deferred_until = ",
+            " WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining'"
+        ))
         .bind(part.object().as_str())
         .bind(i64::from(part.version().get()))
         .bind(i64::from(part.part().get()))
         .bind(self.defer_backoff.as_secs_f64())
+        .bind(self.defer_backoff_cap.as_secs_f64())
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Defers a claimed part whose SSD source directory is GONE (ENOENT at the size
+    /// gate), counting the observation toward the terminal write-off — and, when the
+    /// count reaches `fail_threshold`, flips the row terminal `failed` instead.
+    ///
+    /// Why a separate counter (`missing_source_attempts`, migration 0015) instead of
+    /// keying the escalation on `defer_attempts`: that counter is SHARED with the
+    /// overdraft (`OverdraftOutstanding`) and not-ready (in-progress MPU) deferral
+    /// paths, so a healthy oversized part paying off a long debt — or an MPU part
+    /// waiting on its address — could accumulate attempts and then be written off on
+    /// its FIRST transient `NotFound`. `failed` is never resurrected (the reconciler
+    /// only registers parts that exist on SSD, and `record_landed_part`'s ON CONFLICT
+    /// never touches status), so a wrong write-off is silent replication loss; only
+    /// genuine missing-source observations may count toward it.
+    ///
+    /// The defer and the escalation are ONE guarded UPDATE (`status='draining'`, the
+    /// pending↔failed choice a CASE on the incremented count): a defer-then-fail pair
+    /// would flip the row `pending` first, opening a window where a concurrent claim
+    /// re-takes it and the follow-up fail either misses its guard or clobbers a live
+    /// claim. Below the threshold the row defers exactly like [`defer_part`]
+    /// (`defer_attempts` still increments — the backoff geometry stays shared); the
+    /// new observation count is RETURNED so the caller needs no second round trip.
+    /// A guard miss (the row advanced concurrently) is [`MissingSourceOutcome::Superseded`]:
+    /// a no-op defer cannot escalate.
+    ///
+    /// `fail_threshold` must be greater than 1: a threshold of 0 or 1 writes the part
+    /// off on its FIRST observation — the exact transient-`NotFound` hazard this
+    /// design exists to prevent — so debug builds assert it (release builds execute
+    /// the first-observation write-off as written).
+    ///
+    /// [`defer_part`]: Store::defer_part
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on failure; [`StoreError::Invalid`] if the stored
+    /// counter reads back negative (unreachable by construction).
+    pub async fn defer_part_missing_source(&self, part: &PartKey, fail_threshold: u32) -> Result<MissingSourceOutcome> {
+        debug_assert!(
+            fail_threshold > 1,
+            "fail_threshold {fail_threshold} writes a part off on its first missing-source observation"
+        );
+        let row: Option<(i32, String)> = sqlx::query_as(with_defer_backoff_sql!(
+            "UPDATE cephor_replication_status \
+             SET missing_source_attempts = missing_source_attempts + 1, \
+                 defer_attempts = defer_attempts + 1, \
+                 status = CASE WHEN missing_source_attempts + 1 >= $6 THEN 'failed' ELSE 'pending' END, \
+                 updated_at = now(), claimed_at = NULL, \
+                 deferred_until = CASE WHEN missing_source_attempts + 1 >= $6 THEN NULL ELSE ",
+            " END \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining' \
+             RETURNING missing_source_attempts, status"
+        ))
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .bind(self.defer_backoff.as_secs_f64())
+        .bind(self.defer_backoff_cap.as_secs_f64())
+        .bind(i64::from(fail_threshold))
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((observations, status)) = row else {
+            return Ok(MissingSourceOutcome::Superseded);
+        };
+        if status == "failed" {
+            return Ok(MissingSourceOutcome::Failed);
+        }
+        let observations = u64::try_from(observations).map_err(|_| StoreError::Invalid {
+            field: "missing_source_attempts",
+            value: i64::from(observations),
+        })?;
+        Ok(MissingSourceOutcome::Deferred(observations))
     }
 
     /// Lists up to `limit` pending parts, oldest first — the reconciler's advisory
@@ -1201,7 +1375,7 @@ mod tests {
 #[cfg(feature = "pg")]
 #[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod part_tests {
-    use super::{Store, StoreError};
+    use super::{MissingSourceOutcome, Store, StoreError};
     use crate::apipart::{ObjectId, PartKey, PartNumber, Version};
     use crate::partdrain::{ClaimedPart, PartReplicationStore, PartVerified};
     use crate::ssd_reclaim::ReclaimLog;
@@ -1616,6 +1790,62 @@ mod part_tests {
         assert_eq!(store.node_undrained_count("node-b").await?, 1, "counts only this node's rows");
         assert_eq!(store.node_undrained_count("node-c").await?, 0, "a node with no rows is idle");
         Ok(())
+    }
+
+    /// Backdates a status row's `landed_at` by `secs`, to age it for the starvation gauge.
+    async fn backdate_landed(pool: &PgPool, object: &str, version: i64, number: i64, secs: i64) {
+        sqlx::query(
+            "UPDATE cephor_replication_status SET landed_at = now() - (interval '1 second' * $4) \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(object)
+        .bind(version)
+        .bind(number)
+        .bind(secs)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn node_oldest_pending_age_secs_is_the_age_of_the_oldest_pending_row_only(pool: PgPool) {
+        let store = Store::from_pool(pool.clone());
+        assert_eq!(
+            store.node_oldest_pending_age_secs("node-a").await.unwrap(),
+            0,
+            "a node with no pending rows reports zero age, not an error"
+        );
+
+        // node-a: two pending rows, 90s and 300s old — the oldest wins. The 300s row is
+        // ALSO backed off (deferred_until in the future): a deferred row is still
+        // `pending`, and an MPU wall aging past hours is exactly what the gauge must show.
+        seed_status_node(&pool, UUID_A, 1, 1, "pending", "node-a").await;
+        backdate_landed(&pool, UUID_A, 1, 1, 90).await;
+        seed_status_node(&pool, UUID_A, 1, 2, "pending", "node-a").await;
+        backdate_landed(&pool, UUID_A, 1, 2, 300).await;
+        sqlx::query("UPDATE cephor_replication_status SET deferred_until = now() + interval '10 minutes' WHERE part_number = 2")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Far older draining/replicated/failed rows: a draining row is being worked and
+        // terminal rows are done — none is starving claimable work, so none counts.
+        seed_status_node(&pool, UUID_A, 1, 3, "draining", "node-a").await;
+        backdate_landed(&pool, UUID_A, 1, 3, 9_000).await;
+        seed_status_node(&pool, UUID_A, 1, 4, "replicated", "node-a").await;
+        backdate_landed(&pool, UUID_A, 1, 4, 9_000).await;
+        seed_status_node(&pool, UUID_A, 1, 5, "failed", "node-a").await;
+        backdate_landed(&pool, UUID_A, 1, 5, 9_000).await;
+        // A peer node's even older pending row is that node's starvation, not this one's.
+        seed_status_node(&pool, UUID_B, 2, 1, "pending", "node-b").await;
+        backdate_landed(&pool, UUID_B, 2, 1, 9_000).await;
+
+        let age = store.node_oldest_pending_age_secs("node-a").await.unwrap();
+        assert!(
+            (300..330).contains(&age),
+            "the oldest pending row (deferred, 300s) wins over the younger one and the non-pending rows, got {age}"
+        );
+        let peer = store.node_oldest_pending_age_secs("node-b").await.unwrap();
+        assert!(peer >= 9_000, "the peer's pending age is scoped to the peer, got {peer}");
     }
 
     #[sqlx::test]
@@ -2198,6 +2428,260 @@ mod part_tests {
         assert!(
             store.claim_part().await.unwrap().is_some(),
             "release clears the backoff, so a Ceph-failed part retries immediately",
+        );
+    }
+
+    /// Seconds until the row's `deferred_until`, measured against the same DB clock
+    /// that stamped it — so the assertion is immune to test-host/DB clock skew.
+    async fn defer_remaining_secs(pool: &PgPool, part: &PartKey) -> f64 {
+        sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM (deferred_until - now()))::float8 FROM cephor_replication_status \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn defer_part_backs_off_exponentially(pool: PgPool) {
+        // The 2026-07-26 head-of-line starvation incident: with a FIXED backoff, a wall
+        // of not-ready MPU parts re-entered the claimable head every interval and — being
+        // oldest by landed_at — consumed every claim slot, starving every younger part.
+        // Repeated deferrals must therefore back off geometrically: 5s, 10s, 20s, ...
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+
+        let mut observed = Vec::new();
+        for _ in 0..3 {
+            store.claim_part().await.unwrap().expect("the part is claimable");
+            store.defer_part(&p).await.unwrap();
+            observed.push(defer_remaining_secs(&pool, &p).await);
+            // Clear the parked backoff so the next round can re-claim immediately.
+            sqlx::query("UPDATE cephor_replication_status SET deferred_until = NULL WHERE object_id = $1")
+                .bind(p.object().as_str())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        for (n, (remaining, expected)) in observed.iter().zip([5.0_f64, 10.0, 20.0]).enumerate() {
+            assert!(
+                (expected - 1.0..=expected + 1.0).contains(remaining),
+                "deferral #{n} should park the part ~{expected}s, got {remaining}s (all: {observed:?})",
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn defer_backoff_is_capped(pool: PgPool) {
+        // A part that has deferred many times (an abandoned MPU that never finalizes)
+        // must park at the cap, not for days: uncapped, 30 attempts would be
+        // 5 * 2^16 s (~3.8 days) even after the exponent clamp.
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        store.claim_part().await.unwrap().expect("the part is claimable");
+        sqlx::query("UPDATE cephor_replication_status SET defer_attempts = 30 WHERE object_id = $1")
+            .bind(p.object().as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        store.defer_part(&p).await.unwrap();
+        let remaining = defer_remaining_secs(&pool, &p).await;
+        assert!(remaining <= 601.0, "the deferral must not exceed the 600s cap, got {remaining}s");
+        assert!(
+            remaining >= 599.0,
+            "a 30-attempt row is parked at the FULL cap, not the base backoff, got {remaining}s",
+        );
+    }
+
+    #[sqlx::test]
+    async fn release_part_preserves_defer_attempts(pool: PgPool) {
+        // A transient Ceph-failure release retries promptly (deferred_until cleared)
+        // but must NOT erase the not-ready escalation: if the part defers again, the
+        // backoff continues geometrically instead of restarting at the base interval.
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        store.claim_part().await.unwrap().expect("the part is claimable");
+        store.defer_part(&p).await.unwrap();
+        sqlx::query("UPDATE cephor_replication_status SET deferred_until = now() - interval '1 second' WHERE object_id = $1")
+            .bind(p.object().as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+        store.claim_part().await.unwrap().expect("re-claimable once the backoff elapsed");
+
+        store.release_part(&p).await.unwrap();
+        let (attempts, deferred_is_null): (i32, bool) = sqlx::query_as(
+            "SELECT defer_attempts, deferred_until IS NULL FROM cephor_replication_status \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(p.object().as_str())
+        .bind(i64::from(p.version().get()))
+        .bind(i64::from(p.part().get()))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts, 1, "release must not reset the defer escalation");
+        assert!(deferred_is_null, "release clears the parked backoff for a prompt retry");
+    }
+
+    /// The row's `(defer_attempts, missing_source_attempts)` — the pair the
+    /// missing-source escalation must keep separable (the shared-counter hazard).
+    async fn attempt_counters(pool: &PgPool, part: &PartKey) -> (i64, i64) {
+        sqlx::query_as(
+            "SELECT defer_attempts::bigint, missing_source_attempts::bigint FROM cephor_replication_status \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn defer_part_missing_source_counts_the_observation_and_keeps_the_shared_backoff(pool: PgPool) {
+        // A missing-source deferral is a normal exponential defer PLUS one
+        // missing-source observation: both counters advance, the backoff stays the
+        // shared defer_attempts geometry (5s, 10s, ...), and the returned count lets
+        // the worker escalate without a second round trip.
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+
+        store.claim_part().await.unwrap().expect("the part is claimable");
+        let first = store.defer_part_missing_source(&p, 20).await.unwrap();
+        assert_eq!(first, MissingSourceOutcome::Deferred(1), "the first observation is counted and returned");
+        assert_eq!(
+            attempt_counters(&pool, &p).await,
+            (1, 1),
+            "both counters advance on a missing-source defer"
+        );
+        let remaining = defer_remaining_secs(&pool, &p).await;
+        assert!(
+            (4.0..=6.0).contains(&remaining),
+            "the first backoff is the shared 5s base, got {remaining}s"
+        );
+        assert_eq!(
+            <Store as PartReplicationStore>::status(&store, &p).await.unwrap(),
+            Some(ReplicationState::Pending),
+            "below the threshold the part is deferred back to pending",
+        );
+
+        sqlx::query("UPDATE cephor_replication_status SET deferred_until = NULL WHERE object_id = $1")
+            .bind(p.object().as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+        store.claim_part().await.unwrap().expect("re-claimable once the backoff is cleared");
+        let second = store.defer_part_missing_source(&p, 20).await.unwrap();
+        assert_eq!(second, MissingSourceOutcome::Deferred(2));
+        let remaining = defer_remaining_secs(&pool, &p).await;
+        assert!(
+            (9.0..=11.0).contains(&remaining),
+            "the backoff doubles like a plain defer, got {remaining}s"
+        );
+    }
+
+    #[sqlx::test]
+    async fn defer_part_missing_source_fails_the_row_atomically_at_the_threshold(pool: PgPool) {
+        // Reaching the threshold must flip the row terminal `failed` IN the same
+        // guarded UPDATE that would otherwise defer it: a defer-then-fail pair would
+        // open a window where the deferred (pending) row is re-claimed between the
+        // two statements and the fail either misses or clobbers a live claim.
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        store.claim_part().await.unwrap().expect("the part is claimable");
+        sqlx::query("UPDATE cephor_replication_status SET missing_source_attempts = 19 WHERE object_id = $1")
+            .bind(p.object().as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let outcome = store.defer_part_missing_source(&p, 20).await.unwrap();
+        assert_eq!(outcome, MissingSourceOutcome::Failed, "the 20th observation writes the part off");
+        assert_eq!(
+            <Store as PartReplicationStore>::status(&store, &p).await.unwrap(),
+            Some(ReplicationState::Failed),
+            "the row is terminal failed",
+        );
+        assert!(
+            store.claim_part().await.unwrap().is_none(),
+            "a failed row is out of the claim set for good — no more churn",
+        );
+        let unparked: bool = sqlx::query_scalar(
+            "SELECT deferred_until IS NULL FROM cephor_replication_status \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(p.object().as_str())
+        .bind(i64::from(p.version().get()))
+        .bind(i64::from(p.part().get()))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(unparked, "the fail arm parks no backoff — deferred_until is cleared, not set");
+    }
+
+    // debug_assert compiles out in release, so this pin only exists where the guard does.
+    #[cfg(debug_assertions)]
+    #[sqlx::test]
+    #[should_panic(expected = "first missing-source observation")]
+    async fn defer_part_missing_source_rejects_a_degenerate_threshold_in_debug(pool: PgPool) {
+        // The domain edge, pinned: a threshold of 0 or 1 means the FIRST observation
+        // writes the part off — the exact transient-NotFound hazard the separate
+        // counter exists to prevent — so debug builds refuse it outright (in release
+        // the documented first-observation write-off would execute as written).
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        store.claim_part().await.unwrap().expect("the part is claimable");
+        let _ = store.defer_part_missing_source(&p, 1).await;
+    }
+
+    #[sqlx::test]
+    async fn defer_part_missing_source_is_a_no_op_off_the_draining_guard(pool: PgPool) {
+        // Like defer_part/release_part, the `status='draining'` guard makes a late
+        // call a no-op when the row has since advanced — and a no-op defer must not
+        // escalate, so the outcome is Superseded, never Failed.
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+
+        // Never claimed: the row is 'pending', so the guard misses.
+        let outcome = store.defer_part_missing_source(&p, 20).await.unwrap();
+        assert_eq!(outcome, MissingSourceOutcome::Superseded, "a guard miss reports Superseded, not a count");
+        assert_eq!(attempt_counters(&pool, &p).await, (0, 0), "a guard miss touches neither counter");
+        assert_eq!(
+            <Store as PartReplicationStore>::status(&store, &p).await.unwrap(),
+            Some(ReplicationState::Pending),
+            "the row is left exactly as it was",
+        );
+    }
+
+    #[sqlx::test]
+    async fn plain_defer_part_never_touches_missing_source_attempts(pool: PgPool) {
+        // The amendment's core invariant: overdraft/not-ready deferrals go through
+        // defer_part and must NOT count toward the missing-source write-off — only
+        // defer_part_missing_source observes a vanished source.
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        store.claim_part().await.unwrap().expect("the part is claimable");
+
+        store.defer_part(&p).await.unwrap();
+        assert_eq!(
+            attempt_counters(&pool, &p).await,
+            (1, 0),
+            "a plain defer advances only the shared backoff counter",
         );
     }
 
