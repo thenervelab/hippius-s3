@@ -68,7 +68,9 @@ class _FakeDb:
         raise AssertionError(f"unexpected fetch in complete flow: {query!r}")
 
     async def execute(self, query: str, *args: Any) -> None:
-        if self._execute_error is not None:
+        # Fault injection is scoped to the wake UPDATE so a future earlier handler
+        # execute doesn't trip it and fail the flow before the code under test runs.
+        if self._execute_error is not None and "cephor_replication_status" in query:
             raise self._execute_error
         self.executed.append((query, args))
 
@@ -162,9 +164,11 @@ async def test_complete_mpu_clears_drain_backoff(monkeypatch: Any, tmp_path: Any
     wakes = _wake_updates(db)
     assert len(wakes) == 1, f"expected exactly one drain wake, got {db.executed!r}"
     query, params = wakes[0]
-    assert "deferred_until = NULL" in query
-    assert "defer_attempts = 0" in query
-    assert "status = 'pending'" in query, "wake must never resurrect failed/replicated rows"
+    # SQL is loaded from disk; normalize whitespace so a reflow of the file doesn't break us.
+    normalized = " ".join(query.split())
+    assert "deferred_until = NULL" in normalized
+    assert "defer_attempts = 0" in normalized
+    assert "status = 'pending'" in normalized, "wake must never resurrect failed/replicated rows"
     assert params == ("obj-1", _PARTS_VERSION), "wake must target the upload's own parts version, not the pointer"
 
 

@@ -1,4 +1,6 @@
-# Terminal cleanup for aborted or abandoned multipart uploads.
+# Terminal cleanup for aborted or abandoned multipart uploads — plus the completion-side
+# counterpart (wake_version_replication), so every Python-side mutation of the drain's
+# cephor_replication_status rows lives in one module.
 #
 # An MPU writes each part to a node-local SSD object cache (the drain's CEPHOR_SSD_ROOT)
 # and the drain records a cephor_replication_status row per part, but

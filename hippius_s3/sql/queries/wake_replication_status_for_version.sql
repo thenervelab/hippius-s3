@@ -11,7 +11,9 @@
 --
 -- Only 'pending' rows: 'failed' is terminal by design and 'replicated'/'draining' rows are
 -- past the defer gate — resurrecting or touching them here would fight the drain's own
--- state machine.
+-- state machine. Accepted residual race: a part mid-claim that read the address as NULL
+-- just before the write defers once more with its preserved near-cap attempts — bounded
+-- to one extra backoff interval for at most claim-slot-count parts.
 -- Parameters: $1: object_id (text), $2: object_version (bigint)
 UPDATE cephor_replication_status
 SET deferred_until = NULL, defer_attempts = 0, updated_at = now()

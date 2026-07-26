@@ -1201,19 +1201,19 @@ async def complete_multipart_upload(
             address=request.state.account.main_account,
         )
 
-        # Drain wake: this version's parts sat in exponential defer backoff (upload enqueue
-        # not ready) while the MPU was in progress; the address write above removes that
-        # cause, so clear the backoff — defer_attempts included, deliberately unlike the
-        # Rust release_part which preserves escalation: the history is about the
-        # unfinalized address and is obsolete once complete. Best-effort (narrow exception
-        # to the no-try/except rule): the complete is already committed, the wake is only
-        # an optimization — the backoff self-heals within the cap — and this handler's
+        # Drain wake: the address write above removes the cause of this version's defer
+        # backoff (rationale, incl. the deliberate defer_attempts reset, lives in
+        # wake_replication_status_for_version.sql). Best-effort (narrow exception to the
+        # no-try/except rule): the complete is already committed, the wake is only an
+        # optimization — the backoff self-heals within the cap — and this handler's
         # outer catch-all would otherwise turn a wake failure into a 500 for a success.
         try:
             await wake_version_replication(db, object_id=object_id, object_version=object_version)
         except Exception:
             logger.warning(
-                "drain wake failed after CompleteMultipartUpload object_id=%s version=%s",
+                "drain wake failed after CompleteMultipartUpload bucket=%s upload_id=%s object_id=%s version=%s",
+                bucket_name,
+                upload_id,
                 object_id,
                 object_version,
                 exc_info=True,
