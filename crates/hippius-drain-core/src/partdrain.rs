@@ -243,8 +243,8 @@ pub trait PartReplicationStore: Send + Sync {
     /// Whether the part's `object_versions` row is still SERVABLE — the discriminator between a
     /// corrupt-live object ([`mark_corrupt`](Self::mark_corrupt)) and an abandoned upload
     /// ([`mark_failed`](Self::mark_failed)) at the moment a persistent `ChunkMismatch` is
-    /// detected. Same predicate as the reclaim gate's `servable_parts` and the janitor's
-    /// unservable predicate: address set OR a real size OR an md5.
+    /// detected. Same predicate as the janitor's unservable predicate: address set OR a real
+    /// size OR an md5.
     fn is_version_servable(&self, part: &PartKey) -> impl Future<Output = Result<bool, Self::Error>> + Send;
 }
 

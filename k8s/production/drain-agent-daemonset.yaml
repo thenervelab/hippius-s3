@@ -146,8 +146,14 @@ spec:
             # code defaults (300s poll / 1h graces); set here for visibility + per-node tuning.
             - name: CEPHOR_RECLAIM_POLL_SECS
               value: "300"
+            # MITIGATION (2026-07-26 data-loss incident): raised 3600 → 604800 (7d). The reclaim
+            # `failed` arm could unlink the only copy of a live pool-only object (deploy abandons
+            # an in-flight upload → mpu-reaper marks it `failed` → reclaim deleted the SSD source
+            # ~1h later). The code fix (reclaim `failed` only when the object row is ABSENT) makes
+            # this grace non-load-bearing, but the wide window is kept as defence-in-depth so a
+            # resumed/re-driven upload has days, not an hour, to rescue an SSD-only part.
             - name: CEPHOR_RECLAIM_GRACE_SECS
-              value: "3600"
+              value: "604800"
             - name: CEPHOR_REPLICATED_RECLAIM_GRACE_SECS
               value: "3600"
             # Max parts drained concurrently — the in-flight gate that lets the node
