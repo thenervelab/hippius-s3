@@ -161,9 +161,13 @@ pub async fn drain_next<E: UploadEnqueuer>(
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 // The SSD source is gone (MPU abort / DeleteObject / overwrite deleted
                 // the ingest copy) — specific to THIS part, so back it off and keep the
-                // burst claiming. Counted as a deferral, exactly like the mid-drain
-                // vanished-source case, so the metric does not depend on WHERE the
-                // ENOENT surfaced. The store counts the observation and — atomically,
+                // burst claiming. The DEFERRAL metric is counted exactly like the
+                // mid-drain vanished-source case, so that metric does not depend on
+                // WHERE the ENOENT surfaced — but the missing-source ESCALATION is
+                // location-dependent by design: only this size-gate arm observes it
+                // (a mid-drain ENOENT goes through plain defer_part and counts nothing
+                // toward the write-off; a truly gone source hits this gate on the next
+                // claim anyway). The store counts the observation and — atomically,
                 // inside the same draining-guarded UPDATE — writes the part off as
                 // terminal `failed` once it has been observed missing
                 // MISSING_SOURCE_FAIL_ATTEMPTS times: a source that is permanently

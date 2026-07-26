@@ -205,6 +205,24 @@ pub enum MissingSourceOutcome {
     Superseded,
 }
 
+/// Splices the shared exponential-backoff expression between two SQL literal halves,
+/// yielding one `&'static str` (sqlx 0.9's `SqlSafeStr` rejects runtime-built strings,
+/// so this is `concat!`, not `format!`). The expression — base × 2^`defer_attempts`,
+/// exponent clamped at 16 so `power` cannot overflow, product capped by the outer
+/// `LEAST` — is defined ONCE here so the cap/clamp geometry cannot drift between
+/// [`Store::defer_part`] and [`Store::defer_part_missing_source`]. It reads the row's
+/// OLD `defer_attempts` (UPDATE right-hand sides see pre-update values) and requires
+/// the splicing query to bind `$4` = base backoff seconds and `$5` = cap seconds.
+macro_rules! with_defer_backoff_sql {
+    ($prefix:expr, $suffix:expr) => {
+        concat!(
+            $prefix,
+            "now() + LEAST($4 * power(2::float8, LEAST(defer_attempts, 16)), $5) * interval '1 second'",
+            $suffix
+        )
+    };
+}
+
 /// Handle to the Postgres central state. Cheap to clone (shares the pool).
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -604,13 +622,13 @@ impl Store {
     ///
     /// [`StoreError::Database`] on failure.
     pub async fn defer_part(&self, part: &PartKey) -> Result<()> {
-        sqlx::query(
+        sqlx::query(with_defer_backoff_sql!(
             "UPDATE cephor_replication_status \
              SET status = 'pending', updated_at = now(), claimed_at = NULL, \
                  defer_attempts = defer_attempts + 1, \
-                 deferred_until = now() + LEAST($4 * power(2::float8, LEAST(defer_attempts, 16)), $5) * interval '1 second' \
-             WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining'",
-        )
+                 deferred_until = ",
+            " WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining'"
+        ))
         .bind(part.object().as_str())
         .bind(i64::from(part.version().get()))
         .bind(i64::from(part.part().get()))
@@ -645,6 +663,11 @@ impl Store {
     /// A guard miss (the row advanced concurrently) is [`MissingSourceOutcome::Superseded`]:
     /// a no-op defer cannot escalate.
     ///
+    /// `fail_threshold` must be greater than 1: a threshold of 0 or 1 writes the part
+    /// off on its FIRST observation — the exact transient-`NotFound` hazard this
+    /// design exists to prevent — so debug builds assert it (release builds execute
+    /// the first-observation write-off as written).
+    ///
     /// [`defer_part`]: Store::defer_part
     ///
     /// # Errors
@@ -652,17 +675,21 @@ impl Store {
     /// [`StoreError::Database`] on failure; [`StoreError::Invalid`] if the stored
     /// counter reads back negative (unreachable by construction).
     pub async fn defer_part_missing_source(&self, part: &PartKey, fail_threshold: u32) -> Result<MissingSourceOutcome> {
-        let row: Option<(i32, String)> = sqlx::query_as(
+        debug_assert!(
+            fail_threshold > 1,
+            "fail_threshold {fail_threshold} writes a part off on its first missing-source observation"
+        );
+        let row: Option<(i32, String)> = sqlx::query_as(with_defer_backoff_sql!(
             "UPDATE cephor_replication_status \
              SET missing_source_attempts = missing_source_attempts + 1, \
                  defer_attempts = defer_attempts + 1, \
                  status = CASE WHEN missing_source_attempts + 1 >= $6 THEN 'failed' ELSE 'pending' END, \
                  updated_at = now(), claimed_at = NULL, \
-                 deferred_until = CASE WHEN missing_source_attempts + 1 >= $6 THEN NULL \
-                     ELSE now() + LEAST($4 * power(2::float8, LEAST(defer_attempts, 16)), $5) * interval '1 second' END \
+                 deferred_until = CASE WHEN missing_source_attempts + 1 >= $6 THEN NULL ELSE ",
+            " END \
              WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining' \
-             RETURNING missing_source_attempts, status",
-        )
+             RETURNING missing_source_attempts, status"
+        ))
         .bind(part.object().as_str())
         .bind(i64::from(part.version().get()))
         .bind(i64::from(part.part().get()))
@@ -2505,6 +2532,33 @@ mod part_tests {
             store.claim_part().await.unwrap().is_none(),
             "a failed row is out of the claim set for good — no more churn",
         );
+        let unparked: bool = sqlx::query_scalar(
+            "SELECT deferred_until IS NULL FROM cephor_replication_status \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(p.object().as_str())
+        .bind(i64::from(p.version().get()))
+        .bind(i64::from(p.part().get()))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(unparked, "the fail arm parks no backoff — deferred_until is cleared, not set");
+    }
+
+    // debug_assert compiles out in release, so this pin only exists where the guard does.
+    #[cfg(debug_assertions)]
+    #[sqlx::test]
+    #[should_panic(expected = "first missing-source observation")]
+    async fn defer_part_missing_source_rejects_a_degenerate_threshold_in_debug(pool: PgPool) {
+        // The domain edge, pinned: a threshold of 0 or 1 means the FIRST observation
+        // writes the part off — the exact transient-NotFound hazard the separate
+        // counter exists to prevent — so debug builds refuse it outright (in release
+        // the documented first-observation write-off would execute as written).
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        store.claim_part().await.unwrap().expect("the part is claimable");
+        let _ = store.defer_part_missing_source(&p, 1).await;
     }
 
     #[sqlx::test]
