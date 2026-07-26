@@ -10,8 +10,8 @@ use crate::localfs::{LocalFs, LocalSsd};
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
 use hippius_drain_core::{
-    BreakerSignal, ClaimedPart, DenyReason, DrainDecision, DrainOutcome, Enforcer, MissingSourceOutcome, PartDrainError, PartKey, PartSource,
-    SnapshotCell, Store, StoreError, UploadEnqueuer, breaker_signal_for, drain_part,
+    BreakerSignal, ClaimedPart, DenyReason, DrainDecision, DrainOutcome, Enforcer, MissingSourceOutcome, PartDrainError, PartKey,
+    PartReplicationStore, PartSource, SnapshotCell, Store, StoreError, UploadEnqueuer, breaker_signal_for, drain_part,
 };
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -180,25 +180,76 @@ async fn resolve_missing_source(
             tracing::debug!(observations, "part source missing; part deferred, burst continues");
         }
         MissingSourceOutcome::Failed => {
-            // The only standing metric of a write-off (per-process; the WARN below is the
-            // only per-event trace): `node_undrained_count` excludes `failed` and the
-            // terminal GC deletes the row. Still NOT counted in `failed`/error_bps.
+            // The only standing metric of a write-off (per-process; the log in
+            // `report_write_off` is the only per-event trace): `node_undrained_count`
+            // excludes `failed` and the terminal GC deletes the row. Still NOT counted
+            // in `failed`/error_bps.
             if let Some(snapshot) = snapshot {
                 snapshot.record_written_off(1);
             }
-            tracing::warn!(
-                object_id = %claim.part().object().as_str(),
-                version = claim.part().version().get(),
-                part_number = claim.part().part().get(),
-                observations = MISSING_SOURCE_FAIL_ATTEMPTS,
-                "writing off part: SSD source gone after repeated observations",
-            );
+            report_write_off(store, claim, snapshot).await;
         }
         MissingSourceOutcome::Superseded => {
             tracing::debug!("part source missing but the claim was superseded; nothing recorded");
         }
     }
     Ok(ClaimOutcome::Skipped)
+}
+
+/// Classifies a just-committed write-off by its version's servability, for the signal only.
+///
+/// A write-off of a SERVABLE version is acknowledged client data the drain just declared
+/// undrainable — a durability emergency (the 2026-07-22/26 incidents wrote off 47 servable
+/// versions with only WARNs: hours of silent acknowledged-data loss). An unservable one is
+/// routine abandoned-upload cleanup. The extra `object_versions` read costs one query per
+/// write-off — a rare, terminal event — which is fine.
+///
+/// Infallible by design: the write-off already committed atomically inside
+/// `defer_part_missing_source`, so a failed servability read must not change the cycle's
+/// outcome — it degrades only the signal. On that failure we take the ERROR/counter path
+/// with servability marked UNKNOWN (counted as servable): the alert fires on the counter,
+/// and a page that cannot be ruled out beats silence.
+async fn report_write_off(store: &Store, claim: &ClaimedPart, snapshot: Option<&SnapshotCell>) {
+    let part = claim.part();
+    match store.is_version_servable(part).await {
+        Ok(false) => {
+            tracing::warn!(
+                object_id = %part.object().as_str(),
+                version = part.version().get(),
+                part_number = part.part().get(),
+                observations = MISSING_SOURCE_FAIL_ATTEMPTS,
+                "writing off part: SSD source gone after repeated observations",
+            );
+        }
+        Ok(true) => {
+            if let Some(snapshot) = snapshot {
+                snapshot.record_written_off_servable(1);
+            }
+            tracing::error!(
+                object_id = %part.object().as_str(),
+                version = part.version().get(),
+                part_number = part.part().get(),
+                observations = MISSING_SOURCE_FAIL_ATTEMPTS,
+                "DRAIN_WRITEOFF_SERVABLE: wrote off a part of a SERVABLE version — \
+                 acknowledged data lost from the drain path",
+            );
+        }
+        Err(err) => {
+            if let Some(snapshot) = snapshot {
+                snapshot.record_written_off_servable(1);
+            }
+            tracing::error!(
+                object_id = %part.object().as_str(),
+                version = part.version().get(),
+                part_number = part.part().get(),
+                observations = MISSING_SOURCE_FAIL_ATTEMPTS,
+                error = %err,
+                "DRAIN_WRITEOFF_SERVABLE: wrote off a part but its servability is UNKNOWN \
+                 (classification query failed); counted as servable — a page that cannot \
+                 be ruled out beats silence",
+            );
+        }
+    }
 }
 
 /// Claims one pending part and drains it SSD → pool, gated by `enforcer`.
@@ -926,6 +977,36 @@ mod tests {
         dir
     }
 
+    /// Stands up the `object_versions` table the write-off servability classification
+    /// reads — prod-shaped like the runtime reclaim tests' twin (the drain-core
+    /// migrations are cephor-only). A write-off test WITHOUT this table exercises the
+    /// classification-failure (unknown-servability) path.
+    async fn create_object_versions_table(pool: &PgPool) {
+        sqlx::query(
+            "CREATE TABLE object_versions (object_id uuid NOT NULL, object_version bigint NOT NULL, \
+             address text, size_bytes bigint, md5_hash text, \
+             PRIMARY KEY (object_id, object_version))",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Seeds one `object_versions` row with explicit servability columns. An abandoned
+    /// upload is `(None, Some(0), Some(""))` (unservable); a live object is any row with
+    /// an address, a real size, or an md5 (servable).
+    async fn seed_object_version(pool: &PgPool, part: &PartKey, address: Option<&str>, size_bytes: Option<i64>, md5: Option<&str>) {
+        sqlx::query("INSERT INTO object_versions (object_id, object_version, address, size_bytes, md5_hash) VALUES ($1::uuid, $2, $3, $4, $5)")
+            .bind(part.object().as_str())
+            .bind(i64::from(part.version().get()))
+            .bind(address)
+            .bind(size_bytes)
+            .bind(md5)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
     /// The row's `missing_source_attempts` — the write-off escalation counter.
     async fn missing_source_count(db: &PgPool, part: &PartKey) -> i64 {
         sqlx::query_scalar(
@@ -959,6 +1040,10 @@ mod tests {
 
         let part = part_at(5, 1);
         store.record_landed_part(&part).await.unwrap();
+        // An UNSERVABLE version (the abandoned-upload shape): this write-off is routine
+        // cleanup, so it must stay a WARN and out of the page-worthy servable counter.
+        create_object_versions_table(&db).await;
+        seed_object_version(&db, &part, None, Some(0), Some("")).await;
         // Threshold-1 prior observations: this claim's ENOENT is the deciding one.
         sqlx::query("UPDATE cephor_replication_status SET missing_source_attempts = $1 WHERE object_id = $2")
             .bind(i64::from(super::MISSING_SOURCE_FAIL_ATTEMPTS - 1))
@@ -985,9 +1070,107 @@ mod tests {
             "the write-off is counted in the snapshot — the WARN log and the (GC'd) failed row are not a metric"
         );
         assert_eq!(
+            counts.written_off_servable, 0,
+            "an unservable (abandoned-upload) write-off is routine cleanup, not a durability page",
+        );
+        assert_eq!(
             enforcer.lock().unwrap().try_drain(1, Instant::now()),
             DrainDecision::Allowed,
             "the write-off must not trip the Ceph breaker",
+        );
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn a_servable_versions_write_off_records_the_page_worthy_counter(pool: PgPool) {
+        // The detection gap behind the 2026-07-22/26 incidents: 47 SERVABLE versions —
+        // acknowledged client data — were written off with only WARN logs, hours of
+        // silent data loss. A write-off whose version is still servable must record the
+        // dedicated servable counter (the alert source) ON TOP of the total, and still
+        // skip (the write-off outcome itself is unchanged — the data is already gone).
+        let db = pool.clone();
+        let ssd_dir = mounted_ssd_dir();
+        let pool_dir = tempfile::tempdir().unwrap();
+        let ssd = LocalSsd::new(ssd_dir.path());
+        let ceph = LocalFs::new(pool_dir.path());
+        let store = Store::from_pool(pool);
+        let snapshot = SnapshotCell::new();
+        let enforcer = enforcer_with(1_000_000);
+
+        let part = part_at(5, 1);
+        store.record_landed_part(&part).await.unwrap();
+        // A SERVABLE version: address finalized — a live object a GET would serve.
+        create_object_versions_table(&db).await;
+        seed_object_version(&db, &part, Some("addr"), Some(4096), Some("d41d8cd9")).await;
+        sqlx::query("UPDATE cephor_replication_status SET missing_source_attempts = $1 WHERE object_id = $2")
+            .bind(i64::from(super::MISSING_SOURCE_FAIL_ATTEMPTS - 1))
+            .bind(part.object().as_str())
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let step = drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot))
+            .await
+            .unwrap();
+        assert_eq!(step, ClaimOutcome::Skipped, "classification changes the signal, never the outcome");
+
+        assert_eq!(
+            status_of(&store, &part).await,
+            Some(ReplicationState::Failed),
+            "the write-off itself is unchanged — the escalation already committed atomically",
+        );
+        let counts = snapshot.load();
+        assert_eq!(counts.written_off, 1, "the total stays the total: every write-off counts in it");
+        assert_eq!(
+            counts.written_off_servable, 1,
+            "a servable version's write-off is acknowledged-data loss — the page-worthy counter must fire",
+        );
+        assert_eq!(counts.error_bps(), 0, "still not a Ceph-write failure");
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn a_write_off_with_unknown_servability_pages_conservatively(pool: PgPool) {
+        // The servability read can fail (object_versions missing on a deploy, transient
+        // PG error) AFTER the write-off already committed. The write-off outcome must
+        // not change — but the signal must be the conservative one: a page you cannot
+        // rule out beats silence, so unknown counts as servable. No object_versions
+        // table here: that absence IS the classification failure under test.
+        let db = pool.clone();
+        let ssd_dir = mounted_ssd_dir();
+        let pool_dir = tempfile::tempdir().unwrap();
+        let ssd = LocalSsd::new(ssd_dir.path());
+        let ceph = LocalFs::new(pool_dir.path());
+        let store = Store::from_pool(pool);
+        let snapshot = SnapshotCell::new();
+        let enforcer = enforcer_with(1_000_000);
+
+        let part = part_at(5, 1);
+        store.record_landed_part(&part).await.unwrap();
+        sqlx::query("UPDATE cephor_replication_status SET missing_source_attempts = $1 WHERE object_id = $2")
+            .bind(i64::from(super::MISSING_SOURCE_FAIL_ATTEMPTS - 1))
+            .bind(part.object().as_str())
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let step = drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot))
+            .await
+            .unwrap();
+        assert_eq!(
+            step,
+            ClaimOutcome::Skipped,
+            "a classification failure must not fail the cycle — the write-off already happened",
+        );
+
+        assert_eq!(
+            status_of(&store, &part).await,
+            Some(ReplicationState::Failed),
+            "the terminal write-off stands regardless of the classification read",
+        );
+        let counts = snapshot.load();
+        assert_eq!(counts.written_off, 1, "the total still counts the write-off");
+        assert_eq!(
+            counts.written_off_servable, 1,
+            "unknown servability counts as servable — the page fires when loss cannot be ruled out",
         );
     }
 

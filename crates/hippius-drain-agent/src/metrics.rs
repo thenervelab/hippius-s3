@@ -175,6 +175,19 @@ pub fn init(service_name: &'static str, snapshot: &Arc<SnapshotCell>, enforcer: 
             .build(),
     ));
 
+    // Durability page: the subset of write-offs whose version was still SERVABLE (or of
+    // unknown servability) — acknowledged client data declared undrainable. The 2026-07-22/26
+    // incidents left this shape observable only as WARN logs; any increase pages
+    // (`increase(drain_parts_written_off_servable_total[1h]) > 0`). Always <= the total above,
+    // which keeps counting every write-off, servable or not.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_parts_written_off_servable_total")
+            .with_callback(move |observer| observer.observe(snap.load().written_off_servable, &[]))
+            .build(),
+    ));
+
     // Silent-failure alarm: the Ceph breaker (trips at debug-level today) as a 0/1 gauge.
     if let Some(enforcer) = enforcer {
         let enforcer = Arc::clone(enforcer);
