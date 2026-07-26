@@ -209,7 +209,12 @@ impl TokenBucket {
         let repaid = added.min(self.debt);
         self.debt -= repaid;
         self.tokens = self.tokens.saturating_add(added - repaid).min(self.burst.get());
-        self.last = now;
+        // Only ever ADVANCE the clock: a stale `now` (an Instant captured before the
+        // caller won the enforcer lock, arriving after a fresher refill) prices a
+        // zero-length window above, but assigning it would rewind `last` and let the
+        // NEXT refill re-price the already-minted [now, last] window — free tokens
+        // (and free debt payoff) exactly under lock contention.
+        self.last = self.last.max(now);
     }
 
     /// Tries to spend `bytes` tokens, refilling first. Returns whether granted.
@@ -555,6 +560,21 @@ mod tests {
             prop_assert!(bucket.try_take(expected, t), "credited at least the exact total {expected}");
             prop_assert!(!bucket.try_take(1, t), "credited no more than the exact total {expected}");
         }
+    }
+
+    #[test]
+    fn a_stale_refill_cannot_regress_the_clock_and_remint_a_window() {
+        // Two callers race for the enforcer lock, each with an Instant captured
+        // pre-lock. The loser's older `now` must not rewind the bucket's clock:
+        // rewinding re-prices the already-minted [stale_now, last] window on the
+        // NEXT refill — free tokens (and free debt payoff) under lock contention.
+        let now = t0();
+        let mut bucket = TokenBucket::new(ByteRate::new(1_000), Bytes::new(1_000), now);
+        assert!(bucket.try_take(1_000, now), "drain the initial burst");
+        let later = now + Duration::from_secs(1);
+        assert!(bucket.try_take(1_000, later), "the now->later window minted its full burst once");
+        let _ = bucket.try_take(0, now); // the stale, pre-lock refill arrives late
+        assert!(!bucket.try_take(1, later), "a stale refill after a fresh one mints nothing extra");
     }
 
     #[test]
