@@ -167,7 +167,9 @@ async def test_failed_attempt_preserves_unpublished_chunks(tmp_path, monkeypatch
             body_iter=dying_body(),
         )
 
-    # B overwrote chunk_0 (atomic rename, its own ciphertext) but deleted nothing.
+    # B's failure deleted nothing: both chunk files survive and chunk_1 still holds A's
+    # bytes. chunk_0's content is deliberately unasserted — B's consumer may or may not
+    # have flushed its first chunk (atomic rename over A's) before the failure propagated.
     on_disk = _read_chunks(fs_store, object_id, 1, 1)
     assert {"chunk_0.bin", "chunk_1.bin"}.issubset(set(on_disk))
     assert on_disk["chunk_1.bin"] == b"A-chunk-1"
