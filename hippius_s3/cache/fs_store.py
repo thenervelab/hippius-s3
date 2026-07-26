@@ -362,6 +362,92 @@ class FileSystemPartsStore:
             logger.error(f"FS meta write failed: object_id={object_id} v={object_version} part={part_number}: {e}")
             raise
 
+    async def trim_chunks_from(self, object_id: str, object_version: int, part_number: int, first_index: int) -> int:
+        """Delete chunk files with index >= first_index; the publish-time exact-set trim.
+
+        Called right after meta.json lands with num_chunks == first_index. The drain
+        replicates a part only when the SSD chunk set is EXACTLY {0..num_chunks-1}
+        (partdrain.rs completeness gate → IncompleteSource); a stale tail left by a
+        larger earlier attempt would strand the part forever — never replicated, never
+        evicted. Never touches meta.json or chunks below first_index.
+
+        Per-file failures are logged at ERROR — a surviving tail IS the stranded-part
+        risk and operators must see it — but never raised: the upload itself is durable
+        on SSD and the client's success must not hinge on tail cleanup.
+
+        Returns:
+            Number of chunk files removed.
+        """
+        part_dir = Path(self.part_path(object_id, object_version, part_number))
+
+        def _trim() -> int:
+            removed = 0
+            try:
+                entries = list(part_dir.iterdir())
+            except FileNotFoundError:
+                return 0
+            except OSError as e:
+                # Same loudness as a per-file failure: an unscannable dir may hide a tail.
+                logger.error(
+                    f"FS trim failed — could not scan part dir, a stale chunk tail may strand the "
+                    f"part as IncompleteSource in the drain: object_id={object_id} "
+                    f"v={object_version} part={part_number}: {e}"
+                )
+                return 0
+            for entry in entries:
+                name = entry.name
+                if not (name.startswith("chunk_") and name.endswith(".bin")):
+                    continue
+                try:
+                    idx = int(name[len("chunk_") : -len(".bin")])
+                except ValueError:
+                    continue  # tmp files etc. — the janitor's orphan sweep owns those
+                if idx < int(first_index):
+                    continue
+                try:
+                    entry.unlink()
+                    removed += 1
+                except OSError as e:
+                    logger.error(
+                        f"FS trim failed — stale chunk tail survives and the part may strand as "
+                        f"IncompleteSource in the drain: object_id={object_id} v={object_version} "
+                        f"part={part_number} chunk={idx}: {e}"
+                    )
+            return removed
+
+        removed = await asyncio.to_thread(_trim)
+        if removed:
+            logger.debug(
+                f"FS: trimmed {removed} stale chunk(s) >= {first_index}: "
+                f"object_id={object_id} v={object_version} part={part_number}"
+            )
+        return removed
+
+    async def delete_meta(self, object_id: str, object_version: int, part_number: int) -> None:
+        """Delete meta.json only, un-publishing a part dir while keeping its chunks.
+
+        Used by the append CAS-loser cleanup: part-number reservation is FOR-UPDATE
+        serialized, so no live winner shares the loser's dir — removing meta makes the
+        dir invisible to readers and the drain reconciler again (restores meta-last)
+        and stops a future append that reuses the number from inheriting stale
+        readiness over mixed content. Idempotent; failures are logged at ERROR (stale
+        readiness left behind) but not raised — the caller is already propagating the
+        CAS failure.
+        """
+        part_dir = Path(self.part_path(object_id, object_version, part_number))
+        meta_path = self._meta_file(part_dir)
+
+        def _unlink() -> None:
+            meta_path.unlink(missing_ok=True)
+
+        try:
+            await asyncio.to_thread(_unlink)
+        except OSError as e:
+            logger.error(
+                f"FS meta delete failed — part stays published with stale readiness: "
+                f"object_id={object_id} v={object_version} part={part_number}: {e}"
+            )
+
     async def get_meta(self, object_id: str, object_version: int, part_number: int) -> Optional[dict]:
         """Read metadata from filesystem.
 

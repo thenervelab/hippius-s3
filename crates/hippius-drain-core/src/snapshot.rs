@@ -116,6 +116,15 @@ pub struct AgentSnapshot {
     /// Kept OUT of [`error_bps`](Self::error_bps) like `deferred`: a write-off is a data
     /// disposition, not a Ceph-write failure.
     pub written_off: u64,
+    /// The subset of [`written_off`](Self::written_off) whose `object_versions` row was
+    /// still SERVABLE (or whose servability could not be determined) at write-off time:
+    /// acknowledged client data the drain just declared undrainable — a durability
+    /// emergency, unlike the routine abandoned-upload write-off. The 2026-07-22/26
+    /// incidents wrote off 47 servable versions with only WARN logs; this counter is the
+    /// page (`increase(drain_parts_written_off_servable_total[1h]) > 0`). The caller
+    /// records the total alongside, so `written_off_servable <= written_off` always.
+    /// Out of [`error_bps`](Self::error_bps) for the same reason as the total.
+    pub written_off_servable: u64,
 }
 
 impl AgentSnapshot {
@@ -157,6 +166,7 @@ pub struct SnapshotCell {
     reclaim_backing_errors: AtomicU64,
     throttled: AtomicU64,
     written_off: AtomicU64,
+    written_off_servable: AtomicU64,
     /// Current SSD backlog (undrained bytes) — a LEVEL, not a monotonic counter, so it
     /// has its own atomic (set, not accumulated) rather than living in [`AgentSnapshot`].
     /// The heartbeat worker writes it (`usage.used_bytes`) each tick; the metrics layer
@@ -283,6 +293,14 @@ impl SnapshotCell {
         self.written_off.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Records `n` write-offs of parts whose version was still servable (or of unknown
+    /// servability) — the page-worthy subset. Callers record the total alongside so
+    /// `written_off_servable <= written_off` holds (see
+    /// [`AgentSnapshot::written_off_servable`]).
+    pub fn record_written_off_servable(&self, n: u64) {
+        self.written_off_servable.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Records the current SSD disk saturation in basis points (`0..=10000`). A gauge:
     /// `store`, not add. The heartbeat writes it from the `statvfs` pressure each tick.
     pub fn record_disk_pressure(&self, bps: u16) {
@@ -340,6 +358,7 @@ impl SnapshotCell {
             reclaim_backing_errors: self.reclaim_backing_errors.load(Ordering::Relaxed),
             throttled: self.throttled.load(Ordering::Relaxed),
             written_off: self.written_off.load(Ordering::Relaxed),
+            written_off_servable: self.written_off_servable.load(Ordering::Relaxed),
         }
     }
 }
@@ -458,6 +477,26 @@ mod tests {
     }
 
     #[test]
+    fn servable_write_offs_count_in_both_counters_without_polluting_error_bps() {
+        // Task 4 (2026-07-22/26 incidents): a write-off of a SERVABLE version is
+        // acknowledged-data loss and needs its own alertable counter, while the total
+        // stays the total — the caller records BOTH, so servable ≤ total always holds
+        // and `drain_parts_written_off_total` keeps meaning every write-off. Like
+        // `written_off`, the servable counter is a data disposition, not a Ceph-write
+        // failure, so it stays out of error_bps.
+        let cell = SnapshotCell::new();
+        cell.record_drained(7);
+        cell.record_failed(3);
+        cell.record_written_off(1);
+        cell.record_written_off_servable(1);
+        cell.record_written_off(1);
+        let snap = cell.load();
+        assert_eq!(snap.written_off, 2, "the total counts every write-off, servable or not");
+        assert_eq!(snap.written_off_servable, 1, "only the servable write-off pages");
+        assert_eq!(snap.error_bps(), 3000, "servable write-offs stay out of the Ceph failure rate");
+    }
+
+    #[test]
     fn records_accumulate_per_counter() {
         let cell = SnapshotCell::new();
         cell.record_drained(3);
@@ -477,6 +516,7 @@ mod tests {
                 reclaim_backing_errors: 0,
                 throttled: 9,
                 written_off: 0,
+                written_off_servable: 0,
             },
         );
     }
@@ -542,6 +582,7 @@ mod tests {
             reclaim_backing_errors: 0,
             throttled: 0,
             written_off: 0,
+            written_off_servable: 0,
         };
         assert_eq!(snapshot.error_bps(), 10_000);
     }
@@ -557,6 +598,7 @@ mod tests {
             reclaim_backing_errors: 0,
             throttled: 0,
             written_off: 0,
+            written_off_servable: 0,
         };
         // 3 failed attempts of 10 total attempts = 30%, i.e. 3000 basis points.
         assert_eq!(snapshot.error_bps(), 3000);
