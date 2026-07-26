@@ -134,6 +134,93 @@ async def test_mpu_duplicate_failure_after_publish_preserves_part(tmp_path, monk
     assert await fs_store.get_chunk(object_id, 1, 1, 1) == published["chunk_1.bin"]
 
 
+@pytest.mark.asyncio
+async def test_failed_attempt_preserves_unpublished_chunks(tmp_path, monkeypatch, small_chunks):
+    """B fails while A is mid-write (A's chunks on disk, meta NOT yet written): A's chunks survive.
+
+    Pins "failure paths never delete chunk files" even for a dir that is not yet published —
+    guards against a future meta-guarded delete creeping back into the failure cleanup.
+    """
+    object_id = str(uuid.uuid4())
+    fs_store = FileSystemPartsStore(str(tmp_path))
+    writer = _make_writer(DummyPool(), fs_store, monkeypatch)
+
+    # Attempt A mid-write: chunks landed, meta.json not yet written.
+    await fs_store.set_chunk(object_id, 1, 1, 0, b"A-chunk-0")
+    await fs_store.set_chunk(object_id, 1, 1, 1, b"A-chunk-1")
+    part_dir = Path(fs_store.part_path(object_id, 1, 1))
+    assert not (part_dir / "meta.json").exists()
+
+    async def dying_body() -> AsyncIterator[bytes]:
+        yield PART_BODY[:4]
+        raise ConnectionError("client disconnected mid-stream")
+
+    with pytest.raises(ConnectionError):
+        await writer.mpu_upload_part_stream(
+            upload_id="upload",
+            object_id=object_id,
+            object_version=1,
+            bucket_name="bucket",
+            bucket_id="bucket",
+            account_address="acct",
+            part_number=1,
+            body_iter=dying_body(),
+        )
+
+    # B overwrote chunk_0 (atomic rename, its own ciphertext) but deleted nothing.
+    on_disk = _read_chunks(fs_store, object_id, 1, 1)
+    assert {"chunk_0.bin", "chunk_1.bin"}.issubset(set(on_disk))
+    assert on_disk["chunk_1.bin"] == b"A-chunk-1"
+    assert not (part_dir / "meta.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_publish_trims_stale_chunk_tail(tmp_path, monkeypatch, small_chunks):
+    """Publishing with num_chunks=N must delete stale chunk files with index >= N.
+
+    The drain replicates a part only when the SSD chunk set is EXACTLY
+    {0..num_chunks-1} (partdrain.rs IncompleteSource gate); a tail left by a
+    larger earlier attempt would strand the part — never replicated, never evicted.
+    """
+    object_id = str(uuid.uuid4())
+    fs_store = FileSystemPartsStore(str(tmp_path))
+    writer = _make_writer(DummyPool(), fs_store, monkeypatch)
+
+    # A larger earlier attempt died after writing 5 chunks (no meta).
+    for i in range(5):
+        await fs_store.set_chunk(object_id, 1, 1, i, f"stale-{i}".encode())
+
+    await _publish_attempt_a(writer, object_id=object_id, object_version=1, part_number=1, upload_id="upload")
+
+    part_dir = Path(fs_store.part_path(object_id, 1, 1))
+    assert sorted(p.name for p in part_dir.iterdir()) == ["chunk_0.bin", "chunk_1.bin", "meta.json"]
+    meta = await fs_store.get_meta(object_id, 1, 1)
+    assert meta is not None and int(meta["num_chunks"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_trim_failure_is_loud_but_publish_succeeds(tmp_path, monkeypatch, small_chunks, caplog):
+    """A trim failure leaves a stranded-part risk: log ERROR, but the client's 200 stands."""
+    import logging
+
+    object_id = str(uuid.uuid4())
+    fs_store = FileSystemPartsStore(str(tmp_path))
+    writer = _make_writer(DummyPool(), fs_store, monkeypatch)
+
+    # Stale tail where one entry is a directory — unlink fails on it (real-FS fault injection).
+    await fs_store.set_chunk(object_id, 1, 1, 2, b"stale-2")
+    part_dir = Path(fs_store.part_path(object_id, 1, 1))
+    (part_dir / "chunk_3.bin").mkdir()
+
+    with caplog.at_level(logging.ERROR, logger="hippius_s3.cache.fs_store"):
+        await _publish_attempt_a(writer, object_id=object_id, object_version=1, part_number=1, upload_id="upload")
+
+    assert not (part_dir / "chunk_2.bin").exists()
+    assert (part_dir / "meta.json").exists()
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any(object_id in r.getMessage() for r in errors), "surviving tail must be loud"
+
+
 class _AppendFakeConn:
     """Just enough of an asyncpg connection for append_stream's two transactions."""
 
@@ -168,6 +255,7 @@ class _AppendFakePool:
         self.object_id = object_id
         self.expected_version = expected_version
         self.next_part = next_part
+        self.executed: list[str] = []
 
     def route_fetchrow(self, query: str) -> Any:
         if "md5_hash" in query and "FOR UPDATE" in query:
@@ -201,6 +289,7 @@ class _AppendFakePool:
         return self.route_fetchval(query)
 
     async def execute(self, query: str, *args: Any) -> None:
+        self.executed.append(query)
         return None
 
     def acquire(self, **_kwargs: Any) -> Any:
@@ -214,19 +303,19 @@ class _AppendFakePool:
 
 
 @pytest.mark.asyncio
-async def test_append_cas_loser_cleanup_preserves_published_part(tmp_path, monkeypatch, small_chunks):
-    """An append CAS loser (winner finalized the same part first) must not wipe the part dir."""
+async def test_append_cas_loser_unpublishes_part_and_number_is_reusable(tmp_path, monkeypatch, small_chunks):
+    """A CAS loser must un-publish its part dir: meta.json deleted, chunks kept, parts row gone.
+
+    Part-number reservation is FOR-UPDATE-serialized, so no live winner shares the loser's
+    dir — but the loser's meta.json already landed (mpu_upload_part_stream returned before the
+    finalize CAS ran). Leaving it would let a future append that reuses the number inherit
+    stale readiness over mixed content. Chunks stay: failure paths never delete chunk files.
+    """
     object_id = str(uuid.uuid4())
     fs_store = FileSystemPartsStore(str(tmp_path))
 
     pool = _AppendFakePool(object_id=object_id, expected_version=7, next_part=3)
     writer = _make_writer(pool, fs_store, monkeypatch)
-
-    # The winner's publish of (object, cov=1, part=3): same bytes the loser will re-write
-    # (deterministic nonces make duplicate ciphertexts identical).
-    await _publish_attempt_a(writer, object_id=object_id, object_version=1, part_number=3, upload_id="upload")
-    published = _read_chunks(fs_store, object_id, 1, 3)
-    assert set(published) == {"chunk_0.bin", "chunk_1.bin"}
 
     async def body() -> AsyncIterator[bytes]:
         yield PART_BODY
@@ -241,9 +330,28 @@ async def test_append_cas_loser_cleanup_preserves_published_part(tmp_path, monke
             body_iter=body(),
         )
 
+    part_dir = Path(fs_store.part_path(object_id, 1, 3))
+    assert not (part_dir / "meta.json").exists(), "CAS loser must un-publish its meta.json"
+    loser_chunks = _read_chunks(fs_store, object_id, 1, 3)
+    assert set(loser_chunks) == {"chunk_0.bin", "chunk_1.bin"}, "chunks must survive (leak beats loss)"
+    assert any("DELETE FROM parts" in q for q in pool.executed), "loser's parts row must be deleted"
+
+    # A later append reuses part 3 with different, SHORTER content: it must publish cleanly
+    # and its trim must remove the loser's stale chunk_1 tail (exact-set drain gate).
+    async def reuse_body() -> AsyncIterator[bytes]:
+        yield b"zzzz"  # 1 chunk at chunk_size=4
+
+    res = await writer.mpu_upload_part_stream(
+        upload_id="11111111-2222-3333-4444-555555555555",
+        object_id=object_id,
+        object_version=1,
+        bucket_name="bucket",
+        bucket_id="bucket",
+        account_address="acct",
+        part_number=3,
+        body_iter=reuse_body(),
+    )
+    assert res.size_bytes == 4
+    assert sorted(p.name for p in part_dir.iterdir()) == ["chunk_0.bin", "meta.json"]
     meta = await fs_store.get_meta(object_id, 1, 3)
-    assert meta is not None, "published meta.json was destroyed by the CAS loser's cleanup"
-    assert int(meta["num_chunks"]) == 2
-    assert _read_chunks(fs_store, object_id, 1, 3) == published
-    assert await fs_store.get_chunk(object_id, 1, 3, 0) == published["chunk_0.bin"]
-    assert await fs_store.get_chunk(object_id, 1, 3, 1) == published["chunk_1.bin"]
+    assert meta is not None and int(meta["num_chunks"]) == 1

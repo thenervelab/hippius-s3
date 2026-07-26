@@ -870,6 +870,23 @@ class ObjectWriter:
                 plain_size=int(total_size),
             )
             meta_written = True
+            # Publish-time exact-set trim (covers MPU and append, which materializes its delta
+            # part here). The drain replicates a part only when the SSD chunk set is EXACTLY
+            # {0..num_chunks-1} (partdrain.rs completeness gate → IncompleteSource); a stale tail
+            # from a LARGER earlier attempt would strand the part forever — never replicated,
+            # never evicted. Races, honestly: an identical concurrent duplicate never writes
+            # indices >= our N (same content ⇒ same N), so this only ever deletes another
+            # attempt's bytes when that attempt has DIFFERENT content — and there S3 semantics
+            # are already last-writer-wins for concurrent same-part uploads. Different-content
+            # attempts interleave arbitrarily; whichever publishes last rewrites meta and its
+            # trim enforces its own N, so any transiently mixed (meta, chunk set) state resolves
+            # to the last publisher's. A drain that catches the mid-window mismatch defers once
+            # as IncompleteSource and retries — benign, not permanent, because the settled state
+            # is exact. Trim failures are ERROR-logged inside (stranded-part risk) but never
+            # fail the request: the part itself is durable on SSD.
+            await self.fs_store.trim_chunks_from(
+                str(object_id), int(object_version), int(part_number), int(next_chunk_index)
+            )
         except Exception:
             if not meta_written:
                 await _cleanup_partial()
@@ -1115,12 +1132,16 @@ class ObjectWriter:
             )
 
         async def _cleanup_part(num_chunks: int | None) -> None:
-            # Deliberately NO fs_store.delete_part here. A CAS loser shares (object, cov,
-            # next_part) — and therefore one part dir — with the append that won; chunk files
-            # are atomic-rename + byte-identical across duplicates and invisible to
-            # readers/reconciler until meta.json lands, so deleting the dir from this failure
-            # path can destroy the winner's already-acknowledged data (the 2026-07-22/26
-            # incidents). A never-finalized dir merely leaks until SSD GC; leak beats loss.
+            # This runs ONLY from the finalize-CAS-loser branch, AFTER mpu_upload_part_stream
+            # returned — so the loser's meta.json HAS landed and the dir IS visible to readers
+            # and the drain reconciler, while _delete_part_row is about to remove its parts row.
+            # Part-number reservation is FOR-UPDATE-serialized, so no live winner shares this
+            # dir: deleting ONLY meta.json is safe and un-publishes it (restores the meta-last
+            # invariant), preventing (a) the drain replicating a part with no DB row and (b) a
+            # future append that reuses this part number inheriting stale readiness over mixed
+            # content (nonce-reuse-on-disk for different plaintext). Chunk files stay — failure
+            # paths never delete chunk data (the 2026-07-22/26 incidents); leak beats loss.
+            await self.fs_store.delete_meta(str(object_id), int(cov), int(next_part))
             try:
                 meta_key = self.obj_cache.build_meta_key(str(object_id), int(cov), int(next_part))
                 keys = [meta_key]
