@@ -68,6 +68,21 @@ async def fail_version_replication(db: Any, *, object_id: Any, object_version: i
     )
 
 
+async def wake_version_replication(db: Any, *, object_id: Any, object_version: int) -> None:
+    """Clear drain defer backoff for one completed version's still-'pending' rows.
+
+    The counterpart of ``fail_version_replication``: completion (not abort) is the
+    signal. In-progress-MPU parts defer with exponential backoff because their upload
+    enqueue is not ready until the address lands at complete; clearing the backoff lets
+    the drain claim them on its next poll instead of waiting out up to the cap.
+    """
+    await db.execute(
+        get_query("wake_replication_status_for_version"),
+        str(object_id),
+        int(object_version),
+    )
+
+
 async def reap_abandoned_uploads(db: Any, *, stale_seconds: int, dlq_object_ids: set[str]) -> ReapResult:
     """Auto-abort never-finalized multipart uploads older than ``stale_seconds``.
 
