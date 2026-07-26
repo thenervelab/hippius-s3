@@ -427,8 +427,11 @@ async fn enqueue_sweep_once<E: UploadEnqueuer>(store: &Store, enqueuer: &E) {
 /// Sets the enforcer's rate under its lock. The op is synchronous, so the guard
 /// never crosses an `.await` (axiom `rust_quality_74`); a poisoned lock recovers
 /// via `into_inner` — the `Enforcer` is a small `Copy` value left consistent.
-fn apply_rate(enforcer: &Arc<Mutex<Enforcer>>, rate: ByteRate) {
-    enforcer.lock().unwrap_or_else(PoisonError::into_inner).set_rate(rate);
+/// `now` settles the bucket's un-refilled window at the outgoing rate before the
+/// swap, so a budget change cannot re-price elapsed time (debt payment is not
+/// burst-capped, so re-pricing would mint or destroy real budget).
+fn apply_rate(enforcer: &Arc<Mutex<Enforcer>>, rate: ByteRate, now: Instant) {
+    enforcer.lock().unwrap_or_else(PoisonError::into_inner).set_rate(rate, now);
 }
 
 /// The enforcer action for one allocation-pull outcome, separated from the async
@@ -482,9 +485,12 @@ async fn run_alloc(token: CancellationToken, coord: Arc<Coordinator>, rate_contr
             PullAction::Adopt(budget) => {
                 base = budget;
                 allocated_at = clock.now();
-                apply_rate(&enforcer, base);
+                apply_rate(&enforcer, base, allocated_at);
             }
-            PullAction::Decay => apply_rate(&enforcer, decay_rate(base, floor, clock.now().duration_since(allocated_at), half_life)),
+            PullAction::Decay => {
+                let now = clock.now();
+                apply_rate(&enforcer, decay_rate(base, floor, now.duration_since(allocated_at), half_life), now);
+            }
         }
         tokio::select! {
             () = token.cancelled() => return,
