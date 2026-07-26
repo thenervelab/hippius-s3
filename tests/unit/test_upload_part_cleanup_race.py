@@ -99,7 +99,6 @@ def small_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("hippius_s3.writer.object_writer.get_config", lambda: cfg)
 
 
-@pytest.mark.xfail(strict=True, reason="RED: _cleanup_partial still wipes the shared part dir")
 @pytest.mark.asyncio
 async def test_mpu_duplicate_failure_after_publish_preserves_part(tmp_path, monkeypatch, small_chunks):
     """A duplicate UploadPart attempt that dies mid-stream must not wipe the published part dir."""
@@ -214,7 +213,6 @@ class _AppendFakePool:
         return _cm()
 
 
-@pytest.mark.xfail(strict=True, reason="RED: _cleanup_part still wipes the shared part dir")
 @pytest.mark.asyncio
 async def test_append_cas_loser_cleanup_preserves_published_part(tmp_path, monkeypatch, small_chunks):
     """An append CAS loser (winner finalized the same part first) must not wipe the part dir."""

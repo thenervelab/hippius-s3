@@ -736,15 +736,13 @@ class ObjectWriter:
         consumer_error: BaseException | None = None
 
         async def _cleanup_partial() -> None:
-            try:
-                await self.fs_store.delete_part(str(object_id), int(object_version), int(part_number))
-            except Exception:
-                logger.warning(
-                    "Failed to cleanup partial part on FS: object_id=%s v=%s part=%s",
-                    object_id,
-                    int(object_version),
-                    int(part_number),
-                )
+            # Deliberately NO fs_store.delete_part here. Hedged duplicate UploadPart attempts
+            # share one part dir; chunk files are atomic-rename + byte-identical across
+            # duplicates and invisible to readers/reconciler until meta.json lands — so a
+            # failure-path deletion is pure hazard: on 2026-07-26 a cancelled duplicate's
+            # cleanup wiped a completed part's data after its 200 was already returned.
+            # A never-published dir merely leaks until SSD GC; leak beats loss (same doctrine
+            # as the drain reclaim).
             if written_chunk_indices:
                 try:
                     keys = [
@@ -1117,15 +1115,12 @@ class ObjectWriter:
             )
 
         async def _cleanup_part(num_chunks: int | None) -> None:
-            try:
-                await self.fs_store.delete_part(str(object_id), int(cov), int(next_part))
-            except Exception:
-                logging.getLogger(__name__).warning(
-                    "Failed to cleanup append part on FS: object_id=%s v=%s part=%s",
-                    object_id,
-                    int(cov),
-                    int(next_part),
-                )
+            # Deliberately NO fs_store.delete_part here. A CAS loser shares (object, cov,
+            # next_part) — and therefore one part dir — with the append that won; chunk files
+            # are atomic-rename + byte-identical across duplicates and invisible to
+            # readers/reconciler until meta.json lands, so deleting the dir from this failure
+            # path can destroy the winner's already-acknowledged data (the 2026-07-22/26
+            # incidents). A never-finalized dir merely leaks until SSD GC; leak beats loss.
             try:
                 meta_key = self.obj_cache.build_meta_key(str(object_id), int(cov), int(next_part))
                 keys = [meta_key]
