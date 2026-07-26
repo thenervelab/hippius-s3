@@ -10,13 +10,24 @@ use crate::localfs::{LocalFs, LocalSsd};
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
 use hippius_drain_core::{
-    BreakerSignal, DenyReason, DrainDecision, DrainOutcome, Enforcer, PartDrainError, PartKey, PartSource, SnapshotCell, Store, StoreError,
-    UploadEnqueuer, breaker_signal_for, drain_part,
+    BreakerSignal, DenyReason, DrainDecision, DrainOutcome, Enforcer, MissingSourceOutcome, PartDrainError, PartKey, PartSource, SnapshotCell, Store,
+    StoreError, UploadEnqueuer, breaker_signal_for, drain_part,
 };
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+
+/// Missing-source observations before a part is written off as terminal `failed`.
+///
+/// Conservative on purpose: `failed` is never resurrected (the reconciler only
+/// registers parts that exist on SSD, and `record_landed_part` never revives a
+/// `failed` row), so a wrong write-off is silent replication loss. At 20 exponential
+/// deferrals (5s base, capped at 10min) the row is HOURS old before the 20th distinct
+/// `NotFound` lands — a slow or blipping mount does not plausibly produce 20 separate
+/// missing-source observations, only a source that is permanently gone does (the
+/// 2026-07-22 rows whose SSD dirs no longer exist).
+const MISSING_SOURCE_FAIL_ATTEMPTS: u32 = 20;
 
 /// A failure during one drain cycle: either claiming the part or draining it.
 ///
@@ -152,13 +163,33 @@ pub async fn drain_next<E: UploadEnqueuer>(
                 // the ingest copy) — specific to THIS part, so back it off and keep the
                 // burst claiming. Counted as a deferral, exactly like the mid-drain
                 // vanished-source case, so the metric does not depend on WHERE the
-                // ENOENT surfaced. Terminal escalation of a persistently missing
-                // source lands next (Task E) on top of this defer.
-                store.defer_part(claim.part()).await?;
-                if let Some(snapshot) = snapshot {
-                    snapshot.record_deferred(1);
+                // ENOENT surfaced. The store counts the observation and — atomically,
+                // inside the same draining-guarded UPDATE — writes the part off as
+                // terminal `failed` once it has been observed missing
+                // MISSING_SOURCE_FAIL_ATTEMPTS times: a source that is permanently
+                // gone (the 2026-07-22 rows) must stop churning claim→defer forever.
+                // A write-off is NOT a Ceph failure: it stays off the breaker and out
+                // of error_bps (the WARN + the terminal row are its record).
+                match store.defer_part_missing_source(claim.part(), MISSING_SOURCE_FAIL_ATTEMPTS).await? {
+                    MissingSourceOutcome::Deferred(observations) => {
+                        if let Some(snapshot) = snapshot {
+                            snapshot.record_deferred(1);
+                        }
+                        tracing::debug!(observations, "part source missing; part deferred, burst continues");
+                    }
+                    MissingSourceOutcome::Failed => {
+                        tracing::warn!(
+                            object_id = %claim.part().object().as_str(),
+                            version = claim.part().version().get(),
+                            part_number = claim.part().part().get(),
+                            observations = MISSING_SOURCE_FAIL_ATTEMPTS,
+                            "writing off part: SSD source gone after repeated observations",
+                        );
+                    }
+                    MissingSourceOutcome::Superseded => {
+                        tracing::debug!("part source missing but the claim was superseded; nothing recorded");
+                    }
                 }
-                tracing::debug!("part source missing; part deferred, burst continues");
                 return Ok(ClaimOutcome::Skipped);
             }
             Err(err) => {
@@ -764,9 +795,114 @@ mod tests {
             "the part is backed off (deferred), not released into the next claim",
         );
         assert_eq!(
+            missing_source_count(&db, &part).await,
+            1,
+            "the vanished source is counted as one missing-source observation",
+        );
+        assert_eq!(
             enforcer.lock().unwrap().try_drain(1, Instant::now()),
             DrainDecision::Allowed,
             "a vanished source must not trip the Ceph breaker",
+        );
+    }
+
+    /// The row's `missing_source_attempts` — the write-off escalation counter.
+    async fn missing_source_count(db: &PgPool, part: &PartKey) -> i64 {
+        sqlx::query_scalar(
+            "SELECT missing_source_attempts::bigint FROM cephor_replication_status \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .fetch_one(db)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn a_source_missing_at_the_threshold_is_written_off_terminally(pool: PgPool) {
+        // The prod motivation (2026-07-22 rows): a part whose SSD dir is permanently
+        // gone deferred forever — claim → ENOENT → defer, on every node, for days. At
+        // the threshold-th missing-source observation the row must go terminal
+        // `failed` (never re-claimed, never resurrected) so it stops churning. The
+        // write-off is NOT a Ceph failure: it must stay out of error_bps and off the
+        // breaker, and the burst keeps claiming (Skipped).
+        let db = pool.clone();
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let pool_dir = tempfile::tempdir().unwrap();
+        let ssd = LocalSsd::new(ssd_dir.path());
+        let ceph = LocalFs::new(pool_dir.path());
+        let store = Store::from_pool(pool);
+        let snapshot = SnapshotCell::new();
+        let enforcer = enforcer_with(1_000_000);
+
+        let part = part_at(5, 1);
+        store.record_landed_part(&part).await.unwrap();
+        // Threshold-1 prior observations: this claim's ENOENT is the deciding one.
+        sqlx::query("UPDATE cephor_replication_status SET missing_source_attempts = $1 WHERE object_id = $2")
+            .bind(i64::from(super::MISSING_SOURCE_FAIL_ATTEMPTS - 1))
+            .bind(part.object().as_str())
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let step = drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot))
+            .await
+            .unwrap();
+        assert_eq!(step, ClaimOutcome::Skipped, "a write-off is part-specific; the burst keeps claiming");
+
+        assert_eq!(
+            status_of(&store, &part).await,
+            Some(ReplicationState::Failed),
+            "the row is written off terminally — no more claim churn",
+        );
+        let counts = snapshot.load();
+        assert_eq!(counts.failed, 0, "a write-off is not a Ceph-write failure");
+        assert_eq!(counts.error_bps(), 0, "the write-off stays out of the Ceph failure rate");
+        assert_eq!(
+            enforcer.lock().unwrap().try_drain(1, Instant::now()),
+            DrainDecision::Allowed,
+            "the write-off must not trip the Ceph breaker",
+        );
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn an_unrelated_defer_history_cannot_fast_track_the_write_off(pool: PgPool) {
+        // The amendment's whole point: defer_attempts is shared with overdraft and
+        // not-ready deferrals, so a part with a LONG unrelated backoff history must
+        // NOT be written off on its first transient NotFound — `failed` is never
+        // resurrected, so that would be silent replication loss. Only missing-source
+        // observations count.
+        let db = pool.clone();
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let pool_dir = tempfile::tempdir().unwrap();
+        let ssd = LocalSsd::new(ssd_dir.path());
+        let ceph = LocalFs::new(pool_dir.path());
+        let store = Store::from_pool(pool);
+        let enforcer = enforcer_with(1_000_000);
+
+        let part = part_at(5, 1);
+        store.record_landed_part(&part).await.unwrap();
+        // A long overdraft/not-ready history, but zero missing-source observations.
+        sqlx::query("UPDATE cephor_replication_status SET defer_attempts = 25 WHERE object_id = $1")
+            .bind(part.object().as_str())
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let step = drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&enforcer), None).await.unwrap();
+        assert_eq!(step, ClaimOutcome::Skipped);
+
+        assert_eq!(
+            status_of(&store, &part).await,
+            Some(ReplicationState::Pending),
+            "the first missing-source observation only defers — the unrelated history must not escalate it",
+        );
+        assert_eq!(
+            missing_source_count(&db, &part).await,
+            1,
+            "the NotFound is counted as the FIRST missing-source observation",
         );
     }
 
