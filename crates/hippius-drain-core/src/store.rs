@@ -182,6 +182,12 @@ const DEFAULT_CLAIM_LEASE: Duration = Duration::from_mins(5);
 /// [`Store::with_defer_backoff`].
 const DEFAULT_DEFER_BACKOFF: Duration = Duration::from_secs(5);
 
+/// The ceiling on the exponential deferral backoff: a part that keeps deferring
+/// (an abandoned MPU that never finalizes) doubles its backoff per attempt but is
+/// never parked longer than this, so it still re-checks within minutes of the
+/// address finally landing. Override via [`Store::with_defer_backoff_cap`].
+const DEFAULT_DEFER_BACKOFF_CAP: Duration = Duration::from_mins(10);
+
 /// Handle to the Postgres central state. Cheap to clone (shares the pool).
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -192,7 +198,12 @@ pub struct Store {
     /// How long a deferred part is backed off before it is re-claimable, so the
     /// drain does not re-claim a not-ready part on every poll (which would starve
     /// the ready ones). Applied by [`Store::defer_part`], honored by `claim_part`.
+    /// This is the BASE of the per-row exponential backoff; the row's
+    /// `defer_attempts` doubles it per deferral up to [`defer_backoff_cap`](Self::with_defer_backoff_cap).
     defer_backoff: Duration,
+    /// Ceiling on the exponential deferral backoff, so a chronically not-ready part
+    /// still re-checks within minutes of its address finally landing.
+    defer_backoff_cap: Duration,
     /// The agent's node id. Parts live on node-local SSD, so a part may only be
     /// drained by the node that holds it: `record_landed_part` stamps this and
     /// `claim_part` scopes to it. `None` for the allocator, which records/claims
@@ -212,6 +223,7 @@ impl Store {
             pool,
             claim_lease: DEFAULT_CLAIM_LEASE,
             defer_backoff: DEFAULT_DEFER_BACKOFF,
+            defer_backoff_cap: DEFAULT_DEFER_BACKOFF_CAP,
             node_id: None,
         })
     }
@@ -226,6 +238,7 @@ impl Store {
             pool,
             claim_lease: DEFAULT_CLAIM_LEASE,
             defer_backoff: DEFAULT_DEFER_BACKOFF,
+            defer_backoff_cap: DEFAULT_DEFER_BACKOFF_CAP,
             node_id: Some("test-node".to_owned()),
         }
     }
@@ -243,6 +256,14 @@ impl Store {
     #[must_use]
     pub fn with_defer_backoff(mut self, backoff: Duration) -> Self {
         self.defer_backoff = backoff;
+        self
+    }
+
+    /// Sets the exponential-deferral ceiling (the daemon wires this from
+    /// `CEPHOR_DEFER_BACKOFF_CAP_SECS`). No deferral parks a part longer than `cap`.
+    #[must_use]
+    pub fn with_defer_backoff_cap(mut self, cap: Duration) -> Self {
+        self.defer_backoff_cap = cap;
         self
     }
 
@@ -527,7 +548,9 @@ impl Store {
     pub async fn release_part(&self, part: &PartKey) -> Result<()> {
         // Clear deferred_until too: a release is the Ceph-failure retry path, which
         // should be re-claimable immediately — it must not inherit a stale backoff a
-        // prior deferral parked on the row.
+        // prior deferral parked on the row. defer_attempts is deliberately left alone:
+        // the escalation tracks the not-ready condition, which a Ceph blip says
+        // nothing about, so resetting it here would re-arm the starvation spiral.
         sqlx::query(
             "UPDATE cephor_replication_status SET status = 'pending', updated_at = now(), claimed_at = NULL, deferred_until = NULL \
              WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining'",
@@ -549,19 +572,33 @@ impl Store {
     /// on `draining` like [`release_part`](Store::release_part), so a late defer cannot
     /// resurrect a finished part.
     ///
+    /// The backoff is EXPONENTIAL per row (base × 2^`defer_attempts`, capped): a fixed
+    /// backoff let a wall of not-ready in-progress-MPU parts — oldest by `landed_at`,
+    /// so at the claim head — re-enter the claimable set every interval and consume
+    /// every claim slot, starving all younger parts (the 2026-07-26 head-of-line
+    /// starvation incident). Doubling per deferral moves a not-ready wall out of the
+    /// claim hot path geometrically. The inner `LEAST(defer_attempts, 16)` clamps the
+    /// exponent so `power` cannot overflow; the outer `LEAST` enforces
+    /// [`defer_backoff_cap`](Store::with_defer_backoff_cap). `release_part` deliberately
+    /// preserves `defer_attempts` — a transient Ceph-failure retry must not erase the
+    /// not-ready escalation.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Database`] on failure.
     pub async fn defer_part(&self, part: &PartKey) -> Result<()> {
         sqlx::query(
             "UPDATE cephor_replication_status \
-             SET status = 'pending', updated_at = now(), claimed_at = NULL, deferred_until = now() + $4 * interval '1 second' \
+             SET status = 'pending', updated_at = now(), claimed_at = NULL, \
+                 defer_attempts = defer_attempts + 1, \
+                 deferred_until = now() + LEAST($4 * power(2::float8, LEAST(defer_attempts, 16)), $5) * interval '1 second' \
              WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining'",
         )
         .bind(part.object().as_str())
         .bind(i64::from(part.version().get()))
         .bind(i64::from(part.part().get()))
         .bind(self.defer_backoff.as_secs_f64())
+        .bind(self.defer_backoff_cap.as_secs_f64())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -2199,6 +2236,107 @@ mod part_tests {
             store.claim_part().await.unwrap().is_some(),
             "release clears the backoff, so a Ceph-failed part retries immediately",
         );
+    }
+
+    /// Seconds until the row's `deferred_until`, measured against the same DB clock
+    /// that stamped it — so the assertion is immune to test-host/DB clock skew.
+    async fn defer_remaining_secs(pool: &PgPool, part: &PartKey) -> f64 {
+        sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM (deferred_until - now()))::float8 FROM cephor_replication_status \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn defer_part_backs_off_exponentially(pool: PgPool) {
+        // The 2026-07-26 head-of-line starvation incident: with a FIXED backoff, a wall
+        // of not-ready MPU parts re-entered the claimable head every interval and — being
+        // oldest by landed_at — consumed every claim slot, starving every younger part.
+        // Repeated deferrals must therefore back off geometrically: 5s, 10s, 20s, ...
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+
+        let mut observed = Vec::new();
+        for _ in 0..3 {
+            store.claim_part().await.unwrap().expect("the part is claimable");
+            store.defer_part(&p).await.unwrap();
+            observed.push(defer_remaining_secs(&pool, &p).await);
+            // Clear the parked backoff so the next round can re-claim immediately.
+            sqlx::query("UPDATE cephor_replication_status SET deferred_until = NULL WHERE object_id = $1")
+                .bind(p.object().as_str())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        for (n, (remaining, expected)) in observed.iter().zip([5.0_f64, 10.0, 20.0]).enumerate() {
+            assert!(
+                (expected - 1.0..=expected + 1.0).contains(remaining),
+                "deferral #{n} should park the part ~{expected}s, got {remaining}s (all: {observed:?})",
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn defer_backoff_is_capped(pool: PgPool) {
+        // A part that has deferred many times (an abandoned MPU that never finalizes)
+        // must park at the cap, not for days: uncapped, 30 attempts would be
+        // 5 * 2^16 s (~3.8 days) even after the exponent clamp.
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        store.claim_part().await.unwrap().expect("the part is claimable");
+        sqlx::query("UPDATE cephor_replication_status SET defer_attempts = 30 WHERE object_id = $1")
+            .bind(p.object().as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        store.defer_part(&p).await.unwrap();
+        let remaining = defer_remaining_secs(&pool, &p).await;
+        assert!(remaining <= 601.0, "the deferral must not exceed the 600s cap, got {remaining}s");
+        assert!(
+            remaining >= 599.0,
+            "a 30-attempt row is parked at the FULL cap, not the base backoff, got {remaining}s",
+        );
+    }
+
+    #[sqlx::test]
+    async fn release_part_preserves_defer_attempts(pool: PgPool) {
+        // A transient Ceph-failure release retries promptly (deferred_until cleared)
+        // but must NOT erase the not-ready escalation: if the part defers again, the
+        // backoff continues geometrically instead of restarting at the base interval.
+        let store = Store::from_pool(pool.clone());
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        store.claim_part().await.unwrap().expect("the part is claimable");
+        store.defer_part(&p).await.unwrap();
+        sqlx::query("UPDATE cephor_replication_status SET deferred_until = now() - interval '1 second' WHERE object_id = $1")
+            .bind(p.object().as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+        store.claim_part().await.unwrap().expect("re-claimable once the backoff elapsed");
+
+        store.release_part(&p).await.unwrap();
+        let (attempts, deferred_is_null): (i32, bool) = sqlx::query_as(
+            "SELECT defer_attempts, deferred_until IS NULL FROM cephor_replication_status \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(p.object().as_str())
+        .bind(i64::from(p.version().get()))
+        .bind(i64::from(p.part().get()))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts, 1, "release must not reset the defer escalation");
+        assert!(deferred_is_null, "release clears the parked backoff for a prompt retry");
     }
 
     /// Drives one part `pending → draining → replicated` (the drain's commit path) and returns it.

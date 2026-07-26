@@ -54,6 +54,11 @@ const DEFAULT_CLAIM_LEASE: Duration = Duration::from_mins(5);
 /// parked before it is re-claimable, so the drain does not spin on not-ready parts every
 /// poll. Mirrors the store-side default.
 const DEFAULT_DEFER_BACKOFF: Duration = Duration::from_secs(5);
+/// Deferral-backoff ceiling when `CEPHOR_DEFER_BACKOFF_CAP_SECS` is unset: the per-row
+/// exponential backoff (base × 2^attempts) never parks a part longer than this, so a
+/// chronically not-ready part still re-checks within minutes of its address finally
+/// landing. Mirrors the store-side default.
+const DEFAULT_DEFER_BACKOFF_CAP: Duration = Duration::from_mins(10);
 /// Heartbeat key TTL when `CEPHOR_HEARTBEAT_TTL_SECS` is unset: how long this node's
 /// heartbeat stays live in the fleet before it must be refreshed. This IS the
 /// fleet-staleness window (the allocator drops a node whose key has expired), so it must
@@ -123,8 +128,12 @@ pub struct Config {
     /// (the H1 crash-recovery TTL; wired into the store via `with_claim_lease`).
     pub claim_lease: Duration,
     /// How long a deferred (enqueue-not-ready) part is backed off before re-claim,
-    /// wired into the store via `with_defer_backoff`.
+    /// wired into the store via `with_defer_backoff`. The base of the per-row
+    /// exponential backoff, doubled per deferral up to `defer_backoff_cap`.
     pub defer_backoff: Duration,
+    /// Ceiling on the exponential deferral backoff, wired into the store via
+    /// `with_defer_backoff_cap`.
+    pub defer_backoff_cap: Duration,
     /// TTL stamped on this node's heartbeat key — the fleet-staleness window the
     /// allocator sees (a node whose key expires drops out of the fleet).
     pub heartbeat_ttl: Duration,
@@ -300,6 +309,7 @@ impl Config {
             allocation_poll: duration_secs(&get, "CEPHOR_ALLOCATION_POLL_SECS", DEFAULT_ALLOCATION_POLL)?,
             claim_lease: duration_secs(&get, "CEPHOR_CLAIM_LEASE_TTL_SECS", DEFAULT_CLAIM_LEASE)?,
             defer_backoff: duration_secs(&get, "CEPHOR_DEFER_BACKOFF_SECS", DEFAULT_DEFER_BACKOFF)?,
+            defer_backoff_cap: duration_secs(&get, "CEPHOR_DEFER_BACKOFF_CAP_SECS", DEFAULT_DEFER_BACKOFF_CAP)?,
             heartbeat_ttl: duration_secs(&get, "CEPHOR_HEARTBEAT_TTL_SECS", DEFAULT_HEARTBEAT_TTL)?,
             redis_queues_url: required(&get, "REDIS_QUEUES_URL")?,
             upload_backends: parse_backends(&get, "HIPPIUS_UPLOAD_BACKENDS"),
@@ -414,9 +424,9 @@ fn duration_secs(get: &impl Fn(&str) -> Option<String>, var: &'static str, defau
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::{
-        Config, ConfigError, DEFAULT_ALLOCATION_POLL, DEFAULT_CLAIM_LEASE, DEFAULT_DECAY_HALF_LIFE, DEFAULT_DRAIN_CONCURRENCY, DEFAULT_DRAIN_POLL,
-        DEFAULT_FLOOR_RATE_BPS, DEFAULT_HEARTBEAT_POLL, DEFAULT_HEARTBEAT_TTL, DEFAULT_MAX_DRAIN_RATE_BPS, DEFAULT_ORPHAN_RECLAIM_GRACE,
-        DEFAULT_RECLAIM_GRACE, DEFAULT_RECLAIM_POLL, DEFAULT_REPLICATED_RECLAIM_GRACE,
+        Config, ConfigError, DEFAULT_ALLOCATION_POLL, DEFAULT_CLAIM_LEASE, DEFAULT_DECAY_HALF_LIFE, DEFAULT_DEFER_BACKOFF_CAP,
+        DEFAULT_DRAIN_CONCURRENCY, DEFAULT_DRAIN_POLL, DEFAULT_FLOOR_RATE_BPS, DEFAULT_HEARTBEAT_POLL, DEFAULT_HEARTBEAT_TTL,
+        DEFAULT_MAX_DRAIN_RATE_BPS, DEFAULT_ORPHAN_RECLAIM_GRACE, DEFAULT_RECLAIM_GRACE, DEFAULT_RECLAIM_POLL, DEFAULT_REPLICATED_RECLAIM_GRACE,
     };
     use core::str::FromStr;
     use hippius_drain_core::{ByteRate, NodeId};
@@ -528,6 +538,20 @@ mod tests {
         pairs.push(("CEPHOR_CLAIM_LEASE_TTL_SECS", "600"));
         let config = Config::from_lookup(lookup(&pairs)).unwrap();
         assert_eq!(config.claim_lease, Duration::from_mins(10));
+    }
+
+    #[test]
+    fn defaults_the_defer_backoff_cap() {
+        let config = Config::from_lookup(lookup(&required_only())).unwrap();
+        assert_eq!(config.defer_backoff_cap, DEFAULT_DEFER_BACKOFF_CAP);
+    }
+
+    #[test]
+    fn a_numeric_defer_backoff_cap_overrides_the_default() {
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_DEFER_BACKOFF_CAP_SECS", "1200"));
+        let config = Config::from_lookup(lookup(&pairs)).unwrap();
+        assert_eq!(config.defer_backoff_cap, Duration::from_mins(20));
     }
 
     #[test]
