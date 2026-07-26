@@ -736,15 +736,17 @@ class ObjectWriter:
         consumer_error: BaseException | None = None
 
         async def _cleanup_partial() -> None:
-            try:
-                await self.fs_store.delete_part(str(object_id), int(object_version), int(part_number))
-            except Exception:
-                logger.warning(
-                    "Failed to cleanup partial part on FS: object_id=%s v=%s part=%s",
-                    object_id,
-                    int(object_version),
-                    int(part_number),
-                )
+            # DATA-LOSS GUARD: never delete the shared FS part dir here. Duplicate / hedged
+            # UploadPart attempts for the SAME (object_id, object_version, part_number) share ONE
+            # deterministic part dir (fs_store.part_path keys only on those three — not per-attempt
+            # / upload_id). A losing attempt's cleanup used to `fs_store.delete_part` (rmtree) that
+            # shared dir and destroy a concurrent WINNER's already-acknowledged (200), meta-committed
+            # data — the beam-dev/100gbdestination1 loss. Ciphertext is deterministic (AEAD with a
+            # deterministic nonce), so any partial left behind is harmless: the winner's chunks are a
+            # superset and overwrite identically. A genuinely-orphaned partial (no winner) has NO
+            # meta.json and NO `parts` row, so it is invisible to the drain and reclaimed by the
+            # janitor's stale-parts reap (cleanup_stale_parts: "no parts row → orphan → reap" after
+            # mpu_stale_seconds). Only the best-effort Redis keys are cleaned below.
             if written_chunk_indices:
                 try:
                     keys = [
